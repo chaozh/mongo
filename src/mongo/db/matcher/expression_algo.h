@@ -29,11 +29,11 @@
 
 #pragma once
 
+#include <functional>
 #include <memory>
 #include <set>
 
 #include "mongo/base/string_data.h"
-#include "mongo/stdx/functional.h"
 #include "mongo/util/string_map.h"
 
 namespace mongo {
@@ -43,7 +43,14 @@ struct DepsTracker;
 
 namespace expression {
 
-using NodeTraversalFunc = stdx::function<void(MatchExpression*, std::string)>;
+using NodeTraversalFunc = std::function<void(MatchExpression*, std::string)>;
+
+/**
+ * Returns true if 'expr' has an $exists predicate on 'path.' Note that this only returns true
+ * for an $exists predicatated on the exact path given: it will not return true if there is a
+ * $exists predicated on a prefix of the path.
+ */
+bool hasExistencePredicateOnPath(const MatchExpression& expr, StringData path);
 
 /**
  * Returns true if the documents matched by 'lhs' are a subset of the documents matched by

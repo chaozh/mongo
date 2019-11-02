@@ -29,23 +29,23 @@
 
 #pragma once
 
-#include <queue>
-
 #include <boost/optional.hpp>
+#include <functional>
+#include <queue>
 
 #include "mongo/db/logical_session_id.h"
 #include "mongo/s/query/cluster_client_cursor.h"
-#include "mongo/stdx/functional.h"
 
 namespace mongo {
 
 class ClusterClientCursorMock final : public ClusterClientCursor {
-    MONGO_DISALLOW_COPYING(ClusterClientCursorMock);
+    ClusterClientCursorMock(const ClusterClientCursorMock&) = delete;
+    ClusterClientCursorMock& operator=(const ClusterClientCursorMock&) = delete;
 
 public:
     ClusterClientCursorMock(boost::optional<LogicalSessionId> lsid,
                             boost::optional<TxnNumber> txnNumber,
-                            stdx::function<void(void)> killCallback = stdx::function<void(void)>());
+                            std::function<void(void)> killCallback = {});
 
     ~ClusterClientCursorMock();
 
@@ -101,12 +101,9 @@ public:
     void incNBatches() final;
 
     /**
-     * Returns true unless marked as having non-exhausted remote cursors via
-     * markRemotesNotExhausted().
+     * Returns false unless the mock cursor has been fully iterated.
      */
     bool remotesExhausted() final;
-
-    void markRemotesNotExhausted();
 
     /**
      * Queues an error response.
@@ -115,9 +112,8 @@ public:
 
 private:
     bool _killed = false;
-    bool _exhausted = false;
     std::queue<StatusWith<ClusterQueryResult>> _resultsQueue;
-    stdx::function<void(void)> _killCallback;
+    std::function<void(void)> _killCallback;
 
     // Originating command object.
     BSONObj _originatingCommand;
@@ -128,7 +124,7 @@ private:
     // Number of returned documents.
     long long _numReturnedSoFar = 0;
 
-    bool _remotesExhausted = true;
+    bool _remotesExhausted = false;
 
     boost::optional<LogicalSessionId> _lsid;
 

@@ -32,9 +32,8 @@
 #include <boost/optional.hpp>
 #include <memory>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/db/repl/oplog_buffer.h"
-#include "mongo/stdx/mutex.h"
+#include "mongo/platform/mutex.h"
 
 namespace mongo {
 namespace repl {
@@ -46,7 +45,8 @@ class StorageInterface;
  * oplog buffer.
  */
 class OplogBufferProxy : public OplogBuffer {
-    MONGO_DISALLOW_COPYING(OplogBufferProxy);
+    OplogBufferProxy(const OplogBufferProxy&) = delete;
+    OplogBufferProxy& operator=(const OplogBufferProxy&) = delete;
 
 public:
     explicit OplogBufferProxy(std::unique_ptr<OplogBuffer> target);
@@ -58,11 +58,9 @@ public:
 
     void startup(OperationContext* opCtx) override;
     void shutdown(OperationContext* opCtx) override;
-    void pushEvenIfFull(OperationContext* opCtx, const Value& value) override;
-    void push(OperationContext* opCtx, const Value& value) override;
-    void pushAllNonBlocking(OperationContext* opCtx,
-                            Batch::const_iterator begin,
-                            Batch::const_iterator end) override;
+    void push(OperationContext* opCtx,
+              Batch::const_iterator begin,
+              Batch::const_iterator end) override;
     void waitForSpace(OperationContext* opCtx, std::size_t size) override;
     bool isEmpty() const override;
     std::size_t getMaxSize() const override;
@@ -82,10 +80,10 @@ private:
     std::unique_ptr<OplogBuffer> _target;
 
     // If both mutexes have to be acquired, acquire _lastPushedMutex first.
-    mutable stdx::mutex _lastPushedMutex;
+    mutable Mutex _lastPushedMutex = MONGO_MAKE_LATCH("OplogBufferProxy::_lastPushedMutex");
     boost::optional<Value> _lastPushed;
 
-    mutable stdx::mutex _lastPeekedMutex;
+    mutable Mutex _lastPeekedMutex = MONGO_MAKE_LATCH("OplogBufferProxy::_lastPeekedMutex");
     boost::optional<Value> _lastPeeked;
 };
 

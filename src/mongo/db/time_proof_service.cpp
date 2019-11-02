@@ -45,19 +45,13 @@ namespace mongo {
 const uint64_t kRangeMask = 0x0000'0000'0000'FFFF;
 
 TimeProofService::Key TimeProofService::generateRandomKey() {
-    // SecureRandom only produces 64-bit numbers, so 3 is the minimum for 20 random bytes.
-    const size_t kRandomNumbers = 3;
-    std::array<std::int64_t, kRandomNumbers> keyBuffer;
-    std::unique_ptr<SecureRandom> rng(SecureRandom::create());
-    std::generate(keyBuffer.begin(), keyBuffer.end(), [&] { return rng->nextInt64(); });
-
-    return fassert(40384,
-                   SHA1Block::fromBuffer(reinterpret_cast<std::uint8_t*>(keyBuffer.data()),
-                                         SHA1Block::kHashLength));
+    std::array<std::uint8_t, SHA1Block::kHashLength> keyBuffer;
+    SecureRandom().fill(keyBuffer.data(), keyBuffer.size());
+    return fassert(40384, SHA1Block::fromBuffer(keyBuffer.data(), keyBuffer.size()));
 }
 
 TimeProofService::TimeProof TimeProofService::getProof(LogicalTime time, const Key& key) {
-    stdx::lock_guard<stdx::mutex> lk(_cacheMutex);
+    stdx::lock_guard<Latch> lk(_cacheMutex);
     auto timeCeil = LogicalTime(Timestamp(time.asTimestamp().asULL() | kRangeMask));
     if (_cache && _cache->hasProof(timeCeil, key)) {
         return _cache->_proof;
@@ -82,7 +76,7 @@ Status TimeProofService::checkProof(LogicalTime time, const TimeProof& proof, co
 }
 
 void TimeProofService::resetCache() {
-    stdx::lock_guard<stdx::mutex> lk(_cacheMutex);
+    stdx::lock_guard<Latch> lk(_cacheMutex);
     if (_cache) {
         _cache = boost::none;
     }

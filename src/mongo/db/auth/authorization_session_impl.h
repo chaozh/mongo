@@ -33,7 +33,6 @@
 #include <string>
 #include <vector>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/base/status.h"
 #include "mongo/db/auth/action_set.h"
 #include "mongo/db/auth/action_type.h"
@@ -92,8 +91,6 @@ public:
 
     RoleNameIterator getAuthenticatedRoleNames() override;
 
-    std::string getAuthenticatedUserNamesToken() override;
-
     void logoutDatabase(OperationContext* opCtx, StringData dbname) override;
 
     void grantInternalAuthorization(Client* client) override;
@@ -111,7 +108,7 @@ public:
     Status checkAuthForUpdate(OperationContext* opCtx,
                               const NamespaceString& ns,
                               const BSONObj& query,
-                              const BSONObj& update,
+                              const write_ops::UpdateModification& update,
                               bool upsert) override;
 
     Status checkAuthForInsert(OperationContext* opCtx, const NamespaceString& ns) override;

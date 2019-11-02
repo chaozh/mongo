@@ -31,13 +31,15 @@
 
 #include "mongo/s/query/document_source_merge_cursors.h"
 
+#include <memory>
+
 #include "mongo/client/remote_command_targeter_factory_mock.h"
 #include "mongo/client/remote_command_targeter_mock.h"
+#include "mongo/db/exec/document_value/document_value_test_util.h"
 #include "mongo/db/json.h"
 #include "mongo/db/pipeline/aggregation_context_fixture.h"
 #include "mongo/db/pipeline/document_source_limit.h"
 #include "mongo/db/pipeline/document_source_sort.h"
-#include "mongo/db/pipeline/document_value_test_util.h"
 #include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/query/cursor_response.h"
 #include "mongo/db/query/getmore_request.h"
@@ -49,7 +51,6 @@
 #include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/sharding_router_test_fixture.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/unittest/unittest.h"
 
@@ -97,7 +98,7 @@ public:
             shards.push_back(shardType);
 
             std::unique_ptr<RemoteCommandTargeterMock> targeter(
-                stdx::make_unique<RemoteCommandTargeterMock>());
+                std::make_unique<RemoteCommandTargeterMock>());
             targeter->setConnectionStringReturnValue(ConnectionString(kTestShardHosts[i]));
             targeter->setFindHostReturnValue(kTestShardHosts[i]);
 
@@ -132,8 +133,8 @@ TEST_F(DocumentSourceMergeCursorsTest, ShouldRejectEmptyArray) {
 
 TEST_F(DocumentSourceMergeCursorsTest, ShouldRejectLegacySerializationFormats) {
     // Formats like this were used in old versions of the server but are no longer supported.
-    auto spec = BSON("$mergeCursors" << BSON_ARRAY(BSON(
-                         "ns" << kTestNss.ns() << "id" << 0LL << "host" << kTestHost.toString())));
+    auto spec = BSON("$mergeCursors" << BSON_ARRAY(BSON("ns" << kTestNss.ns() << "id" << 0LL
+                                                             << "host" << kTestHost.toString())));
     ASSERT_THROWS_CODE(DocumentSourceMergeCursors::createFromBson(spec.firstElement(), getExpCtx()),
                        AssertionException,
                        17026);
@@ -265,7 +266,7 @@ TEST_F(DocumentSourceMergeCursorsTest, ShouldBeAbleToIterateCursorsUntilEOF) {
         return cursorResponseObj(expCtx->ns, kExhaustedCursorID, {BSON("x" << 1)});
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(DocumentSourceMergeCursorsTest, ShouldNotKillCursorsIfTheyAreNotOwned) {
@@ -330,7 +331,7 @@ TEST_F(DocumentSourceMergeCursorsTest, ShouldKillCursorIfPartiallyIterated) {
         // anything except {ok: 1}.
         return BSON("ok" << 1);
     });
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(DocumentSourceMergeCursorsTest, ShouldEnforceSortSpecifiedViaARMParams) {
@@ -378,7 +379,7 @@ TEST_F(DocumentSourceMergeCursorsTest, ShouldEnforceSortSpecifiedViaARMParams) {
                                   BSON("x" << 4 << "$sortKey" << BSON("" << 4))});
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 }  // namespace
 }  // namespace mongo

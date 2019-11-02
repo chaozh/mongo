@@ -31,16 +31,16 @@
 
 #include "mongo/db/pipeline/accumulator.h"
 
+#include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/pipeline/accumulation_statement.h"
 #include "mongo/db/pipeline/expression_context.h"
-#include "mongo/db/pipeline/value.h"
 
 namespace mongo {
 
 using boost::intrusive_ptr;
 using std::vector;
 
-REGISTER_ACCUMULATOR(addToSet, AccumulatorAddToSet::create);
+REGISTER_ACCUMULATOR(addToSet, genericParseSingleExpressionAccumulator<AccumulatorAddToSet>);
 
 const char* AccumulatorAddToSet::getOpName() const {
     return "$addToSet";

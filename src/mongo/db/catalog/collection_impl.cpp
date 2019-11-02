@@ -31,8 +31,6 @@
 
 #include "mongo/platform/basic.h"
 
-#include "mongo/db/catalog/private/record_store_validate_adaptor.h"
-
 #include "mongo/db/catalog/collection_impl.h"
 
 #include "mongo/base/counter.h"
@@ -42,19 +40,16 @@
 #include "mongo/bson/simple_bsonelement_comparator.h"
 #include "mongo/bson/simple_bsonobj_comparator.h"
 #include "mongo/db/background.h"
-#include "mongo/db/catalog/collection_catalog_entry.h"
-#include "mongo/db/catalog/collection_info_cache_impl.h"
+#include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/catalog/collection_options.h"
-#include "mongo/db/catalog/database_catalog_entry.h"
 #include "mongo/db/catalog/document_validation.h"
 #include "mongo/db/catalog/index_catalog_impl.h"
 #include "mongo/db/catalog/index_consistency.h"
 #include "mongo/db/catalog/index_key_validate.h"
-#include "mongo/db/catalog/namespace_uuid_cache.h"
-#include "mongo/db/catalog/uuid_catalog.h"
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/commands/server_status_metric.h"
 #include "mongo/db/concurrency/d_concurrency.h"
+#include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/index/index_access_method.h"
 #include "mongo/db/index/index_descriptor.h"
@@ -65,17 +60,19 @@
 #include "mongo/db/ops/update_request.h"
 #include "mongo/db/query/collation/collator_factory_interface.h"
 #include "mongo/db/query/collation/collator_interface.h"
+#include "mongo/db/query/collection_query_info.h"
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/service_context.h"
+#include "mongo/db/storage/durable_catalog.h"
 #include "mongo/db/storage/key_string.h"
 #include "mongo/db/storage/record_store.h"
 #include "mongo/db/update/update_driver.h"
 
 #include "mongo/db/auth/user_document_parser.h"  // XXX-ANDY
 #include "mongo/rpc/object_check.h"
-#include "mongo/util/fail_point_service.h"
+#include "mongo/util/fail_point.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
@@ -98,25 +95,30 @@ MONGO_FAIL_POINT_DEFINE(failCollectionInserts);
 //  }
 MONGO_FAIL_POINT_DEFINE(hangAfterCollectionInserts);
 
+// This fail point throws a WriteConflictException after a successful call to insertRecords.
+MONGO_FAIL_POINT_DEFINE(failAfterBulkLoadDocInsert);
+
 /**
  * Checks the 'failCollectionInserts' fail point at the beginning of an insert operation to see if
  * the insert should fail. Returns Status::OK if The function should proceed with the insertion.
  * Otherwise, the function should fail and return early with the error Status.
  */
 Status checkFailCollectionInsertsFailPoint(const NamespaceString& ns, const BSONObj& firstDoc) {
-    MONGO_FAIL_POINT_BLOCK(failCollectionInserts, extraData) {
-        const BSONObj& data = extraData.getData();
-        const auto collElem = data["collectionNS"];
-        // If the failpoint specifies no collection or matches the existing one, fail.
-        if (!collElem || ns.ns() == collElem.str()) {
+    Status s = Status::OK();
+    failCollectionInserts.executeIf(
+        [&](const BSONObj& data) {
             const std::string msg = str::stream()
                 << "Failpoint (failCollectionInserts) has been enabled (" << data
                 << "), so rejecting insert (first doc): " << firstDoc;
             log() << msg;
-            return {ErrorCodes::FailPointEnabled, msg};
-        }
-    }
-    return Status::OK();
+            s = {ErrorCodes::FailPointEnabled, msg};
+        },
+        [&](const BSONObj& data) {
+            // If the failpoint specifies no collection or matches the existing one, fail.
+            const auto collElem = data["collectionNS"];
+            return !collElem || ns.ns() == collElem.str();
+        });
+    return s;
 }
 
 // Uses the collator factory to convert the BSON representation of a collator to a
@@ -186,70 +188,62 @@ StatusWith<CollectionImpl::ValidationAction> _parseValidationAction(StringData n
 
 }  // namespace
 
-using std::endl;
-using std::string;
-using std::unique_ptr;
-using std::vector;
-
-using logger::LogComponent;
-
 CollectionImpl::CollectionImpl(OperationContext* opCtx,
-                               StringData fullNS,
-                               OptionalCollectionUUID uuid,
-                               CollectionCatalogEntry* details,
-                               RecordStore* recordStore,
-                               DatabaseCatalogEntry* dbce)
-    : _magic(kMagicNumber),
-      _ns(fullNS),
+                               const NamespaceString& nss,
+                               UUID uuid,
+                               std::unique_ptr<RecordStore> recordStore)
+    : _ns(nss),
       _uuid(uuid),
-      _details(details),
-      _recordStore(recordStore),
-      _dbce(dbce),
-      _needCappedLock(supportsDocLocking() && _recordStore->isCapped() && _ns.db() != "local"),
-      _infoCache(std::make_unique<CollectionInfoCacheImpl>(this, _ns)),
-      _indexCatalog(
-          std::make_unique<IndexCatalogImpl>(this, getCatalogEntry()->getMaxAllowedIndexes())),
-      _collator(parseCollation(opCtx, _ns, _details->getCollectionOptions(opCtx).collation)),
-      _validatorDoc(_details->getCollectionOptions(opCtx).validator.getOwned()),
-      _validator(uassertStatusOK(
-          parseValidator(opCtx, _validatorDoc, MatchExpressionParser::kAllowAllSpecialFeatures))),
-      _validationAction(uassertStatusOK(
-          _parseValidationAction(_details->getCollectionOptions(opCtx).validationAction))),
-      _validationLevel(uassertStatusOK(
-          _parseValidationLevel(_details->getCollectionOptions(opCtx).validationLevel))),
-      _cappedNotifier(_recordStore->isCapped() ? stdx::make_unique<CappedInsertNotifier>()
-                                               : nullptr) {
-
-    _indexCatalog->init(opCtx).transitional_ignore();
+      _recordStore(std::move(recordStore)),
+      _needCappedLock(supportsDocLocking() && _recordStore && _recordStore->isCapped() &&
+                      _ns.db() != "local"),
+      _indexCatalog(std::make_unique<IndexCatalogImpl>(this)),
+      _cappedNotifier(_recordStore && _recordStore->isCapped()
+                          ? std::make_unique<CappedInsertNotifier>()
+                          : nullptr) {
     if (isCapped())
         _recordStore->setCappedCallback(this);
-
-    _infoCache->init(opCtx);
 }
 
 CollectionImpl::~CollectionImpl() {
-    verify(ok());
     if (isCapped()) {
         _recordStore->setCappedCallback(nullptr);
         _cappedNotifier->kill();
     }
 
-    if (_uuid) {
-        if (auto opCtx = cc().getOperationContext()) {
-            auto& uuidCatalog = UUIDCatalog::get(opCtx);
-            invariant(uuidCatalog.lookupCollectionByUUID(_uuid.get()) != this);
-            auto& cache = NamespaceUUIDCache::get(opCtx);
-            // TODO(geert): cache.verifyNotCached(ns(), uuid().get());
-            cache.evictNamespace(ns());
-        }
-        LOG(2) << "destructed collection " << ns() << " with UUID " << uuid()->toString();
+    if (ns().isOplog()) {
+        repl::clearLocalOplogPtr();
     }
-    _magic = 0;
+}
+
+std::unique_ptr<Collection> CollectionImpl::FactoryImpl::make(
+    OperationContext* opCtx,
+    const NamespaceString& nss,
+    CollectionUUID uuid,
+    std::unique_ptr<RecordStore> rs) const {
+    return std::make_unique<CollectionImpl>(opCtx, nss, uuid, std::move(rs));
+}
+
+void CollectionImpl::init(OperationContext* opCtx) {
+    auto collectionOptions = DurableCatalog::get(opCtx)->getCollectionOptions(opCtx, _ns);
+    _collator = parseCollation(opCtx, _ns, collectionOptions.collation);
+    _validatorDoc = collectionOptions.validator.getOwned();
+    _validator = uassertStatusOK(
+        parseValidator(opCtx, _validatorDoc, MatchExpressionParser::kAllowAllSpecialFeatures));
+    _validationAction = uassertStatusOK(_parseValidationAction(collectionOptions.validationAction));
+    _validationLevel = uassertStatusOK(_parseValidationLevel(collectionOptions.validationLevel));
+
+    getIndexCatalog()->init(opCtx).transitional_ignore();
+    _initialized = true;
+}
+
+bool CollectionImpl::isInitialized() const {
+    return _initialized;
 }
 
 bool CollectionImpl::requiresIdIndex() const {
-    if (_ns.isVirtualized() || _ns.isOplog()) {
-        // No indexes on virtual collections or the oplog.
+    if (_ns.isOplog()) {
+        // No indexes on the oplog.
         return false;
     }
 
@@ -266,7 +260,6 @@ bool CollectionImpl::requiresIdIndex() const {
 std::unique_ptr<SeekableRecordCursor> CollectionImpl::getCursor(OperationContext* opCtx,
                                                                 bool forward) const {
     dassert(opCtx->lockState()->isCollectionLockedForMode(ns(), MODE_IS));
-    invariant(ok());
 
     return _recordStore->getCursor(opCtx, forward);
 }
@@ -318,15 +311,13 @@ StatusWithMatchExpression CollectionImpl::parseValidator(
     if (ns().isSystem() && !ns().isDropPendingNamespace()) {
         return {ErrorCodes::InvalidOptions,
                 str::stream() << "Document validators not allowed on system collection " << ns()
-                              << (_uuid ? " with UUID " + _uuid->toString() : "")};
+                              << " with UUID " << _uuid};
     }
 
     if (ns().isOnInternalDb()) {
         return {ErrorCodes::InvalidOptions,
                 str::stream() << "Document validators are not allowed on collection " << ns().ns()
-                              << (_uuid ? " with UUID " + _uuid->toString() : "")
-                              << " in the "
-                              << ns().db()
+                              << " with UUID " << _uuid << " in the " << ns().db()
                               << " internal database"};
     }
 
@@ -339,6 +330,10 @@ StatusWithMatchExpression CollectionImpl::parseValidator(
     // Enforce a maximum feature version if requested.
     expCtx->maxFeatureCompatibilityVersion = maxFeatureCompatibilityVersion;
 
+    // The match expression parser needs to know that we're parsing an expression for a
+    // validator to apply some additional checks.
+    expCtx->isParsingCollectionValidator = true;
+
     auto statusWithMatcher =
         MatchExpressionParser::parse(validator, expCtx, ExtensionsCallbackNoop(), allowedFeatures);
     if (!statusWithMatcher.isOK())
@@ -348,18 +343,15 @@ StatusWithMatchExpression CollectionImpl::parseValidator(
 }
 
 Status CollectionImpl::insertDocumentsForOplog(OperationContext* opCtx,
-                                               const DocWriter* const* docs,
-                                               Timestamp* timestamps,
-                                               size_t nDocs) {
+                                               std::vector<Record>* records,
+                                               const std::vector<Timestamp>& timestamps) {
     dassert(opCtx->lockState()->isWriteLocked());
 
     // Since this is only for the OpLog, we can assume these for simplicity.
-    // This also means that we do not need to forward this object to the OpObserver, which is good
-    // because it would defeat the purpose of using DocWriter.
     invariant(!_validator);
     invariant(!_indexCatalog->haveAnyIndexes());
 
-    Status status = _recordStore->insertRecordsWithDocWriter(opCtx, docs, timestamps, nDocs);
+    Status status = _recordStore->insertRecords(opCtx, records, timestamps);
     if (!status.isOK())
         return status;
 
@@ -371,8 +363,8 @@ Status CollectionImpl::insertDocumentsForOplog(OperationContext* opCtx,
 
 
 Status CollectionImpl::insertDocuments(OperationContext* opCtx,
-                                       const vector<InsertStatement>::const_iterator begin,
-                                       const vector<InsertStatement>::const_iterator end,
+                                       const std::vector<InsertStatement>::const_iterator begin,
+                                       const std::vector<InsertStatement>::const_iterator end,
                                        OpDebug* opDebug,
                                        bool fromMigrate) {
 
@@ -411,24 +403,27 @@ Status CollectionImpl::insertDocuments(OperationContext* opCtx,
     opCtx->recoveryUnit()->onCommit(
         [this](boost::optional<Timestamp>) { notifyCappedWaitersIfNeeded(); });
 
-    MONGO_FAIL_POINT_BLOCK(hangAfterCollectionInserts, extraData) {
-        const BSONObj& data = extraData.getData();
-        const auto collElem = data["collectionNS"];
-        const auto firstIdElem = data["first_id"];
-        // If the failpoint specifies no collection or matches the existing one, hang.
-        if ((!collElem || _ns.ns() == collElem.str()) &&
-            (!firstIdElem || (begin != end && firstIdElem.type() == mongo::String &&
-                              begin->doc["_id"].str() == firstIdElem.str()))) {
-            string whenFirst =
-                firstIdElem ? (string(" when first _id is ") + firstIdElem.str()) : "";
-            while (MONGO_FAIL_POINT(hangAfterCollectionInserts)) {
-                log() << "hangAfterCollectionInserts fail point enabled for " << _ns.toString()
-                      << whenFirst << ". Blocking until fail point is disabled.";
-                mongo::sleepsecs(1);
-                opCtx->checkForInterrupt();
+    hangAfterCollectionInserts.executeIf(
+        [&](const BSONObj& data) {
+            const auto& firstIdElem = data["first_id"];
+            std::string whenFirst;
+            if (firstIdElem) {
+                whenFirst += " when first _id is ";
+                whenFirst += firstIdElem.str();
             }
-        }
-    }
+            log() << "hangAfterCollectionInserts fail point enabled for " << _ns << whenFirst
+                  << ". Blocking until fail point is disabled.";
+            hangAfterCollectionInserts.pauseWhileSet(opCtx);
+        },
+        [&](const BSONObj& data) {
+            const auto& collElem = data["collectionNS"];
+            const auto& firstIdElem = data["first_id"];
+            // If the failpoint specifies no collection or matches the existing one, hang.
+            return (!collElem || _ns.ns() == collElem.str()) &&
+                (!firstIdElem ||
+                 (begin != end && firstIdElem.type() == mongo::String &&
+                  begin->doc["_id"].str() == firstIdElem.str()));
+        });
 
     return Status::OK();
 }
@@ -437,7 +432,7 @@ Status CollectionImpl::insertDocument(OperationContext* opCtx,
                                       const InsertStatement& docToInsert,
                                       OpDebug* opDebug,
                                       bool fromMigrate) {
-    vector<InsertStatement> docs;
+    std::vector<InsertStatement> docs;
     docs.push_back(docToInsert);
     return insertDocuments(opCtx, docs.begin(), docs.end(), opDebug, fromMigrate);
 }
@@ -458,8 +453,8 @@ Status CollectionImpl::insertDocumentForBulkLoader(OperationContext* opCtx,
 
     dassert(opCtx->lockState()->isCollectionLockedForMode(ns(), MODE_IX));
 
-    // TODO SERVER-30638: using timestamp 0 for these inserts, which are non-oplog so we don't yet
-    // care about their correct timestamps.
+    // Using timestamp 0 for these inserts, which are non-oplog so we don't have an appropriate
+    // timestamp to use.
     StatusWith<RecordId> loc =
         _recordStore->insertRecord(opCtx, doc.objdata(), doc.objsize(), Timestamp());
 
@@ -467,11 +462,14 @@ Status CollectionImpl::insertDocumentForBulkLoader(OperationContext* opCtx,
         return loc.getStatus();
 
     status = onRecordInserted(loc.getValue());
-    if (!status.isOK()) {
-        return status;
+
+    if (MONGO_unlikely(failAfterBulkLoadDocInsert.shouldFail())) {
+        log() << "Failpoint failAfterBulkLoadDocInsert enabled for " << _ns.ns()
+              << ". Throwing WriteConflictException.";
+        throw WriteConflictException();
     }
 
-    vector<InsertStatement> inserts;
+    std::vector<InsertStatement> inserts;
     OplogSlot slot;
     // Fetch a new optime now, if necessary.
     auto replCoord = repl::ReplicationCoordinator::get(opCtx);
@@ -491,8 +489,8 @@ Status CollectionImpl::insertDocumentForBulkLoader(OperationContext* opCtx,
 }
 
 Status CollectionImpl::_insertDocuments(OperationContext* opCtx,
-                                        const vector<InsertStatement>::const_iterator begin,
-                                        const vector<InsertStatement>::const_iterator end,
+                                        const std::vector<InsertStatement>::const_iterator begin,
+                                        const std::vector<InsertStatement>::const_iterator end,
                                         OpDebug* opDebug) {
     dassert(opCtx->lockState()->isCollectionLockedForMode(ns(), MODE_IX));
 
@@ -521,7 +519,7 @@ Status CollectionImpl::_insertDocuments(OperationContext* opCtx,
 
     for (auto it = begin; it != end; it++) {
         records.emplace_back(Record{RecordId(), RecordData(it->doc.objdata(), it->doc.objsize())});
-        timestamps.emplace_back(it->oplogSlot.opTime.getTimestamp());
+        timestamps.emplace_back(it->oplogSlot.getTimestamp());
     }
     Status status = _recordStore->insertRecords(opCtx, &records, timestamps);
     if (!status.isOK())
@@ -535,7 +533,7 @@ Status CollectionImpl::_insertDocuments(OperationContext* opCtx,
         invariant(RecordId::min() < loc);
         invariant(loc < RecordId::max());
 
-        BsonRecord bsonRecord = {loc, Timestamp(it->oplogSlot.opTime.getTimestamp()), &(it->doc)};
+        BsonRecord bsonRecord = {loc, Timestamp(it->oplogSlot.getTimestamp()), &(it->doc)};
         bsonRecords.push_back(bsonRecord);
     }
 
@@ -546,6 +544,12 @@ Status CollectionImpl::_insertDocuments(OperationContext* opCtx,
     }
 
     return status;
+}
+
+void CollectionImpl::setMinimumVisibleSnapshot(Timestamp newMinimumVisibleSnapshot) {
+    if (!_minVisibleSnapshot || (newMinimumVisibleSnapshot > _minVisibleSnapshot.get())) {
+        _minVisibleSnapshot = newMinimumVisibleSnapshot;
+    }
 }
 
 bool CollectionImpl::haveCappedWaiters() {
@@ -665,14 +669,12 @@ RecordId CollectionImpl::updateDocument(OperationContext* opCtx,
     if (_recordStore->isCapped() && oldSize != newDoc.objsize())
         uasserted(ErrorCodes::CannotGrowDocumentInCappedNamespace,
                   str::stream() << "Cannot change the size of a document in a capped collection: "
-                                << oldSize
-                                << " != "
-                                << newDoc.objsize());
+                                << oldSize << " != " << newDoc.objsize());
 
     args->preImageDoc = oldDoc.value().getOwned();
 
-    Status updateStatus =
-        _recordStore->updateRecord(opCtx, oldLocation, newDoc.objdata(), newDoc.objsize());
+    uassertStatusOK(
+        _recordStore->updateRecord(opCtx, oldLocation, newDoc.objdata(), newDoc.objsize()));
 
     if (indexesAffected) {
         int64_t keysInserted, keysDeleted;
@@ -689,8 +691,7 @@ RecordId CollectionImpl::updateDocument(OperationContext* opCtx,
     invariant(sid == opCtx->recoveryUnit()->getSnapshotId());
     args->updatedDoc = newDoc;
 
-    invariant(uuid());
-    OplogUpdateEntryArgs entryArgs(*args, ns(), *uuid());
+    OplogUpdateEntryArgs entryArgs(*args, ns(), _uuid);
     getGlobalServiceContext()->getOpObserver()->onUpdate(opCtx, entryArgs);
 
     return {oldLocation};
@@ -720,11 +721,14 @@ StatusWith<RecordData> CollectionImpl::updateDocumentWithDamages(
     if (newRecStatus.isOK()) {
         args->updatedDoc = newRecStatus.getValue().toBson();
 
-        invariant(uuid());
-        OplogUpdateEntryArgs entryArgs(*args, ns(), *uuid());
+        OplogUpdateEntryArgs entryArgs(*args, ns(), _uuid);
         getGlobalServiceContext()->getOpObserver()->onUpdate(opCtx, entryArgs);
     }
     return newRecStatus;
+}
+
+bool CollectionImpl::isTemporary(OperationContext* opCtx) const {
+    return DurableCatalog::get(opCtx)->getCollectionOptions(opCtx, _ns).temp;
 }
 
 bool CollectionImpl::isCapped() const {
@@ -748,8 +752,10 @@ uint64_t CollectionImpl::dataSize(OperationContext* opCtx) const {
     return _recordStore->dataSize(opCtx);
 }
 
-uint64_t CollectionImpl::getIndexSize(OperationContext* opCtx, BSONObjBuilder* details, int scale) {
-    IndexCatalog* idxCatalog = getIndexCatalog();
+uint64_t CollectionImpl::getIndexSize(OperationContext* opCtx,
+                                      BSONObjBuilder* details,
+                                      int scale) const {
+    const IndexCatalog* idxCatalog = getIndexCatalog();
 
     std::unique_ptr<IndexCatalog::IndexIterator> ii = idxCatalog->getIndexIterator(opCtx, true);
 
@@ -780,11 +786,10 @@ uint64_t CollectionImpl::getIndexSize(OperationContext* opCtx, BSONObjBuilder* d
  */
 Status CollectionImpl::truncate(OperationContext* opCtx) {
     dassert(opCtx->lockState()->isCollectionLockedForMode(ns(), MODE_X));
-    BackgroundOperation::assertNoBgOpInProgForNs(ns());
     invariant(_indexCatalog->numIndexesInProgress(opCtx) == 0);
 
     // 1) store index specs
-    vector<BSONObj> indexSpecs;
+    std::vector<BSONObj> indexSpecs;
     {
         std::unique_ptr<IndexCatalog::IndexIterator> ii =
             _indexCatalog->getIndexIterator(opCtx, false);
@@ -815,7 +820,6 @@ Status CollectionImpl::truncate(OperationContext* opCtx) {
 void CollectionImpl::cappedTruncateAfter(OperationContext* opCtx, RecordId end, bool inclusive) {
     dassert(opCtx->lockState()->isCollectionLockedForMode(ns(), MODE_X));
     invariant(isCapped());
-    BackgroundOperation::assertNoBgOpInProgForNs(ns());
     invariant(_indexCatalog->numIndexesInProgress(opCtx) == 0);
 
     _recordStore->cappedTruncateAfter(opCtx, end, inclusive);
@@ -835,13 +839,12 @@ Status CollectionImpl::setValidator(OperationContext* opCtx, BSONObj validatorDo
     if (!statusWithMatcher.isOK())
         return statusWithMatcher.getStatus();
 
-    _details->updateValidator(opCtx, validatorDoc, getValidationLevel(), getValidationAction());
+    DurableCatalog::get(opCtx)->updateValidator(
+        opCtx, ns(), validatorDoc, getValidationLevel(), getValidationAction());
 
-    opCtx->recoveryUnit()->onRollback([
-        this,
-        oldValidator = std::move(_validator),
-        oldValidatorDoc = std::move(_validatorDoc)
-    ]() mutable {
+    opCtx->recoveryUnit()->onRollback([this,
+                                       oldValidator = std::move(_validator),
+                                       oldValidatorDoc = std::move(_validatorDoc)]() mutable {
         this->_validator = std::move(oldValidator);
         this->_validatorDoc = std::move(oldValidatorDoc);
     });
@@ -883,7 +886,8 @@ Status CollectionImpl::setValidationLevel(OperationContext* opCtx, StringData ne
     auto oldValidationLevel = _validationLevel;
     _validationLevel = levelSW.getValue();
 
-    _details->updateValidator(opCtx, _validatorDoc, getValidationLevel(), getValidationAction());
+    DurableCatalog::get(opCtx)->updateValidator(
+        opCtx, ns(), _validatorDoc, getValidationLevel(), getValidationAction());
     opCtx->recoveryUnit()->onRollback(
         [this, oldValidationLevel]() { this->_validationLevel = oldValidationLevel; });
 
@@ -901,7 +905,9 @@ Status CollectionImpl::setValidationAction(OperationContext* opCtx, StringData n
     auto oldValidationAction = _validationAction;
     _validationAction = actionSW.getValue();
 
-    _details->updateValidator(opCtx, _validatorDoc, getValidationLevel(), getValidationAction());
+
+    DurableCatalog::get(opCtx)->updateValidator(
+        opCtx, ns(), _validatorDoc, getValidationLevel(), getValidationAction());
     opCtx->recoveryUnit()->onRollback(
         [this, oldValidationAction]() { this->_validationAction = oldValidationAction; });
 
@@ -914,20 +920,18 @@ Status CollectionImpl::updateValidator(OperationContext* opCtx,
                                        StringData newAction) {
     invariant(opCtx->lockState()->isCollectionLockedForMode(ns(), MODE_X));
 
-    opCtx->recoveryUnit()->onRollback([
-        this,
-        oldValidator = std::move(_validator),
-        oldValidatorDoc = std::move(_validatorDoc),
-        oldValidationLevel = _validationLevel,
-        oldValidationAction = _validationAction
-    ]() mutable {
+    opCtx->recoveryUnit()->onRollback([this,
+                                       oldValidator = std::move(_validator),
+                                       oldValidatorDoc = std::move(_validatorDoc),
+                                       oldValidationLevel = _validationLevel,
+                                       oldValidationAction = _validationAction]() mutable {
         this->_validator = std::move(oldValidator);
         this->_validatorDoc = std::move(oldValidatorDoc);
         this->_validationLevel = oldValidationLevel;
         this->_validationAction = oldValidationAction;
     });
 
-    _details->updateValidator(opCtx, newValidator, newLevel, newAction);
+    DurableCatalog::get(opCtx)->updateValidator(opCtx, ns(), newValidator, newLevel, newAction);
     _validatorDoc = std::move(newValidator);
 
     auto validatorSW =
@@ -1003,367 +1007,6 @@ StatusWith<std::vector<BSONObj>> CollectionImpl::addCollationDefaultsToIndexSpec
     return newIndexSpecs;
 }
 
-namespace {
-
-using ValidateResultsMap = std::map<std::string, ValidateResults>;
-
-// General validation logic for any RecordStore. Performs sanity checks to confirm that each
-// record in the store is valid according to the given RecordStoreValidateAdaptor and updates
-// record store stats to match.
-void _genericRecordStoreValidate(OperationContext* opCtx,
-                                 RecordStore* recordStore,
-                                 RecordStoreValidateAdaptor* indexValidator,
-                                 ValidateResults* results,
-                                 BSONObjBuilder* output) {
-    long long nrecords = 0;
-    long long dataSizeTotal = 0;
-    long long nInvalid = 0;
-
-    results->valid = true;
-    std::unique_ptr<SeekableRecordCursor> cursor = recordStore->getCursor(opCtx, true);
-    int interruptInterval = 4096;
-    RecordId prevRecordId;
-
-    while (auto record = cursor->next()) {
-        if (!(nrecords % interruptInterval)) {
-            opCtx->checkForInterrupt();
-        }
-        ++nrecords;
-        auto dataSize = record->data.size();
-        dataSizeTotal += dataSize;
-        size_t validatedSize;
-        Status status = indexValidator->validate(record->id, record->data, &validatedSize);
-
-        // Check to ensure isInRecordIdOrder() is being used properly.
-        if (prevRecordId.isValid()) {
-            invariant(prevRecordId < record->id);
-        }
-
-        // ValidatedSize = dataSize is not a general requirement as some storage engines may use
-        // padding, but we still require that they return the unpadded record data.
-        if (!status.isOK() || validatedSize != static_cast<size_t>(dataSize)) {
-            if (results->valid) {
-                // Only log once.
-                results->errors.push_back("detected one or more invalid documents (see logs)");
-            }
-            nInvalid++;
-            results->valid = false;
-            log() << "document at location: " << record->id << " is corrupted";
-        }
-
-        prevRecordId = record->id;
-    }
-
-    if (results->valid) {
-        recordStore->updateStatsAfterRepair(opCtx, nrecords, dataSizeTotal);
-    }
-
-    output->append("nInvalidDocuments", nInvalid);
-    output->appendNumber("nrecords", nrecords);
-}
-
-void _validateRecordStore(OperationContext* opCtx,
-                          RecordStore* recordStore,
-                          ValidateCmdLevel level,
-                          bool background,
-                          RecordStoreValidateAdaptor* indexValidator,
-                          ValidateResults* results,
-                          BSONObjBuilder* output) {
-
-    // Validate RecordStore and, if `level == kValidateFull`, use the RecordStore's validate
-    // function.
-    if (background) {
-        indexValidator->traverseRecordStore(recordStore, level, results, output);
-    } else {
-        recordStore->validate(opCtx, level, results, output);
-        _genericRecordStoreValidate(opCtx, recordStore, indexValidator, results, output);
-    }
-}
-
-void _validateIndexes(OperationContext* opCtx,
-                      IndexCatalog* indexCatalog,
-                      BSONObjBuilder* keysPerIndex,
-                      RecordStoreValidateAdaptor* indexValidator,
-                      ValidateCmdLevel level,
-                      ValidateResultsMap* indexNsResultsMap,
-                      ValidateResults* results) {
-
-    std::unique_ptr<IndexCatalog::IndexIterator> it = indexCatalog->getIndexIterator(opCtx, false);
-
-    // Validate Indexes.
-    while (it->more()) {
-        opCtx->checkForInterrupt();
-        const IndexCatalogEntry* entry = it->next();
-        const IndexDescriptor* descriptor = entry->descriptor();
-        const IndexAccessMethod* iam = entry->accessMethod();
-
-        log(LogComponent::kIndex) << "validating index " << descriptor->indexNamespace() << endl;
-        ValidateResults& curIndexResults = (*indexNsResultsMap)[descriptor->indexNamespace()];
-        bool checkCounts = false;
-        int64_t numTraversedKeys;
-        int64_t numValidatedKeys;
-
-        if (level == kValidateFull) {
-            iam->validate(opCtx, &numValidatedKeys, &curIndexResults);
-            checkCounts = true;
-        }
-
-        if (curIndexResults.valid) {
-            indexValidator->traverseIndex(iam, descriptor, &curIndexResults, &numTraversedKeys);
-
-            if (checkCounts && (numValidatedKeys != numTraversedKeys)) {
-                curIndexResults.valid = false;
-                string msg = str::stream()
-                    << "number of traversed index entries (" << numTraversedKeys
-                    << ") does not match the number of expected index entries (" << numValidatedKeys
-                    << ")";
-                results->errors.push_back(msg);
-                results->valid = false;
-            }
-
-            if (curIndexResults.valid) {
-                keysPerIndex->appendNumber(descriptor->indexNamespace(),
-                                           static_cast<long long>(numTraversedKeys));
-            } else {
-                results->valid = false;
-            }
-        } else {
-            results->valid = false;
-        }
-    }
-}
-
-void _markIndexEntriesInvalid(ValidateResultsMap* indexNsResultsMap, ValidateResults* results) {
-
-    // The error message can't be more specific because even though the index is
-    // invalid, we won't know if the corruption occurred on the index entry or in
-    // the document.
-    for (auto& it : *indexNsResultsMap) {
-        // Marking all indexes as invalid since we don't know which one failed.
-        ValidateResults& r = it.second;
-        r.valid = false;
-    }
-    string msg = "one or more indexes contain invalid index entries.";
-    results->errors.push_back(msg);
-    results->valid = false;
-}
-
-void _validateIndexKeyCount(OperationContext* opCtx,
-                            IndexCatalog* indexCatalog,
-                            RecordStore* recordStore,
-                            RecordStoreValidateAdaptor* indexValidator,
-                            ValidateResultsMap* indexNsResultsMap) {
-
-    std::unique_ptr<IndexCatalog::IndexIterator> indexIterator =
-        indexCatalog->getIndexIterator(opCtx, false);
-    while (indexIterator->more()) {
-        const IndexDescriptor* descriptor = indexIterator->next()->descriptor();
-        ValidateResults& curIndexResults = (*indexNsResultsMap)[descriptor->indexNamespace()];
-
-        if (curIndexResults.valid) {
-            indexValidator->validateIndexKeyCount(
-                descriptor, recordStore->numRecords(opCtx), curIndexResults);
-        }
-    }
-}
-
-void _reportValidationResults(OperationContext* opCtx,
-                              IndexCatalog* indexCatalog,
-                              ValidateResultsMap* indexNsResultsMap,
-                              BSONObjBuilder* keysPerIndex,
-                              ValidateCmdLevel level,
-                              ValidateResults* results,
-                              BSONObjBuilder* output) {
-
-    std::unique_ptr<BSONObjBuilder> indexDetails;
-    if (level == kValidateFull) {
-        indexDetails = stdx::make_unique<BSONObjBuilder>();
-    }
-
-    // Report index validation results.
-    for (const auto& it : *indexNsResultsMap) {
-        const std::string indexNs = it.first;
-        const ValidateResults& vr = it.second;
-
-        if (!vr.valid) {
-            results->valid = false;
-        }
-
-        if (indexDetails.get()) {
-            BSONObjBuilder bob(indexDetails->subobjStart(indexNs));
-            bob.appendBool("valid", vr.valid);
-
-            if (!vr.warnings.empty()) {
-                bob.append("warnings", vr.warnings);
-            }
-
-            if (!vr.errors.empty()) {
-                bob.append("errors", vr.errors);
-            }
-        }
-
-        results->warnings.insert(results->warnings.end(), vr.warnings.begin(), vr.warnings.end());
-        results->errors.insert(results->errors.end(), vr.errors.begin(), vr.errors.end());
-    }
-
-    output->append("nIndexes", indexCatalog->numIndexesReady(opCtx));
-    output->append("keysPerIndex", keysPerIndex->done());
-    if (indexDetails.get()) {
-        output->append("indexDetails", indexDetails->done());
-    }
-}
-template <typename T>
-void addErrorIfUnequal(T stored, T cached, StringData name, ValidateResults* results) {
-    if (stored != cached) {
-        results->valid = false;
-        results->errors.push_back(str::stream() << "stored value for " << name
-                                                << " does not match cached value: "
-                                                << stored
-                                                << " != "
-                                                << cached);
-    }
-}
-
-void _validateCatalogEntry(OperationContext* opCtx,
-                           CollectionImpl* coll,
-                           BSONObj validatorDoc,
-                           ValidateResults* results) {
-    CollectionOptions options = coll->getCatalogEntry()->getCollectionOptions(opCtx);
-    addErrorIfUnequal(options.uuid, coll->uuid(), "UUID", results);
-    const CollatorInterface* collation = coll->getDefaultCollator();
-    addErrorIfUnequal(options.collation.isEmpty(), !collation, "simple collation", results);
-    if (!options.collation.isEmpty() && collation)
-        addErrorIfUnequal(options.collation.toString(),
-                          collation->getSpec().toBSON().toString(),
-                          "collation",
-                          results);
-    addErrorIfUnequal(options.capped, coll->isCapped(), "is capped", results);
-
-    addErrorIfUnequal(options.validator.toString(), validatorDoc.toString(), "validator", results);
-    if (!options.validator.isEmpty() && !validatorDoc.isEmpty()) {
-        addErrorIfUnequal(options.validationAction.length() ? options.validationAction : "error",
-                          coll->getValidationAction().toString(),
-                          "validation action",
-                          results);
-        addErrorIfUnequal(options.validationLevel.length() ? options.validationLevel : "strict",
-                          coll->getValidationLevel().toString(),
-                          "validation level",
-                          results);
-    }
-
-    addErrorIfUnequal(options.isView(), false, "is a view", results);
-    auto status = options.validateForStorage();
-    if (!status.isOK()) {
-        results->valid = false;
-        results->errors.push_back(str::stream() << "collection options are not valid for storage: "
-                                                << options.toBSON());
-    }
-}
-
-}  // namespace
-
-Status CollectionImpl::validate(OperationContext* opCtx,
-                                ValidateCmdLevel level,
-                                bool background,
-                                std::unique_ptr<Lock::CollectionLock> collLk,
-                                ValidateResults* results,
-                                BSONObjBuilder* output) {
-    dassert(opCtx->lockState()->isCollectionLockedForMode(ns(), MODE_IS));
-
-    try {
-        ValidateResultsMap indexNsResultsMap;
-        BSONObjBuilder keysPerIndex;  // not using subObjStart to be exception safe
-        IndexConsistency indexConsistency(
-            opCtx, this, ns(), _recordStore, std::move(collLk), background);
-        RecordStoreValidateAdaptor indexValidator = RecordStoreValidateAdaptor(
-            opCtx, &indexConsistency, level, _indexCatalog.get(), &indexNsResultsMap);
-
-        // Validate the record store
-        std::string uuidString = str::stream()
-            << " (UUID: " << (uuid() ? uuid()->toString() : "none") << ")";
-        log(LogComponent::kIndex) << "validating collection " << ns().toString() << uuidString
-                                  << endl;
-        _validateRecordStore(
-            opCtx, _recordStore, level, background, &indexValidator, results, output);
-
-        // Validate in-memory catalog information with the persisted info.
-        _validateCatalogEntry(opCtx, this, _validatorDoc, results);
-
-        // Validate indexes and check for mismatches.
-        if (results->valid) {
-            _validateIndexes(opCtx,
-                             _indexCatalog.get(),
-                             &keysPerIndex,
-                             &indexValidator,
-                             level,
-                             &indexNsResultsMap,
-                             results);
-
-            if (indexConsistency.haveEntryMismatch()) {
-                _markIndexEntriesInvalid(&indexNsResultsMap, results);
-            }
-        }
-
-        // Validate index key count.
-        if (results->valid) {
-            _validateIndexKeyCount(
-                opCtx, _indexCatalog.get(), _recordStore, &indexValidator, &indexNsResultsMap);
-        }
-
-        // Report the validation results for the user to see
-        _reportValidationResults(
-            opCtx, _indexCatalog.get(), &indexNsResultsMap, &keysPerIndex, level, results, output);
-
-        if (!results->valid) {
-            log(LogComponent::kIndex) << "validating collection " << ns() << " failed"
-                                      << uuidString;
-        } else {
-            log(LogComponent::kIndex) << "validated collection " << ns() << uuidString;
-        }
-    } catch (DBException& e) {
-        if (ErrorCodes::isInterruption(e.code())) {
-            return e.toStatus();
-        }
-        string err = str::stream() << "exception during index validation: " << e.toString();
-        results->errors.push_back(err);
-        results->valid = false;
-    }
-
-    return Status::OK();
-}
-
-Status CollectionImpl::touch(OperationContext* opCtx,
-                             bool touchData,
-                             bool touchIndexes,
-                             BSONObjBuilder* output) const {
-    if (touchData) {
-        BSONObjBuilder b;
-        Status status = _recordStore->touch(opCtx, &b);
-        if (!status.isOK())
-            return status;
-        output->append("data", b.obj());
-    }
-
-    if (touchIndexes) {
-        Timer t;
-        std::unique_ptr<IndexCatalog::IndexIterator> ii =
-            _indexCatalog->getIndexIterator(opCtx, false);
-        while (ii->more()) {
-            const IndexCatalogEntry* entry = ii->next();
-            const IndexAccessMethod* iam = entry->accessMethod();
-            Status status = iam->touch(opCtx);
-            if (!status.isOK())
-                return status;
-        }
-
-        output->append(
-            "indexes",
-            BSON("num" << _indexCatalog->numIndexesTotal(opCtx) << "millis" << t.millis()));
-    }
-
-    return Status::OK();
-}
-
 std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> CollectionImpl::makePlanExecutor(
     OperationContext* opCtx, PlanExecutor::YieldPolicy yieldPolicy, ScanDirection scanDirection) {
     auto isForward = scanDirection == ScanDirection::kForward;
@@ -1373,13 +1016,11 @@ std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> CollectionImpl::makePlanExe
 
 void CollectionImpl::setNs(NamespaceString nss) {
     _ns = std::move(nss);
-    _indexCatalog->setNs(_ns);
-    _infoCache->setNs(_ns);
-    _recordStore->setNs(_ns);
+    _recordStore.get()->setNs(_ns);
 }
 
 void CollectionImpl::indexBuildSuccess(OperationContext* opCtx, IndexCatalogEntry* index) {
-    _details->indexBuildSuccess(opCtx, index->descriptor()->indexName());
+    DurableCatalog::get(opCtx)->indexBuildSuccess(opCtx, ns(), index->descriptor()->indexName());
     _indexCatalog->indexBuildSuccess(opCtx, index);
 }
 

@@ -33,6 +33,7 @@
 #include "mongo/db/operation_context_noop.h"
 #include "mongo/db/service_context_test_fixture.h"
 #include "mongo/s/session_catalog_router.h"
+#include "mongo/s/transaction_router.h"
 #include "mongo/s/write_ops/batched_command_request.h"
 #include "mongo/s/write_ops/mock_ns_targeter.h"
 #include "mongo/s/write_ops/write_error_detail.h"
@@ -75,7 +76,7 @@ TEST(WriteOpTests, BasicError) {
         return insertOp;
     }());
 
-    WriteOp writeOp(BatchItemRef(&request, 0));
+    WriteOp writeOp(BatchItemRef(&request, 0), false);
     ASSERT_EQUALS(writeOp.getWriteState(), WriteOpState_Ready);
 
     const auto error(buildError(ErrorCodes::UnknownError, BSON("data" << 12345), "some message"));
@@ -102,7 +103,7 @@ TEST(WriteOpTests, TargetSingle) {
 
     // Do single-target write op
 
-    WriteOp writeOp(BatchItemRef(&request, 0));
+    WriteOp writeOp(BatchItemRef(&request, 0), false);
     ASSERT_EQUALS(writeOp.getWriteState(), WriteOpState_Ready);
 
     MockNSTargeter targeter;
@@ -137,7 +138,7 @@ TEST(WriteOpTests, TargetMultiOneShard) {
         return deleteOp;
     }());
 
-    WriteOp writeOp(BatchItemRef(&request, 0));
+    WriteOp writeOp(BatchItemRef(&request, 0), false);
     ASSERT_EQUALS(writeOp.getWriteState(), WriteOpState_Ready);
 
     MockNSTargeter targeter;
@@ -176,7 +177,7 @@ TEST(WriteOpTests, TargetMultiAllShards) {
     }());
 
     // Do multi-target write op
-    WriteOp writeOp(BatchItemRef(&request, 0));
+    WriteOp writeOp(BatchItemRef(&request, 0), false);
     ASSERT_EQUALS(writeOp.getWriteState(), WriteOpState_Ready);
 
     MockNSTargeter targeter;
@@ -205,6 +206,56 @@ TEST(WriteOpTests, TargetMultiAllShards) {
     writeOp.noteWriteComplete(*targeted[2]);
 
     ASSERT_EQUALS(writeOp.getWriteState(), WriteOpState_Completed);
+}
+
+TEST(WriteOpTests, TargetMultiAllShardsAndErrorSingleChildOp) {
+    OperationContextNoop opCtx;
+
+    NamespaceString nss("foo.bar");
+    ShardEndpoint endpointA(ShardId("shardA"), ChunkVersion(10, 0, OID()));
+    ShardEndpoint endpointB(ShardId("shardB"), ChunkVersion(20, 0, OID()));
+
+    BatchedCommandRequest request([&] {
+        write_ops::Delete deleteOp(nss);
+        deleteOp.setDeletes({buildDelete(BSON("x" << GTE << -1 << LT << 1), false)});
+        return deleteOp;
+    }());
+
+    // Do multi-target write op
+    WriteOp writeOp(BatchItemRef(&request, 0), false);
+    ASSERT_EQUALS(writeOp.getWriteState(), WriteOpState_Ready);
+
+    MockNSTargeter targeter;
+    targeter.init(nss,
+                  {MockRange(endpointA, BSON("x" << MINKEY), BSON("x" << 0)),
+                   MockRange(endpointB, BSON("x" << 0), BSON("x" << MAXKEY))});
+
+    OwnedPointerVector<TargetedWrite> targetedOwned;
+    std::vector<TargetedWrite*>& targeted = targetedOwned.mutableVector();
+    Status status = writeOp.targetWrites(&opCtx, targeter, &targeted);
+
+    ASSERT(status.isOK());
+    ASSERT_EQUALS(writeOp.getWriteState(), WriteOpState_Pending);
+    ASSERT_EQUALS(targeted.size(), 2u);
+    sortByEndpoint(&targeted);
+    ASSERT_EQUALS(targeted[0]->endpoint.shardName, endpointA.shardName);
+    ASSERT(ChunkVersion::isIgnoredVersion(targeted[0]->endpoint.shardVersion));
+    ASSERT_EQUALS(targeted[1]->endpoint.shardName, endpointB.shardName);
+    ASSERT(ChunkVersion::isIgnoredVersion(targeted[1]->endpoint.shardVersion));
+
+    // Simulate retryable error.
+    WriteErrorDetail retryableError;
+    retryableError.setIndex(0);
+    retryableError.setStatus({ErrorCodes::StaleShardVersion, "simulate ssv error for test"});
+    writeOp.noteWriteError(*targeted[0], retryableError);
+
+    // State should not change until we have result from all nodes.
+    ASSERT_EQUALS(writeOp.getWriteState(), WriteOpState_Pending);
+
+    writeOp.noteWriteComplete(*targeted[1]);
+
+    // State resets back to ready because of retryable error.
+    ASSERT_EQUALS(writeOp.getWriteState(), WriteOpState_Ready);
 }
 
 class WriteOpTransactionTests : public ServiceContextTest {
@@ -243,7 +294,7 @@ TEST_F(WriteOpTransactionTests, TargetMultiDoesNotTargetAllShards) {
     }());
 
     // Target the multi-write.
-    WriteOp writeOp(BatchItemRef(&request, 0));
+    WriteOp writeOp(BatchItemRef(&request, 0), false);
     ASSERT_EQUALS(writeOp.getWriteState(), WriteOpState_Ready);
 
     MockNSTargeter targeter;
@@ -265,9 +316,58 @@ TEST_F(WriteOpTransactionTests, TargetMultiDoesNotTargetAllShards) {
     assertEndpointsEqual(targeted.back()->endpoint, endpointB);
 
     writeOp.noteWriteComplete(*targeted[0]);
-    writeOp.noteWriteComplete(*targeted[1]);
+    ASSERT_EQUALS(writeOp.getWriteState(), WriteOpState_Pending);
 
+    writeOp.noteWriteComplete(*targeted[1]);
     ASSERT_EQUALS(writeOp.getWriteState(), WriteOpState_Completed);
+}
+
+TEST_F(WriteOpTransactionTests, TargetMultiAllShardsAndErrorSingleChildOp) {
+    NamespaceString nss("foo.bar");
+    ShardEndpoint endpointA(ShardId("shardA"), ChunkVersion(10, 0, OID()));
+    ShardEndpoint endpointB(ShardId("shardB"), ChunkVersion(20, 0, OID()));
+
+    BatchedCommandRequest request([&] {
+        write_ops::Delete deleteOp(nss);
+        deleteOp.setDeletes({buildDelete(BSON("x" << GTE << -1 << LT << 1), false)});
+        return deleteOp;
+    }());
+
+    const TxnNumber kTxnNumber = 1;
+    opCtx()->setTxnNumber(kTxnNumber);
+
+    auto txnRouter = TransactionRouter::get(opCtx());
+    txnRouter.beginOrContinueTxn(
+        opCtx(), kTxnNumber, TransactionRouter::TransactionActions::kStart);
+
+    // Do multi-target write op
+    WriteOp writeOp(BatchItemRef(&request, 0), true);
+    ASSERT_EQUALS(writeOp.getWriteState(), WriteOpState_Ready);
+
+    MockNSTargeter targeter;
+    targeter.init(nss,
+                  {MockRange(endpointA, BSON("x" << MINKEY), BSON("x" << 0)),
+                   MockRange(endpointB, BSON("x" << 0), BSON("x" << MAXKEY))});
+
+    OwnedPointerVector<TargetedWrite> targetedOwned;
+    std::vector<TargetedWrite*>& targeted = targetedOwned.mutableVector();
+    Status status = writeOp.targetWrites(opCtx(), targeter, &targeted);
+
+    ASSERT(status.isOK());
+    ASSERT_EQUALS(writeOp.getWriteState(), WriteOpState_Pending);
+    ASSERT_EQUALS(targeted.size(), 2u);
+    sortByEndpoint(&targeted);
+    ASSERT_EQUALS(targeted[0]->endpoint.shardName, endpointA.shardName);
+    ASSERT_EQUALS(targeted[1]->endpoint.shardName, endpointB.shardName);
+
+    // Simulate retryable error.
+    WriteErrorDetail retryableError;
+    retryableError.setIndex(0);
+    retryableError.setStatus({ErrorCodes::StaleShardVersion, "simulate ssv error for test"});
+    writeOp.noteWriteError(*targeted[0], retryableError);
+
+    // State should change to error right away even with retryable error when in a transaction.
+    ASSERT_EQUALS(writeOp.getWriteState(), WriteOpState_Error);
 }
 
 // Single error after targeting test
@@ -285,7 +385,7 @@ TEST(WriteOpTests, ErrorSingle) {
 
     // Do single-target write op
 
-    WriteOp writeOp(BatchItemRef(&request, 0));
+    WriteOp writeOp(BatchItemRef(&request, 0), false);
     ASSERT_EQUALS(writeOp.getWriteState(), WriteOpState_Ready);
 
     MockNSTargeter targeter;
@@ -326,7 +426,7 @@ TEST(WriteOpTests, CancelSingle) {
 
     // Do single-target write op
 
-    WriteOp writeOp(BatchItemRef(&request, 0));
+    WriteOp writeOp(BatchItemRef(&request, 0), false);
     ASSERT_EQUALS(writeOp.getWriteState(), WriteOpState_Ready);
 
     MockNSTargeter targeter;
@@ -341,7 +441,7 @@ TEST(WriteOpTests, CancelSingle) {
     ASSERT_EQUALS(targeted.size(), 1u);
     assertEndpointsEqual(targeted.front()->endpoint, endpoint);
 
-    writeOp.cancelWrites(NULL);
+    writeOp.cancelWrites(nullptr);
 
     ASSERT_EQUALS(writeOp.getWriteState(), WriteOpState_Ready);
 }
@@ -365,7 +465,7 @@ TEST(WriteOpTests, RetrySingleOp) {
 
     // Do single-target write op
 
-    WriteOp writeOp(BatchItemRef(&request, 0));
+    WriteOp writeOp(BatchItemRef(&request, 0), false);
     ASSERT_EQUALS(writeOp.getWriteState(), WriteOpState_Ready);
 
     MockNSTargeter targeter;

@@ -29,6 +29,9 @@
 
 #include "mongo/platform/basic.h"
 
+#include <boost/date_time/gregorian/gregorian_types.hpp>
+#include <boost/date_time/posix_time/posix_time.hpp>
+#include <boost/date_time/posix_time/posix_time_types.hpp>
 #include <boost/optional.hpp>
 #include <vector>
 
@@ -51,6 +54,12 @@ namespace {
 using executor::RemoteCommandRequest;
 using std::vector;
 using unittest::assertGet;
+
+boost::gregorian::date currentDate() {
+    boost::posix_time::ptime now = boost::posix_time::second_clock::local_time();
+    return now.date();
+}
+
 
 BSONObj getReplSecondaryOkMetadata() {
     BSONObjBuilder o;
@@ -104,7 +113,7 @@ TEST_F(BalancerConfigurationTestFixture, NoConfigurationDocuments) {
     expectSettingsQuery(ChunkSizeSettingsType::kKey, boost::optional<BSONObj>());
     expectSettingsQuery(AutoSplitSettingsType::kKey, boost::optional<BSONObj>());
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 
     ASSERT(config.shouldBalance());
     ASSERT(config.shouldBalanceForAutoSplit());
@@ -125,7 +134,7 @@ TEST_F(BalancerConfigurationTestFixture, ChunkSizeSettingsDocumentOnly) {
     expectSettingsQuery(ChunkSizeSettingsType::kKey, boost::optional<BSONObj>(BSON("value" << 3)));
     expectSettingsQuery(AutoSplitSettingsType::kKey, boost::optional<BSONObj>());
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 
     ASSERT(config.shouldBalance());
     ASSERT(config.shouldBalanceForAutoSplit());
@@ -147,7 +156,7 @@ TEST_F(BalancerConfigurationTestFixture, BalancerSettingsDocumentOnly) {
     expectSettingsQuery(ChunkSizeSettingsType::kKey, boost::optional<BSONObj>());
     expectSettingsQuery(AutoSplitSettingsType::kKey, boost::optional<BSONObj>());
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 
     ASSERT(!config.shouldBalance());
     ASSERT(!config.shouldBalanceForAutoSplit());
@@ -169,7 +178,7 @@ TEST_F(BalancerConfigurationTestFixture, AutoSplitSettingsDocumentOnly) {
     expectSettingsQuery(AutoSplitSettingsType::kKey,
                         boost::optional<BSONObj>(BSON("enabled" << false)));
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 
     ASSERT(config.shouldBalance());
     ASSERT(config.shouldBalanceForAutoSplit());
@@ -193,7 +202,7 @@ TEST_F(BalancerConfigurationTestFixture, BalancerSettingsDocumentBalanceForAutoS
     expectSettingsQuery(AutoSplitSettingsType::kKey,
                         boost::optional<BSONObj>(BSON("enabled" << true)));
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 
     ASSERT(!config.shouldBalance());
     ASSERT(config.shouldBalanceForAutoSplit());
@@ -301,8 +310,7 @@ TEST(BalancerSettingsType, InvalidBalancingWindowTimeFormat) {
 
     ASSERT_NOT_OK(BalancerSettingsType::fromBSON(BSON("activeWindow" << BSON("start"
                                                                              << "23:00"
-                                                                             << "stop"
-                                                                             << 6LL)))
+                                                                             << "stop" << 6LL)))
                       .getStatus());
 }
 

@@ -33,14 +33,13 @@
 #include <queue>
 #include <vector>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/base/status_with.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/db/cursor_id.h"
 #include "mongo/executor/task_executor.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/s/query/async_results_merger_params_gen.h"
 #include "mongo/s/query/cluster_query_result.h"
-#include "mongo/stdx/mutex.h"
 #include "mongo/util/concurrency/with_lock.h"
 #include "mongo/util/net/hostandport.h"
 #include "mongo/util/time_support.h"
@@ -73,7 +72,8 @@ class CursorResponse;
  * Does not throw exceptions.
  */
 class AsyncResultsMerger {
-    MONGO_DISALLOW_COPYING(AsyncResultsMerger);
+    AsyncResultsMerger(const AsyncResultsMerger&) = delete;
+    AsyncResultsMerger& operator=(const AsyncResultsMerger&) = delete;
 
 public:
     // When mongos has to do a merge in order to return results to the client in the correct sort
@@ -98,7 +98,7 @@ public:
      * with a new, valid OperationContext before the next use.
      */
     AsyncResultsMerger(OperationContext* opCtx,
-                       executor::TaskExecutor* executor,
+                       std::shared_ptr<executor::TaskExecutor> executor,
                        AsyncResultsMergerParams params);
 
     /**
@@ -446,12 +446,12 @@ private:
     void _updateRemoteMetadata(WithLock, size_t remoteIndex, const CursorResponse& response);
 
     OperationContext* _opCtx;
-    executor::TaskExecutor* _executor;
+    std::shared_ptr<executor::TaskExecutor> _executor;
     TailableModeEnum _tailableMode;
     AsyncResultsMergerParams _params;
 
     // Must be acquired before accessing any data members (other than _params, which is read-only).
-    mutable stdx::mutex _mutex;
+    mutable Mutex _mutex = MONGO_MAKE_LATCH("AsyncResultsMerger::_mutex");
 
     // Data tracking the state of our communication with each of the remote nodes.
     std::vector<RemoteCursorData> _remotes;

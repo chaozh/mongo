@@ -144,7 +144,7 @@ void SpecializedWithValueServerParameter::append(OperationContext*,
 }
 
 Status SpecializedWithValueServerParameter::setFromString(const std::string& value) {
-    return parseNumberFromString(value, &_data);
+    return NumberParser{}(value, &_data);
 }
 
 TEST(SpecializedServerParameter, withValue) {
@@ -195,7 +195,7 @@ void SpecializedWithAtomicValueServerParameter::append(OperationContext*,
 Status SpecializedWithAtomicValueServerParameter::setFromString(const std::string& value) {
     std::uint32_t val;
 
-    auto status = parseNumberFromString(value, &val);
+    auto status = NumberParser{}(value, &val);
     if (!status.isOK()) {
         return status;
     }
@@ -211,6 +211,8 @@ TEST(SpecializedServerParameter, withAtomicValue) {
     auto* wv = getServerParameter<cls>("specializedWithAtomicValue");
     ASSERT_EQ(wv->_data.load(), cls::kDataDefault);
     ASSERT_APPENDED_INT(wv, cls::kDataDefault);
+    ASSERT_OK(wv->set(BSON("" << 99).firstElement()));
+    ASSERT_APPENDED_INT(wv, 99);
     ASSERT_OK(wv->setFromString("101"));
     ASSERT_APPENDED_INT(wv, 101);
     ASSERT_EQ(wv->_data.load(), 101);
@@ -242,24 +244,20 @@ TEST(SpecializedServerParameter, multiValue) {
     ASSERT_APPENDED_OBJECT(edsp,
                            BSON("value"
                                 << "start value"
-                                << "flag"
-                                << true));
+                                << "flag" << true));
     ASSERT_OK(edsp->setFromString("second value"));
     ASSERT_APPENDED_OBJECT(edsp,
                            BSON("value"
                                 << "second value"
-                                << "flag"
-                                << false));
+                                << "flag" << false));
     ASSERT_OK(edsp->set(BSON("" << BSON("value"
                                         << "third value"
-                                        << "flag"
-                                        << true))
+                                        << "flag" << true))
                             .firstElement()));
     ASSERT_APPENDED_OBJECT(edsp,
                            BSON("value"
                                 << "third value"
-                                << "flag"
-                                << true));
+                                << "flag" << true));
 }
 
 // specializedWithCtorAndValue
@@ -275,7 +273,7 @@ void SpecializedWithCtorAndValueServerParameter::append(OperationContext*,
 }
 
 Status SpecializedWithCtorAndValueServerParameter::setFromString(const std::string& value) {
-    return parseNumberFromString(value, &_data);
+    return NumberParser{}(value, &_data);
 }
 
 TEST(SpecializedServerParameter, withCtorAndValue) {

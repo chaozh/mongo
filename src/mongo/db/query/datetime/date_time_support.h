@@ -32,7 +32,6 @@
 #include <memory>
 #include <string>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/db/service_context.h"
 #include "mongo/util/string_map.h"
 #include "mongo/util/time_support.h"
@@ -296,8 +295,7 @@ private:
 
         uassert(18537,
                 str::stream() << "Could not convert date to string: date component was outside "
-                              << "the supported range of 0-9999: "
-                              << number,
+                              << "the supported range of 0-9999: " << number,
                 (number >= 0) && (number <= 9999));
 
         int digits = 1;
@@ -332,7 +330,8 @@ private:
  * accessed via the global service context.
  */
 class TimeZoneDatabase {
-    MONGO_DISALLOW_COPYING(TimeZoneDatabase);
+    TimeZoneDatabase(const TimeZoneDatabase&) = delete;
+    TimeZoneDatabase& operator=(const TimeZoneDatabase&) = delete;
 
 public:
     /**
@@ -409,6 +408,8 @@ public:
      * Creates a TimeZoneDatabase object using time zone rules given by 'timeZoneDatabase'.
      */
     TimeZoneDatabase(std::unique_ptr<_timelib_tzdb, TimeZoneDBDeleter> timeZoneDatabase);
+
+    std::vector<std::string> getTimeZoneStrings() const;
 
 private:
     /**

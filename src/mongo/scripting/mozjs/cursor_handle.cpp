@@ -34,6 +34,7 @@
 #include "mongo/client/dbclient_base.h"
 #include "mongo/scripting/mozjs/cursor_handle.h"
 #include "mongo/scripting/mozjs/implscope.h"
+#include "mongo/scripting/mozjs/scripting_util_gen.h"
 #include "mongo/scripting/mozjs/wrapconstrainedmethod.h"
 #include "mongo/util/log.h"
 
@@ -41,7 +42,8 @@ namespace mongo {
 namespace mozjs {
 
 const JSFunctionSpec CursorHandleInfo::methods[2] = {
-    MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(zeroCursorId, CursorHandleInfo), JS_FS_END,
+    MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(zeroCursorId, CursorHandleInfo),
+    JS_FS_END,
 };
 
 const char* const CursorHandleInfo::className = "CursorHandle";
@@ -68,7 +70,7 @@ void CursorHandleInfo::finalize(js::FreeOp* fop, JSObject* obj) {
     auto cursorTracker = static_cast<CursorHandleInfo::CursorTracker*>(JS_GetPrivate(obj));
     if (cursorTracker) {
         const long long cursorId = cursorTracker->cursorId;
-        if (cursorId) {
+        if (!skipShellCursorFinalize && cursorId) {
             try {
                 cursorTracker->client->killCursor(cursorTracker->ns, cursorId);
             } catch (...) {

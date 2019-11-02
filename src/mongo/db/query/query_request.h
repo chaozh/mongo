@@ -36,6 +36,7 @@
 #include "mongo/db/jsobj.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/pipeline/runtime_constants_gen.h"
 #include "mongo/db/query/tailable_mode.h"
 
 namespace mongo {
@@ -77,8 +78,8 @@ public:
 
     /**
      * If _uuid exists for this QueryRequest, use it to update the value of _nss via the
-     * UUIDCatalog associated with opCtx. This should only be called when we hold a DBLock
-     * on the database to which _uuid belongs, if the _uuid is present in the UUIDCatalog.
+     * CollectionCatalog associated with opCtx. This should only be called when we hold a DBLock
+     * on the database to which _uuid belongs, if the _uuid is present in the CollectionCatalog.
      */
     void refreshNSS(OperationContext* opCtx);
 
@@ -134,10 +135,12 @@ public:
     // Names of the $meta projection values.
     static const std::string metaGeoNearDistance;
     static const std::string metaGeoNearPoint;
-    static const std::string metaIndexKey;
     static const std::string metaRecordId;
     static const std::string metaSortKey;
     static const std::string metaTextScore;
+
+    // Allow using disk during the find command.
+    static const std::string kAllowDiskUseField;
 
     const NamespaceString& nss() const {
         invariant(!_nss.isEmpty());
@@ -240,20 +243,20 @@ public:
         _wantMore = wantMore;
     }
 
+    bool allowDiskUse() const {
+        return _allowDiskUse;
+    }
+
+    void setAllowDiskUse(bool allowDiskUse) {
+        _allowDiskUse = allowDiskUse;
+    }
+
     bool isExplain() const {
         return _explain;
     }
 
     void setExplain(bool explain) {
         _explain = explain;
-    }
-
-    const std::string& getComment() const {
-        return _comment;
-    }
-
-    void setComment(const std::string& comment) {
-        _comment = comment;
     }
 
     const BSONObj& getUnwrappedReadPref() const {
@@ -327,6 +330,14 @@ public:
 
     TailableModeEnum getTailableMode() const {
         return _tailableMode;
+    }
+
+    void setRuntimeConstants(RuntimeConstants runtimeConstants) {
+        _runtimeConstants = std::move(runtimeConstants);
+    }
+
+    const boost::optional<RuntimeConstants>& getRuntimeConstants() const {
+        return _runtimeConstants;
     }
 
     bool isSlaveOk() const {
@@ -435,11 +446,6 @@ private:
     Status initFullQuery(const BSONObj& top);
 
     /**
-     * Updates the projection object with a $meta projection for the returnKey option.
-     */
-    void addReturnKeyMetaProj();
-
-    /**
      * Updates the projection object with a $meta projection for the showRecordId option.
      */
     void addShowRecordIdMetaProj();
@@ -495,14 +501,14 @@ private:
     // allowed.
     boost::optional<long long> _batchSize;
 
+    bool _allowDiskUse = false;
+
     // Set only when parsed from an OP_QUERY find message. The value is computed by driver or shell
     // and is set to be a min of batchSize and limit provided by user. QR can have set either
     // ntoreturn or batchSize / limit.
     boost::optional<long long> _ntoreturn;
 
     bool _explain = false;
-
-    std::string _comment;
 
     // A user-specified maxTimeMS limit, or a value of '0' if not specified.
     int _maxTimeMS = 0;
@@ -513,6 +519,9 @@ private:
     bool _returnKey = false;
     bool _showRecordId = false;
     bool _hasReadPref = false;
+
+    // Runtime constants which may be referenced by $expr, if present.
+    boost::optional<RuntimeConstants> _runtimeConstants;
 
     // Options that can be specified in the OP_QUERY 'flags' header.
     TailableModeEnum _tailableMode = TailableModeEnum::kNormal;

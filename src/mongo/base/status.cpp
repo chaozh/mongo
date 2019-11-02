@@ -32,7 +32,7 @@
 #include "mongo/base/status.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 #include <ostream>
 #include <sstream>
@@ -97,7 +97,7 @@ Status::Status(ErrorCodes::Error code, StringData reason, const BSONObj& extraIn
     }
 }
 
-Status::Status(ErrorCodes::Error code, const mongoutils::str::stream& reason)
+Status::Status(ErrorCodes::Error code, const str::stream& reason)
     : Status(code, std::string(reason)) {}
 
 Status Status::withReason(StringData newReason) const {
@@ -141,6 +141,17 @@ std::string Status::toString() const {
     StringBuilder sb;
     sb << *this;
     return sb.str();
+}
+
+void Status::serializeErrorToBSON(BSONObjBuilder* builder) const {
+    invariant(!isOK());
+
+    builder->append("code", code());
+    builder->append("codeName", ErrorCodes::errorString(code()));
+    builder->append("errmsg", reason());
+
+    if (auto ei = extraInfo())
+        ei->serialize(builder);
 }
 
 }  // namespace mongo

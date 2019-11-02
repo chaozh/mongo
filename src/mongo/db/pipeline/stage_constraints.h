@@ -101,6 +101,11 @@ struct StageConstraints {
      */
     enum class TransactionRequirement { kNotAllowed, kAllowed };
 
+    /**
+     * Indicates whether or not this stage may be run as part of a $lookup pipeline.
+     */
+    enum class LookupRequirement { kNotAllowed, kAllowed };
+
     using DiskUseAndTransactionRequirement = std::pair<DiskUseRequirement, TransactionRequirement>;
 
     /**
@@ -145,6 +150,7 @@ struct StageConstraints {
         DiskUseRequirement diskRequirement,
         FacetRequirement facetRequirement,
         TransactionRequirement transactionRequirement,
+        LookupRequirement lookupRequirement,
         ChangeStreamRequirement changeStreamRequirement = ChangeStreamRequirement::kBlacklist)
         : requiredPosition(requiredPosition),
           hostRequirement(hostRequirement),
@@ -152,12 +158,19 @@ struct StageConstraints {
           changeStreamRequirement(changeStreamRequirement),
           facetRequirement(facetRequirement),
           transactionRequirement(transactionRequirement),
+          lookupRequirement(lookupRequirement),
           streamType(streamType) {
         // Stages which are allowed to run in $facet must not have any position requirements.
         invariant(!(isAllowedInsideFacetStage() && requiredPosition != PositionRequirement::kNone));
 
-        // No change stream stages are permitted to run in a $facet pipeline.
+        // No change stream stages are permitted to run in a $facet or $lookup pipelines.
         invariant(!(isChangeStreamStage() && isAllowedInsideFacetStage()));
+        invariant(!(isChangeStreamStage() && isAllowedInLookupPipeline()));
+
+        // Stages which write persistent data cannot be used in a $lookup pipeline.
+        invariant(!(isAllowedInLookupPipeline() && writesPersistentData()));
+        invariant(
+            !(isAllowedInLookupPipeline() && hostRequirement == HostTypeRequirement::kMongoS));
 
         // Only streaming stages are permitted in $changeStream pipelines.
         invariant(!(isAllowedInChangeStream() && streamType == StreamType::kBlocking));
@@ -180,8 +193,8 @@ struct StageConstraints {
 
         // Stages which write data to user collections should not be permitted with readConcern
         // level "snapshot" or inside of a multi-document transaction.
-        // TODO (SERVER-36259): relax this requirement when $out (which writes persistent data)
-        // is allowed in a transaction.
+        // TODO (SERVER-36259): relax this requirement when $out and/or $merge (which write
+        // persistent data) is allowed in a transaction.
         if (diskRequirement == DiskUseRequirement::kWritesPersistentData) {
             invariant(!isAllowedInTransaction());
         }
@@ -237,6 +250,13 @@ struct StageConstraints {
     }
 
     /**
+     * Returns true if this stage may be used inside a $lookup subpipeline.
+     */
+    bool isAllowedInLookupPipeline() const {
+        return lookupRequirement == LookupRequirement::kAllowed;
+    }
+
+    /**
      * Returns true if this stage writes persistent data to disk.
      */
     bool writesPersistentData() const {
@@ -265,6 +285,9 @@ struct StageConstraints {
     // aggregate is running inside of a multi-document transaction.
     const TransactionRequirement transactionRequirement;
 
+    // Indicates whether this stage is allowed in a $lookup subpipeline.
+    const LookupRequirement lookupRequirement;
+
     // Indicates whether this is a streaming or blocking stage.
     const StreamType streamType;
 
@@ -289,5 +312,8 @@ struct StageConstraints {
     // order of documents can be swapped with a $sample because our implementation of sample will do
     // a random sort which shuffles the order.
     bool canSwapWithLimitAndSample = false;
+
+    // Indicates that a stage is allowed within a pipeline-stlye update.
+    bool isAllowedWithinUpdatePipeline = false;
 };
 }  // namespace mongo

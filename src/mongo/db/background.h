@@ -39,11 +39,12 @@
 #include <set>
 #include <vector>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/base/string_data.h"
 #include "mongo/db/namespace_string.h"
 
 namespace mongo {
+
+class OperationContext;
 
 /* these are administrative operations / jobs
    for a namespace running in the background, and that if in progress,
@@ -55,12 +56,14 @@ namespace mongo {
    anything special in the implementation here to be fast.
 */
 class BackgroundOperation {
-    MONGO_DISALLOW_COPYING(BackgroundOperation);
+    BackgroundOperation(const BackgroundOperation&) = delete;
+    BackgroundOperation& operator=(const BackgroundOperation&) = delete;
 
 public:
     static bool inProgForDb(StringData db);
     static int numInProgForDb(StringData db);
     static bool inProgForNs(StringData ns);
+    static void assertNoBgOpInProg();
     static void assertNoBgOpInProgForDb(StringData db);
     static void assertNoBgOpInProgForNs(StringData ns);
     static void awaitNoBgOpInProgForDb(StringData db);
@@ -76,6 +79,15 @@ public:
     static void awaitNoBgOpInProgForNs(const NamespaceString& ns) {
         awaitNoBgOpInProgForNs(ns.ns());
     }
+
+    /**
+     * Waits until an index build on collection 'ns' finishes. If there are no index builds in
+     * progress, returns immediately.
+     *
+     * Note: a collection lock should not be held when calling this, as that would block index
+     * builds from finishing and this function ever returning.
+     */
+    static void waitUntilAnIndexBuildFinishes(OperationContext* opCtx, StringData ns);
 
     /* check for in progress before instantiating */
     BackgroundOperation(StringData ns);

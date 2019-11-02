@@ -48,23 +48,22 @@
 #include "mongo/base/initializer.h"
 #include "mongo/base/initializer_context.h"
 #include "mongo/base/initializer_function.h"
-#include "mongo/base/make_string_vector.h"
 #include "mongo/base/status.h"
 
 /**
  * Convenience parameter representing an empty set of prerequisites for an initializer function.
  */
-#define MONGO_NO_PREREQUISITES (NULL)
+#define MONGO_NO_PREREQUISITES ()
 
 /**
  * Convenience parameter representing an empty set of dependents of an initializer function.
  */
-#define MONGO_NO_DEPENDENTS (NULL)
+#define MONGO_NO_DEPENDENTS ()
 
 /**
  * Convenience parameter representing the default set of dependents for initializer functions.
  */
-#define MONGO_DEFAULT_PREREQUISITES (MONGO_DEFAULT_PREREQUISITES_STR)
+#define MONGO_DEFAULT_PREREQUISITES (::mongo::defaultInitializerName().c_str())
 
 /**
  * Macro to define an initializer function named "NAME" with the default prerequisites, and
@@ -95,6 +94,8 @@
 #define MONGO_INITIALIZER_WITH_PREREQUISITES(NAME, PREREQUISITES) \
     MONGO_INITIALIZER_GENERAL(NAME, PREREQUISITES, MONGO_NO_DEPENDENTS)
 
+#define MONGO_INITIALIZER_STRIP_PARENS_(...) __VA_ARGS__
+
 /**
  * Macro to define an initializer that depends on PREREQUISITES and has DEPENDENTS as explicit
  * dependents.
@@ -123,9 +124,10 @@
     namespace {                                                                           \
     ::mongo::GlobalInitializerRegisterer _mongoInitializerRegisterer_##NAME(              \
         std::string(#NAME),                                                               \
-        MONGO_MAKE_STRING_VECTOR PREREQUISITES,                                           \
-        MONGO_MAKE_STRING_VECTOR DEPENDENTS,                                              \
-        mongo::InitializerFunction(MONGO_INITIALIZER_FUNCTION_NAME_(NAME)));              \
+        mongo::InitializerFunction(MONGO_INITIALIZER_FUNCTION_NAME_(NAME)),               \
+        mongo::DeinitializerFunction(nullptr),                                            \
+        std::vector<std::string>{MONGO_INITIALIZER_STRIP_PARENS_ PREREQUISITES},          \
+        std::vector<std::string>{MONGO_INITIALIZER_STRIP_PARENS_ DEPENDENTS});            \
     }                                                                                     \
     ::mongo::Status MONGO_INITIALIZER_FUNCTION_NAME_(NAME)
 

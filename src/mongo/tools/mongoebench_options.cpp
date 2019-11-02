@@ -40,8 +40,8 @@
 #include "mongo/db/storage/storage_options.h"
 #include "mongo/platform/random.h"
 #include "mongo/shell/bench.h"
-#include "mongo/util/mongoutils/str.h"
 #include "mongo/util/options_parser/startup_options.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -94,7 +94,7 @@ Status storeMongoeBenchOptions(const moe::Environment& params,
     }
 
     int64_t seed = params.count("seed") ? static_cast<int64_t>(params["seed"].as<long>())
-                                        : SecureRandom::create()->nextInt64();
+                                        : SecureRandom().nextInt64();
 
     if (mongoeBenchGlobalParams.preConfig) {
         mongoeBenchGlobalParams.preConfig->randomSeed = seed;
@@ -125,8 +125,7 @@ Status storeMongoeBenchOptions(const moe::Environment& params,
     if (!parentPath.empty() && !boost::filesystem::exists(parentPath)) {
         return {ErrorCodes::NonExistentPath,
                 str::stream() << "Directory containing output file must already exist, but "
-                              << parentPath.string()
-                              << " wasn't found"};
+                              << parentPath.string() << " wasn't found"};
     }
 
     return Status::OK();

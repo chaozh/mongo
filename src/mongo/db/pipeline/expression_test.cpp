@@ -31,14 +31,14 @@
 
 #include "mongo/bson/bsonmisc.h"
 #include "mongo/config.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/document_value_test_util.h"
+#include "mongo/db/exec/document_value/value_comparator.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/json.h"
 #include "mongo/db/pipeline/accumulator.h"
-#include "mongo/db/pipeline/document.h"
-#include "mongo/db/pipeline/document_value_test_util.h"
 #include "mongo/db/pipeline/expression.h"
 #include "mongo/db/pipeline/expression_context_for_test.h"
-#include "mongo/db/pipeline/value_comparator.h"
 #include "mongo/db/query/collation/collator_interface_mock.h"
 #include "mongo/dbtests/dbtests.h"
 #include "mongo/unittest/unittest.h"
@@ -47,13 +47,13 @@ namespace ExpressionTests {
 
 using boost::intrusive_ptr;
 using std::initializer_list;
+using std::list;
 using std::numeric_limits;
 using std::pair;
 using std::set;
 using std::sort;
 using std::string;
 using std::vector;
-using std::list;
 
 /**
  * Creates an expression given by 'expressionName' and evaluates it using
@@ -65,20 +65,7 @@ static Value evaluateExpression(const string& expressionName,
     VariablesParseState vps = expCtx->variablesParseState;
     const BSONObj obj = BSON(expressionName << ImplicitValue::convertToValue(operands));
     auto expression = Expression::parseExpression(expCtx, obj, vps);
-    Value result = expression->evaluate(Document());
-    return result;
-}
-
-/**
- * Creates an expression which parses named arguments via an object specification, then evaluates it
- * and returns the result.
- */
-static Value evaluateNamedArgExpression(const string& expressionName, const Document& operand) {
-    intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    VariablesParseState vps = expCtx->variablesParseState;
-    const BSONObj obj = BSON(expressionName << operand);
-    auto expression = Expression::parseExpression(expCtx, obj, vps);
-    Value result = expression->evaluate(Document());
+    Value result = expression->evaluate({}, &expCtx->variables);
     return result;
 }
 
@@ -113,8 +100,8 @@ static BSONObj constify(const BSONObj& obj, bool parentIsArray = false) {
             // arrays within arrays are treated as constant values by the real
             // parser
             bob << elem.fieldName() << BSONArray(constify(elem.Obj(), true));
-        } else if (str::equals(elem.fieldName(), "$const") ||
-                   (elem.type() == mongo::String && elem.valuestrsafe()[0] == '$')) {
+        } else if (elem.fieldNameStringData() == "$const" ||
+                   (elem.type() == mongo::String && elem.valueStringDataSafe().startsWith("$"))) {
             bob.append(elem);
         } else {
             bob.append(elem.fieldName(), BSON("$const" << elem));
@@ -157,587 +144,16 @@ Value valueFromBson(BSONObj obj) {
     return Value(element);
 }
 
-template <typename T>
-intrusive_ptr<ExpressionConstant> makeConstant(T&& val) {
-    intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    return ExpressionConstant::create(expCtx, Value(std::forward<T>(val)));
-}
-
-class ExpressionBaseTest : public unittest::Test {
-public:
-    void addOperand(intrusive_ptr<ExpressionNary> expr, Value arg) {
-        intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-        expr->addOperand(ExpressionConstant::create(expCtx, arg));
-    }
-};
-
-class ExpressionNaryTestOneArg : public ExpressionBaseTest {
-public:
-    virtual void assertEvaluates(Value input, Value output) {
-        addOperand(_expr, input);
-        ASSERT_VALUE_EQ(output, _expr->evaluate(Document()));
-        ASSERT_EQUALS(output.getType(), _expr->evaluate(Document()).getType());
-    }
-
-    intrusive_ptr<ExpressionNary> _expr;
-};
-
-class ExpressionNaryTestTwoArg : public ExpressionBaseTest {
-public:
-    virtual void assertEvaluates(Value input1, Value input2, Value output) {
-        addOperand(_expr, input1);
-        addOperand(_expr, input2);
-        ASSERT_VALUE_EQ(output, _expr->evaluate(Document()));
-        ASSERT_EQUALS(output.getType(), _expr->evaluate(Document()).getType());
-    }
-
-    intrusive_ptr<ExpressionNary> _expr;
-};
-
-/* ------------------------- NaryExpression -------------------------- */
-
-/** A dummy child of ExpressionNary used for testing. */
-class Testable : public ExpressionNary {
-public:
-    virtual Value evaluate(const Document& root) const {
-        // Just put all the values in a list.
-        // By default, this is not associative/commutative so the results will change if
-        // instantiated as commutative or associative and operations are reordered.
-        vector<Value> values;
-        for (ExpressionVector::const_iterator i = vpOperand.begin(); i != vpOperand.end(); ++i) {
-            values.push_back((*i)->evaluate(root));
-        }
-        return Value(values);
-    }
-
-    virtual const char* getOpName() const {
-        return "$testable";
-    }
-
-    virtual bool isAssociative() const {
-        return _isAssociative;
-    }
-
-    virtual bool isCommutative() const {
-        return _isCommutative;
-    }
-
-    static intrusive_ptr<Testable> create(bool associative, bool commutative) {
-        return new Testable(associative, commutative);
-    }
-
-private:
-    Testable(bool isAssociative, bool isCommutative)
-        : ExpressionNary(
-              boost::intrusive_ptr<ExpressionContextForTest>(new ExpressionContextForTest())),
-          _isAssociative(isAssociative),
-          _isCommutative(isCommutative) {}
-    bool _isAssociative;
-    bool _isCommutative;
-};
-
-class ExpressionNaryTest : public unittest::Test {
-public:
-    virtual void setUp() override {
-        _notAssociativeNorCommutative = Testable::create(false, false);
-        _associativeOnly = Testable::create(true, false);
-        _associativeAndCommutative = Testable::create(true, true);
-    }
-
-protected:
-    void assertDependencies(const intrusive_ptr<Testable>& expr,
-                            const BSONArray& expectedDependencies) {
-        DepsTracker dependencies;
-        expr->addDependencies(&dependencies);
-        BSONArrayBuilder dependenciesBson;
-        for (set<string>::const_iterator i = dependencies.fields.begin();
-             i != dependencies.fields.end();
-             ++i) {
-            dependenciesBson << *i;
-        }
-        ASSERT_BSONOBJ_EQ(expectedDependencies, dependenciesBson.arr());
-        ASSERT_EQUALS(false, dependencies.needWholeDocument);
-        ASSERT_EQUALS(false, dependencies.getNeedsMetadata(DepsTracker::MetadataType::TEXT_SCORE));
-    }
-
-    void assertContents(const intrusive_ptr<Testable>& expr, const BSONArray& expectedContents) {
-        ASSERT_BSONOBJ_EQ(constify(BSON("$testable" << expectedContents)), expressionToBson(expr));
-    }
-
-    void addOperandArrayToExpr(const intrusive_ptr<Testable>& expr, const BSONArray& operands) {
-        intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-        VariablesParseState vps = expCtx->variablesParseState;
-        BSONObjIterator i(operands);
-        while (i.more()) {
-            BSONElement element = i.next();
-            expr->addOperand(Expression::parseOperand(expCtx, element, vps));
-        }
-    }
-
-    intrusive_ptr<Testable> _notAssociativeNorCommutative;
-    intrusive_ptr<Testable> _associativeOnly;
-    intrusive_ptr<Testable> _associativeAndCommutative;
-};
-
-TEST_F(ExpressionNaryTest, AddedConstantOperandIsSerialized) {
-    intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    _notAssociativeNorCommutative->addOperand(ExpressionConstant::create(expCtx, Value(9)));
-    assertContents(_notAssociativeNorCommutative, BSON_ARRAY(9));
-}
-
-TEST_F(ExpressionNaryTest, AddedFieldPathOperandIsSerialized) {
-    intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    _notAssociativeNorCommutative->addOperand(ExpressionFieldPath::create(expCtx, "ab.c"));
-    assertContents(_notAssociativeNorCommutative, BSON_ARRAY("$ab.c"));
-}
-
-TEST_F(ExpressionNaryTest, ValidateEmptyDependencies) {
-    assertDependencies(_notAssociativeNorCommutative, BSONArray());
-}
-
-TEST_F(ExpressionNaryTest, ValidateConstantExpressionDependency) {
-    intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    _notAssociativeNorCommutative->addOperand(ExpressionConstant::create(expCtx, Value(1)));
-    assertDependencies(_notAssociativeNorCommutative, BSONArray());
-}
-
-TEST_F(ExpressionNaryTest, ValidateFieldPathExpressionDependency) {
-    intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    _notAssociativeNorCommutative->addOperand(ExpressionFieldPath::create(expCtx, "ab.c"));
-    assertDependencies(_notAssociativeNorCommutative, BSON_ARRAY("ab.c"));
-}
-
-TEST_F(ExpressionNaryTest, ValidateObjectExpressionDependency) {
-    BSONObj spec = BSON("" << BSON("a"
-                                   << "$x"
-                                   << "q"
-                                   << "$r"));
-    intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    BSONElement specElement = spec.firstElement();
-    VariablesParseState vps = expCtx->variablesParseState;
-    _notAssociativeNorCommutative->addOperand(
-        Expression::parseObject(expCtx, specElement.Obj(), vps));
-    assertDependencies(_notAssociativeNorCommutative,
-                       BSON_ARRAY("r"
-                                  << "x"));
-}
-
-TEST_F(ExpressionNaryTest, SerializationToBsonObj) {
-    intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    _notAssociativeNorCommutative->addOperand(ExpressionConstant::create(expCtx, Value(5)));
-    ASSERT_BSONOBJ_EQ(BSON("foo" << BSON("$testable" << BSON_ARRAY(BSON("$const" << 5)))),
-                      BSON("foo" << _notAssociativeNorCommutative->serialize(false)));
-}
-
-TEST_F(ExpressionNaryTest, SerializationToBsonArr) {
-    intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    _notAssociativeNorCommutative->addOperand(ExpressionConstant::create(expCtx, Value(5)));
-    ASSERT_BSONOBJ_EQ(constify(BSON_ARRAY(BSON("$testable" << BSON_ARRAY(5)))),
-                      BSON_ARRAY(_notAssociativeNorCommutative->serialize(false)));
-}
-
-// Verify that the internal operands are optimized
-TEST_F(ExpressionNaryTest, InternalOperandOptimizationIsDone) {
-    BSONArray spec = BSON_ARRAY(BSON("$and" << BSONArray()) << "$abc");
-    addOperandArrayToExpr(_notAssociativeNorCommutative, spec);
-    assertContents(_notAssociativeNorCommutative, spec);
-    ASSERT(_notAssociativeNorCommutative == _notAssociativeNorCommutative->optimize());
-    assertContents(_notAssociativeNorCommutative, BSON_ARRAY(true << "$abc"));
-}
-
-// Verify that if all the operands are constants, the expression is replaced
-// by a constant value equivalent to the expression applied to the operands.
-TEST_F(ExpressionNaryTest, AllConstantOperandOptimization) {
-    BSONArray spec = BSON_ARRAY(1 << 2);
-    addOperandArrayToExpr(_notAssociativeNorCommutative, spec);
-    assertContents(_notAssociativeNorCommutative, spec);
-    intrusive_ptr<Expression> optimized = _notAssociativeNorCommutative->optimize();
-    ASSERT(_notAssociativeNorCommutative != optimized);
-    ASSERT_BSONOBJ_EQ(BSON("$const" << BSON_ARRAY(1 << 2)), expressionToBson(optimized));
-}
-
-// Verify that the optimization of grouping constant and non-constant operands
-// and then applying the expression to the constant operands to reduce them to
-// one constant operand is only applied if the expression is associative and
-// commutative.
-TEST_F(ExpressionNaryTest, GroupingOptimizationOnNotCommutativeNorAssociative) {
-    BSONArray spec = BSON_ARRAY(55 << 66 << "$path");
-    addOperandArrayToExpr(_notAssociativeNorCommutative, spec);
-    assertContents(_notAssociativeNorCommutative, spec);
-    intrusive_ptr<Expression> optimized = _notAssociativeNorCommutative->optimize();
-    ASSERT(_notAssociativeNorCommutative == optimized);
-    assertContents(_notAssociativeNorCommutative, spec);
-}
-
-TEST_F(ExpressionNaryTest, GroupingOptimizationOnAssociativeOnlyFrontOperands) {
-    BSONArray spec = BSON_ARRAY(55 << 66 << "$path");
-    addOperandArrayToExpr(_associativeOnly, spec);
-    assertContents(_associativeOnly, spec);
-    intrusive_ptr<Expression> optimized = _associativeOnly->optimize();
-    ASSERT(_associativeOnly == optimized);
-    assertContents(_associativeOnly, BSON_ARRAY(BSON_ARRAY(55 << 66) << "$path"));
-}
-
-TEST_F(ExpressionNaryTest, GroupingOptimizationOnAssociativeOnlyMiddleOperands) {
-    BSONArray spec = BSON_ARRAY("$path1" << 55 << 66 << "$path");
-    addOperandArrayToExpr(_associativeOnly, spec);
-    assertContents(_associativeOnly, spec);
-    intrusive_ptr<Expression> optimized = _associativeOnly->optimize();
-    ASSERT(_associativeOnly == optimized);
-    assertContents(_associativeOnly, BSON_ARRAY("$path1" << BSON_ARRAY(55 << 66) << "$path"));
-}
-
-TEST_F(ExpressionNaryTest, GroupingOptimizationOnAssociativeOnlyBackOperands) {
-    BSONArray spec = BSON_ARRAY("$path" << 55 << 66);
-    addOperandArrayToExpr(_associativeOnly, spec);
-    assertContents(_associativeOnly, spec);
-    intrusive_ptr<Expression> optimized = _associativeOnly->optimize();
-    ASSERT(_associativeOnly == optimized);
-    assertContents(_associativeOnly, BSON_ARRAY("$path" << BSON_ARRAY(55 << 66)));
-}
-
-TEST_F(ExpressionNaryTest, GroupingOptimizationOnAssociativeOnlyNotExecuteOnSingleConstantsFront) {
-    BSONArray spec = BSON_ARRAY(55 << "$path");
-    addOperandArrayToExpr(_associativeOnly, spec);
-    assertContents(_associativeOnly, spec);
-    intrusive_ptr<Expression> optimized = _associativeOnly->optimize();
-    ASSERT(_associativeOnly == optimized);
-    assertContents(_associativeOnly, BSON_ARRAY(55 << "$path"));
-}
-
-TEST_F(ExpressionNaryTest, GroupingOptimizationOnAssociativeOnlyNotExecuteOnSingleConstantsMiddle) {
-    BSONArray spec = BSON_ARRAY("$path1" << 55 << "$path2");
-    addOperandArrayToExpr(_associativeOnly, spec);
-    assertContents(_associativeOnly, spec);
-    intrusive_ptr<Expression> optimized = _associativeOnly->optimize();
-    ASSERT(_associativeOnly == optimized);
-    assertContents(_associativeOnly, BSON_ARRAY("$path1" << 55 << "$path2"));
-}
-
-TEST_F(ExpressionNaryTest, GroupingOptimizationOnAssociativeOnlyNotExecuteOnSingleConstantsBack) {
-    BSONArray spec = BSON_ARRAY("$path" << 55);
-    addOperandArrayToExpr(_associativeOnly, spec);
-    assertContents(_associativeOnly, spec);
-    intrusive_ptr<Expression> optimized = _associativeOnly->optimize();
-    ASSERT(_associativeOnly == optimized);
-    assertContents(_associativeOnly, BSON_ARRAY("$path" << 55));
-}
-
-TEST_F(ExpressionNaryTest, GroupingOptimizationOnCommutativeAndAssociative) {
-    BSONArray spec = BSON_ARRAY(55 << 66 << "$path");
-    addOperandArrayToExpr(_associativeAndCommutative, spec);
-    assertContents(_associativeAndCommutative, spec);
-    intrusive_ptr<Expression> optimized = _associativeAndCommutative->optimize();
-    ASSERT(_associativeAndCommutative == optimized);
-    assertContents(_associativeAndCommutative, BSON_ARRAY("$path" << BSON_ARRAY(55 << 66)));
-}
-
-TEST_F(ExpressionNaryTest, FlattenOptimizationNotDoneOnOtherExpressionsForAssociativeExpressions) {
-    BSONArray spec = BSON_ARRAY(66 << "$path" << BSON("$sum" << BSON_ARRAY("$path" << 2)));
-    addOperandArrayToExpr(_associativeOnly, spec);
-    assertContents(_associativeOnly, spec);
-    intrusive_ptr<Expression> optimized = _associativeOnly->optimize();
-    ASSERT(_associativeOnly == optimized);
-    assertContents(_associativeOnly, spec);
-}
-
-TEST_F(ExpressionNaryTest, FlattenOptimizationNotDoneOnSameButNotAssociativeExpression) {
-    BSONArrayBuilder specBuilder;
-
-    intrusive_ptr<Testable> innerOperand = Testable::create(false, false);
-    addOperandArrayToExpr(innerOperand, BSON_ARRAY(100 << "$path1" << 101));
-    specBuilder.append(expressionToBson(innerOperand));
-    _associativeOnly->addOperand(innerOperand);
-
-    addOperandArrayToExpr(_associativeOnly, BSON_ARRAY(99 << "$path2"));
-    specBuilder << 99 << "$path2";
-
-    BSONArray spec = specBuilder.arr();
-    assertContents(_associativeOnly, spec);
-    intrusive_ptr<Expression> optimized = _associativeOnly->optimize();
-    ASSERT(_associativeOnly == optimized);
-
-    assertContents(_associativeOnly, spec);
-}
-
-// Test that if there is an expression of the same type in a non-commutative nor associative
-// expression, the inner expression is not expanded.
-// {"$testable" : [ { "$testable" : [ 100, "$path1"] }, 99, "$path2"] } is optimized to:
-// {"$testable" : [ { "$testable" : [ 100, "$path1"] }, 99, "$path2"] }
-TEST_F(ExpressionNaryTest, FlattenInnerOperandsOptimizationOnNotCommutativeNorAssociative) {
-    BSONArrayBuilder specBuilder;
-
-    intrusive_ptr<Testable> innerOperand = Testable::create(false, false);
-    addOperandArrayToExpr(innerOperand, BSON_ARRAY(100 << "$path1"));
-    specBuilder.append(expressionToBson(innerOperand));
-    _notAssociativeNorCommutative->addOperand(innerOperand);
-
-    addOperandArrayToExpr(_notAssociativeNorCommutative, BSON_ARRAY(99 << "$path2"));
-    specBuilder << 99 << "$path2";
-
-    BSONArray spec = specBuilder.arr();
-    assertContents(_notAssociativeNorCommutative, spec);
-    intrusive_ptr<Expression> optimized = _notAssociativeNorCommutative->optimize();
-    ASSERT(_notAssociativeNorCommutative == optimized);
-
-    assertContents(_notAssociativeNorCommutative, spec);
-}
-
-// Test that if there is an expression of the same type as the first operand
-// in a non-commutative but associative expression, the inner expression is expanded.
-// Also, there shouldn't be any grouping of the operands.
-// {"$testable" : [ { "$testable" : [ 100, "$path1"] }, 99, "$path2"] } is optimized to:
-// {"$testable" : [ 100, "$path1", 99, "$path2"] }
-TEST_F(ExpressionNaryTest, FlattenInnerOperandsOptimizationOnAssociativeOnlyFrontOperandNoGroup) {
-    BSONArrayBuilder specBuilder;
-
-    intrusive_ptr<Testable> innerOperand = Testable::create(true, false);
-    addOperandArrayToExpr(innerOperand, BSON_ARRAY(100 << "$path1"));
-    specBuilder.append(expressionToBson(innerOperand));
-    _associativeOnly->addOperand(innerOperand);
-
-    addOperandArrayToExpr(_associativeOnly, BSON_ARRAY(99 << "$path2"));
-    specBuilder << 99 << "$path2";
-
-    BSONArray spec = specBuilder.arr();
-    assertContents(_associativeOnly, spec);
-    intrusive_ptr<Expression> optimized = _associativeOnly->optimize();
-    ASSERT(_associativeOnly == optimized);
-
-    BSONArray expectedContent = BSON_ARRAY(100 << "$path1" << 99 << "$path2");
-    assertContents(_associativeOnly, expectedContent);
-}
-
-// Test that if there is an expression of the same type as the first operand
-// in a non-commutative but associative expression, the inner expression is expanded.
-// Partial collapsing optimization should be applied to the operands.
-// {"$testable" : [ { "$testable" : [ 100, "$path1", 101] }, 99, "$path2"] } is optimized to:
-// {"$testable" : [ 100, "$path1", [101, 99], "$path2"] }
-TEST_F(ExpressionNaryTest, FlattenInnerOperandsOptimizationOnAssociativeOnlyFrontOperandAndGroup) {
-    BSONArrayBuilder specBuilder;
-
-    intrusive_ptr<Testable> innerOperand = Testable::create(true, false);
-    addOperandArrayToExpr(innerOperand, BSON_ARRAY(100 << "$path1" << 101));
-    specBuilder.append(expressionToBson(innerOperand));
-    _associativeOnly->addOperand(innerOperand);
-
-    addOperandArrayToExpr(_associativeOnly, BSON_ARRAY(99 << "$path2"));
-    specBuilder << 99 << "$path2";
-
-    BSONArray spec = specBuilder.arr();
-    assertContents(_associativeOnly, spec);
-    intrusive_ptr<Expression> optimized = _associativeOnly->optimize();
-    ASSERT(_associativeOnly == optimized);
-
-    BSONArray expectedContent = BSON_ARRAY(100 << "$path1" << BSON_ARRAY(101 << 99) << "$path2");
-    assertContents(_associativeOnly, expectedContent);
-}
-
-// Test that if there is an expression of the same type in the middle of the operands
-// in a non-commutative but associative expression, the inner expression is expanded.
-// Partial collapsing optimization should not be applied to the operands.
-// {"$testable" : [ 200, "$path3", { "$testable" : [ 100, "$path1"] }, 99, "$path2"] } is
-// optimized to: {"$testable" : [ 200, "$path3", 100, "$path1", 99, "$path2"] }
-TEST_F(ExpressionNaryTest, FlattenInnerOperandsOptimizationOnAssociativeOnlyMiddleOperandNoGroup) {
-    BSONArrayBuilder specBuilder;
-
-    addOperandArrayToExpr(_associativeOnly, BSON_ARRAY(200 << "$path3"));
-    specBuilder << 200 << "$path3";
-
-    intrusive_ptr<Testable> innerOperand = Testable::create(true, false);
-    addOperandArrayToExpr(innerOperand, BSON_ARRAY(100 << "$path1"));
-    specBuilder.append(expressionToBson(innerOperand));
-    _associativeOnly->addOperand(innerOperand);
-
-    addOperandArrayToExpr(_associativeOnly, BSON_ARRAY(99 << "$path2"));
-    specBuilder << 99 << "$path2";
-
-    BSONArray spec = specBuilder.arr();
-    assertContents(_associativeOnly, spec);
-    intrusive_ptr<Expression> optimized = _associativeOnly->optimize();
-    ASSERT(_associativeOnly == optimized);
-
-    BSONArray expectedContent = BSON_ARRAY(200 << "$path3" << 100 << "$path1" << 99 << "$path2");
-    assertContents(_associativeOnly, expectedContent);
-}
-
-// Test that if there is an expression of the same type in the middle of the operands
-// in a non-commutative but associative expression, the inner expression is expanded.
-// Partial collapsing optimization should be applied to the operands.
-// {"$testable" : [ 200, "$path3", 201 { "$testable" : [ 100, "$path1", 101] }, 99, "$path2"] } is
-// optimized to: {"$testable" : [ 200, "$path3", [201, 100], "$path1", [101, 99], "$path2"] }
-TEST_F(ExpressionNaryTest, FlattenInnerOperandsOptimizationOnAssociativeOnlyMiddleOperandAndGroup) {
-    BSONArrayBuilder specBuilder;
-
-    addOperandArrayToExpr(_associativeOnly, BSON_ARRAY(200 << "$path3" << 201));
-    specBuilder << 200 << "$path3" << 201;
-
-    intrusive_ptr<Testable> innerOperand = Testable::create(true, false);
-    addOperandArrayToExpr(innerOperand, BSON_ARRAY(100 << "$path1" << 101));
-    specBuilder.append(expressionToBson(innerOperand));
-    _associativeOnly->addOperand(innerOperand);
-
-    addOperandArrayToExpr(_associativeOnly, BSON_ARRAY(99 << "$path2"));
-    specBuilder << 99 << "$path2";
-
-    BSONArray spec = specBuilder.arr();
-    assertContents(_associativeOnly, spec);
-    intrusive_ptr<Expression> optimized = _associativeOnly->optimize();
-    ASSERT(_associativeOnly == optimized);
-
-    BSONArray expectedContent = BSON_ARRAY(
-        200 << "$path3" << BSON_ARRAY(201 << 100) << "$path1" << BSON_ARRAY(101 << 99) << "$path2");
-    assertContents(_associativeOnly, expectedContent);
-}
-
-// Test that if there is an expression of the same type in the back of the operands in a
-// non-commutative but associative expression, the inner expression is expanded.
-// Partial collapsing optimization should not be applied to the operands.
-// {"$testable" : [ 200, "$path3", { "$testable" : [ 100, "$path1"] }] } is
-// optimized to: {"$testable" : [ 200, "$path3", 100, "$path1"] }
-TEST_F(ExpressionNaryTest, FlattenInnerOperandsOptimizationOnAssociativeOnlyBackOperandNoGroup) {
-    BSONArrayBuilder specBuilder;
-
-    addOperandArrayToExpr(_associativeOnly, BSON_ARRAY(200 << "$path3"));
-    specBuilder << 200 << "$path3";
-
-    intrusive_ptr<Testable> innerOperand = Testable::create(true, false);
-    addOperandArrayToExpr(innerOperand, BSON_ARRAY(100 << "$path1"));
-    specBuilder.append(expressionToBson(innerOperand));
-    _associativeOnly->addOperand(innerOperand);
-
-    BSONArray spec = specBuilder.arr();
-    assertContents(_associativeOnly, spec);
-    intrusive_ptr<Expression> optimized = _associativeOnly->optimize();
-    ASSERT(_associativeOnly == optimized);
-
-    BSONArray expectedContent = BSON_ARRAY(200 << "$path3" << 100 << "$path1");
-    assertContents(_associativeOnly, expectedContent);
-}
-
-// Test that if there is an expression of the same type in the back of the operands in a
-// non-commutative but associative expression, the inner expression is expanded.
-// Partial collapsing optimization should be applied to the operands.
-// {"$testable" : [ 200, "$path3", 201, { "$testable" : [ 100, "$path1", 101] }] } is
-// optimized to: {"$testable" : [ 200, "$path3", [201, 100], "$path1", 101] }
-TEST_F(ExpressionNaryTest, FlattenInnerOperandsOptimizationOnAssociativeOnlyBackOperandAndGroup) {
-    BSONArrayBuilder specBuilder;
-
-    addOperandArrayToExpr(_associativeOnly, BSON_ARRAY(200 << "$path3" << 201));
-    specBuilder << 200 << "$path3" << 201;
-
-    intrusive_ptr<Testable> innerOperand = Testable::create(true, false);
-    addOperandArrayToExpr(innerOperand, BSON_ARRAY(100 << "$path1" << 101));
-    specBuilder.append(expressionToBson(innerOperand));
-    _associativeOnly->addOperand(innerOperand);
-
-    BSONArray spec = specBuilder.arr();
-    assertContents(_associativeOnly, spec);
-    intrusive_ptr<Expression> optimized = _associativeOnly->optimize();
-    ASSERT(_associativeOnly == optimized);
-
-    BSONArray expectedContent =
-        BSON_ARRAY(200 << "$path3" << BSON_ARRAY(201 << 100) << "$path1" << 101);
-    assertContents(_associativeOnly, expectedContent);
-}
-
-// Test that if there are two consecutive inner expressions of the same type in a non-commutative
-// but associative expression, both expressions are correctly flattened.
-// Partial collapsing optimization should not be applied to the operands.
-// {"$testable" : [ { "$testable" : [ 100, "$path1"] }, { "$testable" : [ 200, "$path2"] }] } is
-// optimized to: {"$testable" : [ 100, "$path1", 200, "$path2"] }
-TEST_F(ExpressionNaryTest, FlattenConsecutiveInnerOperandsOptimizationOnAssociativeOnlyNoGroup) {
-    BSONArrayBuilder specBuilder;
-
-    intrusive_ptr<Testable> innerOperand = Testable::create(true, false);
-    addOperandArrayToExpr(innerOperand, BSON_ARRAY(100 << "$path1"));
-    specBuilder.append(expressionToBson(innerOperand));
-    _associativeOnly->addOperand(innerOperand);
-
-    intrusive_ptr<Testable> innerOperand2 = Testable::create(true, false);
-    addOperandArrayToExpr(innerOperand2, BSON_ARRAY(200 << "$path2"));
-    specBuilder.append(expressionToBson(innerOperand2));
-    _associativeOnly->addOperand(innerOperand2);
-
-    BSONArray spec = specBuilder.arr();
-    assertContents(_associativeOnly, spec);
-    intrusive_ptr<Expression> optimized = _associativeOnly->optimize();
-    ASSERT(_associativeOnly == optimized);
-
-    BSONArray expectedContent = BSON_ARRAY(100 << "$path1" << 200 << "$path2");
-    assertContents(_associativeOnly, expectedContent);
-}
-
-// Test that if there are two consecutive inner expressions of the same type in a non-commutative
-// but associative expression, both expressions are correctly flattened.
-// Partial collapsing optimization should be applied to the operands.
-// {"$testable" : [ { "$testable" : [ 100, "$path1", 101] }, { "$testable" : [ 200, "$path2"] }] }
-// is optimized to: {"$testable" : [ 100, "$path1", [ 101, 200], "$path2"] }
-TEST_F(ExpressionNaryTest, FlattenConsecutiveInnerOperandsOptimizationOnAssociativeAndGroup) {
-    BSONArrayBuilder specBuilder;
-
-    intrusive_ptr<Testable> innerOperand = Testable::create(true, false);
-    addOperandArrayToExpr(innerOperand, BSON_ARRAY(100 << "$path1" << 101));
-    specBuilder.append(expressionToBson(innerOperand));
-    _associativeOnly->addOperand(innerOperand);
-
-    intrusive_ptr<Testable> innerOperand2 = Testable::create(true, false);
-    addOperandArrayToExpr(innerOperand2, BSON_ARRAY(200 << "$path2"));
-    specBuilder.append(expressionToBson(innerOperand2));
-    _associativeOnly->addOperand(innerOperand2);
-
-    BSONArray spec = specBuilder.arr();
-    assertContents(_associativeOnly, spec);
-    intrusive_ptr<Expression> optimized = _associativeOnly->optimize();
-    ASSERT(_associativeOnly == optimized);
-
-    BSONArray expectedContent = BSON_ARRAY(100 << "$path1" << BSON_ARRAY(101 << 200) << "$path2");
-    assertContents(_associativeOnly, expectedContent);
-}
-
-// Test that inner expressions are correctly flattened and constant operands re-arranged and
-// collapsed when using a commutative and associative expression.
-// {"$testable" : [ 200, "$path3", 201, { "$testable" : [ 100, "$path1", 101] }, 99, "$path2"] } is
-// optimized to: {"$testable" : [ "$path3", "$path1", "$path2", [200, 201, [ 100, 101], 99] ] }
-TEST_F(ExpressionNaryTest, FlattenInnerOperandsOptimizationOnCommutativeAndAssociative) {
-    BSONArrayBuilder specBuilder;
-
-    addOperandArrayToExpr(_associativeAndCommutative, BSON_ARRAY(200 << "$path3" << 201));
-    specBuilder << 200 << "$path3" << 201;
-
-    intrusive_ptr<Testable> innerOperand = Testable::create(true, true);
-    addOperandArrayToExpr(innerOperand, BSON_ARRAY(100 << "$path1" << 101));
-    specBuilder.append(expressionToBson(innerOperand));
-    _associativeAndCommutative->addOperand(innerOperand);
-
-    addOperandArrayToExpr(_associativeAndCommutative, BSON_ARRAY(99 << "$path2"));
-    specBuilder << 99 << "$path2";
-
-    BSONArray spec = specBuilder.arr();
-    assertContents(_associativeAndCommutative, spec);
-    intrusive_ptr<Expression> optimized = _associativeAndCommutative->optimize();
-    ASSERT(_associativeAndCommutative == optimized);
-
-    BSONArray expectedContent = BSON_ARRAY("$path3"
-                                           << "$path1"
-                                           << "$path2"
-                                           << BSON_ARRAY(200 << 201 << BSON_ARRAY(100 << 101)
-                                                             << 99));
-    assertContents(_associativeAndCommutative, expectedContent);
-}
-
 /* ------------------------- ExpressionArrayToObject -------------------------- */
 
 TEST(ExpressionArrayToObjectTest, KVFormatSimple) {
     assertExpectedResults("$arrayToObject",
                           {{{Value(BSON_ARRAY(BSON("k"
                                                    << "key1"
-                                                   << "v"
-                                                   << 2)
+                                                   << "v" << 2)
                                               << BSON("k"
                                                       << "key2"
-                                                      << "v"
-                                                      << 3)))},
+                                                      << "v" << 3)))},
                             {Value(BSON("key1" << 2 << "key2" << 3))}}});
 }
 
@@ -745,12 +161,10 @@ TEST(ExpressionArrayToObjectTest, KVFormatWithDuplicates) {
     assertExpectedResults("$arrayToObject",
                           {{{Value(BSON_ARRAY(BSON("k"
                                                    << "hi"
-                                                   << "v"
-                                                   << 2)
+                                                   << "v" << 2)
                                               << BSON("k"
                                                       << "hi"
-                                                      << "v"
-                                                      << 3)))},
+                                                      << "v" << 3)))},
                             {Value(BSON("hi" << 3))}}});
 }
 
@@ -764,124 +178,6 @@ TEST(ExpressionArrayToObjectTest, ListFormWithDuplicates) {
     assertExpectedResults("$arrayToObject",
                           {{{Value(BSON_ARRAY(BSON_ARRAY("key1" << 2) << BSON_ARRAY("key1" << 3)))},
                             {Value(BSON("key1" << 3))}}});
-}
-
-/* ------------------------- ExpressionCeil -------------------------- */
-
-class ExpressionCeilTest : public ExpressionNaryTestOneArg {
-public:
-    virtual void assertEvaluates(Value input, Value output) override {
-        intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-        _expr = new ExpressionCeil(expCtx);
-        ExpressionNaryTestOneArg::assertEvaluates(input, output);
-    }
-};
-
-TEST_F(ExpressionCeilTest, IntArg) {
-    assertEvaluates(Value(0), Value(0));
-    assertEvaluates(Value(numeric_limits<int>::min()), Value(numeric_limits<int>::min()));
-    assertEvaluates(Value(numeric_limits<int>::max()), Value(numeric_limits<int>::max()));
-}
-
-TEST_F(ExpressionCeilTest, LongArg) {
-    assertEvaluates(Value(0LL), Value(0LL));
-    assertEvaluates(Value(numeric_limits<long long>::min()),
-                    Value(numeric_limits<long long>::min()));
-    assertEvaluates(Value(numeric_limits<long long>::max()),
-                    Value(numeric_limits<long long>::max()));
-}
-
-TEST_F(ExpressionCeilTest, DoubleArg) {
-    assertEvaluates(Value(2.0), Value(2.0));
-    assertEvaluates(Value(-2.0), Value(-2.0));
-    assertEvaluates(Value(0.9), Value(1.0));
-    assertEvaluates(Value(0.1), Value(1.0));
-    assertEvaluates(Value(-1.2), Value(-1.0));
-    assertEvaluates(Value(-1.7), Value(-1.0));
-
-    // Outside the range of long longs (there isn't enough precision for decimals in this range, so
-    // ceil should just preserve the number).
-    double largerThanLong = numeric_limits<long long>::max() * 2.0;
-    assertEvaluates(Value(largerThanLong), Value(largerThanLong));
-    double smallerThanLong = numeric_limits<long long>::min() * 2.0;
-    assertEvaluates(Value(smallerThanLong), Value(smallerThanLong));
-}
-
-TEST_F(ExpressionCeilTest, DecimalArg) {
-    assertEvaluates(Value(Decimal128("2")), Value(Decimal128("2.0")));
-    assertEvaluates(Value(Decimal128("-2")), Value(Decimal128("-2.0")));
-    assertEvaluates(Value(Decimal128("0.9")), Value(Decimal128("1.0")));
-    assertEvaluates(Value(Decimal128("0.1")), Value(Decimal128("1.0")));
-    assertEvaluates(Value(Decimal128("-1.2")), Value(Decimal128("-1.0")));
-    assertEvaluates(Value(Decimal128("-1.7")), Value(Decimal128("-1.0")));
-    assertEvaluates(Value(Decimal128("1234567889.000000000000000000000001")),
-                    Value(Decimal128("1234567890")));
-    assertEvaluates(Value(Decimal128("-99999999999999999999999999999.99")),
-                    Value(Decimal128("-99999999999999999999999999999.00")));
-    assertEvaluates(Value(Decimal128("3.4E-6000")), Value(Decimal128("1")));
-}
-
-TEST_F(ExpressionCeilTest, NullArg) {
-    assertEvaluates(Value(BSONNULL), Value(BSONNULL));
-}
-
-/* ------------------------- ExpressionFloor -------------------------- */
-
-class ExpressionFloorTest : public ExpressionNaryTestOneArg {
-public:
-    virtual void assertEvaluates(Value input, Value output) override {
-        intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-        _expr = new ExpressionFloor(expCtx);
-        ExpressionNaryTestOneArg::assertEvaluates(input, output);
-    }
-};
-
-TEST_F(ExpressionFloorTest, IntArg) {
-    assertEvaluates(Value(0), Value(0));
-    assertEvaluates(Value(numeric_limits<int>::min()), Value(numeric_limits<int>::min()));
-    assertEvaluates(Value(numeric_limits<int>::max()), Value(numeric_limits<int>::max()));
-}
-
-TEST_F(ExpressionFloorTest, LongArg) {
-    assertEvaluates(Value(0LL), Value(0LL));
-    assertEvaluates(Value(numeric_limits<long long>::min()),
-                    Value(numeric_limits<long long>::min()));
-    assertEvaluates(Value(numeric_limits<long long>::max()),
-                    Value(numeric_limits<long long>::max()));
-}
-
-TEST_F(ExpressionFloorTest, DoubleArg) {
-    assertEvaluates(Value(2.0), Value(2.0));
-    assertEvaluates(Value(-2.0), Value(-2.0));
-    assertEvaluates(Value(0.9), Value(0.0));
-    assertEvaluates(Value(0.1), Value(0.0));
-    assertEvaluates(Value(-1.2), Value(-2.0));
-    assertEvaluates(Value(-1.7), Value(-2.0));
-
-    // Outside the range of long longs (there isn't enough precision for decimals in this range, so
-    // floor should just preserve the number).
-    double largerThanLong = numeric_limits<long long>::max() * 2.0;
-    assertEvaluates(Value(largerThanLong), Value(largerThanLong));
-    double smallerThanLong = numeric_limits<long long>::min() * 2.0;
-    assertEvaluates(Value(smallerThanLong), Value(smallerThanLong));
-}
-
-TEST_F(ExpressionFloorTest, DecimalArg) {
-    assertEvaluates(Value(Decimal128("2")), Value(Decimal128("2.0")));
-    assertEvaluates(Value(Decimal128("-2")), Value(Decimal128("-2.0")));
-    assertEvaluates(Value(Decimal128("0.9")), Value(Decimal128("0.0")));
-    assertEvaluates(Value(Decimal128("0.1")), Value(Decimal128("0.0")));
-    assertEvaluates(Value(Decimal128("-1.2")), Value(Decimal128("-2.0")));
-    assertEvaluates(Value(Decimal128("-1.7")), Value(Decimal128("-2.0")));
-    assertEvaluates(Value(Decimal128("1234567890.000000000000000000000001")),
-                    Value(Decimal128("1234567890")));
-    assertEvaluates(Value(Decimal128("-99999999999999999999999999999.99")),
-                    Value(Decimal128("-100000000000000000000000000000")));
-    assertEvaluates(Value(Decimal128("3.4E-6000")), Value(Decimal128("0")));
-}
-
-TEST_F(ExpressionFloorTest, NullArg) {
-    assertEvaluates(Value(BSONNULL), Value(BSONNULL));
 }
 
 /* ------------------------ ExpressionRange --------------------------- */
@@ -941,403 +237,6 @@ TEST(ExpressionReverseArrayTest, ReturnsNullWithNullishInput) {
         {{{Value(BSONNULL)}, Value(BSONNULL)}, {{Value(BSONUndefined)}, Value(BSONNULL)}});
 }
 
-/* ------------------------- ExpressionRound -------------------------- */
-
-class ExpressionRoundOneArgTest : public ExpressionNaryTestOneArg {
-public:
-    void assertEval(ImplicitValue input, ImplicitValue output) {
-        intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-        _expr = new ExpressionRound(expCtx);
-        ExpressionNaryTestOneArg::assertEvaluates(input, output);
-    }
-};
-
-class ExpressionRoundTwoArgTest : public ExpressionNaryTestTwoArg {
-public:
-    void assertEval(ImplicitValue input1, ImplicitValue input2, ImplicitValue output) {
-        intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-        _expr = new ExpressionRound(expCtx);
-        ExpressionNaryTestTwoArg::assertEvaluates(input1, input2, output);
-    }
-};
-
-TEST_F(ExpressionRoundOneArgTest, IntArg1) {
-    assertEval(0, 0);
-    assertEval(numeric_limits<int>::min(), numeric_limits<int>::min());
-    assertEval(numeric_limits<int>::max(), numeric_limits<int>::max());
-}
-
-TEST_F(ExpressionRoundTwoArgTest, IntArg2) {
-    assertEval(0, 0, 0);
-    assertEval(2, -1, 0);
-    assertEval(29, -1, 30);
-    assertEval(numeric_limits<int>::min(), 10, numeric_limits<int>::min());
-    assertEval(numeric_limits<int>::max(), 42, numeric_limits<int>::max());
-}
-
-TEST_F(ExpressionRoundOneArgTest, LongArg1) {
-    assertEval(0LL, 0LL);
-    assertEval(numeric_limits<long long>::min(), numeric_limits<long long>::min());
-    assertEval(numeric_limits<long long>::max(), numeric_limits<long long>::max());
-}
-
-TEST_F(ExpressionRoundTwoArgTest, LongArg2) {
-    assertEval(0LL, 0LL, 0LL);
-    assertEval(2LL, -1LL, 0LL);
-    assertEval(29LL, -1LL, 30LL);
-    assertEval(numeric_limits<long long>::min(), 10LL, numeric_limits<long long>::min());
-    assertEval(numeric_limits<long long>::max(), 42LL, numeric_limits<long long>::max());
-}
-
-TEST_F(ExpressionRoundOneArgTest, DoubleArg1) {
-    assertEval(2.0, 2.0);
-    assertEval(-2.0, -2.0);
-    assertEval(0.9, 1.0);
-    assertEval(0.1, 0.0);
-    assertEval(-1.2, -1.0);
-    assertEval(-1.7, -2.0);
-
-    // Outside the range of long longs (there isn't enough precision for decimals in this range, so
-    // should just preserve the number).
-    double largerThanLong = numeric_limits<long long>::max() * 2.0;
-    assertEval(largerThanLong, largerThanLong);
-    double smallerThanLong = numeric_limits<long long>::min() * 2.0;
-    assertEval(smallerThanLong, smallerThanLong);
-}
-
-TEST_F(ExpressionRoundTwoArgTest, DoubleArg2) {
-    assertEval(2.0, 1.0, 2.0);
-    assertEval(-2.0, 2.0, -2.0);
-    assertEval(0.9, 0, 1.0);
-    assertEval(0.1, 0, 0.0);
-    assertEval(-1.2, 0, -1.0);
-    assertEval(-1.7, 0, -2.0);
-
-    assertEval(-3.14159265, 0, -3.0);
-    assertEval(-3.14159265, 1, -3.1);
-    assertEval(-3.14159265, 2, -3.14);
-    assertEval(-3.14159265, 3, -3.142);
-    assertEval(-3.14159265, 4, -3.1416);
-    assertEval(-3.14159265, 5, -3.14159);
-    assertEval(-3.14159265, 6, -3.141593);
-    assertEval(-3.14159265, 7, -3.1415927);
-    assertEval(-3.14159265, 100, -3.14159265);
-    assertEval(3.14159265, 0, 3.0);
-    assertEval(3.14159265, 1, 3.1);
-    assertEval(3.14159265, 2, 3.14);
-    assertEval(3.14159265, 3, 3.142);
-    assertEval(3.14159265, 4, 3.1416);
-    assertEval(3.14159265, 5, 3.14159);
-    assertEval(3.14159265, 6, 3.141593);
-    assertEval(3.14159265, 7, 3.1415927);
-    assertEval(3.14159265, 100, 3.14159265);
-    assertEval(3.14159265, -1, 0.0);
-    assertEval(335.14159265, -1, 340.0);
-    assertEval(333.14159265, -2, 300.0);
-}
-
-TEST_F(ExpressionRoundOneArgTest, DecimalArg1) {
-    assertEval(Decimal128("2"), Decimal128("2.0"));
-    assertEval(Decimal128("-2"), Decimal128("-2.0"));
-    assertEval(Decimal128("0.9"), Decimal128("1.0"));
-    assertEval(Decimal128("0.1"), Decimal128("0.0"));
-    assertEval(Decimal128("-1.2"), Decimal128("-1.0"));
-    assertEval(Decimal128("-1.7"), Decimal128("-2.0"));
-    assertEval(Decimal128("123456789.9999999999999999999999999"), Decimal128("123456790"));
-    assertEval(Decimal128("-99999999999999999999999999999.99"),
-               Decimal128("-100000000000000000000000000000"));
-    assertEval(Decimal128("3.4E-6000"), Decimal128("0"));
-}
-
-TEST_F(ExpressionRoundTwoArgTest, DecimalArg2) {
-    assertEval(Decimal128("2"), 0, Decimal128("2.0"));
-    assertEval(Decimal128("-2"), 0, Decimal128("-2.0"));
-    assertEval(Decimal128("0.9"), 0, Decimal128("1.0"));
-    assertEval(Decimal128("0.1"), 0, Decimal128("0.0"));
-    assertEval(Decimal128("-1.2"), 0, Decimal128("-1.0"));
-    assertEval(Decimal128("-1.7"), 0, Decimal128("-2.0"));
-    assertEval(Decimal128("123456789.9999999999999999999999999"), 0, Decimal128("123456790"));
-    assertEval(Decimal128("-99999999999999999999999999999.99"),
-               0,
-               Decimal128("-100000000000000000000000000000"));
-    assertEval(Decimal128("3.4E-6000"), 0, Decimal128("0"));
-
-    assertEval(Decimal128("-3.14159265"), 0, Decimal128("-3.0"));
-    assertEval(Decimal128("-3.14159265"), 1, Decimal128("-3.1"));
-    assertEval(Decimal128("-3.14159265"), 2, Decimal128("-3.14"));
-    assertEval(Decimal128("-3.14159265"), 3, Decimal128("-3.142"));
-    assertEval(Decimal128("-3.14159265"), 4, Decimal128("-3.1416"));
-    assertEval(Decimal128("-3.14159265"), 5, Decimal128("-3.14159"));
-    assertEval(Decimal128("-3.14159265"), 6, Decimal128("-3.141593"));
-    assertEval(Decimal128("-3.14159265"), 7, Decimal128("-3.1415926"));
-    assertEval(Decimal128("-3.14159265"), 100, Decimal128("-3.14159265"));
-    assertEval(Decimal128("3.14159265"), 0, Decimal128("3.0"));
-    assertEval(Decimal128("3.14159265"), 1, Decimal128("3.1"));
-    assertEval(Decimal128("3.14159265"), 2, Decimal128("3.14"));
-    assertEval(Decimal128("3.14159265"), Decimal128("3"), Decimal128("3.142"));
-    assertEval(Decimal128("3.14159265"), 4, Decimal128("3.1416"));
-    assertEval(Decimal128("3.14159265"), Decimal128("5"), Decimal128("3.14159"));
-    assertEval(Decimal128("3.14159265"), 6, Decimal128("3.141593"));
-    assertEval(Decimal128("3.14159265"), 7, Decimal128("3.1415926"));
-    assertEval(Decimal128("3.14159265"), 100, Decimal128("3.14159265"));
-    assertEval(Decimal128("3.14159265"), Decimal128("-1"), Decimal128("0"));
-    assertEval(Decimal128("335.14159265"), -1, Decimal128("340"));
-    assertEval(Decimal128("333.14159265"), -2, Decimal128("300"));
-}
-
-TEST_F(ExpressionRoundOneArgTest, NullArg1) {
-    assertEval(BSONNULL, BSONNULL);
-}
-
-TEST_F(ExpressionRoundTwoArgTest, NullArg2) {
-    assertEval(BSONNULL, BSONNULL, BSONNULL);
-    assertEval(1, BSONNULL, BSONNULL);
-    assertEval(BSONNULL, 1, BSONNULL);
-}
-
-/* ------------------------- ExpressionTrunc -------------------------- */
-
-class ExpressionTruncOneArgTest : public ExpressionNaryTestOneArg {
-public:
-    void assertEval(ImplicitValue input, ImplicitValue output) {
-        intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-        _expr = new ExpressionTrunc(expCtx);
-        ExpressionNaryTestOneArg::assertEvaluates(input, output);
-    }
-};
-
-class ExpressionTruncTwoArgTest : public ExpressionNaryTestTwoArg {
-public:
-    void assertEval(ImplicitValue input1, ImplicitValue input2, ImplicitValue output) {
-        intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-        _expr = new ExpressionTrunc(expCtx);
-        ExpressionNaryTestTwoArg::assertEvaluates(input1, input2, output);
-    }
-};
-
-TEST_F(ExpressionTruncOneArgTest, IntArg1) {
-    assertEval(0, 0);
-    assertEval(numeric_limits<int>::min(), numeric_limits<int>::min());
-    assertEval(numeric_limits<int>::max(), numeric_limits<int>::max());
-}
-
-TEST_F(ExpressionTruncTwoArgTest, IntArg2) {
-    assertEval(0, 0, 0);
-    assertEval(2, -1, 0);
-    assertEval(29, -1, 20);
-    assertEval(numeric_limits<int>::min(), 10, numeric_limits<int>::min());
-    assertEval(numeric_limits<int>::max(), 42, numeric_limits<int>::max());
-}
-
-TEST_F(ExpressionTruncOneArgTest, LongArg1) {
-    assertEval(0LL, 0LL);
-    assertEval(numeric_limits<long long>::min(), numeric_limits<long long>::min());
-    assertEval(numeric_limits<long long>::max(), numeric_limits<long long>::max());
-}
-
-TEST_F(ExpressionTruncTwoArgTest, LongArg2) {
-    assertEval(0LL, 0LL, 0LL);
-    assertEval(2LL, -1LL, 0LL);
-    assertEval(29LL, -1LL, 20LL);
-    assertEval(numeric_limits<long long>::min(), 10LL, numeric_limits<long long>::min());
-    assertEval(numeric_limits<long long>::max(), 42LL, numeric_limits<long long>::max());
-}
-
-TEST_F(ExpressionTruncOneArgTest, DoubleArg1) {
-    assertEval(2.0, 2.0);
-    assertEval(-2.0, -2.0);
-    assertEval(0.9, 0.0);
-    assertEval(0.1, 0.0);
-    assertEval(-1.2, -1.0);
-    assertEval(-1.7, -1.0);
-
-    // Outside the range of long longs (there isn't enough precision for decimals in this range, so
-    // should just preserve the number).
-    double largerThanLong = numeric_limits<long long>::max() * 2.0;
-    assertEval(largerThanLong, largerThanLong);
-    double smallerThanLong = numeric_limits<long long>::min() * 2.0;
-    assertEval(smallerThanLong, smallerThanLong);
-}
-
-TEST_F(ExpressionTruncTwoArgTest, DoubleArg2) {
-    assertEval(2.0, 1.0, 2.0);
-    assertEval(-2.0, 2.0, -2.0);
-    assertEval(0.9, 0, 0.0);
-    assertEval(0.1, 0, 0.0);
-    assertEval(-1.2, 0, -1.0);
-    assertEval(-1.7, 0, -1.0);
-
-
-    assertEval(-3.14159265, 0, -3.0);
-    assertEval(-3.14159265, 1, -3.1);
-    assertEval(-3.14159265, 2, -3.14);
-    assertEval(-3.14159265, 3, -3.141);
-    assertEval(-3.14159265, 4, -3.1415);
-    assertEval(-3.14159265, 5, -3.14159);
-    assertEval(-3.14159265, 6, -3.141592);
-    assertEval(-3.14159265, 7, -3.1415926);
-    assertEval(-3.14159265, 100, -3.14159265);
-    assertEval(3.14159265, 0, 3.0);
-    assertEval(3.14159265, 1, 3.1);
-    assertEval(3.14159265, 2, 3.14);
-    assertEval(3.14159265, 3, 3.141);
-    assertEval(3.14159265, 4, 3.1415);
-    assertEval(3.14159265, 5, 3.14159);
-    assertEval(3.14159265, 6, 3.141592);
-    assertEval(3.14159265, 7, 3.1415926);
-    assertEval(3.14159265, 100, 3.14159265);
-    assertEval(3.14159265, -1, 0.0);
-    assertEval(335.14159265, -1, 330.0);
-    assertEval(333.14159265, -2, 300.0);
-}
-
-TEST_F(ExpressionTruncOneArgTest, DecimalArg1) {
-    assertEval(Decimal128("2"), Decimal128("2.0"));
-    assertEval(Decimal128("-2"), Decimal128("-2.0"));
-    assertEval(Decimal128("0.9"), Decimal128("0.0"));
-    assertEval(Decimal128("0.1"), Decimal128("0.0"));
-    assertEval(Decimal128("-1.2"), Decimal128("-1.0"));
-    assertEval(Decimal128("-1.7"), Decimal128("-1.0"));
-    assertEval(Decimal128("123456789.9999999999999999999999999"), Decimal128("123456789"));
-    assertEval(Decimal128("-99999999999999999999999999999.99"),
-               Decimal128("-99999999999999999999999999999.00"));
-    assertEval(Decimal128("3.4E-6000"), Decimal128("0"));
-}
-
-TEST_F(ExpressionTruncTwoArgTest, DecimalArg2) {
-    assertEval(Decimal128("2"), 0, Decimal128("2.0"));
-    assertEval(Decimal128("-2"), 0, Decimal128("-2.0"));
-    assertEval(Decimal128("0.9"), 0, Decimal128("0.0"));
-    assertEval(Decimal128("0.1"), 0, Decimal128("0.0"));
-    assertEval(Decimal128("-1.2"), 0, Decimal128("-1.0"));
-    assertEval(Decimal128("-1.7"), 0, Decimal128("-1.0"));
-    assertEval(Decimal128("123456789.9999999999999999999999999"), 0, Decimal128("123456789"));
-    assertEval(Decimal128("-99999999999999999999999999999.99"),
-               0,
-               Decimal128("-99999999999999999999999999999.00"));
-    assertEval(Decimal128("3.4E-6000"), 0, Decimal128("0"));
-
-    assertEval(Decimal128("-3.14159265"), 0, Decimal128("-3.0"));
-    assertEval(Decimal128("-3.14159265"), 1, Decimal128("-3.1"));
-    assertEval(Decimal128("-3.14159265"), 2, Decimal128("-3.14"));
-    assertEval(Decimal128("-3.14159265"), 3, Decimal128("-3.141"));
-    assertEval(Decimal128("-3.14159265"), 4, Decimal128("-3.1415"));
-    assertEval(Decimal128("-3.14159265"), 5, Decimal128("-3.14159"));
-    assertEval(Decimal128("-3.14159265"), 6, Decimal128("-3.141592"));
-    assertEval(Decimal128("-3.14159265"), 7, Decimal128("-3.1415926"));
-    assertEval(Decimal128("-3.14159265"), 100, Decimal128("-3.14159265"));
-    assertEval(Decimal128("3.14159265"), 0, Decimal128("3.0"));
-    assertEval(Decimal128("3.14159265"), 1, Decimal128("3.1"));
-    assertEval(Decimal128("3.14159265"), 2, Decimal128("3.14"));
-    assertEval(Decimal128("3.14159265"), Decimal128("3"), Decimal128("3.141"));
-    assertEval(Decimal128("3.14159265"), 4, Decimal128("3.1415"));
-    assertEval(Decimal128("3.14159265"), Decimal128("5"), Decimal128("3.14159"));
-    assertEval(Decimal128("3.14159265"), 6, Decimal128("3.141592"));
-    assertEval(Decimal128("3.14159265"), 7, Decimal128("3.1415926"));
-    assertEval(Decimal128("3.14159265"), 100, Decimal128("3.14159265"));
-    assertEval(Decimal128("3.14159265"), Decimal128("-1"), Decimal128("0"));
-    assertEval(Decimal128("335.14159265"), -1, Decimal128("330"));
-    assertEval(Decimal128("333.14159265"), -2, Decimal128("300"));
-}
-
-TEST_F(ExpressionTruncOneArgTest, NullArg1) {
-    assertEval((BSONNULL), (BSONNULL));
-}
-
-TEST_F(ExpressionTruncTwoArgTest, NullArg2) {
-    assertEval((BSONNULL), (BSONNULL), (BSONNULL));
-    assertEval((1), (BSONNULL), (BSONNULL));
-    assertEval((BSONNULL), (1), (BSONNULL));
-}
-
-/* ------------------------- ExpressionSqrt -------------------------- */
-
-class ExpressionSqrtTest : public ExpressionNaryTestOneArg {
-public:
-    virtual void assertEvaluates(Value input, Value output) override {
-        intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-        _expr = new ExpressionSqrt(expCtx);
-        ExpressionNaryTestOneArg::assertEvaluates(input, output);
-    }
-};
-
-TEST_F(ExpressionSqrtTest, SqrtIntArg) {
-    assertEvaluates(Value(0), Value(0.0));
-    assertEvaluates(Value(1), Value(1.0));
-    assertEvaluates(Value(25), Value(5.0));
-}
-
-TEST_F(ExpressionSqrtTest, SqrtLongArg) {
-    assertEvaluates(Value(0LL), Value(0.0));
-    assertEvaluates(Value(1LL), Value(1.0));
-    assertEvaluates(Value(25LL), Value(5.0));
-    assertEvaluates(Value(40000000000LL), Value(200000.0));
-}
-
-TEST_F(ExpressionSqrtTest, SqrtDoubleArg) {
-    assertEvaluates(Value(0.0), Value(0.0));
-    assertEvaluates(Value(1.0), Value(1.0));
-    assertEvaluates(Value(25.0), Value(5.0));
-}
-
-TEST_F(ExpressionSqrtTest, SqrtDecimalArg) {
-    assertEvaluates(Value(Decimal128("0")), Value(Decimal128("0")));
-    assertEvaluates(Value(Decimal128("1")), Value(Decimal128("1")));
-    assertEvaluates(Value(Decimal128("25")), Value(Decimal128("5")));
-    assertEvaluates(Value(Decimal128("30.25")), Value(Decimal128("5.5")));
-}
-
-TEST_F(ExpressionSqrtTest, SqrtNullArg) {
-    assertEvaluates(Value(BSONNULL), Value(BSONNULL));
-}
-
-TEST_F(ExpressionSqrtTest, SqrtNaNArg) {
-    assertEvaluates(Value(std::numeric_limits<double>::quiet_NaN()),
-                    Value(std::numeric_limits<double>::quiet_NaN()));
-}
-
-/* ------------------------- ExpressionExp -------------------------- */
-
-class ExpressionExpTest : public ExpressionNaryTestOneArg {
-public:
-    virtual void assertEvaluates(Value input, Value output) override {
-        intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-        _expr = new ExpressionExp(expCtx);
-        ExpressionNaryTestOneArg::assertEvaluates(input, output);
-    }
-
-    const Decimal128 decimalE = Decimal128("2.718281828459045235360287471352662");
-};
-
-TEST_F(ExpressionExpTest, ExpIntArg) {
-    assertEvaluates(Value(0), Value(1.0));
-    assertEvaluates(Value(1), Value(exp(1.0)));
-}
-
-TEST_F(ExpressionExpTest, ExpLongArg) {
-    assertEvaluates(Value(0LL), Value(1.0));
-    assertEvaluates(Value(1LL), Value(exp(1.0)));
-}
-
-TEST_F(ExpressionExpTest, ExpDoubleArg) {
-    assertEvaluates(Value(0.0), Value(1.0));
-    assertEvaluates(Value(1.0), Value(exp(1.0)));
-}
-
-TEST_F(ExpressionExpTest, ExpDecimalArg) {
-    assertEvaluates(Value(Decimal128("0")), Value(Decimal128("1")));
-    assertEvaluates(Value(Decimal128("1")), Value(decimalE));
-}
-
-TEST_F(ExpressionExpTest, ExpNullArg) {
-    assertEvaluates(Value(BSONNULL), Value(BSONNULL));
-}
-
-TEST_F(ExpressionExpTest, ExpNaNArg) {
-    assertEvaluates(Value(std::numeric_limits<double>::quiet_NaN()),
-                    Value(std::numeric_limits<double>::quiet_NaN()));
-}
-
 /* ------------------------- Old-style tests -------------------------- */
 
 namespace Add {
@@ -1349,7 +248,7 @@ public:
         intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
         intrusive_ptr<ExpressionNary> expression = new ExpressionAdd(expCtx);
         populateOperands(expression);
-        ASSERT_BSONOBJ_EQ(expectedResult(), toBson(expression->evaluate(Document())));
+        ASSERT_BSONOBJ_EQ(expectedResult(), toBson(expression->evaluate({}, &expCtx->variables)));
     }
 
 protected:
@@ -1365,7 +264,7 @@ public:
         intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
         intrusive_ptr<ExpressionNary> expression = new ExpressionAdd(expCtx);
         expression->addOperand(ExpressionConstant::create(expCtx, Value(2)));
-        ASSERT_BSONOBJ_EQ(BSON("" << 2), toBson(expression->evaluate(Document())));
+        ASSERT_BSONOBJ_EQ(BSON("" << 2), toBson(expression->evaluate({}, &expCtx->variables)));
     }
 };
 
@@ -1384,7 +283,7 @@ public:
         intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
         intrusive_ptr<ExpressionNary> expression = new ExpressionAdd(expCtx);
         expression->addOperand(ExpressionConstant::create(expCtx, Value("a"_sd)));
-        ASSERT_THROWS(expression->evaluate(Document()), AssertionException);
+        ASSERT_THROWS(expression->evaluate({}, &expCtx->variables), AssertionException);
     }
 };
 
@@ -1395,7 +294,7 @@ public:
         intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
         intrusive_ptr<ExpressionNary> expression = new ExpressionAdd(expCtx);
         expression->addOperand(ExpressionConstant::create(expCtx, Value(true)));
-        ASSERT_THROWS(expression->evaluate(Document()), AssertionException);
+        ASSERT_THROWS(expression->evaluate({}, &expCtx->variables), AssertionException);
     }
 };
 
@@ -1622,304 +521,6 @@ class LongUndefined : public TwoOperandBase {
 
 }  // namespace Add
 
-namespace And {
-
-class ExpectedResultBase {
-public:
-    virtual ~ExpectedResultBase() {}
-    void run() {
-        intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-        BSONObj specObject = BSON("" << spec());
-        BSONElement specElement = specObject.firstElement();
-        VariablesParseState vps = expCtx->variablesParseState;
-        intrusive_ptr<Expression> expression = Expression::parseOperand(expCtx, specElement, vps);
-        ASSERT_BSONOBJ_EQ(constify(spec()), expressionToBson(expression));
-        ASSERT_BSONOBJ_EQ(BSON("" << expectedResult()),
-                          toBson(expression->evaluate(fromBson(BSON("a" << 1)))));
-        intrusive_ptr<Expression> optimized = expression->optimize();
-        ASSERT_BSONOBJ_EQ(BSON("" << expectedResult()),
-                          toBson(optimized->evaluate(fromBson(BSON("a" << 1)))));
-    }
-
-protected:
-    virtual BSONObj spec() = 0;
-    virtual bool expectedResult() = 0;
-};
-
-class OptimizeBase {
-public:
-    virtual ~OptimizeBase() {}
-    void run() {
-        intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-        BSONObj specObject = BSON("" << spec());
-        BSONElement specElement = specObject.firstElement();
-        VariablesParseState vps = expCtx->variablesParseState;
-        intrusive_ptr<Expression> expression = Expression::parseOperand(expCtx, specElement, vps);
-        ASSERT_BSONOBJ_EQ(constify(spec()), expressionToBson(expression));
-        intrusive_ptr<Expression> optimized = expression->optimize();
-        ASSERT_BSONOBJ_EQ(expectedOptimized(), expressionToBson(optimized));
-    }
-
-protected:
-    virtual BSONObj spec() = 0;
-    virtual BSONObj expectedOptimized() = 0;
-};
-
-class NoOptimizeBase : public OptimizeBase {
-    BSONObj expectedOptimized() {
-        return constify(spec());
-    }
-};
-
-/** $and without operands. */
-class NoOperands : public ExpectedResultBase {
-    BSONObj spec() {
-        return BSON("$and" << BSONArray());
-    }
-    bool expectedResult() {
-        return true;
-    }
-};
-
-/** $and passed 'true'. */
-class True : public ExpectedResultBase {
-    BSONObj spec() {
-        return BSON("$and" << BSON_ARRAY(true));
-    }
-    bool expectedResult() {
-        return true;
-    }
-};
-
-/** $and passed 'false'. */
-class False : public ExpectedResultBase {
-    BSONObj spec() {
-        return BSON("$and" << BSON_ARRAY(false));
-    }
-    bool expectedResult() {
-        return false;
-    }
-};
-
-/** $and passed 'true', 'true'. */
-class TrueTrue : public ExpectedResultBase {
-    BSONObj spec() {
-        return BSON("$and" << BSON_ARRAY(true << true));
-    }
-    bool expectedResult() {
-        return true;
-    }
-};
-
-/** $and passed 'true', 'false'. */
-class TrueFalse : public ExpectedResultBase {
-    BSONObj spec() {
-        return BSON("$and" << BSON_ARRAY(true << false));
-    }
-    bool expectedResult() {
-        return false;
-    }
-};
-
-/** $and passed 'false', 'true'. */
-class FalseTrue : public ExpectedResultBase {
-    BSONObj spec() {
-        return BSON("$and" << BSON_ARRAY(false << true));
-    }
-    bool expectedResult() {
-        return false;
-    }
-};
-
-/** $and passed 'false', 'false'. */
-class FalseFalse : public ExpectedResultBase {
-    BSONObj spec() {
-        return BSON("$and" << BSON_ARRAY(false << false));
-    }
-    bool expectedResult() {
-        return false;
-    }
-};
-
-/** $and passed 'true', 'true', 'true'. */
-class TrueTrueTrue : public ExpectedResultBase {
-    BSONObj spec() {
-        return BSON("$and" << BSON_ARRAY(true << true << true));
-    }
-    bool expectedResult() {
-        return true;
-    }
-};
-
-/** $and passed 'true', 'true', 'false'. */
-class TrueTrueFalse : public ExpectedResultBase {
-    BSONObj spec() {
-        return BSON("$and" << BSON_ARRAY(true << true << false));
-    }
-    bool expectedResult() {
-        return false;
-    }
-};
-
-/** $and passed '0', '1'. */
-class ZeroOne : public ExpectedResultBase {
-    BSONObj spec() {
-        return BSON("$and" << BSON_ARRAY(0 << 1));
-    }
-    bool expectedResult() {
-        return false;
-    }
-};
-
-/** $and passed '1', '2'. */
-class OneTwo : public ExpectedResultBase {
-    BSONObj spec() {
-        return BSON("$and" << BSON_ARRAY(1 << 2));
-    }
-    bool expectedResult() {
-        return true;
-    }
-};
-
-/** $and passed a field path. */
-class FieldPath : public ExpectedResultBase {
-    BSONObj spec() {
-        return BSON("$and" << BSON_ARRAY("$a"));
-    }
-    bool expectedResult() {
-        return true;
-    }
-};
-
-/** A constant expression is optimized to a constant. */
-class OptimizeConstantExpression : public OptimizeBase {
-    BSONObj spec() {
-        return BSON("$and" << BSON_ARRAY(1));
-    }
-    BSONObj expectedOptimized() {
-        return BSON("$const" << true);
-    }
-};
-
-/** A non constant expression is not optimized. */
-class NonConstant : public NoOptimizeBase {
-    BSONObj spec() {
-        return BSON("$and" << BSON_ARRAY("$a"));
-    }
-};
-
-/** An expression beginning with a single constant is optimized. */
-class ConstantNonConstantTrue : public OptimizeBase {
-    BSONObj spec() {
-        return BSON("$and" << BSON_ARRAY(1 << "$a"));
-    }
-    BSONObj expectedOptimized() {
-        return BSON("$and" << BSON_ARRAY("$a"));
-    }
-    // note: using $and as serialization of ExpressionCoerceToBool rather than
-    // ExpressionAnd
-};
-
-class ConstantNonConstantFalse : public OptimizeBase {
-    BSONObj spec() {
-        return BSON("$and" << BSON_ARRAY(0 << "$a"));
-    }
-    BSONObj expectedOptimized() {
-        return BSON("$const" << false);
-    }
-};
-
-/** An expression with a field path and '1'. */
-class NonConstantOne : public OptimizeBase {
-    BSONObj spec() {
-        return BSON("$and" << BSON_ARRAY("$a" << 1));
-    }
-    BSONObj expectedOptimized() {
-        return BSON("$and" << BSON_ARRAY("$a"));
-    }
-};
-
-/** An expression with a field path and '0'. */
-class NonConstantZero : public OptimizeBase {
-    BSONObj spec() {
-        return BSON("$and" << BSON_ARRAY("$a" << 0));
-    }
-    BSONObj expectedOptimized() {
-        return BSON("$const" << false);
-    }
-};
-
-/** An expression with two field paths and '1'. */
-class NonConstantNonConstantOne : public OptimizeBase {
-    BSONObj spec() {
-        return BSON("$and" << BSON_ARRAY("$a"
-                                         << "$b"
-                                         << 1));
-    }
-    BSONObj expectedOptimized() {
-        return BSON("$and" << BSON_ARRAY("$a"
-                                         << "$b"));
-    }
-};
-
-/** An expression with two field paths and '0'. */
-class NonConstantNonConstantZero : public OptimizeBase {
-    BSONObj spec() {
-        return BSON("$and" << BSON_ARRAY("$a"
-                                         << "$b"
-                                         << 0));
-    }
-    BSONObj expectedOptimized() {
-        return BSON("$const" << false);
-    }
-};
-
-/** An expression with '0', '1', and a field path. */
-class ZeroOneNonConstant : public OptimizeBase {
-    BSONObj spec() {
-        return BSON("$and" << BSON_ARRAY(0 << 1 << "$a"));
-    }
-    BSONObj expectedOptimized() {
-        return BSON("$const" << false);
-    }
-};
-
-/** An expression with '1', '1', and a field path. */
-class OneOneNonConstant : public OptimizeBase {
-    BSONObj spec() {
-        return BSON("$and" << BSON_ARRAY(1 << 1 << "$a"));
-    }
-    BSONObj expectedOptimized() {
-        return BSON("$and" << BSON_ARRAY("$a"));
-    }
-};
-
-/** Nested $and expressions. */
-class Nested : public OptimizeBase {
-    BSONObj spec() {
-        return BSON("$and" << BSON_ARRAY(1 << BSON("$and" << BSON_ARRAY(1)) << "$a"
-                                           << "$b"));
-    }
-    BSONObj expectedOptimized() {
-        return BSON("$and" << BSON_ARRAY("$a"
-                                         << "$b"));
-    }
-};
-
-/** Nested $and expressions containing a nested value evaluating to false. */
-class NestedZero : public OptimizeBase {
-    BSONObj spec() {
-        return BSON("$and" << BSON_ARRAY(
-                        1 << BSON("$and" << BSON_ARRAY(BSON("$and" << BSON_ARRAY(0)))) << "$a"
-                          << "$b"));
-    }
-    BSONObj expectedOptimized() {
-        return BSON("$const" << false);
-    }
-};
-
-}  // namespace And
-
 namespace CoerceToBool {
 
 /** Nested expression coerced to true. */
@@ -1929,7 +530,7 @@ public:
         intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
         intrusive_ptr<Expression> nested = ExpressionConstant::create(expCtx, Value(5));
         intrusive_ptr<Expression> expression = ExpressionCoerceToBool::create(expCtx, nested);
-        ASSERT(expression->evaluate(Document()).getBool());
+        ASSERT(expression->evaluate({}, &expCtx->variables).getBool());
     }
 };
 
@@ -1940,7 +541,7 @@ public:
         intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
         intrusive_ptr<Expression> nested = ExpressionConstant::create(expCtx, Value(0));
         intrusive_ptr<Expression> expression = ExpressionCoerceToBool::create(expCtx, nested);
-        ASSERT(!expression->evaluate(Document()).getBool());
+        ASSERT(!expression->evaluate({}, &expCtx->variables).getBool());
     }
 };
 
@@ -1956,7 +557,7 @@ public:
         ASSERT_EQUALS(1U, dependencies.fields.size());
         ASSERT_EQUALS(1U, dependencies.fields.count("a.b"));
         ASSERT_EQUALS(false, dependencies.needWholeDocument);
-        ASSERT_EQUALS(false, dependencies.getNeedsMetadata(DepsTracker::MetadataType::TEXT_SCORE));
+        ASSERT_EQUALS(false, dependencies.getNeedsAnyMetadata());
     }
 };
 
@@ -2003,416 +604,6 @@ private:
 
 }  // namespace CoerceToBool
 
-namespace Compare {
-
-class OptimizeBase {
-public:
-    virtual ~OptimizeBase() {}
-    void run() {
-        BSONObj specObject = BSON("" << spec());
-        BSONElement specElement = specObject.firstElement();
-        intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-        VariablesParseState vps = expCtx->variablesParseState;
-        intrusive_ptr<Expression> expression = Expression::parseOperand(expCtx, specElement, vps);
-        intrusive_ptr<Expression> optimized = expression->optimize();
-        ASSERT_BSONOBJ_EQ(constify(expectedOptimized()), expressionToBson(optimized));
-    }
-
-protected:
-    virtual BSONObj spec() = 0;
-    virtual BSONObj expectedOptimized() = 0;
-};
-
-class FieldRangeOptimize : public OptimizeBase {
-    BSONObj expectedOptimized() {
-        return spec();
-    }
-};
-
-class NoOptimize : public OptimizeBase {
-    BSONObj expectedOptimized() {
-        return spec();
-    }
-};
-
-/** Check expected result for expressions depending on constants. */
-class ExpectedResultBase : public OptimizeBase {
-public:
-    void run() {
-        OptimizeBase::run();
-        BSONObj specObject = BSON("" << spec());
-        BSONElement specElement = specObject.firstElement();
-        intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-        VariablesParseState vps = expCtx->variablesParseState;
-        intrusive_ptr<Expression> expression = Expression::parseOperand(expCtx, specElement, vps);
-        // Check expression spec round trip.
-        ASSERT_BSONOBJ_EQ(constify(spec()), expressionToBson(expression));
-        // Check evaluation result.
-        ASSERT_BSONOBJ_EQ(expectedResult(), toBson(expression->evaluate(Document())));
-        // Check that the result is the same after optimizing.
-        intrusive_ptr<Expression> optimized = expression->optimize();
-        ASSERT_BSONOBJ_EQ(expectedResult(), toBson(optimized->evaluate(Document())));
-    }
-
-protected:
-    virtual BSONObj spec() = 0;
-    virtual BSONObj expectedResult() = 0;
-
-private:
-    virtual BSONObj expectedOptimized() {
-        return BSON("$const" << expectedResult().firstElement());
-    }
-};
-
-class ExpectedTrue : public ExpectedResultBase {
-    BSONObj expectedResult() {
-        return BSON("" << true);
-    }
-};
-
-class ExpectedFalse : public ExpectedResultBase {
-    BSONObj expectedResult() {
-        return BSON("" << false);
-    }
-};
-
-class ParseError {
-public:
-    virtual ~ParseError() {}
-    void run() {
-        intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-        BSONObj specObject = BSON("" << spec());
-        BSONElement specElement = specObject.firstElement();
-        VariablesParseState vps = expCtx->variablesParseState;
-        ASSERT_THROWS(Expression::parseOperand(expCtx, specElement, vps), AssertionException);
-    }
-
-protected:
-    virtual BSONObj spec() = 0;
-};
-
-/** $eq with first < second. */
-class EqLt : public ExpectedFalse {
-    BSONObj spec() {
-        return BSON("$eq" << BSON_ARRAY(1 << 2));
-    }
-};
-
-/** $eq with first == second. */
-class EqEq : public ExpectedTrue {
-    BSONObj spec() {
-        return BSON("$eq" << BSON_ARRAY(1 << 1));
-    }
-};
-
-/** $eq with first > second. */
-class EqGt : public ExpectedFalse {
-    BSONObj spec() {
-        return BSON("$eq" << BSON_ARRAY(1 << 0));
-    }
-};
-
-/** $ne with first < second. */
-class NeLt : public ExpectedTrue {
-    BSONObj spec() {
-        return BSON("$ne" << BSON_ARRAY(1 << 2));
-    }
-};
-
-/** $ne with first == second. */
-class NeEq : public ExpectedFalse {
-    BSONObj spec() {
-        return BSON("$ne" << BSON_ARRAY(1 << 1));
-    }
-};
-
-/** $ne with first > second. */
-class NeGt : public ExpectedTrue {
-    BSONObj spec() {
-        return BSON("$ne" << BSON_ARRAY(1 << 0));
-    }
-};
-
-/** $gt with first < second. */
-class GtLt : public ExpectedFalse {
-    BSONObj spec() {
-        return BSON("$gt" << BSON_ARRAY(1 << 2));
-    }
-};
-
-/** $gt with first == second. */
-class GtEq : public ExpectedFalse {
-    BSONObj spec() {
-        return BSON("$gt" << BSON_ARRAY(1 << 1));
-    }
-};
-
-/** $gt with first > second. */
-class GtGt : public ExpectedTrue {
-    BSONObj spec() {
-        return BSON("$gt" << BSON_ARRAY(1 << 0));
-    }
-};
-
-/** $gte with first < second. */
-class GteLt : public ExpectedFalse {
-    BSONObj spec() {
-        return BSON("$gte" << BSON_ARRAY(1 << 2));
-    }
-};
-
-/** $gte with first == second. */
-class GteEq : public ExpectedTrue {
-    BSONObj spec() {
-        return BSON("$gte" << BSON_ARRAY(1 << 1));
-    }
-};
-
-/** $gte with first > second. */
-class GteGt : public ExpectedTrue {
-    BSONObj spec() {
-        return BSON("$gte" << BSON_ARRAY(1 << 0));
-    }
-};
-
-/** $lt with first < second. */
-class LtLt : public ExpectedTrue {
-    BSONObj spec() {
-        return BSON("$lt" << BSON_ARRAY(1 << 2));
-    }
-};
-
-/** $lt with first == second. */
-class LtEq : public ExpectedFalse {
-    BSONObj spec() {
-        return BSON("$lt" << BSON_ARRAY(1 << 1));
-    }
-};
-
-/** $lt with first > second. */
-class LtGt : public ExpectedFalse {
-    BSONObj spec() {
-        return BSON("$lt" << BSON_ARRAY(1 << 0));
-    }
-};
-
-/** $lte with first < second. */
-class LteLt : public ExpectedTrue {
-    BSONObj spec() {
-        return BSON("$lte" << BSON_ARRAY(1 << 2));
-    }
-};
-
-/** $lte with first == second. */
-class LteEq : public ExpectedTrue {
-    BSONObj spec() {
-        return BSON("$lte" << BSON_ARRAY(1 << 1));
-    }
-};
-
-/** $lte with first > second. */
-class LteGt : public ExpectedFalse {
-    BSONObj spec() {
-        return BSON("$lte" << BSON_ARRAY(1 << 0));
-    }
-};
-
-/** $cmp with first < second. */
-class CmpLt : public ExpectedResultBase {
-    BSONObj spec() {
-        return BSON("$cmp" << BSON_ARRAY(1 << 2));
-    }
-    BSONObj expectedResult() {
-        return BSON("" << -1);
-    }
-};
-
-/** $cmp with first == second. */
-class CmpEq : public ExpectedResultBase {
-    BSONObj spec() {
-        return BSON("$cmp" << BSON_ARRAY(1 << 1));
-    }
-    BSONObj expectedResult() {
-        return BSON("" << 0);
-    }
-};
-
-/** $cmp with first > second. */
-class CmpGt : public ExpectedResultBase {
-    BSONObj spec() {
-        return BSON("$cmp" << BSON_ARRAY(1 << 0));
-    }
-    BSONObj expectedResult() {
-        return BSON("" << 1);
-    }
-};
-
-/** $cmp results are bracketed to an absolute value of 1. */
-class CmpBracketed : public ExpectedResultBase {
-    BSONObj spec() {
-        return BSON("$cmp" << BSON_ARRAY("z"
-                                         << "a"));
-    }
-    BSONObj expectedResult() {
-        return BSON("" << 1);
-    }
-};
-
-/** Zero operands provided. */
-class ZeroOperands : public ParseError {
-    BSONObj spec() {
-        return BSON("$ne" << BSONArray());
-    }
-};
-
-/** One operand provided. */
-class OneOperand : public ParseError {
-    BSONObj spec() {
-        return BSON("$eq" << BSON_ARRAY(1));
-    }
-};
-
-/** Three operands provided. */
-class ThreeOperands : public ParseError {
-    BSONObj spec() {
-        return BSON("$gt" << BSON_ARRAY(2 << 3 << 4));
-    }
-};
-
-/** Incompatible types can be compared. */
-class IncompatibleTypes {
-public:
-    void run() {
-        BSONObj specObject = BSON("" << BSON("$ne" << BSON_ARRAY("a" << 1)));
-        BSONElement specElement = specObject.firstElement();
-        intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-        VariablesParseState vps = expCtx->variablesParseState;
-        intrusive_ptr<Expression> expression = Expression::parseOperand(expCtx, specElement, vps);
-        ASSERT_VALUE_EQ(expression->evaluate(Document()), Value(true));
-    }
-};
-
-/**
- * An expression depending on constants is optimized to a constant via
- * ExpressionNary::optimize().
- */
-class OptimizeConstants : public OptimizeBase {
-    BSONObj spec() {
-        return BSON("$eq" << BSON_ARRAY(1 << 1));
-    }
-    BSONObj expectedOptimized() {
-        return BSON("$const" << true);
-    }
-};
-
-/** $cmp is not optimized. */
-class NoOptimizeCmp : public NoOptimize {
-    BSONObj spec() {
-        return BSON("$cmp" << BSON_ARRAY(1 << "$a"));
-    }
-};
-
-/** $ne is not optimized. */
-class NoOptimizeNe : public NoOptimize {
-    BSONObj spec() {
-        return BSON("$ne" << BSON_ARRAY(1 << "$a"));
-    }
-};
-
-/** No optimization is performend without a constant. */
-class NoOptimizeNoConstant : public NoOptimize {
-    BSONObj spec() {
-        return BSON("$ne" << BSON_ARRAY("$a"
-                                        << "$b"));
-    }
-};
-
-/** No optimization is performend without an immediate field path. */
-class NoOptimizeWithoutFieldPath : public NoOptimize {
-    BSONObj spec() {
-        return BSON("$eq" << BSON_ARRAY(BSON("$and" << BSON_ARRAY("$a")) << 1));
-    }
-};
-
-/** No optimization is performend without an immediate field path. */
-class NoOptimizeWithoutFieldPathReverse : public NoOptimize {
-    BSONObj spec() {
-        return BSON("$eq" << BSON_ARRAY(1 << BSON("$and" << BSON_ARRAY("$a"))));
-    }
-};
-
-/** An equality expression is optimized. */
-class OptimizeEq : public FieldRangeOptimize {
-    BSONObj spec() {
-        return BSON("$eq" << BSON_ARRAY("$a" << 1));
-    }
-};
-
-/** A reverse sense equality expression is optimized. */
-class OptimizeEqReverse : public FieldRangeOptimize {
-    BSONObj spec() {
-        return BSON("$eq" << BSON_ARRAY(1 << "$a"));
-    }
-};
-
-/** A $lt expression is optimized. */
-class OptimizeLt : public FieldRangeOptimize {
-    BSONObj spec() {
-        return BSON("$lt" << BSON_ARRAY("$a" << 1));
-    }
-};
-
-/** A reverse sense $lt expression is optimized. */
-class OptimizeLtReverse : public FieldRangeOptimize {
-    BSONObj spec() {
-        return BSON("$lt" << BSON_ARRAY(1 << "$a"));
-    }
-};
-
-/** A $lte expression is optimized. */
-class OptimizeLte : public FieldRangeOptimize {
-    BSONObj spec() {
-        return BSON("$lte" << BSON_ARRAY("$b" << 2));
-    }
-};
-
-/** A reverse sense $lte expression is optimized. */
-class OptimizeLteReverse : public FieldRangeOptimize {
-    BSONObj spec() {
-        return BSON("$lte" << BSON_ARRAY(2 << "$b"));
-    }
-};
-
-/** A $gt expression is optimized. */
-class OptimizeGt : public FieldRangeOptimize {
-    BSONObj spec() {
-        return BSON("$gt" << BSON_ARRAY("$b" << 2));
-    }
-};
-
-/** A reverse sense $gt expression is optimized. */
-class OptimizeGtReverse : public FieldRangeOptimize {
-    BSONObj spec() {
-        return BSON("$gt" << BSON_ARRAY(2 << "$b"));
-    }
-};
-
-/** A $gte expression is optimized. */
-class OptimizeGte : public FieldRangeOptimize {
-    BSONObj spec() {
-        return BSON("$gte" << BSON_ARRAY("$b" << 2));
-    }
-};
-
-/** A reverse sense $gte expression is optimized. */
-class OptimizeGteReverse : public FieldRangeOptimize {
-    BSONObj spec() {
-        return BSON("$gte" << BSON_ARRAY(2 << "$b"));
-    }
-};
-
-}  // namespace Compare
-
 namespace Constant {
 
 /** Create an ExpressionConstant from a Value. */
@@ -2421,7 +612,7 @@ public:
     void run() {
         intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
         intrusive_ptr<Expression> expression = ExpressionConstant::create(expCtx, Value(5));
-        assertBinaryEqual(BSON("" << 5), toBson(expression->evaluate(Document())));
+        assertBinaryEqual(BSON("" << 5), toBson(expression->evaluate({}, &expCtx->variables)));
     }
 };
 
@@ -2437,7 +628,7 @@ public:
         intrusive_ptr<Expression> expression = ExpressionConstant::parse(expCtx, specElement, vps);
         assertBinaryEqual(BSON(""
                                << "foo"),
-                          toBson(expression->evaluate(Document())));
+                          toBson(expression->evaluate({}, &expCtx->variables)));
     }
 };
 
@@ -2462,7 +653,7 @@ public:
         expression->addDependencies(&dependencies);
         ASSERT_EQUALS(0U, dependencies.fields.size());
         ASSERT_EQUALS(false, dependencies.needWholeDocument);
-        ASSERT_EQUALS(false, dependencies.getNeedsMetadata(DepsTracker::MetadataType::TEXT_SCORE));
+        ASSERT_EQUALS(false, dependencies.getNeedsAnyMetadata());
     }
 };
 
@@ -2503,7 +694,9 @@ private:
 TEST(ExpressionConstantTest, ConstantOfValueMissingRemovesField) {
     intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
     intrusive_ptr<Expression> expression = ExpressionConstant::create(expCtx, Value());
-    assertBinaryEqual(BSONObj(), toBson(expression->evaluate(Document{{"foo", Value("bar"_sd)}})));
+    assertBinaryEqual(
+        BSONObj(),
+        toBson(expression->evaluate(Document{{"foo", Value("bar"_sd)}}, &expCtx->variables)));
 }
 
 TEST(ExpressionConstantTest, ConstantOfValueMissingSerializesToRemoveSystemVar) {
@@ -2606,11 +799,11 @@ TEST(ExpressionPowTest, ThrowsWhenBaseZeroAndExpNegative) {
     VariablesParseState vps = expCtx->variablesParseState;
 
     const auto expr = Expression::parseExpression(expCtx, BSON("$pow" << BSON_ARRAY(0 << -5)), vps);
-    ASSERT_THROWS([&] { expr->evaluate(Document()); }(), AssertionException);
+    ASSERT_THROWS([&] { expr->evaluate({}, &expCtx->variables); }(), AssertionException);
 
     const auto exprWithLong =
         Expression::parseExpression(expCtx, BSON("$pow" << BSON_ARRAY(0LL << -5LL)), vps);
-    ASSERT_THROWS([&] { expr->evaluate(Document()); }(), AssertionException);
+    ASSERT_THROWS([&] { expr->evaluate({}, &expCtx->variables); }(), AssertionException);
 }
 
 TEST(ExpressionPowTest, LargeExponentValuesWithBaseOfOne) {
@@ -2761,21 +954,35 @@ TEST(ExpressionIndexOfArray,
         fromjson("{ $indexOfArray : [ [0, 1, 2, 3, 4, 5, 'val'] , '$x'] }"),
         expCtx->variablesParseState);
     auto optimizedIndexOfArray = expIndexOfArray->optimize();
-    ASSERT_VALUE_EQ(Value(0), optimizedIndexOfArray->evaluate(Document{{"x", 0}}));
-    ASSERT_VALUE_EQ(Value(1), optimizedIndexOfArray->evaluate(Document{{"x", 1}}));
-    ASSERT_VALUE_EQ(Value(2), optimizedIndexOfArray->evaluate(Document{{"x", 2}}));
-    ASSERT_VALUE_EQ(Value(3), optimizedIndexOfArray->evaluate(Document{{"x", 3}}));
-    ASSERT_VALUE_EQ(Value(4), optimizedIndexOfArray->evaluate(Document{{"x", 4}}));
-    ASSERT_VALUE_EQ(Value(5), optimizedIndexOfArray->evaluate(Document{{"x", 5}}));
-    ASSERT_VALUE_EQ(Value(6), optimizedIndexOfArray->evaluate(Document{{"x", string("val")}}));
+    ASSERT_VALUE_EQ(Value(0),
+                    optimizedIndexOfArray->evaluate(Document{{"x", 0}}, &expCtx->variables));
+    ASSERT_VALUE_EQ(Value(1),
+                    optimizedIndexOfArray->evaluate(Document{{"x", 1}}, &expCtx->variables));
+    ASSERT_VALUE_EQ(Value(2),
+                    optimizedIndexOfArray->evaluate(Document{{"x", 2}}, &expCtx->variables));
+    ASSERT_VALUE_EQ(Value(3),
+                    optimizedIndexOfArray->evaluate(Document{{"x", 3}}, &expCtx->variables));
+    ASSERT_VALUE_EQ(Value(4),
+                    optimizedIndexOfArray->evaluate(Document{{"x", 4}}, &expCtx->variables));
+    ASSERT_VALUE_EQ(Value(5),
+                    optimizedIndexOfArray->evaluate(Document{{"x", 5}}, &expCtx->variables));
+    ASSERT_VALUE_EQ(
+        Value(6),
+        optimizedIndexOfArray->evaluate(Document{{"x", string("val")}}, &expCtx->variables));
 
     auto optimizedIndexNotFound = optimizedIndexOfArray->optimize();
     // Should evaluate to -1 if not found.
-    ASSERT_VALUE_EQ(Value(-1), optimizedIndexNotFound->evaluate(Document{{"x", 10}}));
-    ASSERT_VALUE_EQ(Value(-1), optimizedIndexNotFound->evaluate(Document{{"x", 100}}));
-    ASSERT_VALUE_EQ(Value(-1), optimizedIndexNotFound->evaluate(Document{{"x", 1000}}));
-    ASSERT_VALUE_EQ(Value(-1), optimizedIndexNotFound->evaluate(Document{{"x", string("string")}}));
-    ASSERT_VALUE_EQ(Value(-1), optimizedIndexNotFound->evaluate(Document{{"x", -1}}));
+    ASSERT_VALUE_EQ(Value(-1),
+                    optimizedIndexNotFound->evaluate(Document{{"x", 10}}, &expCtx->variables));
+    ASSERT_VALUE_EQ(Value(-1),
+                    optimizedIndexNotFound->evaluate(Document{{"x", 100}}, &expCtx->variables));
+    ASSERT_VALUE_EQ(Value(-1),
+                    optimizedIndexNotFound->evaluate(Document{{"x", 1000}}, &expCtx->variables));
+    ASSERT_VALUE_EQ(
+        Value(-1),
+        optimizedIndexNotFound->evaluate(Document{{"x", string("string")}}, &expCtx->variables));
+    ASSERT_VALUE_EQ(Value(-1),
+                    optimizedIndexNotFound->evaluate(Document{{"x", -1}}, &expCtx->variables));
 }
 
 TEST(ExpressionIndexOfArray,
@@ -2788,10 +995,12 @@ TEST(ExpressionIndexOfArray,
         fromjson("{ $indexOfArray : [ [0, 1, 2, 3, 4, 5] , '$x', 3, 5] }"),
         expCtx->variablesParseState);
     auto optimizedIndexOfArray = expIndexOfArray->optimize();
-    ASSERT_VALUE_EQ(Value(4), optimizedIndexOfArray->evaluate(Document{{"x", 4}}));
+    ASSERT_VALUE_EQ(Value(4),
+                    optimizedIndexOfArray->evaluate(Document{{"x", 4}}, &expCtx->variables));
 
     // Should evaluate to -1 if not found in range.
-    ASSERT_VALUE_EQ(Value(-1), optimizedIndexOfArray->evaluate(Document{{"x", 0}}));
+    ASSERT_VALUE_EQ(Value(-1),
+                    optimizedIndexOfArray->evaluate(Document{{"x", 0}}, &expCtx->variables));
 }
 
 TEST(ExpressionIndexOfArray,
@@ -2804,8 +1013,9 @@ TEST(ExpressionIndexOfArray,
                                     fromjson("{ $indexOfArray : [ [0, 1, 2, 2, 3, 4, 5] , '$x'] }"),
                                     expCtx->variablesParseState);
     auto optimizedIndexOfArrayWithDuplicateValues = expIndexOfArrayWithDuplicateValues->optimize();
-    ASSERT_VALUE_EQ(Value(2),
-                    optimizedIndexOfArrayWithDuplicateValues->evaluate(Document{{"x", 2}}));
+    ASSERT_VALUE_EQ(
+        Value(2),
+        optimizedIndexOfArrayWithDuplicateValues->evaluate(Document{{"x", 2}}, &expCtx->variables));
     // Duplicate Values in a range.
     auto expIndexInRangeWithhDuplicateValues = Expression::parseExpression(
         expCtx,
@@ -2814,994 +1024,10 @@ TEST(ExpressionIndexOfArray,
         expCtx->variablesParseState);
     auto optimizedIndexInRangeWithDuplcateValues = expIndexInRangeWithhDuplicateValues->optimize();
     // Should evaluate to 4.
-    ASSERT_VALUE_EQ(Value(4),
-                    optimizedIndexInRangeWithDuplcateValues->evaluate(Document{{"x", 2}}));
-}
-
-namespace FieldPath {
-
-/** The provided field path does not pass validation. */
-class Invalid {
-public:
-    void run() {
-        intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-        ASSERT_THROWS(ExpressionFieldPath::create(expCtx, ""), AssertionException);
-    }
-};
-
-TEST(FieldPath, NoOptimizationForRootFieldPathWithDottedPath) {
-    intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    intrusive_ptr<ExpressionFieldPath> expression =
-        ExpressionFieldPath::parse(expCtx, "$$ROOT.x.y", expCtx->variablesParseState);
-
-    // An attempt to optimize returns the Expression itself.
-    ASSERT_EQUALS(expression, expression->optimize());
-}
-
-TEST(FieldPath, NoOptimizationForCurrentFieldPathWithDottedPath) {
-    intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    intrusive_ptr<ExpressionFieldPath> expression =
-        ExpressionFieldPath::parse(expCtx, "$$CURRENT.x.y", expCtx->variablesParseState);
-
-    // An attempt to optimize returns the Expression itself.
-    ASSERT_EQUALS(expression, expression->optimize());
-}
-
-TEST(FieldPath, RemoveOptimizesToMissingValue) {
-    intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    intrusive_ptr<ExpressionFieldPath> expression =
-        ExpressionFieldPath::parse(expCtx, "$$REMOVE", expCtx->variablesParseState);
-
-    auto optimizedExpr = expression->optimize();
-
-    ASSERT_VALUE_EQ(Value(), optimizedExpr->evaluate(Document(BSON("x" << BSON("y" << 123)))));
-}
-
-TEST(FieldPath, NoOptimizationOnNormalPath) {
-    intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    intrusive_ptr<Expression> expression = ExpressionFieldPath::create(expCtx, "a");
-    // An attempt to optimize returns the Expression itself.
-    ASSERT_EQUALS(expression, expression->optimize());
-}
-
-TEST(FieldPath, OptimizeOnVariableWithConstantScalarValue) {
-    intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    auto varId = expCtx->variablesParseState.defineVariable("userVar");
-    expCtx->variables.setConstantValue(varId, Value(123));
-
-    auto expr = ExpressionFieldPath::parse(expCtx, "$$userVar", expCtx->variablesParseState);
-    ASSERT_TRUE(dynamic_cast<ExpressionFieldPath*>(expr.get()));
-
-    auto optimizedExpr = expr->optimize();
-    ASSERT_TRUE(dynamic_cast<ExpressionConstant*>(optimizedExpr.get()));
-}
-
-TEST(FieldPath, OptimizeOnVariableWithConstantArrayValue) {
-    intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    auto varId = expCtx->variablesParseState.defineVariable("userVar");
-    expCtx->variables.setConstantValue(varId, Value(BSON_ARRAY(1 << 2 << 3)));
-
-    auto expr = ExpressionFieldPath::parse(expCtx, "$$userVar", expCtx->variablesParseState);
-    ASSERT_TRUE(dynamic_cast<ExpressionFieldPath*>(expr.get()));
-
-    auto optimizedExpr = expr->optimize();
-    auto constantExpr = dynamic_cast<ExpressionConstant*>(optimizedExpr.get());
-    ASSERT_TRUE(constantExpr);
-    ASSERT_VALUE_EQ(Value(BSON_ARRAY(1 << 2 << 3)), constantExpr->getValue());
-}
-
-TEST(FieldPath, OptimizeToEmptyArrayOnNumericalPathComponentAndConstantArrayValue) {
-    intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    auto varId = expCtx->variablesParseState.defineVariable("userVar");
-    expCtx->variables.setConstantValue(varId, Value(BSON_ARRAY(1 << 2 << 3)));
-
-    auto expr = ExpressionFieldPath::parse(expCtx, "$$userVar.1", expCtx->variablesParseState);
-    ASSERT_TRUE(dynamic_cast<ExpressionFieldPath*>(expr.get()));
-
-    auto optimizedExpr = expr->optimize();
-    auto constantExpr = dynamic_cast<ExpressionConstant*>(optimizedExpr.get());
-    ASSERT_TRUE(constantExpr);
-    ASSERT_VALUE_EQ(Value(BSONArray()), constantExpr->getValue());
-}
-
-TEST(FieldPath, OptimizeOnVariableWithConstantValueAndDottedPath) {
-    intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    auto varId = expCtx->variablesParseState.defineVariable("userVar");
-    expCtx->variables.setConstantValue(varId, Value(Document{{"x", Document{{"y", 123}}}}));
-
-    auto expr = ExpressionFieldPath::parse(expCtx, "$$userVar.x.y", expCtx->variablesParseState);
-    ASSERT_TRUE(dynamic_cast<ExpressionFieldPath*>(expr.get()));
-
-    auto optimizedExpr = expr->optimize();
-    auto constantExpr = dynamic_cast<ExpressionConstant*>(optimizedExpr.get());
-    ASSERT_TRUE(constantExpr);
-    ASSERT_VALUE_EQ(Value(123), constantExpr->getValue());
-}
-
-TEST(FieldPath, NoOptimizationOnVariableWithNoValue) {
-    intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    expCtx->variablesParseState.defineVariable("userVar");
-
-    auto expr = ExpressionFieldPath::parse(expCtx, "$$userVar", expCtx->variablesParseState);
-    ASSERT_TRUE(dynamic_cast<ExpressionFieldPath*>(expr.get()));
-
-    auto optimizedExpr = expr->optimize();
-    ASSERT_FALSE(dynamic_cast<ExpressionConstant*>(optimizedExpr.get()));
-}
-
-TEST(FieldPath, NoOptimizationOnVariableWithMissingValue) {
-    intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    auto varId = expCtx->variablesParseState.defineVariable("userVar");
-    expCtx->variables.setValue(varId, Value());
-
-    auto expr = ExpressionFieldPath::parse(expCtx, "$$userVar", expCtx->variablesParseState);
-    ASSERT_TRUE(dynamic_cast<ExpressionFieldPath*>(expr.get()));
-
-    auto optimizedExpr = expr->optimize();
-    ASSERT_FALSE(dynamic_cast<ExpressionConstant*>(optimizedExpr.get()));
-}
-
-TEST(FieldPath, ScalarVariableWithDottedFieldPathOptimizesToConstantMissingValue) {
-    intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    auto varId = expCtx->variablesParseState.defineVariable("userVar");
-    expCtx->variables.setConstantValue(varId, Value(123));
-
-    auto expr = ExpressionFieldPath::parse(expCtx, "$$userVar.x.y", expCtx->variablesParseState);
-    ASSERT_TRUE(dynamic_cast<ExpressionFieldPath*>(expr.get()));
-
-    auto optimizedExpr = expr->optimize();
-    auto constantExpr = dynamic_cast<ExpressionConstant*>(optimizedExpr.get());
-    ASSERT_TRUE(constantExpr);
-    ASSERT_VALUE_EQ(Value(), constantExpr->getValue());
-}
-
-/** The field path itself is a dependency. */
-class Dependencies {
-public:
-    void run() {
-        intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-        intrusive_ptr<Expression> expression = ExpressionFieldPath::create(expCtx, "a.b");
-        DepsTracker dependencies;
-        expression->addDependencies(&dependencies);
-        ASSERT_EQUALS(1U, dependencies.fields.size());
-        ASSERT_EQUALS(1U, dependencies.fields.count("a.b"));
-        ASSERT_EQUALS(false, dependencies.needWholeDocument);
-        ASSERT_EQUALS(false, dependencies.getNeedsMetadata(DepsTracker::MetadataType::TEXT_SCORE));
-    }
-};
-
-/** Field path target field is missing. */
-class Missing {
-public:
-    void run() {
-        intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-        intrusive_ptr<Expression> expression = ExpressionFieldPath::create(expCtx, "a");
-        assertBinaryEqual(fromjson("{}"), toBson(expression->evaluate(Document())));
-    }
-};
-
-/** Simple case where the target field is present. */
-class Present {
-public:
-    void run() {
-        intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-        intrusive_ptr<Expression> expression = ExpressionFieldPath::create(expCtx, "a");
-        assertBinaryEqual(fromjson("{'':123}"),
-                          toBson(expression->evaluate(fromBson(BSON("a" << 123)))));
-    }
-};
-
-/** Target field parent is null. */
-class NestedBelowNull {
-public:
-    void run() {
-        intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-        intrusive_ptr<Expression> expression = ExpressionFieldPath::create(expCtx, "a.b");
-        assertBinaryEqual(fromjson("{}"),
-                          toBson(expression->evaluate(fromBson(fromjson("{a:null}")))));
-    }
-};
-
-/** Target field parent is undefined. */
-class NestedBelowUndefined {
-public:
-    void run() {
-        intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-        intrusive_ptr<Expression> expression = ExpressionFieldPath::create(expCtx, "a.b");
-        assertBinaryEqual(fromjson("{}"),
-                          toBson(expression->evaluate(fromBson(fromjson("{a:undefined}")))));
-    }
-};
-
-/** Target field parent is missing. */
-class NestedBelowMissing {
-public:
-    void run() {
-        intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-        intrusive_ptr<Expression> expression = ExpressionFieldPath::create(expCtx, "a.b");
-        assertBinaryEqual(fromjson("{}"),
-                          toBson(expression->evaluate(fromBson(fromjson("{z:1}")))));
-    }
-};
-
-/** Target field parent is an integer. */
-class NestedBelowInt {
-public:
-    void run() {
-        intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-        intrusive_ptr<Expression> expression = ExpressionFieldPath::create(expCtx, "a.b");
-        assertBinaryEqual(fromjson("{}"), toBson(expression->evaluate(fromBson(BSON("a" << 2)))));
-    }
-};
-
-/** A value in a nested object. */
-class NestedValue {
-public:
-    void run() {
-        intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-        intrusive_ptr<Expression> expression = ExpressionFieldPath::create(expCtx, "a.b");
-        assertBinaryEqual(BSON("" << 55),
-                          toBson(expression->evaluate(fromBson(BSON("a" << BSON("b" << 55))))));
-    }
-};
-
-/** Target field within an empty object. */
-class NestedBelowEmptyObject {
-public:
-    void run() {
-        intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-        intrusive_ptr<Expression> expression = ExpressionFieldPath::create(expCtx, "a.b");
-        assertBinaryEqual(fromjson("{}"),
-                          toBson(expression->evaluate(fromBson(BSON("a" << BSONObj())))));
-    }
-};
-
-/** Target field within an empty array. */
-class NestedBelowEmptyArray {
-public:
-    void run() {
-        intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-        intrusive_ptr<Expression> expression = ExpressionFieldPath::create(expCtx, "a.b");
-        assertBinaryEqual(BSON("" << BSONArray()),
-                          toBson(expression->evaluate(fromBson(BSON("a" << BSONArray())))));
-    }
-};
-
-/** Target field within an array containing null. */
-class NestedBelowArrayWithNull {
-public:
-    void run() {
-        intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-        intrusive_ptr<Expression> expression = ExpressionFieldPath::create(expCtx, "a.b");
-        assertBinaryEqual(fromjson("{'':[]}"),
-                          toBson(expression->evaluate(fromBson(fromjson("{a:[null]}")))));
-    }
-};
-
-/** Target field within an array containing undefined. */
-class NestedBelowArrayWithUndefined {
-public:
-    void run() {
-        intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-        intrusive_ptr<Expression> expression = ExpressionFieldPath::create(expCtx, "a.b");
-        assertBinaryEqual(fromjson("{'':[]}"),
-                          toBson(expression->evaluate(fromBson(fromjson("{a:[undefined]}")))));
-    }
-};
-
-/** Target field within an array containing an integer. */
-class NestedBelowArrayWithInt {
-public:
-    void run() {
-        intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-        intrusive_ptr<Expression> expression = ExpressionFieldPath::create(expCtx, "a.b");
-        assertBinaryEqual(fromjson("{'':[]}"),
-                          toBson(expression->evaluate(fromBson(fromjson("{a:[1]}")))));
-    }
-};
-
-/** Target field within an array. */
-class NestedWithinArray {
-public:
-    void run() {
-        intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-        intrusive_ptr<Expression> expression = ExpressionFieldPath::create(expCtx, "a.b");
-        assertBinaryEqual(fromjson("{'':[9]}"),
-                          toBson(expression->evaluate(fromBson(fromjson("{a:[{b:9}]}")))));
-    }
-};
-
-/** Multiple value types within an array. */
-class MultipleArrayValues {
-public:
-    void run() {
-        intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-        intrusive_ptr<Expression> expression = ExpressionFieldPath::create(expCtx, "a.b");
-        assertBinaryEqual(fromjson("{'':[9,20]}"),
-                          toBson(expression->evaluate(
-                              fromBson(fromjson("{a:[{b:9},null,undefined,{g:4},{b:20},{}]}")))));
-    }
-};
-
-/** Expanding values within nested arrays. */
-class ExpandNestedArrays {
-public:
-    void run() {
-        intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-        intrusive_ptr<Expression> expression = ExpressionFieldPath::create(expCtx, "a.b.c");
-        assertBinaryEqual(fromjson("{'':[[1,2],3,[4],[[5]],[6,7]]}"),
-                          toBson(expression->evaluate(fromBson(fromjson("{a:[{b:[{c:1},{c:2}]},"
-                                                                        "{b:{c:3}},"
-                                                                        "{b:[{c:4}]},"
-                                                                        "{b:[{c:[5]}]},"
-                                                                        "{b:{c:[6,7]}}]}")))));
-    }
-};
-
-/** Add to a BSONObj. */
-class AddToBsonObj {
-public:
-    void run() {
-        intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-        intrusive_ptr<Expression> expression = ExpressionFieldPath::create(expCtx, "a.b.c");
-        assertBinaryEqual(BSON("foo"
-                               << "$a.b.c"),
-                          BSON("foo" << expression->serialize(false)));
-    }
-};
-
-/** Add to a BSONArray. */
-class AddToBsonArray {
-public:
-    void run() {
-        intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-        intrusive_ptr<Expression> expression = ExpressionFieldPath::create(expCtx, "a.b.c");
-        BSONArrayBuilder bab;
-        bab << expression->serialize(false);
-        assertBinaryEqual(BSON_ARRAY("$a.b.c"), bab.arr());
-    }
-};
-
-}  // namespace FieldPath
-
-namespace Object {
-using mongo::ExpressionObject;
-
-template <typename T>
-Document literal(T&& value) {
-    return Document{{"$const", Value(std::forward<T>(value))}};
-}
-
-//
-// Parsing.
-//
-
-TEST(ExpressionObjectParse, ShouldAcceptEmptyObject) {
-    intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    VariablesParseState vps = expCtx->variablesParseState;
-    auto object = ExpressionObject::parse(expCtx, BSONObj(), vps);
-    ASSERT_VALUE_EQ(Value(Document{}), object->serialize(false));
-}
-
-TEST(ExpressionObjectParse, ShouldAcceptLiteralsAsValues) {
-    intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    VariablesParseState vps = expCtx->variablesParseState;
-    auto object = ExpressionObject::parse(expCtx,
-                                          BSON("a" << 5 << "b"
-                                                   << "string"
-                                                   << "c"
-                                                   << BSONNULL),
-                                          vps);
-    auto expectedResult =
-        Value(Document{{"a", literal(5)}, {"b", literal("string"_sd)}, {"c", literal(BSONNULL)}});
-    ASSERT_VALUE_EQ(expectedResult, object->serialize(false));
-}
-
-TEST(ExpressionObjectParse, ShouldAccept_idAsFieldName) {
-    intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    VariablesParseState vps = expCtx->variablesParseState;
-    auto object = ExpressionObject::parse(expCtx, BSON("_id" << 5), vps);
-    auto expectedResult = Value(Document{{"_id", literal(5)}});
-    ASSERT_VALUE_EQ(expectedResult, object->serialize(false));
-}
-
-TEST(ExpressionObjectParse, ShouldAcceptFieldNameContainingDollar) {
-    intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    VariablesParseState vps = expCtx->variablesParseState;
-    auto object = ExpressionObject::parse(expCtx, BSON("a$b" << 5), vps);
-    auto expectedResult = Value(Document{{"a$b", literal(5)}});
-    ASSERT_VALUE_EQ(expectedResult, object->serialize(false));
-}
-
-TEST(ExpressionObjectParse, ShouldAcceptNestedObjects) {
-    intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    VariablesParseState vps = expCtx->variablesParseState;
-    auto object =
-        ExpressionObject::parse(expCtx, fromjson("{a: {b: 1}, c: {d: {e: 1, f: 1}}}"), vps);
-    auto expectedResult =
-        Value(Document{{"a", Document{{"b", literal(1)}}},
-                       {"c", Document{{"d", Document{{"e", literal(1)}, {"f", literal(1)}}}}}});
-    ASSERT_VALUE_EQ(expectedResult, object->serialize(false));
-}
-
-TEST(ExpressionObjectParse, ShouldAcceptArrays) {
-    intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    VariablesParseState vps = expCtx->variablesParseState;
-    auto object = ExpressionObject::parse(expCtx, fromjson("{a: [1, 2]}"), vps);
-    auto expectedResult =
-        Value(Document{{"a", vector<Value>{Value(literal(1)), Value(literal(2))}}});
-    ASSERT_VALUE_EQ(expectedResult, object->serialize(false));
-}
-
-TEST(ObjectParsing, ShouldAcceptExpressionAsValue) {
-    intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    VariablesParseState vps = expCtx->variablesParseState;
-    auto object = ExpressionObject::parse(expCtx, BSON("a" << BSON("$and" << BSONArray())), vps);
-    ASSERT_VALUE_EQ(object->serialize(false),
-                    Value(Document{{"a", Document{{"$and", BSONArray()}}}}));
-}
-
-//
-// Error cases.
-//
-
-TEST(ExpressionObjectParse, ShouldRejectDottedFieldNames) {
-    intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    VariablesParseState vps = expCtx->variablesParseState;
-    ASSERT_THROWS(ExpressionObject::parse(expCtx, BSON("a.b" << 1), vps), AssertionException);
-    ASSERT_THROWS(ExpressionObject::parse(expCtx, BSON("c" << 3 << "a.b" << 1), vps),
-                  AssertionException);
-    ASSERT_THROWS(ExpressionObject::parse(expCtx, BSON("a.b" << 1 << "c" << 3), vps),
-                  AssertionException);
-}
-
-TEST(ExpressionObjectParse, ShouldRejectDuplicateFieldNames) {
-    intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    VariablesParseState vps = expCtx->variablesParseState;
-    ASSERT_THROWS(ExpressionObject::parse(expCtx, BSON("a" << 1 << "a" << 1), vps),
-                  AssertionException);
-    ASSERT_THROWS(ExpressionObject::parse(expCtx, BSON("a" << 1 << "b" << 2 << "a" << 1), vps),
-                  AssertionException);
-    ASSERT_THROWS(
-        ExpressionObject::parse(expCtx, BSON("a" << BSON("c" << 1) << "b" << 2 << "a" << 1), vps),
-        AssertionException);
-    ASSERT_THROWS(
-        ExpressionObject::parse(expCtx, BSON("a" << 1 << "b" << 2 << "a" << BSON("c" << 1)), vps),
-        AssertionException);
-}
-
-TEST(ExpressionObjectParse, ShouldRejectInvalidFieldName) {
-    intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    VariablesParseState vps = expCtx->variablesParseState;
-    ASSERT_THROWS(ExpressionObject::parse(expCtx, BSON("$a" << 1), vps), AssertionException);
-    ASSERT_THROWS(ExpressionObject::parse(expCtx, BSON("" << 1), vps), AssertionException);
-    ASSERT_THROWS(ExpressionObject::parse(expCtx, BSON(std::string("a\0b", 3) << 1), vps),
-                  AssertionException);
-}
-
-TEST(ExpressionObjectParse, ShouldRejectInvalidFieldPathAsValue) {
-    intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    VariablesParseState vps = expCtx->variablesParseState;
-    ASSERT_THROWS(ExpressionObject::parse(expCtx,
-                                          BSON("a"
-                                               << "$field."),
-                                          vps),
-                  AssertionException);
-}
-
-TEST(ParseObject, ShouldRejectExpressionAsTheSecondField) {
-    intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    VariablesParseState vps = expCtx->variablesParseState;
-    ASSERT_THROWS(
-        ExpressionObject::parse(
-            expCtx, BSON("a" << BSON("$and" << BSONArray()) << "$or" << BSONArray()), vps),
-        AssertionException);
-}
-
-//
-// Evaluation.
-//
-
-TEST(ExpressionObjectEvaluate, EmptyObjectShouldEvaluateToEmptyDocument) {
-    intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    auto object = ExpressionObject::create(expCtx, {});
-    ASSERT_VALUE_EQ(Value(Document()), object->evaluate(Document()));
-    ASSERT_VALUE_EQ(Value(Document()), object->evaluate(Document{{"a", 1}}));
-    ASSERT_VALUE_EQ(Value(Document()), object->evaluate(Document{{"_id", "ID"_sd}}));
-}
-
-TEST(ExpressionObjectEvaluate, ShouldEvaluateEachField) {
-    intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    auto object =
-        ExpressionObject::create(expCtx, {{"a", makeConstant(1)}, {"b", makeConstant(5)}});
-    ASSERT_VALUE_EQ(Value(Document{{"a", 1}, {"b", 5}}), object->evaluate(Document()));
-    ASSERT_VALUE_EQ(Value(Document{{"a", 1}, {"b", 5}}), object->evaluate(Document{{"a", 1}}));
-    ASSERT_VALUE_EQ(Value(Document{{"a", 1}, {"b", 5}}),
-                    object->evaluate(Document{{"_id", "ID"_sd}}));
-}
-
-TEST(ExpressionObjectEvaluate, OrderOfFieldsInOutputShouldMatchOrderInSpecification) {
-    intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    auto object = ExpressionObject::create(expCtx,
-                                           {{"a", ExpressionFieldPath::create(expCtx, "a")},
-                                            {"b", ExpressionFieldPath::create(expCtx, "b")},
-                                            {"c", ExpressionFieldPath::create(expCtx, "c")}});
     ASSERT_VALUE_EQ(
-        Value(Document{{"a", "A"_sd}, {"b", "B"_sd}, {"c", "C"_sd}}),
-        object->evaluate(Document{{"c", "C"_sd}, {"a", "A"_sd}, {"b", "B"_sd}, {"_id", "ID"_sd}}));
+        Value(4),
+        optimizedIndexInRangeWithDuplcateValues->evaluate(Document{{"x", 2}}, &expCtx->variables));
 }
-
-TEST(ExpressionObjectEvaluate, ShouldRemoveFieldsThatHaveMissingValues) {
-    intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    auto object = ExpressionObject::create(expCtx,
-                                           {{"a", ExpressionFieldPath::create(expCtx, "a.b")},
-                                            {"b", ExpressionFieldPath::create(expCtx, "missing")}});
-    ASSERT_VALUE_EQ(Value(Document{}), object->evaluate(Document()));
-    ASSERT_VALUE_EQ(Value(Document{}), object->evaluate(Document{{"a", 1}}));
-}
-
-TEST(ExpressionObjectEvaluate, ShouldEvaluateFieldsWithinNestedObject) {
-    intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    auto object = ExpressionObject::create(
-        expCtx,
-        {{"a",
-          ExpressionObject::create(
-              expCtx,
-              {{"b", makeConstant(1)}, {"c", ExpressionFieldPath::create(expCtx, "_id")}})}});
-    ASSERT_VALUE_EQ(Value(Document{{"a", Document{{"b", 1}}}}), object->evaluate(Document()));
-    ASSERT_VALUE_EQ(Value(Document{{"a", Document{{"b", 1}, {"c", "ID"_sd}}}}),
-                    object->evaluate(Document{{"_id", "ID"_sd}}));
-}
-
-TEST(ExpressionObjectEvaluate, ShouldEvaluateToEmptyDocumentIfAllFieldsAreMissing) {
-    intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    auto object =
-        ExpressionObject::create(expCtx, {{"a", ExpressionFieldPath::create(expCtx, "missing")}});
-    ASSERT_VALUE_EQ(Value(Document{}), object->evaluate(Document()));
-
-    auto objectWithNestedObject = ExpressionObject::create(expCtx, {{"nested", object}});
-    ASSERT_VALUE_EQ(Value(Document{{"nested", Document{}}}),
-                    objectWithNestedObject->evaluate(Document()));
-}
-
-//
-// Dependencies.
-//
-
-TEST(ExpressionObjectDependencies, ConstantValuesShouldNotBeAddedToDependencies) {
-    intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    auto object = ExpressionObject::create(expCtx, {{"a", makeConstant(5)}});
-    DepsTracker deps;
-    object->addDependencies(&deps);
-    ASSERT_EQ(deps.fields.size(), 0UL);
-}
-
-TEST(ExpressionObjectDependencies, FieldPathsShouldBeAddedToDependencies) {
-    intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    auto object =
-        ExpressionObject::create(expCtx, {{"x", ExpressionFieldPath::create(expCtx, "c.d")}});
-    DepsTracker deps;
-    object->addDependencies(&deps);
-    ASSERT_EQ(deps.fields.size(), 1UL);
-    ASSERT_EQ(deps.fields.count("c.d"), 1UL);
-};
-
-TEST(ExpressionObjectDependencies, VariablesShouldBeAddedToDependencies) {
-    intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    auto varID = expCtx->variablesParseState.defineVariable("var1");
-    auto fieldPath = ExpressionFieldPath::parse(expCtx, "$$var1", expCtx->variablesParseState);
-    DepsTracker deps;
-    fieldPath->addDependencies(&deps);
-    ASSERT_EQ(deps.vars.size(), 1UL);
-    ASSERT_EQ(deps.vars.count(varID), 1UL);
-}
-
-TEST(ExpressionObjectDependencies, LocalLetVariablesShouldBeFilteredOutOfDependencies) {
-    intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    expCtx->variablesParseState.defineVariable("var1");
-    auto letSpec = BSON("$let" << BSON("vars" << BSON("var2"
-                                                      << "abc")
-                                              << "in"
-                                              << BSON("$multiply" << BSON_ARRAY("$$var1"
-                                                                                << "$$var2"))));
-    auto expressionLet =
-        ExpressionLet::parse(expCtx, letSpec.firstElement(), expCtx->variablesParseState);
-    DepsTracker deps;
-    expressionLet->addDependencies(&deps);
-    ASSERT_EQ(deps.vars.size(), 1UL);
-    ASSERT_EQ(expCtx->variablesParseState.getVariable("var1"), *deps.vars.begin());
-}
-
-TEST(ExpressionObjectDependencies, LocalMapVariablesShouldBeFilteredOutOfDependencies) {
-    intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    expCtx->variablesParseState.defineVariable("var1");
-    auto mapSpec = BSON("$map" << BSON("input"
-                                       << "$field1"
-                                       << "as"
-                                       << "var2"
-                                       << "in"
-                                       << BSON("$multiply" << BSON_ARRAY("$$var1"
-                                                                         << "$$var2"))));
-
-    auto expressionMap =
-        ExpressionMap::parse(expCtx, mapSpec.firstElement(), expCtx->variablesParseState);
-    DepsTracker deps;
-    expressionMap->addDependencies(&deps);
-    ASSERT_EQ(deps.vars.size(), 1UL);
-    ASSERT_EQ(expCtx->variablesParseState.getVariable("var1"), *deps.vars.begin());
-}
-
-TEST(ExpressionObjectDependencies, LocalFilterVariablesShouldBeFilteredOutOfDependencies) {
-    intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    expCtx->variablesParseState.defineVariable("var1");
-    auto filterSpec = BSON("$filter" << BSON("input" << BSON_ARRAY(1 << 2 << 3) << "as"
-                                                     << "var2"
-                                                     << "cond"
-                                                     << BSON("$gt" << BSON_ARRAY("$$var1"
-                                                                                 << "$$var2"))));
-
-    auto expressionFilter =
-        ExpressionFilter::parse(expCtx, filterSpec.firstElement(), expCtx->variablesParseState);
-    DepsTracker deps;
-    expressionFilter->addDependencies(&deps);
-    ASSERT_EQ(deps.vars.size(), 1UL);
-    ASSERT_EQ(expCtx->variablesParseState.getVariable("var1"), *deps.vars.begin());
-}
-
-//
-// Optimizations.
-//
-
-TEST(ExpressionObjectOptimizations, OptimizingAnObjectShouldOptimizeSubExpressions) {
-    // Build up the object {a: {$add: [1, 2]}}.
-    intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    VariablesParseState vps = expCtx->variablesParseState;
-    auto addExpression =
-        ExpressionAdd::parse(expCtx, BSON("$add" << BSON_ARRAY(1 << 2)).firstElement(), vps);
-    auto object = ExpressionObject::create(expCtx, {{"a", addExpression}});
-    ASSERT_EQ(object->getChildExpressions().size(), 1UL);
-
-    auto optimized = object->optimize();
-    auto optimizedObject = dynamic_cast<ExpressionConstant*>(optimized.get());
-    ASSERT_TRUE(optimizedObject);
-    ASSERT_VALUE_EQ(optimizedObject->evaluate(Document()), Value(BSON("a" << 3)));
-};
-
-TEST(ExpressionObjectOptimizations,
-     OptimizingAnObjectWithAllConstantsShouldOptimizeToExpressionConstant) {
-
-    intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    VariablesParseState vps = expCtx->variablesParseState;
-
-    // All constants should optimize to ExpressionConstant.
-    auto objectWithAllConstants = ExpressionObject::parse(expCtx, BSON("b" << 1 << "c" << 1), vps);
-    auto optimizedToAllConstants = objectWithAllConstants->optimize();
-    auto constants = dynamic_cast<ExpressionConstant*>(optimizedToAllConstants.get());
-    ASSERT_TRUE(constants);
-
-    // Not all constants should not optimize to ExpressionConstant.
-    auto objectNotAllConstants = ExpressionObject::parse(expCtx,
-                                                         BSON("b" << 1 << "input"
-                                                                  << "$inputField"),
-                                                         vps);
-    auto optimizedNotAllConstants = objectNotAllConstants->optimize();
-    auto shouldNotBeConstant = dynamic_cast<ExpressionConstant*>(optimizedNotAllConstants.get());
-    ASSERT_FALSE(shouldNotBeConstant);
-
-    // Sub expression should optimize to constant expression.
-    auto expressionWithConstantObject = ExpressionObject::parse(
-        expCtx,
-        BSON("willBeConstant" << BSON("$add" << BSON_ARRAY(1 << 2)) << "alreadyConstant"
-                              << "string"),
-        vps);
-    auto optimizedWithConstant = expressionWithConstantObject->optimize();
-    auto optimizedObject = dynamic_cast<ExpressionConstant*>(optimizedWithConstant.get());
-    ASSERT_TRUE(optimizedObject);
-    ASSERT_VALUE_EQ(optimizedObject->evaluate(Document()),
-                    Value(BSON("willBeConstant" << 3 << "alreadyConstant"
-                                                << "string")));
-};
-
-}  // namespace Object
-
-namespace Or {
-
-class ExpectedResultBase {
-public:
-    virtual ~ExpectedResultBase() {}
-    void run() {
-        intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-        BSONObj specObject = BSON("" << spec());
-        BSONElement specElement = specObject.firstElement();
-        VariablesParseState vps = expCtx->variablesParseState;
-        intrusive_ptr<Expression> expression = Expression::parseOperand(expCtx, specElement, vps);
-        ASSERT_BSONOBJ_EQ(constify(spec()), expressionToBson(expression));
-        ASSERT_BSONOBJ_EQ(BSON("" << expectedResult()),
-                          toBson(expression->evaluate(fromBson(BSON("a" << 1)))));
-        intrusive_ptr<Expression> optimized = expression->optimize();
-        ASSERT_BSONOBJ_EQ(BSON("" << expectedResult()),
-                          toBson(optimized->evaluate(fromBson(BSON("a" << 1)))));
-    }
-
-protected:
-    virtual BSONObj spec() = 0;
-    virtual bool expectedResult() = 0;
-};
-
-class OptimizeBase {
-public:
-    virtual ~OptimizeBase() {}
-    void run() {
-        intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-        BSONObj specObject = BSON("" << spec());
-        BSONElement specElement = specObject.firstElement();
-        VariablesParseState vps = expCtx->variablesParseState;
-        intrusive_ptr<Expression> expression = Expression::parseOperand(expCtx, specElement, vps);
-        ASSERT_BSONOBJ_EQ(constify(spec()), expressionToBson(expression));
-        intrusive_ptr<Expression> optimized = expression->optimize();
-        ASSERT_BSONOBJ_EQ(expectedOptimized(), expressionToBson(optimized));
-    }
-
-protected:
-    virtual BSONObj spec() = 0;
-    virtual BSONObj expectedOptimized() = 0;
-};
-
-class NoOptimizeBase : public OptimizeBase {
-    BSONObj expectedOptimized() {
-        return constify(spec());
-    }
-};
-
-/** $or without operands. */
-class NoOperands : public ExpectedResultBase {
-    BSONObj spec() {
-        return BSON("$or" << BSONArray());
-    }
-    bool expectedResult() {
-        return false;
-    }
-};
-
-/** $or passed 'true'. */
-class True : public ExpectedResultBase {
-    BSONObj spec() {
-        return BSON("$or" << BSON_ARRAY(true));
-    }
-    bool expectedResult() {
-        return true;
-    }
-};
-
-/** $or passed 'false'. */
-class False : public ExpectedResultBase {
-    BSONObj spec() {
-        return BSON("$or" << BSON_ARRAY(false));
-    }
-    bool expectedResult() {
-        return false;
-    }
-};
-
-/** $or passed 'true', 'true'. */
-class TrueTrue : public ExpectedResultBase {
-    BSONObj spec() {
-        return BSON("$or" << BSON_ARRAY(true << true));
-    }
-    bool expectedResult() {
-        return true;
-    }
-};
-
-/** $or passed 'true', 'false'. */
-class TrueFalse : public ExpectedResultBase {
-    BSONObj spec() {
-        return BSON("$or" << BSON_ARRAY(true << false));
-    }
-    bool expectedResult() {
-        return true;
-    }
-};
-
-/** $or passed 'false', 'true'. */
-class FalseTrue : public ExpectedResultBase {
-    BSONObj spec() {
-        return BSON("$or" << BSON_ARRAY(false << true));
-    }
-    bool expectedResult() {
-        return true;
-    }
-};
-
-/** $or passed 'false', 'false'. */
-class FalseFalse : public ExpectedResultBase {
-    BSONObj spec() {
-        return BSON("$or" << BSON_ARRAY(false << false));
-    }
-    bool expectedResult() {
-        return false;
-    }
-};
-
-/** $or passed 'false', 'false', 'false'. */
-class FalseFalseFalse : public ExpectedResultBase {
-    BSONObj spec() {
-        return BSON("$or" << BSON_ARRAY(false << false << false));
-    }
-    bool expectedResult() {
-        return false;
-    }
-};
-
-/** $or passed 'false', 'false', 'true'. */
-class FalseFalseTrue : public ExpectedResultBase {
-    BSONObj spec() {
-        return BSON("$or" << BSON_ARRAY(false << false << true));
-    }
-    bool expectedResult() {
-        return true;
-    }
-};
-
-/** $or passed '0', '1'. */
-class ZeroOne : public ExpectedResultBase {
-    BSONObj spec() {
-        return BSON("$or" << BSON_ARRAY(0 << 1));
-    }
-    bool expectedResult() {
-        return true;
-    }
-};
-
-/** $or passed '0', 'false'. */
-class ZeroFalse : public ExpectedResultBase {
-    BSONObj spec() {
-        return BSON("$or" << BSON_ARRAY(0 << false));
-    }
-    bool expectedResult() {
-        return false;
-    }
-};
-
-/** $or passed a field path. */
-class FieldPath : public ExpectedResultBase {
-    BSONObj spec() {
-        return BSON("$or" << BSON_ARRAY("$a"));
-    }
-    bool expectedResult() {
-        return true;
-    }
-};
-
-/** A constant expression is optimized to a constant. */
-class OptimizeConstantExpression : public OptimizeBase {
-    BSONObj spec() {
-        return BSON("$or" << BSON_ARRAY(1));
-    }
-    BSONObj expectedOptimized() {
-        return BSON("$const" << true);
-    }
-};
-
-/** A non constant expression is not optimized. */
-class NonConstant : public NoOptimizeBase {
-    BSONObj spec() {
-        return BSON("$or" << BSON_ARRAY("$a"));
-    }
-};
-
-/** An expression beginning with a single constant is optimized. */
-class ConstantNonConstantTrue : public OptimizeBase {
-    BSONObj spec() {
-        return BSON("$or" << BSON_ARRAY(1 << "$a"));
-    }
-    BSONObj expectedOptimized() {
-        return BSON("$const" << true);
-    }
-};
-
-/** An expression beginning with a single constant is optimized. */
-class ConstantNonConstantFalse : public OptimizeBase {
-    BSONObj spec() {
-        return BSON("$or" << BSON_ARRAY(0 << "$a"));
-    }
-    BSONObj expectedOptimized() {
-        return BSON("$and" << BSON_ARRAY("$a"));
-    }
-    // note: using $and as serialization of ExpressionCoerceToBool rather than
-    // ExpressionAnd
-};
-
-/** An expression with a field path and '1'. */
-class NonConstantOne : public OptimizeBase {
-    BSONObj spec() {
-        return BSON("$or" << BSON_ARRAY("$a" << 1));
-    }
-    BSONObj expectedOptimized() {
-        return BSON("$const" << true);
-    }
-};
-
-/** An expression with a field path and '0'. */
-class NonConstantZero : public OptimizeBase {
-    BSONObj spec() {
-        return BSON("$or" << BSON_ARRAY("$a" << 0));
-    }
-    BSONObj expectedOptimized() {
-        return BSON("$and" << BSON_ARRAY("$a"));
-    }
-};
-
-/** An expression with two field paths and '1'. */
-class NonConstantNonConstantOne : public OptimizeBase {
-    BSONObj spec() {
-        return BSON("$or" << BSON_ARRAY("$a"
-                                        << "$b"
-                                        << 1));
-    }
-    BSONObj expectedOptimized() {
-        return BSON("$const" << true);
-    }
-};
-
-/** An expression with two field paths and '0'. */
-class NonConstantNonConstantZero : public OptimizeBase {
-    BSONObj spec() {
-        return BSON("$or" << BSON_ARRAY("$a"
-                                        << "$b"
-                                        << 0));
-    }
-    BSONObj expectedOptimized() {
-        return BSON("$or" << BSON_ARRAY("$a"
-                                        << "$b"));
-    }
-};
-
-/** An expression with '0', '1', and a field path. */
-class ZeroOneNonConstant : public OptimizeBase {
-    BSONObj spec() {
-        return BSON("$or" << BSON_ARRAY(0 << 1 << "$a"));
-    }
-    BSONObj expectedOptimized() {
-        return BSON("$const" << true);
-    }
-};
-
-/** An expression with '0', '0', and a field path. */
-class ZeroZeroNonConstant : public OptimizeBase {
-    BSONObj spec() {
-        return BSON("$or" << BSON_ARRAY(0 << 0 << "$a"));
-    }
-    BSONObj expectedOptimized() {
-        return BSON("$and" << BSON_ARRAY("$a"));
-    }
-};
-
-/** Nested $or expressions. */
-class Nested : public OptimizeBase {
-    BSONObj spec() {
-        return BSON("$or" << BSON_ARRAY(0 << BSON("$or" << BSON_ARRAY(0)) << "$a"
-                                          << "$b"));
-    }
-    BSONObj expectedOptimized() {
-        return BSON("$or" << BSON_ARRAY("$a"
-                                        << "$b"));
-    }
-};
-
-/** Nested $or expressions containing a nested value evaluating to false. */
-class NestedOne : public OptimizeBase {
-    BSONObj spec() {
-        return BSON("$or" << BSON_ARRAY(0 << BSON("$or" << BSON_ARRAY(BSON("$or" << BSON_ARRAY(1))))
-                                          << "$a"
-                                          << "$b"));
-    }
-    BSONObj expectedOptimized() {
-        return BSON("$const" << true);
-    }
-};
-
-}  // namespace Or
 
 namespace Parse {
 
@@ -4028,7 +1254,7 @@ public:
                 VariablesParseState vps = expCtx->variablesParseState;
                 const intrusive_ptr<Expression> expr =
                     Expression::parseExpression(expCtx, obj, vps);
-                Value result = expr->evaluate(Document());
+                Value result = expr->evaluate({}, &expCtx->variables);
                 if (result.getType() == Array) {
                     result = sortSet(result);
                 }
@@ -4055,7 +1281,7 @@ public:
                         // same
                         const intrusive_ptr<Expression> expr =
                             Expression::parseExpression(expCtx, obj, vps);
-                        expr->evaluate(Document());
+                        expr->evaluate({}, &expCtx->variables);
                     }(),
                     AssertionException);
             }
@@ -4070,12 +1296,9 @@ class Same : public ExpectedResultBase {
     Document getSpec() {
         return DOC("input" << DOC_ARRAY(DOC_ARRAY(1 << 2) << DOC_ARRAY(1 << 2)) << "expected"
                            << DOC("$setIsSubset" << true << "$setEquals" << true
-                                                 << "$setIntersection"
-                                                 << DOC_ARRAY(1 << 2)
-                                                 << "$setUnion"
-                                                 << DOC_ARRAY(1 << 2)
-                                                 << "$setDifference"
-                                                 << vector<Value>()));
+                                                 << "$setIntersection" << DOC_ARRAY(1 << 2)
+                                                 << "$setUnion" << DOC_ARRAY(1 << 2)
+                                                 << "$setDifference" << vector<Value>()));
     }
 };
 
@@ -4083,12 +1306,9 @@ class Redundant : public ExpectedResultBase {
     Document getSpec() {
         return DOC("input" << DOC_ARRAY(DOC_ARRAY(1 << 2) << DOC_ARRAY(1 << 2 << 2)) << "expected"
                            << DOC("$setIsSubset" << true << "$setEquals" << true
-                                                 << "$setIntersection"
-                                                 << DOC_ARRAY(1 << 2)
-                                                 << "$setUnion"
-                                                 << DOC_ARRAY(1 << 2)
-                                                 << "$setDifference"
-                                                 << vector<Value>()));
+                                                 << "$setIntersection" << DOC_ARRAY(1 << 2)
+                                                 << "$setUnion" << DOC_ARRAY(1 << 2)
+                                                 << "$setDifference" << vector<Value>()));
     }
 };
 
@@ -4097,11 +1317,8 @@ class DoubleRedundant : public ExpectedResultBase {
         return DOC(
             "input" << DOC_ARRAY(DOC_ARRAY(1 << 1 << 2) << DOC_ARRAY(1 << 2 << 2)) << "expected"
                     << DOC("$setIsSubset" << true << "$setEquals" << true << "$setIntersection"
-                                          << DOC_ARRAY(1 << 2)
-                                          << "$setUnion"
-                                          << DOC_ARRAY(1 << 2)
-                                          << "$setDifference"
-                                          << vector<Value>()));
+                                          << DOC_ARRAY(1 << 2) << "$setUnion" << DOC_ARRAY(1 << 2)
+                                          << "$setDifference" << vector<Value>()));
     }
 };
 
@@ -4109,12 +1326,9 @@ class Super : public ExpectedResultBase {
     Document getSpec() {
         return DOC("input" << DOC_ARRAY(DOC_ARRAY(1 << 2) << DOC_ARRAY(1)) << "expected"
                            << DOC("$setIsSubset" << false << "$setEquals" << false
-                                                 << "$setIntersection"
-                                                 << DOC_ARRAY(1)
-                                                 << "$setUnion"
-                                                 << DOC_ARRAY(1 << 2)
-                                                 << "$setDifference"
-                                                 << DOC_ARRAY(2)));
+                                                 << "$setIntersection" << DOC_ARRAY(1)
+                                                 << "$setUnion" << DOC_ARRAY(1 << 2)
+                                                 << "$setDifference" << DOC_ARRAY(2)));
     }
 };
 
@@ -4122,12 +1336,9 @@ class SuperWithRedundant : public ExpectedResultBase {
     Document getSpec() {
         return DOC("input" << DOC_ARRAY(DOC_ARRAY(1 << 2 << 2) << DOC_ARRAY(1)) << "expected"
                            << DOC("$setIsSubset" << false << "$setEquals" << false
-                                                 << "$setIntersection"
-                                                 << DOC_ARRAY(1)
-                                                 << "$setUnion"
-                                                 << DOC_ARRAY(1 << 2)
-                                                 << "$setDifference"
-                                                 << DOC_ARRAY(2)));
+                                                 << "$setIntersection" << DOC_ARRAY(1)
+                                                 << "$setUnion" << DOC_ARRAY(1 << 2)
+                                                 << "$setDifference" << DOC_ARRAY(2)));
     }
 };
 
@@ -4135,12 +1346,9 @@ class Sub : public ExpectedResultBase {
     Document getSpec() {
         return DOC("input" << DOC_ARRAY(DOC_ARRAY(1) << DOC_ARRAY(1 << 2)) << "expected"
                            << DOC("$setIsSubset" << true << "$setEquals" << false
-                                                 << "$setIntersection"
-                                                 << DOC_ARRAY(1)
-                                                 << "$setUnion"
-                                                 << DOC_ARRAY(1 << 2)
-                                                 << "$setDifference"
-                                                 << vector<Value>()));
+                                                 << "$setIntersection" << DOC_ARRAY(1)
+                                                 << "$setUnion" << DOC_ARRAY(1 << 2)
+                                                 << "$setDifference" << vector<Value>()));
     }
 };
 
@@ -4148,12 +1356,9 @@ class SameBackwards : public ExpectedResultBase {
     Document getSpec() {
         return DOC("input" << DOC_ARRAY(DOC_ARRAY(1 << 2) << DOC_ARRAY(2 << 1)) << "expected"
                            << DOC("$setIsSubset" << true << "$setEquals" << true
-                                                 << "$setIntersection"
-                                                 << DOC_ARRAY(1 << 2)
-                                                 << "$setUnion"
-                                                 << DOC_ARRAY(1 << 2)
-                                                 << "$setDifference"
-                                                 << vector<Value>()));
+                                                 << "$setIntersection" << DOC_ARRAY(1 << 2)
+                                                 << "$setUnion" << DOC_ARRAY(1 << 2)
+                                                 << "$setDifference" << vector<Value>()));
     }
 };
 
@@ -4161,12 +1366,9 @@ class NoOverlap : public ExpectedResultBase {
     Document getSpec() {
         return DOC("input" << DOC_ARRAY(DOC_ARRAY(1 << 2) << DOC_ARRAY(8 << 4)) << "expected"
                            << DOC("$setIsSubset" << false << "$setEquals" << false
-                                                 << "$setIntersection"
-                                                 << vector<Value>()
-                                                 << "$setUnion"
-                                                 << DOC_ARRAY(1 << 2 << 4 << 8)
-                                                 << "$setDifference"
-                                                 << DOC_ARRAY(1 << 2)));
+                                                 << "$setIntersection" << vector<Value>()
+                                                 << "$setUnion" << DOC_ARRAY(1 << 2 << 4 << 8)
+                                                 << "$setDifference" << DOC_ARRAY(1 << 2)));
     }
 };
 
@@ -4174,12 +1376,9 @@ class Overlap : public ExpectedResultBase {
     Document getSpec() {
         return DOC("input" << DOC_ARRAY(DOC_ARRAY(1 << 2) << DOC_ARRAY(8 << 2 << 4)) << "expected"
                            << DOC("$setIsSubset" << false << "$setEquals" << false
-                                                 << "$setIntersection"
-                                                 << DOC_ARRAY(2)
-                                                 << "$setUnion"
-                                                 << DOC_ARRAY(1 << 2 << 4 << 8)
-                                                 << "$setDifference"
-                                                 << DOC_ARRAY(1)));
+                                                 << "$setIntersection" << DOC_ARRAY(2)
+                                                 << "$setUnion" << DOC_ARRAY(1 << 2 << 4 << 8)
+                                                 << "$setDifference" << DOC_ARRAY(1)));
     }
 };
 
@@ -4187,8 +1386,7 @@ class LastNull : public ExpectedResultBase {
     Document getSpec() {
         return DOC("input" << DOC_ARRAY(DOC_ARRAY(1 << 2) << Value(BSONNULL)) << "expected"
                            << DOC("$setIntersection" << BSONNULL << "$setUnion" << BSONNULL
-                                                     << "$setDifference"
-                                                     << BSONNULL)
+                                                     << "$setDifference" << BSONNULL)
                            << "error"
                            << DOC_ARRAY("$setEquals"_sd
                                         << "$setIsSubset"_sd));
@@ -4199,8 +1397,29 @@ class FirstNull : public ExpectedResultBase {
     Document getSpec() {
         return DOC("input" << DOC_ARRAY(Value(BSONNULL) << DOC_ARRAY(1 << 2)) << "expected"
                            << DOC("$setIntersection" << BSONNULL << "$setUnion" << BSONNULL
-                                                     << "$setDifference"
-                                                     << BSONNULL)
+                                                     << "$setDifference" << BSONNULL)
+                           << "error"
+                           << DOC_ARRAY("$setEquals"_sd
+                                        << "$setIsSubset"_sd));
+    }
+};
+
+class LeftNullAndRightEmpty : public ExpectedResultBase {
+    Document getSpec() {
+        return DOC("input" << DOC_ARRAY(Value(BSONNULL) << vector<Value>()) << "expected"
+                           << DOC("$setIntersection" << BSONNULL << "$setUnion" << BSONNULL
+                                                     << "$setDifference" << BSONNULL)
+                           << "error"
+                           << DOC_ARRAY("$setEquals"_sd
+                                        << "$setIsSubset"_sd));
+    }
+};
+
+class RightNullAndLeftEmpty : public ExpectedResultBase {
+    Document getSpec() {
+        return DOC("input" << DOC_ARRAY(vector<Value>() << Value(BSONNULL)) << "expected"
+                           << DOC("$setIntersection" << BSONNULL << "$setUnion" << BSONNULL
+                                                     << "$setDifference" << BSONNULL)
                            << "error"
                            << DOC_ARRAY("$setEquals"_sd
                                         << "$setIsSubset"_sd));
@@ -4247,12 +1466,8 @@ class LeftArgEmpty : public ExpectedResultBase {
     Document getSpec() {
         return DOC("input" << DOC_ARRAY(vector<Value>() << DOC_ARRAY(1 << 2)) << "expected"
                            << DOC("$setIntersection" << vector<Value>() << "$setUnion"
-                                                     << DOC_ARRAY(1 << 2)
-                                                     << "$setIsSubset"
-                                                     << true
-                                                     << "$setEquals"
-                                                     << false
-                                                     << "$setDifference"
+                                                     << DOC_ARRAY(1 << 2) << "$setIsSubset" << true
+                                                     << "$setEquals" << false << "$setDifference"
                                                      << vector<Value>()));
     }
 };
@@ -4261,45 +1476,39 @@ class RightArgEmpty : public ExpectedResultBase {
     Document getSpec() {
         return DOC("input" << DOC_ARRAY(DOC_ARRAY(1 << 2) << vector<Value>()) << "expected"
                            << DOC("$setIntersection" << vector<Value>() << "$setUnion"
-                                                     << DOC_ARRAY(1 << 2)
-                                                     << "$setIsSubset"
-                                                     << false
-                                                     << "$setEquals"
-                                                     << false
-                                                     << "$setDifference"
+                                                     << DOC_ARRAY(1 << 2) << "$setIsSubset" << false
+                                                     << "$setEquals" << false << "$setDifference"
                                                      << DOC_ARRAY(1 << 2)));
     }
 };
 
 class ManyArgs : public ExpectedResultBase {
     Document getSpec() {
-        return DOC(
-            "input" << DOC_ARRAY(DOC_ARRAY(8 << 3) << DOC_ARRAY("asdf"_sd
-                                                                << "foo"_sd)
-                                                   << DOC_ARRAY(80.3 << 34)
-                                                   << vector<Value>()
-                                                   << DOC_ARRAY(80.3 << "foo"_sd << 11 << "yay"_sd))
-                    << "expected"
-                    << DOC("$setIntersection" << vector<Value>() << "$setEquals" << false
-                                              << "$setUnion"
-                                              << DOC_ARRAY(3 << 8 << 11 << 34 << 80.3 << "asdf"_sd
-                                                             << "foo"_sd
-                                                             << "yay"_sd))
-                    << "error"
-                    << DOC_ARRAY("$setIsSubset"_sd
-                                 << "$setDifference"_sd));
+        return DOC("input" << DOC_ARRAY(DOC_ARRAY(8 << 3)
+                                        << DOC_ARRAY("asdf"_sd
+                                                     << "foo"_sd)
+                                        << DOC_ARRAY(80.3 << 34) << vector<Value>()
+                                        << DOC_ARRAY(80.3 << "foo"_sd << 11 << "yay"_sd))
+                           << "expected"
+                           << DOC("$setIntersection"
+                                  << vector<Value>() << "$setEquals" << false << "$setUnion"
+                                  << DOC_ARRAY(3 << 8 << 11 << 34 << 80.3 << "asdf"_sd
+                                                 << "foo"_sd
+                                                 << "yay"_sd))
+                           << "error"
+                           << DOC_ARRAY("$setIsSubset"_sd
+                                        << "$setDifference"_sd));
     }
 };
 
 class ManyArgsEqual : public ExpectedResultBase {
     Document getSpec() {
-        return DOC("input" << DOC_ARRAY(DOC_ARRAY(1 << 2 << 4) << DOC_ARRAY(1 << 2 << 2 << 4)
-                                                               << DOC_ARRAY(4 << 1 << 2)
-                                                               << DOC_ARRAY(2 << 1 << 1 << 4))
+        return DOC("input" << DOC_ARRAY(DOC_ARRAY(1 << 2 << 4)
+                                        << DOC_ARRAY(1 << 2 << 2 << 4) << DOC_ARRAY(4 << 1 << 2)
+                                        << DOC_ARRAY(2 << 1 << 1 << 4))
                            << "expected"
                            << DOC("$setIntersection" << DOC_ARRAY(1 << 2 << 4) << "$setEquals"
-                                                     << true
-                                                     << "$setUnion"
+                                                     << true << "$setUnion"
                                                      << DOC_ARRAY(1 << 2 << 4))
                            << "error"
                            << DOC_ARRAY("$setIsSubset"_sd
@@ -4337,7 +1546,8 @@ private:
         VariablesParseState vps = expCtx->variablesParseState;
         intrusive_ptr<Expression> expression = Expression::parseOperand(expCtx, specElement, vps);
         ASSERT_BSONOBJ_EQ(constify(spec), expressionToBson(expression));
-        ASSERT_BSONOBJ_EQ(BSON("" << expectedResult), toBson(expression->evaluate(Document())));
+        ASSERT_BSONOBJ_EQ(BSON("" << expectedResult),
+                          toBson(expression->evaluate({}, &expCtx->variables)));
     }
 };
 
@@ -4463,7 +1673,8 @@ public:
         VariablesParseState vps = expCtx->variablesParseState;
         intrusive_ptr<Expression> expression = Expression::parseOperand(expCtx, specElement, vps);
         ASSERT_BSONOBJ_EQ(constify(spec()), expressionToBson(expression));
-        ASSERT_BSONOBJ_EQ(BSON("" << expectedResult()), toBson(expression->evaluate(Document())));
+        ASSERT_BSONOBJ_EQ(BSON("" << expectedResult()),
+                          toBson(expression->evaluate({}, &expCtx->variables)));
     }
 
 protected:
@@ -4581,10 +1792,10 @@ TEST(ExpressionSubstrTest, ThrowsWithNegativeStart) {
     const auto str = "abcdef"_sd;
     const auto expr =
         Expression::parseExpression(expCtx, BSON("$substrCP" << BSON_ARRAY(str << -5 << 1)), vps);
-    ASSERT_THROWS([&] { expr->evaluate(Document()); }(), AssertionException);
+    ASSERT_THROWS([&] { expr->evaluate({}, &expCtx->variables); }(), AssertionException);
 }
 
-}  // namespace Substr
+}  // namespace SubstrBytes
 
 namespace SubstrCP {
 
@@ -4595,7 +1806,7 @@ TEST(ExpressionSubstrCPTest, DoesThrowWithBadContinuationByte) {
     const auto continuationByte = "\x80\x00"_sd;
     const auto expr = Expression::parseExpression(
         expCtx, BSON("$substrCP" << BSON_ARRAY(continuationByte << 0 << 1)), vps);
-    ASSERT_THROWS([&] { expr->evaluate(Document()); }(), AssertionException);
+    ASSERT_THROWS([&] { expr->evaluate({}, &expCtx->variables); }(), AssertionException);
 }
 
 TEST(ExpressionSubstrCPTest, DoesThrowWithInvalidLeadingByte) {
@@ -4605,7 +1816,7 @@ TEST(ExpressionSubstrCPTest, DoesThrowWithInvalidLeadingByte) {
     const auto leadingByte = "\xFF\x00"_sd;
     const auto expr = Expression::parseExpression(
         expCtx, BSON("$substrCP" << BSON_ARRAY(leadingByte << 0 << 1)), vps);
-    ASSERT_THROWS([&] { expr->evaluate(Document()); }(), AssertionException);
+    ASSERT_THROWS([&] { expr->evaluate({}, &expCtx->variables); }(), AssertionException);
 }
 
 TEST(ExpressionSubstrCPTest, WithStandardValue) {
@@ -4655,699 +1866,6 @@ TEST(ExpressionSubstrCPTest, ShouldCoerceDateToString) {
 }
 
 }  // namespace SubstrCP
-
-namespace Trim {
-
-TEST(ExpressionTrimParsingTest, ThrowsIfSpecIsNotAnObject) {
-    intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-
-    ASSERT_THROWS(
-        Expression::parseExpression(expCtx, BSON("$trim" << 1), expCtx->variablesParseState),
-        AssertionException);
-    ASSERT_THROWS(Expression::parseExpression(
-                      expCtx, BSON("$trim" << BSON_ARRAY(1 << 2)), expCtx->variablesParseState),
-                  AssertionException);
-    ASSERT_THROWS(Expression::parseExpression(
-                      expCtx, BSON("$ltrim" << BSONNULL), expCtx->variablesParseState),
-                  AssertionException);
-    ASSERT_THROWS(Expression::parseExpression(expCtx,
-                                              BSON("$rtrim"
-                                                   << "string"),
-                                              expCtx->variablesParseState),
-                  AssertionException);
-}
-
-TEST(ExpressionTrimParsingTest, ThrowsIfSpecDoesNotSpecifyInput) {
-    intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-
-    ASSERT_THROWS(Expression::parseExpression(
-                      expCtx, BSON("$trim" << BSONObj()), expCtx->variablesParseState),
-                  AssertionException);
-    ASSERT_THROWS(Expression::parseExpression(expCtx,
-                                              BSON("$ltrim" << BSON("chars"
-                                                                    << "xyz")),
-                                              expCtx->variablesParseState),
-                  AssertionException);
-}
-
-TEST(ExpressionTrimParsingTest, ThrowsIfSpecContainsUnrecognizedField) {
-    intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-
-    ASSERT_THROWS(Expression::parseExpression(
-                      expCtx, BSON("$trim" << BSON("other" << 1)), expCtx->variablesParseState),
-                  AssertionException);
-    ASSERT_THROWS(Expression::parseExpression(expCtx,
-                                              BSON("$ltrim" << BSON("chars"
-                                                                    << "xyz"
-                                                                    << "other"
-                                                                    << 1)),
-                                              expCtx->variablesParseState),
-                  AssertionException);
-    ASSERT_THROWS(Expression::parseExpression(expCtx,
-                                              BSON("$rtrim" << BSON("input"
-                                                                    << "$x"
-                                                                    << "chars"
-                                                                    << "xyz"
-                                                                    << "other"
-                                                                    << 1)),
-                                              expCtx->variablesParseState),
-                  AssertionException);
-}
-
-TEST(ExpressionTrimTest, ThrowsIfInputIsNotString) {
-    ASSERT_THROWS(evaluateNamedArgExpression("$trim", Document{{"input", 1}}), AssertionException);
-    ASSERT_THROWS(evaluateNamedArgExpression("$trim", Document{{"input", BSON_ARRAY(1 << 2)}}),
-                  AssertionException);
-    ASSERT_THROWS(evaluateNamedArgExpression("$ltrim", Document{{"input", 3}}), AssertionException);
-    ASSERT_THROWS(evaluateNamedArgExpression("$rtrim", Document{{"input", Document{{"x", 1}}}}),
-                  AssertionException);
-}
-
-TEST(ExpressionTrimTest, ThrowsIfCharsIsNotAString) {
-    ASSERT_THROWS(evaluateNamedArgExpression("$trim", Document{{"input", " x "_sd}, {"chars", 1}}),
-                  AssertionException);
-    ASSERT_THROWS(evaluateNamedArgExpression(
-                      "$trim", Document{{"input", " x "_sd}, {"chars", BSON_ARRAY(1 << 2)}}),
-                  AssertionException);
-    ASSERT_THROWS(evaluateNamedArgExpression("$ltrim", Document{{"input", " x "_sd}, {"chars", 3}}),
-                  AssertionException);
-    ASSERT_THROWS(evaluateNamedArgExpression(
-                      "$rtrim", Document{{"input", " x "_sd}, {"chars", Document{{"x", 1}}}}),
-                  AssertionException);
-}
-
-TEST(ExpressionTrimTest, DoesTrimAsciiWhitespace) {
-    // Trim from both sides.
-    ASSERT_VALUE_EQ(evaluateNamedArgExpression("$trim", Document{{"input", "  abc  "_sd}}),
-                    Value{"abc"_sd});
-    ASSERT_VALUE_EQ(evaluateNamedArgExpression("$trim", Document{{"input", "\n  abc \r\n "_sd}}),
-                    Value{"abc"_sd});
-
-    // Trim just from the right.
-    ASSERT_VALUE_EQ(evaluateNamedArgExpression("$rtrim", Document{{"input", "abc  "_sd}}),
-                    Value{"abc"_sd});
-    ASSERT_VALUE_EQ(evaluateNamedArgExpression("$rtrim", Document{{"input", "abc \r\n "_sd}}),
-                    Value{"abc"_sd});
-
-    // Trim just from the left.
-    ASSERT_VALUE_EQ(evaluateNamedArgExpression("$ltrim", Document{{"input", "  abc"_sd}}),
-                    Value{"abc"_sd});
-    ASSERT_VALUE_EQ(evaluateNamedArgExpression("$ltrim", Document{{"input", "\n  abc"_sd}}),
-                    Value{"abc"_sd});
-
-    // Make sure we don't trim from the opposite side when doing $ltrim or $rtrim.
-    ASSERT_VALUE_EQ(evaluateNamedArgExpression("$rtrim", Document{{"input", "  abc"_sd}}),
-                    Value{"  abc"_sd});
-    ASSERT_VALUE_EQ(evaluateNamedArgExpression("$rtrim", Document{{"input", "\t \nabc \r\n "_sd}}),
-                    Value{"\t \nabc"_sd});
-    ASSERT_VALUE_EQ(evaluateNamedArgExpression("$ltrim", Document{{"input", "  abc  "_sd}}),
-                    Value{"abc  "_sd});
-    ASSERT_VALUE_EQ(evaluateNamedArgExpression("$ltrim", Document{{"input", "\n  abc \t\n  "_sd}}),
-                    Value{"abc \t\n  "_sd});
-    ASSERT_VALUE_EQ(evaluateNamedArgExpression("$ltrim", Document{{"input", "abc  "_sd}}),
-                    Value{"abc  "_sd});
-}
-
-TEST(ExpressionTrimTest, DoesTrimNullCharacters) {
-    // Trim from both sides.
-    ASSERT_VALUE_EQ(evaluateNamedArgExpression("$trim", Document{{"input", "\0\0abc\0"_sd}}),
-                    Value{"abc"_sd});
-    ASSERT_VALUE_EQ(evaluateNamedArgExpression("$trim", Document{{"input", "\0 \0 abc \0  "_sd}}),
-                    Value{"abc"_sd});
-    ASSERT_VALUE_EQ(
-        evaluateNamedArgExpression("$trim", Document{{"input", "\n \0  abc \r\0\n "_sd}}),
-        Value{"abc"_sd});
-
-    // Trim just from the right.
-    ASSERT_VALUE_EQ(evaluateNamedArgExpression("$rtrim", Document{{"input", "abc\0\0"_sd}}),
-                    Value{"abc"_sd});
-    ASSERT_VALUE_EQ(evaluateNamedArgExpression("$rtrim", Document{{"input", "abc \r\0\n\0 "_sd}}),
-                    Value{"abc"_sd});
-
-    // Trim just from the left.
-    ASSERT_VALUE_EQ(evaluateNamedArgExpression("$ltrim", Document{{"input", "\0\0abc"_sd}}),
-                    Value{"abc"_sd});
-    ASSERT_VALUE_EQ(evaluateNamedArgExpression("$ltrim", Document{{"input", "\n \0\0 abc"_sd}}),
-                    Value{"abc"_sd});
-
-    // Make sure we don't trim from the opposite side when doing $ltrim or $rtrim.
-    ASSERT_VALUE_EQ(evaluateNamedArgExpression("$rtrim", Document{{"input", "\0\0abc"_sd}}),
-                    Value{"\0\0abc"_sd});
-    ASSERT_VALUE_EQ(evaluateNamedArgExpression("$rtrim", Document{{"input", " \0 abc"_sd}}),
-                    Value{" \0 abc"_sd});
-    ASSERT_VALUE_EQ(
-        evaluateNamedArgExpression("$rtrim", Document{{"input", "\t\0\0 \nabc \r\n "_sd}}),
-        Value{"\t\0\0 \nabc"_sd});
-    ASSERT_VALUE_EQ(evaluateNamedArgExpression("$ltrim", Document{{"input", "  abc\0\0"_sd}}),
-                    Value{"abc\0\0"_sd});
-    ASSERT_VALUE_EQ(
-        evaluateNamedArgExpression("$ltrim", Document{{"input", "\n  abc \t\0\n \0\0 "_sd}}),
-        Value{"abc \t\0\n \0\0 "_sd});
-    ASSERT_VALUE_EQ(evaluateNamedArgExpression("$ltrim", Document{{"input", "abc\0\0"_sd}}),
-                    Value{"abc\0\0"_sd});
-}
-
-TEST(ExpressionTrimTest, DoesTrimUnicodeWhitespace) {
-    // Trim from both sides.
-    ASSERT_VALUE_EQ(
-        evaluateNamedArgExpression("$trim", Document{{"input", "\u2001abc\u2004\u200A"_sd}}),
-        Value{"abc"_sd});
-    ASSERT_VALUE_EQ(
-        evaluateNamedArgExpression(
-            "$trim", Document{{"input", "\n\u0020 \0\u2007  abc \r\0\n\u0009\u200A "_sd}}),
-        Value{"abc"_sd});
-
-    // Trim just from the right.
-    ASSERT_VALUE_EQ(evaluateNamedArgExpression("$rtrim", Document{{"input", "abc\u2007\u2006"_sd}}),
-                    Value{"abc"_sd});
-    ASSERT_VALUE_EQ(evaluateNamedArgExpression(
-                        "$rtrim", Document{{"input", "abc \r\u2009\u0009\u200A\n\0 "_sd}}),
-                    Value{"abc"_sd});
-
-    // Trim just from the left.
-    ASSERT_VALUE_EQ(evaluateNamedArgExpression("$ltrim", Document{{"input", "\u2009\u2004abc"_sd}}),
-                    Value{"abc"_sd});
-    ASSERT_VALUE_EQ(evaluateNamedArgExpression(
-                        "$ltrim", Document{{"input", "\n \u2000 \0\u2008\0 \u200Aabc"_sd}}),
-                    Value{"abc"_sd});
-}
-
-TEST(ExpressionTrimTest, DoesTrimCustomAsciiCharacters) {
-    // Trim from both sides.
-    ASSERT_VALUE_EQ(
-        evaluateNamedArgExpression("$trim", Document{{"input", "xxXXxx"_sd}, {"chars", "x"_sd}}),
-        Value{"XX"_sd});
-    ASSERT_VALUE_EQ(
-        evaluateNamedArgExpression("$trim", Document{{"input", "00123"_sd}, {"chars", "0"_sd}}),
-        Value{"123"_sd});
-    ASSERT_VALUE_EQ(
-        evaluateNamedArgExpression("$trim",
-                                   Document{{"input", "30:00:12 I don't care about the time"_sd},
-                                            {"chars", "0123456789: "_sd}}),
-        Value{"I don't care about the time"_sd});
-
-    // Trim just from the right.
-    ASSERT_VALUE_EQ(
-        evaluateNamedArgExpression("$rtrim", Document{{"input", "xxXXxx"_sd}, {"chars", "x"_sd}}),
-        Value{"xxXX"_sd});
-    ASSERT_VALUE_EQ(
-        evaluateNamedArgExpression("$rtrim", Document{{"input", "00123"_sd}, {"chars", "0"_sd}}),
-        Value{"00123"_sd});
-    ASSERT_VALUE_EQ(
-        evaluateNamedArgExpression("$rtrim",
-                                   Document{{"input", "30:00:12 I don't care about the time"_sd},
-                                            {"chars", "0123456789: "_sd}}),
-        Value{"30:00:12 I don't care about the time"_sd});
-
-    // Trim just from the left.
-    ASSERT_VALUE_EQ(
-        evaluateNamedArgExpression("$rtrim", Document{{"input", "xxXXxx"_sd}, {"chars", "x"_sd}}),
-        Value{"xxXX"_sd});
-    ASSERT_VALUE_EQ(
-        evaluateNamedArgExpression("$rtrim", Document{{"input", "00123"_sd}, {"chars", "0"_sd}}),
-        Value{"00123"_sd});
-    ASSERT_VALUE_EQ(
-        evaluateNamedArgExpression("$rtrim",
-                                   Document{{"input", "30:00:12 I don't care about the time"_sd},
-                                            {"chars", "0123456789: "_sd}}),
-        Value{"30:00:12 I don't care about the time"_sd});
-}
-
-TEST(ExpressionTrimTest, DoesTrimCustomUnicodeCharacters) {
-    ASSERT_VALUE_EQ(
-        evaluateNamedArgExpression("$ltrim", Document{{"input", "∃x.x ≥ y"_sd}, {"chars", "∃"_sd}}),
-        Value{"x.x ≥ y"_sd});
-    ASSERT_VALUE_EQ(
-        evaluateNamedArgExpression("$rtrim", Document{{"input", "∃x.x ≥ y"_sd}, {"chars", "∃"_sd}}),
-        Value{"∃x.x ≥ y"_sd});
-    ASSERT_VALUE_EQ(
-        evaluateNamedArgExpression("$trim", Document{{"input", "∃x.x ≥ y"_sd}, {"chars", "∃"_sd}}),
-        Value{"x.x ≥ y"_sd});
-
-    ASSERT_VALUE_EQ(
-        evaluateNamedArgExpression("$ltrim", Document{{"input", "⌊x⌋"_sd}, {"chars", "⌊⌋"_sd}}),
-        Value{"x⌋"_sd});
-    ASSERT_VALUE_EQ(
-        evaluateNamedArgExpression("$rtrim", Document{{"input", "⌊x⌋"_sd}, {"chars", "⌊⌋"_sd}}),
-        Value{"⌊x"_sd});
-    ASSERT_VALUE_EQ(
-        evaluateNamedArgExpression("$trim", Document{{"input", "⌊x⌋"_sd}, {"chars", "⌊⌋"_sd}}),
-        Value{"x"_sd});
-}
-
-TEST(ExpressionTrimTest, DoesTrimCustomMixOfUnicodeAndAsciiCharacters) {
-    ASSERT_VALUE_EQ(evaluateNamedArgExpression(
-                        "$ltrim", Document{{"input", "∃x.x ≥ y"_sd}, {"chars", "∃y"_sd}}),
-                    Value{"x.x ≥ y"_sd});
-    ASSERT_VALUE_EQ(evaluateNamedArgExpression(
-                        "$rtrim", Document{{"input", "∃x.x ≥ y"_sd}, {"chars", "∃y"_sd}}),
-                    Value{"∃x.x ≥ "_sd});
-    ASSERT_VALUE_EQ(
-        evaluateNamedArgExpression("$trim", Document{{"input", "∃x.x ≥ y"_sd}, {"chars", "∃y"_sd}}),
-        Value{"x.x ≥ "_sd});
-
-    ASSERT_VALUE_EQ(
-        evaluateNamedArgExpression("$ltrim", Document{{"input", "⌊x⌋"_sd}, {"chars", "⌊x⌋"_sd}}),
-        Value{""_sd});
-    ASSERT_VALUE_EQ(
-        evaluateNamedArgExpression("$rtrim", Document{{"input", "⌊x⌋"_sd}, {"chars", "⌊x⌋"_sd}}),
-        Value{""_sd});
-    ASSERT_VALUE_EQ(
-        evaluateNamedArgExpression("$trim", Document{{"input", "⌊x⌋"_sd}, {"chars", "⌊x⌋"_sd}}),
-        Value{""_sd});
-
-    ASSERT_VALUE_EQ(
-        evaluateNamedArgExpression(
-            "$ltrim", Document{{"input", "▹▱◯□ I ▙◉VE Shapes □◯▱◃"_sd}, {"chars", "□◯▱◃▹ "_sd}}),
-        Value{"I ▙◉VE Shapes □◯▱◃"_sd});
-    ASSERT_VALUE_EQ(
-        evaluateNamedArgExpression(
-            "$rtrim", Document{{"input", "▹▱◯□ I ▙◉VE Shapes □◯▱◃"_sd}, {"chars", "□◯▱◃▹ "_sd}}),
-        Value{"▹▱◯□ I ▙◉VE Shapes"_sd});
-    ASSERT_VALUE_EQ(
-        evaluateNamedArgExpression(
-            "$trim", Document{{"input", "▹▱◯□ I ▙◉VE Shapes □◯▱◃"_sd}, {"chars", "□◯▱◃▹ "_sd}}),
-        Value{"I ▙◉VE Shapes"_sd});
-}
-
-TEST(ExpressionTrimTest, DoesNotTrimFromMiddle) {
-    // Using ascii whitespace.
-    ASSERT_VALUE_EQ(evaluateNamedArgExpression("$trim", Document{{"input", "  a\tb c  "_sd}}),
-                    Value{"a\tb c"_sd});
-    ASSERT_VALUE_EQ(
-        evaluateNamedArgExpression("$trim", Document{{"input", "\n  a\nb  c \r\n "_sd}}),
-        Value{"a\nb  c"_sd});
-    ASSERT_VALUE_EQ(evaluateNamedArgExpression("$rtrim", Document{{"input", "  a\tb c  "_sd}}),
-                    Value{"  a\tb c"_sd});
-    ASSERT_VALUE_EQ(
-        evaluateNamedArgExpression("$rtrim", Document{{"input", "\n  a\nb  c \r\n "_sd}}),
-        Value{"\n  a\nb  c"_sd});
-    ASSERT_VALUE_EQ(evaluateNamedArgExpression("$ltrim", Document{{"input", "  a\tb c  "_sd}}),
-                    Value{"a\tb c  "_sd});
-    ASSERT_VALUE_EQ(
-        evaluateNamedArgExpression("$ltrim", Document{{"input", "\n  a\nb  c \r\n "_sd}}),
-        Value{"a\nb  c \r\n "_sd});
-
-    // Using unicode whitespace.
-    ASSERT_VALUE_EQ(evaluateNamedArgExpression(
-                        "$trim", Document{{"input", "\u2001a\u2001\u000Ab\u2009c\u2004\u200A"_sd}}),
-                    Value{"a\u2001\u000Ab\u2009c"_sd});
-    ASSERT_VALUE_EQ(
-        evaluateNamedArgExpression(
-            "$ltrim", Document{{"input", "\u2001a\u2001\u000Ab\u2009c\u2004\u200A"_sd}}),
-        Value{"a\u2001\u000Ab\u2009c\u2004\u200A"_sd});
-    ASSERT_VALUE_EQ(
-        evaluateNamedArgExpression(
-            "$rtrim", Document{{"input", "\u2001a\u2001\u000Ab\u2009c\u2004\u200A"_sd}}),
-        Value{"\u2001a\u2001\u000Ab\u2009c"_sd});
-
-    // With custom ascii characters.
-    ASSERT_VALUE_EQ(
-        evaluateNamedArgExpression("$trim", Document{{"input", "xxXxXxx"_sd}, {"chars", "x"_sd}}),
-        Value{"XxX"_sd});
-    ASSERT_VALUE_EQ(
-        evaluateNamedArgExpression("$rtrim", Document{{"input", "xxXxXxx"_sd}, {"chars", "x"_sd}}),
-        Value{"xxXxX"_sd});
-    ASSERT_VALUE_EQ(
-        evaluateNamedArgExpression("$ltrim", Document{{"input", "xxXxXxx"_sd}, {"chars", "x"_sd}}),
-        Value{"XxXxx"_sd});
-
-    // With custom unicode characters.
-    ASSERT_VALUE_EQ(evaluateNamedArgExpression(
-                        "$trim", Document{{"input", "⌊y + 2⌋⌊x⌋"_sd}, {"chars", "⌊⌋"_sd}}),
-                    Value{"y + 2⌋⌊x"_sd});
-    ASSERT_VALUE_EQ(evaluateNamedArgExpression(
-                        "$ltrim", Document{{"input", "⌊y + 2⌋⌊x⌋"_sd}, {"chars", "⌊⌋"_sd}}),
-                    Value{"y + 2⌋⌊x⌋"_sd});
-    ASSERT_VALUE_EQ(evaluateNamedArgExpression(
-                        "$rtrim", Document{{"input", "⌊y + 2⌋⌊x⌋"_sd}, {"chars", "⌊⌋"_sd}}),
-                    Value{"⌊y + 2⌋⌊x"_sd});
-}
-
-TEST(ExpressionTrimTest, DoesTrimEntireString) {
-    // Using ascii whitespace.
-    ASSERT_VALUE_EQ(evaluateNamedArgExpression("$trim", Document{{"input", "  \t \n  "_sd}}),
-                    Value{""_sd});
-    ASSERT_VALUE_EQ(evaluateNamedArgExpression("$ltrim", Document{{"input", "   \t  \n\0  "_sd}}),
-                    Value{""_sd});
-    ASSERT_VALUE_EQ(evaluateNamedArgExpression("$rtrim", Document{{"input", "  \t   "_sd}}),
-                    Value{""_sd});
-
-    // Using unicode whitespace.
-    ASSERT_VALUE_EQ(
-        evaluateNamedArgExpression(
-            "$trim", Document{{"input", "\u2001 \u2001\t\u000A  \u2009\u2004\u200A"_sd}}),
-        Value{""_sd});
-    ASSERT_VALUE_EQ(
-        evaluateNamedArgExpression(
-            "$ltrim", Document{{"input", "\u2001 \u2001\t\u000A  \u2009\u2004\u200A"_sd}}),
-        Value{""_sd});
-    ASSERT_VALUE_EQ(
-        evaluateNamedArgExpression(
-            "$rtrim", Document{{"input", "\u2001 \u2001\t\u000A  \u2009\u2004\u200A"_sd}}),
-        Value{""_sd});
-
-    // With custom characters.
-    ASSERT_VALUE_EQ(
-        evaluateNamedArgExpression("$trim", Document{{"input", "xxXxXxx"_sd}, {"chars", "x"_sd}}),
-        Value{"XxX"_sd});
-    ASSERT_VALUE_EQ(
-        evaluateNamedArgExpression("$rtrim", Document{{"input", "xxXxXxx"_sd}, {"chars", "x"_sd}}),
-        Value{"xxXxX"_sd});
-    ASSERT_VALUE_EQ(
-        evaluateNamedArgExpression("$ltrim", Document{{"input", "xxXxXxx"_sd}, {"chars", "x"_sd}}),
-        Value{"XxXxx"_sd});
-
-    // With custom unicode characters.
-    ASSERT_VALUE_EQ(
-        evaluateNamedArgExpression("$trim", Document{{"input", "⌊y⌋⌊x⌋"_sd}, {"chars", "⌊xy⌋"_sd}}),
-        Value{""_sd});
-    ASSERT_VALUE_EQ(evaluateNamedArgExpression(
-                        "$ltrim", Document{{"input", "⌊y⌋⌊x⌋"_sd}, {"chars", "⌊xy⌋"_sd}}),
-                    Value{""_sd});
-    ASSERT_VALUE_EQ(evaluateNamedArgExpression(
-                        "$rtrim", Document{{"input", "⌊y⌋⌊x⌋"_sd}, {"chars", "⌊xy⌋"_sd}}),
-                    Value{""_sd});
-}
-
-TEST(ExpressionTrimTest, DoesNotTrimAnyThingWithEmptyChars) {
-    ASSERT_VALUE_EQ(
-        evaluateNamedArgExpression("$trim", Document{{"input", "abcde"_sd}, {"chars", ""_sd}}),
-        Value{"abcde"_sd});
-    ASSERT_VALUE_EQ(
-        evaluateNamedArgExpression("$trim", Document{{"input", "  "_sd}, {"chars", ""_sd}}),
-        Value{"  "_sd});
-    ASSERT_VALUE_EQ(
-        evaluateNamedArgExpression("$trim", Document{{"input", " ⌊y⌋⌊x⌋ "_sd}, {"chars", ""_sd}}),
-        Value{" ⌊y⌋⌊x⌋ "_sd});
-}
-
-TEST(ExpressionTrimTest, TrimComparisonsShouldNotRespectCollation) {
-    intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    auto caseInsensitive =
-        stdx::make_unique<CollatorInterfaceMock>(CollatorInterfaceMock::MockType::kToLowerString);
-    expCtx->setCollator(caseInsensitive.get());
-
-    auto trim = Expression::parseExpression(expCtx,
-                                            BSON("$trim" << BSON("input"
-                                                                 << "xxXXxx"
-                                                                 << "chars"
-                                                                 << "x")),
-                                            expCtx->variablesParseState);
-
-    ASSERT_VALUE_EQ(trim->evaluate(Document()), Value("XX"_sd));
-}
-
-TEST(ExpressionTrimTest, ShouldRejectInvalidUTFInCharsArgument) {
-    const auto twoThirdsOfExistsSymbol = "\xE2\x88"_sd;  // Full ∃ symbol would be "\xE2\x88\x83".
-    ASSERT_THROWS(evaluateNamedArgExpression(
-                      "$trim", Document{{"input", "abcde"_sd}, {"chars", twoThirdsOfExistsSymbol}}),
-                  AssertionException);
-    const auto stringWithExtraContinuationByte = "\xE2\x88\x83\x83"_sd;
-    ASSERT_THROWS(
-        evaluateNamedArgExpression(
-            "$trim", Document{{"input", "ab∃"_sd}, {"chars", stringWithExtraContinuationByte}}),
-        AssertionException);
-    ASSERT_THROWS(
-        evaluateNamedArgExpression("$ltrim",
-                                   Document{{"input", "a" + twoThirdsOfExistsSymbol + "b∃"},
-                                            {"chars", stringWithExtraContinuationByte}}),
-        AssertionException);
-}
-
-TEST(ExpressionTrimTest, ShouldIgnoreUTF8InputWithTruncatedCodePoint) {
-    const auto twoThirdsOfExistsSymbol = "\xE2\x88"_sd;  // Full ∃ symbol would be "\xE2\x88\x83".
-
-    // We are OK producing invalid UTF-8 if the input string was invalid UTF-8, so if the truncated
-    // code point is in the middle and we never examine it, it should work fine.
-    ASSERT_VALUE_EQ(
-        evaluateNamedArgExpression(
-            "$rtrim",
-            Document{{"input", "abc" + twoThirdsOfExistsSymbol + "edf∃"}, {"chars", "∃"_sd}}),
-        Value("abc" + twoThirdsOfExistsSymbol + "edf"));
-
-    ASSERT_VALUE_EQ(evaluateNamedArgExpression(
-                        "$trim", Document{{"input", twoThirdsOfExistsSymbol}, {"chars", "∃"_sd}}),
-                    Value(twoThirdsOfExistsSymbol));
-    ASSERT_VALUE_EQ(
-        evaluateNamedArgExpression(
-            "$rtrim", Document{{"input", "abc" + twoThirdsOfExistsSymbol}, {"chars", "∃"_sd}}),
-        Value("abc" + twoThirdsOfExistsSymbol));
-}
-
-TEST(ExpressionTrimTest, ShouldNotTrimUTF8InputWithTrailingExtraContinuationBytes) {
-    const auto stringWithExtraContinuationByte = "\xE2\x88\x83\x83"_sd;
-
-    ASSERT_VALUE_EQ(
-        evaluateNamedArgExpression(
-            "$trim",
-            Document{{"input", stringWithExtraContinuationByte + "edf∃"}, {"chars", "∃"_sd}}),
-        Value("\x83" + "edf"_sd));
-    ASSERT_VALUE_EQ(evaluateNamedArgExpression(
-                        "$trim",
-                        Document{{"input", "abc" + stringWithExtraContinuationByte + "edf∃"},
-                                 {"chars", "∃"_sd}}),
-                    Value("abc" + stringWithExtraContinuationByte + "edf"_sd));
-    ASSERT_VALUE_EQ(
-        evaluateNamedArgExpression(
-            "$trim",
-            Document{{"input", "Abc" + stringWithExtraContinuationByte}, {"chars", "∃"_sd}}),
-        Value("Abc" + stringWithExtraContinuationByte));
-    ASSERT_VALUE_EQ(
-        evaluateNamedArgExpression(
-            "$rtrim", Document{{"input", stringWithExtraContinuationByte}, {"chars", "∃"_sd}}),
-        Value(stringWithExtraContinuationByte));
-}
-
-TEST(ExpressionTrimTest, ShouldRetunNullIfInputIsNullish) {
-    ASSERT_VALUE_EQ(evaluateNamedArgExpression("$trim", Document{{"input", BSONNULL}}),
-                    Value(BSONNULL));
-    ASSERT_VALUE_EQ(evaluateNamedArgExpression("$trim", Document{{"input", "$missingField"_sd}}),
-                    Value(BSONNULL));
-    ASSERT_VALUE_EQ(evaluateNamedArgExpression("$trim", Document{{"input", BSONUndefined}}),
-                    Value(BSONNULL));
-
-    // Test with a chars argument provided.
-    ASSERT_VALUE_EQ(
-        evaluateNamedArgExpression("$trim", Document{{"input", BSONNULL}, {"chars", "∃"_sd}}),
-        Value(BSONNULL));
-    ASSERT_VALUE_EQ(evaluateNamedArgExpression(
-                        "$trim", Document{{"input", "$missingField"_sd}, {"chars", "∃"_sd}}),
-                    Value(BSONNULL));
-    ASSERT_VALUE_EQ(
-        evaluateNamedArgExpression("$trim", Document{{"input", BSONUndefined}, {"chars", "∃"_sd}}),
-        Value(BSONNULL));
-
-    // Test other variants of trim.
-    ASSERT_VALUE_EQ(evaluateNamedArgExpression("$ltrim", Document{{"input", BSONNULL}}),
-                    Value(BSONNULL));
-    ASSERT_VALUE_EQ(evaluateNamedArgExpression(
-                        "$rtrim", Document{{"input", "$missingField"_sd}, {"chars", "∃"_sd}}),
-                    Value(BSONNULL));
-}
-
-TEST(ExpressionTrimTest, ShouldRetunNullIfCharsIsNullish) {
-    ASSERT_VALUE_EQ(
-        evaluateNamedArgExpression("$trim", Document{{"input", " x "_sd}, {"chars", BSONNULL}}),
-        Value(BSONNULL));
-    ASSERT_VALUE_EQ(evaluateNamedArgExpression(
-                        "$trim", Document{{"input", " x "_sd}, {"chars", "$missingField"_sd}}),
-                    Value(BSONNULL));
-    ASSERT_VALUE_EQ(evaluateNamedArgExpression(
-                        "$trim", Document{{"input", " x "_sd}, {"chars", BSONUndefined}}),
-                    Value(BSONNULL));
-
-    // Test other variants of trim.
-    ASSERT_VALUE_EQ(evaluateNamedArgExpression(
-                        "$ltrim", Document{{"input", " x "_sd}, {"chars", "$missingField"_sd}}),
-                    Value(BSONNULL));
-    ASSERT_VALUE_EQ(evaluateNamedArgExpression(
-                        "$rtrim", Document{{"input", " x "_sd}, {"chars", BSONUndefined}}),
-                    Value(BSONNULL));
-}
-
-TEST(ExpressionTrimTest, ShouldReturnNullIfBothCharsAndCharsAreNullish) {
-    ASSERT_VALUE_EQ(
-        evaluateNamedArgExpression("$trim", Document{{"input", BSONNULL}, {"chars", BSONNULL}}),
-        Value(BSONNULL));
-    ASSERT_VALUE_EQ(evaluateNamedArgExpression(
-                        "$trim", Document{{"input", BSONUndefined}, {"chars", "$missingField"_sd}}),
-                    Value(BSONNULL));
-    ASSERT_VALUE_EQ(evaluateNamedArgExpression(
-                        "$trim", Document{{"input", "$missingField"_sd}, {"chars", BSONUndefined}}),
-                    Value(BSONNULL));
-
-    // Test other variants of trim.
-    ASSERT_VALUE_EQ(evaluateNamedArgExpression(
-                        "$rtrim", Document{{"input", BSONNULL}, {"chars", "$missingField"_sd}}),
-                    Value(BSONNULL));
-    ASSERT_VALUE_EQ(evaluateNamedArgExpression(
-                        "$ltrim", Document{{"input", "$missingField"_sd}, {"chars", BSONNULL}}),
-                    Value(BSONNULL));
-}
-
-TEST(ExpressionTrimTest, DoesOptimizeToConstantWithNoChars) {
-    intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    auto trim = Expression::parseExpression(expCtx,
-                                            BSON("$trim" << BSON("input"
-                                                                 << " abc ")),
-                                            expCtx->variablesParseState);
-    auto optimized = trim->optimize();
-    auto constant = dynamic_cast<ExpressionConstant*>(optimized.get());
-    ASSERT_TRUE(constant);
-    ASSERT_VALUE_EQ(constant->getValue(), Value("abc"_sd));
-
-    // Test that it optimizes to a constant if the input also optimizes to a constant.
-    trim = Expression::parseExpression(
-        expCtx,
-        BSON("$trim" << BSON("input" << BSON("$concat" << BSON_ARRAY(" "
-                                                                     << "abc ")))),
-        expCtx->variablesParseState);
-    optimized = trim->optimize();
-    constant = dynamic_cast<ExpressionConstant*>(optimized.get());
-    ASSERT_TRUE(constant);
-    ASSERT_VALUE_EQ(constant->getValue(), Value("abc"_sd));
-}
-
-TEST(ExpressionTrimTest, DoesOptimizeToConstantWithCustomChars) {
-    intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    auto trim = Expression::parseExpression(expCtx,
-                                            BSON("$trim" << BSON("input"
-                                                                 << " abc "
-                                                                 << "chars"
-                                                                 << " ")),
-                                            expCtx->variablesParseState);
-    auto optimized = trim->optimize();
-    auto constant = dynamic_cast<ExpressionConstant*>(optimized.get());
-    ASSERT_TRUE(constant);
-    ASSERT_VALUE_EQ(constant->getValue(), Value("abc"_sd));
-
-    // Test that it optimizes to a constant if the chars argument optimizes to a constant.
-    trim = Expression::parseExpression(
-        expCtx,
-        BSON("$trim" << BSON("input"
-                             << "  abc "
-                             << "chars"
-                             << BSON("$substrCP" << BSON_ARRAY("  " << 1 << 1)))),
-        expCtx->variablesParseState);
-    optimized = trim->optimize();
-    constant = dynamic_cast<ExpressionConstant*>(optimized.get());
-    ASSERT_TRUE(constant);
-    ASSERT_VALUE_EQ(constant->getValue(), Value("abc"_sd));
-
-    // Test that it optimizes to a constant if both arguments optimize to a constant.
-    trim = Expression::parseExpression(
-        expCtx,
-        BSON("$trim" << BSON("input" << BSON("$concat" << BSON_ARRAY(" "
-                                                                     << "abc "))
-                                     << "chars"
-                                     << BSON("$substrCP" << BSON_ARRAY("  " << 1 << 1)))),
-        expCtx->variablesParseState);
-    optimized = trim->optimize();
-    constant = dynamic_cast<ExpressionConstant*>(optimized.get());
-    ASSERT_TRUE(constant);
-    ASSERT_VALUE_EQ(constant->getValue(), Value("abc"_sd));
-}
-
-TEST(ExpressionTrimTest, DoesNotOptimizeToConstantWithFieldPaths) {
-    intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-
-    // 'input' is field path.
-    auto trim = Expression::parseExpression(expCtx,
-                                            BSON("$trim" << BSON("input"
-                                                                 << "$inputField")),
-                                            expCtx->variablesParseState);
-    auto optimized = trim->optimize();
-    auto constant = dynamic_cast<ExpressionConstant*>(optimized.get());
-    ASSERT_FALSE(constant);
-
-    // 'chars' is field path.
-    trim = Expression::parseExpression(expCtx,
-                                       BSON("$trim" << BSON("input"
-                                                            << " abc "
-                                                            << "chars"
-                                                            << "$secondInput")),
-                                       expCtx->variablesParseState);
-    optimized = trim->optimize();
-    constant = dynamic_cast<ExpressionConstant*>(optimized.get());
-    ASSERT_FALSE(constant);
-
-    // Both are field paths.
-    trim = Expression::parseExpression(expCtx,
-                                       BSON("$trim" << BSON("input"
-                                                            << "$inputField"
-                                                            << "chars"
-                                                            << "$secondInput")),
-                                       expCtx->variablesParseState);
-    optimized = trim->optimize();
-    constant = dynamic_cast<ExpressionConstant*>(optimized.get());
-    ASSERT_FALSE(constant);
-}
-
-TEST(ExpressionTrimTest, DoesAddInputDependencies) {
-    intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-
-    auto trim = Expression::parseExpression(expCtx,
-                                            BSON("$trim" << BSON("input"
-                                                                 << "$inputField")),
-                                            expCtx->variablesParseState);
-    DepsTracker deps;
-    trim->addDependencies(&deps);
-    ASSERT_EQ(deps.fields.count("inputField"), 1u);
-    ASSERT_EQ(deps.fields.size(), 1u);
-}
-
-TEST(ExpressionTrimTest, DoesAddCharsDependencies) {
-    intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-
-    auto trim = Expression::parseExpression(expCtx,
-                                            BSON("$trim" << BSON("input"
-                                                                 << "$inputField"
-                                                                 << "chars"
-                                                                 << "$$CURRENT.a")),
-                                            expCtx->variablesParseState);
-    DepsTracker deps;
-    trim->addDependencies(&deps);
-    ASSERT_EQ(deps.fields.count("inputField"), 1u);
-    ASSERT_EQ(deps.fields.count("a"), 1u);
-    ASSERT_EQ(deps.fields.size(), 2u);
-}
-
-TEST(ExpressionTrimTest, DoesSerializeCorrectly) {
-    intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-
-    auto trim = Expression::parseExpression(expCtx,
-                                            BSON("$trim" << BSON("input"
-                                                                 << " abc ")),
-                                            expCtx->variablesParseState);
-    ASSERT_VALUE_EQ(trim->serialize(false), trim->serialize(true));
-    ASSERT_VALUE_EQ(
-        trim->serialize(false),
-        Value(Document{{"$trim", Document{{"input", Document{{"$const", " abc "_sd}}}}}}));
-
-    // Make sure we can re-parse it and evaluate it.
-    auto reparsedTrim = Expression::parseExpression(
-        expCtx, trim->serialize(false).getDocument().toBson(), expCtx->variablesParseState);
-    ASSERT_VALUE_EQ(reparsedTrim->evaluate(Document()), Value("abc"_sd));
-
-    // Use $ltrim, and specify the 'chars' option.
-    trim = Expression::parseExpression(expCtx,
-                                       BSON("$ltrim" << BSON("input"
-                                                             << "$inputField"
-                                                             << "chars"
-                                                             << "$$CURRENT.a")),
-                                       expCtx->variablesParseState);
-    ASSERT_VALUE_EQ(
-        trim->serialize(false),
-        Value(Document{{"$ltrim", Document{{"input", "$inputField"_sd}, {"chars", "$a"_sd}}}}));
-
-    // Make sure we can re-parse it and evaluate it.
-    reparsedTrim = Expression::parseExpression(
-        expCtx, trim->serialize(false).getDocument().toBson(), expCtx->variablesParseState);
-    ASSERT_VALUE_EQ(reparsedTrim->evaluate(Document{{"inputField", " , 4"_sd}, {"a", " ,"_sd}}),
-                    Value("4"_sd));
-}
-}  // namespace Trim
 
 namespace Type {
 
@@ -5441,6 +1959,102 @@ TEST(ExpressionTypeTest, WithMaxKeyValue) {
 }
 
 }  // namespace Type
+
+namespace IsNumber {
+
+TEST(ExpressionIsNumberTest, WithMinKeyValue) {
+    assertExpectedResults("$isNumber", {{{Value(MINKEY)}, Value(false)}});
+}
+
+TEST(ExpressionIsNumberTest, WithDoubleValue) {
+    assertExpectedResults("$isNumber", {{{Value(1.0)}, Value(true)}});
+}
+
+TEST(ExpressionIsNumberTest, WithStringValue) {
+    assertExpectedResults("$isNumber", {{{Value("stringValue"_sd)}, Value(false)}});
+}
+
+TEST(ExpressionIsNumberTest, WithNumericStringValue) {
+    assertExpectedResults("$isNumber", {{{Value("5"_sd)}, Value(false)}});
+}
+
+TEST(ExpressionIsNumberTest, WithObjectValue) {
+    BSONObj objectVal = fromjson("{a: {$literal: 1}}");
+    assertExpectedResults("$isNumber", {{{Value(objectVal)}, Value(false)}});
+}
+
+TEST(ExpressionIsNumberTest, WithArrayValue) {
+    assertExpectedResults("$isNumber", {{{Value(BSON_ARRAY(1 << 2))}, Value(false)}});
+}
+
+TEST(ExpressionIsNumberTest, WithBinDataValue) {
+    BSONBinData binDataVal = BSONBinData("", 0, BinDataGeneral);
+    assertExpectedResults("$isNumber", {{{Value(binDataVal)}, Value(false)}});
+}
+
+TEST(ExpressionIsNumberTest, WithUndefinedValue) {
+    assertExpectedResults("$isNumber", {{{Value(BSONUndefined)}, Value(false)}});
+}
+
+TEST(ExpressionIsNumberTest, WithOIDValue) {
+    assertExpectedResults("$isNumber", {{{Value(OID())}, Value(false)}});
+}
+
+TEST(ExpressionIsNumberTest, WithBoolValue) {
+    assertExpectedResults("$isNumber", {{{Value(true)}, Value(false)}});
+}
+
+TEST(ExpressionIsNumberTest, WithDateValue) {
+    Date_t dateVal = BSON("" << DATENOW).firstElement().Date();
+    assertExpectedResults("$isNumber", {{{Value(dateVal)}, Value(false)}});
+}
+
+TEST(ExpressionIsNumberTest, WithNullValue) {
+    assertExpectedResults("$isNumber", {{{Value(BSONNULL)}, Value(false)}});
+}
+
+TEST(ExpressionIsNumberTest, WithRegexValue) {
+    assertExpectedResults("$isNumber", {{{Value(BSONRegEx("a.b"))}, Value(false)}});
+}
+
+TEST(ExpressionIsNumberTest, WithSymbolValue) {
+    assertExpectedResults("$isNumber", {{{Value(BSONSymbol("a"))}, Value(false)}});
+}
+
+TEST(ExpressionIsNumberTest, WithDBRefValue) {
+    assertExpectedResults("$isNumber", {{{Value(BSONDBRef("", OID()))}, Value(false)}});
+}
+
+TEST(ExpressionIsNumberTest, WithCodeWScopeValue) {
+    assertExpectedResults("$isNumber",
+                          {{{Value(BSONCodeWScope("var x = 3", BSONObj()))}, Value(false)}});
+}
+
+TEST(ExpressionIsNumberTest, WithCodeValue) {
+    assertExpectedResults("$isNumber", {{{Value(BSONCode("var x = 3"))}, Value(false)}});
+}
+
+TEST(ExpressionIsNumberTest, WithIntValue) {
+    assertExpectedResults("$isNumber", {{{Value(1)}, Value(true)}});
+}
+
+TEST(ExpressionIsNumberTest, WithDecimalValue) {
+    assertExpectedResults("$isNumber", {{{Value(Decimal128(0.3))}, Value(true)}});
+}
+
+TEST(ExpressionIsNumberTest, WithLongValue) {
+    assertExpectedResults("$isNumber", {{{Value(1LL)}, Value(true)}});
+}
+
+TEST(ExpressionIsNumberTest, WithTimestampValue) {
+    assertExpectedResults("$isNumber", {{{Value(Timestamp(0, 0))}, Value(false)}});
+}
+
+TEST(ExpressionIsNumberTest, WithMaxKeyValue) {
+    assertExpectedResults("$isNumber", {{{Value(MAXKEY)}, Value(false)}});
+}
+
+}  // namespace IsNumber
 
 namespace BuiltinRemoveVariable {
 
@@ -5572,7 +2186,8 @@ public:
         VariablesParseState vps = expCtx->variablesParseState;
         intrusive_ptr<Expression> expression = Expression::parseOperand(expCtx, specElement, vps);
         ASSERT_BSONOBJ_EQ(constify(spec()), expressionToBson(expression));
-        ASSERT_BSONOBJ_EQ(BSON("" << expectedResult()), toBson(expression->evaluate(Document())));
+        ASSERT_BSONOBJ_EQ(BSON("" << expectedResult()),
+                          toBson(expression->evaluate({}, &expCtx->variables)));
     }
 
 protected:
@@ -5629,7 +2244,8 @@ public:
         VariablesParseState vps = expCtx->variablesParseState;
         intrusive_ptr<Expression> expression = Expression::parseOperand(expCtx, specElement, vps);
         ASSERT_BSONOBJ_EQ(constify(spec()), expressionToBson(expression));
-        ASSERT_BSONOBJ_EQ(BSON("" << expectedResult()), toBson(expression->evaluate(Document())));
+        ASSERT_BSONOBJ_EQ(BSON("" << expectedResult()),
+                          toBson(expression->evaluate({}, &expCtx->variables)));
     }
 
 protected:
@@ -5691,7 +2307,7 @@ public:
                 VariablesParseState vps = expCtx->variablesParseState;
                 const intrusive_ptr<Expression> expr =
                     Expression::parseExpression(expCtx, obj, vps);
-                const Value result = expr->evaluate(Document());
+                const Value result = expr->evaluate({}, &expCtx->variables);
                 if (ValueComparator().evaluate(result != expected)) {
                     string errMsg = str::stream()
                         << "for expression " << field.first.toString() << " with argument "
@@ -5715,7 +2331,7 @@ public:
                         // same
                         const intrusive_ptr<Expression> expr =
                             Expression::parseExpression(expCtx, obj, vps);
-                        expr->evaluate(Document());
+                        expr->evaluate({}, &expCtx->variables);
                     }(),
                     AssertionException);
             }
@@ -5770,8 +2386,9 @@ class FalseViaInt : public ExpectedResultBase {
 
 class Null : public ExpectedResultBase {
     Document getSpec() {
-        return DOC("input" << DOC_ARRAY(BSONNULL) << "error" << DOC_ARRAY("$allElementsTrue"_sd
-                                                                          << "$anyElementTrue"_sd));
+        return DOC("input" << DOC_ARRAY(BSONNULL) << "error"
+                           << DOC_ARRAY("$allElementsTrue"_sd
+                                        << "$anyElementTrue"_sd));
     }
 };
 
@@ -5950,9 +2567,261 @@ TEST(GetComputedPathsTest, ExpressionMapNotConsideredRenameWithDottedInputPath) 
 
 }  // namespace GetComputedPathsTest
 
-class All : public Suite {
+namespace expression_meta_test {
+TEST(ExpressionMetaTest, ExpressionMetaSearchScore) {
+    intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    VariablesParseState vps = expCtx->variablesParseState;
+    BSONObj expr = fromjson("{$meta: \"searchScore\"}");
+    auto expressionMeta = ExpressionMeta::parse(expCtx, expr.firstElement(), vps);
+
+    MutableDocument doc;
+    doc.metadata().setSearchScore(1.234);
+    Value val = expressionMeta->evaluate(doc.freeze(), &expCtx->variables);
+    ASSERT_EQ(val.getDouble(), 1.234);
+}
+
+TEST(ExpressionMetaTest, ExpressionMetaSearchHighlights) {
+    intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    VariablesParseState vps = expCtx->variablesParseState;
+    BSONObj expr = fromjson("{$meta: \"searchHighlights\"}");
+    auto expressionMeta = ExpressionMeta::parse(expCtx, expr.firstElement(), vps);
+
+    MutableDocument doc;
+    Document highlights = DOC("this part" << 1 << "is opaque to the server" << 1);
+    doc.metadata().setSearchHighlights(Value(highlights));
+
+    Value val = expressionMeta->evaluate(doc.freeze(), &expCtx->variables);
+    ASSERT_DOCUMENT_EQ(val.getDocument(), highlights);
+}
+
+TEST(ExpressionMetaTest, ExpressionMetaGeoNearDistance) {
+    intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    BSONObj expr = fromjson("{$meta: \"geoNearDistance\"}");
+    auto expressionMeta =
+        ExpressionMeta::parse(expCtx, expr.firstElement(), expCtx->variablesParseState);
+
+    MutableDocument doc;
+    doc.metadata().setGeoNearDistance(1.23);
+    Value val = expressionMeta->evaluate(doc.freeze(), &expCtx->variables);
+    ASSERT_EQ(val.getDouble(), 1.23);
+}
+
+TEST(ExpressionMetaTest, ExpressionMetaGeoNearPoint) {
+    intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    BSONObj expr = fromjson("{$meta: \"geoNearPoint\"}");
+    auto expressionMeta =
+        ExpressionMeta::parse(expCtx, expr.firstElement(), expCtx->variablesParseState);
+
+    MutableDocument doc;
+    Document pointDoc = Document{fromjson("{some: 'document'}")};
+    doc.metadata().setGeoNearPoint(Value(pointDoc));
+    Value val = expressionMeta->evaluate(doc.freeze(), &expCtx->variables);
+    ASSERT_DOCUMENT_EQ(val.getDocument(), pointDoc);
+}
+
+TEST(ExpressionMetaTest, ExpressionMetaIndexKey) {
+    intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    BSONObj expr = fromjson("{$meta: \"indexKey\"}");
+    auto expressionMeta =
+        ExpressionMeta::parse(expCtx, expr.firstElement(), expCtx->variablesParseState);
+
+    MutableDocument doc;
+    BSONObj ixKey = fromjson("{'': 1, '': 'string'}");
+    doc.metadata().setIndexKey(ixKey);
+    Value val = expressionMeta->evaluate(doc.freeze(), &expCtx->variables);
+    ASSERT_DOCUMENT_EQ(val.getDocument(), Document(ixKey));
+}
+
+TEST(ExpressionMetaTest, ExpressionMetaRecordId) {
+    intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    BSONObj expr = fromjson("{$meta: \"recordId\"}");
+    auto expressionMeta =
+        ExpressionMeta::parse(expCtx, expr.firstElement(), expCtx->variablesParseState);
+
+    MutableDocument doc;
+    doc.metadata().setRecordId(RecordId(123LL));
+    Value val = expressionMeta->evaluate(doc.freeze(), &expCtx->variables);
+    ASSERT_EQ(val.getLong(), 123LL);
+}
+
+TEST(ExpressionMetaTest, ExpressionMetaRandVal) {
+    intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    BSONObj expr = fromjson("{$meta: \"randVal\"}");
+    auto expressionMeta =
+        ExpressionMeta::parse(expCtx, expr.firstElement(), expCtx->variablesParseState);
+
+    MutableDocument doc;
+    doc.metadata().setRandVal(1.23);
+    Value val = expressionMeta->evaluate(doc.freeze(), &expCtx->variables);
+    ASSERT_EQ(val.getDouble(), 1.23);
+}
+
+TEST(ExpressionMetaTest, ExpressionMetaSortKey) {
+    intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    BSONObj expr = fromjson("{$meta: \"sortKey\"}");
+    auto expressionMeta =
+        ExpressionMeta::parse(expCtx, expr.firstElement(), expCtx->variablesParseState);
+
+    MutableDocument doc;
+    Value sortKey = Value(std::vector<Value>{Value(1), Value(2)});
+    doc.metadata().setSortKey(sortKey, /* isSingleElementSortKey = */ false);
+    Value val = expressionMeta->evaluate(doc.freeze(), &expCtx->variables);
+    ASSERT_BSONOBJ_EQ(val.getDocument().toBson(), BSON("" << 1 << "" << 2));
+}
+
+TEST(ExpressionMetaTest, ExpressionMetaTextScore) {
+    intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    BSONObj expr = fromjson("{$meta: \"textScore\"}");
+    auto expressionMeta =
+        ExpressionMeta::parse(expCtx, expr.firstElement(), expCtx->variablesParseState);
+
+    MutableDocument doc;
+    doc.metadata().setTextScore(1.23);
+    Value val = expressionMeta->evaluate(doc.freeze(), &expCtx->variables);
+    ASSERT_EQ(val.getDouble(), 1.23);
+}
+}  // namespace expression_meta_test
+
+namespace ExpressionRegexTest {
+
+class ExpressionRegexTest {
 public:
-    All() : Suite("expression") {}
+    template <typename ExpressionRegexSubClass>
+    static intrusive_ptr<Expression> generateOptimizedExpression(
+        const BSONObj& input, intrusive_ptr<ExpressionContextForTest> expCtx) {
+
+        auto expression = ExpressionRegexSubClass::parse(
+            expCtx, input.firstElement(), expCtx->variablesParseState);
+        return expression->optimize();
+    }
+
+    static void testAllExpressions(const BSONObj& input,
+                                   bool optimized,
+                                   const std::vector<Value>& expectedFindAllOutput) {
+
+        intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+        {
+            // For $regexFindAll.
+            auto expression = generateOptimizedExpression<ExpressionRegexFindAll>(input, expCtx);
+            auto regexFindAllExpr = dynamic_cast<ExpressionRegexFindAll*>(expression.get());
+            ASSERT_EQ(regexFindAllExpr->hasConstantRegex(), optimized);
+            Value output = expression->evaluate({}, &expCtx->variables);
+            ASSERT_VALUE_EQ(output, Value(expectedFindAllOutput));
+        }
+        {
+            // For $regexFind.
+            auto expression = generateOptimizedExpression<ExpressionRegexFind>(input, expCtx);
+            auto regexFindExpr = dynamic_cast<ExpressionRegexFind*>(expression.get());
+            ASSERT_EQ(regexFindExpr->hasConstantRegex(), optimized);
+            Value output = expression->evaluate({}, &expCtx->variables);
+            ASSERT_VALUE_EQ(
+                output, expectedFindAllOutput.empty() ? Value(BSONNULL) : expectedFindAllOutput[0]);
+        }
+        {
+            // For $regexMatch.
+            auto expression = generateOptimizedExpression<ExpressionRegexMatch>(input, expCtx);
+            auto regexMatchExpr = dynamic_cast<ExpressionRegexMatch*>(expression.get());
+            ASSERT_EQ(regexMatchExpr->hasConstantRegex(), optimized);
+            Value output = expression->evaluate({}, &expCtx->variables);
+            ASSERT_VALUE_EQ(output, expectedFindAllOutput.empty() ? Value(false) : Value(true));
+        }
+    }
+};
+
+TEST(ExpressionRegexTest, BasicTest) {
+    ExpressionRegexTest::testAllExpressions(
+        fromjson("{$regexFindAll : {input: 'asdf', regex: '^as' }}"),
+        true,
+        {Value(fromjson("{match: 'as', idx:0, captures:[]}"))});
+}
+
+TEST(ExpressionRegexTest, ExtendedRegexOptions) {
+    ExpressionRegexTest::testAllExpressions(
+        fromjson("{$regexFindAll : {input: 'FirstLine\\nSecondLine', regex: "
+                 "'^second' , options: 'mi'}}"),
+        true,
+        {Value(fromjson("{match: 'Second', idx:10, captures:[]}"))});
+}
+
+TEST(ExpressionRegexTest, MultipleMatches) {
+    ExpressionRegexTest::testAllExpressions(
+        fromjson("{$regexFindAll : {input: 'a1b2c3', regex: '([a-c][1-3])' }}"),
+        true,
+        {Value(fromjson("{match: 'a1', idx:0, captures:['a1']}")),
+         Value(fromjson("{match: 'b2', idx:2, captures:['b2']}")),
+         Value(fromjson("{match: 'c3', idx:4, captures:['c3']}"))});
+}
+
+TEST(ExpressionRegexTest, OptimizPatternWhenInputIsVariable) {
+    ExpressionRegexTest::testAllExpressions(
+        fromjson("{$regexFindAll : {input: '$input', regex: '([a-c][1-3])' }}"), true, {});
+}
+
+TEST(ExpressionRegexTest, NoOptimizePatternWhenRegexVariable) {
+    ExpressionRegexTest::testAllExpressions(
+        fromjson("{$regexFindAll : {input: 'asdf', regex: '$regex' }}"), false, {});
+}
+
+TEST(ExpressionRegexTest, NoOptimizePatternWhenOptionsVariable) {
+    ExpressionRegexTest::testAllExpressions(
+        fromjson("{$regexFindAll : {input: 'asdf', regex: '(asdf)', options: '$options' }}"),
+        false,
+        {Value(fromjson("{match: 'asdf', idx:0, captures:['asdf']}"))});
+}
+
+TEST(ExpressionRegexTest, NoMatch) {
+    ExpressionRegexTest::testAllExpressions(
+        fromjson("{$regexFindAll : {input: 'a1b2c3', regex: 'ab' }}"), true, {});
+}
+
+TEST(ExpressionRegexTest, FailureCaseBadRegexType) {
+    ASSERT_THROWS_CODE(ExpressionRegexTest::testAllExpressions(
+                           fromjson("{$regexFindAll : {input: 'FirstLine\\nSecondLine', regex: "
+                                    "{invalid : 'regex'} , options: 'mi'}}"),
+                           false,
+                           {}),
+                       AssertionException,
+                       51105);
+}
+
+TEST(ExpressionRegexTest, FailureCaseBadRegexPattern) {
+    ASSERT_THROWS_CODE(
+        ExpressionRegexTest::testAllExpressions(
+            fromjson("{$regexFindAll : {input: 'FirstLine\\nSecondLine', regex: '[0-9'}}"),
+            false,
+            {}),
+        AssertionException,
+        51111);
+}
+
+TEST(ExpressionRegexTest, InvalidUTF8InInput) {
+    std::string inputField = "1234 ";
+    // Append an invalid UTF-8 character.
+    inputField += '\xe5';
+    inputField += "  1234";
+    BSONObj input(fromjson("{$regexFindAll: {input: '" + inputField + "', regex: '[0-9]'}}"));
+
+    // Verify that PCRE will error during execution if input is not a valid UTF-8.
+    ASSERT_THROWS_CODE(
+        ExpressionRegexTest::testAllExpressions(input, true, {}), AssertionException, 51156);
+}
+
+TEST(ExpressionRegexTest, InvalidUTF8InRegex) {
+    std::string regexField = "1234 ";
+    // Append an invalid UTF-8 character.
+    regexField += '\xe5';
+    BSONObj input(fromjson("{$regexFindAll: {input: '123456', regex: '" + regexField + "'}}"));
+    // Verify that PCRE will error if REGEX is not a valid UTF-8.
+    ASSERT_THROWS_CODE(
+        ExpressionRegexTest::testAllExpressions(input, false, {}), AssertionException, 51111);
+}
+
+}  // namespace ExpressionRegexTest
+
+class All : public OldStyleSuiteSpecification {
+public:
+    All() : OldStyleSuiteSpecification("expression") {}
+
     void setupTests() {
         add<Add::NullDocument>();
         add<Add::NoOperands>();
@@ -5975,80 +2844,11 @@ public:
         add<Add::IntNull>();
         add<Add::LongUndefined>();
 
-        add<And::NoOperands>();
-        add<And::True>();
-        add<And::False>();
-        add<And::TrueTrue>();
-        add<And::TrueFalse>();
-        add<And::FalseTrue>();
-        add<And::FalseFalse>();
-        add<And::TrueTrueTrue>();
-        add<And::TrueTrueFalse>();
-        add<And::TrueTrueFalse>();
-        add<And::ZeroOne>();
-        add<And::OneTwo>();
-        add<And::FieldPath>();
-        add<And::OptimizeConstantExpression>();
-        add<And::NonConstant>();
-        add<And::ConstantNonConstantTrue>();
-        add<And::ConstantNonConstantFalse>();
-        add<And::NonConstantOne>();
-        add<And::NonConstantZero>();
-        add<And::NonConstantNonConstantOne>();
-        add<And::NonConstantNonConstantZero>();
-        add<And::ZeroOneNonConstant>();
-        add<And::OneOneNonConstant>();
-        add<And::Nested>();
-        add<And::NestedZero>();
-
         add<CoerceToBool::EvaluateTrue>();
         add<CoerceToBool::EvaluateFalse>();
         add<CoerceToBool::Dependencies>();
         add<CoerceToBool::AddToBsonObj>();
         add<CoerceToBool::AddToBsonArray>();
-
-        add<Compare::EqLt>();
-        add<Compare::EqEq>();
-        add<Compare::EqGt>();
-        add<Compare::NeLt>();
-        add<Compare::NeEq>();
-        add<Compare::NeGt>();
-        add<Compare::GtLt>();
-        add<Compare::GtEq>();
-        add<Compare::GtGt>();
-        add<Compare::GteLt>();
-        add<Compare::GteEq>();
-        add<Compare::GteGt>();
-        add<Compare::LtLt>();
-        add<Compare::LtEq>();
-        add<Compare::LtGt>();
-        add<Compare::LteLt>();
-        add<Compare::LteEq>();
-        add<Compare::LteGt>();
-        add<Compare::CmpLt>();
-        add<Compare::CmpEq>();
-        add<Compare::CmpGt>();
-        add<Compare::CmpBracketed>();
-        add<Compare::ZeroOperands>();
-        add<Compare::OneOperand>();
-        add<Compare::ThreeOperands>();
-        add<Compare::IncompatibleTypes>();
-        add<Compare::OptimizeConstants>();
-        add<Compare::NoOptimizeCmp>();
-        add<Compare::NoOptimizeNe>();
-        add<Compare::NoOptimizeNoConstant>();
-        add<Compare::NoOptimizeWithoutFieldPath>();
-        add<Compare::NoOptimizeWithoutFieldPathReverse>();
-        add<Compare::OptimizeEq>();
-        add<Compare::OptimizeEqReverse>();
-        add<Compare::OptimizeLt>();
-        add<Compare::OptimizeLtReverse>();
-        add<Compare::OptimizeLte>();
-        add<Compare::OptimizeLteReverse>();
-        add<Compare::OptimizeGt>();
-        add<Compare::OptimizeGtReverse>();
-        add<Compare::OptimizeGte>();
-        add<Compare::OptimizeGteReverse>();
 
         add<Constant::Create>();
         add<Constant::CreateFromBsonElement>();
@@ -6056,53 +2856,6 @@ public:
         add<Constant::Dependencies>();
         add<Constant::AddToBsonObj>();
         add<Constant::AddToBsonArray>();
-
-        add<FieldPath::Invalid>();
-        add<FieldPath::Dependencies>();
-        add<FieldPath::Missing>();
-        add<FieldPath::Present>();
-        add<FieldPath::NestedBelowNull>();
-        add<FieldPath::NestedBelowUndefined>();
-        add<FieldPath::NestedBelowMissing>();
-        add<FieldPath::NestedBelowInt>();
-        add<FieldPath::NestedValue>();
-        add<FieldPath::NestedBelowEmptyObject>();
-        add<FieldPath::NestedBelowEmptyArray>();
-        add<FieldPath::NestedBelowEmptyArray>();
-        add<FieldPath::NestedBelowArrayWithNull>();
-        add<FieldPath::NestedBelowArrayWithUndefined>();
-        add<FieldPath::NestedBelowArrayWithInt>();
-        add<FieldPath::NestedWithinArray>();
-        add<FieldPath::MultipleArrayValues>();
-        add<FieldPath::ExpandNestedArrays>();
-        add<FieldPath::AddToBsonObj>();
-        add<FieldPath::AddToBsonArray>();
-
-
-        add<Or::NoOperands>();
-        add<Or::True>();
-        add<Or::False>();
-        add<Or::TrueTrue>();
-        add<Or::TrueFalse>();
-        add<Or::FalseTrue>();
-        add<Or::FalseFalse>();
-        add<Or::FalseFalseFalse>();
-        add<Or::FalseFalseTrue>();
-        add<Or::ZeroOne>();
-        add<Or::ZeroFalse>();
-        add<Or::FieldPath>();
-        add<Or::OptimizeConstantExpression>();
-        add<Or::NonConstant>();
-        add<Or::ConstantNonConstantTrue>();
-        add<Or::ConstantNonConstantFalse>();
-        add<Or::NonConstantOne>();
-        add<Or::NonConstantZero>();
-        add<Or::NonConstantNonConstantOne>();
-        add<Or::NonConstantNonConstantZero>();
-        add<Or::ZeroOneNonConstant>();
-        add<Or::ZeroZeroNonConstant>();
-        add<Or::Nested>();
-        add<Or::NestedOne>();
 
         add<Strcasecmp::NullBegin>();
         add<Strcasecmp::NullEnd>();
@@ -6134,6 +2887,8 @@ public:
         add<Set::NoOverlap>();
         add<Set::Overlap>();
         add<Set::FirstNull>();
+        add<Set::LeftNullAndRightEmpty>();
+        add<Set::RightNullAndLeftEmpty>();
         add<Set::LastNull>();
         add<Set::NoArg>();
         add<Set::OneArg>();
@@ -6153,6 +2908,44 @@ public:
     }
 };
 
-SuiteInstance<All> myall;
+OldStyleSuiteInitializer<All> myAll;
 
+namespace NowAndClusterTime {
+TEST(NowAndClusterTime, BasicTest) {
+    intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+
+    // $$NOW is the Date type.
+    {
+        auto expression = ExpressionFieldPath::parse(expCtx, "$$NOW", expCtx->variablesParseState);
+        Value result = expression->evaluate(Document(), &(expCtx->variables));
+        ASSERT_EQ(result.getType(), Date);
+    }
+    // $$CLUSTER_TIME is the timestamp type.
+    {
+        auto expression =
+            ExpressionFieldPath::parse(expCtx, "$$CLUSTER_TIME", expCtx->variablesParseState);
+        Value result = expression->evaluate(Document(), &(expCtx->variables));
+        ASSERT_EQ(result.getType(), bsonTimestamp);
+    }
+
+    // Multiple references to $$NOW must return the same value.
+    {
+        auto expression = Expression::parseExpression(
+            expCtx, fromjson("{$eq: [\"$$NOW\", \"$$NOW\"]}"), expCtx->variablesParseState);
+        Value result = expression->evaluate(Document(), &(expCtx->variables));
+
+        ASSERT_VALUE_EQ(result, Value{true});
+    }
+    // Same is true for the $$CLUSTER_TIME.
+    {
+        auto expression =
+            Expression::parseExpression(expCtx,
+                                        fromjson("{$eq: [\"$$CLUSTER_TIME\", \"$$CLUSTER_TIME\"]}"),
+                                        expCtx->variablesParseState);
+        Value result = expression->evaluate(Document(), &(expCtx->variables));
+
+        ASSERT_VALUE_EQ(result, Value{true});
+    }
+}
+}  // namespace NowAndClusterTime
 }  // namespace ExpressionTests

@@ -29,11 +29,10 @@
 
 #pragma once
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/logger/log_component.h"
 #include "mongo/logger/log_severity.h"
 #include "mongo/platform/atomic_word.h"
-#include "mongo/stdx/mutex.h"
+#include "mongo/platform/mutex.h"
 
 namespace mongo {
 namespace logger {
@@ -44,7 +43,8 @@ namespace logger {
  * provide log severities for the other components (up to but not including kNumLogComponents).
  */
 class LogComponentSettings {
-    MONGO_DISALLOW_COPYING(LogComponentSettings);
+    LogComponentSettings(const LogComponentSettings&) = delete;
+    LogComponentSettings& operator=(const LogComponentSettings&) = delete;
 
 public:
     LogComponentSettings();
@@ -87,7 +87,7 @@ private:
 
     // A mutex to synchronize writes to the severity arrays. This mutex is to synchronize changes to
     // the entire array, and the atomics are to synchronize individual elements.
-    stdx::mutex _mtx;
+    Mutex _mtx = MONGO_MAKE_LATCH("LogComponentSettings::_mtx");
 
     // True if a log severity is explicitly set for a component.
     // This differentiates between unconfigured components and components that happen to have

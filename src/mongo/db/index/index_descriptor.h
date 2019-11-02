@@ -29,6 +29,8 @@
 
 #pragma once
 
+#include "mongo/db/index/index_descriptor_fwd.h"
+
 #include <set>
 #include <string>
 
@@ -73,7 +75,7 @@ public:
     static constexpr StringData kIndexVersionFieldName = "v"_sd;
     static constexpr StringData kKeyPatternFieldName = "key"_sd;
     static constexpr StringData kLanguageOverrideFieldName = "language_override"_sd;
-    static constexpr StringData kNamespaceFieldName = "ns"_sd;
+    static constexpr StringData kNamespaceFieldName = "ns"_sd;  // Removed in 4.4
     static constexpr StringData kPartialFilterExprFieldName = "partialFilterExpression"_sd;
     static constexpr StringData kPathProjectionFieldName = "wildcardProjection"_sd;
     static constexpr StringData kSparseFieldName = "sparse"_sd;
@@ -81,12 +83,6 @@ public:
     static constexpr StringData kTextVersionFieldName = "textIndexVersion"_sd;
     static constexpr StringData kUniqueFieldName = "unique"_sd;
     static constexpr StringData kWeightsFieldName = "weights"_sd;
-
-    /**
-     * Given a BSONObj representing an index spec, returns a new owned BSONObj which is identical to
-     * 'spec' after replacing the 'ns' field with the value of 'newNs'.
-     */
-    static BSONObj renameNsInIndexSpec(BSONObj spec, const NamespaceString& newNs);
 
     /**
      * infoObj is a copy of the index-describing BSONObj contained in the catalog.
@@ -137,14 +133,6 @@ public:
         return _projection;
     }
 
-    /**
-     * Test only command for testing behavior resulting from an incorrect key
-     * pattern.
-     */
-    void setKeyPatternForTest(BSONObj newKeyPattern) {
-        _keyPattern = newKeyPattern;
-    }
-
     // How many fields do we index / are in the key pattern?
     int getNumFields() const {
         return _numFields;
@@ -160,14 +148,7 @@ public:
     }
 
     // Return the name of the indexed collection.
-    const std::string& parentNS() const {
-        return _parentNS;
-    }
-
-    // Return the name of this index's storage area (database.table.$index)
-    const std::string& indexNamespace() const {
-        return _indexNamespace;
-    }
+    const NamespaceString& parentNS() const;
 
     // Return the name of the access method we must use to access this index's data.
     const std::string& getAccessMethodName() const {
@@ -204,7 +185,7 @@ public:
     }
 
     // Is this index multikey?
-    bool isMultikey(OperationContext* opCtx) const;
+    bool isMultikey() const;
 
     MultikeyPaths getMultikeyPaths(OperationContext* opCtx) const;
 
@@ -229,8 +210,6 @@ public:
     const IndexCatalog* getIndexCatalog() const;
 
     bool areIndexOptionsEquivalent(const IndexDescriptor* other) const;
-
-    void setNs(NamespaceString ns);
 
     const BSONObj& collation() const {
         return _collation;
@@ -269,8 +248,6 @@ private:
     BSONObj _keyPattern;
     BSONObj _projection;
     std::string _indexName;
-    std::string _parentNS;
-    std::string _indexNamespace;
     bool _isIdIndex;
     bool _sparse;
     bool _unique;

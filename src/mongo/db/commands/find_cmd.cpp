@@ -37,18 +37,18 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/run_aggregate.h"
 #include "mongo/db/commands/test_commands_enabled.h"
-#include "mongo/db/curop_failpoint_helpers.h"
 #include "mongo/db/cursor_manager.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/exec/working_set_common.h"
 #include "mongo/db/matcher/extensions_callback_real.h"
+#include "mongo/db/pipeline/variables.h"
+#include "mongo/db/query/collation/collator_factory_interface.h"
 #include "mongo/db/query/cursor_response.h"
 #include "mongo/db/query/explain.h"
 #include "mongo/db/query/find.h"
 #include "mongo/db/query/find_common.h"
 #include "mongo/db/query/get_executor.h"
 #include "mongo/db/repl/replication_coordinator.h"
-#include "mongo/db/s/collection_sharding_state.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/stats/counters.h"
 #include "mongo/db/stats/server_read_concern_metrics.h"
@@ -61,6 +61,60 @@ namespace mongo {
 namespace {
 
 const auto kTermField = "term"_sd;
+
+// Parses the command object to a QueryRequest. If the client request did not specify any runtime
+// constants, make them available to the query here.
+std::unique_ptr<QueryRequest> parseCmdObjectToQueryRequest(OperationContext* opCtx,
+                                                           NamespaceString nss,
+                                                           BSONObj cmdObj,
+                                                           bool isExplain) {
+    auto qr = uassertStatusOK(
+        QueryRequest::makeFromFindCommand(std::move(nss), std::move(cmdObj), isExplain));
+    if (!qr->getRuntimeConstants()) {
+        qr->setRuntimeConstants(Variables::generateRuntimeConstants(opCtx));
+    }
+    return qr;
+}
+
+boost::intrusive_ptr<ExpressionContext> makeExpressionContext(OperationContext* opCtx,
+                                                              const QueryRequest& queryRequest) {
+    std::unique_ptr<CollatorInterface> collator;
+    if (!queryRequest.getCollation().isEmpty()) {
+        collator = uassertStatusOK(CollatorFactoryInterface::get(opCtx->getServiceContext())
+                                       ->makeFromBSON(queryRequest.getCollation()));
+    }
+
+    // Although both 'find' and 'aggregate' commands have an ExpressionContext, some of the data
+    // members in the ExpressionContext are used exclusively by the aggregation subsystem. This
+    // includes the following fields which here we simply initialize to some meaningless default
+    // value:
+    //  - explain
+    //  - fromMongos
+    //  - needsMerge
+    //  - bypassDocumentValidation
+    //  - mongoProcessInterface
+    //  - resolvedNamespaces
+    //  - uuid
+    //
+    // As we change the code to make the find and agg systems more tightly coupled, it would make
+    // sense to start initializing these fields for find operations as well.
+    auto expCtx =
+        make_intrusive<ExpressionContext>(opCtx,
+                                          boost::none,  // explain
+                                          false,        // fromMongos
+                                          false,        // needsMerge
+                                          queryRequest.allowDiskUse(),
+                                          false,  // bypassDocumentValidation
+                                          queryRequest.nss(),
+                                          queryRequest.getRuntimeConstants(),
+                                          std::move(collator),
+                                          nullptr,  // mongoProcessInterface
+                                          StringMap<ExpressionContext::ResolvedNamespace>{},
+                                          boost::none  // uuid
+        );
+    expCtx->tempDir = storageGlobalParams.dbpath + "/_tmp";
+    return expCtx;
+}
 
 /**
  * A command for running .find() queries.
@@ -121,7 +175,12 @@ public:
             return false;
         }
 
-        bool supportsReadConcern(repl::ReadConcernLevel level) const final {
+        ReadConcernSupportResult supportsReadConcern(repl::ReadConcernLevel level) const final {
+            return {ReadConcernSupportResult::ReadConcern::kSupported,
+                    ReadConcernSupportResult::DefaultReadConcern::kPermitted};
+        }
+
+        bool canIgnorePrepareConflicts() const override {
             return true;
         }
 
@@ -146,8 +205,8 @@ public:
 
             const auto hasTerm = _request.body.hasField(kTermField);
             uassertStatusOK(authSession->checkAuthForFind(
-                AutoGetCollection::resolveNamespaceStringOrUUID(
-                    opCtx, CommandHelpers::parseNsOrUUID(_dbName, _request.body)),
+                CollectionCatalog::get(opCtx).resolveNamespaceStringOrUUID(
+                    CommandHelpers::parseNsOrUUID(_dbName, _request.body)),
                 hasTerm));
         }
 
@@ -164,16 +223,15 @@ public:
 
             // Parse the command BSON to a QueryRequest.
             const bool isExplain = true;
-            auto qr =
-                uassertStatusOK(QueryRequest::makeFromFindCommand(nss, _request.body, isExplain));
+            auto qr = parseCmdObjectToQueryRequest(opCtx, nss, _request.body, isExplain);
 
             // Finish the parsing step by using the QueryRequest to create a CanonicalQuery.
             const ExtensionsCallbackReal extensionsCallback(opCtx, &nss);
-            const boost::intrusive_ptr<ExpressionContext> expCtx;
+            auto expCtx = makeExpressionContext(opCtx, *qr);
             auto cq = uassertStatusOK(
                 CanonicalQuery::canonicalize(opCtx,
                                              std::move(qr),
-                                             expCtx,
+                                             std::move(expCtx),
                                              extensionsCallback,
                                              MatchExpressionParser::kAllowAllSpecialFeatures));
 
@@ -199,8 +257,8 @@ public:
                 } catch (DBException& error) {
                     if (error.code() == ErrorCodes::InvalidPipelineOperator) {
                         uasserted(ErrorCodes::InvalidPipelineOperator,
-                                  str::stream() << "Unsupported in view pipeline: "
-                                                << error.what());
+                                  str::stream()
+                                      << "Unsupported in view pipeline: " << error.what());
                     }
                     throw;
                 }
@@ -212,11 +270,13 @@ public:
             Collection* const collection = ctx->getCollection();
 
             // Get the execution plan for the query.
-            auto exec = uassertStatusOK(getExecutorFind(opCtx, collection, std::move(cq)));
+            bool permitYield = true;
+            auto exec =
+                uassertStatusOK(getExecutorFind(opCtx, collection, std::move(cq), permitYield));
 
             auto bodyBuilder = result->getBodyBuilder();
             // Got the execution tree. Explain it.
-            Explain::explainStages(exec.get(), collection, verbosity, &bodyBuilder);
+            Explain::explainStages(exec.get(), collection, verbosity, BSONObj(), &bodyBuilder);
         }
 
         /**
@@ -235,13 +295,13 @@ public:
             ServerReadConcernMetrics::get(opCtx)->recordReadConcern(
                 repl::ReadConcernArgs::get(opCtx));
 
-            // Parse the command BSON to a QueryRequest.
+            // Parse the command BSON to a QueryRequest. Pass in the parsedNss in case _request.body
+            // does not have a UUID.
+            auto parsedNss =
+                NamespaceString{CommandHelpers::parseNsFromCommand(_dbName, _request.body)};
             const bool isExplain = false;
-            // Pass parseNs to makeFromFindCommand in case _request.body does not have a UUID.
-            auto qr = uassertStatusOK(QueryRequest::makeFromFindCommand(
-                NamespaceString(CommandHelpers::parseNsFromCommand(_dbName, _request.body)),
-                _request.body,
-                isExplain));
+            auto qr =
+                parseCmdObjectToQueryRequest(opCtx, std::move(parsedNss), _request.body, isExplain);
 
             // Only allow speculative majority for internal commands that specify the correct flag.
             uassert(ErrorCodes::ReadConcernMajorityNotEnabled,
@@ -253,18 +313,22 @@ public:
             const auto txnParticipant = TransactionParticipant::get(opCtx);
             uassert(ErrorCodes::InvalidOptions,
                     "It is illegal to open a tailable cursor in a transaction",
-                    !txnParticipant ||
-                        !(txnParticipant.inMultiDocumentTransaction() && qr->isTailable()));
+                    !(opCtx->inMultiDocumentTransaction() && qr->isTailable()));
 
             uassert(ErrorCodes::OperationNotSupportedInTransaction,
                     "The 'readOnce' option is not supported within a transaction.",
-                    !txnParticipant || !txnParticipant.inActiveOrKilledMultiDocumentTransaction() ||
-                        !qr->isReadOnce());
+                    !txnParticipant || !opCtx->inMultiDocumentTransaction() || !qr->isReadOnce());
 
             uassert(ErrorCodes::InvalidOptions,
                     "The '$_internalReadAtClusterTime' option is only supported when testing"
                     " commands are enabled",
                     !qr->getReadAtClusterTime() || getTestCommandsEnabled());
+
+            uassert(
+                ErrorCodes::OperationNotSupportedInTransaction,
+                "The '$_internalReadAtClusterTime' option is not supported within a transaction.",
+                !txnParticipant || !opCtx->inMultiDocumentTransaction() ||
+                    !qr->getReadAtClusterTime());
 
             uassert(ErrorCodes::InvalidOptions,
                     "The '$_internalReadAtClusterTime' option is only supported when replication is"
@@ -287,6 +351,11 @@ public:
             // collection via AutoGetCollectionForRead in order to ensure the comparison to the
             // collection's minimum visible snapshot is accurate.
             if (auto targetClusterTime = qr->getReadAtClusterTime()) {
+                uassert(ErrorCodes::InvalidOptions,
+                        str::stream() << "$_internalReadAtClusterTime value must not be a null"
+                                         " timestamp.",
+                        !targetClusterTime->isNull());
+
                 // We aren't holding the global lock in intent mode, so it is possible after
                 // comparing 'targetClusterTime' to 'lastAppliedOpTime' for the last applied opTime
                 // to go backwards or for the term to change due to replication rollback. This isn't
@@ -299,8 +368,7 @@ public:
                         str::stream() << "$_internalReadAtClusterTime value must not be greater"
                                          " than the last applied opTime. Requested clusterTime: "
                                       << targetClusterTime->toString()
-                                      << "; last applied opTime: "
-                                      << lastAppliedOpTime.toString(),
+                                      << "; last applied opTime: " << lastAppliedOpTime.toString(),
                         lastAppliedOpTime.getTimestamp() >= targetClusterTime);
 
                 // We aren't holding the global lock in intent mode, so it is possible for the
@@ -308,17 +376,16 @@ public:
                 // shutting down. This isn't an actual concern because the testing infrastructure
                 // won't use the $_internalReadAtClusterTime option in any test suite where clean
                 // shutdown is expected to occur concurrently with tests running.
-                auto allCommittedTime = storageEngine->getAllCommittedTimestamp();
-                invariant(!allCommittedTime.isNull());
+                auto allDurableTime = storageEngine->getAllDurableTimestamp();
+                invariant(!allDurableTime.isNull());
 
                 uassert(ErrorCodes::InvalidOptions,
                         str::stream() << "$_internalReadAtClusterTime value must not be greater"
-                                         " than the all-committed timestamp. Requested"
+                                         " than the all_durable timestamp. Requested"
                                          " clusterTime: "
                                       << targetClusterTime->toString()
-                                      << "; all-committed timestamp: "
-                                      << allCommittedTime.toString(),
-                        allCommittedTime >= targetClusterTime);
+                                      << "; all_durable timestamp: " << allDurableTime.toString(),
+                        allDurableTime >= targetClusterTime);
 
                 // The $_internalReadAtClusterTime option causes any storage-layer cursors created
                 // during plan execution to read from a consistent snapshot of data at the supplied
@@ -327,8 +394,10 @@ public:
                                                               targetClusterTime);
 
                 // The $_internalReadAtClusterTime option also causes any storage-layer cursors
-                // created during plan execution to block on prepared transactions.
-                opCtx->recoveryUnit()->setIgnorePrepared(false);
+                // created during plan execution to block on prepared transactions. Since the find
+                // command ignores prepare conflicts by default, change the behavior.
+                opCtx->recoveryUnit()->setPrepareConflictBehavior(
+                    PrepareConflictBehavior::kEnforce);
             }
 
             // Acquire locks. If the query is on a view, we release our locks and convert the query
@@ -356,11 +425,11 @@ public:
 
             // Finish the parsing step by using the QueryRequest to create a CanonicalQuery.
             const ExtensionsCallbackReal extensionsCallback(opCtx, &nss);
-            const boost::intrusive_ptr<ExpressionContext> expCtx;
+            auto expCtx = makeExpressionContext(opCtx, *qr);
             auto cq = uassertStatusOK(
                 CanonicalQuery::canonicalize(opCtx,
                                              std::move(qr),
-                                             expCtx,
+                                             std::move(expCtx),
                                              extensionsCallback,
                                              MatchExpressionParser::kAllowAllSpecialFeatures));
 
@@ -394,7 +463,9 @@ public:
             }
 
             // Get the execution plan for the query.
-            auto exec = uassertStatusOK(getExecutorFind(opCtx, collection, std::move(cq)));
+            bool permitYield = true;
+            auto exec =
+                uassertStatusOK(getExecutorFind(opCtx, collection, std::move(cq), permitYield));
 
             {
                 stdx::lock_guard<Client> lk(*opCtx->getClient());
@@ -412,12 +483,7 @@ public:
                 return;
             }
 
-            CurOpFailpointHelpers::waitWhileFailPointEnabled(&waitInFindBeforeMakingBatch,
-                                                             opCtx,
-                                                             "waitInFindBeforeMakingBatch",
-                                                             []() {},
-                                                             false,
-                                                             nss);
+            FindCommon::waitInFindBeforeMakingBatch(opCtx, *exec->getCanonicalQuery());
 
             const QueryRequest& originalQR = exec->getCanonicalQuery()->getQueryRequest();
 
@@ -425,12 +491,13 @@ public:
             CursorResponseBuilder::Options options;
             options.isInitialResponse = true;
             CursorResponseBuilder firstBatch(result, options);
-            BSONObj obj;
+            Document doc;
             PlanExecutor::ExecState state = PlanExecutor::ADVANCED;
             std::uint64_t numResults = 0;
             while (!FindCommon::enoughForFirstBatch(originalQR, numResults) &&
-                   PlanExecutor::ADVANCED == (state = exec->getNext(&obj, nullptr))) {
+                   PlanExecutor::ADVANCED == (state = exec->getNext(&doc, nullptr))) {
                 // If we can't fit this result inside the current batch, then we stash it for later.
+                BSONObj obj = doc.toBson();
                 if (!FindCommon::haveSpaceForNext(obj, numResults, firstBatch.bytesUsed())) {
                     exec->enqueue(obj);
                     break;
@@ -444,18 +511,16 @@ public:
             // Throw an assertion if query execution fails for any reason.
             if (PlanExecutor::FAILURE == state) {
                 firstBatch.abandon();
-                LOG(1) << "Plan executor error during find command: "
-                       << PlanExecutor::statestr(state)
-                       << ", stats: " << redact(Explain::getWinningPlanStats(exec.get()));
 
-                uassertStatusOK(WorkingSetCommon::getMemberObjectStatus(obj).withContext(
-                    "Executor error during find command"));
+                // We should always have a valid status member object at this point.
+                auto status = WorkingSetCommon::getMemberObjectStatus(doc);
+                invariant(!status.isOK());
+                warning() << "Plan executor error during find command: "
+                          << PlanExecutor::statestr(state) << ", status: " << status
+                          << ", stats: " << redact(Explain::getWinningPlanStats(exec.get()));
+
+                uassertStatusOK(status.withContext("Executor error during find command"));
             }
-
-            // Before saving the cursor, ensure that whatever plan we established happened with the
-            // expected collection version
-            auto css = CollectionShardingState::get(opCtx, nss);
-            css->checkShardVersionOrThrow(opCtx);
 
             // Set up the cursor for getMore.
             CursorId cursorId = 0;
@@ -467,10 +532,12 @@ public:
                     {std::move(exec),
                      nss,
                      AuthorizationSession::get(opCtx->getClient())->getAuthenticatedUserNames(),
+                     opCtx->getWriteConcern(),
                      repl::ReadConcernArgs::get(opCtx),
                      _request.body,
                      ClientCursorParams::LockPolicy::kLockExternally,
-                     {Privilege(ResourcePattern::forExactNamespace(nss), ActionType::find)}});
+                     {Privilege(ResourcePattern::forExactNamespace(nss), ActionType::find)},
+                     expCtx->needsMerge});
                 cursorId = pinnedCursor.getCursor()->cursorid();
 
                 invariant(!exec);

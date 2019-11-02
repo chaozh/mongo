@@ -46,21 +46,20 @@ namespace {
 using namespace mongo;
 using namespace mongo::repl;
 
-BSONObj makeOp(long long seconds, long long term = 1LL) {
+BSONObj makeOp(long long seconds, long long term = 1LL, long wallClockMillis = 0) {
     auto uuid = unittest::assertGet(UUID::parse("b4c66a44-c1ca-4d86-8d25-12e82fa2de5b"));
     return BSON("ts" << Timestamp(seconds, seconds) << "t" << term << "op"
                      << "n"
-                     << "o"
-                     << BSONObj()
-                     << "ns"
+                     << "o" << BSONObj() << "ns"
                      << "roll_back_local_operations.test"
-                     << "ui"
-                     << uuid);
+                     << "ui" << uuid << "wall" << Date_t::fromMillisSinceEpoch(wallClockMillis));
 }
 
 int recordId = 0;
-OplogInterfaceMock::Operation makeOpAndRecordId(long long seconds, long long term = 1LL) {
-    return std::make_pair(makeOp(seconds), RecordId(++recordId));
+OplogInterfaceMock::Operation makeOpAndRecordId(long long seconds,
+                                                long long term = 1LL,
+                                                long long wallClockMillis = 0) {
+    return std::make_pair(makeOp(seconds, term, wallClockMillis), RecordId(++recordId));
 }
 
 TEST(RollBackLocalOperationsTest, InvalidLocalOplogIterator) {
@@ -72,6 +71,10 @@ TEST(RollBackLocalOperationsTest, InvalidLocalOplogIterator) {
         std::unique_ptr<Iterator> makeIterator() const override {
             return std::unique_ptr<Iterator>();
         }
+        std::unique_ptr<TransactionHistoryIteratorBase> makeTransactionHistoryIterator(
+            const OpTime& startingOpTime, bool permitYield = false) const override {
+            MONGO_UNREACHABLE;
+        };
         HostAndPort hostAndPort() const override {
             return {};
         }
@@ -127,7 +130,8 @@ TEST(RollBackLocalOperationsTest, RollbackMultipleLocalOperations) {
 TEST(RollBackLocalOperationsTest, RollbackOperationFailed) {
     auto commonOperation = makeOpAndRecordId(1);
     OplogInterfaceMock::Operations localOperations({
-        makeOpAndRecordId(2), commonOperation,
+        makeOpAndRecordId(2),
+        commonOperation,
     });
     OplogInterfaceMock localOplog(localOperations);
     auto rollbackOperation = [&](const BSONObj& operation) {
@@ -152,7 +156,10 @@ TEST(RollBackLocalOperationsTest, EndOfLocalOplog) {
 TEST(RollBackLocalOperationsTest, SkipRemoteOperations) {
     auto commonOperation = makeOpAndRecordId(1);
     OplogInterfaceMock::Operations localOperations({
-        makeOpAndRecordId(5), makeOpAndRecordId(4), makeOpAndRecordId(2), commonOperation,
+        makeOpAndRecordId(5),
+        makeOpAndRecordId(4),
+        makeOpAndRecordId(2),
+        commonOperation,
     });
     OplogInterfaceMock localOplog(localOperations);
     auto i = localOperations.cbegin();
@@ -186,7 +193,8 @@ TEST(RollBackLocalOperationsTest, SkipRemoteOperations) {
 TEST(RollBackLocalOperationsTest, SameTimestampDifferentTermsRollbackNoSuchKey) {
     auto commonOperation = makeOpAndRecordId(1, 1);
     OplogInterfaceMock::Operations localOperations({
-        makeOpAndRecordId(2, 3), commonOperation,
+        makeOpAndRecordId(2, 3),
+        commonOperation,
     });
     OplogInterfaceMock localOplog(localOperations);
     auto rollbackOperation = [&](const BSONObj& operation) {
@@ -216,9 +224,12 @@ TEST(SyncRollBackLocalOperationsTest, RemoteOplogMissing) {
 }
 
 TEST(SyncRollBackLocalOperationsTest, RollbackTwoOperations) {
-    auto commonOperation = makeOpAndRecordId(1);
+    auto commonOperation = makeOpAndRecordId(1, 1LL, 1 * 5000);
+    auto firstOpAfterCommonPoint = makeOpAndRecordId(2, 1LL, 2 * 60 * 60 * 24 * 1000);
     OplogInterfaceMock::Operations localOperations({
-        makeOpAndRecordId(3), makeOpAndRecordId(2), commonOperation,
+        makeOpAndRecordId(3),
+        firstOpAfterCommonPoint,
+        commonOperation,
     });
     auto i = localOperations.cbegin();
     auto result = syncRollBackLocalOperations(OplogInterfaceMock(localOperations),
@@ -234,6 +245,10 @@ TEST(SyncRollBackLocalOperationsTest, RollbackTwoOperations) {
     ASSERT_EQUALS(commonOperation.second, result.getValue().getRecordId());
     ASSERT_FALSE(i == localOperations.cend());
     ASSERT_BSONOBJ_EQ(commonOperation.first, i->first);
+    auto firstOplogEntryAfterCommonPoint =
+        uassertStatusOK(OplogEntry::parse(firstOpAfterCommonPoint.first));
+    ASSERT_EQUALS(result.getValue().getFirstOpWallClockTimeAfterCommonPoint(),
+                  firstOplogEntryAfterCommonPoint.getWallClockTime());
     i++;
     ASSERT_TRUE(i == localOperations.cend());
 }

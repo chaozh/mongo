@@ -32,11 +32,11 @@
 #include "mongo/db/pipeline/document_source_sample.h"
 
 #include "mongo/db/client.h"
-#include "mongo/db/pipeline/document.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/pipeline/expression.h"
 #include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/lite_parsed_document_source.h"
-#include "mongo/db/pipeline/value.h"
 
 namespace mongo {
 using boost::intrusive_ptr;
@@ -44,17 +44,15 @@ using boost::intrusive_ptr;
 constexpr StringData DocumentSourceSample::kStageName;
 
 DocumentSourceSample::DocumentSourceSample(const intrusive_ptr<ExpressionContext>& pExpCtx)
-    : DocumentSource(pExpCtx), _size(0) {}
+    : DocumentSource(kStageName, pExpCtx), _size(0) {}
 
 REGISTER_DOCUMENT_SOURCE(sample,
                          LiteParsedDocumentSourceDefault::parse,
                          DocumentSourceSample::createFromBson);
 
-DocumentSource::GetNextResult DocumentSourceSample::getNext() {
+DocumentSource::GetNextResult DocumentSourceSample::doGetNext() {
     if (_size == 0)
         return GetNextResult::makeEOF();
-
-    pExpCtx->checkForInterrupt();
 
     if (!_sortStage->isPopulated()) {
         // Exhaust source stage, add random metadata, and push all into sorter.
@@ -62,7 +60,7 @@ DocumentSource::GetNextResult DocumentSourceSample::getNext() {
         auto nextInput = pSource->getNext();
         for (; nextInput.isAdvanced(); nextInput = pSource->getNext()) {
             MutableDocument doc(nextInput.releaseDocument());
-            doc.setRandMetaField(prng.nextCanonicalDouble());
+            doc.metadata().setRandVal(prng.nextCanonicalDouble());
             _sortStage->loadDocument(doc.freeze());
         }
         switch (nextInput.getStatus()) {
@@ -102,8 +100,9 @@ intrusive_ptr<DocumentSource> DocumentSourceSample::createFromBson(
 
         if (fieldName == "size") {
             uassert(28746, "size argument to $sample must be a number", elem.isNumber());
-            uassert(28747, "size argument to $sample must not be negative", elem.numberLong() >= 0);
-            sample->_size = elem.numberLong();
+            auto size = elem.safeNumberLong();
+            uassert(28747, "size argument to $sample must not be negative", size >= 0);
+            sample->_size = size;
             sizeSpecified = true;
         } else {
             uasserted(28748, str::stream() << "unrecognized option to $sample: " << fieldName);
@@ -116,11 +115,10 @@ intrusive_ptr<DocumentSource> DocumentSourceSample::createFromBson(
     return sample;
 }
 
-
-boost::optional<DocumentSource::MergingLogic> DocumentSourceSample::mergingLogic() {
+boost::optional<DocumentSource::DistributedPlanLogic> DocumentSourceSample::distributedPlanLogic() {
     // On the merger we need to merge the pre-sorted documents by their random values, then limit to
     // the number we need.
-    MergingLogic logic;
+    DistributedPlanLogic logic;
     logic.shardsStage = this;
     if (_size > 0) {
         logic.mergingStage = DocumentSourceLimit::create(pExpCtx, _size);

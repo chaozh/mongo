@@ -35,6 +35,7 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/find_and_modify_common.h"
 #include "mongo/db/query/collation/collator_factory_interface.h"
+#include "mongo/db/storage/duplicate_key_error_info.h"
 #include "mongo/executor/task_executor_pool.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/s/balancer_configuration.h"
@@ -42,11 +43,14 @@
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/cluster_commands_helpers.h"
 #include "mongo/s/commands/cluster_explain.h"
+#include "mongo/s/commands/document_shard_key_update_util.h"
 #include "mongo/s/commands/strategy.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/multi_statement_transaction_requests_sender.h"
+#include "mongo/s/session_catalog_router.h"
 #include "mongo/s/stale_exception.h"
 #include "mongo/s/transaction_router.h"
+#include "mongo/s/would_change_owning_shard_exception.h"
 #include "mongo/s/write_ops/cluster_write.h"
 #include "mongo/util/timer.h"
 
@@ -54,6 +58,16 @@ namespace mongo {
 namespace {
 
 const ReadPreferenceSetting kPrimaryOnlyReadPreference(ReadPreference::PrimaryOnly);
+const char kRuntimeConstantsField[] = "runtimeConstants";
+
+BSONObj appendRuntimeConstantsToCommandObject(OperationContext* opCtx, const BSONObj& origCmdObj) {
+    uassert(51196,
+            "Cannot specify runtime constants option to a mongos",
+            !origCmdObj.getField(kRuntimeConstantsField));
+    auto rtcBSON =
+        BSON(kRuntimeConstantsField << Variables::generateRuntimeConstants(opCtx).toBSON());
+    return origCmdObj.addField(rtcBSON.getField(kRuntimeConstantsField));
+}
 
 BSONObj getCollation(const BSONObj& cmdObj) {
     BSONElement collationElement;
@@ -76,6 +90,53 @@ BSONObj getShardKey(OperationContext* opCtx, const ChunkManager& chunkMgr, const
     return shardKey;
 }
 
+void updateShardKeyValueOnWouldChangeOwningShardError(OperationContext* opCtx,
+                                                      const NamespaceString nss,
+                                                      Status responseStatus,
+                                                      const BSONObj& cmdObj,
+                                                      BSONObjBuilder* result) {
+    BSONObjBuilder extraInfoBuilder;
+    responseStatus.extraInfo()->serialize(&extraInfoBuilder);
+    auto extraInfo = extraInfoBuilder.obj();
+    auto wouldChangeOwningShardExtraInfo =
+        WouldChangeOwningShardInfo::parseFromCommandError(extraInfo);
+
+    try {
+        auto matchedDocOrUpserted = documentShardKeyUpdateUtil::updateShardKeyForDocument(
+            opCtx, nss, wouldChangeOwningShardExtraInfo);
+        auto upserted = matchedDocOrUpserted && wouldChangeOwningShardExtraInfo.getShouldUpsert();
+        auto updatedExistingDocument = matchedDocOrUpserted && !upserted;
+
+        BSONObjBuilder lastErrorObjBuilder(result->subobjStart("lastErrorObject"));
+        lastErrorObjBuilder.appendNumber("n", matchedDocOrUpserted ? 1 : 0);
+        lastErrorObjBuilder.appendBool("updatedExisting", updatedExistingDocument);
+        if (upserted) {
+            lastErrorObjBuilder.appendAs(wouldChangeOwningShardExtraInfo.getPostImage()["_id"],
+                                         "upserted");
+        }
+        lastErrorObjBuilder.doneFast();
+
+        auto shouldReturnPostImage = cmdObj.getBoolField("new");
+        if (updatedExistingDocument) {
+            result->append("value",
+                           shouldReturnPostImage ? wouldChangeOwningShardExtraInfo.getPostImage()
+                                                 : wouldChangeOwningShardExtraInfo.getPreImage());
+        } else if (upserted && shouldReturnPostImage) {
+            result->append("value", wouldChangeOwningShardExtraInfo.getPostImage());
+        } else {
+            result->appendNull("value");
+        }
+        result->append("ok", 1.0);
+    } catch (DBException& e) {
+        if (e.code() == ErrorCodes::DuplicateKey &&
+            e.extraInfo<DuplicateKeyErrorInfo>()->getKeyPattern().hasField("_id")) {
+            e.addContext(documentShardKeyUpdateUtil::kDuplicateKeyErrorContext);
+        }
+        e.addContext("findAndModify");
+        throw;
+    }
+}
+
 class FindAndModifyCmd : public BasicCommand {
 public:
     FindAndModifyCmd() : BasicCommand("findAndModify", "findandmodify") {}
@@ -92,10 +153,11 @@ public:
         return true;
     }
 
-    bool supportsReadConcern(const std::string& dbName,
-                             const BSONObj& cmdObj,
-                             repl::ReadConcernLevel level) const final {
-        return true;
+    ReadConcernSupportResult supportsReadConcern(const std::string& dbName,
+                                                 const BSONObj& cmdObj,
+                                                 repl::ReadConcernLevel level) const final {
+        return {ReadConcernSupportResult::ReadConcern::kSupported,
+                ReadConcernSupportResult::DefaultReadConcern::kPermitted};
     }
 
     void addRequiredPrivileges(const std::string& dbname,
@@ -132,17 +194,31 @@ public:
                 Grid::get(opCtx)->shardRegistry()->getShard(opCtx, chunk.getShardId()));
         }
 
-        const auto explainCmd = ClusterExplain::wrapAsExplain(cmdObj, verbosity);
+        const auto explainCmd = ClusterExplain::wrapAsExplain(
+            appendRuntimeConstantsToCommandObject(opCtx, cmdObj), verbosity);
 
         // Time how long it takes to run the explain command on the shard.
         Timer timer;
         BSONObjBuilder bob;
-        _runCommand(opCtx,
-                    shard->getId(),
-                    (chunkMgr ? chunkMgr->getVersion(shard->getId()) : ChunkVersion::UNSHARDED()),
-                    nss,
-                    explainCmd,
-                    &bob);
+
+        if (chunkMgr) {
+            _runCommand(opCtx,
+                        shard->getId(),
+                        chunkMgr->getVersion(shard->getId()),
+                        boost::none,
+                        nss,
+                        explainCmd,
+                        &bob);
+        } else {
+            _runCommand(opCtx,
+                        shard->getId(),
+                        ChunkVersion::UNSHARDED(),
+                        routingInfo.db().databaseVersion(),
+                        nss,
+                        explainCmd,
+                        &bob);
+        }
+
         const auto millisElapsed = timer.millis();
 
         Strategy::CommandResult cmdResult;
@@ -166,31 +242,36 @@ public:
 
         // findAndModify should only be creating database if upsert is true, but this would require
         // that the parsing be pulled into this function.
-        uassertStatusOK(createShardDatabase(opCtx, nss.db()));
+        createShardDatabase(opCtx, nss.db());
+
+        // Append mongoS' runtime constants to the command object before forwarding it to the shard.
+        auto cmdObjForShard = appendRuntimeConstantsToCommandObject(opCtx, cmdObj);
 
         const auto routingInfo = uassertStatusOK(getCollectionRoutingInfoForTxnCmd(opCtx, nss));
         if (!routingInfo.cm()) {
             _runCommand(opCtx,
                         routingInfo.db().primaryId(),
                         ChunkVersion::UNSHARDED(),
+                        routingInfo.db().databaseVersion(),
                         nss,
-                        cmdObj,
+                        cmdObjForShard,
                         &result);
             return true;
         }
 
         const auto chunkMgr = routingInfo.cm();
 
-        const BSONObj query = cmdObj.getObjectField("query");
-        const BSONObj collation = getCollation(cmdObj);
+        const BSONObj query = cmdObjForShard.getObjectField("query");
+        const BSONObj collation = getCollation(cmdObjForShard);
         const BSONObj shardKey = getShardKey(opCtx, *chunkMgr, query);
         auto chunk = chunkMgr->findIntersectingChunk(shardKey, collation);
 
         _runCommand(opCtx,
                     chunk.getShardId(),
                     chunkMgr->getVersion(chunk.getShardId()),
+                    boost::none,
                     nss,
-                    cmdObj,
+                    cmdObjForShard,
                     &result);
 
         return true;
@@ -200,17 +281,20 @@ private:
     static void _runCommand(OperationContext* opCtx,
                             const ShardId& shardId,
                             const ChunkVersion& shardVersion,
+                            boost::optional<DatabaseVersion> dbVersion,
                             const NamespaceString& nss,
                             const BSONObj& cmdObj,
                             BSONObjBuilder* result) {
+        bool isRetryableWrite = opCtx->getTxnNumber() && !TransactionRouter::get(opCtx);
         const auto response = [&] {
             std::vector<AsyncRequestsSender::Request> requests;
-            requests.emplace_back(
-                shardId,
-                appendShardVersion(CommandHelpers::filterCommandRequestForPassthrough(cmdObj),
-                                   shardVersion));
-
-            bool isRetryableWrite = opCtx->getTxnNumber() && !TransactionRouter::get(opCtx);
+            BSONObj filteredCmdObj = appendAllowImplicitCreate(
+                CommandHelpers::filterCommandRequestForPassthrough(cmdObj), false);
+            BSONObj cmdObjWithVersions(std::move(filteredCmdObj));
+            if (dbVersion) {
+                cmdObjWithVersions = appendDbVersionIfPresent(cmdObjWithVersions, *dbVersion);
+            }
+            requests.emplace_back(shardId, appendShardVersion(cmdObjWithVersions, shardVersion));
 
             MultiStatementTransactionRequestsSender ars(
                 opCtx,
@@ -230,9 +314,53 @@ private:
 
         const auto responseStatus = getStatusFromCommandResult(response.data);
         if (ErrorCodes::isNeedRetargettingError(responseStatus.code()) ||
-            ErrorCodes::isSnapshotError(responseStatus.code())) {
+            ErrorCodes::isSnapshotError(responseStatus.code()) ||
+            responseStatus.code() == ErrorCodes::StaleDbVersion) {
             // Command code traps this exception and re-runs
             uassertStatusOK(responseStatus.withContext("findAndModify"));
+        }
+
+        if (responseStatus.code() == ErrorCodes::WouldChangeOwningShard) {
+            if (isRetryableWrite) {
+                RouterOperationContextSession routerSession(opCtx);
+                try {
+                    auto& readConcernArgs = repl::ReadConcernArgs::get(opCtx);
+                    readConcernArgs =
+                        repl::ReadConcernArgs(repl::ReadConcernLevel::kLocalReadConcern);
+
+                    // Re-run the findAndModify command that will change the shard key value in a
+                    // transaction. We call _runCommand recursively, and this second time through
+                    // since it will be run as a transaction it will take the other code path to
+                    // updateShardKeyValueOnWouldChangeOwningShardError.
+                    documentShardKeyUpdateUtil::startTransactionForShardKeyUpdate(opCtx);
+                    _runCommand(opCtx, shardId, shardVersion, dbVersion, nss, cmdObj, result);
+                    uassertStatusOK(getStatusFromCommandResult(result->asTempObj()));
+                    auto commitResponse =
+                        documentShardKeyUpdateUtil::commitShardKeyUpdateTransaction(opCtx);
+
+                    uassertStatusOK(getStatusFromCommandResult(commitResponse));
+                    if (auto wcErrorElem = commitResponse["writeConcernError"]) {
+                        appendWriteConcernErrorToCmdResponse(shardId, wcErrorElem, *result);
+                    }
+                } catch (DBException& e) {
+                    if (e.code() != ErrorCodes::DuplicateKey ||
+                        (e.code() == ErrorCodes::DuplicateKey &&
+                         !e.extraInfo<DuplicateKeyErrorInfo>()->getKeyPattern().hasField("_id"))) {
+                        e.addContext(documentShardKeyUpdateUtil::kNonDuplicateKeyErrorContext);
+                    };
+
+                    auto txnRouterForAbort = TransactionRouter::get(opCtx);
+                    if (txnRouterForAbort)
+                        txnRouterForAbort.implicitlyAbortTransaction(opCtx, e.toStatus());
+
+                    throw;
+                }
+            } else {
+                updateShardKeyValueOnWouldChangeOwningShardError(
+                    opCtx, nss, responseStatus, cmdObj, result);
+            }
+
+            return;
         }
 
         // First append the properly constructed writeConcernError. It will then be skipped in
@@ -244,7 +372,6 @@ private:
         result->appendElementsUnique(
             CommandHelpers::filterCommandReplyForPassthrough(response.data));
     }
-
 } findAndModifyCmd;
 
 }  // namespace

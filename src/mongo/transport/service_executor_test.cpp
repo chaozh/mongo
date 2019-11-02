@@ -51,7 +51,7 @@ namespace {
 constexpr Milliseconds kWorkerThreadRunTime{1000};
 // Run time + generous scheduling time slice
 const Milliseconds kShutdownTime = kWorkerThreadRunTime + Milliseconds{50};
-}
+}  // namespace
 
 struct TestOptions : public ServiceExecutorAdaptive::Options {
     int reservedThreads() const final {
@@ -128,11 +128,11 @@ public:
     }
 
     void schedule(Task task) final {
-        asio::post(_ioContext, std::move(task));
+        asio::post(_ioContext, [task = std::move(task)] { task(Status::OK()); });
     }
 
     void dispatch(Task task) final {
-        asio::dispatch(_ioContext, std::move(task));
+        asio::dispatch(_ioContext, [task = std::move(task)] { task(Status::OK()); });
     }
 
     bool onReactorThread() const final {
@@ -153,9 +153,9 @@ protected:
         auto scOwned = ServiceContext::make();
         setGlobalServiceContext(std::move(scOwned));
 
-        auto configOwned = stdx::make_unique<TestOptions>();
+        auto configOwned = std::make_unique<TestOptions>();
         executorConfig = configOwned.get();
-        executor = stdx::make_unique<ServiceExecutorAdaptive>(
+        executor = std::make_unique<ServiceExecutorAdaptive>(
             getGlobalServiceContext(), std::make_shared<ASIOReactor>(), std::move(configOwned));
     }
 
@@ -170,7 +170,7 @@ protected:
         auto scOwned = ServiceContext::make();
         setGlobalServiceContext(std::move(scOwned));
 
-        executor = stdx::make_unique<ServiceExecutorSynchronous>(getGlobalServiceContext());
+        executor = std::make_unique<ServiceExecutorSynchronous>(getGlobalServiceContext());
     }
 
     std::unique_ptr<ServiceExecutorSynchronous> executor;
@@ -178,13 +178,13 @@ protected:
 
 void scheduleBasicTask(ServiceExecutor* exec, bool expectSuccess) {
     stdx::condition_variable cond;
-    stdx::mutex mutex;
+    auto mutex = MONGO_MAKE_LATCH();
     auto task = [&cond, &mutex] {
-        stdx::unique_lock<stdx::mutex> lk(mutex);
+        stdx::unique_lock<Latch> lk(mutex);
         cond.notify_all();
     };
 
-    stdx::unique_lock<stdx::mutex> lk(mutex);
+    stdx::unique_lock<Latch> lk(mutex);
     auto status = exec->schedule(
         std::move(task), ServiceExecutor::kEmptyFlags, ServiceExecutorTaskName::kSSMStartSession);
     if (expectSuccess) {

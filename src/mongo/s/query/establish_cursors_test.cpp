@@ -29,6 +29,8 @@
 
 #include "mongo/platform/basic.h"
 
+#include <memory>
+
 #include "mongo/client/remote_command_targeter_factory_mock.h"
 #include "mongo/client/remote_command_targeter_mock.h"
 #include "mongo/db/json.h"
@@ -37,7 +39,6 @@
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/query/establish_cursors.h"
 #include "mongo/s/sharding_router_test_fixture.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
@@ -73,7 +74,7 @@ public:
             shards.push_back(shardType);
 
             std::unique_ptr<RemoteCommandTargeterMock> targeter(
-                stdx::make_unique<RemoteCommandTargeterMock>());
+                std::make_unique<RemoteCommandTargeterMock>());
             targeter->setConnectionStringReturnValue(ConnectionString(kTestShardHosts[i]));
             targeter->setFindHostReturnValue(kTestShardHosts[i]);
 
@@ -124,7 +125,7 @@ TEST_F(EstablishCursorsTest, SingleRemoteRespondsWithSuccess) {
         return cursorResponse.toBSON(CursorResponse::ResponseType::InitialResponse);
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(EstablishCursorsTest, SingleRemoteRespondsWithNonretriableError) {
@@ -146,7 +147,7 @@ TEST_F(EstablishCursorsTest, SingleRemoteRespondsWithNonretriableError) {
         ASSERT_EQ(_nss.coll(), request.cmdObj.firstElement().valueStringData());
         return Status(ErrorCodes::FailedToParse, "failed to parse");
     });
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(EstablishCursorsTest, SingleRemoteRespondsWithNonretriableErrorAllowPartialResults) {
@@ -169,7 +170,7 @@ TEST_F(EstablishCursorsTest, SingleRemoteRespondsWithNonretriableErrorAllowParti
         ASSERT_EQ(_nss.coll(), request.cmdObj.firstElement().valueStringData());
         return Status(ErrorCodes::FailedToParse, "failed to parse");
     });
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(EstablishCursorsTest, SingleRemoteRespondsWithRetriableErrorThenSuccess) {
@@ -201,7 +202,7 @@ TEST_F(EstablishCursorsTest, SingleRemoteRespondsWithRetriableErrorThenSuccess) 
         return cursorResponse.toBSON(CursorResponse::ResponseType::InitialResponse);
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(EstablishCursorsTest, SingleRemoteRespondsWithRetriableErrorThenSuccessAllowPartialResults) {
@@ -234,7 +235,7 @@ TEST_F(EstablishCursorsTest, SingleRemoteRespondsWithRetriableErrorThenSuccessAl
         return cursorResponse.toBSON(CursorResponse::ResponseType::InitialResponse);
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(EstablishCursorsTest, SingleRemoteMaxesOutRetriableErrors) {
@@ -258,7 +259,7 @@ TEST_F(EstablishCursorsTest, SingleRemoteMaxesOutRetriableErrors) {
             return Status(ErrorCodes::HostUnreachable, "host unreachable");
         });
     }
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(EstablishCursorsTest, SingleRemoteMaxesOutRetriableErrorsAllowPartialResults) {
@@ -286,7 +287,7 @@ TEST_F(EstablishCursorsTest, SingleRemoteMaxesOutRetriableErrorsAllowPartialResu
             return Status(ErrorCodes::HostUnreachable, "host unreachable");
         });
     }
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(EstablishCursorsTest, MultipleRemotesRespondWithSuccess) {
@@ -315,7 +316,7 @@ TEST_F(EstablishCursorsTest, MultipleRemotesRespondWithSuccess) {
         });
     }
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(EstablishCursorsTest, MultipleRemotesOneRemoteRespondsWithNonretriableError) {
@@ -357,7 +358,7 @@ TEST_F(EstablishCursorsTest, MultipleRemotesOneRemoteRespondsWithNonretriableErr
         return cursorResponse.toBSON(CursorResponse::ResponseType::InitialResponse);
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(EstablishCursorsTest,
@@ -401,7 +402,7 @@ TEST_F(EstablishCursorsTest,
         return cursorResponse.toBSON(CursorResponse::ResponseType::InitialResponse);
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(EstablishCursorsTest, MultipleRemotesOneRemoteRespondsWithRetriableErrorThenSuccess) {
@@ -452,7 +453,7 @@ TEST_F(EstablishCursorsTest, MultipleRemotesOneRemoteRespondsWithRetriableErrorT
         return cursorResponse.toBSON(CursorResponse::ResponseType::InitialResponse);
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(EstablishCursorsTest,
@@ -504,7 +505,7 @@ TEST_F(EstablishCursorsTest,
         return cursorResponse.toBSON(CursorResponse::ResponseType::InitialResponse);
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(EstablishCursorsTest, MultipleRemotesOneRemoteMaxesOutRetriableErrors) {
@@ -554,7 +555,7 @@ TEST_F(EstablishCursorsTest, MultipleRemotesOneRemoteMaxesOutRetriableErrors) {
         });
     }
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(EstablishCursorsTest, MultipleRemotesOneRemoteMaxesOutRetriableErrorsAllowPartialResults) {
@@ -606,7 +607,7 @@ TEST_F(EstablishCursorsTest, MultipleRemotesOneRemoteMaxesOutRetriableErrorsAllo
         });
     }
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 }  // namespace

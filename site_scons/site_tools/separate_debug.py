@@ -14,6 +14,7 @@
 
 import SCons
 
+
 def _update_builder(env, builder, bitcode):
 
     old_scanner = builder.target_scanner
@@ -25,7 +26,8 @@ def _update_builder(env, builder, bitcode):
         if origin:
             origin_results = old_scanner(origin, env, path)
             for origin_result in origin_results:
-                origin_result_debug_file = getattr(origin_result.attributes, "separate_debug_file", None)
+                origin_result_debug_file = getattr(origin_result.attributes, "separate_debug_file",
+                                                   None)
                 if origin_result_debug_file:
                     results.append(origin_result_debug_file)
         # TODO: Do we need to do the same sort of drag along for bcsymbolmap files?
@@ -51,48 +53,41 @@ def _update_builder(env, builder, bitcode):
         if bitcode:
             base_action.list.append(
                 SCons.Action.Action(
-                    "dsymutil $TARGET --symbol-map=${TARGET}.bcsymbolmap -o ${TARGET}.dSYM",
-                    "Generating debug info for $TARGET into ${TARGET}.dSYM"
-                )
-            )
+                    "dsymutil -num-threads=1 $TARGET --symbol-map=${TARGET}.bcsymbolmap -o ${TARGET}.dSYM",
+                    "Generating debug info for $TARGET into ${TARGET}.dSYM"))
 
         else:
             base_action.list.append(
-                SCons.Action.Action(
-                    "dsymutil $TARGET -o ${TARGET}.dSYM",
-                    "Generating debug info for $TARGET into ${TARGET}.dSYM"
-                )
-            )
-        base_action.list.append(
-            SCons.Action.Action(
-                "strip -Sx ${TARGET}",
-                "Stripping ${TARGET}"
-            )
-        )
+                SCons.Action.Action("dsymutil -num-threads=1 $TARGET -o ${TARGET}.dSYM",
+                                    "Generating debug info for $TARGET into ${TARGET}.dSYM"))
+        base_action.list.append(SCons.Action.Action("strip -Sx ${TARGET}", "Stripping ${TARGET}"))
     elif env.TargetOSIs('posix'):
         base_action.list.extend([
-            SCons.Action.Action(
-                "${OBJCOPY} --only-keep-debug $TARGET ${TARGET}.debug",
-                "Generating debug info for $TARGET into ${TARGET}.debug"
-            ),
+            SCons.Action.Action("${OBJCOPY} --only-keep-debug $TARGET ${TARGET}.debug",
+                                "Generating debug info for $TARGET into ${TARGET}.debug"),
             SCons.Action.Action(
                 "${OBJCOPY} --strip-debug --add-gnu-debuglink ${TARGET}.debug ${TARGET}",
-                "Stripping debug info from ${TARGET} and adding .gnu.debuglink to ${TARGET}.debug"
-            ),
+                "Stripping debug info from ${TARGET} and adding .gnu.debuglink to ${TARGET}.debug"),
         ])
     else:
         pass
 
+    builder.action = base_action
+
     base_emitter = builder.emitter
+
     def new_emitter(target, source, env):
 
         bitcode_file = None
         if env.TargetOSIs('darwin'):
-            debug_file = env.Dir(str(target[0]) + ".dSYM")
+            debug_file = env.Entry(str(target[0]) + ".dSYM")
+            env.Precious(debug_file)
             if bitcode:
                 bitcode_file = env.File(str(target[0]) + ".bcsymbolmap")
         elif env.TargetOSIs('posix'):
             debug_file = env.File(str(target[0]) + ".debug")
+        elif env.TargetOSIs('windows'):
+            debug_file = env.File(env.subst('${PDB}', target=target))
         else:
             pass
 
@@ -110,6 +105,7 @@ def _update_builder(env, builder, bitcode):
 
     new_emitter = SCons.Builder.ListEmitter([base_emitter, new_emitter])
     builder.emitter = new_emitter
+
 
 def generate(env):
     if not exists(env):
@@ -132,12 +128,12 @@ def generate(env):
             "-Wl,-bitcode_symbol_map,${TARGET}.bcsymbolmap",
         ])
 
-
     # TODO: For now, not doing this for programs. Need to update
     # auto_install_binaries to understand to install the debug symbol
     # for target X to the same target location as X.
-    for builder in ['SharedLibrary', 'LoadableModule']:
+    for builder in ['Program', 'SharedLibrary', 'LoadableModule']:
         _update_builder(env, env['BUILDERS'][builder], bitcode)
+
 
 def exists(env):
     return True

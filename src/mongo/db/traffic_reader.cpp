@@ -93,8 +93,8 @@ bool readBytes(size_t toRead, char* buf, int fd) {
             auto pair = errnoAndDescription();
 
             uassert(ErrorCodes::FileStreamFailed,
-                    str::stream() << "failed to read bytes: errno(" << pair.first << ") : "
-                                  << pair.second,
+                    str::stream() << "failed to read bytes: errno(" << pair.first
+                                  << ") : " << pair.second,
                     pair.first == EINTR);
 
             continue;
@@ -122,12 +122,12 @@ boost::optional<TrafficReaderPacket> readPacket(char* buf, int fd) {
     ConstDataRangeCursor cdr(buf, buf + len);
 
     // Read the packet
-    uassertStatusOK(cdr.skip<LittleEndian<uint32_t>>());
-    uint64_t id = uassertStatusOK(cdr.readAndAdvance<LittleEndian<uint64_t>>());
-    StringData local = uassertStatusOK(cdr.readAndAdvance<Terminated<'\0', StringData>>());
-    StringData remote = uassertStatusOK(cdr.readAndAdvance<Terminated<'\0', StringData>>());
-    uint64_t date = uassertStatusOK(cdr.readAndAdvance<LittleEndian<uint64_t>>());
-    uint64_t order = uassertStatusOK(cdr.readAndAdvance<LittleEndian<uint64_t>>());
+    cdr.skip<LittleEndian<uint32_t>>();
+    uint64_t id = cdr.readAndAdvance<LittleEndian<uint64_t>>();
+    StringData local = cdr.readAndAdvance<Terminated<'\0', StringData>>();
+    StringData remote = cdr.readAndAdvance<Terminated<'\0', StringData>>();
+    uint64_t date = cdr.readAndAdvance<LittleEndian<uint64_t>>();
+    uint64_t order = cdr.readAndAdvance<LittleEndian<uint64_t>>();
     MsgData::ConstView message(cdr.data());
 
     return TrafficReaderPacket{
@@ -192,7 +192,8 @@ void addOpType(TrafficReaderPacket& packet, BSONObjBuilder* builder) {
     if (packet.message.getNetworkOp() == dbMsg) {
         Message message;
         message.setData(dbMsg, packet.message.data(), packet.message.dataLen());
-
+        // Some header fields like requestId are missing, so the checksum won't match.
+        OpMsg::removeChecksum(&message);
         auto opMsg = rpc::opMsgRequestFromAnyProtocol(message);
         builder->append("opType", opMsg.getCommandName());
     } else {

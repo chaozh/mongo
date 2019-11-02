@@ -99,10 +99,13 @@ function InitialSyncTest(name = "InitialSyncTest", replSet, timeout) {
      * Calls replSetGetStatus and checks if the node is in the provided state.
      */
     function isNodeInState(node, state) {
+        // We suppress the initialSync field here, because initial sync is paused while holding the
+        // mutex needed to report initial sync progress.
         return state ===
             assert
-                .commandWorkedOrFailedWithCode(node.adminCommand({replSetGetStatus: 1}),
-                                               ErrorCodes.NotYetInitialized)
+                .commandWorkedOrFailedWithCode(
+                    node.adminCommand({replSetGetStatus: 1, initialSync: 0}),
+                    ErrorCodes.NotYetInitialized)
                 .myState;
     }
 
@@ -142,16 +145,21 @@ function InitialSyncTest(name = "InitialSyncTest", replSet, timeout) {
         // Skip validation when stopping the node in case there are transactions in prepare.
         replSet.stop(secondary, undefined, {skipValidation: true});
 
+        const nodeOptions = {
+            startClean: true,
+            setParameter: {
+                'failpoint.initialSyncFuzzerSynchronizationPoint1': tojson({mode: 'alwaysOn'}),
+            },
+        };
+
+        if (TestData.logComponentVerbosity) {
+            nodeOptions.setParameter.logComponentVerbosity =
+                tojsononeline(TestData.logComponentVerbosity);
+        }
+
         // Restart the node with the first synchronization failpoint enabled so that initial sync
         // doesn't finish before we can pause it.
-        secondary = replSet.start(
-            secondary,
-            {
-              startClean: true,
-              setParameter:
-                  {'failpoint.initialSyncFuzzerSynchronizationPoint1': tojson({mode: 'alwaysOn'})}
-            },
-            true);
+        secondary = replSet.start(secondary, nodeOptions, true);
     }
 
     /**
@@ -165,7 +173,6 @@ function InitialSyncTest(name = "InitialSyncTest", replSet, timeout) {
                 return true;
             }
             return hasCompletedInitialSync();
-
         }, "initial sync did not pause or complete");
     }
 

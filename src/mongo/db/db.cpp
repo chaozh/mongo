@@ -36,6 +36,7 @@
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <memory>
 #include <signal.h>
 #include <string>
 
@@ -50,19 +51,20 @@
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/sasl_options.h"
 #include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/collection_catalog.h"
+#include "mongo/db/catalog/collection_impl.h"
 #include "mongo/db/catalog/create_collection.h"
 #include "mongo/db/catalog/database.h"
-#include "mongo/db/catalog/database_catalog_entry.h"
 #include "mongo/db/catalog/database_holder_impl.h"
 #include "mongo/db/catalog/health_log.h"
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/catalog/index_key_validate.h"
-#include "mongo/db/catalog/uuid_catalog.h"
 #include "mongo/db/client.h"
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/commands/feature_compatibility_version.h"
 #include "mongo/db/commands/feature_compatibility_version_gen.h"
 #include "mongo/db/concurrency/d_concurrency.h"
+#include "mongo/db/concurrency/flow_control_ticketholder.h"
 #include "mongo/db/concurrency/lock_state.h"
 #include "mongo/db/concurrency/replication_state_transition_lock_guard.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
@@ -74,6 +76,7 @@
 #include "mongo/db/free_mon/free_mon_mongod.h"
 #include "mongo/db/ftdc/ftdc_mongod.h"
 #include "mongo/db/global_settings.h"
+#include "mongo/db/index/index_access_method_factory_impl.h"
 #include "mongo/db/index_builds_coordinator_mongod.h"
 #include "mongo/db/index_names.h"
 #include "mongo/db/initialize_server_global_state.h"
@@ -107,6 +110,7 @@
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/replication_coordinator_external_state_impl.h"
 #include "mongo/db/repl/replication_coordinator_impl.h"
+#include "mongo/db/repl/replication_coordinator_impl_gen.h"
 #include "mongo/db/repl/replication_process.h"
 #include "mongo/db/repl/replication_recovery.h"
 #include "mongo/db/repl/storage_interface_impl.h"
@@ -119,6 +123,7 @@
 #include "mongo/db/s/shard_server_op_observer.h"
 #include "mongo/db/s/sharding_initialization_mongod.h"
 #include "mongo/db/s/sharding_state_recovery.h"
+#include "mongo/db/s/wait_for_majority_service.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/service_entry_point_mongod.h"
@@ -127,11 +132,14 @@
 #include "mongo/db/stats/counters.h"
 #include "mongo/db/storage/backup_cursor_hooks.h"
 #include "mongo/db/storage/encryption_hooks.h"
+#include "mongo/db/storage/flow_control.h"
+#include "mongo/db/storage/flow_control_parameters_gen.h"
 #include "mongo/db/storage/storage_engine.h"
 #include "mongo/db/storage/storage_engine_init.h"
 #include "mongo/db/storage/storage_engine_lock_file.h"
 #include "mongo/db/storage/storage_options.h"
 #include "mongo/db/system_index.h"
+#include "mongo/db/transaction_participant.h"
 #include "mongo/db/ttl.h"
 #include "mongo/db/wire_version.h"
 #include "mongo/executor/network_connection_hook.h"
@@ -139,6 +147,7 @@
 #include "mongo/executor/network_interface_thread_pool.h"
 #include "mongo/executor/thread_pool_task_executor.h"
 #include "mongo/platform/process_id.h"
+#include "mongo/platform/random.h"
 #include "mongo/rpc/metadata/egress_metadata_hook_list.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
@@ -146,7 +155,6 @@
 #include "mongo/scripting/dbdirectclient_factory.h"
 #include "mongo/scripting/engine.h"
 #include "mongo/stdx/future.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/transport/transport_layer_manager.h"
 #include "mongo/util/assert_util.h"
@@ -156,7 +164,7 @@
 #include "mongo/util/concurrency/thread_name.h"
 #include "mongo/util/exception_filter_win32.h"
 #include "mongo/util/exit.h"
-#include "mongo/util/fail_point_service.h"
+#include "mongo/util/fail_point.h"
 #include "mongo/util/fast_clock_source_factory.h"
 #include "mongo/util/log.h"
 #include "mongo/util/net/socket_utils.h"
@@ -171,10 +179,10 @@
 #include "mongo/util/sequence_util.h"
 #include "mongo/util/signal_handlers.h"
 #include "mongo/util/stacktrace.h"
-#include "mongo/util/startup_test.h"
 #include "mongo/util/text.h"
 #include "mongo/util/time_support.h"
 #include "mongo/util/version.h"
+#include "mongo/watchdog/watchdog_mongod.h"
 
 #ifdef MONGO_CONFIG_SSL
 #include "mongo/util/net/ssl_options.h"
@@ -205,7 +213,7 @@ void logStartup(OperationContext* opCtx) {
     toLog.append("_id", id.str());
     toLog.append("hostname", getHostNameCached());
 
-    toLog.appendTimeT("startTime", time(0));
+    toLog.appendTimeT("startTime", time(nullptr));
     toLog.append("startTimeLocal", dateToCtimeString(Date_t::now()));
 
     toLog.append("cmdLine", serverGlobalParams.parsedOpts);
@@ -222,16 +230,17 @@ void logStartup(OperationContext* opCtx) {
     Lock::GlobalWrite lk(opCtx);
     AutoGetOrCreateDb autoDb(opCtx, startupLogCollectionName.db(), mongo::MODE_X);
     Database* db = autoDb.getDb();
-    Collection* collection = db->getCollection(opCtx, startupLogCollectionName);
+    Collection* collection =
+        CollectionCatalog::get(opCtx).lookupCollectionByNamespace(startupLogCollectionName);
     WriteUnitOfWork wunit(opCtx);
     if (!collection) {
         BSONObj options = BSON("capped" << true << "size" << 10 * 1024 * 1024);
         repl::UnreplicatedWritesBlock uwb(opCtx);
-        CollectionOptions collectionOptions;
-        uassertStatusOK(
-            collectionOptions.parse(options, CollectionOptions::ParseKind::parseForCommand));
+        CollectionOptions collectionOptions = uassertStatusOK(
+            CollectionOptions::parse(options, CollectionOptions::ParseKind::parseForCommand));
         uassertStatusOK(db->userCreateNS(opCtx, startupLogCollectionName, collectionOptions));
-        collection = db->getCollection(opCtx, startupLogCollectionName);
+        collection =
+            CollectionCatalog::get(opCtx).lookupCollectionByNamespace(startupLogCollectionName);
     }
     invariant(collection);
 
@@ -264,15 +273,14 @@ ExitCode _initAndListen(int listenPort) {
     auto serviceContext = getGlobalServiceContext();
 
     serviceContext->setFastClockSource(FastClockSourceFactory::create(Milliseconds(10)));
-    auto opObserverRegistry = stdx::make_unique<OpObserverRegistry>();
-    opObserverRegistry->addObserver(stdx::make_unique<OpObserverShardingImpl>());
-    opObserverRegistry->addObserver(stdx::make_unique<UUIDCatalogObserver>());
-    opObserverRegistry->addObserver(stdx::make_unique<AuthOpObserver>());
+    auto opObserverRegistry = std::make_unique<OpObserverRegistry>();
+    opObserverRegistry->addObserver(std::make_unique<OpObserverShardingImpl>());
+    opObserverRegistry->addObserver(std::make_unique<AuthOpObserver>());
 
     if (serverGlobalParams.clusterRole == ClusterRole::ShardServer) {
-        opObserverRegistry->addObserver(stdx::make_unique<ShardServerOpObserver>());
+        opObserverRegistry->addObserver(std::make_unique<ShardServerOpObserver>());
     } else if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
-        opObserverRegistry->addObserver(stdx::make_unique<ConfigServerOpObserver>());
+        opObserverRegistry->addObserver(std::make_unique<ConfigServerOpObserver>());
     }
     setupFreeMonitoringOpObserver(opObserverRegistry.get());
 
@@ -296,7 +304,8 @@ ExitCode _initAndListen(int listenPort) {
         l << (is32bit ? " 32" : " 64") << "-bit host=" << getHostNameCached() << endl;
     }
 
-    DEV log(LogComponent::kControl) << "DEBUG build (which is slower)" << endl;
+    if (kDebugBuild)
+        log(LogComponent::kControl) << "DEBUG build (which is slower)" << endl;
 
 #if defined(_WIN32)
     VersionInfoInterface::instance().logTargetMinOS();
@@ -304,8 +313,7 @@ ExitCode _initAndListen(int listenPort) {
 
     logProcessDetails();
 
-    serviceContext->setServiceEntryPoint(
-        stdx::make_unique<ServiceEntryPointMongod>(serviceContext));
+    serviceContext->setServiceEntryPoint(std::make_unique<ServiceEntryPointMongod>(serviceContext));
 
     if (!storageGlobalParams.repair) {
         auto tl =
@@ -321,8 +329,10 @@ ExitCode _initAndListen(int listenPort) {
     // Set up the periodic runner for background job execution. This is required to be running
     // before the storage engine is initialized.
     auto runner = makePeriodicRunner(serviceContext);
-    runner->startup();
     serviceContext->setPeriodicRunner(std::move(runner));
+    FlowControl::set(serviceContext,
+                     std::make_unique<FlowControl>(
+                         serviceContext, repl::ReplicationCoordinator::get(serviceContext)));
 
     initializeStorageEngine(serviceContext, StorageEngineInitFlags::kNone);
 
@@ -371,18 +381,6 @@ ExitCode _initAndListen(int listenPort) {
 
     logMongodStartupWarnings(storageGlobalParams, serverGlobalParams, serviceContext);
 
-#ifdef MONGO_CONFIG_SSL
-    if (sslGlobalParams.sslAllowInvalidCertificates &&
-        ((serverGlobalParams.clusterAuthMode.load() == ServerGlobalParams::ClusterAuthMode_x509) ||
-         sequenceContains(saslGlobalParams.authenticationMechanisms, "MONGODB-X509"))) {
-        log() << "** WARNING: While invalid X509 certificates may be used to" << startupWarningsLog;
-        log() << "**          connect to this server, they will not be considered"
-              << startupWarningsLog;
-        log() << "**          permissible for authentication." << startupWarningsLog;
-        log() << startupWarningsLog;
-    }
-#endif
-
     {
         std::stringstream ss;
         ss << endl;
@@ -395,6 +393,8 @@ ExitCode _initAndListen(int listenPort) {
     }
 
     initializeSNMP();
+
+    startWatchdog();
 
     if (!storageGlobalParams.readOnly) {
         boost::filesystem::remove_all(storageGlobalParams.dbpath + "/_tmp/");
@@ -414,33 +414,33 @@ ExitCode _initAndListen(int listenPort) {
                                                        repl::StorageInterface::get(serviceContext));
     }
 
-    auto swNonLocalDatabases = repairDatabasesAndCheckVersion(startupOpCtx.get());
-    if (!swNonLocalDatabases.isOK()) {
-        // SERVER-31611 introduced a return value to `repairDatabasesAndCheckVersion`. Previously,
-        // a failing condition would fassert. SERVER-31611 covers a case where the binary (3.6) is
-        // refusing to start up because it refuses acknowledgement of FCV 3.2 and requires the
-        // user to start up with an older binary. Thus shutting down the server must leave the
-        // datafiles in a state that the older binary can start up. This requires going through a
-        // clean shutdown.
-        //
-        // The invariant is *not* a statement that `repairDatabasesAndCheckVersion` must return
-        // `MustDowngrade`. Instead, it is meant as a guardrail to protect future developers from
-        // accidentally buying into this behavior. New errors that are returned from the method
-        // may or may not want to go through a clean shutdown, and they likely won't want the
-        // program to return an exit code of `EXIT_NEED_DOWNGRADE`.
-        severe(LogComponent::kControl) << "** IMPORTANT: "
-                                       << swNonLocalDatabases.getStatus().reason();
-        invariant(swNonLocalDatabases == ErrorCodes::MustDowngrade);
+    bool nonLocalDatabases;
+    try {
+        nonLocalDatabases = repairDatabasesAndCheckVersion(startupOpCtx.get());
+    } catch (const ExceptionFor<ErrorCodes::MustDowngrade>& error) {
+        severe(LogComponent::kControl) << "** IMPORTANT: " << error.toStatus().reason();
         exitCleanly(EXIT_NEED_DOWNGRADE);
     }
+
+    auto replProcess = repl::ReplicationProcess::get(serviceContext);
+    invariant(replProcess);
+    const bool initialSyncFlag =
+        replProcess->getConsistencyMarkers()->getInitialSyncFlag(startupOpCtx.get());
 
     // Assert that the in-memory featureCompatibilityVersion parameter has been explicitly set. If
     // we are part of a replica set and are started up with no data files, we do not set the
     // featureCompatibilityVersion until a primary is chosen. For this case, we expect the in-memory
-    // featureCompatibilityVersion parameter to still be uninitialized until after startup.
-    if (canCallFCVSetIfCleanStartup &&
-        (!replSettings.usingReplSets() || swNonLocalDatabases.getValue())) {
+    // featureCompatibilityVersion parameter to still be uninitialized until after startup. If the
+    // initial sync flag is set and we are part of a replica set, we expect the version to be
+    // initialized as part of initial sync after startup.
+    const bool initializeFCVAtInitialSync = replSettings.usingReplSets() && initialSyncFlag;
+    if (canCallFCVSetIfCleanStartup && (!replSettings.usingReplSets() || nonLocalDatabases) &&
+        !initializeFCVAtInitialSync) {
         invariant(serverGlobalParams.featureCompatibility.isVersionInitialized());
+    }
+
+    if (gFlowControlEnabled.load()) {
+        log() << "Flow Control is enabled on this deployment.";
     }
 
     if (storageGlobalParams.upgrade) {
@@ -509,11 +509,17 @@ ExitCode _initAndListen(int listenPort) {
               << startupWarningsLog;
     }
 
+    WaitForMajorityService::get(serviceContext).setUp(serviceContext);
+
     // This function may take the global lock.
     auto shardingInitialized = ShardingInitializationMongoD::get(startupOpCtx.get())
                                    ->initializeShardingAwarenessIfNeeded(startupOpCtx.get());
     if (shardingInitialized) {
-        waitForShardRegistryReload(startupOpCtx.get()).transitional_ignore();
+        auto status = waitForShardRegistryReload(startupOpCtx.get());
+        if (!status.isOK()) {
+            LOG(0) << "Failed to load the shard registry as part of startup"
+                   << causedBy(redact(status));
+        }
     }
 
     auto storageEngine = serviceContext->getStorageEngine();
@@ -530,9 +536,16 @@ ExitCode _initAndListen(int listenPort) {
 
         startFreeMonitoring(serviceContext);
 
+        auto replCoord = repl::ReplicationCoordinator::get(startupOpCtx.get());
+        invariant(replCoord);
+        if (replCoord->isReplEnabled()) {
+            storageEngine->setOldestActiveTransactionTimestampCallback(
+                TransactionParticipant::getOldestActiveTimestamp);
+        }
+
         if (serverGlobalParams.clusterRole == ClusterRole::ShardServer) {
             // Note: For replica sets, ShardingStateRecovery happens on transition to primary.
-            if (!repl::ReplicationCoordinator::get(startupOpCtx.get())->isReplEnabled()) {
+            if (!replCoord->isReplEnabled()) {
                 if (ShardingState::get(startupOpCtx.get())->enabled()) {
                     uassertStatusOK(ShardingStateRecovery::recover(startupOpCtx.get()));
                 }
@@ -550,7 +563,7 @@ ExitCode _initAndListen(int listenPort) {
 
             Grid::get(startupOpCtx.get())->setShardingInitialized();
         } else if (replSettings.usingReplSets()) {  // standalone replica set
-            auto keysCollectionClient = stdx::make_unique<KeysCollectionClientDirect>();
+            auto keysCollectionClient = std::make_unique<KeysCollectionClientDirect>();
             auto keyManager = std::make_shared<KeysCollectionManager>(
                 KeysCollectionManager::kKeyManagerPurposeString,
                 std::move(keysCollectionClient),
@@ -558,10 +571,10 @@ ExitCode _initAndListen(int listenPort) {
             keyManager->startMonitoring(startupOpCtx->getServiceContext());
 
             LogicalTimeValidator::set(startupOpCtx->getServiceContext(),
-                                      stdx::make_unique<LogicalTimeValidator>(keyManager));
+                                      std::make_unique<LogicalTimeValidator>(keyManager));
         }
 
-        repl::ReplicationCoordinator::get(startupOpCtx.get())->startup(startupOpCtx.get());
+        replCoord->startup(startupOpCtx.get());
         if (getReplSetMemberInStandaloneMode(serviceContext)) {
             log() << startupWarningsLog;
             log() << "** WARNING: mongod started without --replSet yet document(s) are present in "
@@ -581,7 +594,7 @@ ExitCode _initAndListen(int listenPort) {
             log() << " For more info see http://dochub.mongodb.org/core/ttlcollections";
             log() << startupWarningsLog;
         } else {
-            startTTLBackgroundJob();
+            startTTLBackgroundJob(serviceContext);
         }
 
         if (replSettings.usingReplSets() || !gInternalValidateFeaturesAsMaster) {
@@ -603,8 +616,12 @@ ExitCode _initAndListen(int listenPort) {
     // Only do this on storage engines supporting snapshot reads, which hold resources we wish to
     // release periodically in order to avoid storage cache pressure build up.
     if (storageEngine->supportsReadConcernSnapshot()) {
-        startPeriodicThreadToAbortExpiredTransactions(serviceContext);
-        startPeriodicThreadToDecreaseSnapshotHistoryCachePressure(serviceContext);
+        PeriodicThreadToAbortExpiredTransactions::get(serviceContext)->start();
+        // The inMemory engine is not yet used for replica or sharded transactions in production so
+        // it does not currently maintain snapshot history. It is live in testing, however.
+        if (!storageEngine->isEphemeral() || getTestCommandsEnabled()) {
+            PeriodicThreadToDecreaseSnapshotHistoryCachePressure::get(serviceContext)->start();
+        }
     }
 
     // Set up the logical session cache
@@ -617,8 +634,7 @@ ExitCode _initAndListen(int listenPort) {
         kind = LogicalSessionCacheServer::kReplicaSet;
     }
 
-    auto sessionCache = makeLogicalSessionCacheD(kind);
-    LogicalSessionCache::set(serviceContext, std::move(sessionCache));
+    LogicalSessionCache::set(serviceContext, makeLogicalSessionCacheD(kind));
 
     // MessageServer::run will return when exit code closes its socket and we don't need the
     // operation context anymore
@@ -655,7 +671,7 @@ ExitCode _initAndListen(int listenPort) {
     }
 #endif
 
-    if (MONGO_FAIL_POINT(shutdownAtStartup)) {
+    if (MONGO_unlikely(shutdownAtStartup.shouldFail())) {
         log() << "starting clean exit via failpoint";
         exitCleanly(EXIT_CLEAN);
     }
@@ -784,6 +800,8 @@ void startupConfigActions(const std::vector<std::string>& args) {
 
 void setUpCatalog(ServiceContext* serviceContext) {
     DatabaseHolder::set(serviceContext, std::make_unique<DatabaseHolderImpl>());
+    IndexAccessMethodFactory::set(serviceContext, std::make_unique<IndexAccessMethodFactoryImpl>());
+    Collection::Factory::set(serviceContext, std::make_unique<CollectionImpl::FactoryImpl>());
 }
 
 auto makeReplicationExecutor(ServiceContext* serviceContext) {
@@ -793,48 +811,48 @@ auto makeReplicationExecutor(ServiceContext* serviceContext) {
     tpOptions.onCreateThread = [](const std::string& threadName) {
         Client::initThread(threadName.c_str());
     };
-    auto hookList = stdx::make_unique<rpc::EgressMetadataHookList>();
-    hookList->addHook(stdx::make_unique<rpc::LogicalTimeMetadataHook>(serviceContext));
-    return stdx::make_unique<executor::ThreadPoolTaskExecutor>(
-        stdx::make_unique<ThreadPool>(tpOptions),
+    auto hookList = std::make_unique<rpc::EgressMetadataHookList>();
+    hookList->addHook(std::make_unique<rpc::LogicalTimeMetadataHook>(serviceContext));
+    return std::make_unique<executor::ThreadPoolTaskExecutor>(
+        std::make_unique<ThreadPool>(tpOptions),
         executor::makeNetworkInterface("Replication", nullptr, std::move(hookList)));
 }
 
 void setUpReplication(ServiceContext* serviceContext) {
-    repl::StorageInterface::set(serviceContext, stdx::make_unique<repl::StorageInterfaceImpl>());
+    repl::StorageInterface::set(serviceContext, std::make_unique<repl::StorageInterfaceImpl>());
     auto storageInterface = repl::StorageInterface::get(serviceContext);
 
     auto consistencyMarkers =
-        stdx::make_unique<repl::ReplicationConsistencyMarkersImpl>(storageInterface);
-    auto recovery = stdx::make_unique<repl::ReplicationRecoveryImpl>(storageInterface,
-                                                                     consistencyMarkers.get());
+        std::make_unique<repl::ReplicationConsistencyMarkersImpl>(storageInterface);
+    auto recovery =
+        std::make_unique<repl::ReplicationRecoveryImpl>(storageInterface, consistencyMarkers.get());
     repl::ReplicationProcess::set(
         serviceContext,
-        stdx::make_unique<repl::ReplicationProcess>(
+        std::make_unique<repl::ReplicationProcess>(
             storageInterface, std::move(consistencyMarkers), std::move(recovery)));
     auto replicationProcess = repl::ReplicationProcess::get(serviceContext);
 
     repl::DropPendingCollectionReaper::set(
-        serviceContext, stdx::make_unique<repl::DropPendingCollectionReaper>(storageInterface));
+        serviceContext, std::make_unique<repl::DropPendingCollectionReaper>(storageInterface));
     auto dropPendingCollectionReaper = repl::DropPendingCollectionReaper::get(serviceContext);
 
     repl::TopologyCoordinator::Options topoCoordOptions;
     topoCoordOptions.maxSyncSourceLagSecs = Seconds(repl::maxSyncSourceLagSecs);
     topoCoordOptions.clusterRole = serverGlobalParams.clusterRole;
 
-    auto logicalClock = stdx::make_unique<LogicalClock>(serviceContext);
+    auto logicalClock = std::make_unique<LogicalClock>(serviceContext);
     LogicalClock::set(serviceContext, std::move(logicalClock));
 
-    auto replCoord = stdx::make_unique<repl::ReplicationCoordinatorImpl>(
+    auto replCoord = std::make_unique<repl::ReplicationCoordinatorImpl>(
         serviceContext,
         getGlobalReplSettings(),
-        stdx::make_unique<repl::ReplicationCoordinatorExternalStateImpl>(
+        std::make_unique<repl::ReplicationCoordinatorExternalStateImpl>(
             serviceContext, dropPendingCollectionReaper, storageInterface, replicationProcess),
         makeReplicationExecutor(serviceContext),
-        stdx::make_unique<repl::TopologyCoordinator>(topoCoordOptions),
+        std::make_unique<repl::TopologyCoordinator>(topoCoordOptions),
         replicationProcess,
         storageInterface,
-        static_cast<int64_t>(curTimeMillis64()));
+        SecureRandom().nextInt64());
     repl::ReplicationCoordinator::set(serviceContext, std::move(replCoord));
     repl::setOplogCollectionName(serviceContext);
 
@@ -855,7 +873,7 @@ MONGO_INITIALIZER_GENERAL(setSSLManagerType, MONGO_NO_PREREQUISITES, ("SSLManage
 
 // NOTE: This function may be called at any time after registerShutdownTask is called below. It
 // must not depend on the prior execution of mongo initializers or the existence of threads.
-void shutdownTask() {
+void shutdownTask(const ShutdownTaskArgs& shutdownArgs) {
     // This client initiation pattern is only to be used here, with plans to eliminate this pattern
     // down the line.
     if (!haveClient())
@@ -864,10 +882,49 @@ void shutdownTask() {
     auto const client = Client::getCurrent();
     auto const serviceContext = client->getServiceContext();
 
+    // If we don't have shutdownArgs, we're shutting down from a signal, or other clean shutdown
+    // path.
+    //
+    // In that case, do a default step down, still shutting down if stepDown fails.
+    if (auto replCoord = repl::ReplicationCoordinator::get(serviceContext);
+        replCoord && !shutdownArgs.isUserInitiated) {
+        replCoord->enterTerminalShutdown();
+        ServiceContext::UniqueOperationContext uniqueOpCtx;
+        OperationContext* opCtx = client->getOperationContext();
+        if (!opCtx) {
+            uniqueOpCtx = client->makeOperationContext();
+            opCtx = uniqueOpCtx.get();
+        }
+
+        // If this is a single node replica set, then we don't have to wait
+        // for any secondaries. Ignore stepdown.
+        if (repl::ReplicationCoordinator::get(serviceContext)->getConfig().getNumMembers() != 1) {
+            try {
+                // For faster tests, we allow a short wait time with setParameter.
+                auto waitTime = repl::waitForStepDownOnNonCommandShutdown.load()
+                    ? Milliseconds(Seconds(10))
+                    : Milliseconds(100);
+                replCoord->stepDown(opCtx, false /* force */, waitTime, Seconds(120));
+            } catch (const ExceptionFor<ErrorCodes::NotMaster>&) {
+                // ignore not master errors
+            } catch (const DBException& e) {
+                log() << "Failed to stepDown in non-command initiated shutdown path "
+                      << e.toString();
+            }
+        }
+    }
+
+    WaitForMajorityService::get(serviceContext).shutDown();
+
     // Terminate the balancer thread so it doesn't leak memory.
     if (auto balancer = Balancer::get(serviceContext)) {
         balancer->interruptBalancer();
         balancer->waitForBalancerToStop();
+    }
+
+    // Join the logical session cache before the transport layer.
+    if (auto lsc = LogicalSessionCache::get(serviceContext)) {
+        lsc->joinOnShutDown();
     }
 
     // Shutdown the TransportLayer so that new connections aren't accepted
@@ -879,13 +936,18 @@ void shutdownTask() {
     // Shut down the global dbclient pool so callers stop waiting for connections.
     globalConnPool.shutdown();
 
-    // Shut down the background periodic task runner. This must be done before shutting down the
-    // storage engine.
-    if (auto runner = serviceContext->getPeriodicRunner()) {
-        runner->shutdown();
+    // Inform Flow Control to stop gating writes on ticket admission. This must be done before the
+    // Periodic Runner is shut down (see SERVER-41751).
+    if (auto flowControlTicketholder = FlowControlTicketholder::get(serviceContext)) {
+        flowControlTicketholder->setInShutdown();
     }
 
-    if (serviceContext->getStorageEngine()) {
+    if (auto storageEngine = serviceContext->getStorageEngine()) {
+        if (storageEngine->supportsReadConcernSnapshot()) {
+            PeriodicThreadToAbortExpiredTransactions::get(serviceContext)->stop();
+            PeriodicThreadToDecreaseSnapshotHistoryCachePressure::get(serviceContext)->stop();
+        }
+
         ServiceContext::UniqueOperationContext uniqueOpCtx;
         OperationContext* opCtx = client->getOperationContext();
         if (!opCtx) {
@@ -932,6 +994,10 @@ void shutdownTask() {
         validator->shutDown();
     }
 
+    if (ShardingState::get(serviceContext)->enabled()) {
+        CatalogCacheLoader::get(serviceContext).shutDown();
+    }
+
 #if __has_feature(address_sanitizer)
     // When running under address sanitizer, we get false positive leaks due to disorder around
     // the lifecycle of a connection and request. When we are running under ASAN, we try a lot
@@ -947,10 +1013,10 @@ void shutdownTask() {
 
     // Shutdown and wait for the service executor to exit
     if (auto svcExec = serviceContext->getServiceExecutor()) {
-        Status status = svcExec->shutdown(Seconds(5));
+        Status status = svcExec->shutdown(Seconds(10));
         if (!status.isOK()) {
-            log(LogComponent::kNetwork) << "Service executor failed to shutdown within timelimit: "
-                                        << status.reason();
+            log(LogComponent::kNetwork)
+                << "Service executor failed to shutdown within timelimit: " << status.reason();
         }
     }
 #endif
@@ -963,18 +1029,11 @@ void shutdownTask() {
 
     // We should always be able to acquire the global lock at shutdown.
     //
-    // TODO: This call chain uses the locker directly, because we do not want to start an
-    // operation context, which also instantiates a recovery unit. Also, using the
-    // lockGlobalBegin/lockGlobalComplete sequence, we avoid taking the flush lock.
-    //
     // For a Windows service, dbexit does not call exit(), so we must leak the lock outside
     // of this function to prevent any operations from running that need a lock.
     //
     LockerImpl* globalLocker = new LockerImpl();
-    LockResult result = globalLocker->lockGlobalBegin(MODE_X, Date_t::max());
-    if (result == LOCK_WAITING) {
-        globalLocker->lockGlobalComplete(Date_t::max());
-    }
+    globalLocker->lockGlobal(MODE_X);
 
     // Global storage engine may not be started in all cases before we exit
     if (serviceContext->getStorageEngine()) {
@@ -1039,7 +1098,6 @@ int mongoDbMain(int argc, char* argv[], char** envp) {
     }
 #endif
 
-    StartupTest::runTests();
     ExitCode exitCode = initAndListen(serverGlobalParams.port);
     exitCleanly(exitCode);
     return 0;

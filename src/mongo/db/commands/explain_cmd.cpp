@@ -32,7 +32,7 @@
 #include "mongo/db/command_can_run_here.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/query/explain.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 namespace {
@@ -150,11 +150,17 @@ std::unique_ptr<CommandInvocation> CmdExplain::parse(OperationContext* opCtx,
             "explain command requires a nested object",
             cmdObj.firstElement().type() == Object);
     auto explainedObj = cmdObj.firstElement().Obj();
+
+    // Extract 'comment' field from the 'explainedObj' only if there is no top-level comment.
+    auto commentField = explainedObj["comment"];
+    if (!opCtx->getComment() && commentField) {
+        opCtx->setComment(commentField.wrap());
+    }
+
     if (auto innerDb = explainedObj["$db"]) {
         uassert(ErrorCodes::InvalidNamespace,
                 str::stream() << "Mismatched $db in explain command. Expected " << dbname
-                              << " but got "
-                              << innerDb.checkAndGetStringData(),
+                              << " but got " << innerDb.checkAndGetStringData(),
                 innerDb.checkAndGetStringData() == dbname);
     }
     auto explainedCommand = CommandHelpers::findCommand(explainedObj.firstElementFieldName());
@@ -163,9 +169,9 @@ std::unique_ptr<CommandInvocation> CmdExplain::parse(OperationContext* opCtx,
                           << explainedObj.firstElementFieldName(),
             explainedCommand);
     auto innerRequest =
-        stdx::make_unique<OpMsgRequest>(OpMsgRequest::fromDBAndBody(dbname, explainedObj));
+        std::make_unique<OpMsgRequest>(OpMsgRequest::fromDBAndBody(dbname, explainedObj));
     auto innerInvocation = explainedCommand->parse(opCtx, *innerRequest);
-    return stdx::make_unique<Invocation>(
+    return std::make_unique<Invocation>(
         this, request, std::move(verbosity), std::move(innerRequest), std::move(innerInvocation));
 }
 

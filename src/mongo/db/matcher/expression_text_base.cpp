@@ -41,14 +41,14 @@ const bool TextMatchExpressionBase::kDiacriticSensitiveDefault = false;
 TextMatchExpressionBase::TextMatchExpressionBase(StringData path)
     : LeafMatchExpression(TEXT, path) {}
 
-void TextMatchExpressionBase::debugString(StringBuilder& debug, int level) const {
+void TextMatchExpressionBase::debugString(StringBuilder& debug, int indentationLevel) const {
     const fts::FTSQuery& ftsQuery = getFTSQuery();
-    _debugAddSpace(debug, level);
+    _debugAddSpace(debug, indentationLevel);
     debug << "TEXT : query=" << ftsQuery.getQuery() << ", language=" << ftsQuery.getLanguage()
           << ", caseSensitive=" << ftsQuery.getCaseSensitive()
           << ", diacriticSensitive=" << ftsQuery.getDiacriticSensitive() << ", tag=";
     MatchExpression::TagData* td = getTag();
-    if (NULL != td) {
+    if (nullptr != td) {
         td->debugString(&debug);
     } else {
         debug << "NULL";
@@ -60,10 +60,8 @@ void TextMatchExpressionBase::serialize(BSONObjBuilder* out) const {
     const fts::FTSQuery& ftsQuery = getFTSQuery();
     out->append("$text",
                 BSON("$search" << ftsQuery.getQuery() << "$language" << ftsQuery.getLanguage()
-                               << "$caseSensitive"
-                               << ftsQuery.getCaseSensitive()
-                               << "$diacriticSensitive"
-                               << ftsQuery.getDiacriticSensitive()));
+                               << "$caseSensitive" << ftsQuery.getCaseSensitive()
+                               << "$diacriticSensitive" << ftsQuery.getDiacriticSensitive()));
 }
 
 bool TextMatchExpressionBase::equivalent(const MatchExpression* other) const {

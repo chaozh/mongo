@@ -34,6 +34,7 @@
 #include "mongo/db/ftdc/file_manager.h"
 
 #include <boost/filesystem.hpp>
+#include <memory>
 #include <string>
 
 #include "mongo/base/string_data.h"
@@ -42,10 +43,9 @@
 #include "mongo/db/ftdc/constants.h"
 #include "mongo/db/ftdc/file_reader.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
@@ -76,8 +76,8 @@ StatusWith<std::unique_ptr<FTDCFileManager>> FTDCFileManager::create(
         boost::filesystem::create_directories(dir, ec);
         if (ec) {
             return {ErrorCodes::NonExistentPath,
-                    str::stream() << "\'" << dir.generic_string() << "\' could not be created: "
-                                  << ec.message()};
+                    str::stream() << "\"" << dir.generic_string()
+                                  << "\" could not be created: " << ec.message()};
         }
     }
 
@@ -102,7 +102,10 @@ StatusWith<std::unique_ptr<FTDCFileManager>> FTDCFileManager::create(
     }
 
     // Rotate as needed after we appended interim data to the archive file
-    mgr->trimDirectory(files);
+    s = mgr->trimDirectory(files);
+    if (!s.isOK()) {
+        return s;
+    }
 
     return {std::move(mgr)};
 }
@@ -206,22 +209,38 @@ Status FTDCFileManager::openArchiveFile(
     return Status::OK();
 }
 
-void FTDCFileManager::trimDirectory(std::vector<boost::filesystem::path>& files) {
+Status FTDCFileManager::trimDirectory(std::vector<boost::filesystem::path>& files) {
     std::uint64_t maxSize = _config->maxDirectorySizeBytes;
     std::uint64_t size = 0;
 
     dassert(std::is_sorted(files.begin(), files.end()));
 
     for (auto it = files.rbegin(); it != files.rend(); ++it) {
-        std::uint64_t fileSize = boost::filesystem::file_size(*it);
+        boost::system::error_code ec;
+        std::uint64_t fileSize = boost::filesystem::file_size(*it, ec);
+        if (ec) {
+            return {ErrorCodes::NonExistentPath,
+                    str::stream() << "\"" << (*it).generic_string()
+                                  << "\" file size could not be retrieved during trimming: "
+                                  << ec.message()};
+        }
         size += fileSize;
 
         if (size >= maxSize) {
             LOG(1) << "Cleaning file over full-time diagnostic data capture quota, file: "
                    << (*it).generic_string() << " with size " << fileSize;
-            boost::filesystem::remove(*it);
+
+            boost::filesystem::remove(*it, ec);
+            if (ec) {
+                return {ErrorCodes::NonExistentPath,
+                        str::stream()
+                            << "\"" << (*it).generic_string()
+                            << "\" could not be removed during trimming: " << ec.message()};
+            }
         }
     }
+
+    return Status::OK();
 }
 
 std::vector<std::tuple<FTDCBSONUtil::FTDCType, BSONObj, Date_t>>
@@ -235,7 +254,14 @@ FTDCFileManager::recoverInterimFile() {
         return docs;
     }
 
-    size_t size = boost::filesystem::file_size(interimFile);
+    boost::system::error_code ec;
+    size_t size = boost::filesystem::file_size(interimFile, ec);
+    if (ec) {
+        log() << "Recover interim file failed as the file size could not be checked: "
+              << ec.message();
+        return docs;
+    }
+
     if (size == 0) {
         return docs;
     }
@@ -281,7 +307,10 @@ Status FTDCFileManager::rotate(Client* client) {
     auto files = scanDirectory();
 
     // Rotate as needed
-    trimDirectory(files);
+    s = trimDirectory(files);
+    if (!s.isOK()) {
+        return s;
+    }
 
     auto swFile = generateArchiveFileName(_path, terseUTCCurrentTime());
     if (!swFile.isOK()) {

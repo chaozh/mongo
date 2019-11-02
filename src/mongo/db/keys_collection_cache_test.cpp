@@ -41,13 +41,14 @@
 #include "mongo/util/clock_source_mock.h"
 
 namespace mongo {
+namespace {
 
 class CacheTest : public ConfigServerTestFixture {
 protected:
     void setUp() override {
         ConfigServerTestFixture::setUp();
 
-        _catalogClient = stdx::make_unique<KeysCollectionClientSharded>(
+        _catalogClient = std::make_unique<KeysCollectionClientSharded>(
             Grid::get(operationContext())->catalogClient());
     }
 
@@ -267,4 +268,5 @@ TEST_F(CacheTest, RefreshCanIncrementallyGetNewKeys) {
     }
 }
 
+}  // namespace
 }  // namespace mongo

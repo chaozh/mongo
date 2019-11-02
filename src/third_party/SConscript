@@ -1,38 +1,89 @@
 # -*- mode: python -*-
 
 import libdeps
+import json
 
 Import("env use_system_version_of_library usemozjs get_option")
-Import("wiredtiger")
 Import("mobile_se")
+Import("use_libunwind")
+Import("use_system_libunwind")
+Import("use_vendored_libunwind")
+Import("wiredtiger")
 
-boostSuffix = "-1.69.0"
+boostSuffix = "-1.70.0"
 snappySuffix = '-1.1.7'
 zlibSuffix = '-1.2.11'
-zstdSuffix = '-1.3.7'
+zstdSuffix = '-1.4.3'
 pcreSuffix = "-8.42"
 mozjsSuffix = '-60'
 yamlSuffix = '-0.6.2'
 icuSuffix = '-57.1'
-gperftoolsSuffix = '-2.7' if env['MONGO_ALLOCATOR'] == "tcmalloc-experimental" else '-2.5'
+gperftoolsSuffix = '-2.7'
 timelibSuffix = '-2018.01'
 tomcryptSuffix = '-1.18.2'
 benchmarkSuffix = '-1.4.1'
 sqliteSuffix = '-amalgamation-3260000'
 
 thirdPartyEnvironmentModifications = {
+   'fmt' : {
+        'CPPPATH' : ['#src/third_party/fmt/dist/include'],
+   },
    's2' : {
         'CPPPATH' : ['#src/third_party/s2'],
    },
+   'safeint' : {
+        'CPPPATH' : ['#src/third_party/SafeInt'],
+        # SAFEINT_USE_INTRINSICS=0 for overflow-safe constexpr multiply. See comment in SafeInt.hpp.
+        'CPPDEFINES' : [('SAFEINT_USE_INTRINSICS', 0)],
+   },
    'timelib' : {
         'CPPPATH' : ['#/src/third_party/timelib' + timelibSuffix],
-   }
+   },
+   'unwind' : {
+   },
 }
 
+def injectMozJS(thisEnv):
+    thisEnv.InjectThirdParty(libraries=['mozjs'])
+
+    if thisEnv.TargetOSIs('windows'):
+        thisEnv.Append(
+            CCFLAGS=[
+                '/FI', 'js-config.h',
+                '/FI', 'js/RequiredDefines.h',
+            ],
+            CPPDEFINES=[
+                '_SILENCE_CXX17_ITERATOR_BASE_CLASS_DEPRECATION_WARNING',
+            ]
+        )
+    else:
+        thisEnv.Append(
+            CCFLAGS=[
+                '-include', 'js-config.h',
+                '-include', 'js/RequiredDefines.h',
+            ],
+            CXXFLAGS=[
+                '-Wno-non-virtual-dtor',
+                '-Wno-invalid-offsetof',
+            ],
+        )
+
+    thisEnv.Prepend(CPPDEFINES=[
+        'JS_USE_CUSTOM_ALLOCATOR',
+        'STATIC_JS_API=1',
+    ])
+
+    if get_option('spider-monkey-dbg') == "on":
+        thisEnv.Prepend(CPPDEFINES=[
+            'DEBUG',
+            'JS_DEBUG',
+        ])
+
+env.AddMethod(injectMozJS, 'InjectMozJS');
+
 if not use_system_version_of_library('tcmalloc'):
-    thirdPartyEnvironmentModifications['gperftools'] = {
-        'CPPPATH' : ['#/src/third_party/gperftools' + gperftoolsSuffix + '/src'],
-    }
+    # GPerftools does this slightly differently than the others.
+    thirdPartyEnvironmentModifications['gperftools'] = {}
 
 if not use_system_version_of_library('pcre'):
     thirdPartyEnvironmentModifications['pcre'] = {
@@ -133,28 +184,102 @@ if not use_system_version_of_library('icu'):
                      '#/src/third_party/icu4c' + icuSuffix + '/source/i18n'],
     }
 
+if not use_system_version_of_library('kms-message'):
+    thirdPartyEnvironmentModifications['kms-message'] = {
+        'CPPPATH' : ['#/src/third_party/kms-message/src'],
+        'CPPDEFINES' :['KMS_MSG_STATIC']
+    }
+
+if use_system_libunwind:
+    thirdPartyEnvironmentModifications['unwind'] = {
+        'CPPDEFINES' : ['MONGO_USE_LIBUNWIND', 'UNW_LOCAL_ONLY'],
+        'SYSLIBDEPS' : [env['LIBDEPS_UNWIND_SYSLIBDEP'], 'lzma'],
+    }
+elif use_vendored_libunwind:
+    thirdPartyEnvironmentModifications['unwind'] = {
+        'CPPDEFINES' : ['MONGO_USE_LIBUNWIND', 'UNW_LOCAL_ONLY'],
+        'LIBDEPS' : ['$BUILD_DIR/third_party/shim_unwind'],
+        'SYSLIBDEPS' : ['lzma'],
+    }
+
 def injectThirdParty(thisEnv, libraries=[], parts=[]):
     libraries = thisEnv.Flatten([libraries])
     parts = thisEnv.Flatten([parts])
     for lib in libraries:
+        mods = thirdPartyEnvironmentModifications.get(lib, None)
+        if mods is None:
+            continue
         if not parts:
-            thisEnv.PrependUnique(**thirdPartyEnvironmentModifications[lib])
+            thisEnv.PrependUnique(**mods)
         else:
             for part in parts:
-                thisEnv.PrependUnique({part : thirdPartyEnvironmentModifications[lib][part]})
+                thisEnv.PrependUnique({part : mods[part]})
 
 env.AddMethod(injectThirdParty, 'InjectThirdParty')
 
 env = env.Clone()
 
 murmurEnv = env.Clone()
+murmurEnv.InjectThirdParty(libraries=['fmt'])
 murmurEnv.SConscript('murmurhash3/SConscript', exports={ 'env' : murmurEnv })
 
 
 s2Env = env.Clone()
-s2Env.InjectThirdParty(libraries=['s2', 'boost', 'abseil-cpp'])
+s2Env.InjectThirdParty(libraries=['s2', 'boost', 'abseil-cpp', 'fmt', 'safeint'])
 s2Env.InjectMongoIncludePaths()
 s2Env.SConscript('s2/SConscript', exports={'env' : s2Env})
+
+if use_libunwind:
+    if use_system_libunwind:
+        unwindEnv = env.Clone(
+            SYSLIBDEPS=[
+                env['LIBDEPS_UNWIND_SYSLIBDEP'],
+            ])
+    else:
+        unwindEnv = env.Clone()
+
+        # SCons uses the "$CC" tool for both C and assembler files. Distinguish them for the sake of
+        # later tools like our Ninja SCons module.
+        unwindEnv['ASPP'] = '$CC'
+        unwindEnv['ASPPCOM'] = unwindEnv['ASPPCOM'].replace('$CC ', '$ASPP ')
+
+        def registerConsumerModifications(env, **kwargs):
+            for k,v in kwargs.items():
+                thirdPartyEnvironmentModifications['unwind'][k] = v
+
+        unwindEnv.AddMethod(registerConsumerModifications, 'RegisterConsumerModifications')
+        unwindEnv.SConscript('unwind/SConscript', exports={'env' : unwindEnv})
+        unwindEnv.Append(
+            LIBDEPS_INTERFACE=[
+                'unwind/unwind',
+            ])
+
+    unwindEnv.Library(
+        target="shim_unwind",
+        source=[
+            'shim_unwind.cpp',
+        ])
+
+if use_system_version_of_library("fmt"):
+    fmtEnv = env.Clone(
+        SYSLIBDEPS=[
+            env['LIBDEPS_FMT_SYSLIBDEP'],
+        ])
+else:
+    fmtEnv = env.Clone()
+    fmtEnv.InjectThirdParty(libraries=['fmt'])
+    fmtEnv.InjectMongoIncludePaths()
+    fmtEnv.SConscript('fmt/SConscript', exports={'env' : fmtEnv})
+    fmtEnv = fmtEnv.Clone(
+        LIBDEPS_INTERFACE=[
+            'fmt/fmt',
+        ])
+
+fmtEnv.Library(
+    target="shim_fmt",
+    source=[
+        'shim_fmt.cpp',
+    ])
 
 
 if use_system_version_of_library("pcre"):
@@ -190,6 +315,8 @@ if use_system_version_of_library("boost"):
                 env['LIBDEPS_BOOST_FILESYSTEM_SYSLIBDEP'],
                 env['LIBDEPS_BOOST_SYSTEM_SYSLIBDEP'],
                 env['LIBDEPS_BOOST_IOSTREAMS_SYSLIBDEP'],
+                env['LIBDEPS_BOOST_THREAD_SYSLIBDEP'],
+                env['LIBDEPS_BOOST_LOG_SYSLIBDEP'],
             ])
 else:
     boostDirectory = 'boost' + boostSuffix
@@ -202,6 +329,7 @@ else:
             boostDirectory + '/boost_filesystem',
             boostDirectory + '/boost_system',
             boostDirectory + '/boost_iostreams',
+            boostDirectory + '/boost_log',
         ])
 
 boostEnv.Library(
@@ -347,7 +475,7 @@ if "tom" in env["MONGO_CRYPTO"]:
         ])
 
 gperftoolsEnv = env
-if (gperftoolsEnv['MONGO_ALLOCATOR'] in ["tcmalloc", "tcmalloc-experimental"]):
+if gperftoolsEnv['MONGO_ALLOCATOR'] in ["tcmalloc", "tcmalloc-experimental"]:
     if use_system_version_of_library("tcmalloc"):
         gperftoolsEnv = env.Clone(
             SYSLIBDEPS=[
@@ -356,7 +484,15 @@ if (gperftoolsEnv['MONGO_ALLOCATOR'] in ["tcmalloc", "tcmalloc-experimental"]):
     else:
         gperftoolsEnv = env.Clone()
         gperftoolsEnv.InjectThirdParty(libraries=['gperftools'])
-        gperftoolsEnv.SConscript('gperftools' + gperftoolsSuffix + '/SConscript', exports={ 'env' : gperftoolsEnv })
+        # Allow gperftools to determine its own consumer-side include/ dirs.
+        # Needed because those are in a platform-specific subdirectory.
+        def registerConsumerModifications(env, **kwargs):
+            for k,v in kwargs.items():
+                thirdPartyEnvironmentModifications['gperftools'][k] = v
+        gperftoolsEnv.AddMethod(registerConsumerModifications, 'RegisterConsumerModifications')
+        gperftoolsEnv.SConscript(
+            'gperftools' + gperftoolsSuffix + '/SConscript',
+            exports={'env' : gperftoolsEnv})
         gperftoolsEnv = gperftoolsEnv.Clone(
             LIBDEPS_INTERFACE=[
                 'gperftools' + gperftoolsSuffix + '/tcmalloc_minimal',
@@ -410,7 +546,7 @@ yamlEnv.Library(
         'shim_yaml.cpp',
     ])
 
-timelibEnv = env.Clone();
+timelibEnv = env.Clone()
 timelibEnv.InjectThirdParty(libraries=['timelib'])
 timelibEnv.SConscript('timelib' + timelibSuffix + '/SConscript', exports={ 'env' : timelibEnv })
 timelibEnv = timelibEnv.Clone(
@@ -526,3 +662,24 @@ icuEnv.Library(
     source=[
         'shim_icu.cpp',
     ])
+
+if use_system_version_of_library("kms-message"):
+    kmsEnv = env.Clone(
+        SYSLIBDEPS=[
+            env['LIBDEPS_KMS-MESSAGE_SYSLIBDEP'],
+        ])
+else:
+    kmsEnv = env.Clone()
+    kmsEnv.InjectThirdParty(libraries=['kms-message'])
+    kmsEnv.SConscript('kms-message/SConscript', exports={ 'env' : kmsEnv })
+    kmsEnv = kmsEnv.Clone(
+        LIBDEPS_INTERFACE=[
+            'kms-message/kms-message',
+        ])
+
+kmsEnv.Library(
+    target="shim_kms_message",
+    source=[
+        'shim_kms_message.cpp',
+    ])
+

@@ -37,14 +37,13 @@
 #include <gperftools/malloc_extension.h>
 #include <valgrind/valgrind.h>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/base/init.h"
 #include "mongo/base/parse_number.h"
 #include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/util/mongoutils/str.h"
 #include "mongo/util/processinfo.h"
+#include "mongo/util/str.h"
 #include "mongo/util/tcmalloc_parameters_gen.h"
 
 namespace mongo {
@@ -76,18 +75,16 @@ StatusWith<size_t> validateTCMallocValue(StringData name, const BSONElement& new
         return {ErrorCodes::TypeMismatch,
                 str::stream() << "Expected server parameter " << name
                               << " to have numeric type, but found "
-                              << newValueElement.toString(false)
-                              << " of type "
+                              << newValueElement.toString(false) << " of type "
                               << typeName(newValueElement.type())};
     }
     long long valueAsLongLong = newValueElement.safeNumberLong();
     if (valueAsLongLong < 0 ||
         static_cast<unsigned long long>(valueAsLongLong) > std::numeric_limits<size_t>::max()) {
-        return Status(
-            ErrorCodes::BadValue,
-            str::stream() << "Value " << newValueElement.toString(false) << " is out of range for "
-                          << name
-                          << "; expected a value between 0 and "
+        return Status(ErrorCodes::BadValue,
+                      str::stream()
+                          << "Value " << newValueElement.toString(false) << " is out of range for "
+                          << name << "; expected a value between 0 and "
                           << std::min<unsigned long long>(std::numeric_limits<size_t>::max(),
                                                           std::numeric_limits<long long>::max()));
     }
@@ -113,7 +110,7 @@ StatusWith<size_t> validateTCMallocValue(StringData name, const BSONElement& new
     }                                                                                \
     Status TCMalloc##cls##ServerParameter::setFromString(const std::string& str) {   \
         size_t value;                                                                \
-        Status status = parseNumberFromString(str, &value);                          \
+        Status status = NumberParser{}(str, &value);                                 \
         if (!status.isOK()) {                                                        \
             return status;                                                           \
         }                                                                            \

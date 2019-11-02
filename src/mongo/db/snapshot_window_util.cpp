@@ -33,13 +33,14 @@
 
 #include "mongo/db/snapshot_window_util.h"
 
+#include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/snapshot_window_options.h"
 #include "mongo/db/storage/storage_engine.h"
-#include "mongo/stdx/mutex.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/util/concurrency/with_lock.h"
-#include "mongo/util/fail_point_service.h"
+#include "mongo/util/fail_point.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
@@ -54,7 +55,7 @@ namespace SnapshotWindowUtil {
 // another, since they act on and modify the same storage parameters. Further guards the static
 // variables "_snapshotWindowLastDecreasedAt" and "_snapshotWindowLastIncreasedAt" used in
 // increaseTargetSnapshotWindowSize() and decreaseSnapshowWindow().
-stdx::mutex snapshotWindowMutex;
+Mutex snapshotWindowMutex;
 
 namespace {
 
@@ -87,11 +88,11 @@ void _decreaseTargetSnapshotWindowSize(WithLock lock, OperationContext* opCtx) {
 }  // namespace
 
 void increaseTargetSnapshotWindowSize(OperationContext* opCtx) {
-    if (MONGO_FAIL_POINT(preventDynamicSnapshotHistoryWindowTargetAdjustments)) {
+    if (MONGO_unlikely(preventDynamicSnapshotHistoryWindowTargetAdjustments.shouldFail())) {
         return;
     }
 
-    stdx::unique_lock<stdx::mutex> lock(snapshotWindowMutex);
+    stdx::unique_lock<Latch> lock(snapshotWindowMutex);
 
     // Tracks the last time that the snapshot window was increased so that it does not go up so fast
     // that the storage engine does not have time to improve snapshot availability.
@@ -109,6 +110,7 @@ void increaseTargetSnapshotWindowSize(OperationContext* opCtx) {
     // the window size.
     StorageEngine* engine = opCtx->getServiceContext()->getStorageEngine();
     if (engine && engine->isCacheUnderPressure(opCtx)) {
+        invariant(!engine->isEphemeral() || getTestCommandsEnabled());
         warning() << "Attempted to increase the time window of available snapshots for "
                      "point-in-time operations (readConcern level 'snapshot' or transactions), but "
                      "the storage engine cache pressure, per the cachePressureThreshold setting of "
@@ -144,16 +146,21 @@ void increaseTargetSnapshotWindowSize(OperationContext* opCtx) {
 }
 
 void decreaseTargetSnapshotWindowSize(OperationContext* opCtx) {
-    if (MONGO_FAIL_POINT(preventDynamicSnapshotHistoryWindowTargetAdjustments)) {
+    if (MONGO_unlikely(preventDynamicSnapshotHistoryWindowTargetAdjustments.shouldFail())) {
         return;
     }
 
-    stdx::unique_lock<stdx::mutex> lock(snapshotWindowMutex);
+    stdx::unique_lock<Latch> lock(snapshotWindowMutex);
 
     StorageEngine* engine = opCtx->getServiceContext()->getStorageEngine();
     if (engine && engine->isCacheUnderPressure(opCtx)) {
+        invariant(!engine->isEphemeral() || getTestCommandsEnabled());
         _decreaseTargetSnapshotWindowSize(lock, opCtx);
     }
+}
+
+void incrementSnapshotTooOldErrorCount() {
+    snapshotWindowParams.snapshotTooOldErrorCount.addAndFetch(1);
 }
 
 }  // namespace SnapshotWindowUtil

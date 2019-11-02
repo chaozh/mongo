@@ -40,6 +40,7 @@
 #include "mongo/db/query/canonical_query_encoder.h"
 #include "mongo/db/query/collation/collator_factory_interface.h"
 #include "mongo/db/query/indexability.h"
+#include "mongo/db/query/projection_parser.h"
 #include "mongo/db/query/query_planner_common.h"
 #include "mongo/util/log.h"
 
@@ -151,11 +152,12 @@ StatusWith<std::unique_ptr<CanonicalQuery>> CanonicalQuery::canonicalize(
     // Make MatchExpression.
     boost::intrusive_ptr<ExpressionContext> newExpCtx;
     if (!expCtx.get()) {
-        newExpCtx.reset(new ExpressionContext(opCtx, collator.get()));
+        newExpCtx.reset(new ExpressionContext(opCtx, collator.get(), qr->getRuntimeConstants()));
     } else {
         newExpCtx = expCtx;
         invariant(CollatorInterface::collatorsMatch(collator.get(), expCtx->getCollator()));
     }
+
     StatusWithMatchExpression statusWithMatcher = MatchExpressionParser::parse(
         qr->getFilter(), newExpCtx, extensionsCallback, allowedFeatures);
     if (!statusWithMatcher.isOK()) {
@@ -168,6 +170,7 @@ StatusWith<std::unique_ptr<CanonicalQuery>> CanonicalQuery::canonicalize(
 
     Status initStatus =
         cq->init(opCtx,
+                 std::move(newExpCtx),
                  std::move(qr),
                  parsingCanProduceNoopMatchNodes(extensionsCallback, allowedFeatures),
                  std::move(me),
@@ -182,7 +185,7 @@ StatusWith<std::unique_ptr<CanonicalQuery>> CanonicalQuery::canonicalize(
 // static
 StatusWith<std::unique_ptr<CanonicalQuery>> CanonicalQuery::canonicalize(
     OperationContext* opCtx, const CanonicalQuery& baseQuery, MatchExpression* root) {
-    auto qr = stdx::make_unique<QueryRequest>(baseQuery.nss());
+    auto qr = std::make_unique<QueryRequest>(baseQuery.nss());
     BSONObjBuilder builder;
     root->serialize(&builder);
     qr->setFilter(builder.obj());
@@ -203,6 +206,7 @@ StatusWith<std::unique_ptr<CanonicalQuery>> CanonicalQuery::canonicalize(
     // Make the CQ we'll hopefully return.
     std::unique_ptr<CanonicalQuery> cq(new CanonicalQuery());
     Status initStatus = cq->init(opCtx,
+                                 baseQuery.getExpCtx(),
                                  std::move(qr),
                                  baseQuery.canHaveNoopMatchNodes(),
                                  root->shallowClone(),
@@ -215,10 +219,12 @@ StatusWith<std::unique_ptr<CanonicalQuery>> CanonicalQuery::canonicalize(
 }
 
 Status CanonicalQuery::init(OperationContext* opCtx,
+                            boost::intrusive_ptr<ExpressionContext> expCtx,
                             std::unique_ptr<QueryRequest> qr,
                             bool canHaveNoopMatchNodes,
                             std::unique_ptr<MatchExpression> root,
                             std::unique_ptr<CollatorInterface> collator) {
+    _expCtx = expCtx;
     _qr = std::move(qr);
     _collator = std::move(collator);
 
@@ -234,15 +240,21 @@ Status CanonicalQuery::init(OperationContext* opCtx,
 
     // Validate the projection if there is one.
     if (!_qr->getProj().isEmpty()) {
-        ParsedProjection* pp;
-        Status projStatus = ParsedProjection::make(opCtx, _qr->getProj(), _root.get(), &pp);
-        if (!projStatus.isOK()) {
-            return projStatus;
+        try {
+            _proj.emplace(projection_ast::parse(expCtx,
+                                                _qr->getProj(),
+                                                _root.get(),
+                                                _qr->getFilter(),
+                                                ProjectionPolicies::findProjectionPolicies()));
+        } catch (const DBException& e) {
+            return e.toStatus();
         }
-        _proj.reset(pp);
+
+        _metadataDeps = _proj->metadataDeps();
     }
 
-    if (_proj && _proj->wantSortKey() && _qr->getSort().isEmpty()) {
+    if (_proj && _proj->metadataDeps()[DocumentMetadataFields::kSortKey] &&
+        _qr->getSort().isEmpty()) {
         return Status(ErrorCodes::BadValue, "cannot use sortKey $meta projection without a sort");
     }
 
@@ -256,6 +268,9 @@ void CanonicalQuery::setCollator(std::unique_ptr<CollatorInterface> collator) {
     // the object owned by '_collator'. We must associate the match expression tree with the new
     // value of '_collator'.
     _root->setCollator(_collator.get());
+
+    // In a similar vein, we must give the ExpressionContext the same collator.
+    _expCtx->setCollator(_collator.get());
 }
 
 // static
@@ -265,7 +280,7 @@ bool CanonicalQuery::isSimpleIdQuery(const BSONObj& query) {
     BSONObjIterator it(query);
     while (it.more()) {
         BSONElement elt = it.next();
-        if (str::equals("_id", elt.fieldName())) {
+        if (elt.fieldNameStringData() == "_id") {
             // Verify that the query on _id is a simple equality.
             hasID = true;
 
@@ -294,8 +309,8 @@ void CanonicalQuery::sortTree(MatchExpression* tree) {
         sortTree(tree->getChild(i));
     }
     std::vector<MatchExpression*>* children = tree->getChildVector();
-    if (NULL != children) {
-        std::sort(children->begin(), children->end(), matchExpressionLessThan);
+    if (nullptr != children) {
+        std::stable_sort(children->begin(), children->end(), matchExpressionLessThan);
     }
 }
 
@@ -441,7 +456,7 @@ std::string CanonicalQuery::toString() const {
     }
 
     // The expression tree puts an endl on for us.
-    ss << "Tree: " << _root->toString();
+    ss << "Tree: " << _root->debugString();
     ss << "Sort: " << _qr->getSort().toString() << '\n';
     ss << "Proj: " << _qr->getProj().toString() << '\n';
     if (!_qr->getCollation().isEmpty()) {
@@ -452,8 +467,8 @@ std::string CanonicalQuery::toString() const {
 
 std::string CanonicalQuery::toStringShort() const {
     str::stream ss;
-    ss << "query: " << _qr->getFilter().toString() << " sort: " << _qr->getSort().toString()
-       << " projection: " << _qr->getProj().toString();
+    ss << "ns: " << _qr->nss().ns() << " query: " << _qr->getFilter().toString()
+       << " sort: " << _qr->getSort().toString() << " projection: " << _qr->getProj().toString();
 
     if (!_qr->getCollation().isEmpty()) {
         ss << " collation: " << _qr->getCollation().toString();

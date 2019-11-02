@@ -29,11 +29,11 @@
 
 #include "mongo/platform/basic.h"
 
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/document_value_test_util.h"
 #include "mongo/db/pipeline/aggregation_context_fixture.h"
-#include "mongo/db/pipeline/document.h"
 #include "mongo/db/pipeline/document_source_mock.h"
 #include "mongo/db/pipeline/document_source_skip.h"
-#include "mongo/db/pipeline/document_value_test_util.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
@@ -44,12 +44,13 @@ using DocumentSourceSkipTest = AggregationContextFixture;
 
 TEST_F(DocumentSourceSkipTest, ShouldPropagatePauses) {
     auto skip = DocumentSourceSkip::create(getExpCtx(), 2);
-    auto mock = DocumentSourceMock::create({Document(),
-                                            DocumentSource::GetNextResult::makePauseExecution(),
-                                            Document(),
-                                            Document(),
-                                            DocumentSource::GetNextResult::makePauseExecution(),
-                                            DocumentSource::GetNextResult::makePauseExecution()});
+    auto mock =
+        DocumentSourceMock::createForTest({Document(),
+                                           DocumentSource::GetNextResult::makePauseExecution(),
+                                           Document(),
+                                           Document(),
+                                           DocumentSource::GetNextResult::makePauseExecution(),
+                                           DocumentSource::GetNextResult::makePauseExecution()});
     skip->setSource(mock.get());
 
     // Skip the first document.

@@ -73,18 +73,26 @@ public:
 
     private:
         bool supportsWriteConcern() const override {
-            return Pipeline::aggSupportsWriteConcern(this->_request.body);
+            return true;
         }
 
-        bool supportsReadConcern(repl::ReadConcernLevel level) const override {
+        bool canIgnorePrepareConflicts() const override {
+            // Aggregate is a special case for prepare conflicts. It may do writes to an output
+            // collection, but it enables enforcement of prepare conflicts before doing so.
+            return true;
+        }
+
+        ReadConcernSupportResult supportsReadConcern(repl::ReadConcernLevel level) const override {
             // Aggregations that are run directly against a collection allow any read concern.
             // Otherwise, if the aggregate is collectionless then the read concern must be 'local'
             // (e.g. $currentOp). The exception to this is a $changeStream on a whole database,
             // which is considered collectionless but must be read concern 'majority'. Further read
             // concern validation is done one the pipeline is parsed.
-            return level == repl::ReadConcernLevel::kLocalReadConcern ||
-                level == repl::ReadConcernLevel::kMajorityReadConcern ||
-                !AggregationRequest::parseNs(_dbName, _request.body).isCollectionlessAggregateNS();
+            return {level == repl::ReadConcernLevel::kLocalReadConcern ||
+                        level == repl::ReadConcernLevel::kMajorityReadConcern ||
+                        !AggregationRequest::parseNs(_dbName, _request.body)
+                             .isCollectionlessAggregateNS(),
+                    ReadConcernSupportResult::DefaultReadConcern::kPermitted};
         }
 
         bool allowsSpeculativeMajorityReads() const override {
@@ -96,7 +104,7 @@ public:
 
         void run(OperationContext* opCtx, rpc::ReplyBuilderInterface* reply) override {
             CommandHelpers::handleMarkKillOnClientDisconnect(
-                opCtx, !Pipeline::aggSupportsWriteConcern(_request.body));
+                opCtx, !Pipeline::aggHasWriteStage(_request.body));
 
             const auto aggregationRequest = uassertStatusOK(
                 AggregationRequest::parseFromBSON(_dbName, _request.body, boost::none));

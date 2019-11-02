@@ -44,7 +44,7 @@
 #include "mongo/util/log.h"
 #include "mongo/util/processinfo.h"
 #include "mongo/util/scopeguard.h"
-#include "mongo/util/stringutils.h"
+#include "mongo/util/str.h"
 
 #include <asio.hpp>
 
@@ -125,8 +125,8 @@ thread_local ServiceExecutorAdaptive::ThreadState* ServiceExecutorAdaptive::_loc
     nullptr;
 
 ServiceExecutorAdaptive::ServiceExecutorAdaptive(ServiceContext* ctx, ReactorHandle reactor)
-    : ServiceExecutorAdaptive(
-          ctx, std::move(reactor), stdx::make_unique<ServerParameterOptions>()) {}
+    : ServiceExecutorAdaptive(ctx, std::move(reactor), std::make_unique<ServerParameterOptions>()) {
+}
 
 ServiceExecutorAdaptive::ServiceExecutorAdaptive(ServiceContext* ctx,
                                                  ReactorHandle reactor,
@@ -160,7 +160,7 @@ Status ServiceExecutorAdaptive::shutdown(Milliseconds timeout) {
     _scheduleCondition.notify_one();
     _controllerThread.join();
 
-    stdx::unique_lock<stdx::mutex> lk(_threadsMutex);
+    stdx::unique_lock<Latch> lk(_threadsMutex);
     _reactorHandle->stop();
     bool result =
         _deathCondition.wait_for(lk, timeout.toSystemDuration(), [&] { return _threads.empty(); });
@@ -183,33 +183,35 @@ Status ServiceExecutorAdaptive::schedule(ServiceExecutorAdaptive::Task task,
     }
 
     auto wrappedTask =
-        [ this, task = std::move(task), scheduleTime, pendingCounterPtr, taskName, flags ] {
-        pendingCounterPtr->subtractAndFetch(1);
-        auto start = _tickSource->getTicks();
-        _totalSpentQueued.addAndFetch(start - scheduleTime);
+        [this, task = std::move(task), scheduleTime, pendingCounterPtr, taskName, flags](
+            auto status) {
+            pendingCounterPtr->subtractAndFetch(1);
+            auto start = _tickSource->getTicks();
+            _totalSpentQueued.addAndFetch(start - scheduleTime);
 
-        _localThreadState->threadMetrics[static_cast<size_t>(taskName)]
-            ._totalSpentQueued.addAndFetch(start - scheduleTime);
-
-        if (_localThreadState->recursionDepth++ == 0) {
-            _localThreadState->executing.markRunning();
-            _threadsInUse.addAndFetch(1);
-        }
-        const auto guard = makeGuard([this, taskName] {
-            if (--_localThreadState->recursionDepth == 0) {
-                _localThreadState->executingCurRun += _localThreadState->executing.markStopped();
-                _threadsInUse.subtractAndFetch(1);
-            }
-            _totalExecuted.addAndFetch(1);
             _localThreadState->threadMetrics[static_cast<size_t>(taskName)]
-                ._totalExecuted.addAndFetch(1);
-        });
+                ._totalSpentQueued.addAndFetch(start - scheduleTime);
 
-        TickTimer _localTimer(_tickSource);
-        task();
-        _localThreadState->threadMetrics[static_cast<size_t>(taskName)]
-            ._totalSpentExecuting.addAndFetch(_localTimer.sinceStartTicks());
-    };
+            if (_localThreadState->recursionDepth++ == 0) {
+                _localThreadState->executing.markRunning();
+                _threadsInUse.addAndFetch(1);
+            }
+            const auto guard = makeGuard([this, taskName] {
+                if (--_localThreadState->recursionDepth == 0) {
+                    _localThreadState->executingCurRun +=
+                        _localThreadState->executing.markStopped();
+                    _threadsInUse.subtractAndFetch(1);
+                }
+                _totalExecuted.addAndFetch(1);
+                _localThreadState->threadMetrics[static_cast<size_t>(taskName)]
+                    ._totalExecuted.addAndFetch(1);
+            });
+
+            TickTimer _localTimer(_tickSource);
+            task();
+            _localThreadState->threadMetrics[static_cast<size_t>(taskName)]
+                ._totalSpentExecuting.addAndFetch(_localTimer.sinceStartTicks());
+        };
 
     // Dispatching a task on the io_context will run the task immediately, and may run it
     // on the current thread (if the current thread is running the io_context right now).
@@ -283,7 +285,7 @@ bool ServiceExecutorAdaptive::_isStarved() const {
  *   by schedule().
  */
 void ServiceExecutorAdaptive::_controllerThreadRoutine() {
-    stdx::mutex noopLock;
+    auto noopLock = MONGO_MAKE_LATCH();
     setThreadName("worker-controller"_sd);
 
     // Setup the timers/timeout values for stuck thread detection.
@@ -292,7 +294,7 @@ void ServiceExecutorAdaptive::_controllerThreadRoutine() {
 
     // Get the initial values for our utilization percentage calculations
     auto getTimerTotals = [this]() {
-        stdx::unique_lock<stdx::mutex> lk(_threadsMutex);
+        stdx::unique_lock<Latch> lk(_threadsMutex);
         auto first = _getThreadTimerTotal(ThreadTimer::kExecuting, lk);
         auto second = _getThreadTimerTotal(ThreadTimer::kRunning, lk);
         return std::make_pair(first, second);
@@ -426,7 +428,7 @@ void ServiceExecutorAdaptive::_controllerThreadRoutine() {
 }
 
 void ServiceExecutorAdaptive::_startWorkerThread(ThreadCreationReason reason) {
-    stdx::unique_lock<stdx::mutex> lk(_threadsMutex);
+    stdx::unique_lock<Latch> lk(_threadsMutex);
     auto it = _threads.emplace(_threads.begin(), _tickSource);
     auto num = _threads.size();
 
@@ -450,7 +452,7 @@ void ServiceExecutorAdaptive::_startWorkerThread(ThreadCreationReason reason) {
 }
 
 Milliseconds ServiceExecutorAdaptive::_getThreadJitter() const {
-    static stdx::mutex jitterMutex;
+    static auto jitterMutex = MONGO_MAKE_LATCH();
     static std::default_random_engine randomEngine = [] {
         std::random_device seed;
         return std::default_random_engine(seed());
@@ -462,7 +464,7 @@ Milliseconds ServiceExecutorAdaptive::_getThreadJitter() const {
 
     std::uniform_int_distribution<> jitterDist(-jitterParam, jitterParam);
 
-    stdx::lock_guard<stdx::mutex> lk(jitterMutex);
+    stdx::lock_guard<Latch> lk(jitterMutex);
     auto jitter = jitterDist(randomEngine);
     if (jitter > _config->workerThreadRunTime().count())
         jitter = 0;
@@ -483,8 +485,8 @@ void ServiceExecutorAdaptive::_accumulateTaskMetrics(MetricsArray* outArray,
     }
 }
 
-void ServiceExecutorAdaptive::_accumulateAllTaskMetrics(
-    MetricsArray* outputMetricsArray, const stdx::unique_lock<stdx::mutex>& lk) const {
+void ServiceExecutorAdaptive::_accumulateAllTaskMetrics(MetricsArray* outputMetricsArray,
+                                                        const stdx::unique_lock<Latch>& lk) const {
     _accumulateTaskMetrics(outputMetricsArray, _accumulatedMetrics);
     for (auto& thread : _threads) {
         _accumulateTaskMetrics(outputMetricsArray, thread.threadMetrics);
@@ -492,7 +494,7 @@ void ServiceExecutorAdaptive::_accumulateAllTaskMetrics(
 }
 
 TickSource::Tick ServiceExecutorAdaptive::_getThreadTimerTotal(
-    ThreadTimer which, const stdx::unique_lock<stdx::mutex>& lk) const {
+    ThreadTimer which, const stdx::unique_lock<Latch>& lk) const {
     TickSource::Tick accumulator;
     switch (which) {
         case ThreadTimer::kRunning:
@@ -537,7 +539,7 @@ void ServiceExecutorAdaptive::_workerThreadRoutine(
 
         _accumulateTaskMetrics(&_accumulatedMetrics, state->threadMetrics);
         {
-            stdx::lock_guard<stdx::mutex> lk(_threadsMutex);
+            stdx::lock_guard<Latch> lk(_threadsMutex);
             _threads.erase(state);
         }
         _deathCondition.notify_one();
@@ -601,8 +603,7 @@ void ServiceExecutorAdaptive::_workerThreadRoutine(
                 terminateThread = pctExecuting <= _config->idlePctThreshold();
             }
         } while (terminateThread &&
-                 _threadsRunning.compareAndSwap(runningThreads, runningThreads - 1) !=
-                     runningThreads);
+                 !_threadsRunning.compareAndSwap(&runningThreads, runningThreads - 1));
         if (terminateThread) {
             log() << "Thread was only executing tasks " << pctExecuting << "% over the last "
                   << runTime << ". Exiting thread.";
@@ -630,7 +631,7 @@ StringData ServiceExecutorAdaptive::_threadStartedByToString(
 }
 
 void ServiceExecutorAdaptive::appendStats(BSONObjBuilder* bob) const {
-    stdx::unique_lock<stdx::mutex> lk(_threadsMutex);
+    stdx::unique_lock<Latch> lk(_threadsMutex);
     *bob << kExecutorLabel << kExecutorName                                                //
          << kTotalQueued << _totalQueued.load()                                            //
          << kTotalExecuted << _totalExecuted.load()                                        //

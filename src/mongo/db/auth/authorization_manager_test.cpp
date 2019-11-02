@@ -29,6 +29,8 @@
 
 #include "mongo/platform/basic.h"
 
+#include <memory>
+
 /**
  * Unit tests of the AuthorizationManager type.
  */
@@ -51,7 +53,6 @@
 #include "mongo/db/operation_context.h"
 #include "mongo/db/service_context_test_fixture.h"
 #include "mongo/db/storage/recovery_unit_noop.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/transport/session.h"
 #include "mongo/transport/transport_layer_mock.h"
 #include "mongo/unittest/unittest.h"
@@ -126,9 +127,7 @@ TEST_F(AuthorizationManagerTest, testAcquireV2User) {
                                                           << "v2read"
                                                           << "db"
                                                           << "test"
-                                                          << "credentials"
-                                                          << credentials
-                                                          << "roles"
+                                                          << "credentials" << credentials << "roles"
                                                           << BSON_ARRAY(BSON("role"
                                                                              << "read"
                                                                              << "db"
@@ -141,9 +140,7 @@ TEST_F(AuthorizationManagerTest, testAcquireV2User) {
                                                           << "v2cluster"
                                                           << "db"
                                                           << "admin"
-                                                          << "credentials"
-                                                          << credentials
-                                                          << "roles"
+                                                          << "credentials" << credentials << "roles"
                                                           << BSON_ARRAY(BSON("role"
                                                                              << "clusterAdmin"
                                                                              << "db"
@@ -179,9 +176,10 @@ TEST_F(AuthorizationManagerTest, testAcquireV2User) {
 
 #ifdef MONGO_CONFIG_SSL
 TEST_F(AuthorizationManagerTest, testLocalX509Authorization) {
-    setX509PeerInfo(
-        session,
-        SSLPeerInfo(buildX509Name(), {RoleName("read", "test"), RoleName("readWrite", "test")}));
+    setX509PeerInfo(session,
+                    SSLPeerInfo(buildX509Name(),
+                                boost::none,
+                                {RoleName("read", "test"), RoleName("readWrite", "test")}));
 
     auto swu = authzManager->acquireUser(opCtx.get(), UserName("CN=mongodb.com", "$external"));
     ASSERT_OK(swu.getStatus());
@@ -206,9 +204,10 @@ TEST_F(AuthorizationManagerTest, testLocalX509Authorization) {
 #endif
 
 TEST_F(AuthorizationManagerTest, testLocalX509AuthorizationInvalidUser) {
-    setX509PeerInfo(
-        session,
-        SSLPeerInfo(buildX509Name(), {RoleName("read", "test"), RoleName("write", "test")}));
+    setX509PeerInfo(session,
+                    SSLPeerInfo(buildX509Name(),
+                                boost::none,
+                                {RoleName("read", "test"), RoleName("write", "test")}));
 
     ASSERT_NOT_OK(
         authzManager->acquireUser(opCtx.get(), UserName("CN=10gen.com", "$external")).getStatus());
@@ -246,20 +245,17 @@ public:
 
 private:
     Status _getUserDocument(OperationContext* opCtx, const UserName& userName, BSONObj* userDoc) {
-        Status status = findOne(opCtx,
-                                AuthorizationManager::usersCollectionNamespace,
-                                BSON(AuthorizationManager::USER_NAME_FIELD_NAME
-                                     << userName.getUser()
-                                     << AuthorizationManager::USER_DB_FIELD_NAME
-                                     << userName.getDB()),
-                                userDoc);
+        Status status =
+            findOne(opCtx,
+                    AuthorizationManager::usersCollectionNamespace,
+                    BSON(AuthorizationManager::USER_NAME_FIELD_NAME
+                         << userName.getUser() << AuthorizationManager::USER_DB_FIELD_NAME
+                         << userName.getDB()),
+                    userDoc);
         if (status == ErrorCodes::NoMatchingDocument) {
-            status =
-                Status(ErrorCodes::UserNotFound,
-                       mongoutils::str::stream() << "Could not find user \"" << userName.getUser()
-                                                 << "\" for db \""
-                                                 << userName.getDB()
-                                                 << "\"");
+            status = Status(ErrorCodes::UserNotFound,
+                            str::stream() << "Could not find user \"" << userName.getUser()
+                                          << "\" for db \"" << userName.getDB() << "\"");
         }
         return status;
     }
@@ -269,10 +265,10 @@ class AuthorizationManagerWithExplicitUserPrivilegesTest : public ::mongo::unitt
 public:
     virtual void setUp() {
         auto localExternalState =
-            stdx::make_unique<AuthzManagerExternalStateMockWithExplicitUserPrivileges>();
+            std::make_unique<AuthzManagerExternalStateMockWithExplicitUserPrivileges>();
         externalState = localExternalState.get();
         externalState->setAuthzVersion(AuthorizationManager::schemaVersion26Final);
-        authzManager = stdx::make_unique<AuthorizationManagerImpl>(
+        authzManager = std::make_unique<AuthorizationManagerImpl>(
             std::move(localExternalState),
             AuthorizationManagerImpl::InstallMockForTestingOrAuthImpl{});
         externalState->setAuthorizationManager(authzManager.get());
@@ -295,9 +291,7 @@ TEST_F(AuthorizationManagerTest, testAcquireV2UserWithUnrecognizedActions) {
              << "myUser"
              << "db"
              << "test"
-             << "credentials"
-             << credentials
-             << "roles"
+             << "credentials" << credentials << "roles"
              << BSON_ARRAY(BSON("role"
                                 << "myRole"
                                 << "db"
@@ -341,9 +335,9 @@ public:
     public:
         MockRecoveryUnit(size_t* registeredChanges) : _registeredChanges(registeredChanges) {}
 
-        virtual void registerChange(Change* change) final {
+        virtual void registerChange(std::unique_ptr<Change> change) final {
             // RecoveryUnitNoop takes ownership of the Change
-            RecoveryUnitNoop::registerChange(change);
+            RecoveryUnitNoop::registerChange(std::move(change));
             ++(*_registeredChanges);
         }
 
@@ -430,7 +424,7 @@ TEST_F(AuthorizationManagerLogOpTest, testCreateAnyCollectionAddsNoRecoveryUnits
     ASSERT_EQ(size_t(0), registeredChanges);
 }
 
-TEST_F(AuthorizationManagerLogOpTest, testRawInsertToRolesCollectionAddsRecoveryUnits) {
+TEST_F(AuthorizationManagerLogOpTest, testRawInsertAddsRecoveryUnits) {
     authzManager->logOp(opCtx.get(),
                         "i",
                         {"admin", "system.profile"},
@@ -445,7 +439,7 @@ TEST_F(AuthorizationManagerLogOpTest, testRawInsertToRolesCollectionAddsRecovery
                         BSON("_id"
                              << "admin.user"),
                         nullptr);
-    ASSERT_EQ(size_t(0), registeredChanges);
+    ASSERT_EQ(size_t(1), registeredChanges);
 
     authzManager->logOp(opCtx.get(),
                         "i",
@@ -453,7 +447,7 @@ TEST_F(AuthorizationManagerLogOpTest, testRawInsertToRolesCollectionAddsRecovery
                         BSON("_id"
                              << "admin.user"),
                         nullptr);
-    ASSERT_EQ(size_t(1), registeredChanges);
+    ASSERT_EQ(size_t(2), registeredChanges);
 }
 
 }  // namespace

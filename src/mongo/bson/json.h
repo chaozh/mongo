@@ -32,7 +32,9 @@
 #include <string>
 
 #include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
 #include "mongo/bson/bsonobj.h"
+#include "mongo/util/time_support.h"
 
 namespace mongo {
 
@@ -52,7 +54,7 @@ namespace mongo {
 BSONObj fromjson(const std::string& str);
 
 /** @param len will be size of JSON object in text chars. */
-BSONObj fromjson(const char* str, int* len = NULL);
+BSONObj fromjson(const char* str, int* len = nullptr);
 
 /**
  * Tests whether the JSON string is an Array.
@@ -410,7 +412,7 @@ private:
      * string, but there is no guarantee that it will not contain other
      * null characters.
      */
-    Status chars(std::string* result, const char* terminalSet, const char* allowedSet = NULL);
+    Status chars(std::string* result, const char* terminalSet, const char* allowedSet = nullptr);
 
     /**
      * Converts the two byte Unicode code point to its UTF8 character
@@ -472,6 +474,12 @@ private:
      * additional context information
      */
     Status parseError(StringData msg);
+
+    /**
+     * @returns a valid Date_t or FailedToParse status.
+     * Updates _input to past the end of the parsed date.
+     */
+    StatusWith<Date_t> parseDate();
 
 public:
     inline int offset() {

@@ -29,17 +29,16 @@
 
 #pragma once
 
+#include <functional>
+#include <memory>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/base/status.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/matcher/match_details.h"
 #include "mongo/db/matcher/matchable.h"
 #include "mongo/db/pipeline/dependencies.h"
-#include "mongo/stdx/functional.h"
-#include "mongo/stdx/memory.h"
-#include "mongo/util/fail_point_service.h"
+#include "mongo/util/fail_point.h"
 
 namespace mongo {
 
@@ -47,7 +46,7 @@ namespace mongo {
  * Enabling the disableMatchExpressionOptimization fail point will stop match expressions from
  * being optimized.
  */
-MONGO_FAIL_POINT_DECLARE(disableMatchExpressionOptimization);
+extern FailPoint disableMatchExpressionOptimization;
 
 class CollatorInterface;
 class MatchExpression;
@@ -56,7 +55,8 @@ class TreeMatchExpression;
 typedef StatusWith<std::unique_ptr<MatchExpression>> StatusWithMatchExpression;
 
 class MatchExpression {
-    MONGO_DISALLOW_COPYING(MatchExpression);
+    MatchExpression(const MatchExpression&) = delete;
+    MatchExpression& operator=(const MatchExpression&) = delete;
 
 public:
     enum MatchType {
@@ -112,6 +112,7 @@ public:
         // JSON Schema expressions.
         INTERNAL_SCHEMA_ALLOWED_PROPERTIES,
         INTERNAL_SCHEMA_ALL_ELEM_MATCH_FROM_INDEX,
+        INTERNAL_SCHEMA_BIN_DATA_ENCRYPTED_TYPE,
         INTERNAL_SCHEMA_BIN_DATA_SUBTYPE,
         INTERNAL_SCHEMA_COND,
         INTERNAL_SCHEMA_EQ,
@@ -142,7 +143,7 @@ public:
     static std::unique_ptr<MatchExpression> optimize(std::unique_ptr<MatchExpression> expression) {
         // If the disableMatchExpressionOptimization failpoint is enabled, optimizations are skipped
         // and the expression is left unmodified.
-        if (MONGO_FAIL_POINT(disableMatchExpressionOptimization)) {
+        if (MONGO_unlikely(disableMatchExpressionOptimization.shouldFail())) {
             return expression;
         }
 
@@ -211,7 +212,12 @@ public:
 
     virtual MatchCategory getCategory() const = 0;
 
-    // XXX: document
+    /**
+     * This method will perform a clone of the entire match expression tree, but will not clone the
+     * memory pointed to by underlying BSONElements. To perform a "deep clone" use this method and
+     * also ensure that the buffer held by the underlying BSONObj will not be destroyed during the
+     * lifetime of the clone.
+     */
     virtual std::unique_ptr<MatchExpression> shallowClone() const = 0;
 
     // XXX document
@@ -308,8 +314,20 @@ public:
     //
     // Debug information
     //
-    virtual std::string toString() const;
-    virtual void debugString(StringBuilder& debug, int level = 0) const = 0;
+
+    /**
+     * Returns a debug string representing the match expression tree, including any tags attached
+     * for planning. This debug string format may spill across multiple lines, so it is not suitable
+     * for logging at low debug levels or for error messages.
+     */
+    std::string debugString() const;
+    virtual void debugString(StringBuilder& debug, int indentationLevel = 0) const = 0;
+
+    /**
+     * Serializes this MatchExpression to BSON, and then returns a standard string representation of
+     * the resulting BSON object.
+     */
+    std::string toString() const;
 
 protected:
     /**
@@ -319,7 +337,7 @@ protected:
      * in the specification of MatchExpression::getOptimizer(std::unique_ptr<MatchExpression>).
      */
     using ExpressionOptimizerFunc =
-        stdx::function<std::unique_ptr<MatchExpression>(std::unique_ptr<MatchExpression>)>;
+        std::function<std::unique_ptr<MatchExpression>(std::unique_ptr<MatchExpression>)>;
 
     /**
      * Subclasses that are collation-aware must implement this method in order to capture changes
@@ -329,7 +347,7 @@ protected:
 
     virtual void _doAddDependencies(DepsTracker* deps) const {}
 
-    void _debugAddSpace(StringBuilder& debug, int level) const;
+    void _debugAddSpace(StringBuilder& debug, int indentationLevel) const;
 
 private:
     /**
@@ -352,4 +370,4 @@ private:
     MatchType _matchType;
     std::unique_ptr<TagData> _tagData;
 };
-}
+}  // namespace mongo

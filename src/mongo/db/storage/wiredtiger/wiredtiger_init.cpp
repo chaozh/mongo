@@ -39,7 +39,7 @@
 #include "mongo/db/catalog/collection_options.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/service_context.h"
-#include "mongo/db/storage/kv/kv_storage_engine.h"
+#include "mongo/db/storage/storage_engine_impl.h"
 #include "mongo/db/storage/storage_engine_init.h"
 #include "mongo/db/storage/storage_engine_lock_file.h"
 #include "mongo/db/storage/storage_engine_metadata.h"
@@ -53,6 +53,10 @@
 #include "mongo/db/storage/wiredtiger/wiredtiger_util.h"
 #include "mongo/util/log.h"
 #include "mongo/util/processinfo.h"
+
+#if __has_feature(address_sanitizer)
+#include <sanitizer/lsan_interface.h>
+#endif
 
 namespace mongo {
 
@@ -101,29 +105,54 @@ public:
             }
         }
         const bool ephemeral = false;
+        const auto maxCacheOverflowMB =
+            static_cast<size_t>(1024 * wiredTigerGlobalOptions.maxCacheOverflowFileSizeGB);
         WiredTigerKVEngine* kv =
             new WiredTigerKVEngine(getCanonicalName().toString(),
                                    params.dbpath,
                                    getGlobalServiceContext()->getFastClockSource(),
                                    wiredTigerGlobalOptions.engineConfig,
                                    cacheMB,
+                                   maxCacheOverflowMB,
                                    params.dur,
                                    ephemeral,
                                    params.repair,
                                    params.readOnly);
         kv->setRecordStoreExtraOptions(wiredTigerGlobalOptions.collectionConfig);
         kv->setSortedDataInterfaceExtraOptions(wiredTigerGlobalOptions.indexConfig);
-        // Intentionally leaked.
-        new WiredTigerServerStatusSection(kv);
-        auto* param = new WiredTigerEngineRuntimeConfigParameter("wiredTigerEngineRuntimeConfig",
-                                                                 ServerParameterType::kRuntimeOnly);
-        param->_data.second = kv;
 
-        KVStorageEngineOptions options;
+        // We must only add the server parameters to the global registry once during unit testing.
+        static int setupCountForUnitTests = 0;
+        if (setupCountForUnitTests == 0) {
+            ++setupCountForUnitTests;
+
+            // Intentionally leaked.
+            MONGO_COMPILER_VARIABLE_UNUSED auto leakedSection =
+                new WiredTigerServerStatusSection(kv);
+
+            auto* param = new WiredTigerEngineRuntimeConfigParameter(
+                "wiredTigerEngineRuntimeConfig", ServerParameterType::kRuntimeOnly);
+            param->_data.second = kv;
+
+            auto* maxCacheOverflowParam = new WiredTigerMaxCacheOverflowSizeGBParameter(
+                "wiredTigerMaxCacheOverflowSizeGB", ServerParameterType::kRuntimeOnly);
+            maxCacheOverflowParam->_data = {wiredTigerGlobalOptions.maxCacheOverflowFileSizeGB, kv};
+
+            // This allows unit tests to run this code without encountering memory leaks
+            // TODO (SERVER-43063): to fix the global server parameter registry memory leak. The
+            // server status section leak will still exist after SERVER-43063.
+#if __has_feature(address_sanitizer)
+            __lsan_ignore_object(leakedSection);
+            __lsan_ignore_object(param);
+            __lsan_ignore_object(maxCacheOverflowParam);
+#endif
+        }
+
+        StorageEngineOptions options;
         options.directoryPerDB = params.directoryperdb;
         options.directoryForIndexes = wiredTigerGlobalOptions.directoryForIndexes;
         options.forRepair = params.repair;
-        return new KVStorageEngine(kv, options);
+        return new StorageEngineImpl(kv, options);
     }
 
     virtual StringData getCanonicalName() const {

@@ -45,11 +45,12 @@
 #include "mongo/db/server_options.h"
 #include "mongo/rpc/protocol.h"
 #include "mongo/shell/shell_utils.h"
+#include "mongo/transport/message_compressor_options_client_gen.h"
 #include "mongo/transport/message_compressor_registry.h"
 #include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
 #include "mongo/util/net/socket_utils.h"
 #include "mongo/util/options_parser/startup_options.h"
+#include "mongo/util/str.h"
 #include "mongo/util/version.h"
 
 namespace mongo {
@@ -62,6 +63,8 @@ using std::vector;
 // SERVER-36807: Limit --setShellParameter to SetParameters we know we want to expose.
 const std::set<std::string> kSetShellParameterWhitelist = {
     "disabledSecureAllocatorDomains",
+    "newLineAfterPasswordPromptForTest",
+    "skipShellCursorFinalize",
 };
 
 std::string getMongoShellHelp(StringData name, const moe::OptionSection& options) {
@@ -152,10 +155,8 @@ Status storeMongoShellOptions(const moe::Environment& params,
     }
 
     if (params.count("net.compression.compressors")) {
-        auto compressors = params["net.compression.compressors"].as<string>();
-        if (compressors != "disabled") {
-            shellGlobalParams.networkMessageCompressors = std::move(compressors);
-        }
+        shellGlobalParams.networkMessageCompressors =
+            params["net.compression.compressors"].as<string>();
     }
 
     if (params.count("nodb")) {
@@ -179,7 +180,7 @@ Status storeMongoShellOptions(const moe::Environment& params,
     if (params.count("writeMode")) {
         std::string mode = params["writeMode"].as<string>();
         if (mode != "commands" && mode != "legacy" && mode != "compatibility") {
-            uasserted(17396, mongoutils::str::stream() << "Unknown writeMode option: " << mode);
+            uasserted(17396, str::stream() << "Unknown writeMode option: " << mode);
         }
         shellGlobalParams.writeMode = mode;
     }
@@ -187,10 +188,8 @@ Status storeMongoShellOptions(const moe::Environment& params,
         std::string mode = params["readMode"].as<string>();
         if (mode != "commands" && mode != "compatibility" && mode != "legacy") {
             uasserted(17397,
-                      mongoutils::str::stream()
-                          << "Unknown readMode option: '"
-                          << mode
-                          << "'. Valid modes are: {commands, compatibility, legacy}");
+                      str::stream() << "Unknown readMode option: '" << mode
+                                    << "'. Valid modes are: {commands, compatibility, legacy}");
         }
         shellGlobalParams.readMode = mode;
     }
@@ -241,6 +240,10 @@ Status storeMongoShellOptions(const moe::Environment& params,
         shellGlobalParams.jsHeapLimitMB = jsHeapLimitMB;
     }
 
+    if (params.count("idleSessionTimeout")) {
+        shellGlobalParams.idleSessionTimeout = Seconds(params["idleSessionTimeout"].as<int>());
+    }
+
     if (shellGlobalParams.url == "*") {
         StringBuilder sb;
         sb << "ERROR: "
@@ -280,7 +283,8 @@ Status storeMongoShellOptions(const moe::Environment& params,
             } else if (shellGlobalParams.gssapiServiceName != saslDefaultServiceName &&
                        uriOptions.count("gssapiServiceName")) {
                 sb << "the GSSAPI service name";
-            } else if (!shellGlobalParams.networkMessageCompressors.empty() &&
+            } else if (shellGlobalParams.networkMessageCompressors !=
+                           kNet_compression_compressorsDefault &&
                        uriOptions.count("compressors") &&
                        uriOptions["compressors"] != shellGlobalParams.networkMessageCompressors) {
                 sb << "different network message compressors";
@@ -321,16 +325,20 @@ Status storeMongoShellOptions(const moe::Environment& params,
             auto* param = paramIt->second;
             if (!param->allowedToChangeAtStartup()) {
                 return {ErrorCodes::BadValue,
-                        str::stream() << "Cannot use --setShellParameter to set '" << name
-                                      << "' at startup"};
+                        str::stream()
+                            << "Cannot use --setShellParameter to set '" << name << "' at startup"};
             }
             auto status = param->setFromString(it.second);
             if (!status.isOK()) {
                 return {ErrorCodes::BadValue,
-                        str::stream() << "Bad value for parameter '" << name << "': "
-                                      << status.reason()};
+                        str::stream()
+                            << "Bad value for parameter '" << name << "': " << status.reason()};
             }
         }
+    }
+
+    if (params.count("logv2")) {
+        shellGlobalParams.logV2 = true;
     }
 
     return Status::OK();

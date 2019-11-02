@@ -41,32 +41,53 @@
 #include "mongo/db/client.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/curop.h"
+#include "mongo/db/index_builds_coordinator.h"
 #include "mongo/db/op_observer.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/write_concern_options.h"
 #include "mongo/util/duration.h"
-#include "mongo/util/fail_point_service.h"
+#include "mongo/util/fail_point.h"
 #include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
 
 namespace mongo {
 
-MONGO_FAIL_POINT_DEFINE(dropDatabaseHangBeforeLog);
 MONGO_FAIL_POINT_DEFINE(dropDatabaseHangAfterAllCollectionsDrop);
+MONGO_FAIL_POINT_DEFINE(dropDatabaseHangBeforeInMemoryDrop);
 
 namespace {
 
 /**
  * Removes database from catalog and writes dropDatabase entry to oplog.
+ *
+ * Ensures that the database's drop-pending flag is reset to false if the drop fails.
+ *
+ * Throws on errors.
  */
-Status _finishDropDatabase(OperationContext* opCtx,
-                           const std::string& dbName,
-                           Database* db,
-                           std::size_t numCollections) {
+void _finishDropDatabase(OperationContext* opCtx,
+                         const std::string& dbName,
+                         Database* db,
+                         std::size_t numCollections) {
+    invariant(opCtx->lockState()->isDbLockedForMode(dbName, MODE_X));
+
     // If DatabaseHolder::dropDb() fails, we should reset the drop-pending state on Database.
     auto dropPendingGuard = makeGuard([db, opCtx] { db->setDropPending(opCtx, false); });
+
+    BackgroundOperation::assertNoBgOpInProgForDb(dbName);
+    IndexBuildsCoordinator::get(opCtx)->assertNoBgOpInProgForDb(dbName);
+
+    writeConflictRetry(opCtx, "dropDatabase_database", dbName, [&] {
+        WriteUnitOfWork wunit(opCtx);
+        opCtx->getServiceContext()->getOpObserver()->onDropDatabase(opCtx, dbName);
+        wunit.commit();
+    });
+
+    if (MONGO_unlikely(dropDatabaseHangBeforeInMemoryDrop.shouldFail())) {
+        log() << "dropDatabase - fail point dropDatabaseHangBeforeInMemoryDrop enabled.";
+        dropDatabaseHangBeforeInMemoryDrop.pauseWhileSet();
+    }
 
     auto databaseHolder = DatabaseHolder::get(opCtx);
     databaseHolder->dropDb(opCtx, db);
@@ -74,18 +95,6 @@ Status _finishDropDatabase(OperationContext* opCtx,
 
     log() << "dropDatabase " << dbName << " - dropped " << numCollections << " collection(s)";
     log() << "dropDatabase " << dbName << " - finished";
-
-    if (MONGO_FAIL_POINT(dropDatabaseHangBeforeLog)) {
-        log() << "dropDatabase - fail point dropDatabaseHangBeforeLog enabled. "
-                 "Blocking until fail point is disabled. ";
-        MONGO_FAIL_POINT_PAUSE_WHILE_SET(dropDatabaseHangBeforeLog);
-    }
-
-    WriteUnitOfWork wunit(opCtx);
-    getGlobalServiceContext()->getOpObserver()->onDropDatabase(opCtx, dbName);
-    wunit.commit();
-
-    return Status::OK();
 }
 
 }  // namespace
@@ -115,25 +124,27 @@ Status dropDatabase(OperationContext* opCtx, const std::string& dbName) {
     // collections to drop.
     repl::OpTime latestDropPendingOpTime;
 
-    using Result = boost::optional<Status>;
-    // Get an optional result--if it's there, early return; otherwise, wait for collections to drop.
-    auto result = writeConflictRetry(opCtx, "dropDatabase_collection", dbName, [&] {
-        Lock::GlobalWrite lk(opCtx);
+    {
         AutoGetDb autoDB(opCtx, dbName, MODE_X);
         Database* const db = autoDB.getDb();
         if (!db) {
-            return Result(Status(ErrorCodes::NamespaceNotFound,
-                                 str::stream() << "Could not drop database " << dbName
-                                               << " because it does not exist"));
+            return Status(ErrorCodes::NamespaceNotFound,
+                          str::stream() << "Could not drop database " << dbName
+                                        << " because it does not exist");
         }
 
         bool userInitiatedWritesAndNotPrimary =
             opCtx->writesAreReplicated() && !replCoord->canAcceptWritesForDatabase(opCtx, dbName);
 
         if (userInitiatedWritesAndNotPrimary) {
-            return Result(
-                Status(ErrorCodes::NotMaster,
-                       str::stream() << "Not primary while dropping database " << dbName));
+            return Status(ErrorCodes::NotMaster,
+                          str::stream() << "Not primary while dropping database " << dbName);
+        }
+
+        if (db->isDropPending(opCtx)) {
+            return Status(ErrorCodes::DatabaseDropPending,
+                          str::stream()
+                              << "The database is currently being dropped. Database: " << dbName);
         }
 
         log() << "dropDatabase " << dbName << " - starting";
@@ -144,7 +155,12 @@ Status dropDatabase(OperationContext* opCtx, const std::string& dbName) {
         auto dropPendingGuard = makeGuard([&db, opCtx] { db->setDropPending(opCtx, false); });
 
         std::vector<NamespaceString> collectionsToDrop;
-        for (Collection* collection : *db) {
+        for (auto collIt = db->begin(opCtx); collIt != db->end(opCtx); ++collIt) {
+            auto collection = *collIt;
+            if (!collection) {
+                break;
+            }
+
             const auto& nss = collection->ns();
             numCollections++;
 
@@ -166,39 +182,44 @@ Status dropDatabase(OperationContext* opCtx, const std::string& dbName) {
 
         for (auto nss : collectionsToDrop) {
             if (!opCtx->writesAreReplicated()) {
-                // Dropping a database on a primary replicates individual collection drops
-                // followed by a database drop oplog entry. When a secondary observes the database
-                // drop oplog entry, all of the replicated collections that were dropped must have
-                // been processed. Only non-replicated collections like `system.profile` should be
-                // left to remove. Collections with the `tmp.mr` namespace may or may not be
-                // getting replicated; be conservative and assume they are not.
+                // Dropping a database on a primary replicates individual collection drops followed
+                // by a database drop oplog entry. When a secondary observes the database drop oplog
+                // entry, all of the replicated collections that were dropped must have been
+                // processed. Only non-replicated collections like `system.profile` should be left
+                // to remove. Collections with the `tmp.mr` namespace may or may not be getting
+                // replicated; be conservative and assume they are not.
                 invariant(!nss.isReplicated() || nss.coll().startsWith("tmp.mr"));
             }
 
-            WriteUnitOfWork wunit(opCtx);
-            // A primary processing this will assign a timestamp when the operation is written to
-            // the oplog. As stated above, a secondary processing must only observe non-replicated
-            // collections, thus this should not be timestamped.
-            fassert(40476, db->dropCollectionEvenIfSystem(opCtx, nss));
-            wunit.commit();
+            BackgroundOperation::assertNoBgOpInProgForNs(nss.ns());
+            IndexBuildsCoordinator::get(opCtx)->assertNoIndexBuildInProgForCollection(
+                CollectionCatalog::get(opCtx).lookupCollectionByNamespace(nss)->uuid());
+
+            writeConflictRetry(opCtx, "dropDatabase_collection", nss.ns(), [&] {
+                WriteUnitOfWork wunit(opCtx);
+                // A primary processing this will assign a timestamp when the operation is written
+                // to the oplog. As stated above, a secondary processing must only observe
+                // non-replicated collections, thus this should not be timestamped.
+                fassert(40476, db->dropCollectionEvenIfSystem(opCtx, nss));
+                wunit.commit();
+            });
         }
+
+
+        // _finishDropDatabase creates its own scope guard to ensure drop-pending is unset.
         dropPendingGuard.dismiss();
 
         // If there are no collection drops to wait for, we complete the drop database operation.
         if (numCollectionsToDrop == 0U && latestDropPendingOpTime.isNull()) {
-            return Result(_finishDropDatabase(opCtx, dbName, db, numCollections));
+            _finishDropDatabase(opCtx, dbName, db, numCollections);
+            return Status::OK();
         }
-
-        return Result(boost::none);
-    });
-
-    if (result) {
-        return *result;
     }
 
-    // If waitForWriteConcern() returns an error or throws an exception, we should reset the
-    // drop-pending state on Database.
-    auto dropPendingGuardWhileAwaitingReplication = makeGuard([dbName, opCtx] {
+    // Create a scope guard to reset the drop-pending state on the Database to false if there are
+    // any errors while we await the replication of any collection drops and then reacquire the
+    // locks (which can throw) needed to finish the drop database.
+    auto dropPendingGuardWhileUnlocked = makeGuard([dbName, opCtx] {
         UninterruptibleLockGuard noInterrupt(opCtx->lockState());
         AutoGetDb autoDB(opCtx, dbName, MODE_IX);
         if (auto db = autoDB.getDb()) {
@@ -258,12 +279,11 @@ Status dropDatabase(OperationContext* opCtx, const std::string& dbName) {
         }
 
         if (!result.status.isOK()) {
-            return result.status.withContext(
-                str::stream() << "dropDatabase " << dbName << " failed waiting for "
-                              << numCollectionsToDrop
-                              << " collection drop(s) (most recent drop optime: "
-                              << awaitOpTime.toString()
-                              << ") to replicate.");
+            return result.status.withContext(str::stream()
+                                             << "dropDatabase " << dbName << " failed waiting for "
+                                             << numCollectionsToDrop
+                                             << " collection drop(s) (most recent drop optime: "
+                                             << awaitOpTime.toString() << ") to replicate.");
         }
 
         log() << "dropDatabase " << dbName << " - successfully dropped " << numCollectionsToDrop
@@ -271,46 +291,39 @@ Status dropDatabase(OperationContext* opCtx, const std::string& dbName) {
               << result.duration << ". dropping database";
     }
 
-    dropPendingGuardWhileAwaitingReplication.dismiss();
-
-    if (MONGO_FAIL_POINT(dropDatabaseHangAfterAllCollectionsDrop)) {
+    if (MONGO_unlikely(dropDatabaseHangAfterAllCollectionsDrop.shouldFail())) {
         log() << "dropDatabase - fail point dropDatabaseHangAfterAllCollectionsDrop enabled. "
                  "Blocking until fail point is disabled. ";
-        MONGO_FAIL_POINT_PAUSE_WHILE_SET(dropDatabaseHangAfterAllCollectionsDrop);
+        dropDatabaseHangAfterAllCollectionsDrop.pauseWhileSet();
     }
 
-    return writeConflictRetry(opCtx, "dropDatabase_database", dbName, [&] {
-        Lock::GlobalWrite lk(opCtx);
-        AutoGetDb autoDB(opCtx, dbName, MODE_X);
-        auto db = autoDB.getDb();
-        if (!db) {
-            return Status(ErrorCodes::NamespaceNotFound,
-                          str::stream() << "Could not drop database " << dbName
-                                        << " because it does not exist after dropping "
-                                        << numCollectionsToDrop
-                                        << " collection(s).");
-        }
+    AutoGetDb autoDB(opCtx, dbName, MODE_X);
+    auto db = autoDB.getDb();
+    if (!db) {
+        return Status(ErrorCodes::NamespaceNotFound,
+                      str::stream() << "Could not drop database " << dbName
+                                    << " because it does not exist after dropping "
+                                    << numCollectionsToDrop << " collection(s).");
+    }
 
-        // If we fail to complete the database drop, we should reset the drop-pending state on
-        // Database.
-        auto dropPendingGuard = makeGuard([&db, opCtx] { db->setDropPending(opCtx, false); });
+    bool userInitiatedWritesAndNotPrimary =
+        opCtx->writesAreReplicated() && !replCoord->canAcceptWritesForDatabase(opCtx, dbName);
 
-        bool userInitiatedWritesAndNotPrimary =
-            opCtx->writesAreReplicated() && !replCoord->canAcceptWritesForDatabase(opCtx, dbName);
+    if (userInitiatedWritesAndNotPrimary) {
+        return Status(ErrorCodes::PrimarySteppedDown,
+                      str::stream()
+                          << "Could not drop database " << dbName
+                          << " because we transitioned from PRIMARY to "
+                          << replCoord->getMemberState().toString() << " while waiting for "
+                          << numCollectionsToDrop << " pending collection drop(s).");
+    }
 
-        if (userInitiatedWritesAndNotPrimary) {
-            return Status(ErrorCodes::PrimarySteppedDown,
-                          str::stream() << "Could not drop database " << dbName
-                                        << " because we transitioned from PRIMARY to "
-                                        << replCoord->getMemberState().toString()
-                                        << " while waiting for "
-                                        << numCollectionsToDrop
-                                        << " pending collection drop(s).");
-        }
+    // _finishDropDatabase creates its own scope guard to ensure drop-pending is unset.
+    dropPendingGuardWhileUnlocked.dismiss();
 
-        dropPendingGuard.dismiss();
-        return _finishDropDatabase(opCtx, dbName, db, numCollections);
-    });
+    _finishDropDatabase(opCtx, dbName, db, numCollections);
+
+    return Status::OK();
 }
 
 }  // namespace mongo

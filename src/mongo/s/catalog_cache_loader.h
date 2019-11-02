@@ -29,16 +29,15 @@
 
 #pragma once
 
+#include <memory>
 #include <vector>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/base/status_with.h"
 #include "mongo/base/string_data.h"
 #include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/catalog/type_collection.h"
 #include "mongo/s/catalog/type_database.h"
 #include "mongo/s/chunk_version.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/util/concurrency/notification.h"
 #include "mongo/util/uuid.h"
 
@@ -92,7 +91,7 @@ public:
     };
 
     using GetChunksSinceCallbackFn =
-        stdx::function<void(OperationContext*, StatusWith<CollectionAndChangedChunks>)>;
+        std::function<void(OperationContext*, StatusWith<CollectionAndChangedChunks>)>;
 
     /**
      * Initializes internal state. Must be called only once when sharding state is initialized.
@@ -108,6 +107,12 @@ public:
      * Changes internal state on step up.
      */
     virtual void onStepUp() = 0;
+
+    /**
+     * Transitions into shut down and cleans up state. Once this transitions to shut down, should
+     * not be able to transition back to normal. Should be safe to be called more than once.
+     */
+    virtual void shutDown() = 0;
 
     /**
      * Notifies the loader that the persisted collection version for 'nss' has been updated.
@@ -142,7 +147,7 @@ public:
      */
     virtual void getDatabase(
         StringData dbName,
-        stdx::function<void(OperationContext*, StatusWith<DatabaseType>)> callbackFn) = 0;
+        std::function<void(OperationContext*, StatusWith<DatabaseType>)> callbackFn) = 0;
 
     /**
      * Waits for any pending changes for the specified collection to be persisted locally (not

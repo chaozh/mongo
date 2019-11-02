@@ -33,6 +33,7 @@
 
 #include "mongo/base/init.h"
 #include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/catalog/collection_mock.h"
 #include "mongo/db/catalog/index_catalog_entry.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/json.h"
@@ -44,7 +45,6 @@
 #include "mongo/db/storage/wiredtiger/wiredtiger_recovery_unit.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_session_cache.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_util.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/unittest/temp_dir.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/system_clock_source.h"
@@ -54,20 +54,44 @@ namespace {
 
 using std::string;
 
-class MyHarnessHelper final : public SortedDataInterfaceHarnessHelper {
+class WiredTigerIndexHarnessHelper final : public SortedDataInterfaceHarnessHelper {
 public:
-    MyHarnessHelper() : _dbpath("wt_test"), _conn(NULL) {
+    WiredTigerIndexHarnessHelper() : _dbpath("wt_test"), _conn(nullptr) {
         const char* config = "create,cache_size=1G,";
-        int ret = wiredtiger_open(_dbpath.path().c_str(), NULL, config, &_conn);
+        int ret = wiredtiger_open(_dbpath.path().c_str(), nullptr, config, &_conn);
         invariantWTOK(ret);
 
-        _fastClockSource = stdx::make_unique<SystemClockSource>();
+        _fastClockSource = std::make_unique<SystemClockSource>();
         _sessionCache = new WiredTigerSessionCache(_conn, _fastClockSource.get());
     }
 
-    ~MyHarnessHelper() final {
+    ~WiredTigerIndexHarnessHelper() final {
         delete _sessionCache;
-        _conn->close(_conn, NULL);
+        _conn->close(_conn, nullptr);
+    }
+
+    std::unique_ptr<SortedDataInterface> newIdIndexSortedDataInterface() final {
+        std::string ns = "test.wt";
+        OperationContextNoop opCtx(newRecoveryUnit().release());
+
+        BSONObj spec = BSON("key" << BSON("_id" << 1) << "name"
+                                  << "_id_"
+                                  << "v" << static_cast<int>(IndexDescriptor::kLatestIndexVersion)
+                                  << "unique" << true);
+
+        auto collection = std::make_unique<CollectionMock>(NamespaceString(ns));
+        IndexDescriptor desc(collection.get(), "", spec);
+        invariant(desc.isIdIndex());
+
+        KVPrefix prefix = KVPrefix::kNotPrefixed;
+        StatusWith<std::string> result = WiredTigerIndex::generateCreateString(
+            kWiredTigerEngineName, "", "", desc, prefix.isPrefixed());
+        ASSERT_OK(result.getStatus());
+
+        string uri = "table:" + ns;
+        invariantWTOK(WiredTigerIndex::Create(&opCtx, uri, result.getValue()));
+
+        return std::make_unique<WiredTigerIndexUnique>(&opCtx, uri, &desc, prefix);
     }
 
     std::unique_ptr<SortedDataInterface> newSortedDataInterface(bool unique, bool partial) final {
@@ -76,12 +100,8 @@ public:
 
         BSONObj spec = BSON("key" << BSON("a" << 1) << "name"
                                   << "testIndex"
-                                  << "v"
-                                  << static_cast<int>(IndexDescriptor::kLatestIndexVersion)
-                                  << "ns"
-                                  << ns
-                                  << "unique"
-                                  << unique);
+                                  << "v" << static_cast<int>(IndexDescriptor::kLatestIndexVersion)
+                                  << "unique" << unique);
 
         if (partial) {
             auto partialBSON =
@@ -90,7 +110,8 @@ public:
             spec = spec.addField(partialBSON.firstElement());
         }
 
-        IndexDescriptor desc(NULL, "", spec);
+        auto collection = std::make_unique<CollectionMock>(NamespaceString(ns));
+        IndexDescriptor desc(collection.get(), "", spec);
 
         KVPrefix prefix = KVPrefix::kNotPrefixed;
         StatusWith<std::string> result = WiredTigerIndex::generateCreateString(
@@ -101,12 +122,12 @@ public:
         invariantWTOK(WiredTigerIndex::Create(&opCtx, uri, result.getValue()));
 
         if (unique)
-            return stdx::make_unique<WiredTigerIndexUnique>(&opCtx, uri, &desc, prefix);
-        return stdx::make_unique<WiredTigerIndexStandard>(&opCtx, uri, &desc, prefix);
+            return std::make_unique<WiredTigerIndexUnique>(&opCtx, uri, &desc, prefix);
+        return std::make_unique<WiredTigerIndexStandard>(&opCtx, uri, &desc, prefix);
     }
 
     std::unique_ptr<RecoveryUnit> newRecoveryUnit() final {
-        return stdx::make_unique<WiredTigerRecoveryUnit>(_sessionCache, &_oplogManager);
+        return std::make_unique<WiredTigerRecoveryUnit>(_sessionCache, &_oplogManager);
     }
 
 private:
@@ -117,12 +138,12 @@ private:
     WiredTigerOplogManager _oplogManager;
 };
 
-std::unique_ptr<HarnessHelper> makeHarnessHelper() {
-    return stdx::make_unique<MyHarnessHelper>();
+std::unique_ptr<SortedDataInterfaceHarnessHelper> makeWTIndexHarnessHelper() {
+    return std::make_unique<WiredTigerIndexHarnessHelper>();
 }
 
-MONGO_INITIALIZER(RegisterHarnessFactory)(InitializerContext* const) {
-    mongo::registerHarnessHelperFactory(makeHarnessHelper);
+MONGO_INITIALIZER(RegisterSortedDataInterfaceHarnessFactory)(InitializerContext* const) {
+    mongo::registerSortedDataInterfaceHarnessHelperFactory(makeWTIndexHarnessHelper);
     return Status::OK();
 }
 }  // namespace

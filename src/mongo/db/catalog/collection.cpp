@@ -37,22 +37,18 @@
 
 namespace mongo {
 
-std::string CompactOptions::toString() const {
-    return str::stream() << " validateDocuments: " << validateDocuments;
-}
-
 //
 // CappedInsertNotifier
 //
 
 void CappedInsertNotifier::notifyAll() {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     ++_version;
     _notifier.notify_all();
 }
 
 void CappedInsertNotifier::waitUntil(uint64_t prevVersion, Date_t deadline) const {
-    stdx::unique_lock<stdx::mutex> lk(_mutex);
+    stdx::unique_lock<Latch> lk(_mutex);
     while (!_dead && prevVersion == _version) {
         if (stdx::cv_status::timeout == _notifier.wait_until(lk, deadline.toSystemTimePoint())) {
             return;
@@ -61,17 +57,35 @@ void CappedInsertNotifier::waitUntil(uint64_t prevVersion, Date_t deadline) cons
 }
 
 void CappedInsertNotifier::kill() {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     _dead = true;
     _notifier.notify_all();
 }
 
 bool CappedInsertNotifier::isDead() {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     return _dead;
 }
 
 // ----
+
+namespace {
+const auto getFactory = ServiceContext::declareDecoration<std::unique_ptr<Collection::Factory>>();
+}
+
+Collection::Factory* Collection::Factory::get(ServiceContext* service) {
+    return getFactory(service).get();
+}
+
+Collection::Factory* Collection::Factory::get(OperationContext* opCtx) {
+    return getFactory(opCtx->getServiceContext()).get();
+};
+
+void Collection::Factory::set(ServiceContext* service,
+                              std::unique_ptr<Collection::Factory> newFactory) {
+    auto& factory = getFactory(service);
+    factory = std::move(newFactory);
+}
 
 // static
 Status Collection::parseValidationLevel(StringData newLevel) {

@@ -45,7 +45,7 @@ namespace mongo {
 namespace {
 
 bool isEquals(ConstDataRange left, const std::vector<uint8_t>& right) {
-    auto rightCDR = makeCDR(right);
+    ConstDataRange rightCDR(right);
     return std::equal(left.data(),
                       left.data() + left.length(),
                       rightCDR.data(),
@@ -100,8 +100,8 @@ void assertOpMsgEquals(const OpMsgRequest& left, const OpMsgRequest& right) {
 }
 
 /**
-* Validate two OpMsgRequests are the same including their DocumentSequences.
-*/
+ * Validate two OpMsgRequests are the same including their DocumentSequences.
+ */
 void assertOpMsgEqualsExact(const OpMsgRequest& left, const OpMsgRequest& right) {
 
     ASSERT_BSONOBJ_EQ(left.body, right.body);
@@ -340,15 +340,15 @@ TEST(IDLOneTypeTests, TestNegativeRequiredUndefinedTypes) {
 
 
 // Mixed: test a type that accepts multiple bson types
-TEST(IDLOneTypeTests, TestSafeInt32) {
-    TestParse<One_safeint32, NumberInt, StringData, String>("test_value");
-    TestParse<One_safeint32, NumberInt, std::int32_t, NumberInt>(123);
-    TestParse<One_safeint32, NumberLong, std::int64_t, NumberLong>(456);
-    TestParse<One_safeint32, NumberDouble, double, NumberDouble>(3.14159);
-    TestParse<One_safeint32, NumberInt, bool, Bool>(true);
-    TestParse<One_safeint32, NumberInt, OID, jstOID>(OID::max());
-    TestParse<One_safeint32, NumberInt, Date_t, Date>(Date_t::now());
-    TestParse<One_safeint32, NumberInt, Timestamp, bsonTimestamp>(Timestamp::max());
+TEST(IDLOneTypeTests, TestSafeInt64) {
+    TestParse<One_safeint64, NumberInt, StringData, String>("test_value");
+    TestParse<One_safeint64, NumberInt, std::int32_t, NumberInt>(123);
+    TestParse<One_safeint64, NumberLong, std::int64_t, NumberLong>(456);
+    TestParse<One_safeint64, NumberDouble, double, NumberDouble>(3.14159);
+    TestParse<One_safeint64, NumberInt, bool, Bool>(true);
+    TestParse<One_safeint64, NumberInt, OID, jstOID>(OID::max());
+    TestParse<One_safeint64, NumberInt, Date_t, Date>(Date_t::now());
+    TestParse<One_safeint64, NumberInt, Timestamp, bsonTimestamp>(Timestamp::max());
 }
 
 // Mixed: test a type that accepts NamespaceString
@@ -766,11 +766,8 @@ TEST(IDLFieldTests, TestOptionalFields) {
 template <typename TestT>
 void TestWeakType(TestT test_value) {
     IDLParserErrorContext ctxt("root");
-    auto testDoc =
-        BSON("field1" << test_value << "field2" << test_value << "field3" << test_value << "field4"
-                      << test_value
-                      << "field5"
-                      << test_value);
+    auto testDoc = BSON("field1" << test_value << "field2" << test_value << "field3" << test_value
+                                 << "field4" << test_value << "field5" << test_value);
     auto testStruct = Optional_field::parse(ctxt, testDoc);
 
     ASSERT_FALSE(testStruct.getField1().is_initialized());
@@ -860,11 +857,8 @@ TEST(IDLArrayTests, TestSimpleArrays) {
     auto testDoc = BSON("field1" << BSON_ARRAY("Foo"
                                                << "Bar"
                                                << "???")
-                                 << "field2"
-                                 << BSON_ARRAY(1 << 2 << 3)
-                                 << "field3"
-                                 << BSON_ARRAY(1.2 << 3.4 << 5.6)
-                                 << "field4"
+                                 << "field2" << BSON_ARRAY(1 << 2 << 3) << "field3"
+                                 << BSON_ARRAY(1.2 << 3.4 << 5.6) << "field4"
                                  << BSON_ARRAY(BSONBinData(array1, 3, BinDataGeneral)
                                                << BSONBinData(array2, 3, BinDataGeneral))
                                  << "field5"
@@ -927,12 +921,10 @@ TEST(IDLArrayTests, TestSimpleOptionalArrays) {
     auto testDoc = BSON("field1" << BSON_ARRAY("Foo"
                                                << "Bar"
                                                << "???")
-                                 << "field2"
-                                 << BSON_ARRAY(1 << 2 << 3)
-                                 << "field3"
+                                 << "field2" << BSON_ARRAY(1 << 2 << 3) << "field3"
                                  << BSON_ARRAY(1.2 << 3.4 << 5.6)
 
-                            );
+    );
     auto testStruct = Optional_array_fields::parse(ctxt, testDoc);
 
     assert_same_types<decltype(testStruct.getField1()),
@@ -1062,38 +1054,30 @@ TEST(IDLArrayTests, TestArraysOfComplexTypes) {
     IDLParserErrorContext ctxt("root");
 
     // Positive: Test document
-    auto testDoc = BSON("field1" << BSON_ARRAY(1 << 2 << 3) << "field2" << BSON_ARRAY("a.b"
-                                                                                      << "c.d")
-                                 << "field3"
-                                 << BSON_ARRAY(1 << "2")
-                                 << "field4"
-                                 << BSON_ARRAY(BSONObj() << BSONObj())
-                                 << "field5"
-                                 << BSON_ARRAY(BSONObj() << BSONObj() << BSONObj())
-                                 << "field6"
+    auto testDoc = BSON("field1" << BSON_ARRAY(1 << 2 << 3) << "field2"
+                                 << BSON_ARRAY("a.b"
+                                               << "c.d")
+                                 << "field3" << BSON_ARRAY(1 << "2") << "field4"
+                                 << BSON_ARRAY(BSONObj() << BSONObj()) << "field5"
+                                 << BSON_ARRAY(BSONObj() << BSONObj() << BSONObj()) << "field6"
                                  << BSON_ARRAY(BSON("value"
                                                     << "hello")
                                                << BSON("value"
                                                        << "world"))
-                                 << "field1o"
-                                 << BSON_ARRAY(1 << 2 << 3)
-                                 << "field2o"
+                                 << "field1o" << BSON_ARRAY(1 << 2 << 3) << "field2o"
                                  << BSON_ARRAY("a.b"
                                                << "c.d")
-                                 << "field3o"
-                                 << BSON_ARRAY(1 << "2")
-                                 << "field4o"
-                                 << BSON_ARRAY(BSONObj() << BSONObj())
-                                 << "field6o"
+                                 << "field3o" << BSON_ARRAY(1 << "2") << "field4o"
+                                 << BSON_ARRAY(BSONObj() << BSONObj()) << "field6o"
                                  << BSON_ARRAY(BSON("value"
                                                     << "goodbye")
                                                << BSON("value"
                                                        << "world"))
 
-                            );
+    );
     auto testStruct = Complex_array_fields::parse(ctxt, testDoc);
 
-    assert_same_types<decltype(testStruct.getField1()), const std::vector<std::int32_t>&>();
+    assert_same_types<decltype(testStruct.getField1()), const std::vector<std::int64_t>&>();
     assert_same_types<decltype(testStruct.getField2()),
                       const std::vector<mongo::NamespaceString>&>();
     assert_same_types<decltype(testStruct.getField3()), const std::vector<mongo::AnyBasicType>&>();
@@ -1104,7 +1088,7 @@ TEST(IDLArrayTests, TestArraysOfComplexTypes) {
                       const std::vector<mongo::idl::import::One_string>&>();
 
     assert_same_types<decltype(testStruct.getField1o()),
-                      const boost::optional<std::vector<std::int32_t>>&>();
+                      const boost::optional<std::vector<std::int64_t>>&>();
     assert_same_types<decltype(testStruct.getField2o()),
                       const boost::optional<std::vector<mongo::NamespaceString>>&>();
     assert_same_types<decltype(testStruct.getField3o()),
@@ -1116,7 +1100,7 @@ TEST(IDLArrayTests, TestArraysOfComplexTypes) {
     assert_same_types<decltype(testStruct.getField6o()),
                       const boost::optional<std::vector<mongo::idl::import::One_string>>&>();
 
-    std::vector<std::int32_t> field1{1, 2, 3};
+    std::vector<std::int64_t> field1{1, 2, 3};
     ASSERT_TRUE(field1 == testStruct.getField1());
     std::vector<NamespaceString> field2{{"a", "b"}, {"c", "d"}};
     ASSERT_TRUE(field2 == testStruct.getField2());
@@ -1157,7 +1141,7 @@ void TestBinDataVector() {
     {
         BSONObjBuilder builder;
         ParserT one_new;
-        one_new.setValue(makeCDR(expected));
+        one_new.setValue(expected);
         testStruct.serialize(&builder);
 
         auto serializedDoc = builder.obj();
@@ -1406,8 +1390,7 @@ TEST(IDLChainedType, TestChainedType) {
 
     auto testDoc = BSON("field1"
                         << "abc"
-                        << "field2"
-                        << 5);
+                        << "field2" << 5);
 
     auto testStruct = Chained_struct_only::parse(ctxt, testDoc);
 
@@ -1450,10 +1433,7 @@ TEST(IDLChainedType, TestExtraFields) {
 
     auto testDoc = BSON("field1"
                         << "abc"
-                        << "field2"
-                        << 5
-                        << "field3"
-                        << 123456);
+                        << "field2" << 5 << "field3" << 123456);
 
     auto testStruct = Chained_struct_only::parse(ctxt, testDoc);
     ASSERT_EQUALS(testStruct.getChainedType().getField1(), "abc");
@@ -1467,10 +1447,7 @@ TEST(IDLChainedType, TestDuplicateFields) {
 
     auto testDoc = BSON("field1"
                         << "abc"
-                        << "field2"
-                        << 5
-                        << "field2"
-                        << 123456);
+                        << "field2" << 5 << "field2" << 123456);
 
     ASSERT_THROWS(Chained_struct_only::parse(ctxt, testDoc), AssertionException);
 }
@@ -1480,8 +1457,9 @@ TEST(IDLChainedType, TestDuplicateFields) {
 TEST(IDLChainedType, TestChainedStruct) {
     IDLParserErrorContext ctxt("root");
 
-    auto testDoc = BSON("anyField" << 123.456 << "objectField" << BSON("random"
-                                                                       << "pair")
+    auto testDoc = BSON("anyField" << 123.456 << "objectField"
+                                   << BSON("random"
+                                           << "pair")
                                    << "field3"
                                    << "abc");
 
@@ -1511,13 +1489,10 @@ TEST(IDLChainedType, TestChainedStructWithExtraFields) {
     {
         auto testDoc = BSON("field3"
                             << "abc"
-                            << "anyField"
-                            << 123.456
-                            << "objectField"
+                            << "anyField" << 123.456 << "objectField"
                             << BSON("random"
                                     << "pair")
-                            << "extraField"
-                            << 787);
+                            << "extraField" << 787);
         ASSERT_THROWS(Chained_struct_mixed::parse(ctxt, testDoc), AssertionException);
     }
 
@@ -1526,13 +1501,10 @@ TEST(IDLChainedType, TestChainedStructWithExtraFields) {
     {
         auto testDoc = BSON("field3"
                             << "abc"
-                            << "anyField"
-                            << 123.456
-                            << "objectField"
+                            << "anyField" << 123.456 << "objectField"
                             << BSON("random"
                                     << "pair")
-                            << "anyField"
-                            << 787);
+                            << "anyField" << 787);
         ASSERT_THROWS(Chained_struct_mixed::parse(ctxt, testDoc), AssertionException);
     }
 
@@ -1542,9 +1514,7 @@ TEST(IDLChainedType, TestChainedStructWithExtraFields) {
                                                   << "thing")
                                           << "field3"
                                           << "abc"
-                                          << "anyField"
-                                          << 123.456
-                                          << "objectField"
+                                          << "anyField" << 123.456 << "objectField"
                                           << BSON("random"
                                                   << "pair"));
         ASSERT_THROWS(Chained_struct_mixed::parse(ctxt, testDoc), AssertionException);
@@ -1554,9 +1524,7 @@ TEST(IDLChainedType, TestChainedStructWithExtraFields) {
     {
         auto testDoc = BSON("field3"
                             << "abc"
-                            << "anyField"
-                            << 123.456
-                            << "objectField"
+                            << "anyField" << 123.456 << "objectField"
                             << BSON("random"
                                     << "pair")
                             << "field3"
@@ -1572,12 +1540,9 @@ TEST(IDLChainedType, TestChainedMixedStruct) {
 
     auto testDoc = BSON("field1"
                         << "abc"
-                        << "field2"
-                        << 5
-                        << "stringField"
+                        << "field2" << 5 << "stringField"
                         << "def"
-                        << "field3"
-                        << 456);
+                        << "field3" << 456);
 
     auto testStruct = Chained_struct_type_mixed::parse(ctxt, testDoc);
 
@@ -1713,14 +1678,12 @@ OpMsgRequest makeOMR(BSONObj obj) {
     return request;
 }
 
-// Positive: demonstrate a command wit concatenate with db
+// Positive: demonstrate a command with concatenate with db
 TEST(IDLCommand, TestConcatentateWithDb) {
     IDLParserErrorContext ctxt("root");
 
     auto testDoc = BSON(BasicConcatenateWithDbCommand::kCommandName << "coll1"
-                                                                    << "field1"
-                                                                    << 3
-                                                                    << "field2"
+                                                                    << "field1" << 3 << "field2"
                                                                     << "five"
                                                                     << "$db"
                                                                     << "db");
@@ -1742,11 +1705,10 @@ TEST(IDLCommand, TestConcatentateWithDb) {
 
     // Positive: Test we can serialize from nothing the same document except for $db
     {
-        auto testDocWithoutDb = BSON(BasicConcatenateWithDbCommand::kCommandName << "coll1"
-                                                                                 << "field1"
-                                                                                 << 3
-                                                                                 << "field2"
-                                                                                 << "five");
+        auto testDocWithoutDb =
+            BSON(BasicConcatenateWithDbCommand::kCommandName << "coll1"
+                                                             << "field1" << 3 << "field2"
+                                                             << "five");
 
         BSONObjBuilder builder;
         BasicConcatenateWithDbCommand one_new(NamespaceString("db.coll1"));
@@ -1791,11 +1753,10 @@ TEST(IDLCommand, TestConcatentateWithDbNegative) {
 
     // Negative - duplicate namespace field
     {
-        auto testDoc = BSON("BasicConcatenateWithDbCommand" << 1 << "field1" << 3
-                                                            << "BasicConcatenateWithDbCommand"
-                                                            << 1
-                                                            << "field2"
-                                                            << "five");
+        auto testDoc =
+            BSON("BasicConcatenateWithDbCommand" << 1 << "field1" << 3
+                                                 << "BasicConcatenateWithDbCommand" << 1 << "field2"
+                                                 << "five");
         ASSERT_THROWS(BasicConcatenateWithDbCommand::parse(ctxt, makeOMR(testDoc)),
                       AssertionException);
     }
@@ -1833,6 +1794,167 @@ TEST(IDLCommand, TestConcatentateWithDbNegative) {
                       AssertionException);
     }
 }
+
+// Positive: demonstrate a command with concatenate with db or uuid - test NSS
+TEST(IDLCommand, TestConcatentateWithDbOrUUID_TestNSS) {
+    IDLParserErrorContext ctxt("root");
+
+    auto testDoc =
+        BSON(BasicConcatenateWithDbOrUUIDCommand::kCommandName << "coll1"
+                                                               << "field1" << 3 << "field2"
+                                                               << "five"
+                                                               << "$db"
+                                                               << "db");
+
+    auto testStruct = BasicConcatenateWithDbOrUUIDCommand::parse(ctxt, makeOMR(testDoc));
+    ASSERT_EQUALS(testStruct.getField1(), 3);
+    ASSERT_EQUALS(testStruct.getField2(), "five");
+    ASSERT_EQUALS(testStruct.getNamespaceOrUUID().nss().get(), NamespaceString("db.coll1"));
+
+    assert_same_types<decltype(testStruct.getNamespaceOrUUID()), const NamespaceStringOrUUID&>();
+
+    // Positive: Test we can roundtrip from the just parsed document
+    {
+        BSONObjBuilder builder;
+        OpMsgRequest reply = testStruct.serialize(BSONObj());
+
+        ASSERT_BSONOBJ_EQ(testDoc, reply.body);
+    }
+
+    // Positive: Test we can serialize from nothing the same document except for $db
+    {
+        auto testDocWithoutDb =
+            BSON(BasicConcatenateWithDbOrUUIDCommand::kCommandName << "coll1"
+                                                                   << "field1" << 3 << "field2"
+                                                                   << "five");
+
+        BSONObjBuilder builder;
+        BasicConcatenateWithDbOrUUIDCommand one_new(NamespaceString("db.coll1"));
+        one_new.setField1(3);
+        one_new.setField2("five");
+        one_new.serialize(BSONObj(), &builder);
+
+        auto serializedDoc = builder.obj();
+        ASSERT_BSONOBJ_EQ(testDocWithoutDb, serializedDoc);
+    }
+
+    // Positive: Test we can serialize from nothing the same document
+    {
+        BSONObjBuilder builder;
+        BasicConcatenateWithDbOrUUIDCommand one_new(NamespaceString("db.coll1"));
+        one_new.setField1(3);
+        one_new.setField2("five");
+        OpMsgRequest reply = one_new.serialize(BSONObj());
+
+        ASSERT_BSONOBJ_EQ(testDoc, reply.body);
+    }
+}
+
+
+// Positive: demonstrate a command with concatenate with db or uuid - test UUID
+TEST(IDLCommand, TestConcatentateWithDbOrUUID_TestUUID) {
+    IDLParserErrorContext ctxt("root");
+
+    UUID uuid = UUID::gen();
+
+    auto testDoc =
+        BSON(BasicConcatenateWithDbOrUUIDCommand::kCommandName << uuid << "field1" << 3 << "field2"
+                                                               << "five"
+                                                               << "$db"
+                                                               << "db");
+
+    auto testStruct = BasicConcatenateWithDbOrUUIDCommand::parse(ctxt, makeOMR(testDoc));
+    ASSERT_EQUALS(testStruct.getField1(), 3);
+    ASSERT_EQUALS(testStruct.getField2(), "five");
+    ASSERT_EQUALS(testStruct.getNamespaceOrUUID().uuid().get(), uuid);
+
+    assert_same_types<decltype(testStruct.getNamespaceOrUUID()), const NamespaceStringOrUUID&>();
+
+    // Positive: Test we can roundtrip from the just parsed document
+    {
+        BSONObjBuilder builder;
+        OpMsgRequest reply = testStruct.serialize(BSONObj());
+
+        ASSERT_BSONOBJ_EQ(testDoc, reply.body);
+    }
+
+    // Positive: Test we can serialize from nothing the same document except for $db
+    {
+        auto testDocWithoutDb = BSON(BasicConcatenateWithDbOrUUIDCommand::kCommandName
+                                     << uuid << "field1" << 3 << "field2"
+                                     << "five");
+
+        BSONObjBuilder builder;
+        BasicConcatenateWithDbOrUUIDCommand one_new(NamespaceStringOrUUID("db", uuid));
+        one_new.setField1(3);
+        one_new.setField2("five");
+        one_new.serialize(BSONObj(), &builder);
+
+        auto serializedDoc = builder.obj();
+        ASSERT_BSONOBJ_EQ(testDocWithoutDb, serializedDoc);
+    }
+
+    // Positive: Test we can serialize from nothing the same document
+    {
+        BSONObjBuilder builder;
+        BasicConcatenateWithDbOrUUIDCommand one_new(NamespaceStringOrUUID("db", uuid));
+        one_new.setField1(3);
+        one_new.setField2("five");
+        OpMsgRequest reply = one_new.serialize(BSONObj());
+
+        ASSERT_BSONOBJ_EQ(testDoc, reply.body);
+    }
+}
+
+
+TEST(IDLCommand, TestConcatentateWithDbOrUUIDNegative) {
+    IDLParserErrorContext ctxt("root");
+
+    // Negative - duplicate namespace field
+    {
+        auto testDoc =
+            BSON("BasicConcatenateWithDbOrUUIDCommand"
+                 << 1 << "field1" << 3 << "BasicConcatenateWithDbOrUUIDCommand" << 1 << "field2"
+                 << "five");
+        ASSERT_THROWS(BasicConcatenateWithDbOrUUIDCommand::parse(ctxt, makeOMR(testDoc)),
+                      AssertionException);
+    }
+
+    // Negative -  namespace field wrong order
+    {
+        auto testDoc = BSON("field1" << 3 << "BasicConcatenateWithDbOrUUIDCommand" << 1 << "field2"
+                                     << "five");
+        ASSERT_THROWS(BasicConcatenateWithDbOrUUIDCommand::parse(ctxt, makeOMR(testDoc)),
+                      AssertionException);
+    }
+
+    // Negative -  namespace missing
+    {
+        auto testDoc = BSON("field1" << 3 << "field2"
+                                     << "five");
+        ASSERT_THROWS(BasicConcatenateWithDbOrUUIDCommand::parse(ctxt, makeOMR(testDoc)),
+                      AssertionException);
+    }
+
+    // Negative - wrong type
+    {
+        auto testDoc = BSON("BasicConcatenateWithDbOrUUIDCommand" << 1 << "field1" << 3 << "field2"
+                                                                  << "five");
+        ASSERT_THROWS(BasicConcatenateWithDbOrUUIDCommand::parse(ctxt, makeOMR(testDoc)),
+                      AssertionException);
+    }
+
+    // Negative - bad ns with embedded null
+    {
+        StringData sd1("db\0foo", 6);
+        auto testDoc =
+            BSON("BasicConcatenateWithDbOrUUIDCommand" << sd1 << "field1" << 3 << "field2"
+                                                       << "five");
+        ASSERT_THROWS(BasicConcatenateWithDbOrUUIDCommand::parse(ctxt, makeOMR(testDoc)),
+                      AssertionException);
+    }
+}
+
 
 // Positive: demonstrate a command with concatenate with db
 TEST(IDLCommand, TestIgnore) {
@@ -1875,9 +1997,9 @@ TEST(IDLCommand, TestIgnoredNegative) {
 
     // Negative - duplicate namespace field
     {
-        auto testDoc = BSON(
-            "BasicIgnoredCommand" << 1 << "field1" << 3 << "BasicIgnoredCommand" << 1 << "field2"
-                                  << "five");
+        auto testDoc = BSON("BasicIgnoredCommand" << 1 << "field1" << 3 << "BasicIgnoredCommand"
+                                                  << 1 << "field2"
+                                                  << "five");
         ASSERT_THROWS(BasicIgnoredCommand::parse(ctxt, makeOMR(testDoc)), AssertionException);
     }
 
@@ -1902,9 +2024,7 @@ TEST(IDLDocSequence, TestBasic) {
 
     auto testTempDoc = BSON("DocSequenceCommand"
                             << "coll1"
-                            << "field1"
-                            << 3
-                            << "field2"
+                            << "field1" << 3 << "field2"
                             << "five"
                             << "$db"
                             << "db"
@@ -1913,8 +2033,7 @@ TEST(IDLDocSequence, TestBasic) {
                                                << "hello")
                                           << BSON("value"
                                                   << "world"))
-                            << "objects"
-                            << BSON_ARRAY(BSON("foo" << 1)));
+                            << "objects" << BSON_ARRAY(BSON("foo" << 1)));
 
     OpMsgRequest request;
     request.body = testTempDoc;
@@ -1980,15 +2099,12 @@ TEST(IDLDocSequence, TestMissingDB) {
 
     auto testTempDoc = BSON("DocSequenceCommand"
                             << "coll1"
-                            << "field1"
-                            << 3
-                            << "field2"
+                            << "field1" << 3 << "field2"
                             << "five"
                             << "structs"
                             << BSON_ARRAY(BSON("value"
                                                << "hello"))
-                            << "objects"
-                            << BSON_ARRAY(BSON("foo" << 1)));
+                            << "objects" << BSON_ARRAY(BSON("foo" << 1)));
 
     OpMsgRequest request;
     request.body = testTempDoc;
@@ -2002,9 +2118,7 @@ void TestDocSequence(StringData name) {
     IDLParserErrorContext ctxt("root");
 
     auto testTempDoc = BSON(name << "coll1"
-                                 << "field1"
-                                 << 3
-                                 << "field2"
+                                 << "field1" << 3 << "field2"
                                  << "five");
 
     OpMsgRequest request = OpMsgRequest::fromDBAndBody("db", testTempDoc);
@@ -2043,9 +2157,7 @@ void TestBadDocSequences(StringData name, bool extraFieldAllowed) {
     IDLParserErrorContext ctxt("root");
 
     auto testTempDoc = BSON(name << "coll1"
-                                 << "field1"
-                                 << 3
-                                 << "field2"
+                                 << "field1" << 3 << "field2"
                                  << "five");
 
     // Negative: Duplicate fields in doc sequence
@@ -2114,17 +2226,14 @@ void TestDuplicateDocSequences(StringData name) {
     // Negative: Duplicate fields in doc sequence and body
     {
         auto testTempDoc = BSON(name << "coll1"
-                                     << "field1"
-                                     << 3
-                                     << "field2"
+                                     << "field1" << 3 << "field2"
                                      << "five"
                                      << "structs"
                                      << BSON_ARRAY(BSON("value"
                                                         << "hello")
                                                    << BSON("value"
                                                            << "world"))
-                                     << "objects"
-                                     << BSON_ARRAY(BSON("foo" << 1)));
+                                     << "objects" << BSON_ARRAY(BSON("foo" << 1)));
 
         OpMsgRequest request = OpMsgRequest::fromDBAndBody("db", testTempDoc);
         request.sequences.push_back({"structs",
@@ -2139,17 +2248,14 @@ void TestDuplicateDocSequences(StringData name) {
     // Negative: Duplicate fields in doc sequence and body
     {
         auto testTempDoc = BSON(name << "coll1"
-                                     << "field1"
-                                     << 3
-                                     << "field2"
+                                     << "field1" << 3 << "field2"
                                      << "five"
                                      << "structs"
                                      << BSON_ARRAY(BSON("value"
                                                         << "hello")
                                                    << BSON("value"
                                                            << "world"))
-                                     << "objects"
-                                     << BSON_ARRAY(BSON("foo" << 1)));
+                                     << "objects" << BSON_ARRAY(BSON("foo" << 1)));
 
         OpMsgRequest request = OpMsgRequest::fromDBAndBody("db", testTempDoc);
         request.sequences.push_back({"objects", {BSON("foo" << 1)}});
@@ -2172,17 +2278,14 @@ TEST(IDLDocSequence, TestEmptySequence) {
     {
         auto testTempDoc = BSON("DocSequenceCommand"
                                 << "coll1"
-                                << "field1"
-                                << 3
-                                << "field2"
+                                << "field1" << 3 << "field2"
                                 << "five"
                                 << "structs"
                                 << BSON_ARRAY(BSON("value"
                                                    << "hello")
                                               << BSON("value"
                                                       << "world"))
-                                << "objects"
-                                << BSON_ARRAY(BSON("foo" << 1)));
+                                << "objects" << BSON_ARRAY(BSON("foo" << 1)));
 
         OpMsgRequest request = OpMsgRequest::fromDBAndBody("db", testTempDoc);
         request.sequences.push_back({"structs", {}});
@@ -2194,12 +2297,9 @@ TEST(IDLDocSequence, TestEmptySequence) {
     {
         auto testTempDoc = BSON("DocSequenceCommand"
                                 << "coll1"
-                                << "field1"
-                                << 3
-                                << "field2"
+                                << "field1" << 3 << "field2"
                                 << "five"
-                                << "objects"
-                                << BSON_ARRAY(BSON("foo" << 1)));
+                                << "objects" << BSON_ARRAY(BSON("foo" << 1)));
 
         OpMsgRequest request = OpMsgRequest::fromDBAndBody("db", testTempDoc);
         request.sequences.push_back({"structs", {}});
@@ -2231,19 +2331,14 @@ TEST(IDLDocSequence, TestWellKnownFieldsAreIgnored) {
     for (auto knownField : knownFields) {
         auto testTempDoc = BSON("DocSequenceCommand"
                                 << "coll1"
-                                << "field1"
-                                << 3
-                                << "field2"
-                                << "five"
-                                << knownField
-                                << "extra"
+                                << "field1" << 3 << "field2"
+                                << "five" << knownField << "extra"
                                 << "structs"
                                 << BSON_ARRAY(BSON("value"
                                                    << "hello")
                                               << BSON("value"
                                                       << "world"))
-                                << "objects"
-                                << BSON_ARRAY(BSON("foo" << 1)));
+                                << "objects" << BSON_ARRAY(BSON("foo" << 1)));
 
 
         OpMsgRequest request = OpMsgRequest::fromDBAndBody("db", testTempDoc);
@@ -2283,21 +2378,16 @@ TEST(IDLDocSequence, TestWellKnownFieldsPassthrough) {
     for (auto knownField : knownFields) {
         auto testTempDoc = BSON("DocSequenceCommand"
                                 << "coll1"
-                                << "field1"
-                                << 3
-                                << "field2"
+                                << "field1" << 3 << "field2"
                                 << "five"
                                 << "$db"
-                                << "db"
-                                << knownField
-                                << "extra"
+                                << "db" << knownField << "extra"
                                 << "structs"
                                 << BSON_ARRAY(BSON("value"
                                                    << "hello")
                                               << BSON("value"
                                                       << "world"))
-                                << "objects"
-                                << BSON_ARRAY(BSON("foo" << 1)));
+                                << "objects" << BSON_ARRAY(BSON("foo" << 1)));
 
         OpMsgRequest request;
         request.body = testTempDoc;
@@ -2317,9 +2407,7 @@ TEST(IDLDocSequence, TestNonStrict) {
     {
         auto testTempDoc = BSON("DocSequenceCommandNonStrict"
                                 << "coll1"
-                                << "field1"
-                                << 3
-                                << "field2"
+                                << "field1" << 3 << "field2"
                                 << "five");
 
         OpMsgRequest request = OpMsgRequest::fromDBAndBody("db", testTempDoc);
@@ -2339,12 +2427,9 @@ TEST(IDLDocSequence, TestNonStrict) {
     {
         auto testTempDoc = BSON("DocSequenceCommandNonStrict"
                                 << "coll1"
-                                << "field1"
-                                << 3
-                                << "field2"
+                                << "field1" << 3 << "field2"
                                 << "five"
-                                << "extra"
-                                << 1);
+                                << "extra" << 1);
 
         OpMsgRequest request = OpMsgRequest::fromDBAndBody("db", testTempDoc);
         request.sequences.push_back({"structs",
@@ -2366,38 +2451,42 @@ TEST(IDLCommand, TestKnownFieldDuplicate) {
 
     auto testPassthrough = BSON("$db"
                                 << "foo"
-                                << "maxTimeMS"
-                                << 6
-                                << "$client"
+                                << "maxTimeMS" << 6 << "$client"
                                 << "foo");
 
     auto testDoc = BSON("KnownFieldCommand"
                         << "coll1"
                         << "$db"
                         << "db"
-                        << "field1"
-                        << 28
-                        << "maxTimeMS"
-                        << 42);
+                        << "field1" << 28 << "maxTimeMS" << 42);
 
     auto testStruct = KnownFieldCommand::parse(ctxt, makeOMR(testDoc));
     ASSERT_EQUALS(28, testStruct.getField1());
     ASSERT_EQUALS(42, testStruct.getMaxTimeMS());
 
-    auto expectedDoc = BSON("KnownFieldCommand"
-                            << "coll1"
+    // OpMsg request serializes original '$db' out because it is part of the OP_MSG request
+    auto expectedOpMsgDoc = BSON("KnownFieldCommand"
+                                 << "coll1"
 
-                            << "field1"
-                            << 28
-                            << "maxTimeMS"
-                            << 42
-                            << "$db"
-                            << "db"
+                                 << "field1" << 28 << "maxTimeMS" << 42 << "$db"
+                                 << "db"
 
-                            << "$client"
-                            << "foo");
+                                 << "$client"
+                                 << "foo");
 
-    ASSERT_BSONOBJ_EQ(expectedDoc, testStruct.serialize(testPassthrough).body);
+    ASSERT_BSONOBJ_EQ(expectedOpMsgDoc, testStruct.serialize(testPassthrough).body);
+
+    // BSON serialize does not round-trip '$db' because it can passed in passthrough data
+    auto expectedBSONDoc = BSON("KnownFieldCommand"
+                                << "coll1"
+
+                                << "field1" << 28 << "maxTimeMS" << 42 << "$db"
+                                << "foo"
+
+                                << "$client"
+                                << "foo");
+
+    ASSERT_BSONOBJ_EQ(expectedBSONDoc, testStruct.toBSON(testPassthrough));
 }
 
 
@@ -2482,14 +2571,9 @@ TEST(IDLValidatedField, Int_basic_ranges) {
                             std::int32_t byte_range,
                             std::int32_t int_range) {
         IDLParserErrorContext ctxt("root");
-        auto doc =
-            BSON("positive_int" << pos << "negative_int" << neg << "non_negative_int" << nonneg
-                                << "non_positive_int"
-                                << nonpos
-                                << "byte_range_int"
-                                << byte_range
-                                << "range_int"
-                                << int_range);
+        auto doc = BSON("positive_int" << pos << "negative_int" << neg << "non_negative_int"
+                                       << nonneg << "non_positive_int" << nonpos << "byte_range_int"
+                                       << byte_range << "range_int" << int_range);
         auto obj = Int_basic_ranges::parse(ctxt, doc);
         ASSERT_EQUALS(obj.getPositive_int(), pos);
         ASSERT_EQUALS(obj.getNegative_int(), neg);
@@ -2507,14 +2591,9 @@ TEST(IDLValidatedField, Int_basic_ranges) {
                             std::int32_t byte_range,
                             std::int32_t int_range) {
         IDLParserErrorContext ctxt("root");
-        auto doc =
-            BSON("positive_int" << pos << "negative_int" << neg << "non_negative_int" << nonneg
-                                << "non_positive_int"
-                                << nonpos
-                                << "byte_range_int"
-                                << byte_range
-                                << "range_int"
-                                << int_range);
+        auto doc = BSON("positive_int" << pos << "negative_int" << neg << "non_negative_int"
+                                       << nonneg << "non_positive_int" << nonpos << "byte_range_int"
+                                       << byte_range << "range_int" << int_range);
         ASSERT_THROWS(Int_basic_ranges::parse(ctxt, doc), AssertionException);
     };
 
@@ -2562,13 +2641,9 @@ TEST(IDLValidatedField, Double_basic_ranges) {
     const auto tryPass =
         [](double pos, double neg, double nonneg, double nonpos, double double_range) {
             IDLParserErrorContext ctxt("root");
-            auto doc =
-                BSON("positive_double" << pos << "negative_double" << neg << "non_negative_double"
-                                       << nonneg
-                                       << "non_positive_double"
-                                       << nonpos
-                                       << "range_double"
-                                       << double_range);
+            auto doc = BSON("positive_double"
+                            << pos << "negative_double" << neg << "non_negative_double" << nonneg
+                            << "non_positive_double" << nonpos << "range_double" << double_range);
             auto obj = Double_basic_ranges::parse(ctxt, doc);
             ASSERT_EQUALS(obj.getPositive_double(), pos);
             ASSERT_EQUALS(obj.getNegative_double(), neg);
@@ -2581,13 +2656,9 @@ TEST(IDLValidatedField, Double_basic_ranges) {
     const auto tryFail =
         [](double pos, double neg, double nonneg, double nonpos, double double_range) {
             IDLParserErrorContext ctxt("root");
-            auto doc =
-                BSON("positive_double" << pos << "negative_double" << neg << "non_negative_double"
-                                       << nonneg
-                                       << "non_positive_double"
-                                       << nonpos
-                                       << "range_double"
-                                       << double_range);
+            auto doc = BSON("positive_double"
+                            << pos << "negative_double" << neg << "non_negative_double" << nonneg
+                            << "non_positive_double" << nonpos << "range_double" << double_range);
             ASSERT_THROWS(Double_basic_ranges::parse(ctxt, doc), AssertionException);
         };
 
@@ -2625,8 +2696,7 @@ TEST(IDLValidatedField, Callback_validators) {
         [](std::int32_t int_even, double double_nearly_int, StringData string_starts_with_x) {
             IDLParserErrorContext ctxt("root");
             auto doc = BSON("int_even" << int_even << "double_nearly_int" << double_nearly_int
-                                       << "string_starts_with_x"
-                                       << string_starts_with_x);
+                                       << "string_starts_with_x" << string_starts_with_x);
             auto obj = Callback_validators::parse(ctxt, doc);
             ASSERT_EQUALS(obj.getInt_even(), int_even);
             ASSERT_EQUALS(obj.getDouble_nearly_int(), double_nearly_int);
@@ -2638,8 +2708,7 @@ TEST(IDLValidatedField, Callback_validators) {
         [](std::int32_t int_even, double double_nearly_int, StringData string_starts_with_x) {
             IDLParserErrorContext ctxt("root");
             auto doc = BSON("int_even" << int_even << "double_nearly_int" << double_nearly_int
-                                       << "string_starts_with_x"
-                                       << string_starts_with_x);
+                                       << "string_starts_with_x" << string_starts_with_x);
             ASSERT_THROWS(Callback_validators::parse(ctxt, doc), AssertionException);
         };
 
@@ -2647,6 +2716,14 @@ TEST(IDLValidatedField, Callback_validators) {
     tryFail(43, 123456789.01, "x-ray");
     tryFail(42, 123456789.11, "x-ray");
     tryFail(42, 123456789.01, "uniform");
+
+    Unusual_callback_validators obj1;
+    obj1.setInt_even(42);
+    ASSERT_THROWS(obj1.setInt_even(7), AssertionException);
+    obj1.setArray_of_int({42});
+    ASSERT_THROWS(obj1.setArray_of_int({7}), AssertionException);
+    obj1.setOne_int(One_int(42));
+    ASSERT_THROWS(obj1.setOne_int(One_int(7)), AssertionException);
 }
 
 // Positive: verify a command a string arg
@@ -2654,9 +2731,7 @@ TEST(IDLTypeCommand, TestString) {
     IDLParserErrorContext ctxt("root");
 
     auto testDoc = BSON(CommandTypeStringCommand::kCommandName << "foo"
-                                                               << "field1"
-                                                               << 3
-                                                               << "$db"
+                                                               << "field1" << 3 << "$db"
                                                                << "db");
 
     auto testStruct = CommandTypeStringCommand::parse(ctxt, makeOMR(testDoc));
@@ -2676,8 +2751,7 @@ TEST(IDLTypeCommand, TestString) {
     // Positive: Test we can serialize from nothing the same document except for $db
     {
         auto testDocWithoutDb = BSON(CommandTypeStringCommand::kCommandName << "foo"
-                                                                            << "field1"
-                                                                            << 3);
+                                                                            << "field1" << 3);
 
         BSONObjBuilder builder;
         CommandTypeStringCommand one_new("foo");
@@ -2817,9 +2891,7 @@ TEST(IDLTypeCommand, TestUnderscoreCommand) {
     IDLParserErrorContext ctxt("root");
 
     auto testDoc = BSON(WellNamedCommand::kCommandName << "foo"
-                                                       << "field1"
-                                                       << 3
-                                                       << "$db"
+                                                       << "field1" << 3 << "$db"
                                                        << "db");
 
     auto testStruct = WellNamedCommand::parse(ctxt, makeOMR(testDoc));
@@ -2839,8 +2911,7 @@ TEST(IDLTypeCommand, TestUnderscoreCommand) {
     // Positive: Test we can serialize from nothing the same document except for $db
     {
         auto testDocWithoutDb = BSON(WellNamedCommand::kCommandName << "foo"
-                                                                    << "field1"
-                                                                    << 3);
+                                                                    << "field1" << 3);
 
         BSONObjBuilder builder;
         WellNamedCommand one_new("foo");

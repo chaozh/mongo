@@ -29,36 +29,38 @@
 
 #include "mongo/platform/basic.h"
 
-#include "mongo/base/init.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/commands/sessions_commands_gen.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/logical_session_cache.h"
 #include "mongo/db/logical_session_id_helpers.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/db/refresh_sessions_gen.h"
 
 namespace mongo {
+namespace {
 
 class RefreshSessionsCommand final : public BasicCommand {
-    MONGO_DISALLOW_COPYING(RefreshSessionsCommand);
-
 public:
     RefreshSessionsCommand() : BasicCommand("refreshSessions") {}
 
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kAlways;
     }
+
     bool adminOnly() const override {
         return false;
     }
+
     bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
+
     std::string help() const override {
         return "renew a set of logical sessions";
     }
+
     Status checkAuthForOperation(OperationContext* opCtx,
                                  const std::string& dbname,
                                  const BSONObj& cmdObj) const override {
@@ -74,18 +76,24 @@ public:
         }
     }
 
-    virtual bool run(OperationContext* opCtx,
-                     const std::string& db,
-                     const BSONObj& cmdObj,
-                     BSONObjBuilder& result) override {
-        IDLParserErrorContext ctx("RefreshSessionsCmdFromClient");
-        auto cmd = RefreshSessionsCmdFromClient::parse(ctx, cmdObj);
-        auto res =
-            LogicalSessionCache::get(opCtx->getServiceContext())->refreshSessions(opCtx, cmd);
-        uassertStatusOK(res);
+    bool run(OperationContext* opCtx,
+             const std::string& db,
+             const BSONObj& cmdObj,
+             BSONObjBuilder& result) override {
+        auto refreshSessionsRequest = RefreshSessionsCmdFromClient::parse(
+            IDLParserErrorContext("RefreshSessionsCmdFromClient"), cmdObj);
+
+        const auto lsCache = LogicalSessionCache::get(opCtx);
+
+        for (const auto& lsid :
+             makeLogicalSessionIds(refreshSessionsRequest.getSessions(), opCtx)) {
+            uassertStatusOK(lsCache->vivify(opCtx, lsid));
+        }
 
         return true;
     }
+
 } refreshSessionsCommand;
 
+}  // namespace
 }  // namespace mongo

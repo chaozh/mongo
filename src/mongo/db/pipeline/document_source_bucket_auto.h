@@ -44,9 +44,10 @@ namespace mongo {
  */
 class DocumentSourceBucketAuto final : public DocumentSource {
 public:
+    static constexpr StringData kStageName = "$bucketAuto"_sd;
     Value serialize(boost::optional<ExplainOptions::Verbosity> explain = boost::none) const final;
     DepsTracker::State getDependencies(DepsTracker* deps) const final;
-    GetNextResult getNext() final;
+
     const char* getSourceName() const final;
 
     StageConstraints constraints(Pipeline::SplitState pipeState) const final {
@@ -55,15 +56,16 @@ public:
                 HostTypeRequirement::kNone,
                 DiskUseRequirement::kWritesTmpData,
                 FacetRequirement::kAllowed,
-                TransactionRequirement::kAllowed};
+                TransactionRequirement::kAllowed,
+                LookupRequirement::kAllowed};
     }
 
     /**
      * The $bucketAuto stage must be run on the merging shard.
      */
-    boost::optional<MergingLogic> mergingLogic() final {
+    boost::optional<DistributedPlanLogic> distributedPlanLogic() final {
         // {shardsStage, mergingStage, sortPattern}
-        return MergingLogic{nullptr, this, boost::none};
+        return DistributedPlanLogic{nullptr, this, boost::none};
     }
 
     static const uint64_t kDefaultMaxMemoryUsageBytes = 100 * 1024 * 1024;
@@ -88,7 +90,11 @@ public:
     static boost::intrusive_ptr<DocumentSource> createFromBson(
         BSONElement elem, const boost::intrusive_ptr<ExpressionContext>& pExpCtx);
 
+    const boost::intrusive_ptr<Expression> getGroupByExpression() const;
+    const std::vector<AccumulationStatement>& getAccumulatedFields() const;
+
 protected:
+    GetNextResult doGetNext() final;
     void doDispose() final;
 
 private:

@@ -38,7 +38,6 @@ class DocumentSourceSample final : public DocumentSource {
 public:
     static constexpr StringData kStageName = "$sample"_sd;
 
-    GetNextResult getNext() final;
     const char* getSourceName() const final {
         return kStageName.rawData();
     }
@@ -50,14 +49,15 @@ public:
                 HostTypeRequirement::kNone,
                 DiskUseRequirement::kWritesTmpData,
                 FacetRequirement::kAllowed,
-                TransactionRequirement::kAllowed};
+                TransactionRequirement::kAllowed,
+                LookupRequirement::kAllowed};
     }
 
     DepsTracker::State getDependencies(DepsTracker* deps) const final {
         return DepsTracker::State::SEE_NEXT;
     }
 
-    boost::optional<MergingLogic> mergingLogic() final;
+    boost::optional<DistributedPlanLogic> distributedPlanLogic() final;
 
     long long getSampleSize() const {
         return _size;
@@ -68,6 +68,8 @@ public:
 
 private:
     explicit DocumentSourceSample(const boost::intrusive_ptr<ExpressionContext>& pExpCtx);
+
+    GetNextResult doGetNext() final;
 
     long long _size;
 

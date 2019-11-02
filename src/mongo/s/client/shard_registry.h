@@ -34,12 +34,11 @@
 #include <string>
 #include <vector>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/executor/task_executor.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/s/client/shard.h"
 #include "mongo/stdx/condition_variable.h"
-#include "mongo/stdx/mutex.h"
 #include "mongo/stdx/unordered_map.h"
 #include "mongo/util/concurrency/with_lock.h"
 
@@ -115,7 +114,7 @@ private:
     void _rebuildShard(WithLock, ConnectionString const& newConnString, ShardFactory* factory);
 
     // Protects the lookup maps below.
-    mutable stdx::mutex _mutex;
+    mutable Mutex _mutex = MONGO_MAKE_LATCH("::_mutex");
 
     using ShardMap = stdx::unordered_map<ShardId, std::shared_ptr<Shard>, ShardId::Hasher>;
 
@@ -138,7 +137,8 @@ private:
  * errors automatically as well.
  */
 class ShardRegistry {
-    MONGO_DISALLOW_COPYING(ShardRegistry);
+    ShardRegistry(const ShardRegistry&) = delete;
+    ShardRegistry& operator=(const ShardRegistry&) = delete;
 
 public:
     /**
@@ -147,13 +147,22 @@ public:
     static const ShardId kConfigServerShardId;
 
     /**
+     * A callback type for functions that can be called on shard removal.
+     */
+    using ShardRemovalHook = std::function<void(const ShardId&)>;
+
+    /**
      * Instantiates a new shard registry.
      *
-     * @param shardFactory Makes shards
-     * @param configServerCS ConnectionString used for communicating with the config servers
+     * @param shardFactory      Makes shards
+     * @param configServerCS    ConnectionString used for communicating with the config servers
+     * @param shardRemovalHooks A list of hooks that will be called when a shard is removed. The
+     *                          hook is expected not to throw. If it does throw, the process will be
+     *                          terminated.
      */
     ShardRegistry(std::unique_ptr<ShardFactory> shardFactory,
-                  const ConnectionString& configServerCS);
+                  const ConnectionString& configServerCS,
+                  std::vector<ShardRemovalHook> shardRemovalHooks = {});
 
     ~ShardRegistry();
     /**
@@ -179,6 +188,12 @@ public:
      * returned false.
      */
     bool reload(OperationContext* opCtx);
+
+    /**
+     * Clears all entries from the shard registry entries, which will force the registry to do a
+     * reload on next access.
+     */
+    void clearEntries();
 
     /**
      * Takes a connection string describing either a shard or config server replica set, looks
@@ -259,22 +274,11 @@ public:
     void shutdown();
 
     /**
-     * For use in mongos and mongod which needs notifications about changes to shard and config
-     * server replset membership to update the ShardRegistry.
-     *
-     * This is expected to be run in an existing thread.
-     */
-    static void replicaSetChangeShardRegistryUpdateHook(const std::string& setName,
-                                                        const std::string& newConnectionString);
-
-    /**
      * For use in mongos which needs notifications about changes to shard replset membership to
      * update the config.shards collection.
-     *
-     * This is expected to be run in a brand new thread.
      */
-    static void replicaSetChangeConfigServerUpdateHook(const std::string& setName,
-                                                       const std::string& newConnectionString);
+    static void updateReplicaSetOnConfigServer(ServiceContext* serviceContex,
+                                               const ConnectionString& connStr) noexcept;
 
 private:
     /**
@@ -287,11 +291,18 @@ private:
      * shard
      */
     ConnectionString _initConfigServerCS;
+
+    /**
+     * A list of callbacks to be called asynchronously when it has been discovered that a shard was
+     * removed.
+     */
+    std::vector<ShardRemovalHook> _shardRemovalHooks;
+
     void _internalReload(const executor::TaskExecutor::CallbackArgs& cbArgs);
     ShardRegistryData _data;
 
     // Protects the _reloadState and _initConfigServerCS during startup.
-    mutable stdx::mutex _reloadMutex;
+    mutable Mutex _reloadMutex = MONGO_MAKE_LATCH("ShardRegistry::_reloadMutex");
     stdx::condition_variable _inReloadCV;
 
     enum class ReloadState {

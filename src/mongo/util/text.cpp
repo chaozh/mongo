@@ -43,7 +43,7 @@
 
 #include "mongo/platform/basic.h"
 #include "mongo/util/allocator.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -154,7 +154,7 @@ std::string toUtf8String(const std::wstring& wide) {
 
     // Calculate necessary buffer size
     int len = ::WideCharToMultiByte(
-        CP_UTF8, 0, wide.c_str(), static_cast<int>(wide.size()), NULL, 0, NULL, NULL);
+        CP_UTF8, 0, wide.c_str(), static_cast<int>(wide.size()), nullptr, 0, nullptr, nullptr);
 
     // Perform actual conversion
     if (len > 0) {
@@ -165,15 +165,15 @@ std::string toUtf8String(const std::wstring& wide) {
                                     static_cast<int>(wide.size()),
                                     &buffer[0],
                                     static_cast<int>(buffer.size()),
-                                    NULL,
-                                    NULL);
+                                    nullptr,
+                                    nullptr);
         if (len > 0) {
             verify(len == static_cast<int>(buffer.size()));
             return std::string(&buffer[0], buffer.size());
         }
     }
 
-    msgasserted(16091, mongoutils::str::stream() << "can't wstring to utf8: " << ::GetLastError());
+    msgasserted(16091, str::stream() << "can't wstring to utf8: " << ::GetLastError());
     return "";
 }
 
@@ -182,9 +182,9 @@ std::wstring toWideString(const char* utf8String) {
                                          0,           // Flags
                                          utf8String,  // Input string
                                          -1,          // Count, -1 for NUL-terminated
-                                         NULL,        // No output buffer
+                                         nullptr,     // No output buffer
                                          0            // Zero means "compute required size"
-                                         );
+    );
     if (bufferSize == 0) {
         return std::wstring();
     }
@@ -196,7 +196,7 @@ std::wstring toWideString(const char* utf8String) {
                         -1,                // Count, -1 for NUL-terminated
                         tempBuffer.get(),  // UTF-16 output buffer
                         bufferSize         // Buffer size in wide characters
-                        );
+    );
     return std::wstring(tempBuffer.get());
 }
 
@@ -212,9 +212,9 @@ bool writeUtf8ToWindowsConsole(const char* utf8String, unsigned int utf8StringSi
                                          0,               // Flags
                                          utf8String,      // Input string
                                          utf8StringSize,  // Input string length
-                                         NULL,            // No output buffer
+                                         nullptr,         // No output buffer
                                          0                // Zero means "compute required size"
-                                         );
+    );
     if (bufferSize == 0) {
         return true;
     }
@@ -225,7 +225,7 @@ bool writeUtf8ToWindowsConsole(const char* utf8String, unsigned int utf8StringSi
                         utf8StringSize,     // Input string length
                         utf16String.get(),  // UTF-16 output buffer
                         bufferSize          // Buffer size in wide characters
-                        );
+    );
     const wchar_t* utf16Pointer = utf16String.get();
     size_t numberOfCharactersToWrite = bufferSize;
     HANDLE consoleHandle = GetStdHandle(STD_OUTPUT_HANDLE);
@@ -240,7 +240,7 @@ bool writeUtf8ToWindowsConsole(const char* utf8String, unsigned int utf8StringSi
                                      utf16Pointer,
                                      numberOfCharactersThisPass,
                                      &numberOfCharactersWritten,
-                                     NULL);
+                                     nullptr);
         if (0 == success) {
             DWORD dosError = GetLastError();
             static bool errorMessageShown = false;
@@ -265,7 +265,7 @@ bool writeUtf8ToWindowsConsole(const char* utf8String, unsigned int utf8StringSi
 }
 
 WindowsCommandLine::WindowsCommandLine(int argc, wchar_t* argvW[], wchar_t* envpW[])
-    : _argv(NULL), _envp(NULL) {
+    : _argv(nullptr), _envp(nullptr) {
     // Construct UTF-8 copy of arguments
     std::vector<std::string> utf8args;
     std::vector<size_t> utf8argLength;
@@ -307,7 +307,7 @@ WindowsCommandLine::WindowsCommandLine(int argc, wchar_t* argvW[], wchar_t* envp
         strcpy_s(_envp[i], utf8envLength[i], utf8envs[i].c_str());
         blockPtr += utf8envLength[i];
     }
-    _envp[i] = NULL;
+    _envp[i] = nullptr;
 }
 
 WindowsCommandLine::~WindowsCommandLine() {

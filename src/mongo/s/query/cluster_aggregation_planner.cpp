@@ -34,12 +34,14 @@
 #include "mongo/db/pipeline/document_source_group.h"
 #include "mongo/db/pipeline/document_source_limit.h"
 #include "mongo/db/pipeline/document_source_match.h"
+#include "mongo/db/pipeline/document_source_merge.h"
 #include "mongo/db/pipeline/document_source_out.h"
 #include "mongo/db/pipeline/document_source_project.h"
 #include "mongo/db/pipeline/document_source_sequential_document_cache.h"
 #include "mongo/db/pipeline/document_source_skip.h"
 #include "mongo/db/pipeline/document_source_sort.h"
 #include "mongo/db/pipeline/document_source_unwind.h"
+#include "mongo/db/pipeline/semantic_analysis.h"
 #include "mongo/executor/task_executor_pool.h"
 #include "mongo/s/catalog_cache.h"
 #include "mongo/s/cluster_commands_helpers.h"
@@ -73,23 +75,23 @@ boost::optional<BSONObj> findSplitPoint(Pipeline::SourceContainer* shardPipe, Pi
         boost::intrusive_ptr<DocumentSource> current = mergePipe->popFront();
 
         // Check if this source is splittable.
-        auto mergeLogic = current->mergingLogic();
-        if (!mergeLogic) {
+        auto distributedPlanLogic = current->distributedPlanLogic();
+        if (!distributedPlanLogic) {
             // Move the source from the merger _sources to the shard _sources.
             shardPipe->push_back(current);
             continue;
         }
 
         // A source may not simultaneously be present on both sides of the split.
-        invariant(mergeLogic->shardsStage != mergeLogic->mergingStage);
+        invariant(distributedPlanLogic->shardsStage != distributedPlanLogic->mergingStage);
 
-        if (mergeLogic->shardsStage)
-            shardPipe->push_back(std::move(mergeLogic->shardsStage));
+        if (distributedPlanLogic->shardsStage)
+            shardPipe->push_back(std::move(distributedPlanLogic->shardsStage));
 
-        if (mergeLogic->mergingStage)
-            mergePipe->addInitialSource(std::move(mergeLogic->mergingStage));
+        if (distributedPlanLogic->mergingStage)
+            mergePipe->addInitialSource(std::move(distributedPlanLogic->mergingStage));
 
-        return mergeLogic->inputSortPattern;
+        return distributedPlanLogic->inputSortPattern;
     }
     return boost::none;
 }
@@ -126,15 +128,12 @@ boost::optional<long long> getPipelineLimit(Pipeline* pipeline) {
 
         auto sortStage = dynamic_cast<DocumentSourceSort*>(source);
         if (sortStage) {
-            return (sortStage->getLimit() >= 0) ? boost::optional<long long>(sortStage->getLimit())
-                                                : boost::none;
+            return sortStage->getLimit();
         }
 
         auto cursorStage = dynamic_cast<DocumentSourceSort*>(source);
         if (cursorStage) {
-            return (cursorStage->getLimit() >= 0)
-                ? boost::optional<long long>(cursorStage->getLimit())
-                : boost::none;
+            return cursorStage->getLimit();
         }
 
         // If this stage is one that can swap with a $limit stage, then we can look at the previous
@@ -208,17 +207,13 @@ void propagateDocLimitToShards(Pipeline* shardPipe, Pipeline* mergePipe) {
  * Documents.
  */
 void limitFieldsSentFromShardsToMerger(Pipeline* shardPipe, Pipeline* mergePipe) {
-    DepsTracker mergeDeps(mergePipe->getDependencies(DepsTracker::kAllMetadataAvailable));
+    DepsTracker mergeDeps(mergePipe->getDependencies(DepsTracker::kAllMetadata));
     if (mergeDeps.needWholeDocument)
         return;  // the merge needs all fields, so nothing we can do.
 
     // Empty project is "special" so if no fields are needed, we just ask for _id instead.
     if (mergeDeps.fields.empty())
         mergeDeps.fields.insert("_id");
-
-    // Remove metadata from dependencies since it automatically flows through projection and we
-    // don't want to project it in to the document.
-    mergeDeps.setNeedsMetadata(DepsTracker::MetadataType::TEXT_SCORE, false);
 
     // HEURISTIC: only apply optimization if none of the shard stages have an exhaustive list of
     // field dependencies. While this may not be 100% ideal in all cases, it is simple and
@@ -230,13 +225,14 @@ void limitFieldsSentFromShardsToMerger(Pipeline* shardPipe, Pipeline* mergePipe)
     // 2) Optimization IS NOT applied immediately following a $project or $group since it would
     //    add an unnecessary project (and therefore a deep-copy).
     for (auto&& source : shardPipe->getSources()) {
-        DepsTracker dt(DepsTracker::kAllMetadataAvailable);
+        DepsTracker dt(DepsTracker::kAllMetadata);
         if (source->getDependencies(&dt) & DepsTracker::State::EXHAUSTIVE_FIELDS)
             return;
     }
     // if we get here, add the project.
     boost::intrusive_ptr<DocumentSource> project = DocumentSourceProject::createFromBson(
-        BSON("$project" << mergeDeps.toProjection()).firstElement(), shardPipe->getContext());
+        BSON("$project" << mergeDeps.toProjectionWithoutMetadata()).firstElement(),
+        shardPipe->getContext());
     shardPipe->pushBack(project);
 }
 
@@ -288,8 +284,8 @@ ClusterClientCursorGuard convertPipelineToRouterStages(
 
 bool stageCanRunInParallel(const boost::intrusive_ptr<DocumentSource>& stage,
                            const std::set<std::string>& nameOfShardKeyFieldsUponEntryToStage) {
-    if (stage->mergingLogic()) {
-        return stage->canRunInParallelBeforeOut(nameOfShardKeyFieldsUponEntryToStage);
+    if (stage->distributedPlanLogic()) {
+        return stage->canRunInParallelBeforeWriteStage(nameOfShardKeyFieldsUponEntryToStage);
     } else {
         // This stage is fine to execute in parallel on each stream. For example, a $match can be
         // applied to each stream in parallel.
@@ -316,8 +312,7 @@ BSONObj buildNewKeyPattern(const ShardKeyPattern& shardKey, StringMap<std::strin
         auto it = renames.find(elem.fieldNameStringData());
         invariant(it != renames.end(),
                   str::stream() << "Could not find new name of shard key field \""
-                                << elem.fieldName()
-                                << "\": rename map was "
+                                << elem.fieldName() << "\": rename map was "
                                 << mapToString(renames));
         newPattern.appendAs(elem, it->second);
     }
@@ -338,7 +333,7 @@ StringMap<std::string> computeShardKeyRenameMap(const Pipeline* mergePipeline,
         // global groups. Thus we want to exclude this stage from our rename tracking.
         traversalEnd = std::prev(traversalEnd);
     }
-    auto renameMap = Pipeline::renamedPaths(traversalStart, traversalEnd, pathsOfShardKey);
+    auto renameMap = semantic_analysis::renamedPaths(traversalStart, traversalEnd, pathsOfShardKey);
     invariant(renameMap,
               str::stream()
                   << "Analyzed pipeline was thought to preserve the shard key fields, but did not: "
@@ -358,7 +353,8 @@ bool anyStageModifiesShardKeyOrNeedsMerge(std::set<std::string> shardKeyPaths,
     const auto& stages = mergePipeline->getSources();
     for (auto it = stages.crbegin(); it != stages.crend(); ++it) {
         const auto& stage = *it;
-        auto renames = stage->renamedPaths(std::move(shardKeyPaths));
+        auto renames = semantic_analysis::renamedPaths(
+            std::move(shardKeyPaths), *stage, semantic_analysis::Direction::kBackward);
         if (!renames) {
             return true;
         }
@@ -376,10 +372,7 @@ bool anyStageModifiesShardKeyOrNeedsMerge(std::set<std::string> shardKeyPaths,
 }
 
 boost::optional<ShardedExchangePolicy> walkPipelineBackwardsTrackingShardKey(
-    OperationContext* opCtx,
-    const boost::intrusive_ptr<const DocumentSourceOut>& outStage,
-    const Pipeline* mergePipeline,
-    const ChunkManager& chunkManager) {
+    OperationContext* opCtx, const Pipeline* mergePipeline, const ChunkManager& chunkManager) {
 
     const ShardKeyPattern& shardKey = chunkManager.getShardKeyPattern();
     std::set<std::string> shardKeyPaths;
@@ -417,7 +410,7 @@ boost::optional<ShardedExchangePolicy> walkPipelineBackwardsTrackingShardKey(
     // chunk has an associated range [from, to); i.e. inclusive lower bound and exclusive upper
     // bound. The chunk ranges must cover all domain without any holes. For the exchange we coalesce
     // ranges into a single vector of points. E.g. chunks [min,5], [5,10], [10,max] will produce
-    // [min,5,10,max] vector. Number of points in the vector is always one grater than number of
+    // [min,5,10,max] vector. Number of points in the vector is always one greater than number of
     // chunks.
     // We also compute consumer indices for every chunk. From the example above (3 chunks) we may
     // get the vector [0,1,2]; i.e. the first chunk goes to the consumer 0 and so on. Note that
@@ -480,12 +473,12 @@ SplitPipeline splitPipeline(std::unique_ptr<Pipeline, PipelineDeleter> pipeline)
 }
 
 void addMergeCursorsSource(Pipeline* mergePipeline,
-                           const LiteParsedPipeline& liteParsedPipeline,
                            BSONObj cmdSentToShards,
                            std::vector<OwnedRemoteCursor> ownedCursors,
                            const std::vector<ShardId>& targetedShards,
                            boost::optional<BSONObj> shardCursorsSortSpec,
-                           executor::TaskExecutor* executor) {
+                           std::shared_ptr<executor::TaskExecutor> executor,
+                           bool hasChangeStream) {
     auto* opCtx = mergePipeline->getContext()->opCtx;
     AsyncResultsMergerParams armParams;
     armParams.setSort(shardCursorsSortSpec);
@@ -523,9 +516,9 @@ void addMergeCursorsSource(Pipeline* mergePipeline,
     // For change streams, we need to set up a custom stage to establish cursors on new shards when
     // they are added, to ensure we don't miss results from the new shards.
     auto mergeCursorsStage = DocumentSourceMergeCursors::create(
-        executor, std::move(armParams), mergePipeline->getContext());
+        std::move(executor), std::move(armParams), mergePipeline->getContext());
 
-    if (liteParsedPipeline.hasChangeStream()) {
+    if (hasChangeStream) {
         mergePipeline->addInitialSource(DocumentSourceUpdateOnAddShard::create(
             mergePipeline->getContext(),
             Grid::get(opCtx)->getExecutorPool()->getArbitraryExecutor(),
@@ -555,29 +548,25 @@ boost::optional<ShardedExchangePolicy> checkIfEligibleForExchange(OperationConte
         return boost::none;
     }
 
-    const auto grid = Grid::get(opCtx);
-    invariant(grid);
-
     if (mergePipeline->getSources().empty()) {
         return boost::none;
     }
 
-    const auto outStage =
-        dynamic_cast<DocumentSourceOut*>(mergePipeline->getSources().back().get());
-    if (!outStage || outStage->getMode() == WriteModeEnum::kModeReplaceCollection) {
-        // If there's no $out stage we won't try to do an $exchange. If the $out stage is using mode
-        // "replaceCollection", then there's no point doing an $exchange because all the writes will
-        // go to a single node, so we should just perform the merge on that host.
+    auto mergeStage = dynamic_cast<DocumentSourceMerge*>(mergePipeline->getSources().back().get());
+    if (!mergeStage) {
+        // If there's no $merge stage we won't try to do an $exchange. For the $out stage there's no
+        // point doing an $exchange because all the writes will go to a single node, so we should
+        // just perform the merge on that host.
         return boost::none;
     }
 
     const auto routingInfo =
-        uassertStatusOK(getCollectionRoutingInfoForTxnCmd(opCtx, outStage->getOutputNs()));
+        uassertStatusOK(getCollectionRoutingInfoForTxnCmd(opCtx, mergeStage->getOutputNs()));
     if (!routingInfo.cm()) {
         return boost::none;
     }
 
-    // The collection is sharded and we have an $out stage! Here we assume the $out stage has
+    // The collection is sharded and we have a $merge stage! Here we assume the $merge stage has
     // already verified that the shard key pattern is compatible with the unique key being used.
     // Assuming this, we just have to make sure the shard key is preserved (though possibly renamed)
     // all the way to the front of the merge pipeline. If this is the case then for any document
@@ -585,7 +574,7 @@ boost::optional<ShardedExchangePolicy> checkIfEligibleForExchange(OperationConte
     // inserted on. With this ability we can insert an exchange on the shards to partition the
     // documents based on which shard will end up owning them. Then each shard can perform a merge
     // of only those documents which belong to it (optimistically, barring chunk migrations).
-    return walkPipelineBackwardsTrackingShardKey(opCtx, outStage, mergePipeline, *routingInfo.cm());
+    return walkPipelineBackwardsTrackingShardKey(opCtx, mergePipeline, *routingInfo.cm());
 }
 
 }  // namespace cluster_aggregation_planner

@@ -31,17 +31,16 @@
 
 #include <boost/optional.hpp>
 #include <functional>
+#include <list>
+#include <memory>
 #include <vector>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/base/global_initializer_registerer.h"
 #include "mongo/db/logical_session_id.h"
 #include "mongo/db/storage/storage_engine.h"
 #include "mongo/platform/atomic_word.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/stdx/condition_variable.h"
-#include "mongo/stdx/list.h"
-#include "mongo/stdx/memory.h"
-#include "mongo/stdx/mutex.h"
 #include "mongo/stdx/unordered_set.h"
 #include "mongo/transport/service_executor.h"
 #include "mongo/transport/session.h"
@@ -50,6 +49,8 @@
 #include "mongo/util/decorable.h"
 #include "mongo/util/periodic_runner.h"
 #include "mongo/util/tick_source.h"
+
+#include <iostream>
 
 namespace mongo {
 
@@ -70,7 +71,8 @@ class TransportLayer;
  * including limitations on the lifetime of registered listeners.
  */
 class KillOpListenerInterface {
-    MONGO_DISALLOW_COPYING(KillOpListenerInterface);
+    KillOpListenerInterface(const KillOpListenerInterface&) = delete;
+    KillOpListenerInterface& operator=(const KillOpListenerInterface&) = delete;
 
 public:
     /**
@@ -95,7 +97,8 @@ protected:
  * zero or more Clients, which in turn each own OperationContexts.
  */
 class ServiceContext final : public Decorable<ServiceContext> {
-    MONGO_DISALLOW_COPYING(ServiceContext);
+    ServiceContext(const ServiceContext&) = delete;
+    ServiceContext& operator=(const ServiceContext&) = delete;
 
 public:
     /**
@@ -162,7 +165,7 @@ public:
         Client* next();
 
     private:
-        stdx::unique_lock<stdx::mutex> _lock;
+        stdx::unique_lock<Latch> _lock;
         ClientSet::const_iterator _curr;
         ClientSet::const_iterator _end;
     };
@@ -270,7 +273,7 @@ public:
                                     DestructorAction destructor = {});
 
     private:
-        using ConstructorActionListIterator = stdx::list<ConstructorDestructorActions>::iterator;
+        using ConstructorActionListIterator = std::list<ConstructorDestructorActions>::iterator;
         ConstructorActionListIterator _iter;
         boost::optional<GlobalInitializerRegisterer> _registerer;
     };
@@ -421,14 +424,6 @@ public:
      */
     void waitForStartupComplete();
 
-    /**
-     * Wait for all clients to complete and unregister themselves. Shutting-down, unmanaged threads
-     * may potentially be unable to acquire the service context mutex before the service context
-     * itself does on destruction.
-     * Used for testing.
-     */
-    void waitForClientsToFinish();
-
     /*
      * Marks initialization as complete and all transport layers as started.
      */
@@ -515,6 +510,14 @@ public:
      */
     BatonHandle makeBaton(OperationContext* opCtx) const;
 
+    uint64_t getCatalogGeneration() const {
+        return _catalogGeneration.load();
+    }
+
+    void incrementCatalogGeneration() {
+        _catalogGeneration.fetchAndAdd(1);
+    }
+
 private:
     class ClientObserverHolder {
     public:
@@ -537,12 +540,7 @@ private:
         std::unique_ptr<ClientObserver> _observer;
     };
 
-    stdx::mutex _mutex;
-
-    /**
-     * The storage engine, if any.
-     */
-    std::unique_ptr<StorageEngine> _storageEngine;
+    Mutex _mutex = MONGO_MAKE_LATCH("ServiceContext::_mutex");
 
     /**
      * The periodic runner.
@@ -565,11 +563,15 @@ private:
     std::unique_ptr<transport::ServiceExecutor> _serviceExecutor;
 
     /**
+     * The storage engine, if any.
+     */
+    std::unique_ptr<StorageEngine> _storageEngine;
+
+    /**
      * Vector of registered observers.
      */
     std::vector<ClientObserverHolder> _clientObservers;
     ClientSet _clients;
-    stdx::condition_variable _clientsEmptyCondVar;
 
     /**
      * The registered OpObserver.
@@ -597,6 +599,9 @@ private:
 
     // Counter for assigning operation ids.
     AtomicWord<unsigned> _nextOpId{1};
+
+    // When the catalog is restarted, the generation goes up by one each time.
+    AtomicWord<uint64_t> _catalogGeneration{0};
 
     bool _startupComplete = false;
     stdx::condition_variable _startupCompleteCondVar;

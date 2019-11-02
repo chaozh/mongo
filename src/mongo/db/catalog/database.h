@@ -36,6 +36,7 @@
 #include "mongo/base/string_data.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/catalog/collection_options.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/repl/optime.h"
@@ -43,7 +44,6 @@
 
 namespace mongo {
 
-class DatabaseCatalogEntry;
 class OperationContext;
 
 /**
@@ -54,8 +54,6 @@ class OperationContext;
  */
 class Database : public Decorable<Database> {
 public:
-    typedef StringMap<Collection*> CollectionMap;
-
     /**
      * Creates the namespace 'ns' in the database 'db' according to 'options'. If
      * 'createDefaultIndexes' is true, creates the _id index for the collection (and the system
@@ -66,52 +64,7 @@ public:
                                 const NamespaceString& fullns,
                                 CollectionOptions collectionOptions,
                                 bool createDefaultIndexes = true,
-                                const BSONObj& idIndex = BSONObj()) = 0;
-
-    /**
-     * Iterating over a Database yields Collection* pointers.
-     */
-    class iterator {
-    public:
-        using iterator_category = std::forward_iterator_tag;
-        using value_type = Collection*;
-        using pointer = const value_type*;
-        using reference = const value_type&;
-        using difference_type = ptrdiff_t;
-
-        explicit inline iterator() = default;
-        inline iterator(CollectionMap::const_iterator it) : _it(std::move(it)) {}
-
-        inline reference operator*() const {
-            return _it->second;
-        }
-
-        inline pointer operator->() const {
-            return &_it->second;
-        }
-
-        inline friend bool operator==(const iterator& lhs, const iterator& rhs) {
-            return lhs._it == rhs._it;
-        }
-
-        inline friend bool operator!=(const iterator& lhs, const iterator& rhs) {
-            return !(lhs == rhs);
-        }
-
-        inline iterator& operator++() {
-            ++_it;
-            return *this;
-        }
-
-        inline iterator operator++(int) {
-            auto oldPosition = *this;
-            ++_it;
-            return oldPosition;
-        }
-
-    private:
-        CollectionMap::const_iterator _it;
-    };
+                                const BSONObj& idIndex = BSONObj()) const = 0;
 
     Database() = default;
 
@@ -121,20 +74,17 @@ public:
     inline Database(Database&&) = delete;
     inline Database& operator=(Database&&) = delete;
 
-    virtual iterator begin() const = 0;
-    virtual iterator end() const = 0;
+    virtual CollectionCatalog::iterator begin(OperationContext* opCtx) const = 0;
+    virtual CollectionCatalog::iterator end(OperationContext* opCtx) const = 0;
 
     /**
      * Sets up internal memory structures.
      */
-    virtual void init(OperationContext* opCtx) = 0;
-
-    // closes files and other cleanup see below.
-    virtual void close(OperationContext* const opCtx) = 0;
+    virtual void init(OperationContext* opCtx) const = 0;
 
     virtual const std::string& name() const = 0;
 
-    virtual void clearTmpCollections(OperationContext* const opCtx) = 0;
+    virtual void clearTmpCollections(OperationContext* const opCtx) const = 0;
 
     /**
      * Sets a new profiling level for the database and returns the outcome.
@@ -146,29 +96,24 @@ public:
 
     virtual int getProfilingLevel() const = 0;
 
-    virtual const char* getProfilingNS() const = 0;
+    virtual const NamespaceString& getProfilingNS() const = 0;
 
     /**
      * Sets the 'drop-pending' state of this Database.
      * This is done at the beginning of a dropDatabase operation and is used to reject subsequent
      * collection creation requests on this database.
-     * Throws a UserAssertion if this is called on a Database that is already in a 'drop-pending'
-     * state.
      * The database must be locked in MODE_X when calling this function.
      */
     virtual void setDropPending(OperationContext* opCtx, bool dropPending) = 0;
 
     /**
      * Returns the 'drop-pending' state of this Database.
-     * The database must be locked in MODE_X when calling this function.
      */
     virtual bool isDropPending(OperationContext* opCtx) const = 0;
 
     virtual void getStats(OperationContext* const opCtx,
                           BSONObjBuilder* const output,
-                          const double scale = 1) = 0;
-
-    virtual const DatabaseCatalogEntry* getDatabaseCatalogEntry() const = 0;
+                          const double scale = 1) const = 0;
 
     /**
      * dropCollection() will refuse to drop system collections. Use dropCollectionEvenIfSystem() if
@@ -176,42 +121,39 @@ public:
      *
      * If we are applying a 'drop' oplog entry on a secondary, 'dropOpTime' will contain the optime
      * of the oplog entry.
+     *
+     * The caller should hold a DB X lock and ensure there are no index builds in progress on the
+     * collection.
+     * N.B. Namespace argument is passed by value as it may otherwise disappear or change.
      */
     virtual Status dropCollection(OperationContext* const opCtx,
-                                  const StringData fullns,
-                                  repl::OpTime dropOpTime = {}) = 0;
+                                  NamespaceString nss,
+                                  repl::OpTime dropOpTime = {}) const = 0;
     virtual Status dropCollectionEvenIfSystem(OperationContext* const opCtx,
-                                              const NamespaceString& fullns,
-                                              repl::OpTime dropOpTime = {}) = 0;
+                                              NamespaceString nss,
+                                              repl::OpTime dropOpTime = {}) const = 0;
 
-    virtual Status dropView(OperationContext* const opCtx, const StringData fullns) = 0;
+    virtual Status dropView(OperationContext* const opCtx, NamespaceString viewName) const = 0;
 
     virtual Collection* createCollection(OperationContext* const opCtx,
-                                         StringData ns,
+                                         const NamespaceString& nss,
                                          const CollectionOptions& options = CollectionOptions(),
                                          const bool createDefaultIndexes = true,
-                                         const BSONObj& idIndex = BSONObj()) = 0;
+                                         const BSONObj& idIndex = BSONObj()) const = 0;
 
     virtual Status createView(OperationContext* const opCtx,
-                              const StringData viewName,
-                              const CollectionOptions& options) = 0;
+                              const NamespaceString& viewName,
+                              const CollectionOptions& options) const = 0;
 
     /**
-     * @param ns - this is fully qualified, which is maybe not ideal ???
+     * Arguments are passed by value as they otherwise would be changing as result of renaming.
      */
-    virtual Collection* getCollection(OperationContext* opCtx, const StringData ns) const = 0;
-
-    virtual Collection* getCollection(OperationContext* opCtx, const NamespaceString& ns) const = 0;
-
-    virtual Collection* getOrCreateCollection(OperationContext* const opCtx,
-                                              const NamespaceString& nss) = 0;
-
     virtual Status renameCollection(OperationContext* const opCtx,
-                                    const StringData fromNS,
-                                    const StringData toNS,
-                                    const bool stayTemp) = 0;
+                                    NamespaceString fromNss,
+                                    NamespaceString toNss,
+                                    const bool stayTemp) const = 0;
 
-    virtual const std::string& getSystemViewsName() const = 0;
+    virtual const NamespaceString& getSystemViewsName() const = 0;
 
     /**
      * Generates a collection namespace suitable for creating a temporary collection.
@@ -231,7 +173,7 @@ public:
      * database, we also gather a list of drop-pending collection namespaces for the
      * DropPendingCollectionReaper to clean up eventually.
      */
-    virtual void checkForIdIndexesAndDropPendingCollections(OperationContext* opCtx) = 0;
+    virtual void checkForIdIndexesAndDropPendingCollections(OperationContext* opCtx) const = 0;
 
     /**
      * A database is assigned a new epoch whenever it is closed and re-opened. This involves

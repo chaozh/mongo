@@ -40,6 +40,125 @@
 namespace mongo {
 namespace {
 
+// Test FutureContinuationResult<Func, Args...>:
+static_assert(std::is_same<FutureContinuationResult<std::function<void()>>, void>::value);
+static_assert(std::is_same<FutureContinuationResult<std::function<Status()>>, void>::value);
+static_assert(std::is_same<FutureContinuationResult<std::function<Future<void>()>>, void>::value);
+static_assert(std::is_same<FutureContinuationResult<std::function<int()>>, int>::value);
+static_assert(std::is_same<FutureContinuationResult<std::function<StatusWith<int>()>>, int>::value);
+static_assert(std::is_same<FutureContinuationResult<std::function<Future<int>()>>, int>::value);
+static_assert(std::is_same<FutureContinuationResult<std::function<int(bool)>, bool>, int>::value);
+
+template <typename T>
+auto overloadCheck(T) -> FutureContinuationResult<std::function<std::true_type(bool)>, T>;
+auto overloadCheck(...) -> std::false_type;
+
+static_assert(decltype(overloadCheck(bool()))::value);          // match.
+static_assert(!decltype(overloadCheck(std::string()))::value);  // SFINAE-failure.
+
+// Don't allow banned conversions:
+static_assert(!std::is_constructible_v<SemiFuture<int>, SemiFuture<double>>);
+static_assert(!std::is_constructible_v<SemiFuture<int>, SemiFuture<void>>);
+static_assert(!std::is_constructible_v<SemiFuture<void>, SemiFuture<int>>);
+static_assert(!std::is_constructible_v<SemiFuture<void>, SemiFuture<double>>);
+
+static_assert(!std::is_constructible_v<Future<int>, Future<double>>);
+static_assert(!std::is_constructible_v<Future<int>, Future<void>>);
+static_assert(!std::is_constructible_v<Future<void>, Future<int>>);
+static_assert(!std::is_constructible_v<Future<void>, Future<double>>);
+
+static_assert(!std::is_constructible_v<Future<int>, SemiFuture<int>>);
+static_assert(!std::is_constructible_v<Future<int>, SemiFuture<double>>);
+static_assert(!std::is_constructible_v<Future<int>, SemiFuture<void>>);
+static_assert(!std::is_constructible_v<Future<void>, SemiFuture<int>>);
+static_assert(!std::is_constructible_v<Future<void>, SemiFuture<double>>);
+static_assert(!std::is_constructible_v<Future<void>, SemiFuture<void>>);
+
+// This isn't currently allowed for implementation reasons, but it isn't fundamentally undesirable.
+// We may want to allow it at some point.
+#ifndef _MSC_VER
+// https://developercommunity.visualstudio.com/content/problem/507821/is-constructible.html
+static_assert(!std::is_constructible_v<SemiFuture<int>, Future<int>>);
+#endif
+
+// Check the return types of then-chaining a Future with a function that returns a SemiFuture or an
+// ExecutorFuture.
+static_assert(std::is_same_v<decltype(Future<void>().then(std::function<SemiFuture<void>()>())),
+                             SemiFuture<void>>);
+static_assert(std::is_same_v<decltype(Future<int>().then(std::function<SemiFuture<void>(int)>())),
+                             SemiFuture<void>>);
+static_assert(std::is_same_v<decltype(Future<void>().then(std::function<SemiFuture<int>()>())),
+                             SemiFuture<int>>);
+static_assert(std::is_same_v<decltype(Future<int>().then(std::function<SemiFuture<int>(int)>())),
+                             SemiFuture<int>>);
+static_assert(std::is_same_v<  //
+              decltype(Future<void>().then(std::function<ExecutorFuture<void>()>())),
+              SemiFuture<void>>);
+static_assert(std::is_same_v<  //
+              decltype(Future<int>().then(std::function<ExecutorFuture<void>(int)>())),
+              SemiFuture<void>>);
+static_assert(std::is_same_v<  //
+              decltype(Future<void>().then(std::function<ExecutorFuture<int>()>())),
+              SemiFuture<int>>);
+static_assert(std::is_same_v<  //
+              decltype(Future<int>().then(std::function<ExecutorFuture<int>(int)>())),
+              SemiFuture<int>>);
+
+static_assert(std::is_same_v<  //
+              decltype(Future<void>().then(std::function<SharedSemiFuture<void>()>())),
+              SemiFuture<void>>);
+static_assert(std::is_same_v<  //
+              decltype(Future<int>().then(std::function<SharedSemiFuture<void>(int)>())),
+              SemiFuture<void>>);
+static_assert(std::is_same_v<  //
+              decltype(Future<void>().then(std::function<SharedSemiFuture<int>()>())),
+              SemiFuture<int>>);
+static_assert(std::is_same_v<  //
+              decltype(Future<int>().then(std::function<SharedSemiFuture<int>(int)>())),
+              SemiFuture<int>>);
+
+
+// Check deduction guides:
+static_assert(std::is_same_v<decltype(SemiFuture(0)), SemiFuture<int>>);
+static_assert(std::is_same_v<decltype(SemiFuture(StatusWith(0))), SemiFuture<int>>);
+static_assert(std::is_same_v<decltype(Future(0)), Future<int>>);
+static_assert(std::is_same_v<decltype(Future(StatusWith(0))), Future<int>>);
+static_assert(std::is_same_v<decltype(SharedSemiFuture(0)), SharedSemiFuture<int>>);
+static_assert(std::is_same_v<decltype(SharedSemiFuture(StatusWith(0))), SharedSemiFuture<int>>);
+
+static_assert(std::is_same_v<  //
+              decltype(ExecutorFuture(ExecutorPtr())),
+              ExecutorFuture<void>>);
+static_assert(std::is_same_v<  //
+              decltype(ExecutorFuture(ExecutorPtr(), 0)),
+              ExecutorFuture<int>>);
+static_assert(std::is_same_v<  //
+              decltype(ExecutorFuture(ExecutorPtr(), StatusWith(0))),
+              ExecutorFuture<int>>);
+
+template <template <typename...> typename FutureLike, typename... Args>
+auto ctadCheck(int) -> decltype(FutureLike(std::declval<Args>()...), std::true_type());
+template <template <typename...> typename FutureLike, typename... Args>
+std::false_type ctadCheck(...);
+
+// Future() and Future(status) are both banned even though they could resolve to Future<void>
+// It just seems too likely to lead to mistakes.
+static_assert(!decltype(ctadCheck<Future>(0))::value);
+static_assert(!decltype(ctadCheck<Future, Status>(0))::value);
+
+static_assert(!decltype(ctadCheck<Future, SemiFuture<int>>(0))::value);
+static_assert(!decltype(ctadCheck<SemiFuture, Future<int>>(0))::value);
+static_assert(!decltype(ctadCheck<ExecutorFuture, SemiFuture<int>>(0))::value);
+static_assert(decltype(ctadCheck<Future, Future<int>>(0))::value);
+static_assert(decltype(ctadCheck<SemiFuture, SemiFuture<int>>(0))::value);
+static_assert(decltype(ctadCheck<ExecutorFuture, ExecutorFuture<int>>(0))::value);
+
+// sanity checks of ctadCheck: (watch those watchmen!)
+static_assert(!decltype(ctadCheck<std::basic_string>(0))::value);
+static_assert(decltype(ctadCheck<std::basic_string, std::string>(0))::value);
+static_assert(decltype(ctadCheck<Future, int>(0))::value);
+static_assert(decltype(ctadCheck<Future, StatusWith<int>>(0))::value);
+
 // This is the motivating case for SharedStateBase::isJustForContinuation. Without that logic, there
 // would be a long chain of SharedStates, growing longer with each recursion. That logic exists to
 // limit it to a fixed-size chain.
@@ -70,36 +189,6 @@ TEST(Future_EdgeCases, looping_onError_with_then) {
     ASSERT_EQ(read().then([](int x) { return x + 0.5; }).get(), 0.5);
 }
 
-class DummyInterruptable final : public Interruptible {
-    StatusWith<stdx::cv_status> waitForConditionOrInterruptNoAssertUntil(
-        stdx::condition_variable& cv,
-        stdx::unique_lock<stdx::mutex>& m,
-        Date_t deadline) noexcept override {
-        return Status(ErrorCodes::Interrupted, "");
-    }
-    Date_t getDeadline() const override {
-        MONGO_UNREACHABLE;
-    }
-    Status checkForInterruptNoAssert() noexcept override {
-        MONGO_UNREACHABLE;
-    }
-    IgnoreInterruptsState pushIgnoreInterrupts() override {
-        MONGO_UNREACHABLE;
-    }
-    void popIgnoreInterrupts(IgnoreInterruptsState iis) override {
-        MONGO_UNREACHABLE;
-    }
-    DeadlineState pushArtificialDeadline(Date_t deadline, ErrorCodes::Error error) override {
-        MONGO_UNREACHABLE;
-    }
-    void popArtificialDeadline(DeadlineState) override {
-        MONGO_UNREACHABLE;
-    }
-    Date_t getExpirationDateForWaitForValue(Milliseconds waitFor) override {
-        MONGO_UNREACHABLE;
-    }
-};
-
 TEST(Future_EdgeCases, interrupted_wait_then_get) {
     DummyInterruptable dummyInterruptable;
 
@@ -121,12 +210,14 @@ TEST(Future_EdgeCases, interrupted_wait_then_get_with_bgthread) {
     auto future = async([] {});
 
     auto res = future.waitNoThrow(&dummyInterruptable);
-    if (!res.isOK())
+    if (!res.isOK()) {
         ASSERT_EQ(res, ErrorCodes::Interrupted);
+    }
 
     res = future.getNoThrow(&dummyInterruptable);
-    if (!res.isOK())
+    if (!res.isOK()) {
         ASSERT_EQ(res, ErrorCodes::Interrupted);
+    }
 
     future.get();
 }
@@ -152,17 +243,19 @@ TEST(Future_EdgeCases, interrupted_wait_then_then_with_bgthread) {
     auto future = async([] {});
 
     auto res = future.waitNoThrow(&dummyInterruptable);
-    if (!res.isOK())
+    if (!res.isOK()) {
         ASSERT_EQ(res, ErrorCodes::Interrupted);
+    }
 
     res = future.getNoThrow(&dummyInterruptable);
-    if (!res.isOK())
+    if (!res.isOK()) {
         ASSERT_EQ(res, ErrorCodes::Interrupted);
+    }
 
     std::move(future).then([] {}).get();
 }
 
-TEST(Future_EdgeCases, Racing_SharePromise_getFuture_and_emplaceValue) {
+TEST(Future_EdgeCases, Racing_SharedPromise_getFuture_and_emplaceValue) {
     SharedPromise<void> sp;
     std::vector<Future<void>> futs;
     futs.reserve(30);
@@ -178,13 +271,13 @@ TEST(Future_EdgeCases, Racing_SharePromise_getFuture_and_emplaceValue) {
         futs.push_back(async([&] { sp.getFuture().get(); }));
     }
 
-    sleepUnlessInTsan();
+    sleepIfShould();
 
     for (int i = 0; i < 10; i++) {
         futs.push_back(async([&] { sp.getFuture().get(); }));
     }
 
-    sleepUnlessInTsan();
+    sleepIfShould();
 
     sp.emplaceValue();
 
@@ -197,7 +290,7 @@ TEST(Future_EdgeCases, Racing_SharePromise_getFuture_and_emplaceValue) {
     }
 }
 
-TEST(Future_EdgeCases, Racing_SharePromise_getFuture_and_setError) {
+TEST(Future_EdgeCases, Racing_SharedPromise_getFuture_and_setError) {
     SharedPromise<void> sp;
     std::vector<Future<void>> futs;
     futs.reserve(30);
@@ -213,13 +306,13 @@ TEST(Future_EdgeCases, Racing_SharePromise_getFuture_and_setError) {
         futs.push_back(async([&] { sp.getFuture().get(); }));
     }
 
-    sleepUnlessInTsan();
+    sleepIfShould();
 
     for (int i = 0; i < 10; i++) {
         futs.push_back(async([&] { sp.getFuture().get(); }));
     }
 
-    sleepUnlessInTsan();
+    sleepIfShould();
 
     sp.setError(failStatus());
 
@@ -230,6 +323,23 @@ TEST(Future_EdgeCases, Racing_SharePromise_getFuture_and_setError) {
     for (auto& fut : futs) {
         ASSERT_EQ(fut.getNoThrow(), failStatus());
     }
+}
+
+TEST(Future_EdgeCases, SharedPromise_CompleteWithUnreadyFuture) {
+    SharedSemiFuture<void> sf;
+    auto [promise, future] = makePromiseFuture<void>();
+
+    {
+        SharedPromise<void> sp;
+        sf = sp.getFuture();
+        sp.setFrom(std::move(future));
+    }
+
+    ASSERT(!sf.isReady());
+
+    promise.emplaceValue();
+    ASSERT(sf.isReady());
+    sf.get();
 }
 
 // Make sure we actually die if someone throws from the getAsync callback.

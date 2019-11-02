@@ -36,9 +36,8 @@
 #include "mongo/db/curop_failpoint_helpers.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/query/query_knobs_gen.h"
-#include "mongo/db/query/query_yield.h"
 #include "mongo/db/service_context.h"
-#include "mongo/util/fail_point_service.h"
+#include "mongo/util/fail_point.h"
 #include "mongo/util/scopeguard.h"
 #include "mongo/util/time_support.h"
 
@@ -70,10 +69,6 @@ bool PlanYieldPolicy::shouldYieldOrInterrupt() {
     if (_policy == PlanExecutor::INTERRUPT_ONLY) {
         return _elapsedTracker.intervalHasElapsed();
     }
-    return shouldYield();
-}
-
-bool PlanYieldPolicy::shouldYield() {
     if (!canAutoYield())
         return false;
     invariant(!_planYielding->getOpCtx()->lockState()->inAWriteUnitOfWork());
@@ -86,7 +81,7 @@ void PlanYieldPolicy::resetTimer() {
     _elapsedTracker.resetLastTime();
 }
 
-Status PlanYieldPolicy::yieldOrInterrupt(stdx::function<void()> whileYieldingFn) {
+Status PlanYieldPolicy::yieldOrInterrupt(std::function<void()> whileYieldingFn) {
     invariant(_planYielding);
 
     if (_policy == PlanExecutor::INTERRUPT_ONLY) {
@@ -95,7 +90,7 @@ Status PlanYieldPolicy::yieldOrInterrupt(stdx::function<void()> whileYieldingFn)
         invariant(opCtx);
         // If the 'setInterruptOnlyPlansCheckForInterruptHang' fail point is enabled, set the 'msg'
         // field of this operation's CurOp to signal that we've hit this point.
-        if (MONGO_FAIL_POINT(setInterruptOnlyPlansCheckForInterruptHang)) {
+        if (MONGO_unlikely(setInterruptOnlyPlansCheckForInterruptHang.shouldFail())) {
             CurOpFailpointHelpers::waitWhileFailPointEnabled(
                 &setInterruptOnlyPlansCheckForInterruptHang,
                 opCtx,
@@ -105,11 +100,6 @@ Status PlanYieldPolicy::yieldOrInterrupt(stdx::function<void()> whileYieldingFn)
         return opCtx->checkForInterruptNoAssert();
     }
 
-    return yield(whileYieldingFn);
-}
-
-Status PlanYieldPolicy::yield(stdx::function<void()> whileYieldingFn) {
-    invariant(_planYielding);
     invariant(canAutoYield());
 
     // After we finish yielding (or in any early return), call resetTimer() to prevent yielding
@@ -126,16 +116,6 @@ Status PlanYieldPolicy::yield(stdx::function<void()> whileYieldingFn) {
     // Can't use writeConflictRetry since we need to call saveState before reseting the transaction.
     for (int attempt = 1; true; attempt++) {
         try {
-            // All YIELD_AUTO plans will get here eventually when the elapsed tracker triggers
-            // that it's time to yield. Whether or not we will actually yield, we need to check
-            // if this operation has been interrupted.
-            if (_policy == PlanExecutor::YIELD_AUTO) {
-                auto interruptStatus = opCtx->checkForInterruptNoAssert();
-                if (!interruptStatus.isOK()) {
-                    return interruptStatus;
-                }
-            }
-
             try {
                 _planYielding->saveState();
             } catch (const WriteConflictException&) {
@@ -147,7 +127,7 @@ Status PlanYieldPolicy::yield(stdx::function<void()> whileYieldingFn) {
                 opCtx->recoveryUnit()->abandonSnapshot();
             } else {
                 // Release and reacquire locks.
-                QueryYield::yieldAllLocks(opCtx, whileYieldingFn, _planYielding->nss());
+                _yieldAllLocks(opCtx, whileYieldingFn, _planYielding->nss());
             }
 
             _planYielding->restoreStateWithoutRetrying();
@@ -163,6 +143,71 @@ Status PlanYieldPolicy::yield(stdx::function<void()> whileYieldingFn) {
             return exceptionToStatus();
         }
     }
+}
+
+namespace {
+MONGO_FAIL_POINT_DEFINE(setYieldAllLocksHang);
+MONGO_FAIL_POINT_DEFINE(setYieldAllLocksWait);
+}  // namespace
+
+void PlanYieldPolicy::_yieldAllLocks(OperationContext* opCtx,
+                                     std::function<void()> whileYieldingFn,
+                                     const NamespaceString& planExecNS) {
+    // Things have to happen here in a specific order:
+    //   * Release lock mgr locks
+    //   * Check for interrupt (kill flag is set)
+    //   * Call the whileYieldingFn
+    //   * Reacquire lock mgr locks
+
+    Locker* locker = opCtx->lockState();
+
+    Locker::LockSnapshot snapshot;
+
+    auto unlocked = locker->saveLockStateAndUnlock(&snapshot);
+
+    // Attempt to check for interrupt while locks are not held, in order to discourage the
+    // assumption that locks will always be held when a Plan Executor returns an error.
+    if (_policy == PlanExecutor::YIELD_AUTO) {
+        opCtx->checkForInterrupt();  // throws
+    }
+
+    if (!unlocked) {
+        // Nothing was unlocked, just return, yielding is pointless.
+        return;
+    }
+
+    // Top-level locks are freed, release any potential low-level (storage engine-specific
+    // locks). If we are yielding, we are at a safe place to do so.
+    opCtx->recoveryUnit()->abandonSnapshot();
+
+    // Track the number of yields in CurOp.
+    CurOp::get(opCtx)->yielded();
+
+    setYieldAllLocksHang.executeIf(
+        [opCtx](const BSONObj& config) {
+            setYieldAllLocksHang.pauseWhileSet();
+
+            if (config.getField("checkForInterruptAfterHang").trueValue()) {
+                // Throws.
+                opCtx->checkForInterrupt();
+            }
+        },
+        [&](const BSONObj& config) {
+            StringData ns = config.getStringField("namespace");
+            return ns.empty() || ns == planExecNS.ns();
+        });
+    setYieldAllLocksWait.executeIf(
+        [&](const BSONObj& data) { sleepFor(Milliseconds(data["waitForMillis"].numberInt())); },
+        [&](const BSONObj& config) {
+            BSONElement dataNs = config["namespace"];
+            return !dataNs || planExecNS.ns() == dataNs.str();
+        });
+
+    if (whileYieldingFn) {
+        whileYieldingFn();
+    }
+
+    locker->restoreLockState(opCtx, snapshot);
 }
 
 }  // namespace mongo

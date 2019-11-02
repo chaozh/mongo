@@ -36,7 +36,6 @@
 #include <string>
 #include <vector>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
 #include "mongo/base/string_data.h"
@@ -44,7 +43,7 @@
 #include "mongo/bson/timestamp.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/repl/storage_interface.h"
-#include "mongo/stdx/mutex.h"
+#include "mongo/platform/mutex.h"
 
 namespace mongo {
 namespace repl {
@@ -56,7 +55,8 @@ struct CollectionMockStats {
 };
 
 class CollectionBulkLoaderMock : public CollectionBulkLoader {
-    MONGO_DISALLOW_COPYING(CollectionBulkLoaderMock);
+    CollectionBulkLoaderMock(const CollectionBulkLoaderMock&) = delete;
+    CollectionBulkLoaderMock& operator=(const CollectionBulkLoaderMock&) = delete;
 
 public:
     explicit CollectionBulkLoaderMock(std::shared_ptr<CollectionMockStats> collStats)
@@ -87,7 +87,8 @@ public:
 };
 
 class StorageInterfaceMock : public StorageInterface {
-    MONGO_DISALLOW_COPYING(StorageInterfaceMock);
+    StorageInterfaceMock(const StorageInterfaceMock&) = delete;
+    StorageInterfaceMock& operator=(const StorageInterfaceMock&) = delete;
 
 public:
     // Used for testing.
@@ -125,7 +126,6 @@ public:
     using IsAdminDbValidFn = std::function<Status(OperationContext*)>;
     using GetCollectionUUIDFn = std::function<StatusWith<OptionalCollectionUUID>(
         OperationContext*, const NamespaceString&)>;
-    using UpgradeNonReplicatedUniqueIndexesFn = std::function<Status(OperationContext*)>;
 
     StorageInterfaceMock() = default;
 
@@ -284,9 +284,6 @@ public:
         return getCollectionUUIDFn(opCtx, nss);
     }
 
-    Status upgradeNonReplicatedUniqueIndexes(OperationContext* opCtx) override {
-        return upgradeNonReplicatedUniqueIndexesFn(opCtx);
-    }
     void setStableTimestamp(ServiceContext* serviceCtx, Timestamp snapshotName) override;
 
     void setInitialDataTimestamp(ServiceContext* serviceCtx, Timestamp snapshotName) override;
@@ -307,11 +304,13 @@ public:
         return false;
     }
 
+    void initializeStorageControlsForReplication(ServiceContext* serviceCtx) const override {}
+
     boost::optional<Timestamp> getRecoveryTimestamp(ServiceContext* serviceCtx) const override {
         return boost::none;
     }
 
-    Timestamp getAllCommittedTimestamp(ServiceContext* serviceCtx) const override;
+    Timestamp getAllDurableTimestamp(ServiceContext* serviceCtx) const override;
 
     Timestamp getOldestOpenReadTimestamp(ServiceContext* serviceCtx) const override;
 
@@ -337,11 +336,6 @@ public:
         return boost::none;
     }
 
-    boost::optional<Timestamp> getLastStableCheckpointTimestampDeprecated(
-        ServiceContext* serviceCtx) const override {
-        return boost::none;
-    }
-
     Timestamp getPointInTimeReadTimestamp(OperationContext* opCtx) const override {
         return {};
     }
@@ -351,8 +345,8 @@ public:
         [](const NamespaceString& nss,
            const CollectionOptions& options,
            const BSONObj idIndexSpec,
-           const std::vector<BSONObj>&
-               secondaryIndexSpecs) -> StatusWith<std::unique_ptr<CollectionBulkLoader>> {
+           const std::vector<BSONObj>& secondaryIndexSpecs)
+        -> StatusWith<std::unique_ptr<CollectionBulkLoader>> {
         return Status{ErrorCodes::IllegalOperation, "CreateCollectionForBulkFn not implemented."};
     };
     InsertDocumentFn insertDocumentFn = [](OperationContext* opCtx,
@@ -403,22 +397,18 @@ public:
     IsAdminDbValidFn isAdminDbValidFn = [](OperationContext*) {
         return Status{ErrorCodes::IllegalOperation, "IsAdminDbValidFn not implemented."};
     };
-    GetCollectionUUIDFn getCollectionUUIDFn = [](
-        OperationContext* opCtx, const NamespaceString& nss) -> StatusWith<OptionalCollectionUUID> {
+    GetCollectionUUIDFn getCollectionUUIDFn =
+        [](OperationContext* opCtx,
+           const NamespaceString& nss) -> StatusWith<OptionalCollectionUUID> {
         return Status{ErrorCodes::IllegalOperation, "GetCollectionUUIDFn not implemented."};
-    };
-    UpgradeNonReplicatedUniqueIndexesFn upgradeNonReplicatedUniqueIndexesFn =
-        [](OperationContext* opCtx) -> Status {
-        return Status{ErrorCodes::IllegalOperation,
-                      "upgradeNonReplicatedUniqueIndexesFn not implemented."};
     };
 
     bool supportsDocLockingBool = false;
-    Timestamp allCommittedTimestamp = Timestamp::min();
+    Timestamp allDurableTimestamp = Timestamp::min();
     Timestamp oldestOpenReadTimestamp = Timestamp::min();
 
 private:
-    mutable stdx::mutex _mutex;
+    mutable Mutex _mutex = MONGO_MAKE_LATCH("StorageInterfaceMock::_mutex");
     int _rbid;
     bool _rbidInitialized = false;
     Timestamp _stableTimestamp = Timestamp::min();

@@ -47,7 +47,7 @@ InternalSchemaAllElemMatchFromIndexMatchExpression::
 
 std::unique_ptr<MatchExpression> InternalSchemaAllElemMatchFromIndexMatchExpression::shallowClone()
     const {
-    auto clone = stdx::make_unique<InternalSchemaAllElemMatchFromIndexMatchExpression>(
+    auto clone = std::make_unique<InternalSchemaAllElemMatchFromIndexMatchExpression>(
         path(), _index, _expression->shallowClone());
     if (getTag()) {
         clone->setTag(getTag()->clone());
@@ -66,11 +66,11 @@ bool InternalSchemaAllElemMatchFromIndexMatchExpression::equivalent(
 }
 
 void InternalSchemaAllElemMatchFromIndexMatchExpression::debugString(StringBuilder& debug,
-                                                                     int level) const {
-    _debugAddSpace(debug, level);
+                                                                     int indentationLevel) const {
+    _debugAddSpace(debug, indentationLevel);
     debug << kName << "\n";
     debug << " index: " << _index << ", query:\n";
-    _expression->getFilter()->debugString(debug, level + 1);
+    _expression->getFilter()->debugString(debug, indentationLevel + 1);
 }
 
 BSONObj InternalSchemaAllElemMatchFromIndexMatchExpression::getSerializedRightHandSide() const {

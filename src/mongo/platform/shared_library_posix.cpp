@@ -34,11 +34,11 @@
 
 #include <boost/filesystem.hpp>
 #include <dlfcn.h>
+#include <memory>
 
-#include "mongo/stdx/memory.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -79,8 +79,7 @@ StatusWith<void*> SharedLibrary::getSymbol(StringData name) {
     if (error_msg != nullptr) {
         return StatusWith<void*>(ErrorCodes::InternalError,
                                  str::stream() << "dlsym failed for symbol " << name
-                                               << " with error message: "
-                                               << error_msg);
+                                               << " with error message: " << error_msg);
     }
 
     return StatusWith<void*>(symbol);

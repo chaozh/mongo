@@ -39,7 +39,7 @@
 
 #include <boost/align/aligned_allocator.hpp>
 
-#include "mongo/stdx/mutex.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/with_alignment.h"
 
@@ -237,7 +237,7 @@ public:
                 KeyPartitioner()(partitioned_detail::getKey(value), nPartitions);
             this->_partitionedContainer->_partitions[partitionId].insert(std::move(value));
         }
-        void insert(value_type)&& = delete;
+        void insert(value_type) && = delete;
 
         /**
          * Erases one entry from the partitioned structure, returns the number of entries removed.

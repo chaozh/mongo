@@ -43,99 +43,104 @@ ThreadPoolMock::ThreadPoolMock(NetworkInterfaceMock* net, int32_t prngSeed, Opti
     : _options(std::move(options)), _prng(prngSeed), _net(net) {}
 
 ThreadPoolMock::~ThreadPoolMock() {
-    stdx::unique_lock<stdx::mutex> lk(_mutex);
-    _inShutdown = true;
-    _net->signalWorkAvailable();
-    _net->exitNetwork();
-    if (_started) {
-        if (_worker.joinable()) {
-            lk.unlock();
-            _worker.join();
-            lk.lock();
-        }
-    } else {
-        consumeTasks(&lk);
-    }
-    invariant(_tasks.empty());
+    stdx::unique_lock<Latch> lk(_mutex);
+    if (_joining)
+        return;
+
+    _shutdown(lk);
+    _join(lk);
 }
 
 void ThreadPoolMock::startup() {
     LOG(1) << "Starting pool";
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     invariant(!_started);
     invariant(!_worker.joinable());
     _started = true;
     _worker = stdx::thread([this] {
         _options.onCreateThread();
-        stdx::unique_lock<stdx::mutex> lk(_mutex);
-        consumeTasks(&lk);
+        stdx::unique_lock<Latch> lk(_mutex);
+
+        LOG(1) << "Starting to consume tasks";
+        while (!_joining) {
+            if (_tasks.empty()) {
+                lk.unlock();
+                _net->waitForWork();
+                lk.lock();
+                continue;
+            }
+
+            _consumeOneTask(lk);
+        }
+        LOG(1) << "Done consuming tasks";
     });
 }
 
 void ThreadPoolMock::shutdown() {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::unique_lock<Latch> lk(_mutex);
+    _shutdown(lk);
+}
+
+void ThreadPoolMock::join() {
+    stdx::unique_lock<Latch> lk(_mutex);
+    _join(lk);
+}
+
+void ThreadPoolMock::schedule(Task task) {
+    stdx::unique_lock<Latch> lk(_mutex);
+    if (_inShutdown) {
+        lk.unlock();
+
+        task({ErrorCodes::ShutdownInProgress, "Shutdown in progress"});
+        return;
+    }
+
+    _tasks.emplace_back(std::move(task));
+}
+
+void ThreadPoolMock::_consumeOneTask(stdx::unique_lock<Latch>& lk) {
+    auto next = static_cast<size_t>(_prng.nextInt64(static_cast<int64_t>(_tasks.size())));
+    if (next + 1 != _tasks.size()) {
+        std::swap(_tasks[next], _tasks.back());
+    }
+    Task fn = std::move(_tasks.back());
+    _tasks.pop_back();
+    lk.unlock();
+    if (_inShutdown) {
+        fn({ErrorCodes::ShutdownInProgress, "Shutdown in progress"});
+    } else {
+        fn(Status::OK());
+    }
+    lk.lock();
+}
+
+void ThreadPoolMock::_shutdown(stdx::unique_lock<Latch>& lk) {
+    LOG(1) << "Shutting down pool";
+
     _inShutdown = true;
     _net->signalWorkAvailable();
 }
 
-void ThreadPoolMock::join() {
-    stdx::unique_lock<stdx::mutex> lk(_mutex);
+void ThreadPoolMock::_join(stdx::unique_lock<Latch>& lk) {
+    LOG(1) << "Joining pool";
+
     _joining = true;
+    _net->signalWorkAvailable();
+    _net->exitNetwork();
+
+    // Since there is only one worker thread, we need to consume tasks here to potentially
+    // unblock that thread.
+    while (!_tasks.empty()) {
+        _consumeOneTask(lk);
+    }
+
     if (_started) {
-        stdx::thread toJoin = std::move(_worker);
-        _net->signalWorkAvailable();
-        _net->exitNetwork();
         lk.unlock();
-        toJoin.join();
+        _worker.join();
         lk.lock();
-        invariant(_tasks.empty());
-    } else {
-        consumeTasks(&lk);
-        invariant(_tasks.empty());
     }
-}
-
-Status ThreadPoolMock::schedule(Task task) {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
-    if (_inShutdown) {
-        return {ErrorCodes::ShutdownInProgress, "Shutdown in progress"};
-    }
-    _tasks.emplace_back(std::move(task));
-    return Status::OK();
-}
-
-void ThreadPoolMock::consumeTasks(stdx::unique_lock<stdx::mutex>* lk) {
-    using std::swap;
-
-    LOG(1) << "Starting to consume tasks";
-    while (!(_inShutdown && _tasks.empty())) {
-        if (_tasks.empty()) {
-            lk->unlock();
-            _net->waitForWork();
-            lk->lock();
-            continue;
-        }
-        auto next = static_cast<size_t>(_prng.nextInt64(static_cast<int64_t>(_tasks.size())));
-        if (next + 1 != _tasks.size()) {
-            swap(_tasks[next], _tasks.back());
-        }
-        Task fn = std::move(_tasks.back());
-        _tasks.pop_back();
-        lk->unlock();
-        fn();
-        lk->lock();
-    }
-    LOG(1) << "Done consuming tasks";
 
     invariant(_tasks.empty());
-
-    while (_started && !_joining) {
-        lk->unlock();
-        _net->waitForWork();
-        lk->lock();
-    }
-
-    LOG(1) << "Ready to join";
 }
 
 }  // namespace executor

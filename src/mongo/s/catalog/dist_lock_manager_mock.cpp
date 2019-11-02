@@ -36,7 +36,7 @@
 #include <algorithm>
 
 #include "mongo/unittest/unittest.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
@@ -45,12 +45,8 @@ namespace {
 
 void NoLockFuncSet(StringData name, StringData whyMessage, Milliseconds waitFor) {
     FAIL(str::stream() << "Lock not expected to be called. "
-                       << "Name: "
-                       << name
-                       << ", whyMessage: "
-                       << whyMessage
-                       << ", waitFor: "
-                       << waitFor);
+                       << "Name: " << name << ", whyMessage: " << whyMessage
+                       << ", waitFor: " << waitFor);
 }
 
 }  // namespace

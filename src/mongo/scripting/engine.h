@@ -29,6 +29,7 @@
 
 #pragma once
 
+#include "mongo/base/string_data.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/service_context.h"
 #include "mongo/platform/atomic_word.h"
@@ -47,7 +48,8 @@ struct JSFile {
 };
 
 class Scope {
-    MONGO_DISALLOW_COPYING(Scope);
+    Scope(const Scope&) = delete;
+    Scope& operator=(const Scope&) = delete;
 
 public:
     Scope();
@@ -64,8 +66,8 @@ public:
     }
 
     virtual void externalSetup() = 0;
-    virtual void setLocalDB(const std::string& localDBName) {
-        _localDBName = localDBName;
+    virtual void setLocalDB(StringData localDBName) {
+        _localDBName = localDBName.toString();
     }
 
     virtual BSONObj getObject(const char* field) = 0;
@@ -139,7 +141,7 @@ public:
         uasserted(9005, std::string("invoke failed: ") + getError());
     }
 
-    virtual void injectNative(const char* field, NativeFunction func, void* data = 0) = 0;
+    virtual void injectNative(const char* field, NativeFunction func, void* data = nullptr) = 0;
 
     virtual bool exec(StringData code,
                       const std::string& name,
@@ -204,10 +206,11 @@ protected:
 };
 
 class ScriptEngine : public KillOpListenerInterface {
-    MONGO_DISALLOW_COPYING(ScriptEngine);
+    ScriptEngine(const ScriptEngine&) = delete;
+    ScriptEngine& operator=(const ScriptEngine&) = delete;
 
 public:
-    ScriptEngine();
+    ScriptEngine(bool disableLoadStored);
     virtual ~ScriptEngine();
 
     virtual Scope* newScope() {
@@ -231,7 +234,12 @@ public:
     virtual int getJSHeapLimitMB() const = 0;
     virtual void setJSHeapLimitMB(int limit) = 0;
 
-    static void setup();
+    /**
+     * Calls the constructor for the Global ScriptEngine. 'disableLoadStored' causes future calls to
+     * the function Scope::loadStored(), which would otherwise load stored procedures, to be
+     * ignored.
+     */
+    static void setup(bool disableLoadStored = true);
     static void dropScopeCache();
 
     /** gets a scope from the pool or a new one if pool is empty
@@ -261,6 +269,7 @@ public:
     virtual void interruptAll() {}
 
     static std::string getInterpreterVersionString();
+    const bool _disableLoadStored;
 
 protected:
     virtual Scope* createScope() = 0;
@@ -277,4 +286,4 @@ const char* jsSkipWhiteSpace(const char* raw);
 
 ScriptEngine* getGlobalScriptEngine();
 void setGlobalScriptEngine(ScriptEngine* impl);
-}
+}  // namespace mongo

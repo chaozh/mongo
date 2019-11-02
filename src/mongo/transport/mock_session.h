@@ -38,7 +38,8 @@ namespace mongo {
 namespace transport {
 
 class MockSession : public Session {
-    MONGO_DISALLOW_COPYING(MockSession);
+    MockSession(const MockSession&) = delete;
+    MockSession& operator=(const MockSession&) = delete;
 
 public:
     static std::shared_ptr<MockSession> create(TransportLayer* tl) {
@@ -48,9 +49,11 @@ public:
 
     static std::shared_ptr<MockSession> create(HostAndPort remote,
                                                HostAndPort local,
+                                               SockAddr remoteAddr,
+                                               SockAddr localAddr,
                                                TransportLayer* tl) {
-        std::shared_ptr<MockSession> handle(
-            new MockSession(std::move(remote), std::move(local), tl));
+        std::shared_ptr<MockSession> handle(new MockSession(
+            std::move(remote), std::move(local), std::move(remoteAddr), std::move(localAddr), tl));
         return handle;
     }
 
@@ -64,6 +67,14 @@ public:
 
     const HostAndPort& local() const override {
         return _local;
+    }
+
+    const SockAddr& remoteAddr() const override {
+        return _remoteAddr;
+    }
+
+    const SockAddr& localAddr() const override {
+        return _localAddr;
     }
 
     void end() override {
@@ -114,16 +125,24 @@ public:
 
     explicit MockSession(TransportLayer* tl)
         : _tl(checked_cast<TransportLayerMock*>(tl)), _remote(), _local() {}
-    explicit MockSession(HostAndPort remote, HostAndPort local, TransportLayer* tl)
+    explicit MockSession(HostAndPort remote,
+                         HostAndPort local,
+                         SockAddr remoteAddr,
+                         SockAddr localAddr,
+                         TransportLayer* tl)
         : _tl(checked_cast<TransportLayerMock*>(tl)),
           _remote(std::move(remote)),
-          _local(std::move(local)) {}
+          _local(std::move(local)),
+          _remoteAddr(std::move(remoteAddr)),
+          _localAddr(std::move(localAddr)) {}
 
 protected:
     TransportLayerMock* _tl;
 
     HostAndPort _remote;
     HostAndPort _local;
+    SockAddr _remoteAddr;
+    SockAddr _localAddr;
 };
 
 }  // namespace transport

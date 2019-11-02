@@ -51,7 +51,7 @@ TEST(ParsedDistinctTest, ConvertToAggregationNoQuery) {
 
     auto pd = ParsedDistinct::parse(opCtx,
                                     testns,
-                                    fromjson("{distinct: 'testcoll', key: 'x'}"),
+                                    fromjson("{distinct: 'testcoll', key: 'x', $db: 'testdb'}"),
                                     ExtensionsCallbackNoop(),
                                     !isExplain);
     ASSERT_OK(pd.getStatus());
@@ -67,16 +67,65 @@ TEST(ParsedDistinctTest, ConvertToAggregationNoQuery) {
     ASSERT_BSONOBJ_EQ(ar.getValue().getCollation(), BSONObj());
     ASSERT(ar.getValue().getReadConcern().isEmpty());
     ASSERT(ar.getValue().getUnwrappedReadPref().isEmpty());
-    ASSERT(ar.getValue().getComment().empty());
     ASSERT_EQUALS(ar.getValue().getMaxTimeMS(), 0u);
 
     std::vector<BSONObj> expectedPipeline{
         BSON("$unwind" << BSON("path"
                                << "$x"
-                               << "preserveNullAndEmptyArrays"
-                               << true)),
-        BSON("$group" << BSON("_id" << BSONNULL << "distinct" << BSON("$addToSet"
-                                                                      << "$x")))};
+                               << "preserveNullAndEmptyArrays" << true)),
+        BSON("$group" << BSON("_id" << BSONNULL << "distinct"
+                                    << BSON("$addToSet"
+                                            << "$x")))};
+    ASSERT(std::equal(expectedPipeline.begin(),
+                      expectedPipeline.end(),
+                      ar.getValue().getPipeline().begin(),
+                      ar.getValue().getPipeline().end(),
+                      SimpleBSONObjComparator::kInstance.makeEqualTo()));
+}
+
+TEST(ParsedDistinctTest, ConvertToAggregationDottedPathNoQuery) {
+    QueryTestServiceContext serviceContext;
+    auto uniqueTxn = serviceContext.makeOperationContext();
+    OperationContext* opCtx = uniqueTxn.get();
+
+    auto pd = ParsedDistinct::parse(opCtx,
+                                    testns,
+                                    fromjson("{distinct: 'testcoll', key: 'x.y.z', $db: 'testdb'}"),
+                                    ExtensionsCallbackNoop(),
+                                    !isExplain);
+    ASSERT_OK(pd.getStatus());
+
+    auto agg = pd.getValue().asAggregationCommand();
+    ASSERT_OK(agg);
+
+    auto ar = AggregationRequest::parseFromBSON(testns, agg.getValue());
+    ASSERT_OK(ar.getStatus());
+    ASSERT(!ar.getValue().getExplain());
+    ASSERT_EQ(ar.getValue().getBatchSize(), AggregationRequest::kDefaultBatchSize);
+    ASSERT_EQ(ar.getValue().getNamespaceString(), testns);
+    ASSERT_BSONOBJ_EQ(ar.getValue().getCollation(), BSONObj());
+    ASSERT(ar.getValue().getReadConcern().isEmpty());
+    ASSERT(ar.getValue().getUnwrappedReadPref().isEmpty());
+    ASSERT_EQUALS(ar.getValue().getMaxTimeMS(), 0u);
+
+    std::vector<BSONObj> expectedPipeline{
+        BSON("$unwind" << BSON("path"
+                               << "$x"
+                               << "preserveNullAndEmptyArrays" << true)),
+        BSON("$unwind" << BSON("path"
+                               << "$x.y"
+                               << "preserveNullAndEmptyArrays" << true)),
+        BSON("$unwind" << BSON("path"
+                               << "$x.y.z"
+                               << "preserveNullAndEmptyArrays" << true)),
+        BSON("$match" << BSON("x" << BSON("$_internalSchemaType"
+                                          << "object")
+                                  << "x.y"
+                                  << BSON("$_internalSchemaType"
+                                          << "object"))),
+        BSON("$group" << BSON("_id" << BSONNULL << "distinct"
+                                    << BSON("$addToSet"
+                                            << "$x.y.z")))};
     ASSERT(std::equal(expectedPipeline.begin(),
                       expectedPipeline.end(),
                       ar.getValue().getPipeline().begin(),
@@ -95,8 +144,6 @@ TEST(ParsedDistinctTest, ConvertToAggregationWithAllOptions) {
                                          << "testcoll"
                                          << "key"
                                          << "x"
-                                         << "hint"
-                                         << BSON("b" << 5)
                                          << "collation"
                                          << BSON("locale"
                                                  << "en_US")
@@ -106,10 +153,8 @@ TEST(ParsedDistinctTest, ConvertToAggregationWithAllOptions) {
                                          << "$queryOptions"
                                          << BSON("readPreference"
                                                  << "secondary")
-                                         << "comment"
-                                         << "aComment"
-                                         << "maxTimeMS"
-                                         << 100),
+                                         << "maxTimeMS" << 100 << "$db"
+                                         << "testdb"),
                                     ExtensionsCallbackNoop(),
                                     !isExplain);
     ASSERT_OK(pd.getStatus());
@@ -131,16 +176,15 @@ TEST(ParsedDistinctTest, ConvertToAggregationWithAllOptions) {
     ASSERT_BSONOBJ_EQ(ar.getValue().getUnwrappedReadPref(),
                       BSON("readPreference"
                            << "secondary"));
-    ASSERT_EQUALS(ar.getValue().getComment(), "aComment");
     ASSERT_EQUALS(ar.getValue().getMaxTimeMS(), 100u);
 
     std::vector<BSONObj> expectedPipeline{
         BSON("$unwind" << BSON("path"
                                << "$x"
-                               << "preserveNullAndEmptyArrays"
-                               << true)),
-        BSON("$group" << BSON("_id" << BSONNULL << "distinct" << BSON("$addToSet"
-                                                                      << "$x")))};
+                               << "preserveNullAndEmptyArrays" << true)),
+        BSON("$group" << BSON("_id" << BSONNULL << "distinct"
+                                    << BSON("$addToSet"
+                                            << "$x")))};
     ASSERT(std::equal(expectedPipeline.begin(),
                       expectedPipeline.end(),
                       ar.getValue().getPipeline().begin(),
@@ -153,11 +197,12 @@ TEST(ParsedDistinctTest, ConvertToAggregationWithQuery) {
     auto uniqueTxn = serviceContext.makeOperationContext();
     OperationContext* opCtx = uniqueTxn.get();
 
-    auto pd = ParsedDistinct::parse(opCtx,
-                                    testns,
-                                    fromjson("{distinct: 'testcoll', key: 'y', query: {z: 7}}"),
-                                    ExtensionsCallbackNoop(),
-                                    !isExplain);
+    auto pd = ParsedDistinct::parse(
+        opCtx,
+        testns,
+        fromjson("{distinct: 'testcoll', key: 'y', query: {z: 7}, $db: 'testdb'}"),
+        ExtensionsCallbackNoop(),
+        !isExplain);
     ASSERT_OK(pd.getStatus());
 
     auto agg = pd.getValue().asAggregationCommand();
@@ -171,17 +216,16 @@ TEST(ParsedDistinctTest, ConvertToAggregationWithQuery) {
     ASSERT_BSONOBJ_EQ(ar.getValue().getCollation(), BSONObj());
     ASSERT(ar.getValue().getReadConcern().isEmpty());
     ASSERT(ar.getValue().getUnwrappedReadPref().isEmpty());
-    ASSERT(ar.getValue().getComment().empty());
     ASSERT_EQUALS(ar.getValue().getMaxTimeMS(), 0u);
 
     std::vector<BSONObj> expectedPipeline{
         BSON("$match" << BSON("z" << 7)),
         BSON("$unwind" << BSON("path"
                                << "$y"
-                               << "preserveNullAndEmptyArrays"
-                               << true)),
-        BSON("$group" << BSON("_id" << BSONNULL << "distinct" << BSON("$addToSet"
-                                                                      << "$y")))};
+                               << "preserveNullAndEmptyArrays" << true)),
+        BSON("$group" << BSON("_id" << BSONNULL << "distinct"
+                                    << BSON("$addToSet"
+                                            << "$y")))};
     ASSERT(std::equal(expectedPipeline.begin(),
                       expectedPipeline.end(),
                       ar.getValue().getPipeline().begin(),
@@ -196,7 +240,7 @@ TEST(ParsedDistinctTest, ExplainNotIncludedWhenConvertingToAggregationCommand) {
 
     auto pd = ParsedDistinct::parse(opCtx,
                                     testns,
-                                    fromjson("{distinct: 'testcoll', key: 'x'}"),
+                                    fromjson("{distinct: 'testcoll', key: 'x', $db: 'testdb'}"),
                                     ExtensionsCallbackNoop(),
                                     isExplain);
     ASSERT_OK(pd.getStatus());
@@ -215,15 +259,80 @@ TEST(ParsedDistinctTest, ExplainNotIncludedWhenConvertingToAggregationCommand) {
     std::vector<BSONObj> expectedPipeline{
         BSON("$unwind" << BSON("path"
                                << "$x"
-                               << "preserveNullAndEmptyArrays"
-                               << true)),
-        BSON("$group" << BSON("_id" << BSONNULL << "distinct" << BSON("$addToSet"
-                                                                      << "$x")))};
+                               << "preserveNullAndEmptyArrays" << true)),
+        BSON("$group" << BSON("_id" << BSONNULL << "distinct"
+                                    << BSON("$addToSet"
+                                            << "$x")))};
     ASSERT(std::equal(expectedPipeline.begin(),
                       expectedPipeline.end(),
                       ar.getValue().getPipeline().begin(),
                       ar.getValue().getPipeline().end(),
                       SimpleBSONObjComparator::kInstance.makeEqualTo()));
+}
+
+TEST(ParsedDistinctTest, FailsToParseDistinctWithUnknownFields) {
+    QueryTestServiceContext serviceContext;
+    auto uniqueTxn = serviceContext.makeOperationContext();
+    OperationContext* opCtx = uniqueTxn.get();
+
+    BSONObj cmdObj = fromjson(R"({
+        distinct: 'testcoll',
+        key: "a",
+        $db: 'testdb',
+        unknown: 1
+    })");
+
+    auto parsedDistinct =
+        ParsedDistinct::parse(opCtx, testns, cmdObj, ExtensionsCallbackNoop(), false);
+    ASSERT_EQ(parsedDistinct.getStatus().code(), 40415);
+}
+
+TEST(QueryRequestTest, FailsToParseDistinctWithMissingKey) {
+    QueryTestServiceContext serviceContext;
+    auto uniqueTxn = serviceContext.makeOperationContext();
+    OperationContext* opCtx = uniqueTxn.get();
+
+    BSONObj cmdObj = fromjson(R"({
+        distinct: 'testns',
+        $db: 'testdb'
+    })");
+
+    auto parsedDistinct =
+        ParsedDistinct::parse(opCtx, testns, cmdObj, ExtensionsCallbackNoop(), false);
+    ASSERT_EQ(parsedDistinct.getStatus().code(), 40414);
+}
+
+TEST(QueryRequestTest, FailsToParseDistinctWithInvalidKeyType) {
+    QueryTestServiceContext serviceContext;
+    auto uniqueTxn = serviceContext.makeOperationContext();
+    OperationContext* opCtx = uniqueTxn.get();
+
+    BSONObj cmdObj = fromjson(R"({
+        distinct: 'testns',
+        key: {a: 1},
+        $db: 'test'
+    })");
+
+    auto parsedDistinct =
+        ParsedDistinct::parse(opCtx, testns, cmdObj, ExtensionsCallbackNoop(), false);
+    ASSERT_EQ(parsedDistinct.getStatus().code(), ErrorCodes::TypeMismatch);
+}
+
+TEST(QueryRequestTest, InvalidGenericCommandArgumentsAreIgnored) {
+    QueryTestServiceContext serviceContext;
+    auto uniqueTxn = serviceContext.makeOperationContext();
+    OperationContext* opCtx = uniqueTxn.get();
+
+    BSONObj cmdObj = fromjson(R"({
+        distinct: 'testns',
+        key: 'a',
+        readConcern: {level: 'invalid'},
+        $db: 'test'
+    })");
+
+    auto parsedDistinct =
+        ParsedDistinct::parse(opCtx, testns, cmdObj, ExtensionsCallbackNoop(), false);
+    ASSERT_OK(parsedDistinct.getStatus());
 }
 
 }  // namespace

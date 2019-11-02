@@ -29,15 +29,14 @@
 
 #pragma once
 
+#include <functional>
 #include <map>
 #include <string>
 #include <vector>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/db/catalog/multi_index_block.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/stdx/functional.h"
-#include "mongo/stdx/mutex.h"
+#include "mongo/platform/mutex.h"
 
 namespace mongo {
 
@@ -53,7 +52,8 @@ enum IndexBuildRecoveryState { Building, Verifying, Committing };
  * state is set up and then cleaned up by this class.
  */
 class IndexBuildsManager {
-    MONGO_DISALLOW_COPYING(IndexBuildsManager);
+    IndexBuildsManager(const IndexBuildsManager&) = delete;
+    IndexBuildsManager& operator=(const IndexBuildsManager&) = delete;
 
 public:
     /**
@@ -120,7 +120,8 @@ public:
      */
     Status drainBackgroundWrites(OperationContext* opCtx,
                                  const UUID& buildUUID,
-                                 RecoveryUnit::ReadSource readSource);
+                                 RecoveryUnit::ReadSource readSource,
+                                 IndexBuildInterceptor::DrainYieldPolicy drainYieldPolicy);
 
     /**
      * Persists information in the index catalog entry to reflect the successful completion of the
@@ -175,7 +176,11 @@ public:
     /**
      * Cleans up the index build state and unregisters it from the manager.
      */
-    void tearDownIndexBuild(OperationContext* opCtx, Collection* collection, const UUID& buildUUID);
+    using OnCleanUpFn = MultiIndexBlock::OnCleanUpFn;
+    void tearDownIndexBuild(OperationContext* opCtx,
+                            Collection* collection,
+                            const UUID& buildUUID,
+                            OnCleanUpFn onCleanUpFn);
 
     /**
      * Returns true if the index build supports background writes while building an index. This is
@@ -205,7 +210,7 @@ private:
     std::shared_ptr<MultiIndexBlock> _getBuilder(const UUID& buildUUID);
 
     // Protects the map data structures below.
-    mutable stdx::mutex _mutex;
+    mutable Mutex _mutex = MONGO_MAKE_LATCH("IndexBuildsManager::_mutex");
 
     // Map of index builders by build UUID. Allows access to the builders so that actions can be
     // taken on and information passed to and from index builds.

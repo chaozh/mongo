@@ -24,7 +24,6 @@
 load('jstests/concurrency/fsm_workload_helpers/chunks.js');  // for chunk helpers
 
 var $config = (function() {
-
     var data = {
         partitionSize: 1,
         // We use a non-hashed shard key of { _id: 1 } so that documents reside on their expected
@@ -61,7 +60,7 @@ var $config = (function() {
 
     // Intended for use on config servers only.
     // Get a random chunk within this thread's partition.
-    data.getRandomChunkInPartition = function getRandomChunkInPartition(conn) {
+    data.getRandomChunkInPartition = function getRandomChunkInPartition(collName, conn) {
         assert(isMongodConfigsvr(conn.getDB('admin')), 'Not connected to a mongod configsvr');
         assert(this.partition,
                'This function must be called from workloads that partition data across threads.');
@@ -69,8 +68,18 @@ var $config = (function() {
         // We must split up these cases because MinKey and MaxKey are not fully comparable.
         // This may be due to SERVER-18341, where the Matcher returns false positives in
         // comparison predicates with MinKey/MaxKey.
-        const maxField = 'max.' + this.shardKeyField;
-        const minField = 'min.' + this.shardKeyField;
+        const shardKeyField = this.shardKeyField[collName] || this.shardKeyField;
+        let maxField = 'max.';
+        let minField = 'min.';
+
+        if (Array.isArray(shardKeyField)) {
+            maxField += shardKeyField[0];
+            minField += shardKeyField[0];
+        } else {
+            maxField += shardKeyField;
+            minField += shardKeyField;
+        }
+
         if (this.partition.isLowChunk && this.partition.isHighChunk) {
             return coll
                 .aggregate([
@@ -82,8 +91,8 @@ var $config = (function() {
             return coll
                 .aggregate([
                     {
-                      $match:
-                          {ns: this.partition.ns, [maxField]: {$lte: this.partition.chunkUpper}}
+                        $match:
+                            {ns: this.partition.ns, [maxField]: {$lte: this.partition.chunkUpper}}
                     },
                     {$sample: {size: 1}}
                 ])
@@ -92,8 +101,8 @@ var $config = (function() {
             return coll
                 .aggregate([
                     {
-                      $match:
-                          {ns: this.partition.ns, [minField]: {$gte: this.partition.chunkLower}}
+                        $match:
+                            {ns: this.partition.ns, [minField]: {$gte: this.partition.chunkLower}}
                     },
                     {$sample: {size: 1}}
                 ])
@@ -102,11 +111,11 @@ var $config = (function() {
             return coll
                 .aggregate([
                     {
-                      $match: {
-                          ns: this.partition.ns,
-                          [minField]: {$gte: this.partition.chunkLower},
-                          [maxField]: {$lte: this.partition.chunkUpper}
-                      }
+                        $match: {
+                            ns: this.partition.ns,
+                            [minField]: {$gte: this.partition.chunkLower},
+                            [maxField]: {$lte: this.partition.chunkUpper}
+                        }
                     },
                     {$sample: {size: 1}}
                 ])
@@ -115,8 +124,8 @@ var $config = (function() {
     };
 
     // This is used by the extended workloads to perform additional setup for more splitPoints.
-    data.setupAdditionalSplitPoints = function setupAdditionalSplitPoints(db, collName, partition) {
-    };
+    data.setupAdditionalSplitPoints = function setupAdditionalSplitPoints(
+        db, collName, partition) {};
 
     var states = (function() {
         // Inform this thread about its partition,
@@ -171,7 +180,7 @@ var $config = (function() {
             for (var i = partition.lower; i < partition.upper; ++i) {
                 bulk.insert({_id: i});
             }
-            assertAlways.writeOK(bulk.execute());
+            assertAlways.commandWorked(bulk.execute());
 
             // Add split point for lower end of this thread's partition.
             // Since a split point will be created at the low end of each partition,
@@ -185,7 +194,6 @@ var $config = (function() {
 
             this.setupAdditionalSplitPoints(db, collName, partition);
         }
-
     };
 
     return {

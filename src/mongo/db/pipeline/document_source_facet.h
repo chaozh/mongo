@@ -58,6 +58,7 @@ class NamespaceString;
  */
 class DocumentSourceFacet final : public DocumentSource {
 public:
+    static constexpr StringData kStageName = "$facet"_sd;
     struct FacetPipeline {
         FacetPipeline(std::string name, std::unique_ptr<Pipeline, PipelineDeleter> pipeline)
             : name(std::move(name)), pipeline(std::move(pipeline)) {}
@@ -83,6 +84,15 @@ public:
 
         bool allowShardedForeignCollection(NamespaceString nss) const final;
 
+        bool allowedToPassthroughFromMongos() const {
+            // If any of the sub-pipelines doesn't allow pass through, then return false.
+            return std::all_of(_liteParsedPipelines.cbegin(),
+                               _liteParsedPipelines.cend(),
+                               [](const auto& subPipeline) {
+                                   return subPipeline.allowedToPassthroughFromMongos();
+                               });
+        }
+
     private:
         const std::vector<LiteParsedPipeline> _liteParsedPipelines;
         const PrivilegeVector _requiredPrivileges;
@@ -96,11 +106,6 @@ public:
         const boost::intrusive_ptr<ExpressionContext>& expCtx);
 
     /**
-     * Blocking call. Will consume all input and produces one output document.
-     */
-    GetNextResult getNext() final;
-
-    /**
      * Optimizes inner pipelines.
      */
     boost::intrusive_ptr<DocumentSource> optimize() final;
@@ -111,7 +116,7 @@ public:
     DepsTracker::State getDependencies(DepsTracker* deps) const final;
 
     const char* getSourceName() const final {
-        return "$facet";
+        return DocumentSourceFacet::kStageName.rawData();
     }
 
     /**
@@ -125,12 +130,16 @@ public:
      * TODO SERVER-24154: Should be smarter about splitting so that parts of the sub-pipelines can
      * potentially be run in parallel on multiple shards.
      */
-    boost::optional<MergingLogic> mergingLogic() final {
+    boost::optional<DistributedPlanLogic> distributedPlanLogic() final {
         // {shardsStage, mergingStage, sortPattern}
-        return MergingLogic{nullptr, this, boost::none};
+        return DistributedPlanLogic{nullptr, this, boost::none};
     }
 
     const std::vector<FacetPipeline>& getFacetPipelines() const {
+        return _facets;
+    }
+
+    auto& getFacetPipelines() {
         return _facets;
     }
 
@@ -142,6 +151,10 @@ public:
     bool usedDisk() final;
 
 protected:
+    /**
+     * Blocking call. Will consume all input and produces one output document.
+     */
+    GetNextResult doGetNext() final;
     void doDispose() final;
 
 private:

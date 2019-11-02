@@ -70,8 +70,8 @@ protected:
         serverGlobalParams.clusterRole = ClusterRole::ShardServer;
 
         CatalogCacheLoader::set(getServiceContext(),
-                                stdx::make_unique<ShardServerCatalogCacheLoader>(
-                                    stdx::make_unique<ConfigServerCatalogCacheLoader>()));
+                                std::make_unique<ShardServerCatalogCacheLoader>(
+                                    std::make_unique<ConfigServerCatalogCacheLoader>()));
 
         ShardingInitializationMongoD::get(getServiceContext())
             ->setGlobalInitMethodForTest([&](OperationContext* opCtx,
@@ -92,7 +92,7 @@ protected:
                 return Status::OK();
             });
 
-        _dbDirectClient = stdx::make_unique<DBDirectClient>(operationContext());
+        _dbDirectClient = std::make_unique<DBDirectClient>(operationContext());
     }
 
     void tearDown() override {
@@ -110,13 +110,13 @@ protected:
 
     std::unique_ptr<DistLockManager> makeDistLockManager(
         std::unique_ptr<DistLockCatalog> distLockCatalog) override {
-        return stdx::make_unique<DistLockManagerMock>(nullptr);
+        return std::make_unique<DistLockManagerMock>(nullptr);
     }
 
     std::unique_ptr<ShardingCatalogClient> makeShardingCatalogClient(
         std::unique_ptr<DistLockManager> distLockManager) override {
         invariant(distLockManager);
-        return stdx::make_unique<ShardingCatalogClientImpl>(std::move(distLockManager));
+        return std::make_unique<ShardingCatalogClientImpl>(std::move(distLockManager));
     }
 
     auto* shardingInitialization() {
@@ -136,16 +136,16 @@ class ScopedSetStandaloneMode {
 public:
     ScopedSetStandaloneMode(ServiceContext* serviceContext) : _serviceContext(serviceContext) {
         serverGlobalParams.clusterRole = ClusterRole::None;
-        _serviceContext->setOpObserver(stdx::make_unique<OpObserverRegistry>());
+        _serviceContext->setOpObserver(std::make_unique<OpObserverRegistry>());
     }
 
     ~ScopedSetStandaloneMode() {
         serverGlobalParams.clusterRole = ClusterRole::ShardServer;
         auto makeOpObserver = [&] {
-            auto opObserver = stdx::make_unique<OpObserverRegistry>();
-            opObserver->addObserver(stdx::make_unique<OpObserverShardingImpl>());
-            opObserver->addObserver(stdx::make_unique<ConfigServerOpObserver>());
-            opObserver->addObserver(stdx::make_unique<ShardServerOpObserver>());
+            auto opObserver = std::make_unique<OpObserverRegistry>();
+            opObserver->addObserver(std::make_unique<OpObserverShardingImpl>());
+            opObserver->addObserver(std::make_unique<ConfigServerOpObserver>());
+            opObserver->addObserver(std::make_unique<ShardServerOpObserver>());
             return opObserver;
         };
 
@@ -183,18 +183,19 @@ TEST_F(ShardingInitializationMongoDTest, InitWhilePreviouslyInErrorStateWillStay
     shardIdentity.setShardName(kShardName);
     shardIdentity.setClusterId(OID::gen());
 
-    shardingInitialization()->setGlobalInitMethodForTest([](
-        OperationContext* opCtx, const ShardIdentity& shardIdentity, StringData distLockProcessId) {
+    shardingInitialization()->setGlobalInitMethodForTest([](OperationContext* opCtx,
+                                                            const ShardIdentity& shardIdentity,
+                                                            StringData distLockProcessId) {
         uasserted(ErrorCodes::ShutdownInProgress, "Not an actual shutdown");
     });
 
     shardingInitialization()->initializeFromShardIdentity(operationContext(), shardIdentity);
 
     // ShardingState is now in error state, attempting to call it again will still result in error.
-    shardingInitialization()->setGlobalInitMethodForTest([](
-        OperationContext* opCtx, const ShardIdentity& shardIdentity, StringData distLockProcessId) {
-        FAIL("Should not be invoked!");
-    });
+    shardingInitialization()->setGlobalInitMethodForTest(
+        [](OperationContext* opCtx,
+           const ShardIdentity& shardIdentity,
+           StringData distLockProcessId) { FAIL("Should not be invoked!"); });
 
     ASSERT_THROWS_CODE(
         shardingInitialization()->initializeFromShardIdentity(operationContext(), shardIdentity),
@@ -223,10 +224,10 @@ TEST_F(ShardingInitializationMongoDTest, InitializeAgainWithMatchingShardIdentit
     shardIdentity2.setShardName(kShardName);
     shardIdentity2.setClusterId(clusterID);
 
-    shardingInitialization()->setGlobalInitMethodForTest([](
-        OperationContext* opCtx, const ShardIdentity& shardIdentity, StringData distLockProcessId) {
-        FAIL("Should not be invoked!");
-    });
+    shardingInitialization()->setGlobalInitMethodForTest(
+        [](OperationContext* opCtx,
+           const ShardIdentity& shardIdentity,
+           StringData distLockProcessId) { FAIL("Should not be invoked!"); });
 
     shardingInitialization()->initializeFromShardIdentity(operationContext(), shardIdentity2);
 
@@ -256,10 +257,10 @@ TEST_F(ShardingInitializationMongoDTest, InitializeAgainWithMatchingReplSetNameS
     shardIdentity2.setShardName(kShardName);
     shardIdentity2.setClusterId(clusterID);
 
-    shardingInitialization()->setGlobalInitMethodForTest([](
-        OperationContext* opCtx, const ShardIdentity& shardIdentity, StringData distLockProcessId) {
-        FAIL("Should not be invoked!");
-    });
+    shardingInitialization()->setGlobalInitMethodForTest(
+        [](OperationContext* opCtx,
+           const ShardIdentity& shardIdentity,
+           StringData distLockProcessId) { FAIL("Should not be invoked!"); });
 
     shardingInitialization()->initializeFromShardIdentity(operationContext(), shardIdentity2);
 
@@ -291,13 +292,9 @@ TEST_F(ShardingInitializationMongoDTest,
     storageGlobalParams.readOnly = true;
     serverGlobalParams.overrideShardIdentity =
         BSON("_id"
-             << "shardIdentity"
-             << ShardIdentity::kShardNameFieldName
-             << kShardName
-             << ShardIdentity::kClusterIdFieldName
-             << OID::gen()
-             << ShardIdentity::kConfigsvrConnectionStringFieldName
-             << "invalid");
+             << "shardIdentity" << ShardIdentity::kShardNameFieldName << kShardName
+             << ShardIdentity::kClusterIdFieldName << OID::gen()
+             << ShardIdentity::kConfigsvrConnectionStringFieldName << "invalid");
 
     ASSERT_THROWS_CODE(
         shardingInitialization()->initializeShardingAwarenessIfNeeded(operationContext()),
@@ -436,10 +433,8 @@ TEST_F(ShardingInitializationMongoDTest,
         ScopedSetStandaloneMode standalone(getServiceContext());
 
         BSONObj invalidShardIdentity = BSON("_id"
-                                            << "shardIdentity"
-                                            << ShardIdentity::kShardNameFieldName
-                                            << kShardName
-                                            << ShardIdentity::kClusterIdFieldName
+                                            << "shardIdentity" << ShardIdentity::kShardNameFieldName
+                                            << kShardName << ShardIdentity::kClusterIdFieldName
                                             << OID::gen()
                                             << ShardIdentity::kConfigsvrConnectionStringFieldName
                                             << "invalid");

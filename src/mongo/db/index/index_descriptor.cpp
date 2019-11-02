@@ -52,7 +52,7 @@ void populateOptionsMap(std::map<StringData, BSONElement>& theMap, const BSONObj
 
         StringData fieldName = e.fieldNameStringData();
         if (fieldName == IndexDescriptor::kKeyPatternFieldName ||
-            fieldName == IndexDescriptor::kNamespaceFieldName ||
+            fieldName == IndexDescriptor::kNamespaceFieldName ||  // removed in 4.4
             fieldName == IndexDescriptor::kIndexNameFieldName ||
             fieldName ==
                 IndexDescriptor::kIndexVersionFieldName ||  // not considered for equivalence
@@ -63,7 +63,7 @@ void populateOptionsMap(std::map<StringData, BSONElement>& theMap, const BSONObj
             fieldName == IndexDescriptor::kDropDuplicatesFieldName ||  // this is now ignored
             fieldName == IndexDescriptor::kSparseFieldName ||          // checked specially
             fieldName == IndexDescriptor::kUniqueFieldName             // check specially
-            ) {
+        ) {
             continue;
         }
         theMap[fieldName] = e;
@@ -107,14 +107,11 @@ IndexDescriptor::IndexDescriptor(Collection* collection,
       _keyPattern(infoObj.getObjectField(IndexDescriptor::kKeyPatternFieldName).getOwned()),
       _projection(infoObj.getObjectField(IndexDescriptor::kPathProjectionFieldName).getOwned()),
       _indexName(infoObj.getStringField(IndexDescriptor::kIndexNameFieldName)),
-      _parentNS(infoObj.getStringField(IndexDescriptor::kNamespaceFieldName)),
       _isIdIndex(isIdIndexPattern(_keyPattern)),
       _sparse(infoObj[IndexDescriptor::kSparseFieldName].trueValue()),
       _unique(_isIdIndex || infoObj[kUniqueFieldName].trueValue()),
       _partial(!infoObj[kPartialFilterExprFieldName].eoo()),
-      _cachedEntry(NULL) {
-    _indexNamespace = NamespaceString(_parentNS).makeIndexNamespace(_indexName).ns();
-
+      _cachedEntry(nullptr) {
     BSONElement e = _infoObj[IndexDescriptor::kIndexVersionFieldName];
     fassert(50942, e.isNumber());
     _version = static_cast<IndexVersion>(e.numberInt());
@@ -154,16 +151,15 @@ Status IndexDescriptor::isIndexVersionAllowedForCreation(
     }
     return {ErrorCodes::CannotCreateIndex,
             str::stream() << "Invalid index specification " << indexSpec
-                          << "; cannot create an index with v="
-                          << static_cast<int>(indexVersion)};
+                          << "; cannot create an index with v=" << static_cast<int>(indexVersion)};
 }
 
 IndexVersion IndexDescriptor::getDefaultIndexVersion() {
     return IndexVersion::kV2;
 }
 
-bool IndexDescriptor::isMultikey(OperationContext* opCtx) const {
-    return _collection->getIndexCatalog()->isMultikey(opCtx, this);
+bool IndexDescriptor::isMultikey() const {
+    return _collection->getIndexCatalog()->isMultikey(this);
 }
 
 MultikeyPaths IndexDescriptor::getMultikeyPaths(OperationContext* opCtx) const {
@@ -172,6 +168,10 @@ MultikeyPaths IndexDescriptor::getMultikeyPaths(OperationContext* opCtx) const {
 
 const IndexCatalog* IndexDescriptor::getIndexCatalog() const {
     return _collection->getIndexCatalog();
+}
+
+const NamespaceString& IndexDescriptor::parentNS() const {
+    return _collection->ns();
 }
 
 bool IndexDescriptor::areIndexOptionsEquivalent(const IndexDescriptor* other) const {
@@ -202,26 +202,6 @@ bool IndexDescriptor::areIndexOptionsEquivalent(const IndexDescriptor* other) co
                            SimpleBSONElementComparator::kInstance.evaluate(lhs.second ==
                                                                            rhs.second);
                    });
-}
-
-void IndexDescriptor::setNs(NamespaceString ns) {
-    _parentNS = ns.toString();
-    _indexNamespace = ns.makeIndexNamespace(_indexName).ns();
-
-    // Construct a new infoObj with the namespace field replaced.
-    _infoObj = renameNsInIndexSpec(_infoObj, ns);
-}
-
-BSONObj IndexDescriptor::renameNsInIndexSpec(BSONObj spec, const NamespaceString& newNs) {
-    BSONObjBuilder builder;
-    for (auto&& elt : spec) {
-        if (elt.fieldNameStringData() == kNamespaceFieldName) {
-            builder.append(kNamespaceFieldName, newNs.ns());
-        } else {
-            builder.append(elt);
-        }
-    }
-    return builder.obj();
 }
 
 }  // namespace mongo

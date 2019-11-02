@@ -33,6 +33,7 @@
 
 #include <algorithm>
 #include <exception>
+#include <memory>
 
 #include "mongo/base/status_with.h"
 #include "mongo/client/connection_string.h"
@@ -45,7 +46,6 @@
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/rpc/message.h"
 #include "mongo/stdx/future.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/unittest/integration_test.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/assert_util.h"
@@ -87,8 +87,7 @@ class HangingHook : public executor::NetworkConnectionHook {
                                                           "admin",
                                                           BSON("sleep" << 1 << "lock"
                                                                        << "none"
-                                                                       << "secs"
-                                                                       << 100000000),
+                                                                       << "secs" << 100000000),
                                                           BSONObj(),
                                                           nullptr))};
     }
@@ -106,7 +105,7 @@ class HangingHook : public executor::NetworkConnectionHook {
 
 // Test that we time out a command if the connection hook hangs.
 TEST_F(NetworkInterfaceIntegrationFixture, HookHangs) {
-    startNet(stdx::make_unique<HangingHook>());
+    startNet(std::make_unique<HangingHook>());
 
     /**
      *  Since mongos's have no ping command, we effectively skip this test by returning
@@ -152,13 +151,14 @@ public:
 
     RemoteCommandRequest makeTestCommand(boost::optional<Milliseconds> timeout = boost::none,
                                          BSONObj cmd = BSON("echo" << 1 << "foo"
-                                                                   << "bar")) {
+                                                                   << "bar"),
+                                         OperationContext* opCtx = nullptr) {
         auto cs = fixture();
         return RemoteCommandRequest(cs.getServers().front(),
                                     "admin",
                                     std::move(cmd),
                                     BSONObj(),
-                                    nullptr,
+                                    opCtx,
                                     timeout ? *timeout : RemoteCommandRequest::kNoTimeout);
     }
 
@@ -167,14 +167,14 @@ public:
         RemoteCommandResponse response;
     };
     IsMasterData waitForIsMaster() {
-        stdx::unique_lock<stdx::mutex> lk(_mutex);
+        stdx::unique_lock<Latch> lk(_mutex);
         _isMasterCond.wait(lk, [this] { return _isMasterResult != boost::none; });
 
         return std::move(*_isMasterResult);
     }
 
     bool hasIsMaster() {
-        stdx::lock_guard<stdx::mutex> lk(_mutex);
+        stdx::lock_guard<Latch> lk(_mutex);
         return _isMasterResult != boost::none;
     }
 
@@ -186,7 +186,7 @@ private:
         Status validateHost(const HostAndPort& host,
                             const BSONObj& request,
                             const RemoteCommandResponse& isMasterReply) override {
-            stdx::lock_guard<stdx::mutex> lk(_parent->_mutex);
+            stdx::lock_guard<Latch> lk(_parent->_mutex);
             _parent->_isMasterResult = IsMasterData{request, isMasterReply};
             _parent->_isMasterCond.notify_all();
             return Status::OK();
@@ -204,7 +204,7 @@ private:
         NetworkInterfaceTest* _parent;
     };
 
-    stdx::mutex _mutex;
+    Mutex _mutex = MONGO_MAKE_LATCH("NetworkInterfaceTest::_mutex");
     stdx::condition_variable _isMasterCond;
     boost::optional<IsMasterData> _isMasterResult;
 };
@@ -274,8 +274,7 @@ TEST_F(NetworkInterfaceTest, AsyncOpTimeout) {
     auto request = makeTestCommand(Milliseconds{1000});
     request.cmdObj = BSON("sleep" << 1 << "lock"
                                   << "none"
-                                  << "secs"
-                                  << 1000000000);
+                                  << "secs" << 1000000000);
     auto deferred = runCommand(cb, request);
 
     waitForIsMaster();
@@ -289,6 +288,81 @@ TEST_F(NetworkInterfaceTest, AsyncOpTimeout) {
         ASSERT(result.elapsedMillis);
         assertNumOps(0u, 1u, 0u, 0u);
     }
+}
+
+TEST_F(NetworkInterfaceTest, AsyncOpTimeoutWithOpCtxDeadlineSooner) {
+    // Kick off operation
+    auto cb = makeCallbackHandle();
+    auto cmdObj = BSON("sleep" << 1 << "lock"
+                               << "none"
+                               << "secs" << 1000000000);
+
+    constexpr auto opCtxDeadline = Milliseconds{600};
+    constexpr auto requestTimeout = Milliseconds{1000};
+
+    auto serviceContext = ServiceContext::make();
+    auto client = serviceContext->makeClient("NetworkClient");
+    auto opCtx = client->makeOperationContext();
+    opCtx->setDeadlineAfterNowBy(opCtxDeadline, ErrorCodes::ExceededTimeLimit);
+
+    auto request = makeTestCommand(requestTimeout, cmdObj, opCtx.get());
+
+    auto deferred = runCommand(cb, request);
+
+    waitForIsMaster();
+
+    auto result = deferred.get();
+
+    // mongos doesn't implement the ping command, so ignore the response there, otherwise
+    // check that we've timed out.
+    if (pingCommandMissing(result)) {
+        return;
+    }
+
+    ASSERT_EQ(ErrorCodes::NetworkInterfaceExceededTimeLimit, result.status);
+    ASSERT(result.elapsedMillis);
+    // check that the request timeout uses the smaller of the operation context deadline and
+    // the timeout specified in the request constructor.
+    ASSERT_GTE(result.elapsedMillis.value(), opCtxDeadline);
+    ASSERT_LT(result.elapsedMillis.value(), requestTimeout);
+    assertNumOps(0u, 1u, 0u, 0u);
+}
+
+TEST_F(NetworkInterfaceTest, AsyncOpTimeoutWithOpCtxDeadlineLater) {
+    // Kick off operation
+    auto cb = makeCallbackHandle();
+    auto cmdObj = BSON("sleep" << 1 << "lock"
+                               << "none"
+                               << "secs" << 1000000000);
+
+    constexpr auto opCtxDeadline = Milliseconds{1000};
+    constexpr auto requestTimeout = Milliseconds{600};
+
+    auto serviceContext = ServiceContext::make();
+    auto client = serviceContext->makeClient("NetworkClient");
+    auto opCtx = client->makeOperationContext();
+    opCtx->setDeadlineAfterNowBy(opCtxDeadline, ErrorCodes::ExceededTimeLimit);
+    auto request = makeTestCommand(requestTimeout, cmdObj, opCtx.get());
+
+    auto deferred = runCommand(cb, request);
+
+    waitForIsMaster();
+
+    auto result = deferred.get();
+
+    // mongos doesn't implement the ping command, so ignore the response there, otherwise
+    // check that we've timed out.
+    if (pingCommandMissing(result)) {
+        return;
+    }
+
+    ASSERT_EQ(ErrorCodes::NetworkInterfaceExceededTimeLimit, result.status);
+    ASSERT(result.elapsedMillis);
+    // check that the request timeout uses the smaller of the operation context deadline and
+    // the timeout specified in the request constructor.
+    ASSERT_GTE(result.elapsedMillis.value(), requestTimeout);
+    ASSERT_LT(result.elapsedMillis.value(), opCtxDeadline);
+    assertNumOps(0u, 1u, 0u, 0u);
 }
 
 TEST_F(NetworkInterfaceTest, StartCommand) {
@@ -322,14 +396,15 @@ TEST_F(NetworkInterfaceTest, SetAlarm) {
     Date_t expiration = net().now() + Milliseconds(100);
     auto makeTimerFuture = [&] {
         auto pf = makePromiseFuture<Date_t>();
-        return std::make_pair([ this, promise = std::move(pf.promise) ](Status status) mutable {
-            if (status.isOK()) {
-                promise.emplaceValue(net().now());
-            } else {
-                promise.setError(status);
-            }
-        },
-                              std::move(pf.future));
+        return std::make_pair(
+            [this, promise = std::move(pf.promise)](Status status) mutable {
+                if (status.isOK()) {
+                    promise.emplaceValue(net().now());
+                } else {
+                    promise.setError(status);
+                }
+            },
+            std::move(pf.future));
     };
 
     auto futurePair = makeTimerFuture();

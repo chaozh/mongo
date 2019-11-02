@@ -37,9 +37,22 @@
 
 namespace mongo {
 namespace {
+std::function<std::unique_ptr<RecordStoreHarnessHelper>()> recordStoreHarnessFactory;
+}
 
-using std::unique_ptr;
+void registerRecordStoreHarnessHelperFactory(
+    std::function<std::unique_ptr<RecordStoreHarnessHelper>()> factory) {
+    recordStoreHarnessFactory = std::move(factory);
+}
+
+auto newRecordStoreHarnessHelper() -> std::unique_ptr<RecordStoreHarnessHelper> {
+    return recordStoreHarnessFactory();
+}
+
+namespace {
+
 using std::string;
+using std::unique_ptr;
 
 TEST(RecordStoreTestHarness, Simple1) {
     const auto harnessHelper(newRecordStoreHarnessHelper());
@@ -75,7 +88,7 @@ TEST(RecordStoreTestHarness, Simple1) {
 
         RecordData rd;
         ASSERT(!rs->findRecord(opCtx.get(), RecordId(111, 17), &rd));
-        ASSERT(rd.data() == NULL);
+        ASSERT(rd.data() == nullptr);
 
         ASSERT(rs->findRecord(opCtx.get(), loc1, &rd));
         ASSERT_EQUALS(s, rd.data());
@@ -95,49 +108,6 @@ TEST(RecordStoreTestHarness, Simple1) {
     {
         ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
         ASSERT_EQUALS(2, rs->numRecords(opCtx.get()));
-    }
-}
-
-namespace {
-class DummyDocWriter final : public DocWriter {
-public:
-    virtual ~DummyDocWriter() {}
-
-    virtual void writeDocument(char* buf) const {
-        memcpy(buf, "eliot", 6);
-    }
-
-    virtual size_t documentSize() const {
-        return 6;
-    }
-
-    virtual bool addPadding() const {
-        return false;
-    }
-};
-}
-
-
-TEST(RecordStoreTestHarness, Simple1InsertDocWroter) {
-    const auto harnessHelper(newRecordStoreHarnessHelper());
-    unique_ptr<RecordStore> rs(harnessHelper->newNonCappedRecordStore());
-
-    RecordId loc1;
-
-    {
-        ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
-
-        {
-            WriteUnitOfWork uow(opCtx.get());
-            DummyDocWriter dw;
-            StatusWith<RecordId> res =
-                rs->insertRecordWithDocWriter(opCtx.get(), &dw, Timestamp(1));
-            ASSERT_OK(res.getStatus());
-            loc1 = res.getValue();
-            uow.commit();
-        }
-
-        ASSERT_EQUALS(string("eliot"), rs->dataFor(opCtx.get(), loc1).data());
     }
 }
 

@@ -93,8 +93,7 @@ StatusWith<BSONObj> extractFindAndModifyNewObj(StatusWith<Shard::CommandResponse
             return {ErrorCodes::UnsupportedFormat,
                     str::stream() << "expected an object from the findAndModify response '"
                                   << kFindAndModifyResponseResultDocField
-                                  << "'field, got: "
-                                  << newDocElem};
+                                  << "'field, got: " << newDocElem};
         }
 
         return newDocElem.Obj().getOwned();
@@ -167,7 +166,7 @@ DistLockCatalogImpl::~DistLockCatalogImpl() = default;
 StatusWith<LockpingsType> DistLockCatalogImpl::getPing(OperationContext* opCtx,
                                                        StringData processID) {
     auto findResult = _findOnConfig(
-        opCtx, kReadPref, _lockPingNS, BSON(LockpingsType::process() << processID), BSONObj(), 1);
+        opCtx, kReadPref, _lockPingNS, BSON(LockpingsType::process() << processID), {}, 1);
 
     if (!findResult.isOK()) {
         return findResult.getStatus();
@@ -204,7 +203,7 @@ Status DistLockCatalogImpl::ping(OperationContext* opCtx, StringData processID, 
         opCtx,
         ReadPreferenceSetting{ReadPreference::PrimaryOnly},
         _locksNS.db().toString(),
-        request.toBSON(),
+        request.toBSON({}),
         Shard::kDefaultConfigCommandTimeout,
         Shard::RetryPolicy::kNotIdempotent);
 
@@ -220,14 +219,10 @@ StatusWith<LocksType> DistLockCatalogImpl::grabLock(OperationContext* opCtx,
                                                     Date_t time,
                                                     StringData why,
                                                     const WriteConcernOptions& writeConcern) {
-    BSONObj newLockDetails(BSON(
-        LocksType::lockID(lockSessionID) << LocksType::state(LocksType::LOCKED) << LocksType::who()
-                                         << who
-                                         << LocksType::process()
-                                         << processId
-                                         << LocksType::when(time)
-                                         << LocksType::why()
-                                         << why));
+    BSONObj newLockDetails(BSON(LocksType::lockID(lockSessionID)
+                                << LocksType::state(LocksType::LOCKED) << LocksType::who() << who
+                                << LocksType::process() << processId << LocksType::when(time)
+                                << LocksType::why() << why));
 
     auto request = FindAndModifyRequest::makeUpdate(
         _locksNS,
@@ -242,7 +237,7 @@ StatusWith<LocksType> DistLockCatalogImpl::grabLock(OperationContext* opCtx,
         opCtx,
         ReadPreferenceSetting{ReadPreference::PrimaryOnly},
         _locksNS.db().toString(),
-        request.toBSON(),
+        request.toBSON({}),
         Shard::kDefaultConfigCommandTimeout,
         Shard::RetryPolicy::kNoRetry);  // Dist lock manager is handling own retries
 
@@ -281,14 +276,10 @@ StatusWith<LocksType> DistLockCatalogImpl::overtakeLock(OperationContext* opCtx,
         BSON(LocksType::name() << lockID << LocksType::state(LocksType::UNLOCKED)));
     orQueryBuilder.append(BSON(LocksType::name() << lockID << LocksType::lockID(currentHolderTS)));
 
-    BSONObj newLockDetails(BSON(
-        LocksType::lockID(lockSessionID) << LocksType::state(LocksType::LOCKED) << LocksType::who()
-                                         << who
-                                         << LocksType::process()
-                                         << processId
-                                         << LocksType::when(time)
-                                         << LocksType::why()
-                                         << why));
+    BSONObj newLockDetails(BSON(LocksType::lockID(lockSessionID)
+                                << LocksType::state(LocksType::LOCKED) << LocksType::who() << who
+                                << LocksType::process() << processId << LocksType::when(time)
+                                << LocksType::why() << why));
 
     auto request = FindAndModifyRequest::makeUpdate(
         _locksNS, BSON("$or" << orQueryBuilder.arr()), BSON("$set" << newLockDetails));
@@ -300,7 +291,7 @@ StatusWith<LocksType> DistLockCatalogImpl::overtakeLock(OperationContext* opCtx,
         opCtx,
         ReadPreferenceSetting{ReadPreference::PrimaryOnly},
         _locksNS.db().toString(),
-        request.toBSON(),
+        request.toBSON({}),
         Shard::kDefaultConfigCommandTimeout,
         Shard::RetryPolicy::kNotIdempotent);
 
@@ -346,7 +337,7 @@ Status DistLockCatalogImpl::_unlock(OperationContext* opCtx, const FindAndModify
         opCtx,
         ReadPreferenceSetting{ReadPreference::PrimaryOnly},
         _locksNS.db().toString(),
-        request.toBSON(),
+        request.toBSON({}),
         Shard::kDefaultConfigCommandTimeout,
         Shard::RetryPolicy::kIdempotent);
 
@@ -448,8 +439,8 @@ StatusWith<DistLockCatalog::ServerInfo> DistLockCatalogImpl::getServerInfo(
 
 StatusWith<LocksType> DistLockCatalogImpl::getLockByTS(OperationContext* opCtx,
                                                        const OID& lockSessionID) {
-    auto findResult = _findOnConfig(
-        opCtx, kReadPref, _locksNS, BSON(LocksType::lockID(lockSessionID)), BSONObj(), 1);
+    auto findResult =
+        _findOnConfig(opCtx, kReadPref, _locksNS, BSON(LocksType::lockID(lockSessionID)), {}, 1);
 
     if (!findResult.isOK()) {
         return findResult.getStatus();
@@ -475,7 +466,7 @@ StatusWith<LocksType> DistLockCatalogImpl::getLockByTS(OperationContext* opCtx,
 
 StatusWith<LocksType> DistLockCatalogImpl::getLockByName(OperationContext* opCtx, StringData name) {
     auto findResult =
-        _findOnConfig(opCtx, kReadPref, _locksNS, BSON(LocksType::name() << name), BSONObj(), 1);
+        _findOnConfig(opCtx, kReadPref, _locksNS, BSON(LocksType::name() << name), {}, 1);
 
     if (!findResult.isOK()) {
         return findResult.getStatus();
@@ -509,7 +500,7 @@ Status DistLockCatalogImpl::stopPing(OperationContext* opCtx, StringData process
         opCtx,
         ReadPreferenceSetting{ReadPreference::PrimaryOnly},
         _locksNS.db().toString(),
-        request.toBSON(),
+        request.toBSON({}),
         Shard::kDefaultConfigCommandTimeout,
         Shard::RetryPolicy::kNotIdempotent);
 

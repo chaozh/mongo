@@ -31,16 +31,16 @@
 
 #include "mongo/platform/basic.h"
 
-#include "mongo/executor/network_connection_hook.h"
 #include "mongo/executor/network_interface_mock.h"
 
 #include <algorithm>
+#include <functional>
 #include <iterator>
 
 #include "mongo/executor/connection_pool_stats.h"
-#include "mongo/stdx/functional.h"
+#include "mongo/executor/network_connection_hook.h"
 #include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
@@ -105,7 +105,7 @@ std::string NetworkInterfaceMock::getHostName() {
 }
 
 Status NetworkInterfaceMock::startCommand(const CallbackHandle& cbHandle,
-                                          RemoteCommandRequest& request,
+                                          RemoteCommandRequestOnAny& request,
                                           RemoteCommandCompletionFn&& onFinish,
                                           const BatonHandle& baton) {
     if (inShutdown()) {
@@ -117,11 +117,14 @@ Status NetworkInterfaceMock::startCommand(const CallbackHandle& cbHandle,
     const Date_t now = _now_inlock();
     auto op = NetworkOperation(cbHandle, request, now, std::move(onFinish));
 
+    // network interface mock only works with single target requests
+    invariant(request.target.size() == 1);
+
     // If we don't have a hook, or we have already 'connected' to this host, enqueue the op.
-    if (!_hook || _connections.count(request.target)) {
+    if (!_hook || _connections.count(request.target[0])) {
         _enqueueOperation_inlock(std::move(op));
     } else {
-        _connectThenEnqueueOperation_inlock(request.target, std::move(op));
+        _connectThenEnqueueOperation_inlock(request.target[0], std::move(op));
     }
 
     return Status::OK();
@@ -484,12 +487,14 @@ void NetworkInterfaceMock::_enqueueOperation_inlock(
         ResponseStatus rs(
             ErrorCodes::NetworkInterfaceExceededTimeLimit, "Network timeout", Milliseconds(0));
         std::vector<NetworkOperationList*> queuesToCheck{&_unscheduled, &_blackHoled, &_scheduled};
-        _alarms.emplace(cbh, _now_inlock() + timeout, [
-            this,
-            cbh = std::move(cbh),
-            queuesToCheck = std::move(queuesToCheck),
-            rs = std::move(rs)
-        ](Status) { _interruptWithResponse_inlock(cbh, queuesToCheck, rs); });
+        _alarms.emplace(cbh,
+                        _now_inlock() + timeout,
+                        [this,
+                         cbh = std::move(cbh),
+                         queuesToCheck = std::move(queuesToCheck),
+                         rs = std::move(rs)](Status) {
+                            _interruptWithResponse_inlock(cbh, queuesToCheck, rs);
+                        });
     }
 }
 
@@ -531,25 +536,26 @@ void NetworkInterfaceMock::_connectThenEnqueueOperation_inlock(const HostAndPort
 
     auto cbh = op.getCallbackHandle();
     // The completion handler for the postconnect command schedules the original command.
-    auto postconnectCompletionHandler = [ this, op = std::move(op) ](ResponseStatus rs) mutable {
-        stdx::lock_guard<stdx::mutex> lk(_mutex);
-        if (!rs.isOK()) {
-            op.setResponse(_now_inlock(), rs);
-            op.finishResponse();
-            return;
-        }
+    auto postconnectCompletionHandler =
+        [this, op = std::move(op)](TaskExecutor::ResponseOnAnyStatus rs) mutable {
+            stdx::lock_guard<stdx::mutex> lk(_mutex);
+            if (!rs.isOK()) {
+                op.setResponse(_now_inlock(), rs);
+                op.finishResponse();
+                return;
+            }
 
-        auto handleStatus = _hook->handleReply(op.getRequest().target, std::move(rs));
+            auto handleStatus = _hook->handleReply(op.getRequest().target, std::move(rs));
 
-        if (!handleStatus.isOK()) {
-            op.setResponse(_now_inlock(), handleStatus);
-            op.finishResponse();
-            return;
-        }
+            if (!handleStatus.isOK()) {
+                op.setResponse(_now_inlock(), handleStatus);
+                op.finishResponse();
+                return;
+            }
 
-        _connections.emplace(op.getRequest().target);
-        _enqueueOperation_inlock(std::move(op));
-    };
+            _connections.emplace(op.getRequest().target);
+            _enqueueOperation_inlock(std::move(op));
+        };
 
     auto postconnectOp = NetworkOperation(cbh,
                                           std::move(*hookPostconnectCommand),
@@ -663,17 +669,21 @@ NetworkInterfaceMock::NetworkOperation::NetworkOperation()
       _response(kUnsetResponse),
       _onFinish() {}
 
-NetworkInterfaceMock::NetworkOperation::NetworkOperation(const CallbackHandle& cbHandle,
-                                                         const RemoteCommandRequest& theRequest,
-                                                         Date_t theRequestDate,
-                                                         RemoteCommandCompletionFn onFinish)
+NetworkInterfaceMock::NetworkOperation::NetworkOperation(
+    const CallbackHandle& cbHandle,
+    const RemoteCommandRequestOnAny& theRequest,
+    Date_t theRequestDate,
+    RemoteCommandCompletionFn onFinish)
     : _requestDate(theRequestDate),
       _nextConsiderationDate(theRequestDate),
       _responseDate(),
       _cbHandle(cbHandle),
-      _request(theRequest),
+      _requestOnAny(theRequest),
+      _request(theRequest, 0),
       _response(kUnsetResponse),
-      _onFinish(std::move(onFinish)) {}
+      _onFinish(std::move(onFinish)) {
+    invariant(theRequest.target.size() == 1);
+}
 
 std::string NetworkInterfaceMock::NetworkOperation::getDiagnosticString() const {
     return str::stream() << "NetworkOperation -- request:'" << _request.toString()
@@ -699,7 +709,7 @@ void NetworkInterfaceMock::NetworkOperation::setResponse(Date_t responseDate,
 
 void NetworkInterfaceMock::NetworkOperation::finishResponse() {
     invariant(_onFinish);
-    _onFinish(_response);
+    _onFinish({_request.target, _response});
     _onFinish = RemoteCommandCompletionFn();
 }
 

@@ -30,6 +30,7 @@
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/command_generic_argument.h"
+#include "mongo/util/string_map.h"
 
 #include <algorithm>
 #include <array>
@@ -42,16 +43,16 @@ namespace {
 
 struct SpecialArgRecord {
     StringData name;
-    bool isGeneric : 1;
-    bool stripFromRequest : 1;
-    bool stripFromReply : 1;
+    bool isGeneric;
+    bool stripFromRequest;
+    bool stripFromReply;
 };
 
 // Not including "help" since we don't pass help requests through to the command parser.
 // If that changes, it should be added. When you add to this list, consider whether you
 // should also change the filterCommandRequestForPassthrough() function.
 // clang-format off
-static constexpr std::array<SpecialArgRecord, 26> specials{{
+static constexpr std::array<SpecialArgRecord, 27> specials{{
     //                                       /-isGeneric
     //                                       |  /-stripFromRequest
     //                                       |  |  /-stripFromReply
@@ -80,31 +81,36 @@ static constexpr std::array<SpecialArgRecord, 26> specials{{
     {"$gleStats"_sd,                         0, 0, 1},
     {"operationTime"_sd,                     0, 0, 1},
     {"lastCommittedOpTime"_sd,               0, 0, 1},
-    {"readOnly"_sd,                          0, 0, 1}}};
+    {"readOnly"_sd,                          0, 0, 1},
+    {"comment"_sd,                           1, 0, 0}}};
 // clang-format on
 
-const SpecialArgRecord* findSpecialArg(StringData arg) {
-    for (const auto& e : specials)
-        if (e.name == arg)
-            return &e;
-    return nullptr;
+template <bool SpecialArgRecord::*pmo>
+bool filteredSpecialsContains(StringData arg) {
+    static const auto& filteredNames = *new auto([] {
+        StringSet s;
+        for (const auto& e : specials) {
+            if (e.*pmo) {
+                s.insert(e.name.toString());
+            }
+        }
+        return s;
+    }());
+    return filteredNames.count(arg) > 0;
 }
 
 }  // namespace
 
 bool isGenericArgument(StringData arg) {
-    auto p = findSpecialArg(arg);
-    return p && p->isGeneric;
+    return filteredSpecialsContains<&SpecialArgRecord::isGeneric>(arg);
 }
 
 bool isRequestStripArgument(StringData arg) {
-    auto p = findSpecialArg(arg);
-    return p && p->stripFromRequest;
+    return filteredSpecialsContains<&SpecialArgRecord::stripFromRequest>(arg);
 }
 
 bool isReplyStripArgument(StringData arg) {
-    auto p = findSpecialArg(arg);
-    return p && p->stripFromReply;
+    return filteredSpecialsContains<&SpecialArgRecord::stripFromReply>(arg);
 }
 
 }  // namespace mongo

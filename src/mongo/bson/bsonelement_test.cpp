@@ -113,7 +113,7 @@ TEST(BSONElement, ExtractLargeSubObject) {
     std::int32_t size = 17 * 1024 * 1024;
     std::vector<char> buffer(size);
     DataRange bufferRange(&buffer.front(), &buffer.back());
-    ASSERT_OK(bufferRange.write(LittleEndian<int32_t>(size)));
+    ASSERT_OK(bufferRange.writeNoThrow(LittleEndian<int32_t>(size)));
 
     BSONObj obj(buffer.data(), BSONObj::LargeSizeTrait{});
 
@@ -128,22 +128,27 @@ TEST(BSONElement, ExtractLargeSubObject) {
 }
 
 TEST(BSONElement, SafeNumberLongPositiveBound) {
-    BSONObj obj = BSON("kLongLongMaxPlusOneAsDouble"
-                       << BSONElement::kLongLongMaxPlusOneAsDouble
-                       << "towardsZero"
-                       << std::nextafter(BSONElement::kLongLongMaxPlusOneAsDouble, 0.0)
-                       << "towardsInfinity"
-                       << std::nextafter(BSONElement::kLongLongMaxPlusOneAsDouble,
-                                         std::numeric_limits<double>::max())
-                       << "positiveInfinity"
-                       << std::numeric_limits<double>::infinity());
+    BSONObj obj =
+        BSON("kLongLongMaxPlusOneAsDouble"
+             << BSONElement::kLongLongMaxPlusOneAsDouble << "towardsZero"
+             << std::nextafter(BSONElement::kLongLongMaxPlusOneAsDouble, 0.0) << "towardsInfinity"
+             << std::nextafter(BSONElement::kLongLongMaxPlusOneAsDouble,
+                               std::numeric_limits<double>::max())
+             << "positiveInfinity" << std::numeric_limits<double>::infinity());
 
-    // The numberLongForHash() function clamps kLongLongMaxPlusOneAsDouble to the max 64-bit value
+    // kLongLongMaxPlusOneAsDouble is the least double value that will overflow a 64-bit signed
+    // two's-complement integer. Historically, converting this value with safeNumberLong() would
+    // return the result of casting to double with a C-style cast. That operation is undefined
+    // because of the overflow, but on most platforms we support, it returned the min 64-bit value
+    // (-2^63). The safeNumberLongForHash() function should preserve that behavior indefinitely for
+    // compatibility with on-disk data.
+    ASSERT_EQ(obj["kLongLongMaxPlusOneAsDouble"].safeNumberLongForHash(),
+              std::numeric_limits<long long>::lowest());
+
+    // The safeNumberLong() function clamps kLongLongMaxPlusOneAsDouble to the max 64-bit value
     // (2^63 - 1).
     ASSERT_EQ(obj["kLongLongMaxPlusOneAsDouble"].safeNumberLong(),
               std::numeric_limits<long long>::max());
-    // The safeNumberLongForHash() function will return -2^63, but we don't test it here, because
-    // the overflowing cast that it uses can trigger UBSan
 
     // One quantum below kLongLongMaxPlusOneAsDouble is the largest double that safely converts to a
     // 64-bit signed two-s complement integer. Both safeNumberLong() and safeNumberLongForHash()
@@ -175,13 +180,10 @@ TEST(BSONElement, SafeNumberLongNegativeBound) {
         static_cast<double>(std::numeric_limits<long long>::lowest());
     BSONObj obj =
         BSON("lowestLongLongAsDouble"  // This comment forces clang-format to break here.
-             << lowestLongLongAsDouble
-             << "towardsZero"
-             << std::nextafter(lowestLongLongAsDouble, 0.0)
-             << "towardsNegativeInfinity"
+             << lowestLongLongAsDouble << "towardsZero"
+             << std::nextafter(lowestLongLongAsDouble, 0.0) << "towardsNegativeInfinity"
              << std::nextafter(lowestLongLongAsDouble, std::numeric_limits<double>::lowest())
-             << "negativeInfinity"
-             << -std::numeric_limits<double>::infinity());
+             << "negativeInfinity" << -std::numeric_limits<double>::infinity());
 
     ASSERT_EQ(obj["lowestLongLongAsDouble"].safeNumberLongForHash(),
               std::numeric_limits<long long>::lowest());
@@ -199,6 +201,103 @@ TEST(BSONElement, SafeNumberLongNegativeBound) {
     ASSERT_EQ(obj["negativeInfinity"].safeNumberLongForHash(),
               std::numeric_limits<long long>::lowest());
     ASSERT_EQ(obj["negativeInfinity"].safeNumberLong(), std::numeric_limits<long long>::lowest());
+}
+
+TEST(BSONElementIntegerParseTest, ParseIntegerElementToNonNegativeLongRejectsNegative) {
+    BSONObj query = BSON("" << -2LL);
+    ASSERT_NOT_OK(query.firstElement().parseIntegerElementToNonNegativeLong());
+}
+
+TEST(BSONElementIntegerParseTest, ParseIntegerElementToLongAcceptsNegative) {
+    BSONObj query = BSON("" << -2LL);
+    auto result = query.firstElement().parseIntegerElementToLong();
+    ASSERT_OK(result.getStatus());
+    ASSERT_EQ(-2LL, result.getValue());
+}
+
+TEST(BSONElementIntegerParseTest, ParseIntegerElementToNonNegativeLongRejectsTooLargeDouble) {
+    BSONObj query = BSON("" << BSONElement::kLongLongMaxPlusOneAsDouble);
+    ASSERT_NOT_OK(query.firstElement().parseIntegerElementToNonNegativeLong());
+}
+
+TEST(BSONElementIntegerParseTest, ParseIntegerElementToLongRejectsTooLargeDouble) {
+    BSONObj query = BSON("" << BSONElement::kLongLongMaxPlusOneAsDouble);
+    ASSERT_NOT_OK(query.firstElement().parseIntegerElementToLong());
+}
+
+TEST(BSONElementIntegerParseTest, ParseIntegerElementToLongRejectsTooLargeNegativeDouble) {
+    BSONObj query = BSON("" << std::numeric_limits<double>::min());
+    ASSERT_NOT_OK(query.firstElement().parseIntegerElementToLong());
+}
+
+TEST(BSONElementIntegerParseTest, ParseIntegerElementToNonNegativeLongRejectsString) {
+    BSONObj query = BSON(""
+                         << "1");
+    ASSERT_NOT_OK(query.firstElement().parseIntegerElementToNonNegativeLong());
+}
+
+TEST(BSONElementIntegerParseTest, ParseIntegerElementToLongRejectsString) {
+    BSONObj query = BSON(""
+                         << "1");
+    ASSERT_NOT_OK(query.firstElement().parseIntegerElementToLong());
+}
+
+TEST(BSONElementIntegerParseTest, ParseIntegerElementToNonNegativeLongRejectsNonIntegralDouble) {
+    BSONObj query = BSON("" << 2.5);
+    ASSERT_NOT_OK(query.firstElement().parseIntegerElementToNonNegativeLong());
+}
+
+TEST(BSONElementIntegerParseTest, ParseIntegerElementToLongRejectsNonIntegralDouble) {
+    BSONObj query = BSON("" << 2.5);
+    ASSERT_NOT_OK(query.firstElement().parseIntegerElementToLong());
+}
+
+TEST(BSONElementIntegerParseTest, ParseIntegerElementToNonNegativeLongRejectsNonIntegralDecimal) {
+    BSONObj query = BSON("" << Decimal128("2.5"));
+    ASSERT_NOT_OK(query.firstElement().parseIntegerElementToNonNegativeLong());
+}
+
+TEST(BSONElementIntegerParseTest, ParseIntegerElementToLongRejectsNonIntegralDecimal) {
+    BSONObj query = BSON("" << Decimal128("2.5"));
+    ASSERT_NOT_OK(query.firstElement().parseIntegerElementToLong());
+}
+
+TEST(BSONElementIntegerParseTest, ParseIntegerElementToNonNegativeLongRejectsLargestDecimal) {
+    BSONObj query = BSON("" << Decimal128(Decimal128::kLargestPositive));
+    ASSERT_NOT_OK(query.firstElement().parseIntegerElementToNonNegativeLong());
+}
+
+TEST(BSONElementIntegerParseTest, ParseIntegerElementToLongRejectsLargestDecimal) {
+    BSONObj query = BSON("" << Decimal128(Decimal128::kLargestPositive));
+    ASSERT_NOT_OK(query.firstElement().parseIntegerElementToLong());
+}
+
+TEST(BSONElementIntegerParseTest, ParseIntegerElementToNonNegativeLongAcceptsZero) {
+    BSONObj query = BSON("" << 0);
+    auto result = query.firstElement().parseIntegerElementToNonNegativeLong();
+    ASSERT_OK(result.getStatus());
+    ASSERT_EQ(result.getValue(), 0LL);
+}
+
+TEST(BSONElementIntegerParseTest, ParseIntegerElementToLongAcceptsZero) {
+    BSONObj query = BSON("" << 0);
+    auto result = query.firstElement().parseIntegerElementToLong();
+    ASSERT_OK(result.getStatus());
+    ASSERT_EQ(result.getValue(), 0LL);
+}
+
+TEST(BSONElementIntegerParseTest, ParseIntegerElementToNonNegativeLongAcceptsThree) {
+    BSONObj query = BSON("" << 3.0);
+    auto result = query.firstElement().parseIntegerElementToNonNegativeLong();
+    ASSERT_OK(result.getStatus());
+    ASSERT_EQ(result.getValue(), 3LL);
+}
+
+TEST(BSONElementIntegerParseTest, ParseIntegerElementToLongAcceptsThree) {
+    BSONObj query = BSON("" << 3.0);
+    auto result = query.firstElement().parseIntegerElementToLong();
+    ASSERT_OK(result.getStatus());
+    ASSERT_EQ(result.getValue(), 3LL);
 }
 
 }  // namespace

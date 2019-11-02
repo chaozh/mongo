@@ -32,8 +32,10 @@
 #include "mongo/db/sessions_collection_rs.h"
 
 #include <boost/optional.hpp>
+#include <memory>
 #include <utility>
 
+#include "mongo/bson/bsonobj.h"
 #include "mongo/client/authenticate.h"
 #include "mongo/client/connection_string.h"
 #include "mongo/client/query.h"
@@ -45,244 +47,191 @@
 #include "mongo/db/repl/repl_set_config.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/rpc/get_status_from_command_result.h"
-#include "mongo/stdx/memory.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
-namespace {
 
-BSONObj lsidQuery(const LogicalSessionId& lsid) {
-    return BSON(LogicalSessionRecord::kIdFieldName << lsid.toBSON());
-}
-
-Status makePrimaryConnection(OperationContext* opCtx, boost::optional<ScopedDbConnection>* conn) {
-    auto coord = mongo::repl::ReplicationCoordinator::get(opCtx);
-    auto config = coord->getConfig();
-    if (!config.isInitialized()) {
-        return {ErrorCodes::NotYetInitialized, "Replication has not yet been configured"};
-    }
-
+auto SessionsCollectionRS::_makePrimaryConnection(OperationContext* opCtx) {
     // Find the primary
-    RemoteCommandTargeterFactoryImpl factory;
-    auto targeter = factory.create(config.getConnectionString());
-    auto res = targeter->findHost(opCtx, ReadPreferenceSetting(ReadPreference::PrimaryOnly));
-    if (!res.isOK()) {
-        return res.getStatus();
+    if (stdx::lock_guard lk(_mutex); !_targeter) {
+        // There is an assumption here that for the lifetime of a given process, the
+        // ReplicationCoordiation will only return configs for a single replica set
+        auto coord = mongo::repl::ReplicationCoordinator::get(opCtx);
+        auto config = coord->getConfig();
+        uassert(ErrorCodes::NotYetInitialized,
+                "Replication has not yet been configured",
+                config.isInitialized());
+
+        RemoteCommandTargeterFactoryImpl factory;
+        _targeter = factory.create(config.getConnectionString());
     }
 
-    auto hostname = res.getValue().toString();
+    auto res = uassertStatusOK(
+        _targeter->findHost(opCtx, ReadPreferenceSetting(ReadPreference::PrimaryOnly)));
+
+    auto conn = std::make_unique<ScopedDbConnection>(res.toString());
 
     // Make a connection to the primary, auth, then send
-    try {
-        conn->emplace(hostname);
-        if (auth::isInternalAuthSet()) {
-            uassertStatusOK((*conn)->get()->authenticateInternalUser());
-        }
-        return Status::OK();
-    } catch (...) {
-        return exceptionToStatus();
+    if (auth::isInternalAuthSet()) {
+        uassertStatusOK(conn->get()->authenticateInternalUser());
     }
+
+    return conn;
 }
 
-template <typename Callback>
-auto runIfStandaloneOrPrimary(const NamespaceString& ns, OperationContext* opCtx, Callback callback)
-    -> boost::optional<decltype(std::declval<Callback>()())> {
-    bool isStandaloneOrPrimary;
-    {
-        Lock::DBLock lk(opCtx, ns.db(), MODE_IS);
-        Lock::CollectionLock lock(
-            opCtx->lockState(), NamespaceString::kLogicalSessionsNamespace.ns(), MODE_IS);
+bool SessionsCollectionRS::_isStandaloneOrPrimary(const NamespaceString& ns,
+                                                  OperationContext* opCtx) {
+    Lock::DBLock lk(opCtx, ns.db(), MODE_IS);
+    Lock::CollectionLock lock(opCtx, NamespaceString::kLogicalSessionsNamespace, MODE_IS);
 
-        auto coord = mongo::repl::ReplicationCoordinator::get(opCtx);
+    auto coord = mongo::repl::ReplicationCoordinator::get(opCtx);
 
-        // There is a window here where we may transition from Primary to
-        // Secondary after we release the locks we take above. In this case,
-        // the callback we run below may return a NotMaster error, or a stale
-        // read. However, this is preferable to running the callback while
-        // we hold locks, since that can lead to a deadlock.
-        isStandaloneOrPrimary = coord->canAcceptWritesForDatabase(opCtx, ns.db());
-    }
-
-    if (isStandaloneOrPrimary) {
-        return callback();
-    }
-
-    return boost::none;
-}
-
-template <typename Callback>
-auto sendToPrimary(OperationContext* opCtx, Callback callback)
-    -> decltype(std::declval<Callback>()(static_cast<DBClientBase*>(nullptr))) {
-    boost::optional<ScopedDbConnection> conn;
-    auto res = makePrimaryConnection(opCtx, &conn);
-    if (!res.isOK()) {
-        return res;
-    }
-
-    auto val = callback(conn->get());
-
-    if (val.isOK()) {
-        conn->done();
-    } else {
-        conn->kill();
-    }
-
-    return std::move(val);
+    return coord->canAcceptWritesForDatabase(opCtx, ns.db());
 }
 
 template <typename LocalCallback, typename RemoteCallback>
-auto dispatch(const NamespaceString& ns,
-              OperationContext* opCtx,
-              LocalCallback localCallback,
-              RemoteCallback remoteCallback)
-    -> decltype(std::declval<RemoteCallback>()(static_cast<DBClientBase*>(nullptr))) {
-    // If we are the primary, write directly to ourself.
-    auto result = runIfStandaloneOrPrimary(ns, opCtx, [&] { return localCallback(); });
-
-    if (result) {
-        return *result;
+auto SessionsCollectionRS::_dispatch(const NamespaceString& ns,
+                                     OperationContext* opCtx,
+                                     LocalCallback&& localCallback,
+                                     RemoteCallback&& remoteCallback)
+    -> CommonResultT<LocalCallback, RemoteCallback> {
+    if (_isStandaloneOrPrimary(ns, opCtx)) {
+        return std::forward<LocalCallback>(localCallback)();
     }
 
-    return sendToPrimary(opCtx, remoteCallback);
+    // There is a window here where we may transition from Primary to Secondary after we release
+    // the locks we take in _isStandaloneOrPrimary(). In this case, the callback we run below
+    // may throw a NotMaster error, or a stale read. However, this is preferable to running the
+    // callback while we hold locks, since that can lead to a deadlock.
+
+    auto conn = _makePrimaryConnection(opCtx);
+    DBClientBase* client = conn->get();
+    auto guard = makeGuard([&] { conn->done(); });
+    try {
+        return std::forward<RemoteCallback>(remoteCallback)(client);
+    } catch (...) {
+        guard.dismiss();
+        conn->kill();
+        throw;
+    }
 }
 
-}  // namespace
-
-Status SessionsCollectionRS::setupSessionsCollection(OperationContext* opCtx) {
-    return dispatch(
+void SessionsCollectionRS::setupSessionsCollection(OperationContext* opCtx) {
+    _dispatch(
         NamespaceString::kLogicalSessionsNamespace,
         opCtx,
         [&] {
-            auto existsStatus = checkSessionsCollectionExists(opCtx);
-            if (existsStatus.isOK()) {
-                return Status::OK();
+            try {
+                checkSessionsCollectionExists(opCtx);
+            } catch (const DBException& ex) {
+
+                DBDirectClient client(opCtx);
+                BSONObj cmd;
+
+                if (ex.code() == ErrorCodes::IndexOptionsConflict) {
+                    cmd = generateCollModCmd();
+                } else {
+                    // Creating the TTL index will auto-generate the collection.
+                    cmd = generateCreateIndexesCmd();
+                }
+
+                BSONObj info;
+                if (!client.runCommand(
+                        NamespaceString::kLogicalSessionsNamespace.db().toString(), cmd, info)) {
+                    uassertStatusOK(getStatusFromCommandResult(info));
+                }
             }
-
-            DBDirectClient client(opCtx);
-            BSONObj cmd;
-
-            if (existsStatus.code() == ErrorCodes::IndexOptionsConflict) {
-                cmd = generateCollModCmd();
-            } else {
-                // Creating the TTL index will auto-generate the collection.
-                cmd = generateCreateIndexesCmd();
-            }
-
-            BSONObj info;
-            if (!client.runCommand(
-                    NamespaceString::kLogicalSessionsNamespace.db().toString(), cmd, info)) {
-                return getStatusFromCommandResult(info);
-            }
-
-            return Status::OK();
         },
-        [&](DBClientBase*) { return checkSessionsCollectionExists(opCtx); });
+        [&](DBClientBase*) { checkSessionsCollectionExists(opCtx); });
 }
 
-Status SessionsCollectionRS::checkSessionsCollectionExists(OperationContext* opCtx) {
+void SessionsCollectionRS::checkSessionsCollectionExists(OperationContext* opCtx) {
     DBDirectClient client(opCtx);
 
-    auto indexes = client.getIndexSpecs(NamespaceString::kLogicalSessionsNamespace.toString());
+    auto indexes = client.getIndexSpecs(NamespaceString::kLogicalSessionsNamespace);
 
-    if (indexes.size() == 0u) {
-        return Status{ErrorCodes::NamespaceNotFound, "config.system.sessions does not exist"};
-    }
+    uassert(ErrorCodes::NamespaceNotFound,
+            str::stream() << NamespaceString::kLogicalSessionsNamespace << " does not exist",
+            indexes.size() != 0u);
 
     auto index = std::find_if(indexes.begin(), indexes.end(), [](const BSONObj& index) {
         return index.getField("name").String() == kSessionsTTLIndex;
     });
 
-    if (index == indexes.end()) {
-        return Status{ErrorCodes::IndexNotFound,
-                      "config.system.sessions does not have the required TTL index"};
-    }
+    uassert(ErrorCodes::IndexNotFound,
+            str::stream() << NamespaceString::kLogicalSessionsNamespace
+                          << " does not have the required TTL index",
+            index != indexes.end());
 
-    if (!index->hasField("expireAfterSeconds") ||
-        index->getField("expireAfterSeconds").Int() != (localLogicalSessionTimeoutMinutes * 60)) {
-        return Status{
-            ErrorCodes::IndexOptionsConflict,
-            "config.system.sessions currently has the incorrect timeout for the TTL index"};
-    }
-
-    return Status::OK();
+    uassert(ErrorCodes::IndexOptionsConflict,
+            str::stream() << NamespaceString::kLogicalSessionsNamespace
+                          << " currently has the incorrect timeout for the TTL index",
+            index->hasField("expireAfterSeconds") &&
+                index->getField("expireAfterSeconds").Int() ==
+                    (localLogicalSessionTimeoutMinutes * 60));
 }
 
-Status SessionsCollectionRS::refreshSessions(OperationContext* opCtx,
-                                             const LogicalSessionRecordSet& sessions) {
-    return dispatch(NamespaceString::kLogicalSessionsNamespace,
-                    opCtx,
-                    [&] {
-                        DBDirectClient client(opCtx);
-                        return doRefresh(NamespaceString::kLogicalSessionsNamespace,
-                                         sessions,
-                                         makeSendFnForBatchWrite(
-                                             NamespaceString::kLogicalSessionsNamespace, &client));
-                    },
-                    [&](DBClientBase* client) {
-                        return doRefresh(NamespaceString::kLogicalSessionsNamespace,
-                                         sessions,
-                                         makeSendFnForBatchWrite(
-                                             NamespaceString::kLogicalSessionsNamespace, client));
-                    });
+void SessionsCollectionRS::refreshSessions(OperationContext* opCtx,
+                                           const LogicalSessionRecordSet& sessions) {
+    const std::vector<LogicalSessionRecord> sessionsVector(sessions.begin(), sessions.end());
+
+    _dispatch(NamespaceString::kLogicalSessionsNamespace,
+              opCtx,
+              [&] {
+                  DBDirectClient client(opCtx);
+                  _doRefresh(
+                      NamespaceString::kLogicalSessionsNamespace,
+                      sessionsVector,
+                      makeSendFnForBatchWrite(NamespaceString::kLogicalSessionsNamespace, &client));
+              },
+              [&](DBClientBase* client) {
+                  _doRefresh(
+                      NamespaceString::kLogicalSessionsNamespace,
+                      sessionsVector,
+                      makeSendFnForBatchWrite(NamespaceString::kLogicalSessionsNamespace, client));
+              });
 }
 
-Status SessionsCollectionRS::removeRecords(OperationContext* opCtx,
-                                           const LogicalSessionIdSet& sessions) {
-    return dispatch(NamespaceString::kLogicalSessionsNamespace,
-                    opCtx,
-                    [&] {
-                        DBDirectClient client(opCtx);
-                        return doRemove(NamespaceString::kLogicalSessionsNamespace,
-                                        sessions,
-                                        makeSendFnForBatchWrite(
-                                            NamespaceString::kLogicalSessionsNamespace, &client));
-                    },
-                    [&](DBClientBase* client) {
-                        return doRemove(NamespaceString::kLogicalSessionsNamespace,
-                                        sessions,
-                                        makeSendFnForBatchWrite(
-                                            NamespaceString::kLogicalSessionsNamespace, client));
-                    });
-}
+void SessionsCollectionRS::removeRecords(OperationContext* opCtx,
+                                         const LogicalSessionIdSet& sessions) {
+    const std::vector<LogicalSessionId> sessionsVector(sessions.begin(), sessions.end());
 
-StatusWith<LogicalSessionIdSet> SessionsCollectionRS::findRemovedSessions(
-    OperationContext* opCtx, const LogicalSessionIdSet& sessions) {
-    return dispatch(NamespaceString::kLogicalSessionsNamespace,
-                    opCtx,
-                    [&] {
-                        DBDirectClient client(opCtx);
-                        return doFetch(NamespaceString::kLogicalSessionsNamespace,
-                                       sessions,
-                                       makeFindFnForCommand(
-                                           NamespaceString::kLogicalSessionsNamespace, &client));
-                    },
-                    [&](DBClientBase* client) {
-                        return doFetch(NamespaceString::kLogicalSessionsNamespace,
-                                       sessions,
-                                       makeFindFnForCommand(
-                                           NamespaceString::kLogicalSessionsNamespace, client));
-                    });
-}
-
-Status SessionsCollectionRS::removeTransactionRecords(OperationContext* opCtx,
-                                                      const LogicalSessionIdSet& sessions) {
-    return dispatch(
-        NamespaceString::kSessionTransactionsTableNamespace,
+    _dispatch(
+        NamespaceString::kLogicalSessionsNamespace,
         opCtx,
         [&] {
             DBDirectClient client(opCtx);
-            return doRemove(NamespaceString::kSessionTransactionsTableNamespace,
-                            sessions,
-                            makeSendFnForBatchWrite(
-                                NamespaceString::kSessionTransactionsTableNamespace, &client));
+            _doRemove(NamespaceString::kLogicalSessionsNamespace,
+                      sessionsVector,
+                      makeSendFnForBatchWrite(NamespaceString::kLogicalSessionsNamespace, &client));
         },
-        [](DBClientBase*) {
-            return Status(ErrorCodes::NotMaster, "Not eligible to remove transaction records");
+        [&](DBClientBase* client) {
+            _doRemove(NamespaceString::kLogicalSessionsNamespace,
+                      sessionsVector,
+                      makeSendFnForBatchWrite(NamespaceString::kLogicalSessionsNamespace, client));
         });
 }
 
-Status SessionsCollectionRS::removeTransactionRecordsHelper(OperationContext* opCtx,
-                                                            const LogicalSessionIdSet& sessions) {
-    return SessionsCollectionRS{}.removeTransactionRecords(opCtx, sessions);
+LogicalSessionIdSet SessionsCollectionRS::findRemovedSessions(OperationContext* opCtx,
+                                                              const LogicalSessionIdSet& sessions) {
+    const std::vector<LogicalSessionId> sessionsVector(sessions.begin(), sessions.end());
+
+    return _dispatch(
+        NamespaceString::kLogicalSessionsNamespace,
+        opCtx,
+        [&] {
+            DBDirectClient client(opCtx);
+            return _doFindRemoved(
+                NamespaceString::kLogicalSessionsNamespace,
+                sessionsVector,
+                makeFindFnForCommand(NamespaceString::kLogicalSessionsNamespace, &client));
+        },
+        [&](DBClientBase* client) {
+            return _doFindRemoved(
+                NamespaceString::kLogicalSessionsNamespace,
+                sessionsVector,
+                makeFindFnForCommand(NamespaceString::kLogicalSessionsNamespace, client));
+        });
 }
 
 }  // namespace mongo

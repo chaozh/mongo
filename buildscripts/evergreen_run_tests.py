@@ -1,7 +1,5 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 """Command line utility for executing MongoDB tests in Evergreen."""
-
-from __future__ import absolute_import
 
 import collections
 import os.path

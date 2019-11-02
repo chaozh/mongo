@@ -30,8 +30,8 @@
 #pragma once
 
 #include <list>
+#include <memory>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/bson/simple_bsonobj_comparator.h"
 #include "mongo/db/logical_time.h"
 #include "mongo/db/namespace_string.h"
@@ -41,7 +41,6 @@
 #include "mongo/db/service_context.h"
 #include "mongo/executor/task_executor.h"
 #include "mongo/s/catalog/type_chunk.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/util/concurrency/notification.h"
 #include "mongo/util/concurrency/with_lock.h"
 
@@ -50,7 +49,8 @@ namespace mongo {
 class RangePreserver;
 
 class MetadataManager {
-    MONGO_DISALLOW_COPYING(MetadataManager);
+    MetadataManager(const MetadataManager&) = delete;
+    MetadataManager& operator=(const MetadataManager&) = delete;
 
 public:
     using CleanupNotification = CollectionRangeDeleter::DeleteNotification;
@@ -80,6 +80,13 @@ public:
      * tests.
      */
     size_t numberOfMetadataSnapshots() const;
+
+    /**
+     * Returns the number of metadata objects that have been set to boost::none in
+     * _retireExpiredMetadata(). The actual number may vary after it returns, so this is really only
+     * useful for unit tests.
+     */
+    int numberOfEmptyMetadataSnapshots() const;
 
     void setFilteringMetadata(CollectionMetadata newMetadata);
 
@@ -152,7 +159,8 @@ private:
      * point in time along with a counter of how many queries are still using it.
      */
     struct CollectionMetadataTracker {
-        MONGO_DISALLOW_COPYING(CollectionMetadataTracker);
+        CollectionMetadataTracker(const CollectionMetadataTracker&) = delete;
+        CollectionMetadataTracker& operator=(const CollectionMetadataTracker&) = delete;
 
         CollectionMetadataTracker(CollectionMetadata inMetadata)
             : metadata(std::move(inMetadata)) {}
@@ -161,7 +169,7 @@ private:
             invariant(!usageCounter);
         }
 
-        CollectionMetadata metadata;
+        boost::optional<CollectionMetadata> metadata;
 
         std::list<Deletion> orphans;
 
@@ -175,7 +183,7 @@ private:
 
     /**
      * Cancels all scheduled deletions of orphan ranges, notifying listeners with status
-     * InterruptedDueToStepDown.
+     * InterruptedDueToReplStateChange.
      */
     void _clearAllCleanups(WithLock);
 
@@ -232,7 +240,7 @@ private:
     executor::TaskExecutor* const _executor;
 
     // Mutex to protect the state below
-    mutable stdx::mutex _managerLock;
+    mutable Mutex _managerLock = MONGO_MAKE_LATCH("MetadataManager::_managerLock");
 
     // Contains a list of collection metadata for the same collection epoch, ordered in
     // chronological order based on the refreshes that occurred. The entry at _metadata.back() is

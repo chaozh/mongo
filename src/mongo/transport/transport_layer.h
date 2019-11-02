@@ -29,11 +29,11 @@
 
 #pragma once
 
+#include <functional>
 #include <memory>
 
 #include "mongo/base/status.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/stdx/functional.h"
 #include "mongo/transport/session.h"
 #include "mongo/util/functional.h"
 #include "mongo/util/future.h"
@@ -65,7 +65,8 @@ using ReactorHandle = std::shared_ptr<Reactor>;
  * References to the TransportLayer should be stored on service context objects.
  */
 class TransportLayer {
-    MONGO_DISALLOW_COPYING(TransportLayer);
+    TransportLayer(const TransportLayer&) = delete;
+    TransportLayer& operator=(const TransportLayer&) = delete;
 
 public:
     static const Status SessionUnknownStatus;

@@ -34,7 +34,8 @@
 #include <ostream>
 
 #include "mongo/base/parse_number.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/db/server_options.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 namespace {
@@ -76,6 +77,8 @@ const NamespaceString NamespaceString::kSystemReplSetNamespace(NamespaceString::
                                                                "system.replset");
 const NamespaceString NamespaceString::kIndexBuildEntryNamespace(NamespaceString::kConfigDb,
                                                                  "system.indexBuilds");
+const NamespaceString NamespaceString::kRangeDeletionNamespace(NamespaceString::kConfigDb,
+                                                               "rangeDeletions");
 
 bool NamespaceString::isListCollectionsCursorNS() const {
     return coll() == listCollectionsCursorCol;
@@ -99,6 +102,8 @@ bool NamespaceString::isLegalClientSystemNS() const {
             return true;
     } else if (db() == "config") {
         if (ns() == "config.system.sessions")
+            return true;
+        if (ns() == kIndexBuildEntryNamespace.ns())
             return true;
     }
 
@@ -139,12 +144,31 @@ bool NamespaceString::isDropPendingNamespace() const {
     return coll().startsWith(dropPendingNSPrefix);
 }
 
+bool NamespaceString::checkLengthForFCV() const {
+    // Prior to longer collection names, the limit in older versions was 120 characters.
+    const size_t previousMaxNSLength = 120U;
+    if (size() <= previousMaxNSLength) {
+        return true;
+    }
+
+    if (!serverGlobalParams.featureCompatibility.isVersionInitialized()) {
+        return false;
+    }
+
+    if (serverGlobalParams.featureCompatibility.getVersion() ==
+        ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo44) {
+        return true;
+    }
+
+    return false;
+}
+
 NamespaceString NamespaceString::makeDropPendingNamespace(const repl::OpTime& opTime) const {
     StringBuilder ss;
     ss << db() << "." << dropPendingNSPrefix;
     ss << opTime.getSecs() << "i" << opTime.getTimestamp().getInc() << "t" << opTime.getTerm();
     ss << "." << coll();
-    return NamespaceString(ss.stringData().substr(0, MaxNsCollectionLen));
+    return NamespaceString(ss.stringData());
 }
 
 StatusWith<repl::OpTime> NamespaceString::getDropPendingNamespaceOpTime() const {
@@ -173,51 +197,48 @@ StatusWith<repl::OpTime> NamespaceString::getDropPendingNamespaceOpTime() const 
     }
 
     long long seconds;
-    auto status = parseNumberFromString(opTimeStr.substr(0, incrementSeparatorIndex), &seconds);
+    auto status = NumberParser{}(opTimeStr.substr(0, incrementSeparatorIndex), &seconds);
     if (!status.isOK()) {
         return status.withContext(
             str::stream() << "Invalid timestamp seconds in drop-pending namespace: " << _ns);
     }
 
     unsigned int increment;
-    status =
-        parseNumberFromString(opTimeStr.substr(incrementSeparatorIndex + 1,
-                                               termSeparatorIndex - (incrementSeparatorIndex + 1)),
-                              &increment);
+    status = NumberParser{}(opTimeStr.substr(incrementSeparatorIndex + 1,
+                                             termSeparatorIndex - (incrementSeparatorIndex + 1)),
+                            &increment);
     if (!status.isOK()) {
         return status.withContext(
             str::stream() << "Invalid timestamp increment in drop-pending namespace: " << _ns);
     }
 
     long long term;
-    status = mongo::parseNumberFromString(opTimeStr.substr(termSeparatorIndex + 1), &term);
+    status = mongo::NumberParser{}(opTimeStr.substr(termSeparatorIndex + 1), &term);
     if (!status.isOK()) {
-        return status.withContext(str::stream() << "Invalid term in drop-pending namespace: "
-                                                << _ns);
+        return status.withContext(str::stream()
+                                  << "Invalid term in drop-pending namespace: " << _ns);
     }
 
     return repl::OpTime(Timestamp(Seconds(seconds), increment), term);
 }
 
-Status NamespaceString::checkLengthForRename(
-    const std::string::size_type longestIndexNameLength) const {
-    auto longestAllowed =
-        std::min(std::string::size_type(NamespaceString::MaxNsCollectionLen),
-                 std::string::size_type(NamespaceString::MaxNsLen - 2U /*strlen(".$")*/ -
-                                        longestIndexNameLength));
-    if (size() > longestAllowed) {
-        StringBuilder sb;
-        sb << "collection name length of " << size() << " exceeds maximum length of "
-           << longestAllowed << ", allowing for index names";
-        return Status(ErrorCodes::InvalidLength, sb.str());
-    }
-    return Status::OK();
-}
+bool NamespaceString::isNamespaceAlwaysUnsharded() const {
+    // Local and admin never have sharded collections
+    if (db() == NamespaceString::kLocalDb || db() == NamespaceString::kAdminDb)
+        return true;
 
-NamespaceString NamespaceString::makeIndexNamespace(StringData indexName) const {
-    StringBuilder ss;
-    ss << coll() << ".$" << indexName;
-    return NamespaceString(db(), ss.stringData());
+    // Certain config collections can never be sharded
+    if (ns() == kSessionTransactionsTableNamespace.ns())
+        return true;
+
+    if (isSystemDotProfile())
+        return true;
+
+    if (ns() == "config.cache.databases" || ns() == "config.cache.collections" ||
+        (db() == "config" && coll().startsWith("cache.chunks")))
+        return true;
+
+    return false;
 }
 
 bool NamespaceString::isReplicated() const {

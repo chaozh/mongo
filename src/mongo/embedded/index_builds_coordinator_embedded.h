@@ -29,7 +29,6 @@
 
 #pragma once
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/db/index_builds_coordinator.h"
 
 namespace mongo {
@@ -46,7 +45,8 @@ class ServiceContext;
  * accessible via the ServiceContext.
  */
 class IndexBuildsCoordinatorEmbedded : public IndexBuildsCoordinator {
-    MONGO_DISALLOW_COPYING(IndexBuildsCoordinatorEmbedded);
+    IndexBuildsCoordinatorEmbedded(const IndexBuildsCoordinatorEmbedded&) = delete;
+    IndexBuildsCoordinatorEmbedded& operator=(const IndexBuildsCoordinatorEmbedded&) = delete;
 
 public:
     IndexBuildsCoordinatorEmbedded() = default;
@@ -58,6 +58,7 @@ public:
 
     StatusWith<SharedSemiFuture<ReplIndexBuildState::IndexCatalogStats>> startIndexBuild(
         OperationContext* opCtx,
+        StringData dbName,
         CollectionUUID collectionUUID,
         const std::vector<BSONObj>& specs,
         const UUID& buildUUID,
@@ -67,12 +68,6 @@ public:
     /**
      * None of the following functions should ever be called on an embedded server node.
      */
-    Status commitIndexBuild(OperationContext* opCtx,
-                            const std::vector<BSONObj>& specs,
-                            const UUID& buildUUID) override;
-    void signalChangeToPrimaryMode() override;
-    void signalChangeToSecondaryMode() override;
-    void signalChangeToInitialSyncMode() override;
     Status voteCommitIndexBuild(const UUID& buildUUID, const HostAndPort& hostAndPort) override;
     Status setCommitQuorum(OperationContext* opCtx,
                            const NamespaceString& nss,

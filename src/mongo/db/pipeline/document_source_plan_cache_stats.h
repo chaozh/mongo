@@ -36,13 +36,13 @@ namespace mongo {
 
 class DocumentSourcePlanCacheStats final : public DocumentSource {
 public:
-    static const char* kStageName;
+    static constexpr StringData kStageName = "$planCacheStats"_sd;
 
     class LiteParsed final : public LiteParsedDocumentSource {
     public:
         static std::unique_ptr<LiteParsed> parse(const AggregationRequest& request,
                                                  const BSONElement& spec) {
-            return stdx::make_unique<LiteParsed>(request.getNamespaceString());
+            return std::make_unique<LiteParsed>(request.getNamespaceString());
         }
 
         explicit LiteParsed(NamespaceString nss) : _nss(std::move(nss)) {}
@@ -60,22 +60,17 @@ public:
             return true;
         }
 
-        bool allowedToForwardFromMongos() const override {
-            // $planCacheStats must be run locally on a mongod.
-            return false;
-        }
-
         bool allowedToPassthroughFromMongos() const override {
             // $planCacheStats must be run locally on a mongod.
             return false;
         }
 
         void assertSupportsReadConcern(const repl::ReadConcernArgs& readConcern) const {
-            uassert(ErrorCodes::InvalidOptions,
-                    str::stream() << "Aggregation stage " << kStageName
-                                  << " requires read concern local but found "
-                                  << readConcern.toString(),
-                    readConcern.getLevel() == repl::ReadConcernLevel::kLocalReadConcern);
+            onlyReadConcernLocalSupported(DocumentSourcePlanCacheStats::kStageName, readConcern);
+        }
+
+        void assertSupportsMultiDocumentTransaction() const {
+            transactionNotSupported(DocumentSourcePlanCacheStats::kStageName);
         }
 
     private:
@@ -87,8 +82,6 @@ public:
 
     virtual ~DocumentSourcePlanCacheStats() = default;
 
-    GetNextResult getNext() override;
-
     StageConstraints constraints(
         Pipeline::SplitState = Pipeline::SplitState::kUnsplit) const override {
         StageConstraints constraints{StreamType::kStreaming,
@@ -98,18 +91,19 @@ public:
                                      HostTypeRequirement::kAnyShard,
                                      DiskUseRequirement::kNoDiskUse,
                                      FacetRequirement::kNotAllowed,
-                                     TransactionRequirement::kNotAllowed};
+                                     TransactionRequirement::kNotAllowed,
+                                     LookupRequirement::kAllowed};
 
         constraints.requiresInputDocSource = false;
         return constraints;
     }
 
-    boost::optional<MergingLogic> mergingLogic() final {
+    boost::optional<DistributedPlanLogic> distributedPlanLogic() final {
         return boost::none;
     }
 
     const char* getSourceName() const override {
-        return kStageName;
+        return DocumentSourcePlanCacheStats::kStageName.rawData();
     }
 
     /**
@@ -125,6 +119,8 @@ public:
 
 private:
     DocumentSourcePlanCacheStats(const boost::intrusive_ptr<ExpressionContext>& expCtx);
+
+    GetNextResult doGetNext() final;
 
     Value serialize(
         boost::optional<ExplainOptions::Verbosity> explain = boost::none) const override {

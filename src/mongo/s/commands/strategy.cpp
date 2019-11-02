@@ -79,10 +79,10 @@
 #include "mongo/s/session_catalog_router.h"
 #include "mongo/s/stale_exception.h"
 #include "mongo/s/transaction_router.h"
-#include "mongo/util/fail_point_service.h"
+#include "mongo/util/fail_point.h"
 #include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
 #include "mongo/util/scopeguard.h"
+#include "mongo/util/str.h"
 #include "mongo/util/timer.h"
 
 namespace mongo {
@@ -135,10 +135,12 @@ void appendRequiredFieldsToResponse(OperationContext* opCtx, BSONObjBuilder* res
         // Add operationTime.
         auto operationTime = OperationTimeTracker::get(opCtx)->getMaxOperationTime();
         if (operationTime != LogicalTime::kUninitialized) {
+            LOG(5) << "Appending operationTime: " << operationTime.asTimestamp();
             responseBuilder->append(kOperationTime, operationTime.asTimestamp());
         } else if (now != LogicalTime::kUninitialized) {
             // If we don't know the actual operation time, use the cluster time instead. This is
             // safe but not optimal because we can always return a later operation time than actual.
+            LOG(5) << "Appending clusterTime as operationTime " << now.asTimestamp();
             responseBuilder->append(kOperationTime, now.asTimestamp());
         }
 
@@ -158,10 +160,12 @@ void appendRequiredFieldsToResponse(OperationContext* opCtx, BSONObjBuilder* res
  */
 void invokeInTransactionRouter(OperationContext* opCtx,
                                CommandInvocation* invocation,
-                               TransactionRouter* txnRouter,
                                rpc::ReplyBuilderInterface* result) {
+    auto txnRouter = TransactionRouter::get(opCtx);
+    invariant(txnRouter);
+
     // No-op if the transaction is not running with snapshot read concern.
-    txnRouter->setDefaultAtClusterTime(opCtx);
+    txnRouter.setDefaultAtClusterTime(opCtx);
 
     try {
         invocation->run(opCtx, result);
@@ -173,7 +177,7 @@ void invokeInTransactionRouter(OperationContext* opCtx,
             throw;
         }
 
-        txnRouter->implicitlyAbortTransaction(opCtx, e.toStatus());
+        txnRouter.implicitlyAbortTransaction(opCtx, e.toStatus());
         throw;
     }
 }
@@ -181,14 +185,12 @@ void invokeInTransactionRouter(OperationContext* opCtx,
 /**
  * Adds info from the active transaction and the given reason as context to the active exception.
  */
-void addContextForTransactionAbortingError(TransactionRouter* txnRouter,
+void addContextForTransactionAbortingError(StringData txnIdAsString,
+                                           StmtId latestStmtId,
                                            DBException& ex,
                                            StringData reason) {
-    ex.addContext(str::stream() << "Transaction " << txnRouter->txnIdToString()
-                                << " was aborted on statement "
-                                << txnRouter->getLatestStmtId()
-                                << " due to: "
-                                << reason);
+    ex.addContext(str::stream() << "Transaction " << txnIdAsString << " was aborted on statement "
+                                << latestStmtId << " due to: " << reason);
 }
 
 void execCommandClient(OperationContext* opCtx,
@@ -280,7 +282,7 @@ void execCommandClient(OperationContext* opCtx,
     auto txnRouter = TransactionRouter::get(opCtx);
     if (!supportsWriteConcern) {
         if (txnRouter) {
-            invokeInTransactionRouter(opCtx, invocation, txnRouter, result);
+            invokeInTransactionRouter(opCtx, invocation, result);
         } else {
             invocation->run(opCtx, result);
         }
@@ -291,20 +293,20 @@ void execCommandClient(OperationContext* opCtx,
         opCtx->setWriteConcern(wcResult);
 
         if (txnRouter) {
-            invokeInTransactionRouter(opCtx, invocation, txnRouter, result);
+            invokeInTransactionRouter(opCtx, invocation, result);
         } else {
             invocation->run(opCtx, result);
         }
 
-        auto body = result->getBodyBuilder();
-
-        MONGO_FAIL_POINT_BLOCK_IF(failCommand, data, [&](const BSONObj& data) {
-            return CommandHelpers::shouldActivateFailCommandFailPoint(
-                       data, request.getCommandName(), opCtx->getClient()) &&
-                data.hasField("writeConcernError");
-        }) {
-            body.append(data.getData()["writeConcernError"]);
-        }
+        failCommand.executeIf(
+            [&](const BSONObj& data) {
+                result->getBodyBuilder().append(data["writeConcernError"]);
+            },
+            [&](const BSONObj& data) {
+                return CommandHelpers::shouldActivateFailCommandFailPoint(
+                           data, request.getCommandName(), opCtx->getClient(), invocation->ns()) &&
+                    data.hasField("writeConcernError");
+            });
     }
 
     auto body = result->getBodyBuilder();
@@ -314,8 +316,8 @@ void execCommandClient(OperationContext* opCtx,
         c->incrementCommandsFailed();
 
         if (auto txnRouter = TransactionRouter::get(opCtx)) {
-            txnRouter->implicitlyAbortTransaction(opCtx,
-                                                  getStatusFromCommandResult(body.asTempObj()));
+            txnRouter.implicitlyAbortTransaction(opCtx,
+                                                 getStatusFromCommandResult(body.asTempObj()));
         }
     }
 }
@@ -363,6 +365,11 @@ void runCommand(OperationContext* opCtx,
     }
     opCtx->checkForInterrupt();  // May trigger maxTimeAlwaysTimeOut fail point.
 
+    // If the command includes a 'comment' field, set it on the current OpCtx.
+    if (auto commentField = request.body["comment"]) {
+        opCtx->setComment(commentField.wrap());
+    }
+
     auto invocation = command->parse(opCtx, request);
 
     // Set the logical optype, command object and namespace as soon as we identify the command. If
@@ -380,7 +387,11 @@ void runCommand(OperationContext* opCtx,
                                               command->attachLogicalSessionsToOpCtx(),
                                               true,
                                               true);
-    validateSessionOptions(osi, command->getName(), nss.db());
+
+    // TODO SERVER-28756: Change allowTransactionsOnConfigDatabase to true once we fix the bug
+    // where the mongos custom write path incorrectly drops the client's txnNumber.
+    auto allowTransactionsOnConfigDatabase = false;
+    validateSessionOptions(osi, command->getName(), nss, allowTransactionsOnConfigDatabase);
 
     auto& readConcernArgs = repl::ReadConcernArgs::get(opCtx);
     auto readConcernParseStatus = [&]() {
@@ -397,17 +408,13 @@ void runCommand(OperationContext* opCtx,
 
     if (readConcernArgs.getLevel() == repl::ReadConcernLevel::kSnapshotReadConcern) {
         uassert(ErrorCodes::InvalidOptions,
-                str::stream() << "read concern snapshot is not supported on mongos for the command "
-                              << commandName,
-                invocation->supportsReadConcern(readConcernArgs.getLevel()));
-        uassert(ErrorCodes::InvalidOptions,
                 "read concern snapshot is not supported with atClusterTime on mongos",
                 !readConcernArgs.getArgsAtClusterTime());
     }
 
     boost::optional<RouterOperationContextSession> routerSession;
     try {
-        CommandHelpers::evaluateFailCommandFailPoint(opCtx, commandName);
+        CommandHelpers::evaluateFailCommandFailPoint(opCtx, commandName, invocation->ns());
         if (osi.getAutocommit()) {
             routerSession.emplace(opCtx);
 
@@ -430,7 +437,7 @@ void runCommand(OperationContext* opCtx,
                 return TransactionRouter::TransactionActions::kContinue;
             })();
 
-            txnRouter->beginOrContinueTxn(opCtx, *txnNumber, transactionAction);
+            txnRouter.beginOrContinueTxn(opCtx, *txnNumber, transactionAction);
         }
 
         for (int tries = 0;; ++tries) {
@@ -451,7 +458,7 @@ void runCommand(OperationContext* opCtx,
 
                 auto responseBuilder = replyBuilder->getBodyBuilder();
                 if (auto txnRouter = TransactionRouter::get(opCtx)) {
-                    txnRouter->appendRecoveryToken(&responseBuilder);
+                    txnRouter.appendRecoveryToken(&responseBuilder);
                 }
 
                 return;
@@ -482,7 +489,7 @@ void runCommand(OperationContext* opCtx,
                 // under a transaction (see the invariant inside ShardConnection). Because of this,
                 // the retargeting error could not have come from a ShardConnection, so we don't
                 // need to reset the connection's in-memory state.
-                if (!MONGO_FAIL_POINT(doNotRefreshShardsOnRetargettingError) &&
+                if (!MONGO_unlikely(doNotRefreshShardsOnRetargettingError.shouldFail()) &&
                     !TransactionRouter::get(opCtx)) {
                     ShardConnection::checkMyConnectionVersions(opCtx, staleNs.ns());
                 }
@@ -493,21 +500,27 @@ void runCommand(OperationContext* opCtx,
                 // error cannot be retried on.
                 if (auto txnRouter = TransactionRouter::get(opCtx)) {
                     auto abortGuard = makeGuard(
-                        [&] { txnRouter->implicitlyAbortTransaction(opCtx, ex.toStatus()); });
+                        [&] { txnRouter.implicitlyAbortTransaction(opCtx, ex.toStatus()); });
 
                     if (!canRetry) {
-                        addContextForTransactionAbortingError(txnRouter, ex, "exhausted retries");
+                        addContextForTransactionAbortingError(txnRouter.txnIdToString(),
+                                                              txnRouter.getLatestStmtId(),
+                                                              ex,
+                                                              "exhausted retries");
                         throw;
                     }
 
-                    if (!txnRouter->canContinueOnStaleShardOrDbError(commandName)) {
+                    if (!txnRouter.canContinueOnStaleShardOrDbError(commandName)) {
                         addContextForTransactionAbortingError(
-                            txnRouter, ex, "an error from cluster data placement change");
+                            txnRouter.txnIdToString(),
+                            txnRouter.getLatestStmtId(),
+                            ex,
+                            "an error from cluster data placement change");
                         throw;
                     }
 
                     // The error is retryable, so update transaction state before retrying.
-                    txnRouter->onStaleShardOrDbError(opCtx, commandName, ex.toStatus());
+                    txnRouter.onStaleShardOrDbError(opCtx, commandName, ex.toStatus());
 
                     abortGuard.dismiss();
                     continue;
@@ -526,21 +539,27 @@ void runCommand(OperationContext* opCtx,
                 // error cannot be retried on.
                 if (auto txnRouter = TransactionRouter::get(opCtx)) {
                     auto abortGuard = makeGuard(
-                        [&] { txnRouter->implicitlyAbortTransaction(opCtx, ex.toStatus()); });
+                        [&] { txnRouter.implicitlyAbortTransaction(opCtx, ex.toStatus()); });
 
                     if (!canRetry) {
-                        addContextForTransactionAbortingError(txnRouter, ex, "exhausted retries");
+                        addContextForTransactionAbortingError(txnRouter.txnIdToString(),
+                                                              txnRouter.getLatestStmtId(),
+                                                              ex,
+                                                              "exhausted retries");
                         throw;
                     }
 
-                    if (!txnRouter->canContinueOnStaleShardOrDbError(commandName)) {
+                    if (!txnRouter.canContinueOnStaleShardOrDbError(commandName)) {
                         addContextForTransactionAbortingError(
-                            txnRouter, ex, "an error from cluster data placement change");
+                            txnRouter.txnIdToString(),
+                            txnRouter.getLatestStmtId(),
+                            ex,
+                            "an error from cluster data placement change");
                         throw;
                     }
 
                     // The error is retryable, so update transaction state before retrying.
-                    txnRouter->onStaleShardOrDbError(opCtx, commandName, ex.toStatus());
+                    txnRouter.onStaleShardOrDbError(opCtx, commandName, ex.toStatus());
 
                     abortGuard.dismiss();
                     continue;
@@ -557,21 +576,26 @@ void runCommand(OperationContext* opCtx,
                 // error cannot be retried on.
                 if (auto txnRouter = TransactionRouter::get(opCtx)) {
                     auto abortGuard = makeGuard(
-                        [&] { txnRouter->implicitlyAbortTransaction(opCtx, ex.toStatus()); });
+                        [&] { txnRouter.implicitlyAbortTransaction(opCtx, ex.toStatus()); });
 
                     if (!canRetry) {
-                        addContextForTransactionAbortingError(txnRouter, ex, "exhausted retries");
+                        addContextForTransactionAbortingError(txnRouter.txnIdToString(),
+                                                              txnRouter.getLatestStmtId(),
+                                                              ex,
+                                                              "exhausted retries");
                         throw;
                     }
 
-                    if (!txnRouter->canContinueOnSnapshotError()) {
-                        addContextForTransactionAbortingError(
-                            txnRouter, ex, "a non-retryable snapshot error");
+                    if (!txnRouter.canContinueOnSnapshotError()) {
+                        addContextForTransactionAbortingError(txnRouter.txnIdToString(),
+                                                              txnRouter.getLatestStmtId(),
+                                                              ex,
+                                                              "a non-retryable snapshot error");
                         throw;
                     }
 
                     // The error is retryable, so update transaction state before retrying.
-                    txnRouter->onSnapshotError(opCtx, ex.toStatus());
+                    txnRouter.onSnapshotError(opCtx, ex.toStatus());
 
                     abortGuard.dismiss();
                     continue;
@@ -615,6 +639,12 @@ DbResponse Strategy::queryOp(OperationContext* opCtx, const NamespaceString& nss
     Client* const client = opCtx->getClient();
     AuthorizationSession* const authSession = AuthorizationSession::get(client);
 
+    // The legacy '$comment' operator gets converted to 'comment' by upconvertQueryEntry(). We
+    // set the comment in 'opCtx' so that it can be passed on to the respective shards.
+    if (auto commentField = upconvertedQuery["comment"]) {
+        opCtx->setComment(commentField.wrap());
+    }
+
     Status status = authSession->checkAuthForFind(nss, false);
     audit::logQueryAuthzCheck(client, nss, q.query, status.code());
     uassertStatusOK(status);
@@ -625,9 +655,7 @@ DbResponse Strategy::queryOp(OperationContext* opCtx, const NamespaceString& nss
     if (q.queryOptions & QueryOption_Exhaust) {
         uasserted(18526,
                   str::stream() << "The 'exhaust' query option is invalid for mongos queries: "
-                                << nss.ns()
-                                << " "
-                                << q.query.toString());
+                                << nss.ns() << " " << q.query.toString());
     }
 
     // Determine the default read preference mode based on the value of the slaveOk flag.
@@ -754,7 +782,18 @@ DbResponse Strategy::clientCommand(OperationContext* opCtx, const Message& m) {
         return {};  // Don't reply.
     }
 
-    return DbResponse{reply->done()};
+    DbResponse dbResponse;
+    if (OpMsg::isFlagSet(m, OpMsg::kExhaustSupported)) {
+        auto responseObj = reply->getBodyBuilder().asTempObj();
+        auto cursorObj = responseObj.getObjectField("cursor");
+        if (responseObj.getField("ok").trueValue() && !cursorObj.isEmpty()) {
+            dbResponse.exhaustNS = cursorObj.getField("ns").String();
+            dbResponse.exhaustCursorId = cursorObj.getField("id").numberLong();
+        }
+    }
+    dbResponse.response = reply->done();
+
+    return dbResponse;
 }
 
 void Strategy::commandOp(OperationContext* opCtx,
@@ -841,9 +880,7 @@ void Strategy::killCursors(OperationContext* opCtx, DbMessage* dbm) {
     const int numCursors = dbm->pullInt();
     massert(34425,
             str::stream() << "Invalid killCursors message. numCursors: " << numCursors
-                          << ", message size: "
-                          << dbm->msg().dataSize()
-                          << ".",
+                          << ", message size: " << dbm->msg().dataSize() << ".",
             dbm->msg().dataSize() == 8 + (8 * numCursors));
     uassert(28794,
             str::stream() << "numCursors must be between 1 and 29999.  numCursors: " << numCursors
@@ -964,7 +1001,7 @@ void Strategy::explainFind(OperationContext* opCtx,
             // under a transaction (see the invariant inside ShardConnection). Because of this, the
             // retargeting error could not have come from a ShardConnection, so we don't need to
             // reset the connection's in-memory state.
-            if (!MONGO_FAIL_POINT(doNotRefreshShardsOnRetargettingError) &&
+            if (!MONGO_unlikely(doNotRefreshShardsOnRetargettingError.shouldFail()) &&
                 !TransactionRouter::get(opCtx)) {
                 ShardConnection::checkMyConnectionVersions(opCtx, staleNs.ns());
             }

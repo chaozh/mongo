@@ -33,11 +33,11 @@
 
 #include <boost/smart_ptr/intrusive_ptr.hpp>
 
-#include "mongo/db/pipeline/document.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/pipeline/document_source_limit.h"
 #include "mongo/db/pipeline/document_source_skip.h"
 #include "mongo/db/pipeline/expression.h"
-#include "mongo/db/pipeline/value.h"
 
 namespace mongo {
 
@@ -46,20 +46,18 @@ using boost::intrusive_ptr;
 DocumentSourceSingleDocumentTransformation::DocumentSourceSingleDocumentTransformation(
     const intrusive_ptr<ExpressionContext>& pExpCtx,
     std::unique_ptr<TransformerInterface> parsedTransform,
-    std::string name,
+    const StringData name,
     bool isIndependentOfAnyCollection)
-    : DocumentSource(pExpCtx),
+    : DocumentSource(name, pExpCtx),
       _parsedTransform(std::move(parsedTransform)),
-      _name(std::move(name)),
+      _name(name.toString()),
       _isIndependentOfAnyCollection(isIndependentOfAnyCollection) {}
 
 const char* DocumentSourceSingleDocumentTransformation::getSourceName() const {
     return _name.c_str();
 }
 
-DocumentSource::GetNextResult DocumentSourceSingleDocumentTransformation::getNext() {
-    pExpCtx->checkForInterrupt();
-
+DocumentSource::GetNextResult DocumentSourceSingleDocumentTransformation::doGetNext() {
     // Get the next input document.
     auto input = pSource->getNext();
     if (!input.isAdvanced()) {
@@ -93,6 +91,11 @@ Value DocumentSourceSingleDocumentTransformation::serialize(
 Pipeline::SourceContainer::iterator DocumentSourceSingleDocumentTransformation::doOptimizeAt(
     Pipeline::SourceContainer::iterator itr, Pipeline::SourceContainer* container) {
     invariant(*itr == this);
+
+    if (std::next(itr) == container->end()) {
+        return container->end();
+    }
+
     auto nextSkip = dynamic_cast<DocumentSourceSkip*>((*std::next(itr)).get());
 
     if (nextSkip) {

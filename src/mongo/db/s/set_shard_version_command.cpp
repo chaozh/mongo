@@ -51,7 +51,7 @@
 #include "mongo/s/grid.h"
 #include "mongo/s/request_types/set_shard_version_request.h"
 #include "mongo/util/log.h"
-#include "mongo/util/stringutils.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 namespace {
@@ -164,8 +164,7 @@ public:
         const auto storedShardName = shardingState->shardId().toString();
         uassert(ErrorCodes::BadValue,
                 str::stream() << "received shardName " << shardName
-                              << " which differs from stored shardName "
-                              << storedShardName,
+                              << " which differs from stored shardName " << storedShardName,
                 storedShardName == shardName);
 
         // Validate config connection string parameter.
@@ -184,8 +183,7 @@ public:
             Grid::get(opCtx)->shardRegistry()->getConfigServerConnectionString();
         uassert(ErrorCodes::IllegalOperation,
                 str::stream() << "Given config server set name: " << givenConnStr.getSetName()
-                              << " differs from known set name: "
-                              << storedConnStr.getSetName(),
+                              << " differs from known set name: " << storedConnStr.getSetName(),
                 givenConnStr.getSetName() == storedConnStr.getSetName());
 
         // Validate namespace parameter.
@@ -222,14 +220,17 @@ public:
                     repl::ReplicationCoordinator::get(opCtx)->canAcceptWritesForDatabase(opCtx,
                                                                                          nss.db()));
 
-            // Views do not require a shard version check.
-            if (autoDb->getDb() && !autoDb->getDb()->getCollection(opCtx, nss) &&
-                ViewCatalog::get(autoDb->getDb())->lookup(opCtx, nss.ns())) {
+            boost::optional<Lock::CollectionLock> collLock;
+            collLock.emplace(opCtx, nss, MODE_IS);
+
+            // Views do not require a shard version check. We do not care about invalid system views
+            // for this check, only to validate if a view already exists for this namespace.
+            if (autoDb->getDb() &&
+                !CollectionCatalog::get(opCtx).lookupCollectionByNamespace(nss) &&
+                ViewCatalog::get(autoDb->getDb())
+                    ->lookupWithoutValidatingDurableViews(opCtx, nss.ns())) {
                 return true;
             }
-
-            boost::optional<Lock::CollectionLock> collLock;
-            collLock.emplace(opCtx->lockState(), nss.ns(), MODE_IS);
 
             auto* const css = CollectionShardingState::get(opCtx, nss);
             const ChunkVersion collectionShardVersion = [&] {
@@ -348,7 +349,10 @@ public:
             opCtx, nss, requestedVersion, forceRefresh /*forceRefreshFromThisThread*/);
 
         {
-            AutoGetCollection autoColl(opCtx, nss, MODE_IS);
+            // Avoid using AutoGetCollection() as it returns the InvalidViewDefinition error code
+            // if an invalid view is in the 'system.views' collection.
+            AutoGetDb autoDb(opCtx, nss.db(), MODE_IS);
+            Lock::CollectionLock collLock(opCtx, nss, MODE_IS);
 
             const ChunkVersion currVersion = [&] {
                 auto* const css = CollectionShardingState::get(opCtx, nss);
@@ -361,15 +365,16 @@ public:
             if (!status.isOK()) {
                 // The reload itself was interrupted or confused here
 
-                errmsg = str::stream() << "could not refresh metadata for " << nss.ns()
-                                       << " with requested shard version "
-                                       << requestedVersion.toString()
-                                       << ", stored shard version is " << currVersion.toString()
-                                       << causedBy(redact(status));
+                errmsg = str::stream()
+                    << "could not refresh metadata for " << nss.ns()
+                    << " with requested shard version " << requestedVersion.toString()
+                    << ", stored shard version is " << currVersion.toString()
+                    << causedBy(redact(status));
 
                 warning() << errmsg;
 
                 result.append("ns", nss.ns());
+                result.append("code", status.code());
                 requestedVersion.appendLegacyWithField(&result, "version");
                 currVersion.appendLegacyWithField(&result, "globalVersion");
                 result.appendBool("reloadConfig", true);

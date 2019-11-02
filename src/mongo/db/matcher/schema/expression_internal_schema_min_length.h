@@ -43,14 +43,12 @@ public:
     }
 
     Validator getComparator() const final {
-        return [strLen = strLen()](int lenWithoutNullTerm) {
-            return lenWithoutNullTerm >= strLen;
-        };
+        return [strLen = strLen()](int lenWithoutNullTerm) { return lenWithoutNullTerm >= strLen; };
     }
 
     std::unique_ptr<MatchExpression> shallowClone() const final {
         std::unique_ptr<InternalSchemaMinLengthMatchExpression> minLen =
-            stdx::make_unique<InternalSchemaMinLengthMatchExpression>(path(), strLen());
+            std::make_unique<InternalSchemaMinLengthMatchExpression>(path(), strLen());
         if (getTag()) {
             minLen->setTag(getTag()->clone());
         }

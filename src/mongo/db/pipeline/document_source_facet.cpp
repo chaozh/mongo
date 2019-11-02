@@ -38,16 +38,15 @@
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/bson/bsontypes.h"
-#include "mongo/db/pipeline/document.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/pipeline/document_source_tee_consumer.h"
 #include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/field_path.h"
 #include "mongo/db/pipeline/pipeline.h"
 #include "mongo/db/pipeline/tee_buffer.h"
-#include "mongo/db/pipeline/value.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -58,7 +57,7 @@ using std::vector;
 
 DocumentSourceFacet::DocumentSourceFacet(std::vector<FacetPipeline> facetPipelines,
                                          const intrusive_ptr<ExpressionContext>& expCtx)
-    : DocumentSource(expCtx),
+    : DocumentSource(kStageName, expCtx),
       _teeBuffer(TeeBuffer::create(facetPipelines.size())),
       _facets(std::move(facetPipelines)) {
     for (size_t facetId = 0; facetId < _facets.size(); ++facetId) {
@@ -94,11 +93,8 @@ vector<pair<string, vector<BSONObj>>> extractRawPipelines(const BSONElement& ele
         for (auto&& subPipeElem : facetElem.Obj()) {
             uassert(40171,
                     str::stream() << "elements of arrays in $facet spec must be non-empty objects, "
-                                  << facetName
-                                  << " argument contained an element of type "
-                                  << typeName(subPipeElem.type())
-                                  << ": "
-                                  << subPipeElem,
+                                  << facetName << " argument contained an element of type "
+                                  << typeName(subPipeElem.type()) << ": " << subPipeElem,
                     subPipeElem.type() == BSONType::Object);
             rawPipeline.push_back(subPipeElem.embeddedObject());
         }
@@ -107,6 +103,20 @@ vector<pair<string, vector<BSONObj>>> extractRawPipelines(const BSONElement& ele
     }
     return rawFacetPipelines;
 }
+
+StageConstraints::LookupRequirement computeLookupRequirement(
+    const std::vector<DocumentSourceFacet::FacetPipeline>& facets) {
+    for (auto&& facet : facets) {
+        const auto& sources = facet.pipeline->getSources();
+        for (auto&& src : sources) {
+            if (!src->constraints().isAllowedInLookupPipeline()) {
+                return StageConstraints::LookupRequirement::kNotAllowed;
+            }
+        }
+    }
+    return StageConstraints::LookupRequirement::kAllowed;
+}
+
 }  // namespace
 
 std::unique_ptr<DocumentSourceFacet::LiteParsed> DocumentSourceFacet::LiteParsed::parse(
@@ -128,8 +138,8 @@ std::unique_ptr<DocumentSourceFacet::LiteParsed> DocumentSourceFacet::LiteParsed
                                                   pipeline.requiredPrivileges(unusedIsMongosFlag));
     }
 
-    return stdx::make_unique<DocumentSourceFacet::LiteParsed>(std::move(liteParsedPipelines),
-                                                              std::move(requiredPrivileges));
+    return std::make_unique<DocumentSourceFacet::LiteParsed>(std::move(liteParsedPipelines),
+                                                             std::move(requiredPrivileges));
 }
 
 stdx::unordered_set<NamespaceString> DocumentSourceFacet::LiteParsed::getInvolvedNamespaces()
@@ -169,9 +179,7 @@ void DocumentSourceFacet::doDispose() {
     }
 }
 
-DocumentSource::GetNextResult DocumentSourceFacet::getNext() {
-    pExpCtx->checkForInterrupt();
-
+DocumentSource::GetNextResult DocumentSourceFacet::doGetNext() {
     if (_done) {
         return GetNextResult::makeEOF();
     }
@@ -273,7 +281,8 @@ StageConstraints DocumentSourceFacet::constraints(Pipeline::SplitState) const {
             host,
             std::get<StageConstraints::DiskUseRequirement>(diskAndTxnReq),
             FacetRequirement::kNotAllowed,
-            std::get<StageConstraints::TransactionRequirement>(diskAndTxnReq)};
+            std::get<StageConstraints::TransactionRequirement>(diskAndTxnReq),
+            computeLookupRequirement(_facets)};
 }
 
 bool DocumentSourceFacet::usedDisk() {
@@ -296,14 +305,14 @@ DepsTracker::State DocumentSourceFacet::getDependencies(DepsTracker* deps) const
 
         // The text score is the only type of metadata that could be needed by $facet.
         deps->setNeedsMetadata(
-            DepsTracker::MetadataType::TEXT_SCORE,
-            deps->getNeedsMetadata(DepsTracker::MetadataType::TEXT_SCORE) ||
-                subDepsTracker.getNeedsMetadata(DepsTracker::MetadataType::TEXT_SCORE));
+            DocumentMetadataFields::kTextScore,
+            deps->getNeedsMetadata(DocumentMetadataFields::kTextScore) ||
+                subDepsTracker.getNeedsMetadata(DocumentMetadataFields::kTextScore));
 
         // If there are variables defined at this stage's scope, there may be dependencies upon
         // them in subsequent pipelines. Keep enumerating.
-        if (deps->needWholeDocument &&
-            deps->getNeedsMetadata(DepsTracker::MetadataType::TEXT_SCORE) && !scopeHasVariables) {
+        if (deps->needWholeDocument && deps->getNeedsMetadata(DocumentMetadataFields::kTextScore) &&
+            !scopeHasVariables) {
             break;
         }
     }
@@ -336,8 +345,7 @@ intrusive_ptr<DocumentSource> DocumentSourceFacet::createFromBson(
         }
         uassert(ErrorCodes::IllegalOperation,
                 str::stream() << "$facet pipeline '" << *needsMongoS
-                              << "' must run on mongoS, but '"
-                              << *needsShard
+                              << "' must run on mongoS, but '" << *needsShard
                               << "' requires a shard",
                 !(needsShard && needsMongoS));
 

@@ -29,8 +29,11 @@
 
 #pragma once
 
-#include "mongo/db/pipeline/document.h"
-#include "mongo/stdx/memory.h"
+#include <memory>
+
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/pipeline/runtime_constants_gen.h"
 #include "mongo/stdx/unordered_map.h"
 #include "mongo/util/string_map.h"
 
@@ -44,6 +47,11 @@ public:
     // Each unique variable is assigned a unique id of this type. Negative ids are reserved for
     // system variables and non-negative ids are allocated for user variables.
     using Id = int64_t;
+
+    /**
+     * Generate runtime constants using the current local and cluster times.
+     */
+    static RuntimeConstants generateRuntimeConstants(OperationContext* opCtx);
 
     /**
      * Generates Variables::Id and keeps track of the number of Ids handed out. Each successive Id
@@ -73,6 +81,9 @@ public:
     // Ids for builtin variables.
     static constexpr Variables::Id kRootId = Id(-1);
     static constexpr Variables::Id kRemoveId = Id(-2);
+    static constexpr Variables::Id kNowId = Id(-3);
+    static constexpr Variables::Id kClusterTimeId = Id(-4);
+    static constexpr Variables::Id kJsScopeId = Id(-5);
 
     // Map from builtin var name to reserved id number.
     static const StringMap<Id> kBuiltinVarNameToId;
@@ -119,6 +130,21 @@ public:
         return &_idGenerator;
     }
 
+    /**
+     * Serializes runtime constants. This is used to send the constants to shards.
+     */
+    RuntimeConstants getRuntimeConstants() const;
+
+    /**
+     * Deserialize runtime constants.
+     */
+    void setRuntimeConstants(const RuntimeConstants& constants);
+
+    /**
+     * Set the runtime constants using the current local and cluster times.
+     */
+    void setDefaultRuntimeConstants(OperationContext* opCtx);
+
 private:
     struct ValueAndState {
         ValueAndState() = default;
@@ -131,8 +157,18 @@ private:
 
     void setValue(Id id, const Value& value, bool isConstant);
 
+    static auto getBuiltinVariableName(Variables::Id variable) {
+        for (auto& [name, id] : kBuiltinVarNameToId) {
+            if (variable == id) {
+                return name;
+            }
+        }
+        return std::string();
+    }
+
     IdGenerator _idGenerator;
     std::vector<ValueAndState> _valueList;
+    stdx::unordered_map<Id, Value> _runtimeConstants;
 };
 
 /**

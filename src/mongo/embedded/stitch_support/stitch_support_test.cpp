@@ -33,6 +33,7 @@
 
 #include "stitch_support/stitch_support.h"
 
+#include "mongo/base/initializer.h"
 #include "mongo/bson/json.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/quick_exit.h"
@@ -159,7 +160,7 @@ protected:
                            return result;
                        });
 
-        return results;
+        return std::make_pair(results, stitch_support_v1_projection_requires_match(projection));
     }
 
     auto checkProjectionStatus(const char* specJSON,
@@ -221,6 +222,10 @@ protected:
             status);
         ASSERT(update);
         ON_BLOCK_EXIT([update] { stitch_support_v1_update_destroy(update); });
+
+        // We assume that callers of this function will provide a 'match' argument if and only if
+        // the update requires it.
+        ASSERT_EQ(match != nullptr, stitch_support_v1_update_requires_match(update));
 
         auto updateResult = stitch_support_v1_update_apply(
             update, toBSONForAPI(document).first, updateDetails, status);
@@ -397,50 +402,64 @@ TEST_F(StitchSupportTest, CheckMatchWorksWithCollation) {
 }
 
 TEST_F(StitchSupportTest, CheckProjectionWorksWithDefaults) {
-    auto results =
+    auto [results, needsMatch] =
         checkProjection("{a: 1}", {"{_id: 1, a: 100, b: 200}", "{_id: 1, a: 200, b: 300}"});
+    ASSERT_FALSE(needsMatch);
     ASSERT_EQ("{ \"_id\" : 1, \"a\" : 100 }", results[0]);
     ASSERT_EQ("{ \"_id\" : 1, \"a\" : 200 }", results[1]);
-    results = checkProjection("{'a.$.c': 1}",
-                              {"{_id: 1, a: [{b: 2, c: 100}, {b: 1, c: 200}]}",
-                               "{_id: 1, a: [{b: 1, c: 100, d: 45}, {b: 2, c: 200}]}"},
-                              "{'a.b': 1}");
+
+    std::tie(results, needsMatch) =
+        checkProjection("{'a.$.c': 1}",
+                        {"{_id: 1, a: [{b: 2, c: 100}, {b: 1, c: 200}]}",
+                         "{_id: 1, a: [{b: 1, c: 100, d: 45}, {b: 2, c: 200}]}"},
+                        "{'a.b': 1}");
+    ASSERT_TRUE(needsMatch);
     ASSERT_EQ("{ \"_id\" : 1, \"a\" : [ { \"b\" : 1, \"c\" : 200 } ] }", results[0]);
     ASSERT_EQ("{ \"_id\" : 1, \"a\" : [ { \"b\" : 1, \"c\" : 100, \"d\" : 45 } ] }", results[1]);
-    ASSERT_EQ(
-        "{ \"a\" : [ { \"b\" : 2, \"c\" : 2 } ] }",
-        checkProjection("{a: {$elemMatch: {b: 2}}}", {"{a: [{b: 1, c: 1}, {b: 2, c: 2}]}"})[0]);
-    ASSERT_EQ("{ \"a\" : [ 2, 3 ] }",
-              checkProjection("{a: {$slice: [1, 2]}}", {"{a: [1, 2, 3, 4]}"})[0]);
+
+    std::tie(results, needsMatch) =
+        checkProjection("{a: {$elemMatch: {b: 2}}}", {"{a: [{b: 1, c: 1}, {b: 2, c: 2}]}"});
+    ASSERT_FALSE(needsMatch);
+    ASSERT_EQ("{ \"a\" : [ { \"b\" : 2, \"c\" : 2 } ] }", results[0]);
+
+    std::tie(results, needsMatch) = checkProjection("{a: {$slice: [1, 2]}}", {"{a: [1, 2, 3, 4]}"});
+    ASSERT_FALSE(needsMatch);
+    ASSERT_EQ("{ \"a\" : [ 2, 3 ] }", results[0]);
 }
 
 TEST_F(StitchSupportTest, CheckProjectionProducesExpectedStatus) {
     ASSERT_EQ(
         "Projections with a positional operator require a matcher",
         checkProjectionStatus("{'a.$.c': 1}", "{_id: 1, a: [{b: 2, c: 100}, {b: 1, c: 200}]}"));
-    ASSERT_EQ(
-        "$textScore, $sortKey, $recordId, $geoNear and $returnKey are not allowed in this context",
-        checkProjectionStatus("{a: {$meta: 'textScore'}}", "{_id: 1, a: 100, b: 200}"));
-    ASSERT_EQ("Unsupported projection option: a: { b: 0 }",
-              checkProjectionStatus("{a: {b: 0}}", "{_id: 1, a: {b: 200}}"));
+    ASSERT_EQ("$textScore, $sortKey, $recordId and $geoNear are not allowed in this context",
+              checkProjectionStatus("{a: {$meta: 'textScore'}}", "{_id: 1, a: 100, b: 200}"));
+
+    ASSERT_EQ("Cannot do inclusion on field c in exclusion projection",
+              checkProjectionStatus("{a: 0, c: 1}", "{_id: 1, a: {b: 200}}"));
 }
 
 TEST_F(StitchSupportTest, CheckProjectionCollatesRespectfully) {
     auto collator = stitch_support_v1_collator_create(
         lib, toBSONForAPI("{locale: 'en', strength: 2}").first, nullptr);
     ON_BLOCK_EXIT([collator] { stitch_support_v1_collator_destroy(collator); });
-    ASSERT_EQ("{ \"_id\" : 1, \"a\" : [ \"mixEdCaSe\" ] }",
-              checkProjection("{a: {$elemMatch: {$eq: 'MiXedcAse'}}}",
-                              {"{_id: 1, a: ['lowercase', 'mixEdCaSe', 'UPPERCASE']}"},
-                              nullptr,
-                              collator)[0]);
+
+    auto [results, needsMatch] =
+        checkProjection("{a: {$elemMatch: {$eq: 'MiXedcAse'}}}",
+                        {"{_id: 1, a: ['lowercase', 'mixEdCaSe', 'UPPERCASE']}"},
+                        nullptr,
+                        collator);
+    ASSERT_FALSE(needsMatch);
+    ASSERT_EQ("{ \"_id\" : 1, \"a\" : [ \"mixEdCaSe\" ] }", results[0]);
+
     // Ignore a matcher's collator.
-    ASSERT_EQ("{ \"_id\" : 1 }",
-              checkProjection("{a: {$elemMatch: {$eq: 'MiXedcAse'}}}",
-                              {"{_id: 1, a: ['lowercase', 'mixEdCaSe', 'UPPERCASE']}"},
-                              "{_id: 1}",
-                              collator,
-                              true)[0]);
+    std::tie(results, needsMatch) =
+        checkProjection("{a: {$elemMatch: {$eq: 'MiXedcAse'}}}",
+                        {"{_id: 1, a: ['lowercase', 'mixEdCaSe', 'UPPERCASE']}"},
+                        "{_id: 1}",
+                        collator,
+                        true);
+    ASSERT_FALSE(needsMatch);
+    ASSERT_EQ("{ \"_id\" : 1 }", results[0]);
 }
 
 TEST_F(StitchSupportTest, TestUpdateSingleElement) {
@@ -453,6 +472,10 @@ TEST_F(StitchSupportTest, TestReplacementStyleUpdateReportsNoModifiedPaths) {
     // currently needed by Stitch.
     ASSERT_EQ("{ \"a\" : 2 }", checkUpdate("{a: 2}", "{a: 1}"));
     ASSERT_EQ("[]", getModifiedPaths());
+}
+
+TEST_F(StitchSupportTest, TestReplacementStyleUpdatePreservesId) {
+    ASSERT_EQ("{ \"_id\" : 123, \"b\" : 789 }", checkUpdate("{b: 789}", "{_id: 123, a: 456}"));
 }
 
 TEST_F(StitchSupportTest, TestUpdateArrayElement) {
@@ -523,7 +546,10 @@ TEST_F(StitchSupportTest, TestUpdateWithSetOnInsert) {
 }
 
 TEST_F(StitchSupportTest, TestUpdateProducesProperStatus) {
-    ASSERT_EQ("Unknown modifier: $bogus", checkUpdateStatus("{$bogus: {a: 2}}", "{a: 1}"));
+    ASSERT_EQ(
+        "Unknown modifier: $bogus. Expected a valid update modifier or pipeline-style update "
+        "specified as an array",
+        checkUpdateStatus("{$bogus: {a: 2}}", "{a: 1}"));
     ASSERT_EQ("Updating the path 'a' would create a conflict at 'a'",
               checkUpdateStatus("{$set: {a: 2, a: 3}}", "{a: 1}"));
     ASSERT_EQ("No array filter found for identifier 'i' in path 'a.$[i]'",
@@ -558,6 +584,14 @@ TEST_F(StitchSupportTest, TestUpsertEmptyMatcher) {
     ASSERT_EQ("{ \"a\" : [ { \"b\" : 2 }, false ] }", checkUpsert("{a: [{b: 2}, false]}", "{}"));
 }
 
+TEST_F(StitchSupportTest, TestUpsertWithReplacementUpdate) {
+    ASSERT_EQ("{ \"_id\" : 1, \"a\" : 2 }", checkUpsert("{a: 2}", "{_id: 1}"));
+    ASSERT_EQ("{ \"_id\" : 1, \"a\" : 2 }", checkUpsert("{a: 2}", "{$and: [{_id: 1}]}"));
+
+    // Upsert with replacement update ues the '_id' field from the query but not any other fields.
+    ASSERT_EQ("{ \"_id\" : 1, \"b\" : 4 }", checkUpsert("{b: 4}", "{_id: 1, a: 2, b: 3}"));
+}
+
 TEST_F(StitchSupportTest, TestUpsertProducesProperStatus) {
     ASSERT_EQ("Cannot apply array updates to non-array element a: 1",
               checkUpsertStatus("{$set: {'a.$[].b': 1}}", "{a: 1}"));
@@ -571,6 +605,20 @@ TEST_F(StitchSupportTest, TestUpsertProducesProperStatus) {
 // calling runGlobalInitializers(), which is called both from the regular unit test main() and from
 // the Stitch Support Library intializer function that gets tested here.
 int main(const int argc, const char* const* const argv) {
+    // See comment by the same code block in mongo_embedded_test.cpp
+    const char* null_argv[1] = {nullptr};
+    auto ret = mongo::runGlobalInitializers(0, null_argv, nullptr);
+    if (!ret.isOK()) {
+        std::cerr << "Global initilization failed";
+        return EXIT_FAILURE;
+    }
+
+    ret = mongo::runGlobalDeinitializers();
+    if (!ret.isOK()) {
+        std::cerr << "Global deinitilization failed";
+        return EXIT_FAILURE;
+    }
+
     const auto result = ::mongo::unittest::Suite::run(std::vector<std::string>(), "", 1);
 
     // This is the standard exit path for Mongo processes. See the mongo::quickExit() declaration

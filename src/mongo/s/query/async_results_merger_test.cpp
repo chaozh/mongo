@@ -31,6 +31,8 @@
 
 #include "mongo/s/query/async_results_merger.h"
 
+#include <memory>
+
 #include "mongo/db/json.h"
 #include "mongo/db/pipeline/change_stream_constants.h"
 #include "mongo/db/pipeline/resume_token.h"
@@ -40,8 +42,6 @@
 #include "mongo/executor/task_executor.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/query/results_merger_test_fixture.h"
-#include "mongo/stdx/memory.h"
-#include "mongo/unittest/death_test.h"
 #include "mongo/unittest/death_test.h"
 #include "mongo/unittest/unittest.h"
 
@@ -54,7 +54,7 @@ LogicalSessionId parseSessionIdFromCmd(BSONObj cmdObj) {
 }
 
 BSONObj makePostBatchResumeToken(Timestamp clusterTime) {
-    auto pbrt = ResumeToken::makeHighWaterMarkToken(clusterTime, boost::none).toDocument().toBson();
+    auto pbrt = ResumeToken::makeHighWaterMarkToken(clusterTime).toDocument().toBson();
     invariant(pbrt.firstElement().type() == BSONType::String);
     return pbrt;
 }
@@ -1323,8 +1323,7 @@ TEST_F(AsyncResultsMergerTest, GetMoreRequestIncludesMaxTimeMS) {
     // The next getMore request should include the maxTimeMS.
     expectedCmdObj = BSON("getMore" << CursorId(123) << "collection"
                                     << "testcoll"
-                                    << "maxTimeMS"
-                                    << 789);
+                                    << "maxTimeMS" << 789);
     ASSERT_BSONOBJ_EQ(getNthPendingRequest(0).cmdObj, expectedCmdObj);
 
     // Clean up.
@@ -1347,14 +1346,12 @@ DEATH_TEST_F(AsyncResultsMergerTest,
     auto firstDocSortKey = makeResumeToken(Timestamp(1, 4), uuid, BSON("_id" << 1));
     auto firstCursorResponse = fromjson(
         str::stream() << "{_id: {clusterTime: {ts: Timestamp(1, 4)}, uuid: '" << uuid.toString()
-                      << "', documentKey: {_id: 1}}, $sortKey: {'': '"
-                      << firstDocSortKey.firstElement().String()
-                      << "'}}");
+                      << "', documentKey: {_id: 1}}, $sortKey: {'': {_data: '"
+                      << firstDocSortKey.firstElement().String() << "'}}}");
     cursors.push_back(makeRemoteCursor(
         kTestShardIds[0],
         kTestShardHosts[0],
-        CursorResponse(
-            kTestNss, 123, {firstCursorResponse}, boost::none, boost::none, pbrtFirstCursor)));
+        CursorResponse(kTestNss, 123, {firstCursorResponse}, boost::none, pbrtFirstCursor)));
     // Create a second cursor whose initial batch has no PBRT.
     cursors.push_back(
         makeRemoteCursor(kTestShardIds[1], kTestShardHosts[1], CursorResponse(kTestNss, 456, {})));
@@ -1362,7 +1359,7 @@ DEATH_TEST_F(AsyncResultsMergerTest,
     params.setTailableMode(TailableModeEnum::kTailableAndAwaitData);
     params.setSort(change_stream_constants::kSortSpec);
     auto arm =
-        stdx::make_unique<AsyncResultsMerger>(operationContext(), executor(), std::move(params));
+        std::make_unique<AsyncResultsMerger>(operationContext(), executor(), std::move(params));
 
     auto readyEvent = unittest::assertGet(arm->nextEvent());
     ASSERT_FALSE(arm->ready());
@@ -1382,19 +1379,17 @@ DEATH_TEST_F(AsyncResultsMergerTest,
     auto firstDocSortKey = makeResumeToken(Timestamp(1, 4), uuid, BSON("_id" << 1));
     auto firstCursorResponse = fromjson(
         str::stream() << "{_id: {clusterTime: {ts: Timestamp(1, 4)}, uuid: '" << uuid.toString()
-                      << "', documentKey: {_id: 1}}, $sortKey: {'': '"
-                      << firstDocSortKey.firstElement().String()
-                      << "'}}");
+                      << "', documentKey: {_id: 1}}, $sortKey: {'': {_data: '"
+                      << firstDocSortKey.firstElement().String() << "'}}}");
     cursors.push_back(makeRemoteCursor(
         kTestShardIds[0],
         kTestShardHosts[0],
-        CursorResponse(
-            kTestNss, 123, {firstCursorResponse}, boost::none, boost::none, pbrtFirstCursor)));
+        CursorResponse(kTestNss, 123, {firstCursorResponse}, boost::none, pbrtFirstCursor)));
     params.setRemotes(std::move(cursors));
     params.setTailableMode(TailableModeEnum::kTailableAndAwaitData);
     params.setSort(change_stream_constants::kSortSpec);
     auto arm =
-        stdx::make_unique<AsyncResultsMerger>(operationContext(), executor(), std::move(params));
+        std::make_unique<AsyncResultsMerger>(operationContext(), executor(), std::move(params));
 
     auto readyEvent = unittest::assertGet(arm->nextEvent());
     ASSERT_TRUE(arm->ready());
@@ -1412,105 +1407,25 @@ TEST_F(AsyncResultsMergerTest, SortedTailableCursorNotReadyIfRemoteHasLowerPostB
     auto firstDocSortKey = makeResumeToken(Timestamp(1, 4), uuid, BSON("_id" << 1));
     auto firstCursorResponse = fromjson(
         str::stream() << "{_id: {clusterTime: {ts: Timestamp(1, 4)}, uuid: '" << uuid.toString()
-                      << "', documentKey: {_id: 1}}, $sortKey: {'': '"
-                      << firstDocSortKey.firstElement().String()
-                      << "'}}");
+                      << "', documentKey: {_id: 1}}, $sortKey: {'': {data: '"
+                      << firstDocSortKey.firstElement().String() << "'}}}");
     cursors.push_back(makeRemoteCursor(
         kTestShardIds[0],
         kTestShardHosts[0],
-        CursorResponse(
-            kTestNss, 123, {firstCursorResponse}, boost::none, boost::none, pbrtFirstCursor)));
-    auto tooLow = makePostBatchResumeToken(Timestamp(1, 2));
-    cursors.push_back(
-        makeRemoteCursor(kTestShardIds[1],
-                         kTestShardHosts[1],
-                         CursorResponse(kTestNss, 456, {}, boost::none, boost::none, tooLow)));
+        CursorResponse(kTestNss, 123, {firstCursorResponse}, boost::none, pbrtFirstCursor)));
+    auto tooLowPBRT = makePostBatchResumeToken(Timestamp(1, 2));
+    cursors.push_back(makeRemoteCursor(kTestShardIds[1],
+                                       kTestShardHosts[1],
+                                       CursorResponse(kTestNss, 456, {}, boost::none, tooLowPBRT)));
     params.setRemotes(std::move(cursors));
     params.setTailableMode(TailableModeEnum::kTailableAndAwaitData);
     params.setSort(change_stream_constants::kSortSpec);
     auto arm =
-        stdx::make_unique<AsyncResultsMerger>(operationContext(), executor(), std::move(params));
+        std::make_unique<AsyncResultsMerger>(operationContext(), executor(), std::move(params));
 
     auto readyEvent = unittest::assertGet(arm->nextEvent());
 
     ASSERT_FALSE(arm->ready());
-
-    // Clean up the cursors.
-    std::vector<CursorResponse> responses;
-    responses.emplace_back(kTestNss, CursorId(0), std::vector<BSONObj>{});
-    scheduleNetworkResponses(std::move(responses));
-    auto killEvent = arm->kill(operationContext());
-    executor()->waitForEvent(killEvent);
-}
-
-DEATH_TEST_F(AsyncResultsMergerTest,
-             SortedTailableCursorInvariantsIfRemoteHasOplogTimestampButNoPostBatchResumeToken,
-             "Fatal Assertion 51062") {
-    AsyncResultsMergerParams params;
-    params.setNss(kTestNss);
-    UUID uuid = UUID::gen();
-    std::vector<RemoteCursor> cursors;
-    auto firstDocSortKey = makeResumeToken(Timestamp(1, 4), uuid, BSON("_id" << 1));
-    auto firstCursorResponse = fromjson(
-        str::stream() << "{_id: {clusterTime: {ts: Timestamp(1, 4)}, uuid: '" << uuid.toString()
-                      << "', documentKey: {_id: 1}}, $sortKey: {'': '"
-                      << firstDocSortKey.firstElement().String()
-                      << "'}}");
-    cursors.push_back(makeRemoteCursor(
-        kTestShardIds[0],
-        kTestShardHosts[0],
-        CursorResponse(
-            kTestNss, 123, {firstCursorResponse}, boost::none, Timestamp(1, 5), boost::none)));
-    params.setRemotes(std::move(cursors));
-    params.setTailableMode(TailableModeEnum::kTailableAndAwaitData);
-    params.setSort(change_stream_constants::kSortSpec);
-    auto arm =
-        stdx::make_unique<AsyncResultsMerger>(operationContext(), executor(), std::move(params));
-
-    auto readyEvent = unittest::assertGet(arm->nextEvent());
-    ASSERT_TRUE(arm->ready());
-
-    // We should be dead by now.
-    MONGO_UNREACHABLE;
-}
-
-// Test that merging is done purely on the basis of the postBatchResumeToken.
-TEST_F(AsyncResultsMergerTest, SortedTailableCursorIgnoresOplogTimestamp) {
-    AsyncResultsMergerParams params;
-    params.setNss(kTestNss);
-    UUID uuid = UUID::gen();
-    std::vector<RemoteCursor> cursors;
-    auto pbrtFirstCursor = makePostBatchResumeToken(Timestamp(1, 5));
-    auto firstDocSortKey = makeResumeToken(Timestamp(1, 4), uuid, BSON("_id" << 1));
-    // Set the first cursor to have both a PBRT and a matching oplog timestamp.
-    auto firstCursorResponse = fromjson(
-        str::stream() << "{_id: {clusterTime: {ts: Timestamp(1, 4)}, uuid: '" << uuid.toString()
-                      << "', documentKey: {_id: 1}}, $sortKey: {'': '"
-                      << firstDocSortKey.firstElement().String()
-                      << "'}}");
-    cursors.push_back(makeRemoteCursor(
-        kTestShardIds[0],
-        kTestShardHosts[0],
-        CursorResponse(
-            kTestNss, 123, {firstCursorResponse}, boost::none, Timestamp(1, 5), pbrtFirstCursor)));
-
-    // Set the second cursor to have a PBRT that comes after the first cursor's, but an oplog time
-    // that preceds it. If merging used the oplog timestamp, then the arm would not be ready.
-    auto pbrtSecondCursor = makePostBatchResumeToken(Timestamp(1, 6));
-    cursors.push_back(makeRemoteCursor(
-        kTestShardIds[1],
-        kTestShardHosts[1],
-        CursorResponse(kTestNss, 456, {}, boost::none, Timestamp(1, 1), pbrtSecondCursor)));
-    params.setRemotes(std::move(cursors));
-    params.setTailableMode(TailableModeEnum::kTailableAndAwaitData);
-    params.setSort(change_stream_constants::kSortSpec);
-    auto arm =
-        stdx::make_unique<AsyncResultsMerger>(operationContext(), executor(), std::move(params));
-
-    auto readyEvent = unittest::assertGet(arm->nextEvent());
-
-    // The ARM is ready, indicating that it used the PBRT rather than the oplog timestamp.
-    ASSERT_TRUE(arm->ready());
 
     // Clean up the cursors.
     std::vector<CursorResponse> responses;
@@ -1531,7 +1446,7 @@ TEST_F(AsyncResultsMergerTest, SortedTailableCursorNewShardOrderedAfterExisting)
     params.setTailableMode(TailableModeEnum::kTailableAndAwaitData);
     params.setSort(change_stream_constants::kSortSpec);
     auto arm =
-        stdx::make_unique<AsyncResultsMerger>(operationContext(), executor(), std::move(params));
+        std::make_unique<AsyncResultsMerger>(operationContext(), executor(), std::move(params));
 
     auto readyEvent = unittest::assertGet(arm->nextEvent());
 
@@ -1543,13 +1458,11 @@ TEST_F(AsyncResultsMergerTest, SortedTailableCursorNewShardOrderedAfterExisting)
     auto pbrtFirstCursor = makePostBatchResumeToken(Timestamp(1, 6));
     auto firstCursorResponse = fromjson(
         str::stream() << "{_id: {clusterTime: {ts: Timestamp(1, 4)}, uuid: '" << uuid.toString()
-                      << "', documentKey: {_id: 1}}, $sortKey: {'': '"
-                      << firstDocSortKey.firstElement().String()
-                      << "'}}");
+                      << "', documentKey: {_id: 1}}, $sortKey: {'': {_data: '"
+                      << firstDocSortKey.firstElement().String() << "'}}}");
     std::vector<BSONObj> batch1 = {firstCursorResponse};
     auto firstDoc = batch1.front();
-    responses.emplace_back(
-        kTestNss, CursorId(123), batch1, boost::none, boost::none, pbrtFirstCursor);
+    responses.emplace_back(kTestNss, CursorId(123), batch1, boost::none, pbrtFirstCursor);
     scheduleNetworkResponses(std::move(responses));
 
     // Should be ready now.
@@ -1561,7 +1474,7 @@ TEST_F(AsyncResultsMergerTest, SortedTailableCursorNewShardOrderedAfterExisting)
     newCursors.push_back(
         makeRemoteCursor(kTestShardIds[1],
                          kTestShardHosts[1],
-                         CursorResponse(kTestNss, 456, {}, boost::none, boost::none, tooLowPBRT)));
+                         CursorResponse(kTestNss, 456, {}, boost::none, tooLowPBRT)));
     arm->addNewShardCursors(std::move(newCursors));
 
     // Now shouldn't be ready, our guarantee from the new shard isn't sufficiently advanced.
@@ -1574,13 +1487,11 @@ TEST_F(AsyncResultsMergerTest, SortedTailableCursorNewShardOrderedAfterExisting)
     auto pbrtSecondCursor = makePostBatchResumeToken(Timestamp(1, 6));
     auto secondCursorResponse = fromjson(
         str::stream() << "{_id: {clusterTime: {ts: Timestamp(1, 5)}, uuid: '" << uuid.toString()
-                      << "', documentKey: {_id: 2}}, $sortKey: {'': '"
-                      << secondDocSortKey.firstElement().String()
-                      << "'}}");
+                      << "', documentKey: {_id: 2}}, $sortKey: {'': {_data: '"
+                      << secondDocSortKey.firstElement().String() << "'}}}");
     std::vector<BSONObj> batch2 = {secondCursorResponse};
     auto secondDoc = batch2.front();
-    responses.emplace_back(
-        kTestNss, CursorId(456), batch2, boost::none, boost::none, pbrtSecondCursor);
+    responses.emplace_back(kTestNss, CursorId(456), batch2, boost::none, pbrtSecondCursor);
     scheduleNetworkResponses(std::move(responses));
     executor()->waitForEvent(readyEvent);
     ASSERT_TRUE(arm->ready());
@@ -1613,7 +1524,7 @@ TEST_F(AsyncResultsMergerTest, SortedTailableCursorNewShardOrderedBeforeExisting
     params.setTailableMode(TailableModeEnum::kTailableAndAwaitData);
     params.setSort(change_stream_constants::kSortSpec);
     auto arm =
-        stdx::make_unique<AsyncResultsMerger>(operationContext(), executor(), std::move(params));
+        std::make_unique<AsyncResultsMerger>(operationContext(), executor(), std::move(params));
 
     auto readyEvent = unittest::assertGet(arm->nextEvent());
 
@@ -1625,12 +1536,10 @@ TEST_F(AsyncResultsMergerTest, SortedTailableCursorNewShardOrderedBeforeExisting
     auto pbrtFirstCursor = makePostBatchResumeToken(Timestamp(1, 5));
     auto firstCursorResponse = fromjson(
         str::stream() << "{_id: {clusterTime: {ts: Timestamp(1, 4)}, uuid: '" << uuid.toString()
-                      << "', documentKey: {_id: 1}}, $sortKey: {'': '"
-                      << firstDocSortKey.firstElement().String()
-                      << "'}}");
+                      << "', documentKey: {_id: 1}}, $sortKey: {'': {_data: '"
+                      << firstDocSortKey.firstElement().String() << "'}}}");
     std::vector<BSONObj> batch1 = {firstCursorResponse};
-    responses.emplace_back(
-        kTestNss, CursorId(123), batch1, boost::none, boost::none, pbrtFirstCursor);
+    responses.emplace_back(kTestNss, CursorId(123), batch1, boost::none, pbrtFirstCursor);
     scheduleNetworkResponses(std::move(responses));
 
     // Should be ready now.
@@ -1642,7 +1551,7 @@ TEST_F(AsyncResultsMergerTest, SortedTailableCursorNewShardOrderedBeforeExisting
     newCursors.push_back(
         makeRemoteCursor(kTestShardIds[1],
                          kTestShardHosts[1],
-                         CursorResponse(kTestNss, 456, {}, boost::none, boost::none, tooLowPBRT)));
+                         CursorResponse(kTestNss, 456, {}, boost::none, tooLowPBRT)));
     arm->addNewShardCursors(std::move(newCursors));
 
     // Now shouldn't be ready, our guarantee from the new shard isn't sufficiently advanced.
@@ -1655,14 +1564,12 @@ TEST_F(AsyncResultsMergerTest, SortedTailableCursorNewShardOrderedBeforeExisting
     auto pbrtSecondCursor = makePostBatchResumeToken(Timestamp(1, 5));
     auto secondCursorResponse = fromjson(
         str::stream() << "{_id: {clusterTime: {ts: Timestamp(1, 3)}, uuid: '" << uuid.toString()
-                      << "', documentKey: {_id: 2}}, $sortKey: {'': '"
-                      << secondDocSortKey.firstElement().String()
-                      << "'}}");
+                      << "', documentKey: {_id: 2}}, $sortKey: {'': {_data: '"
+                      << secondDocSortKey.firstElement().String() << "'}}}");
     std::vector<BSONObj> batch2 = {secondCursorResponse};
     // The last observed time should still be later than the first shard, so we can get the data
     // from it.
-    responses.emplace_back(
-        kTestNss, CursorId(456), batch2, boost::none, boost::none, pbrtSecondCursor);
+    responses.emplace_back(kTestNss, CursorId(456), batch2, boost::none, pbrtSecondCursor);
     scheduleNetworkResponses(std::move(responses));
     executor()->waitForEvent(readyEvent);
     ASSERT_TRUE(arm->ready());
@@ -1690,25 +1597,25 @@ TEST_F(AsyncResultsMergerTest, SortedTailableCursorReturnsHighWaterMarkSortKey) 
     std::vector<RemoteCursor> cursors;
     // Create three cursors with empty initial batches. Each batch has a PBRT.
     auto pbrtFirstCursor = makePostBatchResumeToken(Timestamp(1, 5));
-    cursors.push_back(makeRemoteCursor(
-        kTestShardIds[0],
-        kTestShardHosts[0],
-        CursorResponse(kTestNss, 123, {}, boost::none, boost::none, pbrtFirstCursor)));
+    cursors.push_back(
+        makeRemoteCursor(kTestShardIds[0],
+                         kTestShardHosts[0],
+                         CursorResponse(kTestNss, 123, {}, boost::none, pbrtFirstCursor)));
     auto pbrtSecondCursor = makePostBatchResumeToken(Timestamp(1, 1));
-    cursors.push_back(makeRemoteCursor(
-        kTestShardIds[1],
-        kTestShardHosts[1],
-        CursorResponse(kTestNss, 456, {}, boost::none, boost::none, pbrtSecondCursor)));
+    cursors.push_back(
+        makeRemoteCursor(kTestShardIds[1],
+                         kTestShardHosts[1],
+                         CursorResponse(kTestNss, 456, {}, boost::none, pbrtSecondCursor)));
     auto pbrtThirdCursor = makePostBatchResumeToken(Timestamp(1, 4));
-    cursors.push_back(makeRemoteCursor(
-        kTestShardIds[2],
-        kTestShardHosts[2],
-        CursorResponse(kTestNss, 789, {}, boost::none, boost::none, pbrtThirdCursor)));
+    cursors.push_back(
+        makeRemoteCursor(kTestShardIds[2],
+                         kTestShardHosts[2],
+                         CursorResponse(kTestNss, 789, {}, boost::none, pbrtThirdCursor)));
     params.setRemotes(std::move(cursors));
     params.setTailableMode(TailableModeEnum::kTailableAndAwaitData);
     params.setSort(change_stream_constants::kSortSpec);
     auto arm =
-        stdx::make_unique<AsyncResultsMerger>(operationContext(), executor(), std::move(params));
+        std::make_unique<AsyncResultsMerger>(operationContext(), executor(), std::move(params));
 
     // We have no results to return, so the ARM is not ready.
     auto readyEvent = unittest::assertGet(arm->nextEvent());
@@ -1721,35 +1628,26 @@ TEST_F(AsyncResultsMergerTest, SortedTailableCursorReturnsHighWaterMarkSortKey) 
     // each cursor to be updated in-order, so we keep the first and third PBRTs constant.
     pbrtSecondCursor = makePostBatchResumeToken(Timestamp(1, 3));
     std::vector<BSONObj> emptyBatch = {};
-    scheduleNetworkResponse(
-        {kTestNss, CursorId(123), emptyBatch, boost::none, boost::none, pbrtFirstCursor});
-    scheduleNetworkResponse(
-        {kTestNss, CursorId(456), emptyBatch, boost::none, boost::none, pbrtSecondCursor});
-    scheduleNetworkResponse(
-        {kTestNss, CursorId(789), emptyBatch, boost::none, boost::none, pbrtThirdCursor});
+    scheduleNetworkResponse({kTestNss, CursorId(123), emptyBatch, boost::none, pbrtFirstCursor});
+    scheduleNetworkResponse({kTestNss, CursorId(456), emptyBatch, boost::none, pbrtSecondCursor});
+    scheduleNetworkResponse({kTestNss, CursorId(789), emptyBatch, boost::none, pbrtThirdCursor});
     ASSERT_BSONOBJ_EQ(arm->getHighWaterMark(), pbrtSecondCursor);
     ASSERT_FALSE(arm->ready());
 
     // Advance the second cursor again, so that it surpasses the other two. The third cursor becomes
     // the new high water mark.
     pbrtSecondCursor = makePostBatchResumeToken(Timestamp(1, 6));
-    scheduleNetworkResponse(
-        {kTestNss, CursorId(123), emptyBatch, boost::none, boost::none, pbrtFirstCursor});
-    scheduleNetworkResponse(
-        {kTestNss, CursorId(456), emptyBatch, boost::none, boost::none, pbrtSecondCursor});
-    scheduleNetworkResponse(
-        {kTestNss, CursorId(789), emptyBatch, boost::none, boost::none, pbrtThirdCursor});
+    scheduleNetworkResponse({kTestNss, CursorId(123), emptyBatch, boost::none, pbrtFirstCursor});
+    scheduleNetworkResponse({kTestNss, CursorId(456), emptyBatch, boost::none, pbrtSecondCursor});
+    scheduleNetworkResponse({kTestNss, CursorId(789), emptyBatch, boost::none, pbrtThirdCursor});
     ASSERT_BSONOBJ_EQ(arm->getHighWaterMark(), pbrtThirdCursor);
     ASSERT_FALSE(arm->ready());
 
     // Advance the third cursor such that the first cursor becomes the high water mark.
     pbrtThirdCursor = makePostBatchResumeToken(Timestamp(1, 7));
-    scheduleNetworkResponse(
-        {kTestNss, CursorId(123), emptyBatch, boost::none, boost::none, pbrtFirstCursor});
-    scheduleNetworkResponse(
-        {kTestNss, CursorId(456), emptyBatch, boost::none, boost::none, pbrtSecondCursor});
-    scheduleNetworkResponse(
-        {kTestNss, CursorId(789), emptyBatch, boost::none, boost::none, pbrtThirdCursor});
+    scheduleNetworkResponse({kTestNss, CursorId(123), emptyBatch, boost::none, pbrtFirstCursor});
+    scheduleNetworkResponse({kTestNss, CursorId(456), emptyBatch, boost::none, pbrtSecondCursor});
+    scheduleNetworkResponse({kTestNss, CursorId(789), emptyBatch, boost::none, pbrtThirdCursor});
     ASSERT_BSONOBJ_EQ(arm->getHighWaterMark(), pbrtFirstCursor);
     ASSERT_FALSE(arm->ready());
 
@@ -1943,7 +1841,7 @@ DEATH_TEST_F(AsyncResultsMergerTest,
 
     // This should trigger an invariant.
     ASSERT_FALSE(
-        stdx::make_unique<AsyncResultsMerger>(operationContext(), executor(), std::move(params)));
+        std::make_unique<AsyncResultsMerger>(operationContext(), executor(), std::move(params)));
 }
 
 DEATH_TEST_F(AsyncResultsMergerTest,

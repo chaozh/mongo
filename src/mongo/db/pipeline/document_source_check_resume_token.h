@@ -59,7 +59,8 @@ namespace mongo {
  */
 class DocumentSourceShardCheckResumability final : public DocumentSource {
 public:
-    GetNextResult getNext() final;
+    static constexpr StringData kStageName = "$_internalCheckShardResumability"_sd;
+
     const char* getSourceName() const final;
 
     StageConstraints constraints(Pipeline::SplitState pipeState) const final {
@@ -69,10 +70,11 @@ public:
                 DiskUseRequirement::kNoDiskUse,
                 FacetRequirement::kNotAllowed,
                 TransactionRequirement::kNotAllowed,
+                LookupRequirement::kNotAllowed,
                 ChangeStreamRequirement::kChangeStreamStage};
     }
 
-    boost::optional<MergingLogic> mergingLogic() final {
+    boost::optional<DistributedPlanLogic> distributedPlanLogic() final {
         return boost::none;
     }
 
@@ -91,6 +93,8 @@ private:
     DocumentSourceShardCheckResumability(const boost::intrusive_ptr<ExpressionContext>& expCtx,
                                          ResumeTokenData token);
 
+    GetNextResult doGetNext() final;
+
     void _assertOplogHasEnoughHistory(const GetNextResult& nextInput);
 
     ResumeTokenData _tokenFromClient;
@@ -104,6 +108,7 @@ private:
  */
 class DocumentSourceEnsureResumeTokenPresent final : public DocumentSource {
 public:
+    static constexpr StringData kStageName = "$_internalEnsureResumeTokenPresent"_sd;
     // Used to record the results of comparing the token data extracted from documents in the
     // resumed stream against the client's resume token.
     enum class ResumeStatus {
@@ -112,7 +117,6 @@ public:
         kCheckNextDoc     // The next document produced by the stream may contain the resume token.
     };
 
-    GetNextResult getNext() final;
     const char* getSourceName() const final;
 
     StageConstraints constraints(Pipeline::SplitState) const final {
@@ -124,11 +128,12 @@ public:
                 DiskUseRequirement::kNoDiskUse,
                 FacetRequirement::kNotAllowed,
                 TransactionRequirement::kNotAllowed,
+                LookupRequirement::kNotAllowed,
                 ChangeStreamRequirement::kChangeStreamStage};
     }
 
-    boost::optional<MergingLogic> mergingLogic() final {
-        MergingLogic logic;
+    boost::optional<DistributedPlanLogic> distributedPlanLogic() final {
+        DistributedPlanLogic logic;
         // This stage must run on mongos to ensure it sees the resume token, which could have come
         // from any shard.  We also must include a mergingPresorted $sort stage to communicate to
         // the AsyncResultsMerger that we need to merge the streams in a particular order.
@@ -151,6 +156,15 @@ private:
      */
     DocumentSourceEnsureResumeTokenPresent(const boost::intrusive_ptr<ExpressionContext>& expCtx,
                                            ResumeTokenData token);
+
+    GetNextResult doGetNext() final;
+
+    /**
+     * Check the given event to determine whether it matches the client's resume token. If so, we
+     * swallow this event and return the next event in the stream. Otherwise, return boost::none.
+     */
+    boost::optional<DocumentSource::GetNextResult> _checkNextDocAndSwallowResumeToken(
+        const DocumentSource::GetNextResult& nextInput);
 
     ResumeStatus _resumeStatus = ResumeStatus::kCheckNextDoc;
     ResumeTokenData _tokenFromClient;

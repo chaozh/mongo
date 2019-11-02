@@ -34,7 +34,6 @@
 #include "mongo/db/db_raii.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/pipeline/document_source.h"
-#include "mongo/db/pipeline/document_source_limit.h"
 #include "mongo/db/query/explain_options.h"
 #include "mongo/db/query/plan_executor.h"
 #include "mongo/db/query/plan_summary_stats.h"
@@ -46,14 +45,10 @@ namespace mongo {
  */
 class DocumentSourceCursor : public DocumentSource {
 public:
+    static constexpr StringData kStageName = "$cursor"_sd;
     // virtuals from DocumentSource
-    GetNextResult getNext() final;
 
     const char* getSourceName() const override;
-
-    BSONObjSet getOutputSorts() override {
-        return _outputSorts;
-    }
 
     Value serialize(boost::optional<ExplainOptions::Verbosity> explain = boost::none) const final;
 
@@ -63,13 +58,14 @@ public:
                                      HostTypeRequirement::kAnyShard,
                                      DiskUseRequirement::kNoDiskUse,
                                      FacetRequirement::kNotAllowed,
-                                     TransactionRequirement::kAllowed);
+                                     TransactionRequirement::kAllowed,
+                                     LookupRequirement::kAllowed);
 
         constraints.requiresInputDocSource = false;
         return constraints;
     }
 
-    boost::optional<MergingLogic> mergingLogic() final {
+    boost::optional<DistributedPlanLogic> distributedPlanLogic() final {
         return boost::none;
     }
 
@@ -86,54 +82,6 @@ public:
         std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> exec,
         const boost::intrusive_ptr<ExpressionContext>& pExpCtx,
         bool trackOplogTimestamp = false);
-
-    /*
-      Record the query that was specified for the cursor this wraps, if
-      any.
-
-      This should be captured after any optimizations are applied to
-      the pipeline so that it reflects what is really used.
-
-      This gets used for explain output.
-
-      @param pBsonObj the query to record
-     */
-    void setQuery(const BSONObj& query) {
-        _query = query;
-    }
-
-    /*
-      Record the sort that was specified for the cursor this wraps, if
-      any.
-
-      This should be captured after any optimizations are applied to
-      the pipeline so that it reflects what is really used.
-
-      This gets used for explain output.
-
-      @param pBsonObj the sort to record
-     */
-    void setSort(const BSONObj& sort) {
-        _sort = sort;
-    }
-
-    /**
-     * Informs this object of projection and dependency information.
-     *
-     * @param projection The projection that has been passed down to the query system.
-     * @param deps The output of DepsTracker::toParsedDeps.
-     */
-    void setProjection(const BSONObj& projection, const boost::optional<ParsedDeps>& deps) {
-        _projection = projection;
-        _dependencies = deps;
-    }
-
-    /**
-     * Returns the limit associated with this cursor, or -1 if there is no limit.
-     */
-    long long getLimit() const {
-        return _limit ? _limit->getLimit() : -1;
-    }
 
     /**
      * If subsequent sources need no information from the cursor, the cursor can simply output empty
@@ -155,11 +103,17 @@ public:
         return _planSummaryStats;
     }
 
+    bool usedDisk() final {
+        return _planSummaryStats.usedDisk;
+    }
+
 protected:
     DocumentSourceCursor(Collection* collection,
                          std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> exec,
                          const boost::intrusive_ptr<ExpressionContext>& pExpCtx,
                          bool trackOplogTimestamp = false);
+
+    GetNextResult doGetNext() final;
 
     ~DocumentSourceCursor();
 
@@ -170,18 +124,14 @@ protected:
     void doDispose() final;
 
     /**
-     * Attempts to combine with any subsequent $limit stages by setting the internal '_limit' field.
-     */
-    Pipeline::SourceContainer::iterator doOptimizeAt(Pipeline::SourceContainer::iterator itr,
-                                                     Pipeline::SourceContainer* container) final;
-
-    /**
      * If '_shouldProduceEmptyDocs' is false, this function hook is called on each 'obj' returned by
      * '_exec' when loading a batch and returns a Document to be added to '_currentBatch'.
      *
-     * The default implementation is a dependency-aware BSONObj-to-Document transformation.
+     * The default implementation is the identity function.
      */
-    virtual Document transformBSONObjToDocument(const BSONObj& obj) const;
+    virtual Document transformDoc(Document&& doc) const {
+        return std::move(doc);
+    }
 
 private:
     /**
@@ -207,14 +157,7 @@ private:
     // Batches results returned from the underlying PlanExecutor.
     std::deque<Document> _currentBatch;
 
-    // BSONObj members must outlive _projection and cursor.
-    BSONObj _query;
-    BSONObj _sort;
-    BSONObj _projection;
     bool _shouldProduceEmptyDocs = false;
-    boost::optional<ParsedDeps> _dependencies;
-    boost::intrusive_ptr<DocumentSourceLimit> _limit;
-    long long _docsAddedToBatches;  // for _limit enforcement
 
     // The underlying query plan which feeds this pipeline. Must be destroyed while holding the
     // collection lock.
@@ -225,7 +168,6 @@ private:
     // the default.
     Status _execStatus = Status::OK();
 
-    BSONObjSet _outputSorts;
     std::string _planSummary;
     PlanSummaryStats _planSummaryStats;
 

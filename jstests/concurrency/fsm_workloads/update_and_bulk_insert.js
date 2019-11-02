@@ -11,14 +11,13 @@
  * Collection::updateDocument().
  */
 var $config = (function() {
-
     var states = {
         insert: function insert(db, collName) {
             var bulk = db[collName].initializeUnorderedBulkOp();
             for (var i = 0; i < 100; ++i) {
                 bulk.insert({});
             }
-            assert.writeOK(bulk.execute());
+            assert.commandWorked(bulk.execute());
         },
 
         update: function update(db, collName) {
@@ -40,5 +39,4 @@ var $config = (function() {
         states: states,
         transitions: transitions
     };
-
 })();

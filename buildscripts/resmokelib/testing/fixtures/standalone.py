@@ -1,7 +1,5 @@
 """Standalone mongod fixture for executing JSTests against."""
 
-from __future__ import absolute_import
-
 import os
 import os.path
 import time
@@ -73,6 +71,13 @@ class MongoDFixture(interface.Fixture):
             raise errors.ServerFailure(msg)
 
         self.mongod = mongod
+
+    def pids(self):
+        """:return: pids owned by this fixture if any."""
+        out = [x.pid for x in [self.mongod] if x is not None]
+        if not out:
+            self.logger.debug('Mongod not running when gathering standalone fixture pid.')
+        return out
 
     def await_ready(self):
         """Block until the fixture can be used for testing."""

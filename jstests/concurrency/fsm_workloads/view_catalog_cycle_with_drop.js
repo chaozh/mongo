@@ -8,7 +8,6 @@
  */
 
 var $config = (function() {
-
     // Use the workload name as a prefix for the view names, since the workload name is assumed
     // to be unique.
     const prefix = 'view_catalog_cycle_with_drop_';
@@ -76,7 +75,6 @@ var $config = (function() {
             recreateViewOnCollection: recreateViewOnCollection,
             readFromView: readFromView
         };
-
     })();
 
     var transitions = {
@@ -89,7 +87,7 @@ var $config = (function() {
 
     function setup(db, collName, cluster) {
         let coll = db[collName];
-        assertAlways.writeOK(coll.insert({x: 1}));
+        assertAlways.commandWorked(coll.insert({x: 1}));
 
         for (let viewName of this.viewList) {
             assertAlways.commandWorked(db.createView(viewName, collName, []));
@@ -114,5 +112,4 @@ var $config = (function() {
         transitions: transitions,
         setup: setup,
     };
-
 })();

@@ -30,6 +30,7 @@
 #pragma once
 
 #include <boost/optional.hpp>
+#include <functional>
 #include <memory>
 #include <vector>
 
@@ -37,8 +38,6 @@
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/pipeline/aggregation_request.h"
 #include "mongo/db/repl/read_concern_args.h"
-#include "mongo/stdx/functional.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/stdx/unordered_set.h"
 
 namespace mongo {
@@ -61,7 +60,7 @@ public:
      * which this aggregation is being performed, and the BSONElement will be the element whose
      * field name is the name of this stage (e.g. the first and only element in {$limit: 1}).
      */
-    using Parser = stdx::function<std::unique_ptr<LiteParsedDocumentSource>(
+    using Parser = std::function<std::unique_ptr<LiteParsedDocumentSource>(
         const AggregationRequest&, const BSONElement&)>;
 
     /**
@@ -108,14 +107,6 @@ public:
     }
 
     /**
-     * Returns true if this pipeline's UUID and collation should be resolved. For the latter, this
-     * means adopting the collection's default collation, unless a custom collation was specified.
-     */
-    virtual bool shouldResolveUUIDAndCollation() const {
-        return true;
-    }
-
-    /**
      * Returns true if this stage does not require an input source.
      */
     virtual bool isInitialSource() const {
@@ -123,14 +114,7 @@ public:
     }
 
     /**
-     * Returns true if this stage may be forwarded to shards from a mongos.
-     */
-    virtual bool allowedToForwardFromMongos() const {
-        return true;
-    }
-
-    /**
-     * Returns true if this stage may be forwarded from Mongos unmodified.
+     * Returns true if this stage may be forwarded from mongos unmodified.
      */
     virtual bool allowedToPassthroughFromMongos() const {
         return true;
@@ -150,6 +134,31 @@ public:
      * UserException if not compatible.
      */
     virtual void assertSupportsReadConcern(const repl::ReadConcernArgs& readConcern) const {}
+
+    /**
+     * Verifies that this stage is allowed to run in a multi-document transaction. Throws a
+     * UserException if not compatible. This should only be called if the caller has determined the
+     * current operation is part of a transaction.
+     */
+    virtual void assertSupportsMultiDocumentTransaction() const {}
+
+protected:
+    void transactionNotSupported(StringData stageName) const {
+        uasserted(ErrorCodes::OperationNotSupportedInTransaction,
+                  str::stream() << "Operation not permitted in transaction :: caused by :: "
+                                << "Aggregation stage " << stageName << " cannot run within a "
+                                << "multi-document transaction.");
+    }
+
+    void onlyReadConcernLocalSupported(StringData stageName,
+                                       const repl::ReadConcernArgs& readConcern) const {
+        uassert(ErrorCodes::InvalidOptions,
+                str::stream()
+                    << "Aggregation stage " << stageName
+                    << " cannot run with a readConcern other than 'local'. Current readConcern: "
+                    << readConcern.toString(),
+                readConcern.getLevel() == repl::ReadConcernLevel::kLocalReadConcern);
+    }
 };
 
 class LiteParsedDocumentSourceDefault final : public LiteParsedDocumentSource {
@@ -161,7 +170,7 @@ public:
      */
     static std::unique_ptr<LiteParsedDocumentSourceDefault> parse(const AggregationRequest& request,
                                                                   const BSONElement& spec) {
-        return stdx::make_unique<LiteParsedDocumentSourceDefault>();
+        return std::make_unique<LiteParsedDocumentSourceDefault>();
     }
 
     LiteParsedDocumentSourceDefault() = default;

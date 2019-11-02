@@ -39,10 +39,11 @@
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/repl/bson_extract_optime.h"
+#include "mongo/db/server_options.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 namespace repl {
@@ -54,7 +55,9 @@ const std::string kElectionTimeFieldName = "electionTime";
 const std::string kMemberStateFieldName = "state";
 const std::string kOkFieldName = "ok";
 const std::string kDurableOpTimeFieldName = "durableOpTime";
+const std::string kDurableWallTimeFieldName = "durableWallTime";
 const std::string kAppliedOpTimeFieldName = "opTime";
+const std::string kAppliedWallTimeFieldName = "wallTime";
 const std::string kPrimaryIdFieldName = "primaryId";
 const std::string kReplSetFieldName = "set";
 const std::string kSyncSourceFieldName = "syncingTo";
@@ -92,9 +95,11 @@ void ReplSetHeartbeatResponse::addToBSON(BSONObjBuilder* builder) const {
     }
     if (_durableOpTimeSet) {
         _durableOpTime.append(builder, kDurableOpTimeFieldName);
+        builder->appendDate(kDurableWallTimeFieldName, _durableWallTime);
     }
     if (_appliedOpTimeSet) {
         _appliedOpTime.append(builder, kAppliedOpTimeFieldName);
+        builder->appendDate(kAppliedWallTimeFieldName, _appliedWallTime);
     }
 }
 
@@ -146,31 +151,50 @@ Status ReplSetHeartbeatResponse::initialize(const BSONObj& doc, long long term) 
     if (!status.isOK()) {
         return status;
     }
+
+    BSONElement durableWallTimeElement;
+    _durableWallTime = Date_t();
+    status = bsonExtractTypedField(
+        doc, kDurableWallTimeFieldName, BSONType::Date, &durableWallTimeElement);
+    if (!status.isOK()) {
+        return status;
+    }
+    _durableWallTime = durableWallTimeElement.Date();
     _durableOpTimeSet = true;
+
 
     // In V1, heartbeats OpTime is type Object and we construct an OpTime out of its nested fields.
     status = bsonExtractOpTimeField(doc, kAppliedOpTimeFieldName, &_appliedOpTime);
     if (!status.isOK()) {
         return status;
     }
+
+    BSONElement appliedWallTimeElement;
+    _appliedWallTime = Date_t();
+    status = bsonExtractTypedField(
+        doc, kAppliedWallTimeFieldName, BSONType::Date, &appliedWallTimeElement);
+    if (!status.isOK()) {
+        return status;
+    }
+    _appliedWallTime = appliedWallTimeElement.Date();
     _appliedOpTimeSet = true;
 
     const BSONElement memberStateElement = doc[kMemberStateFieldName];
     if (memberStateElement.eoo()) {
         _stateSet = false;
     } else if (memberStateElement.type() != NumberInt && memberStateElement.type() != NumberLong) {
-        return Status(
-            ErrorCodes::TypeMismatch,
-            str::stream() << "Expected \"" << kMemberStateFieldName
+        return Status(ErrorCodes::TypeMismatch,
+                      str::stream()
+                          << "Expected \"" << kMemberStateFieldName
                           << "\" field in response to replSetHeartbeat "
                              "command to have type NumberInt or NumberLong, but found type "
                           << typeName(memberStateElement.type()));
     } else {
         long long stateInt = memberStateElement.numberLong();
         if (stateInt < 0 || stateInt > MemberState::RS_MAX) {
-            return Status(
-                ErrorCodes::BadValue,
-                str::stream() << "Value for \"" << kMemberStateFieldName
+            return Status(ErrorCodes::BadValue,
+                          str::stream()
+                              << "Value for \"" << kMemberStateFieldName
                               << "\" in response to replSetHeartbeat is "
                                  "out of range; legal values are non-negative and no more than "
                               << MemberState::RS_MAX);
@@ -183,8 +207,7 @@ Status ReplSetHeartbeatResponse::initialize(const BSONObj& doc, long long term) 
     if (configVersionElement.eoo()) {
         return Status(ErrorCodes::NoSuchKey,
                       str::stream() << "Response to replSetHeartbeat missing required \""
-                                    << kConfigVersionFieldName
-                                    << "\" field");
+                                    << kConfigVersionFieldName << "\" field");
     }
     if (configVersionElement.type() != NumberInt) {
         return Status(ErrorCodes::TypeMismatch,
@@ -250,9 +273,19 @@ OpTime ReplSetHeartbeatResponse::getAppliedOpTime() const {
     return _appliedOpTime;
 }
 
+OpTimeAndWallTime ReplSetHeartbeatResponse::getAppliedOpTimeAndWallTime() const {
+    invariant(_appliedOpTimeSet);
+    return {_appliedOpTime, _appliedWallTime};
+}
+
 OpTime ReplSetHeartbeatResponse::getDurableOpTime() const {
     invariant(_durableOpTimeSet);
     return _durableOpTime;
+}
+
+OpTimeAndWallTime ReplSetHeartbeatResponse::getDurableOpTimeAndWallTime() const {
+    invariant(_durableOpTimeSet);
+    return {_durableOpTime, _durableWallTime};
 }
 
 }  // namespace repl

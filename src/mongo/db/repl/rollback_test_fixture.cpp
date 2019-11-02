@@ -31,9 +31,9 @@
 
 #include "mongo/db/repl/rollback_test_fixture.h"
 
+#include <memory>
 #include <string>
 
-#include "mongo/db/catalog/collection_catalog_entry.h"
 #include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/client.h"
 #include "mongo/db/db_raii.h"
@@ -46,10 +46,10 @@
 #include "mongo/db/repl/replication_process.h"
 #include "mongo/db/repl/replication_recovery.h"
 #include "mongo/db/repl/rs_rollback.h"
+#include "mongo/db/storage/durable_catalog.h"
 #include "mongo/logger/log_component.h"
 #include "mongo/logger/logger.h"
-#include "mongo/stdx/memory.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 namespace repl {
@@ -89,10 +89,10 @@ public:
 void RollbackTest::setUp() {
     _storageInterface = new StorageInterfaceRollback();
     auto serviceContext = getServiceContext();
-    auto consistencyMarkers = stdx::make_unique<ReplicationConsistencyMarkersMock>();
+    auto consistencyMarkers = std::make_unique<ReplicationConsistencyMarkersMock>();
     auto recovery =
-        stdx::make_unique<ReplicationRecoveryImpl>(_storageInterface, consistencyMarkers.get());
-    _replicationProcess = stdx::make_unique<ReplicationProcess>(
+        std::make_unique<ReplicationRecoveryImpl>(_storageInterface, consistencyMarkers.get());
+    _replicationProcess = std::make_unique<ReplicationProcess>(
         _storageInterface, std::move(consistencyMarkers), std::move(recovery));
     _dropPendingCollectionReaper = new DropPendingCollectionReaper(_storageInterface);
     DropPendingCollectionReaper::set(
@@ -160,6 +160,7 @@ std::pair<BSONObj, RecordId> RollbackTest::makeCRUDOp(OpTypeEnum opType,
     if (o2) {
         bob.append("o2", *o2);
     }
+    bob.append("wall", Date_t());
 
     return std::make_pair(bob.obj(), RecordId(recordId));
 }
@@ -183,6 +184,7 @@ std::pair<BSONObj, RecordId> RollbackTest::makeCommandOp(Timestamp ts,
     if (o2) {
         bob.append("o2", *o2);
     }
+    bob.append("wall", Date_t());
 
     return std::make_pair(bob.obj(), RecordId(recordId));
 }
@@ -195,8 +197,8 @@ Collection* RollbackTest::_createCollection(OperationContext* opCtx,
     auto databaseHolder = DatabaseHolder::get(opCtx);
     auto db = databaseHolder->openDb(opCtx, nss.db());
     ASSERT_TRUE(db);
-    db->dropCollection(opCtx, nss.ns()).transitional_ignore();
-    auto coll = db->createCollection(opCtx, nss.ns(), options);
+    db->dropCollection(opCtx, nss).transitional_ignore();
+    auto coll = db->createCollection(opCtx, nss, options);
     ASSERT_TRUE(coll);
     wuow.commit();
     return coll;
@@ -276,8 +278,8 @@ void RollbackResyncsCollectionOptionsTest::resyncCollectionOptionsTest(
                                 remoteCollOptionsObj,
                                 BSON("collMod"
                                      << "coll"
-                                     << "noPadding"
-                                     << false),
+                                     << "validationLevel"
+                                     << "strict"),
                                 "coll");
 }
 void RollbackResyncsCollectionOptionsTest::resyncCollectionOptionsTest(
@@ -295,12 +297,9 @@ void RollbackResyncsCollectionOptionsTest::resyncCollectionOptionsTest(
     auto commonOpUuid = unittest::assertGet(UUID::parse("f005ba11-cafe-bead-f00d-123456789abc"));
     auto commonOpBson = BSON("ts" << Timestamp(1, 1) << "t" << 1LL << "op"
                                   << "n"
-                                  << "o"
-                                  << BSONObj()
-                                  << "ns"
+                                  << "o" << BSONObj() << "ns"
                                   << "rollback_test.test"
-                                  << "ui"
-                                  << commonOpUuid);
+                                  << "wall" << Date_t() << "ui" << commonOpUuid);
 
     auto commonOperation = std::make_pair(commonOpBson, RecordId(1));
 
@@ -321,7 +320,7 @@ void RollbackResyncsCollectionOptionsTest::resyncCollectionOptionsTest(
     // Make sure the collection options are correct.
     AutoGetCollectionForReadCommand autoColl(_opCtx.get(), NamespaceString(nss.toString()));
     auto collAfterRollbackOptions =
-        autoColl.getCollection()->getCatalogEntry()->getCollectionOptions(_opCtx.get());
+        DurableCatalog::get(_opCtx.get())->getCollectionOptions(_opCtx.get(), nss);
 
     BSONObjBuilder expectedOptionsBob;
     if (localCollOptions.uuid) {

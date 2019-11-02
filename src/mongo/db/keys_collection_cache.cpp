@@ -33,7 +33,8 @@
 
 #include "mongo/db/keys_collection_client.h"
 #include "mongo/db/keys_collection_document.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -46,7 +47,7 @@ StatusWith<KeysCollectionDocument> KeysCollectionCache::refresh(OperationContext
     decltype(_cache)::size_type originalSize = 0;
 
     {
-        stdx::lock_guard<stdx::mutex> lk(_cacheMutex);
+        stdx::lock_guard<Latch> lk(_cacheMutex);
         auto iter = _cache.crbegin();
         if (iter != _cache.crend()) {
             newerThanThis = iter->second.getExpiresAt();
@@ -55,7 +56,16 @@ StatusWith<KeysCollectionDocument> KeysCollectionCache::refresh(OperationContext
         originalSize = _cache.size();
     }
 
-    auto refreshStatus = _client->getNewKeys(opCtx, _purpose, newerThanThis);
+    // Don't allow this to read during initial sync because it will read at the initialDataTimestamp
+    // and that could conflict with reconstructing prepared transactions using the
+    // initialDataTimestamp as the prepareTimestamp.
+    if (repl::ReplicationCoordinator::get(opCtx) &&
+        repl::ReplicationCoordinator::get(opCtx)->getMemberState().startup2()) {
+        return {ErrorCodes::InitialSyncActive,
+                "Cannot refresh keys collection cache during initial sync"};
+    }
+
+    auto refreshStatus = _client->getNewKeys(opCtx, _purpose, newerThanThis, true);
 
     if (!refreshStatus.isOK()) {
         return refreshStatus.getStatus();
@@ -63,7 +73,7 @@ StatusWith<KeysCollectionDocument> KeysCollectionCache::refresh(OperationContext
 
     auto& newKeys = refreshStatus.getValue();
 
-    stdx::lock_guard<stdx::mutex> lk(_cacheMutex);
+    stdx::lock_guard<Latch> lk(_cacheMutex);
     if (originalSize > _cache.size()) {
         // _cache cleared while we getting the new keys, just return the newest key without
         // touching the _cache so the next refresh will populate it properly.
@@ -86,7 +96,7 @@ StatusWith<KeysCollectionDocument> KeysCollectionCache::refresh(OperationContext
 
 StatusWith<KeysCollectionDocument> KeysCollectionCache::getKeyById(long long keyId,
                                                                    const LogicalTime& forThisTime) {
-    stdx::lock_guard<stdx::mutex> lk(_cacheMutex);
+    stdx::lock_guard<Latch> lk(_cacheMutex);
 
     for (auto iter = _cache.lower_bound(forThisTime); iter != _cache.cend(); ++iter) {
         if (iter->second.getKeyId() == keyId) {
@@ -96,14 +106,12 @@ StatusWith<KeysCollectionDocument> KeysCollectionCache::getKeyById(long long key
 
     return {ErrorCodes::KeyNotFound,
             str::stream() << "Cache Reader No keys found for " << _purpose
-                          << " that is valid for time: "
-                          << forThisTime.toString()
-                          << " with id: "
-                          << keyId};
+                          << " that is valid for time: " << forThisTime.toString()
+                          << " with id: " << keyId};
 }
 
 StatusWith<KeysCollectionDocument> KeysCollectionCache::getKey(const LogicalTime& forThisTime) {
-    stdx::lock_guard<stdx::mutex> lk(_cacheMutex);
+    stdx::lock_guard<Latch> lk(_cacheMutex);
 
     auto iter = _cache.upper_bound(forThisTime);
 
@@ -118,7 +126,7 @@ StatusWith<KeysCollectionDocument> KeysCollectionCache::getKey(const LogicalTime
 void KeysCollectionCache::resetCache() {
     // keys that read with non majority readConcern level can be rolled back.
     if (!_client->supportsMajorityReads()) {
-        stdx::lock_guard<stdx::mutex> lk(_cacheMutex);
+        stdx::lock_guard<Latch> lk(_cacheMutex);
         _cache.clear();
     }
 }

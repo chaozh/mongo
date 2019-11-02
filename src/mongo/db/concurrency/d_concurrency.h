@@ -38,7 +38,7 @@
 namespace mongo {
 
 class StringData;
-class NamespaceString;
+class NamespaceStringOrUUID;
 
 class Lock {
 public:
@@ -46,7 +46,8 @@ public:
      * NOTE: DO NOT add any new usages of TempRelease. It is being deprecated/removed.
      */
     class TempRelease {
-        MONGO_DISALLOW_COPYING(TempRelease);
+        TempRelease(const TempRelease&) = delete;
+        TempRelease& operator=(const TempRelease&) = delete;
 
     public:
         explicit TempRelease(Locker* lockState);
@@ -72,7 +73,8 @@ public:
      * resources other than RESOURCE_GLOBAL, RESOURCE_DATABASE and RESOURCE_COLLECTION.
      */
     class ResourceLock {
-        MONGO_DISALLOW_COPYING(ResourceLock);
+        ResourceLock(const ResourceLock&) = delete;
+        ResourceLock& operator=(const ResourceLock&) = delete;
 
     public:
         ResourceLock(Locker* locker, ResourceId rid)
@@ -96,7 +98,8 @@ public:
             }
         }
 
-        void lock(LockMode mode);
+        void lock(LockMode mode);                           // Uninterruptible
+        void lock(OperationContext* opCtx, LockMode mode);  // Interruptible
         void unlock();
 
         bool isLocked() const {
@@ -154,6 +157,16 @@ public:
     public:
         ExclusiveLock(Locker* locker, ResourceMutex mutex)
             : ResourceLock(locker, mutex.rid(), MODE_X) {}
+
+        using ResourceLock::lock;
+
+        /**
+         * Parameterless overload to allow ExclusiveLock to be used with stdx::unique_lock and
+         * stdx::condition_variable_any
+         */
+        void lock() {
+            lock(MODE_X);
+        }
     };
 
     /**
@@ -186,8 +199,6 @@ public:
      */
     class GlobalLock {
     public:
-        class EnqueueOnly {};
-
         /**
          * A GlobalLock without a deadline defaults to Date_t::max() and an InterruptBehavior of
          * kThrow.
@@ -205,20 +216,9 @@ public:
 
         GlobalLock(GlobalLock&&);
 
-        /**
-         * Enqueues lock but does not block on lock acquisition.
-         * Call waitForLockUntil() to complete locking process.
-         *
-         * Does not set that the global lock was taken on the GlobalLockAcquisitionTracker. Call
-         * waitForLockUntil to do so.
-         */
-        GlobalLock(OperationContext* opCtx,
-                   LockMode lockMode,
-                   Date_t deadline,
-                   InterruptBehavior behavior,
-                   EnqueueOnly enqueueOnly);
-
         ~GlobalLock() {
+            // Preserve the original lock result which will be overridden by unlock().
+            auto lockResult = _result;
             if (isLocked()) {
                 // Abandon our snapshot if destruction of the GlobalLock object results in actually
                 // unlocking the global lock. Recursive locking and the two-phase locking protocol
@@ -230,21 +230,16 @@ public:
                 }
                 _unlock();
             }
-            _opCtx->lockState()->unlock(resourceIdReplicationStateTransitionLock);
+            if (lockResult == LOCK_OK || lockResult == LOCK_WAITING) {
+                _opCtx->lockState()->unlock(resourceIdReplicationStateTransitionLock);
+            }
         }
-
-        /**
-         * Waits for lock to be granted. Sets that the global lock was taken on the
-         * GlobalLockAcquisitionTracker.
-         */
-        void waitForLockUntil(Date_t deadline);
 
         bool isLocked() const {
             return _result == LOCK_OK;
         }
 
     private:
-        void _enqueue(LockMode lockMode, Date_t deadline);
         void _unlock();
 
         OperationContext* const _opCtx;
@@ -352,43 +347,21 @@ public:
      * will be upgraded to MODE_S and MODE_IX will be upgraded to MODE_X.
      */
     class CollectionLock {
-        MONGO_DISALLOW_COPYING(CollectionLock);
+        CollectionLock(const CollectionLock&) = delete;
+        CollectionLock& operator=(const CollectionLock&) = delete;
 
     public:
-        CollectionLock(Locker* lockState,
-                       StringData ns,
+        CollectionLock(OperationContext* opCtx,
+                       const NamespaceStringOrUUID& nssOrUUID,
                        LockMode mode,
                        Date_t deadline = Date_t::max());
+
         CollectionLock(CollectionLock&&);
         ~CollectionLock();
 
-        bool isLocked() const {
-            return _result == LOCK_OK;
-        }
-
     private:
-        const ResourceId _id;
-        LockResult _result;
-        Locker* _lockState;
-    };
-
-    /**
-     * Like the CollectionLock, but optimized for the local oplog. Always locks in MODE_IX,
-     * must call serializeIfNeeded() before doing any concurrent operations in order to
-     * support storage engines without document level locking. It is an error, checked with a
-     * dassert(), to not have a suitable database lock when taking this lock.
-     */
-    class OplogIntentWriteLock {
-        MONGO_DISALLOW_COPYING(OplogIntentWriteLock);
-
-    public:
-        explicit OplogIntentWriteLock(Locker* lockState);
-        ~OplogIntentWriteLock();
-        void serializeIfNeeded();
-
-    private:
-        Locker* const _lockState;
-        bool _serialized;
+        ResourceId _id;
+        OperationContext* _opCtx;
     };
 
     /**
@@ -398,7 +371,8 @@ public:
      * writers just call setShouldConflictWithSecondaryBatchApplication(false).
      */
     class ParallelBatchWriterMode {
-        MONGO_DISALLOW_COPYING(ParallelBatchWriterMode);
+        ParallelBatchWriterMode(const ParallelBatchWriterMode&) = delete;
+        ParallelBatchWriterMode& operator=(const ParallelBatchWriterMode&) = delete;
 
     public:
         explicit ParallelBatchWriterMode(Locker* lockState);

@@ -32,9 +32,9 @@
 #include <string>
 #include <vector>
 
-#include "mongo/base/disallow_copying.h"
+#include "mongo/client/replica_set_change_notifier.h"
 #include "mongo/executor/task_executor.h"
-#include "mongo/stdx/mutex.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/util/string_map.h"
 
 namespace mongo {
@@ -48,7 +48,8 @@ class MongoURI;
  * Manages the lifetime of a set of replica set monitors.
  */
 class ReplicaSetMonitorManager {
-    MONGO_DISALLOW_COPYING(ReplicaSetMonitorManager);
+    ReplicaSetMonitorManager(const ReplicaSetMonitorManager&) = delete;
+    ReplicaSetMonitorManager& operator=(const ReplicaSetMonitorManager&) = delete;
 
 public:
     ReplicaSetMonitorManager();
@@ -85,28 +86,36 @@ public:
     void shutdown();
 
     /**
-     * Reports information about the replica sets tracked by us, for diagnostic purposes.
+     * Reports information about the replica sets tracked by us, for diagnostic purposes. If
+     * forFTDC, trim to minimize its size for full-time diagnostic data capture.
      */
-    void report(BSONObjBuilder* builder);
+    void report(BSONObjBuilder* builder, bool forFTDC = false);
 
     /**
      * Returns an executor for running RSM tasks.
      */
     executor::TaskExecutor* getExecutor();
 
+    ReplicaSetChangeNotifier& getNotifier();
+
+    bool isShutdown() const;
+
 private:
     using ReplicaSetMonitorsMap = StringMap<std::weak_ptr<ReplicaSetMonitor>>;
 
     // Protects access to the replica set monitors
-    stdx::mutex _mutex;
+    mutable Mutex _mutex = MONGO_MAKE_LATCH("ReplicaSetMonitorManager::_mutex");
 
     // Executor for monitoring replica sets.
     std::unique_ptr<executor::TaskExecutor> _taskExecutor;
 
+    // Widget to notify listeners when a RSM notices a change
+    ReplicaSetChangeNotifier _notifier;
+
     // Needs to be after `_taskExecutor`, so that it will be destroyed before the `_taskExecutor`.
     ReplicaSetMonitorsMap _monitors;
 
-    void _setupTaskExecutorInLock(const std::string& name);
+    void _setupTaskExecutorInLock();
 
     // set to true when shutdown has been called.
     bool _isShutdown{false};

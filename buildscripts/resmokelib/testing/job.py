@@ -1,7 +1,5 @@
 """Enable running tests simultaneously by processing them from a multi-consumer queue."""
 
-from __future__ import absolute_import
-
 import sys
 import time
 
@@ -9,7 +7,6 @@ from . import queue_element
 from . import testcases
 from .. import config
 from .. import errors
-from ..testing.fixtures import interface as _fixtures
 from ..testing.hooks import stepdown
 from ..testing.testcases import fixture as _fixture
 from ..utils import queue as _queue
@@ -44,14 +41,13 @@ class Job(object):  # pylint: disable=too-many-instance-attributes
 
         Return True if the setup was successful, False otherwise.
         """
-        if isinstance(self.fixture, _fixtures.NoOpFixture):
-            return True
         test_case = _fixture.FixtureSetupTestCase(self.test_queue_logger, self.fixture,
                                                   "job{}".format(self.job_num))
         test_case(self.report)
         if self.report.find_test_info(test_case).status != "pass":
             self.logger.error("The setup of %s failed.", self.fixture)
             return False
+
         return True
 
     def teardown_fixture(self):
@@ -59,14 +55,13 @@ class Job(object):  # pylint: disable=too-many-instance-attributes
 
         Return True if the teardown was successful, False otherwise.
         """
-        if isinstance(self.fixture, _fixtures.NoOpFixture):
-            return True
         test_case = _fixture.FixtureTeardownTestCase(self.test_queue_logger, self.fixture,
                                                      "job{}".format(self.job_num))
         test_case(self.report)
         if self.report.find_test_info(test_case).status != "pass":
             self.logger.error("The teardown of %s failed.", self.fixture)
             return False
+
         return True
 
     @staticmethod
@@ -86,23 +81,64 @@ class Job(object):  # pylint: disable=too-many-instance-attributes
         will be run before this method returns. If an error occurs
         while destroying the fixture, then the 'teardown_flag' will be set.
         """
-        if setup_flag is not None and not self.setup_fixture():
-            self._interrupt_all_jobs(queue, interrupt_flag)
-            return
+        setup_succeeded = True
+        if setup_flag is not None:
+            try:
+                setup_succeeded = self.setup_fixture()
+            except errors.StopExecution as err:
+                # Something went wrong when setting up the fixture. Perhaps we couldn't get a
+                # test_id from logkeeper for where to put the log output. We don't attempt to run
+                # any tests.
+                self.logger.error(
+                    "Received a StopExecution exception when setting up the fixture: %s.", err)
+                setup_succeeded = False
+            except:  # pylint: disable=bare-except
+                # Something unexpected happened when setting up the fixture. We don't attempt to run
+                # any tests.
+                self.logger.exception("Encountered an error when setting up the fixture.")
+                setup_succeeded = False
 
-        try:
-            self._run(queue, interrupt_flag)
-        except errors.StopExecution as err:
-            # Stop running tests immediately.
-            self.logger.error("Received a StopExecution exception: %s.", err)
-            self._interrupt_all_jobs(queue, interrupt_flag)
-        except:  # pylint: disable=bare-except
-            # Unknown error, stop execution.
-            self.logger.exception("Encountered an error during test execution.")
-            self._interrupt_all_jobs(queue, interrupt_flag)
+            if not setup_succeeded:
+                setup_flag.set()
+                self._interrupt_all_jobs(queue, interrupt_flag)
 
-        if teardown_flag is not None and not self.teardown_fixture():
-            teardown_flag.set()
+        if setup_succeeded:
+            try:
+                self._run(queue, interrupt_flag)
+            except errors.StopExecution as err:
+                # Stop running tests immediately.
+                self.logger.error("Received a StopExecution exception: %s.", err)
+                self._interrupt_all_jobs(queue, interrupt_flag)
+            except:  # pylint: disable=bare-except
+                # Unknown error, stop execution.
+                self.logger.exception("Encountered an error during test execution.")
+                self._interrupt_all_jobs(queue, interrupt_flag)
+
+        if teardown_flag is not None:
+            try:
+                teardown_succeeded = self.teardown_fixture()
+            except errors.StopExecution as err:
+                # Something went wrong when tearing down the fixture. Perhaps we couldn't get a
+                # test_id from logkeeper for where to put the log output. We indicate back to the
+                # executor thread that teardown has failed. This likely means resmoke.py is exiting
+                # without having terminated all of the child processes it spawned.
+                self.logger.error(
+                    "Received a StopExecution exception when tearing down the fixture: %s.", err)
+                teardown_succeeded = False
+            except:  # pylint: disable=bare-except
+                # Something unexpected happened when tearing down the fixture. We indicate back to
+                # the executor thread that teardown has failed. This may mean resmoke.py is exiting
+                # without having terminated all of the child processes it spawned.
+                self.logger.exception("Encountered an error when tearing down the fixture.")
+                teardown_succeeded = False
+
+            if not teardown_succeeded:
+                teardown_flag.set()
+
+    @staticmethod
+    def _get_time():
+        """Get current time to aid in the unit testing of the _run method."""
+        return time.time()
 
     def _run(self, queue, interrupt_flag):
         """Call the before/after suite hooks and continuously execute tests from 'queue'."""
@@ -112,12 +148,12 @@ class Job(object):  # pylint: disable=too-many-instance-attributes
 
         while not queue.empty() and not interrupt_flag.is_set():
             queue_elem = queue.get_nowait()
-            test_time_start = time.time()
+            test_time_start = self._get_time()
             try:
                 test = queue_elem.testcase
                 self._execute_test(test)
             finally:
-                queue_elem.job_completed(time.time() - test_time_start)
+                queue_elem.job_completed(self._get_time() - test_time_start)
                 queue.task_done()
 
             self._requeue_test(queue, queue_elem, interrupt_flag)
@@ -175,8 +211,8 @@ class Job(object):  # pylint: disable=too-many-instance-attributes
                     test.short_description())
                 self.report.setFailure(test, return_code=2)
                 # Always fail fast if the fixture fails.
-                raise errors.StopExecution("%s not running after %s" % (self.fixture,
-                                                                        test.short_description()))
+                raise errors.StopExecution(
+                    "%s not running after %s" % (self.fixture, test.short_description()))
         finally:
             success = self.report.find_test_info(test).status == "pass"
             if self.archival:

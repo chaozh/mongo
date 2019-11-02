@@ -39,12 +39,13 @@
 namespace mongo {
 namespace {
 
-using MergeChunkTest = ConfigServerTestFixture;
-
 const NamespaceString kNamespace("TestDB.TestColl");
+
+using MergeChunkTest = ConfigServerTestFixture;
 
 TEST_F(MergeChunkTest, MergeExistingChunksCorrectlyShouldSucceed) {
     ChunkType chunk;
+    chunk.setName(OID::gen());
     chunk.setNS(kNamespace);
 
     auto origVersion = ChunkVersion(1, 0, OID::gen());
@@ -53,6 +54,7 @@ TEST_F(MergeChunkTest, MergeExistingChunksCorrectlyShouldSucceed) {
 
     // Construct chunk to be merged
     auto chunk2(chunk);
+    chunk2.setName(OID::gen());
 
     auto chunkMin = BSON("a" << 1);
     auto chunkBound = BSON("a" << 5);
@@ -66,7 +68,7 @@ TEST_F(MergeChunkTest, MergeExistingChunksCorrectlyShouldSucceed) {
 
     std::vector<BSONObj> chunkBoundaries{chunkMin, chunkBound, chunkMax};
 
-    setupChunks({chunk, chunk2}).transitional_ignore();
+    setupChunks({chunk, chunk2});
 
     Timestamp validAfter{100, 0};
 
@@ -110,6 +112,7 @@ TEST_F(MergeChunkTest, MergeExistingChunksCorrectlyShouldSucceed) {
 
 TEST_F(MergeChunkTest, MergeSeveralChunksCorrectlyShouldSucceed) {
     ChunkType chunk;
+    chunk.setName(OID::gen());
     chunk.setNS(kNamespace);
 
     auto origVersion = ChunkVersion(1, 0, OID::gen());
@@ -119,6 +122,8 @@ TEST_F(MergeChunkTest, MergeSeveralChunksCorrectlyShouldSucceed) {
     // Construct chunks to be merged
     auto chunk2(chunk);
     auto chunk3(chunk);
+    chunk2.setName(OID::gen());
+    chunk3.setName(OID::gen());
 
     auto chunkMin = BSON("a" << 1);
     auto chunkBound = BSON("a" << 5);
@@ -137,7 +142,7 @@ TEST_F(MergeChunkTest, MergeSeveralChunksCorrectlyShouldSucceed) {
     // Record chunk boundaries for passing into commitChunkMerge
     std::vector<BSONObj> chunkBoundaries{chunkMin, chunkBound, chunkBound2, chunkMax};
 
-    setupChunks({chunk, chunk2, chunk3}).transitional_ignore();
+    setupChunks({chunk, chunk2, chunk3});
 
     Timestamp validAfter{100, 0};
 
@@ -181,7 +186,9 @@ TEST_F(MergeChunkTest, MergeSeveralChunksCorrectlyShouldSucceed) {
 
 TEST_F(MergeChunkTest, NewMergeShouldClaimHighestVersion) {
     ChunkType chunk, otherChunk;
+    chunk.setName(OID::gen());
     chunk.setNS(kNamespace);
+    otherChunk.setName(OID::gen());
     otherChunk.setNS(kNamespace);
     auto collEpoch = OID::gen();
 
@@ -191,6 +198,7 @@ TEST_F(MergeChunkTest, NewMergeShouldClaimHighestVersion) {
 
     // Construct chunk to be merged
     auto chunk2(chunk);
+    chunk2.setName(OID::gen());
 
     auto chunkMin = BSON("a" << 1);
     auto chunkBound = BSON("a" << 5);
@@ -212,7 +220,7 @@ TEST_F(MergeChunkTest, NewMergeShouldClaimHighestVersion) {
     otherChunk.setMin(BSON("a" << 10));
     otherChunk.setMax(BSON("a" << 20));
 
-    setupChunks({chunk, chunk2, otherChunk}).transitional_ignore();
+    setupChunks({chunk, chunk2, otherChunk});
 
     Timestamp validAfter{100, 0};
 
@@ -256,6 +264,7 @@ TEST_F(MergeChunkTest, NewMergeShouldClaimHighestVersion) {
 
 TEST_F(MergeChunkTest, MergeLeavesOtherChunksAlone) {
     ChunkType chunk;
+    chunk.setName(OID::gen());
     chunk.setNS(kNamespace);
 
     auto origVersion = ChunkVersion(1, 2, OID::gen());
@@ -264,6 +273,7 @@ TEST_F(MergeChunkTest, MergeLeavesOtherChunksAlone) {
 
     // Construct chunk to be merged
     auto chunk2(chunk);
+    chunk2.setName(OID::gen());
 
     auto chunkMin = BSON("a" << 1);
     auto chunkBound = BSON("a" << 5);
@@ -280,10 +290,11 @@ TEST_F(MergeChunkTest, MergeLeavesOtherChunksAlone) {
 
     // Set up unmerged chunk
     auto otherChunk(chunk);
+    otherChunk.setName(OID::gen());
     otherChunk.setMin(BSON("a" << 10));
     otherChunk.setMax(BSON("a" << 20));
 
-    setupChunks({chunk, chunk2, otherChunk}).transitional_ignore();
+    setupChunks({chunk, chunk2, otherChunk});
 
     Timestamp validAfter{1};
 
@@ -349,7 +360,7 @@ TEST_F(MergeChunkTest, NonExistingNamespace) {
     // Record chunk boundaries for passing into commitChunkMerge
     std::vector<BSONObj> chunkBoundaries{chunkMin, chunkBound, chunkMax};
 
-    setupChunks({chunk, chunk2}).transitional_ignore();
+    setupChunks({chunk, chunk2});
 
     Timestamp validAfter{1};
 
@@ -386,7 +397,7 @@ TEST_F(MergeChunkTest, NonMatchingEpochsOfChunkAndRequestErrors) {
     // Record chunk baoundaries for passing into commitChunkMerge
     std::vector<BSONObj> chunkBoundaries{chunkMin, chunkBound, chunkMax};
 
-    setupChunks({chunk, chunk2}).transitional_ignore();
+    setupChunks({chunk, chunk2});
 
     Timestamp validAfter{1};
 
@@ -400,8 +411,9 @@ TEST_F(MergeChunkTest, NonMatchingEpochsOfChunkAndRequestErrors) {
     ASSERT_EQ(ErrorCodes::StaleEpoch, mergeStatus);
 }
 
-TEST_F(MergeChunkTest, MergeAlreadyHappenedFailsPrecondition) {
+TEST_F(MergeChunkTest, MergeAlreadyHappenedSucceeds) {
     ChunkType chunk;
+    chunk.setName(OID::gen());
     chunk.setNS(kNamespace);
 
     auto origVersion = ChunkVersion(1, 0, OID::gen());
@@ -410,6 +422,7 @@ TEST_F(MergeChunkTest, MergeAlreadyHappenedFailsPrecondition) {
 
     // Construct chunk to be merged
     auto chunk2(chunk);
+    chunk2.setName(OID::gen());
 
     auto chunkMin = BSON("a" << 1);
     auto chunkBound = BSON("a" << 5);
@@ -429,12 +442,11 @@ TEST_F(MergeChunkTest, MergeAlreadyHappenedFailsPrecondition) {
     mergedChunk.setVersion(mergedVersion);
     mergedChunk.setMax(chunkMax);
 
-    setupChunks({mergedChunk}).transitional_ignore();
+    setupChunks({mergedChunk});
 
     Timestamp validAfter{1};
 
-    ASSERT_EQ(ErrorCodes::BadValue,
-              ShardingCatalogManager::get(operationContext())
+    ASSERT_OK(ShardingCatalogManager::get(operationContext())
                   ->commitChunkMerge(operationContext(),
                                      kNamespace,
                                      origVersion.epoch(),
@@ -472,6 +484,7 @@ TEST_F(MergeChunkTest, ChunkBoundariesOutOfOrderFails) {
         ChunkVersion version = ChunkVersion(1, 0, epoch);
 
         ChunkType chunk;
+        chunk.setName(OID::gen());
         chunk.setNS(kNamespace);
         chunk.setShard(ShardId("shard0000"));
 
@@ -481,18 +494,20 @@ TEST_F(MergeChunkTest, ChunkBoundariesOutOfOrderFails) {
         originalChunks.push_back(chunk);
 
         version.incMinor();
+        chunk.setName(OID::gen());
         chunk.setMin(BSON("a" << 200));
         chunk.setMax(BSON("a" << 300));
         chunk.setVersion(version);
         originalChunks.push_back(chunk);
 
         version.incMinor();
+        chunk.setName(OID::gen());
         chunk.setMin(BSON("a" << 300));
         chunk.setMax(BSON("a" << 400));
         chunk.setVersion(version);
         originalChunks.push_back(chunk);
 
-        setupChunks(originalChunks).transitional_ignore();
+        setupChunks(originalChunks);
     }
 
     Timestamp validAfter{1};
@@ -506,6 +521,7 @@ TEST_F(MergeChunkTest, ChunkBoundariesOutOfOrderFails) {
 
 TEST_F(MergeChunkTest, MergingChunksWithDollarPrefixShouldSucceed) {
     ChunkType chunk1;
+    chunk1.setName(OID::gen());
     chunk1.setNS(kNamespace);
 
     auto origVersion = ChunkVersion(1, 0, OID::gen());
@@ -514,6 +530,8 @@ TEST_F(MergeChunkTest, MergingChunksWithDollarPrefixShouldSucceed) {
 
     auto chunk2(chunk1);
     auto chunk3(chunk1);
+    chunk2.setName(OID::gen());
+    chunk3.setName(OID::gen());
 
     auto chunkMin = BSON("a" << kMinBSONKey);
     auto chunkBound1 = BSON("a" << BSON("$maxKey" << 1));
@@ -530,7 +548,7 @@ TEST_F(MergeChunkTest, MergingChunksWithDollarPrefixShouldSucceed) {
     chunk3.setMin(chunkBound2);
     chunk3.setMax(chunkMax);
 
-    ASSERT_OK(setupChunks({chunk1, chunk2, chunk3}));
+    setupChunks({chunk1, chunk2, chunk3});
 
     // Record chunk boundaries for passing into commitChunkMerge
     std::vector<BSONObj> chunkBoundaries{chunkMin, chunkBound1, chunkBound2, chunkMax};

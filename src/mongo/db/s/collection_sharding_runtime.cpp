@@ -53,18 +53,7 @@ bool isNamespaceAlwaysUnsharded(const NamespaceString& nss) {
     if (serverGlobalParams.clusterRole != ClusterRole::ShardServer)
         return true;
 
-    // Local and admin never have sharded collections
-    if (nss.db() == NamespaceString::kLocalDb || nss.db() == NamespaceString::kAdminDb)
-        return true;
-
-    // Certain config collections can never be sharded
-    if (nss == NamespaceString::kSessionTransactionsTableNamespace)
-        return true;
-
-    if (nss.isSystemDotProfile())
-        return true;
-
-    return false;
+    return nss.isNamespaceAlwaysUnsharded();
 }
 
 }  // namespace
@@ -86,11 +75,18 @@ CollectionShardingRuntime* CollectionShardingRuntime::get(OperationContext* opCt
     return checked_cast<CollectionShardingRuntime*>(css);
 }
 
+CollectionShardingRuntime* CollectionShardingRuntime::get_UNSAFE(ServiceContext* svcCtx,
+                                                                 const NamespaceString& nss) {
+    auto* const css = CollectionShardingState::get_UNSAFE(svcCtx, nss);
+    return checked_cast<CollectionShardingRuntime*>(css);
+}
+
 void CollectionShardingRuntime::setFilteringMetadata(OperationContext* opCtx,
                                                      CollectionMetadata newMetadata) {
     invariant(!newMetadata.isSharded() || !isNamespaceAlwaysUnsharded(_nss),
               str::stream() << "Namespace " << _nss.ns() << " must never be sharded.");
-    invariant(opCtx->lockState()->isCollectionLockedForMode(_nss, MODE_X));
+
+    auto csrLock = CollectionShardingState::CSRLock::lockExclusive(opCtx, this);
 
     _metadataManager->setFilteringMetadata(std::move(newMetadata));
 }
@@ -156,8 +152,7 @@ Status CollectionShardingRuntime::waitForClean(OperationContext* opCtx,
         Status result = stillScheduled->waitStatus(opCtx);
         if (!result.isOK()) {
             return result.withContext(str::stream() << "Failed to delete orphaned " << nss.ns()
-                                                    << " range "
-                                                    << orphanRange.toString());
+                                                    << " range " << orphanRange.toString());
         }
     }
 
@@ -182,7 +177,6 @@ CollectionCriticalSection::CollectionCriticalSection(OperationContext* opCtx, Na
     : _nss(std::move(ns)), _opCtx(opCtx) {
     AutoGetCollection autoColl(_opCtx,
                                _nss,
-                               MODE_IX,
                                MODE_X,
                                AutoGetCollection::ViewMode::kViewsForbidden,
                                opCtx->getServiceContext()->getPreciseClockSource()->now() +
@@ -195,7 +189,7 @@ CollectionCriticalSection::CollectionCriticalSection(OperationContext* opCtx, Na
 
 CollectionCriticalSection::~CollectionCriticalSection() {
     UninterruptibleLockGuard noInterrupt(_opCtx->lockState());
-    AutoGetCollection autoColl(_opCtx, _nss, MODE_IX, MODE_IX);
+    AutoGetCollection autoColl(_opCtx, _nss, MODE_IX);
     auto* const csr = CollectionShardingRuntime::get(_opCtx, _nss);
     auto csrLock = CollectionShardingRuntime::CSRLock::lockExclusive(_opCtx, csr);
 
@@ -205,7 +199,6 @@ CollectionCriticalSection::~CollectionCriticalSection() {
 void CollectionCriticalSection::enterCommitPhase() {
     AutoGetCollection autoColl(_opCtx,
                                _nss,
-                               MODE_IX,
                                MODE_X,
                                AutoGetCollection::ViewMode::kViewsForbidden,
                                _opCtx->getServiceContext()->getPreciseClockSource()->now() +

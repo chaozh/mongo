@@ -33,17 +33,18 @@
 #include <string>
 #include <utility>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/base/status_with.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/db/record_id.h"
+#include "mongo/db/transaction_history_iterator.h"
 #include "mongo/util/net/hostandport.h"
 
 namespace mongo {
 namespace repl {
 
 class OplogInterface {
-    MONGO_DISALLOW_COPYING(OplogInterface);
+    OplogInterface(const OplogInterface&) = delete;
+    OplogInterface& operator=(const OplogInterface&) = delete;
 
 public:
     class Iterator;
@@ -61,6 +62,13 @@ public:
     virtual std::unique_ptr<Iterator> makeIterator() const = 0;
 
     /**
+     * Produces an iterator that returns operations within a transaction.  Valid only for local
+     * oplogs.
+     */
+    virtual std::unique_ptr<TransactionHistoryIteratorBase> makeTransactionHistoryIterator(
+        const OpTime& startingOpTime, bool permitYield = false) const = 0;
+
+    /**
      * The host and port of the server.
      */
     virtual HostAndPort hostAndPort() const = 0;
@@ -70,7 +78,8 @@ protected:
 };
 
 class OplogInterface::Iterator {
-    MONGO_DISALLOW_COPYING(Iterator);
+    Iterator(const Iterator&) = delete;
+    Iterator& operator=(const Iterator&) = delete;
 
 public:
     using Value = std::pair<BSONObj, RecordId>;

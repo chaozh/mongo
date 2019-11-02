@@ -34,7 +34,6 @@
 #include <memory>
 
 #include "mongo/bson/bsonmisc.h"
-#include "mongo/db/catalog/collection_catalog_entry.h"
 #include "mongo/db/catalog/collection_options.h"
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/document_validation.h"
@@ -48,16 +47,16 @@
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/oplog.h"
-#include "mongo/db/repl/oplog_interface_local.h"
+#include "mongo/db/repl/oplog_applier_impl_test_fixture.h"
 #include "mongo/db/repl/replication_coordinator_mock.h"
 #include "mongo/db/repl/storage_interface_impl.h"
 #include "mongo/db/service_context_d_test_fixture.h"
-#include "mongo/stdx/memory.h"
+#include "mongo/db/storage/durable_catalog.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/fail_point_service.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/fail_point.h"
+#include "mongo/util/str.h"
 
 namespace {
 
@@ -67,14 +66,10 @@ using namespace mongo::repl;
 const auto kIndexVersion = IndexDescriptor::IndexVersion::kV2;
 
 BSONObj makeIdIndexSpec(const NamespaceString& nss) {
-    return BSON("ns" << nss.toString() << "name"
-                     << "_id_"
-                     << "key"
-                     << BSON("_id" << 1)
-                     << "unique"
-                     << true
-                     << "v"
-                     << static_cast<int>(kIndexVersion));
+    return BSON("name"
+                << "_id_"
+                << "key" << BSON("_id" << 1) << "unique" << true << "v"
+                << static_cast<int>(kIndexVersion));
 }
 
 /**
@@ -82,8 +77,7 @@ BSONObj makeIdIndexSpec(const NamespaceString& nss) {
  */
 template <typename T>
 NamespaceString makeNamespace(const T& t, const std::string& suffix = "") {
-    return NamespaceString(std::string("local." + t.getSuiteName() + "_" + t.getTestName())
-                               .substr(0, NamespaceString::MaxNsCollectionLen - suffix.length()) +
+    return NamespaceString(std::string("local." + t.getSuiteName() + "_" + t.getTestName()) +
                            suffix);
 }
 
@@ -122,7 +116,7 @@ void createCollection(OperationContext* opCtx,
         auto db = ctx.db();
         ASSERT_TRUE(db);
         mongo::WriteUnitOfWork wuow(opCtx);
-        auto coll = db->createCollection(opCtx, nss.ns(), options);
+        auto coll = db->createCollection(opCtx, nss, options);
         ASSERT_TRUE(coll);
         wuow.commit();
     });
@@ -202,7 +196,7 @@ private:
         ServiceContextMongoDTest::setUp();
         _createOpCtx();
         auto service = getServiceContext();
-        auto replCoord = stdx::make_unique<ReplicationCoordinatorMock>(service);
+        auto replCoord = std::make_unique<ReplicationCoordinatorMock>(service);
         _replicationCoordinatorMock = replCoord.get();
         ReplicationCoordinator::set(service, std::move(replCoord));
     }
@@ -217,8 +211,8 @@ private:
     void _createOpCtx() {
         _opCtx = cc().makeOperationContext();
         // We are not replicating nor validating these writes.
-        _uwb = stdx::make_unique<UnreplicatedWritesBlock>(_opCtx.get());
-        _ddv = stdx::make_unique<DisableDocumentValidation>(_opCtx.get());
+        _uwb = std::make_unique<UnreplicatedWritesBlock>(_opCtx.get());
+        _ddv = std::make_unique<DisableDocumentValidation>(_opCtx.get());
     }
 
     ServiceContext::UniqueOperationContext _opCtx;
@@ -269,32 +263,26 @@ TEST_F(StorageInterfaceImplTest,
 }
 
 /**
- * Check collection contents. OplogInterface returns documents in reverse natural order.
+ * Check collection contents.
  */
 void _assertDocumentsInCollectionEquals(OperationContext* opCtx,
                                         const NamespaceString& nss,
                                         const std::vector<BSONObj>& docs) {
-    std::vector<BSONObj> reversedDocs(docs);
-    std::reverse(reversedDocs.begin(), reversedDocs.end());
-    OplogInterfaceLocal oplog(opCtx, nss.ns());
-    auto iter = oplog.makeIterator();
-    for (const auto& doc : reversedDocs) {
-        ASSERT_BSONOBJ_EQ(doc, unittest::assertGet(iter->next()).first);
+    CollectionReader reader(opCtx, nss);
+    for (const auto& doc : docs) {
+        ASSERT_BSONOBJ_EQ(doc, unittest::assertGet(reader.next()));
     }
-    ASSERT_EQUALS(ErrorCodes::CollectionIsEmpty, iter->next().getStatus());
+    ASSERT_EQUALS(ErrorCodes::CollectionIsEmpty, reader.next().getStatus());
 }
 
 void _assertDocumentsInCollectionEquals(OperationContext* opCtx,
                                         const NamespaceString& nss,
                                         const std::vector<TimestampedBSONObj>& docs) {
-    std::vector<TimestampedBSONObj> reversedDocs(docs);
-    std::reverse(reversedDocs.begin(), reversedDocs.end());
-    OplogInterfaceLocal oplog(opCtx, nss.ns());
-    auto iter = oplog.makeIterator();
-    for (const auto& doc : reversedDocs) {
-        ASSERT_BSONOBJ_EQ(doc.obj, unittest::assertGet(iter->next()).first);
+    CollectionReader reader(opCtx, nss);
+    for (const auto& doc : docs) {
+        ASSERT_BSONOBJ_EQ(doc.obj, unittest::assertGet(reader.next()));
     }
-    ASSERT_EQUALS(ErrorCodes::CollectionIsEmpty, iter->next().getStatus());
+    ASSERT_EQUALS(ErrorCodes::CollectionIsEmpty, reader.next().getStatus());
 }
 
 /**
@@ -305,8 +293,7 @@ void _assertRollbackIDDocument(OperationContext* opCtx, int id) {
         opCtx,
         NamespaceString(StorageInterfaceImpl::kDefaultRollbackIdNamespace),
         {BSON("_id" << StorageInterfaceImpl::kRollbackIdDocumentId
-                    << StorageInterfaceImpl::kRollbackIdFieldName
-                    << id)});
+                    << StorageInterfaceImpl::kRollbackIdFieldName << id)});
 }
 
 TEST_F(StorageInterfaceImplTest, RollbackIdInitializesIncrementsAndReadsProperly) {
@@ -386,8 +373,7 @@ TEST_F(StorageInterfaceImplTest, GetRollbackIDReturnsBadStatusIfRollbackIDIsNotI
 
     std::vector<TimestampedBSONObj> badDoc = {
         TimestampedBSONObj{BSON("_id" << StorageInterfaceImpl::kRollbackIdDocumentId
-                                      << StorageInterfaceImpl::kRollbackIdFieldName
-                                      << "bad id"),
+                                      << StorageInterfaceImpl::kRollbackIdFieldName << "bad id"),
                            Timestamp::min()}};
     ASSERT_OK(storage.insertDocuments(opCtx, nss, transformInserts(badDoc)));
     ASSERT_EQUALS(ErrorCodes::TypeMismatch, storage.getRollbackID(opCtx).getStatus());
@@ -456,12 +442,8 @@ TEST_F(StorageInterfaceImplTest,
     }
     ASSERT_OK(storage.insertDocuments(opCtx, nss, docs));
 
-    // Check collection contents. OplogInterface returns documents in reverse natural order.
-    OplogInterfaceLocal oplog(opCtx, nss.ns());
-    auto iter = oplog.makeIterator();
-    ASSERT_BSONOBJ_EQ(doc2.doc, unittest::assertGet(iter->next()).first);
-    ASSERT_BSONOBJ_EQ(doc1.doc, unittest::assertGet(iter->next()).first);
-    ASSERT_EQUALS(ErrorCodes::CollectionIsEmpty, iter->next().getStatus());
+    // Check collection contents.
+    _assertDocumentsInCollectionEquals(opCtx, nss, {doc1.doc, doc2.doc});
 }
 
 TEST_F(StorageInterfaceImplTest, InsertDocumentsSavesOperationsReturnsOpTimeOfLastOperation) {
@@ -477,12 +459,8 @@ TEST_F(StorageInterfaceImplTest, InsertDocumentsSavesOperationsReturnsOpTimeOfLa
     auto op2 = makeOplogEntry({Timestamp(Seconds(1), 0), 1LL});
     ASSERT_OK(storage.insertDocuments(opCtx, nss, transformInserts({op1, op2})));
 
-    // Check contents of oplog. OplogInterface iterates over oplog collection in reverse.
-    repl::OplogInterfaceLocal oplog(opCtx, nss.ns());
-    auto iter = oplog.makeIterator();
-    ASSERT_BSONOBJ_EQ(op2.obj, unittest::assertGet(iter->next()).first);
-    ASSERT_BSONOBJ_EQ(op1.obj, unittest::assertGet(iter->next()).first);
-    ASSERT_EQUALS(ErrorCodes::CollectionIsEmpty, iter->next().getStatus());
+    // Check contents of oplog.
+    _assertDocumentsInCollectionEquals(opCtx, nss, {op1.obj, op2.obj});
 }
 
 TEST_F(StorageInterfaceImplTest, InsertDocumentsSavesOperationsWhenCollSpecifiedWithUUID) {
@@ -501,12 +479,8 @@ TEST_F(StorageInterfaceImplTest, InsertDocumentsSavesOperationsWhenCollSpecified
     ASSERT_OK(storage.insertDocuments(
         opCtx, {nss.db().toString(), *options.uuid}, transformInserts({op1, op2})));
 
-    // Check contents of oplog. OplogInterface iterates over oplog collection in reverse.
-    repl::OplogInterfaceLocal oplog(opCtx, nss.ns());
-    auto iter = oplog.makeIterator();
-    ASSERT_BSONOBJ_EQ(op2.obj, unittest::assertGet(iter->next()).first);
-    ASSERT_BSONOBJ_EQ(op1.obj, unittest::assertGet(iter->next()).first);
-    ASSERT_EQUALS(ErrorCodes::CollectionIsEmpty, iter->next().getStatus());
+    // Check contents of oplog.
+    _assertDocumentsInCollectionEquals(opCtx, nss, {op1.obj, op2.obj});
 }
 
 TEST_F(StorageInterfaceImplTest,
@@ -610,7 +584,7 @@ void _testDestroyUncommitedCollectionBulkLoader(
     OperationContext* opCtx,
     const NamespaceString& nss,
     std::vector<BSONObj> secondaryIndexes,
-    stdx::function<void(std::unique_ptr<CollectionBulkLoader> loader)> destroyLoaderFn) {
+    std::function<void(std::unique_ptr<CollectionBulkLoader> loader)> destroyLoaderFn) {
     StorageInterfaceImpl storage;
     CollectionOptions opts = generateOptionsWithUuid();
     auto loaderStatus =
@@ -642,9 +616,7 @@ TEST_F(StorageInterfaceImplTest, DestroyingUncommittedCollectionBulkLoaderDropsI
     auto opCtx = getOperationContext();
     auto nss = makeNamespace(_agent);
     std::vector<BSONObj> indexes = {BSON("v" << 1 << "key" << BSON("x" << 1) << "name"
-                                             << "x_1"
-                                             << "ns"
-                                             << nss.ns())};
+                                             << "x_1")};
     auto destroyLoaderFn = [](std::unique_ptr<CollectionBulkLoader> loader) {
         // Destroy 'loader' by letting it go out of scope.
     };
@@ -667,9 +639,7 @@ TEST_F(StorageInterfaceImplTest,
     auto opCtx = getOperationContext();
     auto nss = makeNamespace(_agent);
     std::vector<BSONObj> indexes = {BSON("v" << 1 << "key" << BSON("x" << 1) << "name"
-                                             << "x_1"
-                                             << "ns"
-                                             << nss.ns())};
+                                             << "x_1")};
     auto destroyLoaderFn = [](std::unique_ptr<CollectionBulkLoader> loader) {
         // Destroy 'loader' in a new thread that does not have a Client.
         stdx::thread([&loader]() { loader.reset(); }).join();
@@ -821,7 +791,7 @@ TEST_F(StorageInterfaceImplTest, RenameCollectionWithStayTempFalseMakesItNotTemp
 
     AutoGetCollectionForReadCommand autoColl2(opCtx, toNss);
     ASSERT_TRUE(autoColl2.getCollection());
-    ASSERT_FALSE(autoColl2.getCollection()->getCatalogEntry()->getCollectionOptions(opCtx).temp);
+    ASSERT_FALSE(DurableCatalog::get(opCtx)->getCollectionOptions(opCtx, toNss).temp);
 }
 
 TEST_F(StorageInterfaceImplTest, RenameCollectionWithStayTempTrueMakesItTemp) {
@@ -840,7 +810,7 @@ TEST_F(StorageInterfaceImplTest, RenameCollectionWithStayTempTrueMakesItTemp) {
 
     AutoGetCollectionForReadCommand autoColl2(opCtx, toNss);
     ASSERT_TRUE(autoColl2.getCollection());
-    ASSERT_TRUE(autoColl2.getCollection()->getCatalogEntry()->getCollectionOptions(opCtx).temp);
+    ASSERT_TRUE(DurableCatalog::get(opCtx)->getCollectionOptions(opCtx, toNss).temp);
 }
 
 TEST_F(StorageInterfaceImplTest, RenameCollectionFailsBetweenDatabases) {
@@ -932,10 +902,7 @@ TEST_F(StorageInterfaceImplTest, FindDocumentsReturnsIndexOptionsConflictIfIndex
     auto nss = makeNamespace(_agent);
     std::vector<BSONObj> indexes = {BSON("v" << 1 << "key" << BSON("x" << 1) << "name"
                                              << "x_1"
-                                             << "ns"
-                                             << nss.ns()
-                                             << "partialFilterExpression"
-                                             << BSON("y" << 1))};
+                                             << "partialFilterExpression" << BSON("y" << 1))};
     auto loader = unittest::assertGet(storage.createCollectionForBulkLoading(
         nss, generateOptionsWithUuid(), makeIdIndexSpec(nss), indexes));
     std::vector<BSONObj> docs = {BSON("_id" << 1), BSON("_id" << 1), BSON("_id" << 2)};
@@ -993,8 +960,8 @@ void _assertDocumentsEqual(const StatusWith<std::vector<BSONObj>>& statusWithDoc
                            const std::vector<BSONObj>& expectedDocs) {
     const auto actualDocs = unittest::assertGet(statusWithDocs);
     auto iter = actualDocs.cbegin();
-    std::string msg = str::stream() << "expected: " << _toString(expectedDocs)
-                                    << "; actual: " << _toString(actualDocs);
+    std::string msg = str::stream()
+        << "expected: " << _toString(expectedDocs) << "; actual: " << _toString(actualDocs);
     for (const auto& doc : expectedDocs) {
         ASSERT_TRUE(iter != actualDocs.cend()) << msg;
         ASSERT_BSONOBJ_EQ(doc, *(iter++));
@@ -1287,13 +1254,9 @@ TEST_F(StorageInterfaceImplTest,
                                               BoundInclusion::kIncludeStartKeyOnly,
                                               1U)));
 
-    // Check collection contents. OplogInterface returns documents in reverse natural order.
-    OplogInterfaceLocal oplog(opCtx, nss.ns());
-    auto iter = oplog.makeIterator();
-    ASSERT_BSONOBJ_EQ(BSON("_id" << 0), unittest::assertGet(iter->next()).first);
-    ASSERT_BSONOBJ_EQ(BSON("_id" << 2), unittest::assertGet(iter->next()).first);
-    ASSERT_BSONOBJ_EQ(BSON("_id" << 1), unittest::assertGet(iter->next()).first);
-    ASSERT_EQUALS(ErrorCodes::CollectionIsEmpty, iter->next().getStatus());
+    // Check collection contents.
+    _assertDocumentsInCollectionEquals(
+        opCtx, nss, {BSON("_id" << 1), BSON("_id" << 2), BSON("_id" << 0)});
 }
 
 TEST_F(StorageInterfaceImplTest,
@@ -2266,7 +2229,8 @@ TEST_F(StorageInterfaceImplTest,
         storage.upsertById(opCtx, nss, BSON("" << 1).firstElement(), unknownUpdateOp),
         AssertionException,
         ErrorCodes::FailedToParse,
-        "Unknown modifier: $unknownUpdateOp");
+        "Unknown modifier: $unknownUpdateOp. Expected a valid update modifier or pipeline-style "
+        "update specified as an array");
 
     ASSERT_THROWS_CODE(storage.upsertById(opCtx,
                                           {nss.db().toString(), *options.uuid},
@@ -2285,9 +2249,7 @@ TEST_F(StorageInterfaceImplTest, DeleteByFilterReturnsNamespaceNotFoundWhenDatab
     ASSERT_EQUALS(ErrorCodes::NamespaceNotFound, status);
     ASSERT_EQUALS(std::string(str::stream()
                               << "Database [nosuchdb] not found. Unable to delete documents in "
-                              << nss.ns()
-                              << " using filter "
-                              << filter),
+                              << nss.ns() << " using filter " << filter),
                   status.reason());
 }
 
@@ -2383,9 +2345,7 @@ TEST_F(StorageInterfaceImplTest, DeleteByFilterReturnsNamespaceNotFoundWhenColle
     ASSERT_EQUALS(std::string(
                       str::stream()
                       << "Collection [mydb.wrongColl] not found. Unable to delete documents in "
-                      << wrongColl.ns()
-                      << " using filter "
-                      << filter),
+                      << wrongColl.ns() << " using filter " << filter),
                   status.reason());
 }
 
@@ -2505,8 +2465,7 @@ TEST_F(StorageInterfaceImplTest,
     CollectionOptions options = generateOptionsWithUuid();
     options.collation = BSON("locale"
                              << "en_US"
-                             << "strength"
-                             << 2);
+                             << "strength" << 2);
     ASSERT_OK(storage.createCollection(opCtx, nss, options));
 
     auto doc1 = BSON("_id" << 1 << "x"
@@ -2681,9 +2640,8 @@ TEST_F(StorageInterfaceImplTest, SetIndexIsMultikeySucceeds) {
     ASSERT_OK(storage.createCollection(opCtx, nss, CollectionOptions()));
 
     auto indexName = "a_b_1";
-    auto indexSpec =
-        BSON("name" << indexName << "ns" << nss.ns() << "key" << BSON("a.b" << 1) << "v"
-                    << static_cast<int>(kIndexVersion));
+    auto indexSpec = BSON("name" << indexName << "key" << BSON("a.b" << 1) << "v"
+                                 << static_cast<int>(kIndexVersion));
     ASSERT_EQUALS(_createIndexOnEmptyCollection(opCtx, nss, indexSpec), 2);
 
     MultikeyPaths paths = {{1}};
@@ -2691,7 +2649,7 @@ TEST_F(StorageInterfaceImplTest, SetIndexIsMultikeySucceeds) {
     AutoGetCollectionForReadCommand autoColl(opCtx, nss);
     ASSERT_TRUE(autoColl.getCollection());
     auto indexCatalog = autoColl.getCollection()->getIndexCatalog();
-    ASSERT(indexCatalog->isMultikey(opCtx, indexCatalog->findIndexByName(opCtx, indexName)));
+    ASSERT(indexCatalog->isMultikey(indexCatalog->findIndexByName(opCtx, indexName)));
     ASSERT(paths ==
            indexCatalog->getMultikeyPaths(opCtx, indexCatalog->findIndexByName(opCtx, indexName)));
 }

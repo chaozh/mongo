@@ -43,7 +43,6 @@
 #include "mongo/db/query/query_planner_params.h"
 #include "mongo/db/query/query_solution.h"
 #include "mongo/db/record_id.h"
-#include "mongo/stdx/memory.h"
 
 namespace mongo {
 
@@ -132,7 +131,8 @@ private:
      * a particular $or branch.
      */
     struct BranchPlanningResult {
-        MONGO_DISALLOW_COPYING(BranchPlanningResult);
+        BranchPlanningResult(const BranchPlanningResult&) = delete;
+        BranchPlanningResult& operator=(const BranchPlanningResult&) = delete;
 
     public:
         BranchPlanningResult() {}

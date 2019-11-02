@@ -61,10 +61,7 @@
 namespace mongo {
 namespace unittest {
 
-DeathTestImpl::DeathTestImpl(stdx::function<std::unique_ptr<Test>()> makeTest)
-    : _makeTest(std::move(makeTest)) {}
-
-void DeathTestImpl::_doTest() {
+void DeathTestBase::_doTest() {
 #if defined(_WIN32)
     log() << "Skipping death test on Windows";
     return;
@@ -81,10 +78,14 @@ void DeathTestImpl::_doTest() {
         char buf[1000];
         std::ostringstream os;
         ssize_t bytesRead;
+        log() << "========== Beginning of interleaved output of death test ==========";
         while (0 < (bytesRead = read(pipes[0], buf, sizeof(buf)))) {
+            std::cout.write(buf, bytesRead);
+            invariant(std::cout);
             os.write(buf, bytesRead);
             invariant(os);
         }
+        log() << "========== End of interleaved output of death test ==========";
         checkSyscall(bytesRead);
         pid_t pid;
         int stat;
@@ -103,7 +104,7 @@ void DeathTestImpl::_doTest() {
         if (WIFSIGNALED(stat) || (WIFEXITED(stat) && WEXITSTATUS(stat) != 0)) {
             // Exited with a signal or non-zero code.  Should check the pattern, here,
             // but haven't figured out how, so just return.
-            ASSERT_STRING_CONTAINS(os.str(), getPattern());
+            ASSERT_STRING_CONTAINS(os.str(), _doGetPattern());
             return;
         } else {
             invariant(!WIFSTOPPED(stat));
@@ -123,7 +124,7 @@ void DeathTestImpl::_doTest() {
     checkSyscall(setrlimit(RLIMIT_CORE, &kNoCoreDump));
 
     try {
-        auto test = _makeTest();
+        auto test = _doMakeTest();
         test->run();
     } catch (const TestAssertionFailureException& tafe) {
         log() << "Caught test exception while expecting death: " << tafe;

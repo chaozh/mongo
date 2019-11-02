@@ -33,7 +33,7 @@
 #include <stddef.h>
 #include <vector>
 
-#include "mongo/db/pipeline/document.h"
+#include "mongo/db/exec/document_value/document.h"
 
 #include "mongo/base/status.h"
 
@@ -44,7 +44,8 @@ namespace mongo {
  * three states: building, serving, or abandoned. See SequentialDocumentCache::CacheStatus.
  */
 class SequentialDocumentCache {
-    MONGO_DISALLOW_COPYING(SequentialDocumentCache);
+    SequentialDocumentCache(const SequentialDocumentCache&) = delete;
+    SequentialDocumentCache& operator=(const SequentialDocumentCache&) = delete;
 
 public:
     explicit SequentialDocumentCache(size_t maxCacheSizeBytes) : _maxSizeBytes(maxCacheSizeBytes) {}

@@ -30,14 +30,14 @@
 #pragma once
 
 #include <atomic>
+#include <functional>
+#include <memory>
 
 #include "mongo/base/status.h"
 #include "mongo/config.h"
 #include "mongo/db/service_context.h"
 #include "mongo/platform/atomic_word.h"
-#include "mongo/stdx/functional.h"
-#include "mongo/stdx/memory.h"
-#include "mongo/stdx/mutex.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/transport/message_compressor_base.h"
 #include "mongo/transport/service_entry_point.h"
@@ -45,6 +45,7 @@
 #include "mongo/transport/service_executor_task_names.h"
 #include "mongo/transport/session.h"
 #include "mongo/transport/transport_mode.h"
+#include "mongo/util/net/ssl_manager.h"
 
 namespace mongo {
 
@@ -156,7 +157,7 @@ public:
     /*
      * Sets a function to be called after the session is ended
      */
-    void setCleanupHook(stdx::function<void()> hook);
+    void setCleanupHook(std::function<void()> hook);
 
 private:
     /*
@@ -232,7 +233,7 @@ private:
     const std::string _threadName;
     ServiceContext::UniqueClient _dbClient;
     const Client* _dbClientPtr;
-    stdx::function<void()> _cleanupHook;
+    std::function<void()> _cleanupHook;
 
     bool _inExhaust = false;
     boost::optional<MessageCompressorId> _compressorId;

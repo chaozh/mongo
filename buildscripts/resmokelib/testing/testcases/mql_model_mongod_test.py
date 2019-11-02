@@ -1,7 +1,5 @@
 """The unittest.TestCase for MQL MongoD Model tests."""
 
-from __future__ import absolute_import
-
 import os
 import os.path
 
@@ -30,6 +28,8 @@ class MqlModelMongodTestCase(jsrunnerfile.JSRunnerFileTestCase):
         return self.test_name
 
     def _populate_test_data(self, test_data):
+        test_data["peerPids"] = self.fixture.pids()
+
         test_data["mqlTestFile"] = self.json_filename
 
         top_level_dirname = os.path.normpath(self.json_filename).split(os.sep)[0]

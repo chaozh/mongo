@@ -46,18 +46,19 @@
 #include "mongo/bson/util/builder.h"
 #include "mongo/config.h"
 #include "mongo/db/server_options.h"
+#include "mongo/idl/server_parameter.h"
 #include "mongo/logger/log_component.h"
 #include "mongo/logger/message_event_utf8_encoder.h"
 #include "mongo/transport/message_compressor_registry.h"
 #include "mongo/util/cmdline_utils/censor_cmdline.h"
-#include "mongo/util/fail_point_service.h"
+#include "mongo/util/fail_point.h"
 #include "mongo/util/log.h"
 #include "mongo/util/map_util.h"
-#include "mongo/util/mongoutils/str.h"
 #include "mongo/util/net/sock.h"
 #include "mongo/util/net/socket_utils.h"
 #include "mongo/util/net/ssl_options.h"
 #include "mongo/util/options_parser/startup_options.h"
+#include "mongo/util/str.h"
 
 using std::endl;
 using std::string;
@@ -91,7 +92,7 @@ CODE facilitynames[] = {{"auth", LOG_AUTH},     {"cron", LOG_CRON},     {"daemon
                         {"syslog", LOG_SYSLOG}, {"user", LOG_USER},     {"uucp", LOG_UUCP},
                         {"local0", LOG_LOCAL0}, {"local1", LOG_LOCAL1}, {"local2", LOG_LOCAL2},
                         {"local3", LOG_LOCAL3}, {"local4", LOG_LOCAL4}, {"local5", LOG_LOCAL5},
-                        {"local6", LOG_LOCAL6}, {"local7", LOG_LOCAL7}, {NULL, -1}};
+                        {"local6", LOG_LOCAL6}, {"local7", LOG_LOCAL7}, {nullptr, -1}};
 
 #endif  // !defined(INTERNAL_NOPRI)
 #endif  // defined(SYSLOG_NAMES)
@@ -145,10 +146,26 @@ Status validateBaseOptions(const moe::Environment& params) {
 
         if (enableTestCommandsValue) {
             // Only register failpoint server parameters if enableTestCommands=1.
-            getGlobalFailPointRegistry()->registerAllFailPointsAsServerParameters();
+            globalFailPointRegistry().registerAllFailPointsAsServerParameters();
         } else {
             // Deregister test-only parameters.
             ServerParameterSet::getGlobal()->disableTestParameters();
+        }
+
+        // Must come after registerAllFailPointsAsServerParameters() above.
+        const auto& spMap = ServerParameterSet::getGlobal()->getMap();
+        for (const auto setParam : parameters) {
+            const auto it = spMap.find(setParam.first);
+
+            if (it == spMap.end()) {
+                return {ErrorCodes::BadValue,
+                        str::stream() << "Unknown --setParameter '" << setParam.first << "'"};
+            }
+            if (!enableTestCommandsValue && it->second->isTestOnly()) {
+                return {ErrorCodes::BadValue,
+                        str::stream() << "--setParameter '" << setParam.first
+                                      << "' only available when used with 'enableTestCommands'"};
+            }
         }
     }
 
@@ -304,6 +321,9 @@ Status storeBaseOptions(const moe::Environment& params) {
             return Status(ErrorCodes::BadValue, sb.str());
         }
     }
+    if (params.count("logv2")) {
+        serverGlobalParams.logV2 = true;
+    }
     if (params.count("systemLog.destination")) {
         std::string systemLogDestination = params["systemLog.destination"].as<std::string>();
         if (systemLogDestination == "file") {
@@ -340,7 +360,8 @@ Status storeBaseOptions(const moe::Environment& params) {
         bool set = false;
         // match facility string to facility value
         size_t facilitynamesLength = sizeof(facilitynames) / sizeof(facilitynames[0]);
-        for (unsigned long i = 0; i < facilitynamesLength && facilitynames[i].c_name != NULL; i++) {
+        for (unsigned long i = 0; i < facilitynamesLength && facilitynames[i].c_name != nullptr;
+             i++) {
             if (!facility.compare(facilitynames[i].c_name)) {
                 serverGlobalParams.syslogFacility = facilitynames[i].c_val;
                 set = true;
@@ -356,6 +377,24 @@ Status storeBaseOptions(const moe::Environment& params) {
         serverGlobalParams.syslogFacility = LOG_USER;
     }
 #endif  // _WIN32
+
+    if (params.count("systemLog.logFormat")) {
+        std::string formatStr = params["systemLog.logFormat"].as<string>();
+        if (!serverGlobalParams.logV2 && formatStr != "default")
+            return Status(ErrorCodes::BadValue,
+                          "Can only use systemLog.logFormat if logv2 is enabled.");
+        if (formatStr == "default") {
+            serverGlobalParams.logFormat = logv2::LogFormat::kDefault;
+        } else if (formatStr == "text") {
+            serverGlobalParams.logFormat = logv2::LogFormat::kText;
+        } else if (formatStr == "json") {
+            serverGlobalParams.logFormat = logv2::LogFormat::kJson;
+        } else {
+            return Status(ErrorCodes::BadValue,
+                          "Unsupported value for logFormat: " + formatStr +
+                              ". Valid values are: default, text or json");
+        }
+    }
 
     if (params.count("systemLog.logAppend") && params["systemLog.logAppend"].as<bool>() == true) {
         serverGlobalParams.logAppend = true;
@@ -399,8 +438,8 @@ Status storeBaseOptions(const moe::Environment& params) {
             ServerParameter* parameter =
                 mapFindWithDefault(ServerParameterSet::getGlobal()->getMap(),
                                    parametersIt->first,
-                                   static_cast<ServerParameter*>(NULL));
-            if (NULL == parameter) {
+                                   static_cast<ServerParameter*>(nullptr));
+            if (nullptr == parameter) {
                 StringBuilder sb;
                 sb << "Illegal --setParameter parameter: \"" << parametersIt->first << "\"";
                 return Status(ErrorCodes::BadValue, sb.str());

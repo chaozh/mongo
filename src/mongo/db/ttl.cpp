@@ -37,8 +37,6 @@
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/user_name.h"
 #include "mongo/db/catalog/collection.h"
-#include "mongo/db/catalog/collection_catalog_entry.h"
-#include "mongo/db/catalog/database_catalog_entry.h"
 #include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/client.h"
@@ -52,6 +50,8 @@
 #include "mongo/db/ops/insert.h"
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/storage/durable_catalog.h"
 #include "mongo/db/ttl_collection_cache.h"
 #include "mongo/db/ttl_gen.h"
 #include "mongo/util/background.h"
@@ -60,6 +60,8 @@
 #include "mongo/util/log.h"
 
 namespace mongo {
+
+MONGO_FAIL_POINT_DEFINE(hangTTLMonitorWithLock);
 
 Counter64 ttlPasses;
 Counter64 ttlDeletedDocuments;
@@ -70,7 +72,7 @@ ServerStatusMetricField<Counter64> ttlDeletedDocumentsDisplay("ttl.deletedDocume
 
 class TTLMonitor : public BackgroundJob {
 public:
-    TTLMonitor() {}
+    TTLMonitor(ServiceContext* serviceContext) : _serviceContext(serviceContext) {}
     virtual ~TTLMonitor() {}
 
     virtual std::string name() const {
@@ -80,8 +82,13 @@ public:
     static std::string secondsExpireField;
 
     virtual void run() {
-        ThreadClient tc(name(), getGlobalServiceContext());
+        ThreadClient tc(name(), _serviceContext);
         AuthorizationSession::get(cc())->grantInternalAuthorization(&cc());
+
+        {
+            stdx::lock_guard<Client> lk(*tc.get());
+            tc.get()->setSystemOperationKillable(lk);
+        }
 
         while (!globalInShutdownDeprecated()) {
             {
@@ -107,6 +114,8 @@ public:
                 doTTLPass();
             } catch (const WriteConflictException&) {
                 LOG(1) << "got WriteConflictException";
+            } catch (const ExceptionForCat<ErrorCategory::Interruption>& interruption) {
+                LOG(1) << "TTLMonitor was interrupted: " << interruption;
             }
         }
     }
@@ -123,38 +132,58 @@ private:
             return;
 
         TTLCollectionCache& ttlCollectionCache = TTLCollectionCache::get(getGlobalServiceContext());
-        std::vector<std::string> ttlCollections = ttlCollectionCache.getCollections();
-        std::vector<BSONObj> ttlIndexes;
+        std::vector<std::pair<UUID, std::string>> ttlInfos = ttlCollectionCache.getTTLInfos();
+
+        // Pair of collection namespace and index spec.
+        std::vector<std::pair<NamespaceString, BSONObj>> ttlIndexes;
 
         ttlPasses.increment();
 
         // Get all TTL indexes from every collection.
-        for (const std::string& collectionNS : ttlCollections) {
-            UninterruptibleLockGuard noInterrupt(opCtx.lockState());
-            NamespaceString collectionNSS(collectionNS);
-            AutoGetCollection autoGetCollection(&opCtx, collectionNSS, MODE_IS);
-            Collection* coll = autoGetCollection.getCollection();
-            if (!coll) {
-                // Skip since collection has been dropped.
+        for (const std::pair<UUID, std::string>& ttlInfo : ttlInfos) {
+            auto uuid = ttlInfo.first;
+            auto indexName = ttlInfo.second;
+
+            auto nss = CollectionCatalog::get(opCtxPtr.get()).lookupNSSByUUID(uuid);
+            if (!nss) {
+                ttlCollectionCache.deregisterTTLInfo(ttlInfo);
                 continue;
             }
 
-            CollectionCatalogEntry* collEntry = coll->getCatalogEntry();
-            std::vector<std::string> indexNames;
-            collEntry->getAllIndexes(&opCtx, &indexNames);
-            for (const std::string& name : indexNames) {
-                BSONObj spec = collEntry->getIndexSpec(&opCtx, name);
-                if (spec.hasField(secondsExpireField)) {
-                    ttlIndexes.push_back(spec.getOwned());
-                }
+            AutoGetCollection autoColl(&opCtx, *nss, MODE_IS);
+            Collection* coll = autoColl.getCollection();
+            // The collection with `uuid` might be renamed before the lock and the wrong
+            // namespace would be locked and looked up so we double check here.
+            if (!coll || coll->uuid() != uuid)
+                continue;
+
+            if (!DurableCatalog::get(opCtxPtr.get())->isIndexPresent(&opCtx, *nss, indexName)) {
+                ttlCollectionCache.deregisterTTLInfo(ttlInfo);
+                continue;
             }
+
+            BSONObj spec =
+                DurableCatalog::get(opCtxPtr.get())->getIndexSpec(&opCtx, *nss, indexName);
+            if (!spec.hasField(secondsExpireField)) {
+                ttlCollectionCache.deregisterTTLInfo(ttlInfo);
+                continue;
+            }
+
+            if (!DurableCatalog::get(opCtxPtr.get())->isIndexReady(&opCtx, *nss, indexName))
+                continue;
+
+            ttlIndexes.push_back(std::make_pair(*nss, spec.getOwned()));
         }
 
-        for (const BSONObj& idx : ttlIndexes) {
+        for (const auto& it : ttlIndexes) {
             try {
-                doTTLForIndex(&opCtx, idx);
+                doTTLForIndex(&opCtx, it.first, it.second);
+            } catch (const ExceptionForCat<ErrorCategory::Interruption>&) {
+                warning() << "TTLMonitor was interrupted, waiting " << ttlMonitorSleepSecs.load()
+                          << " seconds before doing another pass";
+                return;
             } catch (const DBException& dbex) {
-                error() << "Error processing ttl index: " << idx << " -- " << dbex.toString();
+                error() << "Error processing ttl index: " << it.second << " -- " << dbex.toString();
                 // Continue on to the next index.
                 continue;
             }
@@ -165,8 +194,7 @@ private:
      * Remove documents from the collection using the specified TTL index after a sufficient amount
      * of time has passed according to its expiry specification.
      */
-    void doTTLForIndex(OperationContext* opCtx, BSONObj idx) {
-        const NamespaceString collectionNSS(idx["ns"].String());
+    void doTTLForIndex(OperationContext* opCtx, NamespaceString collectionNSS, BSONObj idx) {
         if (collectionNSS.isDropPendingNamespace()) {
             return;
         }
@@ -186,6 +214,12 @@ private:
         LOG(1) << "ns: " << collectionNSS << " key: " << key << " name: " << name;
 
         AutoGetCollection autoGetCollection(opCtx, collectionNSS, MODE_IX);
+        if (MONGO_unlikely(hangTTLMonitorWithLock.shouldFail())) {
+            log() << "Hanging due to hangTTLMonitorWithLock fail point";
+            hangTTLMonitorWithLock.pauseWhileSet(opCtx);
+        }
+
+
         Collection* collection = autoGetCollection.getCollection();
         if (!collection) {
             // Collection was dropped.
@@ -237,7 +271,7 @@ private:
         const char* keyFieldName = key.firstElement().fieldName();
         BSONObj query =
             BSON(keyFieldName << BSON("$gte" << kDawnOfTime << "$lte" << expirationTime));
-        auto qr = stdx::make_unique<QueryRequest>(collectionNSS);
+        auto qr = std::make_unique<QueryRequest>(collectionNSS);
         qr->setFilter(query);
         auto canonicalQuery = CanonicalQuery::canonicalize(opCtx, std::move(qr));
         invariant(canonicalQuery.getStatus());
@@ -268,6 +302,8 @@ private:
         ttlDeletedDocuments.increment(numDeleted);
         LOG(1) << "deleted: " << numDeleted;
     }
+
+    ServiceContext* _serviceContext;
 };
 
 namespace {
@@ -277,8 +313,8 @@ namespace {
 TTLMonitor* ttlMonitor = nullptr;
 }  // namespace
 
-void startTTLBackgroundJob() {
-    ttlMonitor = new TTLMonitor();
+void startTTLBackgroundJob(ServiceContext* serviceContext) {
+    ttlMonitor = new TTLMonitor(serviceContext);
     ttlMonitor->go();
 }
 

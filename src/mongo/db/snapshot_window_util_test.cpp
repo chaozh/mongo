@@ -32,6 +32,7 @@
 #include "mongo/db/snapshot_window_util.h"
 
 #include "mongo/db/client.h"
+#include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/service_context_devnull_test_fixture.h"
 #include "mongo/db/snapshot_window_options.h"
@@ -51,6 +52,7 @@ public:
     void setUp() override {
         ServiceContextDevnullTestFixture::setUp();
         _opCtx = cc().makeOperationContext();
+        setTestCommandsEnabled(true);
     }
 
     void tearDown() override {
@@ -72,6 +74,10 @@ TEST_F(SnapshotWindowTest, DecreaseAndIncreaseSnapshotWindow) {
     // Dec must match Inc b/c increaseTargetWindowSize can call into decreaseTargetWindowSize.
     snapshotWindowParams.minMillisBetweenSnapshotWindowInc.store(100);
     snapshotWindowParams.minMillisBetweenSnapshotWindowDec.store(100);
+
+    // Stabilize for the test so we know that we are testing things as expected.
+    snapshotWindowParams.snapshotWindowAdditiveIncreaseSeconds.store(2);
+    snapshotWindowParams.snapshotWindowMultiplicativeDecrease.store(0.75);
 
     auto maxTargetSnapshotWindowSeconds =
         snapshotWindowParams.maxTargetSnapshotHistoryWindowInSeconds.load();
@@ -154,6 +160,14 @@ TEST_F(SnapshotWindowTest, DecreaseAndIncreaseSnapshotWindow) {
     auto snapshotWindowSecondsFive =
         snapshotWindowParams.targetSnapshotHistoryWindowInSeconds.load();
     ASSERT_EQ(snapshotWindowSecondsFive, maxTargetSnapshotWindowSeconds);
+}
+
+TEST_F(SnapshotWindowTest, IncrementSnapshotTooOldErrorCount) {
+    auto beforeCount = snapshotWindowParams.snapshotTooOldErrorCount.load();
+    incrementSnapshotTooOldErrorCount();
+    incrementSnapshotTooOldErrorCount();
+    auto afterCount = snapshotWindowParams.snapshotTooOldErrorCount.load();
+    ASSERT_EQ(beforeCount + 2, afterCount);
 }
 
 }  // namespace

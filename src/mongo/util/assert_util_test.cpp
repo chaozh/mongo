@@ -38,7 +38,7 @@
 #include "mongo/unittest/death_test.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 namespace {
@@ -87,9 +87,10 @@ TEST(AssertUtils, UassertNamedCodeWithoutCategories) {
     ASSERT_NOT_CATCHES(ErrorCodes::BadValue, ExceptionForCat<ErrorCategory::Interruption>);
 }
 
-// NotMaster - just NotMasterError
+// NotMaster - NotMasterError, RetriableError
 MONGO_STATIC_ASSERT(std::is_same<error_details::ErrorCategoriesFor<ErrorCodes::NotMaster>,
-                                 error_details::CategoryList<ErrorCategory::NotMasterError>>());
+                                 error_details::CategoryList<ErrorCategory::NotMasterError,
+                                                             ErrorCategory::RetriableError>>());
 MONGO_STATIC_ASSERT(std::is_base_of<AssertionException, ExceptionFor<ErrorCodes::NotMaster>>());
 MONGO_STATIC_ASSERT(!std::is_base_of<ExceptionForCat<ErrorCategory::NetworkError>,
                                      ExceptionFor<ErrorCodes::NotMaster>>());
@@ -108,32 +109,33 @@ TEST(AssertUtils, UassertNamedCodeWithOneCategory) {
     ASSERT_NOT_CATCHES(ErrorCodes::NotMaster, ExceptionForCat<ErrorCategory::Interruption>);
 }
 
-// InterruptedDueToStepDown - NotMasterError and Interruption
+// InterruptedDueToReplStateChange - NotMasterError, Interruption, RetriableError
 MONGO_STATIC_ASSERT(
-    std::is_same<
-        error_details::ErrorCategoriesFor<ErrorCodes::InterruptedDueToStepDown>,
-        error_details::CategoryList<ErrorCategory::Interruption, ErrorCategory::NotMasterError>>());
-MONGO_STATIC_ASSERT(
-    std::is_base_of<AssertionException, ExceptionFor<ErrorCodes::InterruptedDueToStepDown>>());
+    std::is_same<error_details::ErrorCategoriesFor<ErrorCodes::InterruptedDueToReplStateChange>,
+                 error_details::CategoryList<ErrorCategory::Interruption,
+                                             ErrorCategory::NotMasterError,
+                                             ErrorCategory::RetriableError>>());
+MONGO_STATIC_ASSERT(std::is_base_of<AssertionException,
+                                    ExceptionFor<ErrorCodes::InterruptedDueToReplStateChange>>());
 MONGO_STATIC_ASSERT(!std::is_base_of<ExceptionForCat<ErrorCategory::NetworkError>,
-                                     ExceptionFor<ErrorCodes::InterruptedDueToStepDown>>());
+                                     ExceptionFor<ErrorCodes::InterruptedDueToReplStateChange>>());
 MONGO_STATIC_ASSERT(std::is_base_of<ExceptionForCat<ErrorCategory::NotMasterError>,
-                                    ExceptionFor<ErrorCodes::InterruptedDueToStepDown>>());
+                                    ExceptionFor<ErrorCodes::InterruptedDueToReplStateChange>>());
 MONGO_STATIC_ASSERT(std::is_base_of<ExceptionForCat<ErrorCategory::Interruption>,
-                                    ExceptionFor<ErrorCodes::InterruptedDueToStepDown>>());
+                                    ExceptionFor<ErrorCodes::InterruptedDueToReplStateChange>>());
 
 TEST(AssertUtils, UassertNamedCodeWithTwoCategories) {
-    ASSERT_CATCHES(ErrorCodes::InterruptedDueToStepDown, DBException);
-    ASSERT_CATCHES(ErrorCodes::InterruptedDueToStepDown, AssertionException);
-    ASSERT_CATCHES(ErrorCodes::InterruptedDueToStepDown,
-                   ExceptionFor<ErrorCodes::InterruptedDueToStepDown>);
-    ASSERT_NOT_CATCHES(ErrorCodes::InterruptedDueToStepDown,
+    ASSERT_CATCHES(ErrorCodes::InterruptedDueToReplStateChange, DBException);
+    ASSERT_CATCHES(ErrorCodes::InterruptedDueToReplStateChange, AssertionException);
+    ASSERT_CATCHES(ErrorCodes::InterruptedDueToReplStateChange,
+                   ExceptionFor<ErrorCodes::InterruptedDueToReplStateChange>);
+    ASSERT_NOT_CATCHES(ErrorCodes::InterruptedDueToReplStateChange,
                        ExceptionFor<ErrorCodes::DuplicateKey>);
-    ASSERT_NOT_CATCHES(ErrorCodes::InterruptedDueToStepDown,
+    ASSERT_NOT_CATCHES(ErrorCodes::InterruptedDueToReplStateChange,
                        ExceptionForCat<ErrorCategory::NetworkError>);
-    ASSERT_CATCHES(ErrorCodes::InterruptedDueToStepDown,
+    ASSERT_CATCHES(ErrorCodes::InterruptedDueToReplStateChange,
                    ExceptionForCat<ErrorCategory::NotMasterError>);
-    ASSERT_CATCHES(ErrorCodes::InterruptedDueToStepDown,
+    ASSERT_CATCHES(ErrorCodes::InterruptedDueToReplStateChange,
                    ExceptionForCat<ErrorCategory::Interruption>);
 }
 
@@ -311,8 +313,8 @@ DEATH_TEST(InvariantTerminationTest,
 DEATH_TEST(InvariantTerminationTest,
            invariantWithStdStringMsg,
            "Terminating with std::string invariant message: 12345") {
-    const std::string msg = str::stream() << "Terminating with std::string invariant message: "
-                                          << 12345;
+    const std::string msg = str::stream()
+        << "Terminating with std::string invariant message: " << 12345;
     invariant(false, msg);
 }
 
@@ -326,8 +328,8 @@ DEATH_TEST(InvariantTerminationTest,
 DEATH_TEST(InvariantTerminationTest,
            invariantOverloadWithStdStringMsg,
            "Terminating with std::string invariant message: 12345") {
-    const std::string msg = str::stream() << "Terminating with std::string invariant message: "
-                                          << 12345;
+    const std::string msg = str::stream()
+        << "Terminating with std::string invariant message: " << 12345;
     invariant(Status(ErrorCodes::InternalError, "Terminating with invariant"), msg);
 }
 
@@ -341,8 +343,8 @@ DEATH_TEST(InvariantTerminationTest,
 DEATH_TEST(InvariantTerminationTest,
            invariantStatusWithOverloadWithStdStringMsg,
            "Terminating with std::string invariant message: 12345") {
-    const std::string msg = str::stream() << "Terminating with std::string invariant message: "
-                                          << 12345;
+    const std::string msg = str::stream()
+        << "Terminating with std::string invariant message: " << 12345;
     invariant(StatusWith<std::string>(ErrorCodes::InternalError, "Terminating with invariant"),
               msg);
 }
@@ -367,8 +369,8 @@ DEATH_TEST(DassertTerminationTest,
 DEATH_TEST(DassertTerminationTest,
            dassertWithStdStringMsg,
            "Terminating with std::string dassert message: 12345") {
-    const std::string msg = str::stream() << "Terminating with std::string dassert message: "
-                                          << 12345;
+    const std::string msg = str::stream()
+        << "Terminating with std::string dassert message: " << 12345;
     dassert(false, msg);
 }
 #endif  // defined(MONGO_CONFIG_DEBUG_BUILD)

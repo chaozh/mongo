@@ -33,12 +33,12 @@
 #include "mongo/db/jsobj.h"
 #include "mongo/db/logical_session_id.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/ops/write_ops_parsers.h"
+#include "mongo/db/pipeline/runtime_constants_gen.h"
 #include "mongo/db/query/explain.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
-
-namespace str = mongoutils::str;
 
 class FieldRef;
 
@@ -103,12 +103,28 @@ public:
         return _collation;
     }
 
-    inline void setUpdates(const BSONObj& updates) {
-        _updates = updates;
+    inline void setUpdateModification(const write_ops::UpdateModification& updateMod) {
+        _updateMod = updateMod;
     }
 
-    inline const BSONObj& getUpdates() const {
-        return _updates;
+    inline const write_ops::UpdateModification& getUpdateModification() const {
+        return _updateMod;
+    }
+
+    inline void setUpdateConstants(const boost::optional<BSONObj>& updateConstants) {
+        _updateConstants = updateConstants;
+    }
+
+    inline const boost::optional<BSONObj>& getUpdateConstants() const {
+        return _updateConstants;
+    }
+
+    inline void setRuntimeConstants(RuntimeConstants runtimeConstants) {
+        _runtimeConstants = std::move(runtimeConstants);
+    }
+
+    inline const boost::optional<RuntimeConstants>& getRuntimeConstants() const {
+        return _runtimeConstants;
     }
 
     inline void setArrayFilters(const std::vector<BSONObj>& arrayFilters) {
@@ -174,6 +190,14 @@ public:
         _returnDocs = value;
     }
 
+    void setHint(const BSONObj& hint) {
+        _hint = hint;
+    }
+
+    BSONObj getHint() const {
+        return _hint;
+    }
+
     inline bool shouldReturnOldDocs() const {
         return _returnDocs == ReturnDocOption::RETURN_OLD;
     }
@@ -208,7 +232,7 @@ public:
         builder << " projection: " << _proj;
         builder << " sort: " << _sort;
         builder << " collation: " << _collation;
-        builder << " updates: " << _updates;
+        builder << " updateModification: " << _updateMod.toString();
         builder << " stmtId: " << _stmtId;
 
         builder << " arrayFilters: [";
@@ -222,6 +246,14 @@ public:
         }
         builder << "]";
 
+        if (_updateConstants) {
+            builder << " updateConstants: " << *_updateConstants;
+        }
+
+        if (_runtimeConstants) {
+            builder << " runtimeConstants: " << _runtimeConstants->toBSON().toString();
+        }
+
         builder << " god: " << _god;
         builder << " upsert: " << _upsert;
         builder << " multi: " << _multi;
@@ -233,6 +265,11 @@ public:
 
 private:
     const NamespaceString& _nsString;
+
+    // The hint provided, if any.  If the hint was by index key pattern, the value of '_hint' is
+    // the key pattern hinted.  If the hint was by index name, the value of '_hint' is
+    // {$hint: <String>}, where <String> is the index name hinted.
+    BSONObj _hint;
 
     // Contains the query that selects documents to update.
     BSONObj _query;
@@ -247,7 +284,17 @@ private:
     BSONObj _collation;
 
     // Contains the modifiers to apply to matched objects, or a replacement document.
-    BSONObj _updates;
+    write_ops::UpdateModification _updateMod;
+
+    // User-defined constant values to be used with a pipeline-style update. Those are different
+    // from the '_runtimeConstants' as they can be specified by the user for each individual
+    // element of the 'updates' array in the 'update' command. The '_runtimeConstants' contains
+    // runtime system constant values which remain unchanged for all update statements in the
+    // 'update' command.
+    boost::optional<BSONObj> _updateConstants;
+
+    // System-defined constant values which may be required by the query or update operation.
+    boost::optional<RuntimeConstants> _runtimeConstants;
 
     // Filters to specify which array elements should be updated.
     std::vector<BSONObj> _arrayFilters;

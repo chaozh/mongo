@@ -44,7 +44,7 @@
 #include "mongo/db/service_context.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
@@ -444,9 +444,7 @@ StatusWith<FTDCType> getBSONDocumentType(const BSONObj& obj) {
         static_cast<FTDCType>(value) != FTDCType::kMetadata) {
         return {ErrorCodes::BadValue,
                 str::stream() << "Field '" << std::string(kFTDCTypeField)
-                              << "' is not an expected value, found '"
-                              << value
-                              << "'"};
+                              << "' is not an expected value, found '" << value << "'"};
     }
 
     return {static_cast<FTDCType>(value)};

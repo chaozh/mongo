@@ -41,7 +41,7 @@
 #include "mongo/db/ftdc/util.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/rpc/object_check.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -162,8 +162,8 @@ StatusWith<BSONObj> FTDCFileReader::readDocument() {
         }
 
         return {ErrorCodes::FileStreamFailed,
-                str::stream() << "Failed to read 4 bytes from file \'" << _file.generic_string()
-                              << "\'"};
+                str::stream() << "Failed to read 4 bytes from file \"" << _file.generic_string()
+                              << "\""};
     }
 
     std::uint32_t bsonLength = ConstDataView(buf).read<LittleEndian<std::int32_t>>();
@@ -177,8 +177,8 @@ StatusWith<BSONObj> FTDCFileReader::readDocument() {
     // Reads past the end of the file will be caught below
     if (bsonLength > _fileSize || bsonLength < BSONObj::kMinBSONLength) {
         return {ErrorCodes::InvalidLength,
-                str::stream() << "Invalid BSON length found in file \'" << _file.generic_string()
-                              << "\'"};
+                str::stream() << "Invalid BSON length found in file \"" << _file.generic_string()
+                              << "\""};
     }
 
     // Read the BSON document
@@ -194,15 +194,14 @@ StatusWith<BSONObj> FTDCFileReader::readDocument() {
 
     if (readSize != _stream.gcount()) {
         return {ErrorCodes::FileStreamFailed,
-                str::stream() << "Failed to read " << readSize << " bytes from file \'"
-                              << _file.generic_string()
-                              << "\'"};
+                str::stream() << "Failed to read " << readSize << " bytes from file \""
+                              << _file.generic_string() << "\""};
     }
 
     ConstDataRange cdr(_buffer.data(), _buffer.data() + bsonLength);
 
     // TODO: Validated only validates objects based on a flag which is the default at the moment
-    auto swl = cdr.read<Validated<BSONObj>>();
+    auto swl = cdr.readNoThrow<Validated<BSONObj>>();
     if (!swl.isOK()) {
         return swl.getStatus();
     }
@@ -216,7 +215,14 @@ Status FTDCFileReader::open(const boost::filesystem::path& file) {
         return Status(ErrorCodes::FileStreamFailed, "Failed to open file " + file.generic_string());
     }
 
-    _fileSize = boost::filesystem::file_size(file);
+    boost::system::error_code ec;
+    _fileSize = boost::filesystem::file_size(file, ec);
+    if (ec) {
+        return {ErrorCodes::NonExistentPath,
+                str::stream() << "\"" << file.generic_string()
+                              << "\" file size could not be retrieved during open: "
+                              << ec.message()};
+    }
 
     _file = file;
 

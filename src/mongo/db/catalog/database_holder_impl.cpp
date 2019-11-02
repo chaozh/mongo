@@ -35,14 +35,11 @@
 
 #include "mongo/db/audit.h"
 #include "mongo/db/background.h"
+#include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/catalog/collection_impl.h"
-#include "mongo/db/catalog/database_catalog_entry.h"
 #include "mongo/db/catalog/database_impl.h"
-#include "mongo/db/catalog/namespace_uuid_cache.h"
-#include "mongo/db/catalog/uuid_catalog.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/db/repl/oplog.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/stats/top.h"
 #include "mongo/db/storage/storage_engine.h"
@@ -73,7 +70,8 @@ StringData _todb(StringData ns) {
 
 Database* DatabaseHolderImpl::getDb(OperationContext* opCtx, StringData ns) const {
     const StringData db = _todb(ns);
-    invariant(opCtx->lockState()->isDbLockedForMode(db, MODE_IS));
+    invariant(opCtx->lockState()->isDbLockedForMode(db, MODE_IS) ||
+              (db.compare("local") == 0 && opCtx->lockState()->isLocked()));
 
     stdx::lock_guard<SimpleMutex> lk(_m);
     DBs::const_iterator it = _dbs.find(db);
@@ -81,7 +79,7 @@ Database* DatabaseHolderImpl::getDb(OperationContext* opCtx, StringData ns) cons
         return it->second;
     }
 
-    return NULL;
+    return nullptr;
 }
 
 std::set<std::string> DatabaseHolderImpl::_getNamesWithConflictingCasing_inlock(StringData name) {
@@ -100,9 +98,18 @@ std::set<std::string> DatabaseHolderImpl::getNamesWithConflictingCasing(StringDa
     return _getNamesWithConflictingCasing_inlock(name);
 }
 
+std::vector<std::string> DatabaseHolderImpl::getNames() {
+    stdx::lock_guard<SimpleMutex> lk(_m);
+    std::vector<std::string> names;
+    for (const auto& nameAndPointer : _dbs) {
+        names.push_back(nameAndPointer.first);
+    }
+    return names;
+}
+
 Database* DatabaseHolderImpl::openDb(OperationContext* opCtx, StringData ns, bool* justCreated) {
     const StringData dbname = _todb(ns);
-    invariant(opCtx->lockState()->isDbLockedForMode(dbname, MODE_X));
+    invariant(opCtx->lockState()->isDbLockedForMode(dbname, MODE_IX));
 
     if (justCreated)
         *justCreated = false;  // Until proven otherwise.
@@ -125,35 +132,36 @@ Database* DatabaseHolderImpl::openDb(OperationContext* opCtx, StringData ns, boo
     auto duplicates = _getNamesWithConflictingCasing_inlock(dbname);
     uassert(ErrorCodes::DatabaseDifferCase,
             str::stream() << "db already exists with different case already have: ["
-                          << *duplicates.cbegin()
-                          << "] trying to create ["
-                          << dbname.toString()
+                          << *duplicates.cbegin() << "] trying to create [" << dbname.toString()
                           << "]",
             duplicates.empty());
 
-
     // Do the catalog lookup and database creation outside of the scoped lock, because these may
-    // block. Only one thread can be inside this method for the same DB name, because of the
-    // requirement for X-lock on the database when we enter. So there is no way we can insert two
-    // different databases for the same name.
+    // block.
     lk.unlock();
-    StorageEngine* storageEngine = getGlobalServiceContext()->getStorageEngine();
-    DatabaseCatalogEntry* entry = storageEngine->getDatabaseCatalogEntry(opCtx, dbname);
 
-    if (!entry->exists()) {
+    if (CollectionCatalog::get(opCtx).getAllCollectionUUIDsFromDb(dbname).empty()) {
         audit::logCreateDatabase(opCtx->getClient(), dbname);
         if (justCreated)
             *justCreated = true;
     }
 
-    auto newDb = stdx::make_unique<DatabaseImpl>(dbname, entry, ++_epoch);
+    auto newDb = std::make_unique<DatabaseImpl>(dbname, ++_epoch);
     newDb->init(opCtx);
 
     // Finally replace our nullptr entry with the new Database pointer.
     removeDbGuard.dismiss();
     lk.lock();
     auto it = _dbs.find(dbname);
-    invariant(it != _dbs.end() && it->second == nullptr);
+    // Dropping a database requires a MODE_X lock, so the entry in the `_dbs` map cannot disappear.
+    invariant(it != _dbs.end());
+    if (it->second) {
+        // Creating databases only requires a DB lock in MODE_IX. Thus databases can concurrently
+        // created. If this thread "lost the race", return the database object that was persisted in
+        // the `_dbs` map.
+        return it->second;
+    }
+
     it->second = newDb.release();
     invariant(_getNamesWithConflictingCasing_inlock(dbname.toString()).empty());
 
@@ -170,14 +178,29 @@ void DatabaseHolderImpl::dropDb(OperationContext* opCtx, Database* db) {
 
     invariant(opCtx->lockState()->isDbLockedForMode(name, MODE_X));
 
-    BackgroundOperation::assertNoBgOpInProgForDb(name);
+    for (auto collIt = db->begin(opCtx); collIt != db->end(opCtx); ++collIt) {
+        auto coll = *collIt;
+        if (!coll) {
+            break;
+        }
+
+        // It is the caller's responsibility to ensure that no index builds are active in the
+        // database.
+        invariant(!coll->getIndexCatalog()->haveAnyIndexesInProgress(),
+                  str::stream() << "An index is building on collection '" << coll->ns() << "'.");
+    }
 
     audit::logDropDatabase(opCtx->getClient(), name);
 
     auto const serviceContext = opCtx->getServiceContext();
 
-    for (auto&& coll : *db) {
-        Top::get(serviceContext).collectionDropped(coll->ns().ns(), true);
+    for (auto collIt = db->begin(opCtx); collIt != db->end(opCtx); ++collIt) {
+        auto coll = *collIt;
+        if (!coll) {
+            break;
+        }
+
+        Top::get(serviceContext).collectionDropped(coll->ns(), true);
     }
 
     close(opCtx, name);
@@ -188,19 +211,9 @@ void DatabaseHolderImpl::dropDb(OperationContext* opCtx, Database* db) {
     });
 }
 
-namespace {
-void evictDatabaseFromUUIDCatalog(OperationContext* opCtx, Database* db) {
-    UUIDCatalog::get(opCtx).onCloseDatabase(db);
-    for (auto&& coll : *db) {
-        NamespaceUUIDCache::get(opCtx).evictNamespace(coll->ns());
-    }
-}
-}  // namespace
-
 void DatabaseHolderImpl::close(OperationContext* opCtx, StringData ns) {
-    invariant(opCtx->lockState()->isW());
-
     const StringData dbName = _todb(ns);
+    invariant(opCtx->lockState()->isDbLockedForMode(dbName, MODE_X));
 
     stdx::lock_guard<SimpleMutex> lk(_m);
 
@@ -210,10 +223,8 @@ void DatabaseHolderImpl::close(OperationContext* opCtx, StringData ns) {
     }
 
     auto db = it->second;
-    repl::oplogCheckCloseDatabase(opCtx, db);
-    evictDatabaseFromUUIDCatalog(opCtx, db);
+    CollectionCatalog::get(opCtx).onCloseDatabase(opCtx, dbName.toString());
 
-    db->close(opCtx);
     delete db;
     db = nullptr;
 
@@ -232,7 +243,18 @@ void DatabaseHolderImpl::closeAll(OperationContext* opCtx) {
 
     std::set<std::string> dbs;
     for (DBs::const_iterator i = _dbs.begin(); i != _dbs.end(); ++i) {
-        BackgroundOperation::assertNoBgOpInProgForDb(i->first);
+        for (auto collIt = i->second->begin(opCtx); collIt != i->second->end(opCtx); ++collIt) {
+            auto coll = *collIt;
+            if (!coll) {
+                continue;
+            }
+
+            // It is the caller's responsibility to ensure that no index builds are active in the
+            // database.
+            invariant(!coll->getIndexCatalog()->haveAnyIndexesInProgress(),
+                      str::stream()
+                          << "An index is building on collection '" << coll->ns() << "'.");
+        }
         dbs.insert(i->first);
     }
 
@@ -240,9 +262,7 @@ void DatabaseHolderImpl::closeAll(OperationContext* opCtx) {
         LOG(2) << "DatabaseHolder::closeAll name:" << name;
 
         Database* db = _dbs[name];
-        repl::oplogCheckCloseDatabase(opCtx, db);
-        evictDatabaseFromUUIDCatalog(opCtx, db);
-        db->close(opCtx);
+        CollectionCatalog::get(opCtx).onCloseDatabase(opCtx, name);
         delete db;
 
         _dbs.erase(name);
@@ -252,16 +272,6 @@ void DatabaseHolderImpl::closeAll(OperationContext* opCtx) {
             ->closeDatabase(opCtx, name)
             .transitional_ignore();
     }
-}
-
-std::unique_ptr<Collection> DatabaseHolderImpl::makeCollection(
-    OperationContext* const opCtx,
-    const StringData fullNS,
-    OptionalCollectionUUID uuid,
-    CollectionCatalogEntry* const details,
-    RecordStore* const recordStore,
-    DatabaseCatalogEntry* const dbce) {
-    return std::make_unique<CollectionImpl>(opCtx, fullNS, uuid, details, recordStore, dbce);
 }
 
 }  // namespace mongo

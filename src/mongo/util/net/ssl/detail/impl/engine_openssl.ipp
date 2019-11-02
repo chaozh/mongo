@@ -16,6 +16,7 @@
 #endif  // defined(_MSC_VER) && (_MSC_VER >= 1200)
 
 #include "asio/detail/config.hpp"
+#include "asio/ip/address.hpp"
 
 #include "asio/detail/throw_error.hpp"
 #include "asio/error.hpp"
@@ -41,18 +42,15 @@ engine::engine(SSL_CTX* context, const std::string& remoteHostName)
 
     ::SSL_set_mode(ssl_, SSL_MODE_ENABLE_PARTIAL_WRITE);
     ::SSL_set_mode(ssl_, SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
-#if defined(SSL_MODE_RELEASE_BUFFERS)
-    ::SSL_set_mode(ssl_, SSL_MODE_RELEASE_BUFFERS);
-#endif  // defined(SSL_MODE_RELEASE_BUFFERS)
 
-    ::BIO* int_bio = 0;
+    ::BIO* int_bio = nullptr;
     ::BIO_new_bio_pair(&int_bio, 0, &ext_bio_, 0);
     ::SSL_set_bio(ssl_, int_bio, int_bio);
 }
 
 engine::~engine() {
     if (SSL_get_app_data(ssl_)) {
-        SSL_set_app_data(ssl_, 0);
+        SSL_set_app_data(ssl_, nullptr);
     }
 
     ::BIO_free(ext_bio_);
@@ -63,17 +61,32 @@ SSL* engine::native_handle() {
     return ssl_;
 }
 
+boost::optional<std::string> engine::get_sni() {
+    if (_sni) {
+        return _sni;
+    }
+
+    auto name = SSL_get_servername(ssl_, TLSEXT_NAMETYPE_host_name);
+    if (!name) {
+        _sni = boost::none;
+        return _sni;
+    }
+
+    _sni = std::string(name);
+    return _sni;
+}
+
 engine::want engine::handshake(stream_base::handshake_type type, asio::error_code& ec) {
     return perform((type == asio::ssl::stream_base::client) ? &engine::do_connect
                                                             : &engine::do_accept,
-                   0,
+                   nullptr,
                    0,
                    ec,
-                   0);
+                   nullptr);
 }
 
 engine::want engine::shutdown(asio::error_code& ec) {
-    return perform(&engine::do_shutdown, 0, 0, ec, 0);
+    return perform(&engine::do_shutdown, nullptr, 0, ec, nullptr);
 }
 
 engine::want engine::write(const asio::const_buffer& data,
@@ -214,9 +227,15 @@ int engine::do_accept(void*, std::size_t) {
 
 int engine::do_connect(void*, std::size_t) {
     if (!_remoteHostName.empty()) {
-        int ret = ::SSL_set_tlsext_host_name(ssl_, _remoteHostName.c_str());
-        if (ret != 1)
-            return ret;
+        error_code ec;
+        ip::make_address(_remoteHostName, ec);
+        // only have TLS advertise _remoteHostName as an SNI if it is not an IP address
+        if (ec) {
+            int ret = ::SSL_set_tlsext_host_name(ssl_, _remoteHostName.c_str());
+            if (ret != 1) {
+                return ret;
+            }
+        }
 
         _remoteHostName.clear();
     }

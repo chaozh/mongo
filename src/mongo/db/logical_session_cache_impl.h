@@ -30,90 +30,50 @@
 #pragma once
 
 #include "mongo/db/logical_session_cache.h"
-#include "mongo/db/logical_session_id.h"
-#include "mongo/db/refresh_sessions_gen.h"
 #include "mongo/db/service_liaison.h"
 #include "mongo/db/sessions_collection.h"
-#include "mongo/db/time_proof_service.h"
-#include "mongo/db/transaction_reaper.h"
-#include "mongo/platform/atomic_word.h"
-#include "mongo/stdx/thread.h"
-#include "mongo/util/lru_cache.h"
+#include "mongo/util/concurrency/with_lock.h"
+#include "mongo/util/functional.h"
 
 namespace mongo {
-
-class Client;
-class OperationContext;
-class ServiceContext;
-
-extern int logicalSessionRefreshMillis;
 
 /**
  * A thread-safe cache structure for logical session records.
  *
- * The cache takes ownership of the passed-in ServiceLiaison and
- * SessionsCollection helper types.
+ * The cache takes ownership of the passed-in ServiceLiaison and SessionsCollection helper types.
+ *
+ * Uses the following service-wide parameters:
+ *  - A timeout value to use for sessions in the cache, in minutes. Defaults to 30 minutes.
+ *      --setParameter localLogicalSessionTimeoutMinutes=X
+ *
+ *  - The interval over which the cache will refresh session records. By default, this is set to
+ *    every 5 minutes (300,000). If the caller is setting the sessionTimeout by hand, it is
+ *    suggested that they consider also setting the refresh interval accordingly.
+ *      --setParameter logicalSessionRefreshMillis=X.
  */
 class LogicalSessionCacheImpl final : public LogicalSessionCache {
 public:
-    static constexpr Milliseconds kLogicalSessionDefaultRefresh = Milliseconds(5 * 60 * 1000);
+    using ReapSessionsOlderThanFn =
+        unique_function<int(OperationContext*, SessionsCollection&, Date_t)>;
 
-    /**
-     * An Options type to support the LogicalSessionCacheImpl.
-     */
-    struct Options {
-        Options(){};
-
-        /**
-         * A timeout value to use for sessions in the cache, in minutes.
-         *
-         * By default, this is set to 30 minutes.
-         *
-         * May be set with --setParameter localLogicalSessionTimeoutMinutes=X.
-         */
-        Minutes sessionTimeout = Minutes(localLogicalSessionTimeoutMinutes);
-
-        /**
-         * The interval over which the cache will refresh session records.
-         *
-         * By default, this is set to every 5 minutes (300,000). If the caller
-         * is setting the sessionTimeout by hand, it is suggested that they
-         * consider also setting the refresh interval accordingly.
-         *
-         * May be set with --setParameter logicalSessionRefreshMillis=X.
-         */
-        Milliseconds refreshInterval = Milliseconds(logicalSessionRefreshMillis);
-    };
-
-    /**
-     * Construct a new session cache.
-     */
-    explicit LogicalSessionCacheImpl(std::unique_ptr<ServiceLiaison> service,
-                                     std::shared_ptr<SessionsCollection> collection,
-                                     std::shared_ptr<TransactionReaper> transactionReaper,
-                                     Options options = Options{});
+    LogicalSessionCacheImpl(std::unique_ptr<ServiceLiaison> service,
+                            std::shared_ptr<SessionsCollection> collection,
+                            ReapSessionsOlderThanFn reapSessionsOlderThanFn);
 
     LogicalSessionCacheImpl(const LogicalSessionCacheImpl&) = delete;
     LogicalSessionCacheImpl& operator=(const LogicalSessionCacheImpl&) = delete;
 
     ~LogicalSessionCacheImpl();
 
-    Status promote(LogicalSessionId lsid) override;
+    void joinOnShutDown() override;
 
-    Status startSession(OperationContext* opCtx, LogicalSessionRecord record) override;
-
-    Status refreshSessions(OperationContext* opCtx,
-                           const RefreshSessionsCmdFromClient& cmd) override;
-    Status refreshSessions(OperationContext* opCtx,
-                           const RefreshSessionsCmdFromClusterMember& cmd) override;
+    Status startSession(OperationContext* opCtx, const LogicalSessionRecord& record) override;
 
     Status vivify(OperationContext* opCtx, const LogicalSessionId& lsid) override;
 
-    Status refreshNow(Client* client) override;
+    Status refreshNow(OperationContext* opCtx) override;
 
-    Status reapNow(Client* client) override;
-
-    Date_t now() override;
+    void reapNow(OperationContext* opCtx) override;
 
     size_t size() override;
 
@@ -129,10 +89,6 @@ public:
     LogicalSessionCacheStats getStats() override;
 
 private:
-    /**
-     * Internal methods to handle scheduling and perform refreshes for active
-     * session records contained within the cache.
-     */
     void _periodicRefresh(Client* client);
     void _refresh(Client* client);
 
@@ -144,31 +100,21 @@ private:
      */
     bool _isDead(const LogicalSessionRecord& record, Date_t now) const;
 
-    /**
-     * Takes the lock and inserts the given record into the cache.
-     */
-    Status _addToCache(LogicalSessionRecord record);
+    Status _addToCacheIfNotFull(WithLock, LogicalSessionRecord record);
 
-    const Milliseconds _refreshInterval;
-    const Minutes _sessionTimeout;
+    const std::unique_ptr<ServiceLiaison> _service;
+    const std::shared_ptr<SessionsCollection> _sessionsColl;
+    const ReapSessionsOlderThanFn _reapSessionsOlderThanFn;
 
-    // This value is only modified under the lock, and is modified
-    // automatically by the background jobs.
-    LogicalSessionCacheStats _stats;
-
-    std::unique_ptr<ServiceLiaison> _service;
-    std::shared_ptr<SessionsCollection> _sessionsColl;
-
-    mutable stdx::mutex _reaperMutex;
-    std::shared_ptr<TransactionReaper> _transactionReaper;
-
-    mutable stdx::mutex _cacheMutex;
+    mutable Mutex _mutex = MONGO_MAKE_LATCH("LogicalSessionCacheImpl::_mutex");
 
     LogicalSessionIdMap<LogicalSessionRecord> _activeSessions;
 
     LogicalSessionIdSet _endingSessions;
 
-    Date_t lastRefreshTime;
+    Date_t _lastRefreshTime;
+
+    LogicalSessionCacheStats _stats;
 };
 
 }  // namespace mongo

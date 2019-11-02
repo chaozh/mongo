@@ -31,20 +31,20 @@
 
 #include "mongo/platform/basic.h"
 
+#include "mongo/db/storage/biggie/biggie_record_store.h"
+
 #include <cstring>
 #include <memory>
 #include <utility>
 
 #include "mongo/bson/bsonobj.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/db/storage/biggie/biggie_record_store.h"
 #include "mongo/db/storage/biggie/biggie_recovery_unit.h"
 #include "mongo/db/storage/biggie/biggie_visibility_manager.h"
 #include "mongo/db/storage/biggie/store.h"
 #include "mongo/db/storage/key_string.h"
 #include "mongo/db/storage/oplog_hack.h"
 #include "mongo/db/storage/write_unit_of_work.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/util/hex.h"
 #include "mongo/util/log.h"
 
@@ -55,16 +55,15 @@ Ordering allAscending = Ordering::make(BSONObj());
 auto const version = KeyString::Version::V1;
 BSONObj const sample = BSON(""
                             << "s"
-                            << ""
-                            << (int64_t)0);
+                            << "" << (int64_t)0);
 
 std::string createKey(StringData ident, int64_t recordId) {
-    KeyString ks(version, BSON("" << ident << "" << recordId), allAscending);
+    KeyString::Builder ks(version, BSON("" << ident << "" << recordId), allAscending);
     return std::string(ks.getBuffer(), ks.getSize());
 }
 
 RecordId extractRecordId(const std::string& keyStr) {
-    KeyString ks(version, sample, allAscending);
+    KeyString::Builder ks(version, sample, allAscending);
     ks.resetFromBuffer(keyStr.c_str(), keyStr.size());
     BSONObj obj = KeyString::toBson(keyStr.c_str(), keyStr.size(), allAscending, ks.getTypeBits());
     auto it = BSONObjIterator(obj);
@@ -121,7 +120,7 @@ bool RecordStore::isCapped() const {
 }
 
 void RecordStore::setCappedCallback(CappedCallback* cb) {
-    stdx::lock_guard<stdx::mutex> cappedCallbackLock(_cappedCallbackMutex);
+    stdx::lock_guard<Latch> cappedCallbackLock(_cappedCallbackMutex);
     _cappedCallback = cb;
 }
 
@@ -187,59 +186,12 @@ Status RecordStore::insertRecords(OperationContext* opCtx,
     return Status::OK();
 }
 
-Status RecordStore::insertRecordsWithDocWriter(OperationContext* opCtx,
-                                               const DocWriter* const* docs,
-                                               const Timestamp*,
-                                               size_t nDocs,
-                                               RecordId* idsOut) {
-    int64_t totalSize = 0;
-    for (size_t i = 0; i < nDocs; i++)
-        totalSize += docs[i]->documentSize();
-
-    // Caller will retry one element at a time.
-    if (_isCapped && totalSize > _cappedMaxSize)
-        return Status(ErrorCodes::BadValue, "object to insert exceeds cappedMaxSize");
-
-    auto ru = RecoveryUnit::get(opCtx);
-    StringStore* workingCopy(ru->getHead());
-    {
-        SizeAdjuster adjuster(opCtx, this);
-        for (size_t i = 0; i < nDocs; i++) {
-            const size_t len = docs[i]->documentSize();
-
-            std::string buf(len, '\0');
-            docs[i]->writeDocument(&buf[0]);
-
-            int64_t thisRecordId = 0;
-            if (_isOplog) {
-                StatusWith<RecordId> status = oploghack::extractKey(buf.data(), len);
-                if (!status.isOK())
-                    return status.getStatus();
-                thisRecordId = status.getValue().repr();
-                _visibilityManager->addUncommittedRecord(opCtx, this, RecordId(thisRecordId));
-            } else {
-                thisRecordId = _nextRecordId();
-            }
-            std::string key = createKey(_ident, thisRecordId);
-
-            StringStore::value_type vt{key, buf};
-            workingCopy->insert(std::move(vt));
-            if (idsOut)
-                idsOut[i] = RecordId(thisRecordId);
-            ru->makeDirty();
-        }
-    }
-
-    _cappedDeleteAsNeeded(opCtx, workingCopy);
-    return Status::OK();
-}
-
 Status RecordStore::updateRecord(OperationContext* opCtx,
                                  const RecordId& oldLocation,
                                  const char* data,
                                  int len) {
     StringStore* workingCopy(RecoveryUnit::get(opCtx)->getHead());
-    SizeAdjuster(opCtx, this);
+    SizeAdjuster adjuster(opCtx, this);
     {
         std::string key = createKey(_ident, oldLocation.repr());
         StringStore::const_iterator it = workingCopy->find(key);
@@ -312,7 +264,7 @@ void RecordStore::cappedTruncateAfter(OperationContext* opCtx, RecordId end, boo
     auto endIt = workingCopy->upper_bound(_postfix);
 
     while (recordIt != endIt) {
-        stdx::lock_guard<stdx::mutex> cappedCallbackLock(_cappedCallbackMutex);
+        stdx::lock_guard<Latch> cappedCallbackLock(_cappedCallbackMutex);
         if (_cappedCallback) {
             // Documents are guaranteed to have a RecordId at the end of the KeyString, unlike
             // unique indexes.
@@ -344,10 +296,6 @@ void RecordStore::appendCustomStats(OperationContext* opCtx,
         result->appendIntOrLL("max", _cappedMaxDocs);
         result->appendIntOrLL("maxSize", _cappedMaxSize / scale);
     }
-}
-
-Status RecordStore::touch(OperationContext* opCtx, BSONObjBuilder* output) const {
-    return Status::OK();  // All data is already in 'cache'.
 }
 
 void RecordStore::updateStatsAfterRepair(OperationContext* opCtx,
@@ -405,11 +353,11 @@ void RecordStore::_cappedDeleteAsNeeded(OperationContext* opCtx, StringStore* wo
     auto recordIt = workingCopy->lower_bound(_prefix);
 
     // Ensure only one thread at a time can do deletes, otherwise they'll conflict.
-    stdx::lock_guard<stdx::mutex> cappedDeleterLock(_cappedDeleterMutex);
+    stdx::lock_guard<Latch> cappedDeleterLock(_cappedDeleterMutex);
 
     while (_cappedAndNeedDelete(opCtx, workingCopy)) {
 
-        stdx::lock_guard<stdx::mutex> cappedCallbackLock(_cappedCallbackMutex);
+        stdx::lock_guard<Latch> cappedCallbackLock(_cappedCallbackMutex);
         RecordId rid = RecordId(extractRecordId(recordIt->first));
 
         if (_isOplog && _visibilityManager->isFirstHidden(rid)) {
@@ -608,7 +556,7 @@ RecordStore::SizeAdjuster::~SizeAdjuster() {
     int64_t deltaDataSize = _workingCopy->dataSize() - _origDataSize;
     _rs->_numRecords.fetchAndAdd(deltaNumRecords);
     _rs->_dataSize.fetchAndAdd(deltaDataSize);
-    RecoveryUnit::get(_opCtx)->onRollback([ rs = _rs, deltaNumRecords, deltaDataSize ]() {
+    RecoveryUnit::get(_opCtx)->onRollback([rs = _rs, deltaNumRecords, deltaDataSize]() {
         invariant(rs->_numRecords.load() >= deltaNumRecords);
         rs->_numRecords.fetchAndSubtract(deltaNumRecords);
         rs->_dataSize.fetchAndSubtract(deltaDataSize);

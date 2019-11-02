@@ -34,10 +34,10 @@
 #include "mongo/db/service_entry_point_mongod.h"
 
 #include "mongo/db/commands/fsync_locked.h"
-#include "mongo/db/concurrency/global_lock_acquisition_tracker.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/read_concern.h"
 #include "mongo/db/repl/repl_client_info.h"
+#include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/speculative_majority_read_info.h"
 #include "mongo/db/s/implicit_create_collection.h"
 #include "mongo/db/s/scoped_operation_completion_sharding_actions.h"
@@ -64,6 +64,15 @@ public:
         return mongo::lockedForWriting();
     }
 
+    void setPrepareConflictBehaviorForReadConcern(
+        OperationContext* opCtx, const CommandInvocation* invocation) const override {
+        const auto prepareConflictBehavior = invocation->canIgnorePrepareConflicts()
+            ? PrepareConflictBehavior::kIgnoreConflicts
+            : PrepareConflictBehavior::kEnforce;
+        mongo::setPrepareConflictBehaviorForReadConcern(
+            opCtx, repl::ReadConcernArgs::get(opCtx), prepareConflictBehavior);
+    }
+
     void waitForReadConcern(OperationContext* opCtx,
                             const CommandInvocation* invocation,
                             const OpMsgRequest& request) const override {
@@ -77,7 +86,8 @@ public:
                 LOG(debugLevel) << "Command on database " << request.getDatabase()
                                 << " timed out waiting for read concern to be satisfied. Command: "
                                 << redact(ServiceEntryPointCommon::getRedactedCopyForLogging(
-                                       invocation->definition(), request.body));
+                                       invocation->definition(), request.body))
+                                << ". Info: " << redact(rcStatus);
             }
 
             uassertStatusOK(rcStatus);
@@ -98,19 +108,56 @@ public:
                              const repl::OpTime& lastOpBeforeRun,
                              BSONObjBuilder& commandResponseBuilder) const override {
         auto lastOpAfterRun = repl::ReplClientInfo::forClient(opCtx->getClient()).getLastOp();
-        // Ensures that if we tried to do a write, we wait for write concern, even if that write was
-        // a noop.
-        if ((lastOpAfterRun == lastOpBeforeRun) &&
-            GlobalLockAcquisitionTracker::get(opCtx).getGlobalWriteLocked()) {
-            repl::ReplClientInfo::forClient(opCtx->getClient()).setLastOpToSystemLastOpTime(opCtx);
-            lastOpAfterRun = repl::ReplClientInfo::forClient(opCtx->getClient()).getLastOp();
+
+        auto waitForWriteConcernAndAppendStatus = [&]() {
+            WriteConcernResult res;
+            auto waitForWCStatus =
+                mongo::waitForWriteConcern(opCtx, lastOpAfterRun, opCtx->getWriteConcern(), &res);
+
+            CommandHelpers::appendCommandWCStatus(commandResponseBuilder, waitForWCStatus, res);
+        };
+
+        if (lastOpAfterRun != lastOpBeforeRun) {
+            invariant(lastOpAfterRun > lastOpBeforeRun);
+            waitForWriteConcernAndAppendStatus();
+            return;
         }
 
-        WriteConcernResult res;
-        auto waitForWCStatus =
-            mongo::waitForWriteConcern(opCtx, lastOpAfterRun, opCtx->getWriteConcern(), &res);
+        // Ensures that if we tried to do a write, we wait for write concern, even if that write was
+        // a noop.
+        //
+        // Transactions do not stash their lockers on commit and abort, so after commit and abort,
+        // wasGlobalLockTakenForWrite will return whether any statement in the transaction as a
+        // whole acquired the global write lock.
+        //
+        // Speculative majority semantics dictate that "abortTransaction" should not wait for write
+        // concern on operations the transaction observed. As a result, "abortTransaction" only ever
+        // waits on an oplog entry it wrote (and has already set lastOp to) or previous writes on
+        // the same client.
+        if (opCtx->lockState()->wasGlobalLockTakenForWrite()) {
+            if (invocation->definition()->getName() != "abortTransaction") {
+                repl::ReplClientInfo::forClient(opCtx->getClient())
+                    .setLastOpToSystemLastOpTime(opCtx);
+                lastOpAfterRun = repl::ReplClientInfo::forClient(opCtx->getClient()).getLastOp();
+            }
+            waitForWriteConcernAndAppendStatus();
+            return;
+        }
 
-        CommandHelpers::appendCommandWCStatus(commandResponseBuilder, waitForWCStatus, res);
+        // Waits for write concern if we tried to explicitly set the lastOp forward but lastOp was
+        // already up to date. We still want to wait for write concern on the lastOp. This is
+        // primarily to make sure back to back retryable write retries still wait for write concern.
+        //
+        // WARNING: Retryable writes that expect to wait for write concern on retries must ensure
+        // this is entered by calling setLastOp() or setLastOpToSystemLastOpTime().
+        if (repl::ReplClientInfo::forClient(opCtx->getClient())
+                .lastOpWasSetExplicitlyByClientForCurrentOperation(opCtx)) {
+            waitForWriteConcernAndAppendStatus();
+            return;
+        }
+
+        // If no write was attempted and the client's lastOp was not changed by the current network
+        // operation then we skip waiting for writeConcern.
     }
 
     void waitForLinearizableReadConcern(OperationContext* opCtx) const override {
@@ -203,9 +250,9 @@ public:
         }
     }
 
-    void advanceConfigOptimeFromRequestMetadata(OperationContext* opCtx) const override {
+    void advanceConfigOpTimeFromRequestMetadata(OperationContext* opCtx) const override {
         // Handle config optime information that may have been sent along with the command.
-        rpc::advanceConfigOptimeFromRequestMetadata(opCtx);
+        rpc::advanceConfigOpTimeFromRequestMetadata(opCtx);
     }
 
     std::unique_ptr<PolymorphicScoped> scopedOperationCompletionShardingActions(

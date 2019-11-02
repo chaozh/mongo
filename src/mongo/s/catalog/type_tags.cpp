@@ -37,7 +37,7 @@
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/s/catalog/type_chunk.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -145,6 +145,13 @@ BSONObj TagsType::toBSON() const {
         builder.append(max.name(), getMaxKey());
 
     return builder.obj();
+}
+
+BSONObj TagsType::toBSONLegacyID() const {
+    // Note that toBSON() doesn't append an _id.
+    BSONObjBuilder bob(toBSON());
+    bob.append("_id", BSON(TagsType::ns(_ns->ns()) << TagsType::min(*_minKey)));
+    return bob.obj();
 }
 
 std::string TagsType::toString() const {

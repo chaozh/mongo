@@ -12,7 +12,6 @@ t.ensureIndex({a: "text"});
 
 // Project the text score.
 var results = t.find({$text: {$search: "textual content -irrelevant"}}, {
-                   _idCopy: 0,
                    score: {$meta: "textScore"}
                }).toArray();
 // printjson(results);
@@ -30,15 +29,17 @@ scores[results[1]._id] = results[1].score;
 // Edge/error cases:
 //
 
-// Project text score into 2 fields.
+// Project text score into 3 fields, one nested.
 results = t.find({$text: {$search: "textual content -irrelevant"}}, {
                otherScore: {$meta: "textScore"},
-               score: {$meta: "textScore"}
+               score: {$meta: "textScore"},
+               "nestedObj.score": {$meta: "textScore"}
            }).toArray();
 assert.eq(2, results.length);
 for (var i = 0; i < results.length; ++i) {
     assert.close(scores[results[i]._id], results[i].score);
     assert.close(scores[results[i]._id], results[i].otherScore);
+    assert.close(scores[results[i]._id], results[i].nestedObj.score);
 }
 
 // printjson(results);
@@ -67,17 +68,10 @@ assert.neq(-1, results[0].b);
 
 // Don't crash if we have no text score.
 var results = t.find({a: /text/}, {score: {$meta: "textScore"}}).toArray();
-// printjson(results);
-
-// No textScore proj. with nested fields
-assert.throws(function() {
-    t.find({$text: {$search: "blah"}}, {'x.y': {$meta: "textScore"}}).toArray();
-});
 
 // SERVER-12173
 // When $text operator is in $or, should evaluate first
 results = t.find({$or: [{$text: {$search: "textual content -irrelevant"}}, {_id: 1}]}, {
-               _idCopy: 0,
                score: {$meta: "textScore"}
            }).toArray();
 printjson(results);

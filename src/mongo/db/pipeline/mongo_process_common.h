@@ -57,7 +57,8 @@ public:
                                        CurrentOpSessionsMode sessionMode,
                                        CurrentOpUserMode userMode,
                                        CurrentOpTruncateMode truncateMode,
-                                       CurrentOpCursorMode cursorMode) const final;
+                                       CurrentOpCursorMode cursorMode,
+                                       CurrentOpBacktraceMode backtraceMode) const final;
 
     virtual std::vector<FieldPath> collectDocumentKeyFieldsActingAsRouter(
         OperationContext*, const NamespaceString&) const override;
@@ -81,7 +82,8 @@ protected:
      */
     virtual BSONObj _reportCurrentOpForClient(OperationContext* opCtx,
                                               Client* client,
-                                              CurrentOpTruncateMode truncateOps) const = 0;
+                                              CurrentOpTruncateMode truncateOps,
+                                              CurrentOpBacktraceMode backtraceMode) const = 0;
 
     /**
      * Iterates through all entries in the local SessionCatalog, and adds an entry to the 'ops'
@@ -90,6 +92,21 @@ protected:
     virtual void _reportCurrentOpsForIdleSessions(OperationContext* opCtx,
                                                   CurrentOpUserMode userMode,
                                                   std::vector<BSONObj>* ops) const = 0;
+
+
+    /**
+     * Report information about transaction coordinators by iterating through all
+     * TransactionCoordinators in the TransactionCoordinatorCatalog.
+     */
+    virtual void _reportCurrentOpsForTransactionCoordinators(OperationContext* opCtx,
+                                                             bool includeIdle,
+                                                             std::vector<BSONObj>* ops) const = 0;
+
+    /**
+     * Converts an array of field names into a set of FieldPath. Throws if 'fields' contains
+     * duplicate elements.
+     */
+    std::set<FieldPath> _convertToFieldPaths(const std::vector<std::string>& fields) const;
 };
 
 }  // namespace mongo

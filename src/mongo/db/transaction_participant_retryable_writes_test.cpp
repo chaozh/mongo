@@ -29,6 +29,8 @@
 
 #include "mongo/platform/basic.h"
 
+#include <memory>
+
 #include "mongo/db/client.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
@@ -39,13 +41,13 @@
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/oplog_entry.h"
 #include "mongo/db/repl/optime.h"
+#include "mongo/db/repl/storage_interface_impl.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/server_transactions_metrics.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/session_catalog_mongod.h"
 #include "mongo/db/transaction_participant.h"
 #include "mongo/stdx/future.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/unittest/death_test.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/net/socket_utils.h"
@@ -62,7 +64,7 @@ repl::OplogEntry makeOplogEntry(repl::OpTime opTime,
                                 repl::OpTypeEnum opType,
                                 BSONObj object,
                                 OperationSessionInfo sessionInfo,
-                                boost::optional<Date_t> wallClockTime,
+                                Date_t wallClockTime,
                                 boost::optional<StmtId> stmtId,
                                 boost::optional<repl::OpTime> prevWriteOpTimeInTransaction) {
     return repl::OplogEntry(
@@ -87,10 +89,10 @@ repl::OplogEntry makeOplogEntry(repl::OpTime opTime,
 class OpObserverMock : public OpObserverNoop {
 public:
     void onTransactionPrepare(OperationContext* opCtx,
-                              const OplogSlot& prepareOpTime,
+                              const std::vector<OplogSlot>& reservedSlots,
                               std::vector<repl::ReplOperation>& statements) override {
         ASSERT_TRUE(opCtx->lockState()->inAWriteUnitOfWork());
-        OpObserverNoop::onTransactionPrepare(opCtx, prepareOpTime, statements);
+        OpObserverNoop::onTransactionPrepare(opCtx, reservedSlots, statements);
 
         uassert(ErrorCodes::OperationFailed,
                 "onTransactionPrepare() failed",
@@ -101,7 +103,7 @@ public:
 
     bool onTransactionPrepareThrowsException = false;
     bool transactionPrepared = false;
-    stdx::function<void()> onTransactionPrepareFn = [this]() { transactionPrepared = true; };
+    std::function<void()> onTransactionPrepareFn = [this]() { transactionPrepared = true; };
 
     void onUnpreparedTransactionCommit(
         OperationContext* opCtx, const std::vector<repl::ReplOperation>& statements) override {
@@ -118,7 +120,7 @@ public:
     bool onUnpreparedTransactionCommitThrowsException = false;
     bool unpreparedTransactionCommitted = false;
 
-    stdx::function<void()> onUnpreparedTransactionCommitFn = [this]() {
+    std::function<void()> onUnpreparedTransactionCommitFn = [this]() {
         unpreparedTransactionCommitted = true;
     };
 
@@ -141,7 +143,7 @@ public:
 
     bool onPreparedTransactionCommitThrowsException = false;
     bool preparedTransactionCommitted = false;
-    stdx::function<void(OplogSlot, Timestamp)> onPreparedTransactionCommitFn =
+    std::function<void(OplogSlot, Timestamp)> onPreparedTransactionCommitFn =
         [this](OplogSlot commitOplogEntryOpTime, Timestamp commitTimestamp) {
             preparedTransactionCommitted = true;
         };
@@ -164,21 +166,20 @@ public:
 
 class TransactionParticipantRetryableWritesTest : public MockReplCoordServerFixture {
 protected:
-    void setUp() final {
+    void setUp() {
         MockReplCoordServerFixture::setUp();
-
+        const auto service = opCtx()->getServiceContext();
+        repl::StorageInterface::set(service, std::make_unique<repl::StorageInterfaceImpl>());
         MongoDSessionCatalog::onStepUp(opCtx());
 
-        const auto service = opCtx()->getServiceContext();
-
         const auto opObserverRegistry = dynamic_cast<OpObserverRegistry*>(service->getOpObserver());
-        opObserverRegistry->addObserver(stdx::make_unique<OpObserverMock>());
+        opObserverRegistry->addObserver(std::make_unique<OpObserverMock>());
 
         opCtx()->setLogicalSessionId(makeLogicalSessionIdForTest());
         _opContextSession.emplace(opCtx());
     }
 
-    void tearDown() final {
+    void tearDown() {
         _opContextSession.reset();
 
         MockReplCoordServerFixture::tearDown();
@@ -200,27 +201,19 @@ protected:
                               TxnNumber txnNumber,
                               StmtId stmtId,
                               repl::OpTime prevOpTime) {
-        OperationSessionInfo osi;
-        osi.setSessionId(lsid);
-        osi.setTxnNumber(txnNumber);
-
-        repl::OplogLink link;
-        link.prevOpTime = prevOpTime;
-
-        return repl::logOp(opCtx,
-                           "n",
-                           nss,
-                           uuid,
-                           BSON("TestValue" << 0),
-                           nullptr,
-                           false,
-                           Date_t::now(),
-                           osi,
-                           stmtId,
-                           link,
-                           false /* prepare */,
-                           false /* inTxn */,
-                           OplogSlot());
+        repl::MutableOplogEntry oplogEntry;
+        oplogEntry.setOpType(repl::OpTypeEnum::kNoop);
+        oplogEntry.setNss(nss);
+        oplogEntry.setUuid(uuid);
+        oplogEntry.setObject(BSON("TestValue" << 0));
+        oplogEntry.setWallClockTime(Date_t::now());
+        if (stmtId != kUninitializedStmtId) {
+            oplogEntry.setSessionId(lsid);
+            oplogEntry.setTxnNumber(txnNumber);
+            oplogEntry.setStatementId(stmtId);
+            oplogEntry.setPrevWriteOpTimeInTransaction(prevOpTime);
+        }
+        return repl::logOp(opCtx, &oplogEntry);
     }
 
     repl::OpTime writeTxnRecord(TxnNumber txnNum,
@@ -237,8 +230,14 @@ protected:
         WriteUnitOfWork wuow(opCtx());
         const auto opTime =
             logOp(opCtx(), kNss, uuid, session->getSessionId(), txnNum, stmtId, prevOpTime);
-        txnParticipant.onWriteOpCompletedOnPrimary(
-            opCtx(), txnNum, {stmtId}, opTime, Date_t::now(), txnState);
+
+        SessionTxnRecord sessionTxnRecord;
+        sessionTxnRecord.setSessionId(session->getSessionId());
+        sessionTxnRecord.setTxnNum(txnNum);
+        sessionTxnRecord.setLastWriteOpTime(opTime);
+        sessionTxnRecord.setLastWriteDate(Date_t::now());
+        sessionTxnRecord.setState(txnState);
+        txnParticipant.onWriteOpCompletedOnPrimary(opCtx(), {stmtId}, sessionTxnRecord);
         wuow.commit();
 
         return opTime;
@@ -397,8 +396,12 @@ TEST_F(TransactionParticipantRetryableWritesTest, SessionTransactionsCollectionN
 
     const auto uuid = UUID::gen();
     const auto opTime = logOp(opCtx(), kNss, uuid, sessionId, txnNum, 0);
-    ASSERT_THROWS(txnParticipant.onWriteOpCompletedOnPrimary(
-                      opCtx(), txnNum, {0}, opTime, Date_t::now(), boost::none),
+    SessionTxnRecord sessionTxnRecord;
+    sessionTxnRecord.setSessionId(sessionId);
+    sessionTxnRecord.setTxnNum(txnNum);
+    sessionTxnRecord.setLastWriteOpTime(opTime);
+    sessionTxnRecord.setLastWriteDate(Date_t::now());
+    ASSERT_THROWS(txnParticipant.onWriteOpCompletedOnPrimary(opCtx(), {0}, sessionTxnRecord),
                   AssertionException);
 }
 
@@ -442,7 +445,7 @@ DEATH_TEST_F(TransactionParticipantRetryableWritesTest,
 
 DEATH_TEST_F(TransactionParticipantRetryableWritesTest,
              WriteOpCompletedOnPrimaryForOldTransactionInvariants,
-             "Invariant failure txnNumber == o().activeTxnNumber") {
+             "Invariant failure sessionTxnRecord.getTxnNum() == o().activeTxnNumber") {
     auto txnParticipant = TransactionParticipant::get(opCtx());
     txnParticipant.refreshFromStorageIfNeeded(opCtx());
 
@@ -456,8 +459,13 @@ DEATH_TEST_F(TransactionParticipantRetryableWritesTest,
         AutoGetCollection autoColl(opCtx(), kNss, MODE_IX);
         WriteUnitOfWork wuow(opCtx());
         const auto opTime = logOp(opCtx(), kNss, uuid, sessionId, txnNum, 0);
-        txnParticipant.onWriteOpCompletedOnPrimary(
-            opCtx(), txnNum, {0}, opTime, Date_t::now(), boost::none);
+
+        SessionTxnRecord sessionTxnRecord;
+        sessionTxnRecord.setSessionId(sessionId);
+        sessionTxnRecord.setTxnNum(txnNum);
+        sessionTxnRecord.setLastWriteOpTime(opTime);
+        sessionTxnRecord.setLastWriteDate(Date_t::now());
+        txnParticipant.onWriteOpCompletedOnPrimary(opCtx(), {0}, sessionTxnRecord);
         wuow.commit();
     }
 
@@ -465,14 +473,19 @@ DEATH_TEST_F(TransactionParticipantRetryableWritesTest,
         AutoGetCollection autoColl(opCtx(), kNss, MODE_IX);
         WriteUnitOfWork wuow(opCtx());
         const auto opTime = logOp(opCtx(), kNss, uuid, sessionId, txnNum - 1, 0);
-        txnParticipant.onWriteOpCompletedOnPrimary(
-            opCtx(), txnNum - 1, {0}, opTime, Date_t::now(), boost::none);
+
+        SessionTxnRecord sessionTxnRecord;
+        sessionTxnRecord.setSessionId(sessionId);
+        sessionTxnRecord.setTxnNum(txnNum - 1);
+        sessionTxnRecord.setLastWriteOpTime(opTime);
+        sessionTxnRecord.setLastWriteDate(Date_t::now());
+        txnParticipant.onWriteOpCompletedOnPrimary(opCtx(), {0}, sessionTxnRecord);
     }
 }
 
 DEATH_TEST_F(TransactionParticipantRetryableWritesTest,
              WriteOpCompletedOnPrimaryForInvalidatedTransactionInvariants,
-             "Invariant failure txnNumber == o().activeTxnNumber") {
+             "Invariant failure sessionTxnRecord.getTxnNum() == o().activeTxnNumber") {
     auto txnParticipant = TransactionParticipant::get(opCtx());
     txnParticipant.refreshFromStorageIfNeeded(opCtx());
 
@@ -485,8 +498,13 @@ DEATH_TEST_F(TransactionParticipantRetryableWritesTest,
     const auto opTime = logOp(opCtx(), kNss, uuid, *opCtx()->getLogicalSessionId(), txnNum, 0);
 
     txnParticipant.invalidate(opCtx());
-    txnParticipant.onWriteOpCompletedOnPrimary(
-        opCtx(), txnNum, {0}, opTime, Date_t::now(), boost::none);
+
+    SessionTxnRecord sessionTxnRecord;
+    sessionTxnRecord.setSessionId(*opCtx()->getLogicalSessionId());
+    sessionTxnRecord.setTxnNum(txnNum);
+    sessionTxnRecord.setLastWriteOpTime(opTime);
+    sessionTxnRecord.setLastWriteDate(Date_t::now());
+    txnParticipant.onWriteOpCompletedOnPrimary(opCtx(), {0}, sessionTxnRecord);
 }
 
 TEST_F(TransactionParticipantRetryableWritesTest, IncompleteHistoryDueToOpLogTruncation) {
@@ -536,7 +554,7 @@ TEST_F(TransactionParticipantRetryableWritesTest, IncompleteHistoryDueToOpLogTru
             sessionRecord.setSessionId(sessionId);
             sessionRecord.setTxnNum(txnNum);
             sessionRecord.setLastWriteOpTime(entry2.getOpTime());
-            sessionRecord.setLastWriteDate(*entry2.getWallClockTime());
+            sessionRecord.setLastWriteDate(entry2.getWallClockTime());
             return sessionRecord.toBSON();
         }());
     }
@@ -566,63 +584,60 @@ TEST_F(TransactionParticipantRetryableWritesTest, ErrorOnlyWhenStmtIdBeingChecke
     txnParticipant.refreshFromStorageIfNeeded(opCtx());
     txnParticipant.beginOrContinue(opCtx(), txnNum, boost::none, boost::none);
 
-    OperationSessionInfo osi;
-    osi.setSessionId(sessionId);
-    osi.setTxnNumber(txnNum);
+    repl::MutableOplogEntry oplogEntry;
+    oplogEntry.setSessionId(sessionId);
+    oplogEntry.setTxnNumber(txnNum);
+    oplogEntry.setNss(kNss);
+    oplogEntry.setUuid(uuid);
 
     auto firstOpTime = ([&]() {
+        oplogEntry.setOpType(repl::OpTypeEnum::kInsert);
+        oplogEntry.setObject(BSON("x" << 1));
+        oplogEntry.setObject2(TransactionParticipant::kDeadEndSentinel);
+        oplogEntry.setPrevWriteOpTimeInTransaction(repl::OpTime());
+        oplogEntry.setStatementId(1);
+
         AutoGetCollection autoColl(opCtx(), kNss, MODE_IX);
         WriteUnitOfWork wuow(opCtx());
 
         const auto wallClockTime = Date_t::now();
+        oplogEntry.setWallClockTime(wallClockTime);
 
-        auto opTime = repl::logOp(opCtx(),
-                                  "i",
-                                  kNss,
-                                  uuid,
-                                  BSON("x" << 1),
-                                  &TransactionParticipant::kDeadEndSentinel,
-                                  false,
-                                  wallClockTime,
-                                  osi,
-                                  1,
-                                  {},
-                                  false /* prepare */,
-                                  false /* inTxn */,
-                                  OplogSlot());
-        txnParticipant.onWriteOpCompletedOnPrimary(
-            opCtx(), txnNum, {1}, opTime, wallClockTime, boost::none);
+        auto opTime = repl::logOp(opCtx(), &oplogEntry);
+
+        SessionTxnRecord sessionTxnRecord;
+        sessionTxnRecord.setSessionId(sessionId);
+        sessionTxnRecord.setTxnNum(txnNum);
+        sessionTxnRecord.setLastWriteOpTime(opTime);
+        sessionTxnRecord.setLastWriteDate(wallClockTime);
+        txnParticipant.onWriteOpCompletedOnPrimary(opCtx(), {1}, sessionTxnRecord);
         wuow.commit();
 
         return opTime;
     })();
 
     {
-        repl::OplogLink link;
-        link.prevOpTime = firstOpTime;
+        oplogEntry.setOpType(repl::OpTypeEnum::kNoop);
+        oplogEntry.setObject({});
+        oplogEntry.setObject2(TransactionParticipant::kDeadEndSentinel);
+        oplogEntry.setPrevWriteOpTimeInTransaction(firstOpTime);
+        oplogEntry.setStatementId(kIncompleteHistoryStmtId);
 
         AutoGetCollection autoColl(opCtx(), kNss, MODE_IX);
         WriteUnitOfWork wuow(opCtx());
 
         const auto wallClockTime = Date_t::now();
+        oplogEntry.setWallClockTime(wallClockTime);
 
-        auto opTime = repl::logOp(opCtx(),
-                                  "n",
-                                  kNss,
-                                  uuid,
-                                  {},
-                                  &TransactionParticipant::kDeadEndSentinel,
-                                  false,
-                                  wallClockTime,
-                                  osi,
-                                  kIncompleteHistoryStmtId,
-                                  link,
-                                  false /* prepare */,
-                                  false /* inTxn */,
-                                  OplogSlot());
+        auto opTime = repl::logOp(opCtx(), &oplogEntry);
 
+        SessionTxnRecord sessionTxnRecord;
+        sessionTxnRecord.setSessionId(sessionId);
+        sessionTxnRecord.setTxnNum(txnNum);
+        sessionTxnRecord.setLastWriteOpTime(opTime);
+        sessionTxnRecord.setLastWriteDate(Date_t::now());
         txnParticipant.onWriteOpCompletedOnPrimary(
-            opCtx(), txnNum, {kIncompleteHistoryStmtId}, opTime, wallClockTime, boost::none);
+            opCtx(), {kIncompleteHistoryStmtId}, sessionTxnRecord);
         wuow.commit();
     }
 
@@ -645,6 +660,67 @@ TEST_F(TransactionParticipantRetryableWritesTest, ErrorOnlyWhenStmtIdBeingChecke
     }
 
     ASSERT_THROWS(txnParticipant.checkStatementExecuted(opCtx(), 2), AssertionException);
+}
+
+/**
+ * Test fixture for a transaction participant running on a shard server.
+ */
+class ShardTxnParticipantRetryableWritesTest : public TransactionParticipantRetryableWritesTest {
+protected:
+    void setUp() final {
+        TransactionParticipantRetryableWritesTest::setUp();
+        serverGlobalParams.clusterRole = ClusterRole::ShardServer;
+    }
+
+    void tearDown() final {
+        serverGlobalParams.clusterRole = ClusterRole::None;
+        TransactionParticipantRetryableWritesTest::tearDown();
+    }
+};
+
+TEST_F(ShardTxnParticipantRetryableWritesTest,
+       RestartingTxnWithExecutedRetryableWriteShouldAssert) {
+    auto txnParticipant = TransactionParticipant::get(opCtx());
+    txnParticipant.refreshFromStorageIfNeeded(opCtx());
+
+    const auto& sessionId = *opCtx()->getLogicalSessionId();
+    const TxnNumber txnNum = 20;
+    opCtx()->setTxnNumber(txnNum);
+    const auto uuid = UUID::gen();
+
+    txnParticipant.beginOrContinue(opCtx(), txnNum, boost::none, boost::none);
+
+    {
+        AutoGetCollection autoColl(opCtx(), kNss, MODE_IX);
+        WriteUnitOfWork wuow(opCtx());
+        const auto opTime = logOp(opCtx(), kNss, uuid, sessionId, txnNum, 0);
+
+        SessionTxnRecord sessionTxnRecord;
+        sessionTxnRecord.setSessionId(sessionId);
+        sessionTxnRecord.setTxnNum(txnNum);
+        sessionTxnRecord.setLastWriteOpTime(opTime);
+        sessionTxnRecord.setLastWriteDate(Date_t::now());
+        txnParticipant.onWriteOpCompletedOnPrimary(opCtx(), {0}, sessionTxnRecord);
+        wuow.commit();
+    }
+
+    auto autocommit = false;
+    auto startTransaction = true;
+    opCtx()->setInMultiDocumentTransaction();
+
+    ASSERT_THROWS_CODE(
+        txnParticipant.beginOrContinue(opCtx(), txnNum, autocommit, startTransaction),
+        AssertionException,
+        50911);
+
+    // Should have the same behavior after loading state from storage.
+    txnParticipant.invalidate(opCtx());
+    txnParticipant.refreshFromStorageIfNeeded(opCtx());
+
+    ASSERT_THROWS_CODE(
+        txnParticipant.beginOrContinue(opCtx(), txnNum, autocommit, startTransaction),
+        AssertionException,
+        50911);
 }
 
 }  // namespace

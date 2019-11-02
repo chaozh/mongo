@@ -29,10 +29,10 @@
 
 #pragma once
 
-#include "mongo/base/disallow_copying.h"
+#include <functional>
+
 #include "mongo/base/status_with.h"
 #include "mongo/db/repl/optime.h"
-#include "mongo/stdx/functional.h"
 
 namespace mongo {
 namespace repl {
@@ -42,7 +42,8 @@ namespace repl {
  * interact with the rollback subsystem.
  */
 class Rollback {
-    MONGO_DISALLOW_COPYING(Rollback);
+    Rollback(const Rollback&) = delete;
+    Rollback& operator=(const Rollback&) = delete;
 
 public:
     /**
@@ -50,7 +51,7 @@ public:
      * passed in.
      */
     using OnCompletionFn =
-        stdx::function<void(const StatusWith<OpTime>& lastOpTimeApplied) noexcept>;
+        std::function<void(const StatusWith<OpTime>& lastOpTimeApplied) noexcept>;
 
     Rollback() = default;
 

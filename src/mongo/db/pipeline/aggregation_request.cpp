@@ -39,48 +39,14 @@
 #include "mongo/db/catalog/document_validation.h"
 #include "mongo/db/command_generic_argument.h"
 #include "mongo/db/commands.h"
-#include "mongo/db/pipeline/document.h"
-#include "mongo/db/pipeline/value.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/query/cursor_request.h"
 #include "mongo/db/query/query_request.h"
 #include "mongo/db/repl/read_concern_args.h"
 #include "mongo/db/storage/storage_options.h"
 
 namespace mongo {
-
-constexpr StringData AggregationRequest::kCommandName;
-constexpr StringData AggregationRequest::kCursorName;
-constexpr StringData AggregationRequest::kBatchSizeName;
-constexpr StringData AggregationRequest::kFromMongosName;
-constexpr StringData AggregationRequest::kNeedsMergeName;
-constexpr StringData AggregationRequest::kMergeByPBRTName;
-constexpr StringData AggregationRequest::kPipelineName;
-constexpr StringData AggregationRequest::kCollationName;
-constexpr StringData AggregationRequest::kExplainName;
-constexpr StringData AggregationRequest::kAllowDiskUseName;
-constexpr StringData AggregationRequest::kHintName;
-constexpr StringData AggregationRequest::kCommentName;
-constexpr StringData AggregationRequest::kExchangeName;
-
-constexpr long long AggregationRequest::kDefaultBatchSize;
-
-StatusWith<std::vector<BSONObj>> AggregationRequest::parsePipelineFromBSON(
-    BSONElement pipelineElem) {
-    std::vector<BSONObj> pipeline;
-    if (pipelineElem.eoo() || pipelineElem.type() != BSONType::Array) {
-        return {ErrorCodes::TypeMismatch, "'pipeline' option must be specified as an array"};
-    }
-
-    for (auto elem : pipelineElem.Obj()) {
-        if (elem.type() != BSONType::Object) {
-            return {ErrorCodes::TypeMismatch,
-                    "Each element of the 'pipeline' array must be an object"};
-        }
-        pipeline.push_back(elem.embeddedObject().getOwned());
-    }
-
-    return std::move(pipeline);
-}
 
 StatusWith<AggregationRequest> AggregationRequest::parseFromBSON(
     const std::string& dbName,
@@ -149,8 +115,7 @@ StatusWith<AggregationRequest> AggregationRequest::parseFromBSON(
             if (elem.type() != BSONType::Object) {
                 return {ErrorCodes::TypeMismatch,
                         str::stream() << repl::ReadConcernArgs::kReadConcernFieldName
-                                      << " must be an object, not a "
-                                      << typeName(elem.type())};
+                                      << " must be an object, not a " << typeName(elem.type())};
             }
             request.setReadConcern(elem.embeddedObject().getOwned());
         } else if (kHintName == fieldName) {
@@ -165,13 +130,6 @@ StatusWith<AggregationRequest> AggregationRequest::parseFromBSON(
                                   << " must be specified as a string representing an index"
                                   << " name, or an object representing an index's key pattern");
             }
-        } else if (kCommentName == fieldName) {
-            if (elem.type() != BSONType::String) {
-                return {ErrorCodes::TypeMismatch,
-                        str::stream() << kCommentName << " must be a string, not a "
-                                      << typeName(elem.type())};
-            }
-            request.setComment(elem.str());
         } else if (kExplainName == fieldName) {
             if (elem.type() != BSONType::Bool) {
                 return {ErrorCodes::TypeMismatch,
@@ -201,14 +159,6 @@ StatusWith<AggregationRequest> AggregationRequest::parseFromBSON(
 
             hasNeedsMergeElem = true;
             request.setNeedsMerge(elem.Bool());
-        } else if (kMergeByPBRTName == fieldName) {
-            if (elem.type() != BSONType::Bool) {
-                return {ErrorCodes::TypeMismatch,
-                        str::stream() << kMergeByPBRTName << " must be a boolean, not a "
-                                      << typeName(elem.type())};
-            }
-
-            request.setMergeByPBRT(elem.Bool());
         } else if (kAllowDiskUseName == fieldName) {
             if (storageGlobalParams.readOnly) {
                 return {ErrorCodes::IllegalOperation,
@@ -232,13 +182,37 @@ StatusWith<AggregationRequest> AggregationRequest::parseFromBSON(
         } else if (WriteConcernOptions::kWriteConcernField == fieldName) {
             if (elem.type() != BSONType::Object) {
                 return {ErrorCodes::TypeMismatch,
-                        str::stream() << fieldName << " must be an object, not a "
-                                      << typeName(elem.type())};
+                        str::stream()
+                            << fieldName << " must be an object, not a " << typeName(elem.type())};
             }
 
             WriteConcernOptions writeConcern;
             uassertStatusOK(writeConcern.parse(elem.embeddedObject()));
             request.setWriteConcern(writeConcern);
+        } else if (kRuntimeConstants == fieldName) {
+            try {
+                IDLParserErrorContext ctx("internalRuntimeConstants");
+                request.setRuntimeConstants(RuntimeConstants::parse(ctx, elem.Obj()));
+            } catch (const DBException& ex) {
+                return ex.toStatus();
+            }
+        } else if (fieldName == "mergeByPBRT"_sd) {
+            // TODO SERVER-41900: we must retain the ability to ingest the 'mergeByPBRT' field for
+            // 4.4 upgrade purposes, since a 4.2 mongoS will always send {mergeByPBRT:true} to the
+            // shards. We do nothing with it because mergeByPBRT is the only mode available in 4.4.
+            // Remove this final vestige of mergeByPBRT during the 4.5 development cycle.
+        } else if (fieldName == kUse44SortKeys) {
+            // TODO (SERVER-43361): After branching for 4.5, we will accept this option but ignore
+            // it, as we will be able to assume that any supported mongoS will be recent enough to
+            // understand the 4.4 sort key format. In the version that follows, we will be able to
+            // completely remove this option.
+            if (elem.type() != BSONType::Bool) {
+                return {ErrorCodes::TypeMismatch,
+                        str::stream() << kUse44SortKeys << " must be a boolean, not a "
+                                      << typeName(elem.type())};
+            }
+
+            request.setUse44SortKeys(elem.boolean());
         } else if (!isGenericArgument(fieldName)) {
             return {ErrorCodes::FailedToParse,
                     str::stream() << "unrecognized field '" << elem.fieldName() << "'"};
@@ -261,23 +235,20 @@ StatusWith<AggregationRequest> AggregationRequest::parseFromBSON(
     if (!hasCursorElem && !hasExplainElem) {
         return {ErrorCodes::FailedToParse,
                 str::stream()
-                    << "The '"
-                    << kCursorName
+                    << "The '" << kCursorName
                     << "' option is required, except for aggregate with the explain argument"};
     }
 
     if (request.getExplain() && cmdObj[WriteConcernOptions::kWriteConcernField]) {
         return {ErrorCodes::FailedToParse,
                 str::stream() << "Aggregation explain does not support the'"
-                              << WriteConcernOptions::kWriteConcernField
-                              << "' option"};
+                              << WriteConcernOptions::kWriteConcernField << "' option"};
     }
 
     if (hasNeedsMergeElem && !hasFromMongosElem) {
         return {ErrorCodes::FailedToParse,
                 str::stream() << "Cannot specify '" << kNeedsMergeName << "' without '"
-                              << kFromMongosName
-                              << "'"};
+                              << kFromMongosName << "'"};
     }
 
     return request;
@@ -310,7 +281,6 @@ NamespaceString AggregationRequest::parseNs(const std::string& dbname, const BSO
 }
 
 Document AggregationRequest::serializeToCommandObj() const {
-    MutableDocument serialized;
     return Document{
         {kCommandName, (_nss.isCollectionlessAggregateNS() ? Value(1) : Value(_nss.coll()))},
         {kPipelineName, _pipeline},
@@ -318,7 +288,6 @@ Document AggregationRequest::serializeToCommandObj() const {
         {kAllowDiskUseName, _allowDiskUse ? Value(true) : Value()},
         {kFromMongosName, _fromMongos ? Value(true) : Value()},
         {kNeedsMergeName, _needsMerge ? Value(true) : Value()},
-        {kMergeByPBRTName, _mergeByPBRT ? Value(true) : Value()},
         {bypassDocumentValidationCommandOption(),
          _bypassDocumentValidation ? Value(true) : Value()},
         // Only serialize a collation if one was specified.
@@ -328,8 +297,6 @@ Document AggregationRequest::serializeToCommandObj() const {
          _explainMode ? Value(Document()) : Value(Document{{kBatchSizeName, _batchSize}})},
         // Only serialize a hint if one was specified.
         {kHintName, _hint.isEmpty() ? Value() : Value(_hint)},
-        // Only serialize a comment if one was specified.
-        {kCommentName, _comment.empty() ? Value() : Value(_comment)},
         // Only serialize readConcern if specified.
         {repl::ReadConcernArgs::kReadConcernFieldName,
          _readConcern.isEmpty() ? Value() : Value(_readConcern)},
@@ -342,6 +309,9 @@ Document AggregationRequest::serializeToCommandObj() const {
         {kExchangeName, _exchangeSpec ? Value(_exchangeSpec->toBSON()) : Value()},
         {WriteConcernOptions::kWriteConcernField,
          _writeConcern ? Value(_writeConcern->toBSON()) : Value()},
+        // Only serialize runtime constants if any were specified.
+        {kRuntimeConstants, _runtimeConstants ? Value(_runtimeConstants->toBSON()) : Value()},
+        {kUse44SortKeys, _use44SortKeys ? Value(true) : Value()},
     };
 }
 }  // namespace mongo

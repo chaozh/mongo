@@ -127,7 +127,7 @@ StatusWith<CachedDatabaseInfo> CatalogCache::getDatabase(OperationContext* opCtx
               "SERVER-37398.");
     try {
         while (true) {
-            stdx::unique_lock<stdx::mutex> ul(_mutex);
+            stdx::unique_lock<Latch> ul(_mutex);
 
             auto& dbEntry = _databases[dbName];
             if (!dbEntry) {
@@ -217,7 +217,7 @@ CatalogCache::RefreshResult CatalogCache::_getCollectionRoutingInfoAt(
 
         const auto dbInfo = std::move(swDbInfo.getValue());
 
-        stdx::unique_lock<stdx::mutex> ul(_mutex);
+        stdx::unique_lock<Latch> ul(_mutex);
 
         const auto itDb = _collectionsByDb.find(nss.db());
         if (itDb == _collectionsByDb.end()) {
@@ -312,7 +312,7 @@ StatusWith<CachedCollectionRoutingInfo> CatalogCache::getShardedCollectionRoutin
 
 void CatalogCache::onStaleDatabaseVersion(const StringData dbName,
                                           const DatabaseVersion& databaseVersion) {
-    stdx::lock_guard<stdx::mutex> lg(_mutex);
+    stdx::lock_guard<Latch> lg(_mutex);
 
     const auto itDbEntry = _databases.find(dbName);
     if (itDbEntry == _databases.end()) {
@@ -345,7 +345,7 @@ void CatalogCache::onStaleShardVersion(CachedCollectionRoutingInfo&& ccriToInval
 
     // We received StaleShardVersion for a collection we thought was sharded. Either a migration
     // occurred to or from a shard we contacted, or the collection was dropped.
-    stdx::lock_guard<stdx::mutex> lg(_mutex);
+    stdx::lock_guard<Latch> lg(_mutex);
 
     const auto nss = ccri._cm->getns();
     const auto itDb = _collectionsByDb.find(nss.db());
@@ -369,12 +369,11 @@ void CatalogCache::onStaleShardVersion(CachedCollectionRoutingInfo&& ccriToInval
 
 void CatalogCache::checkEpochOrThrow(const NamespaceString& nss,
                                      ChunkVersion targetCollectionVersion) const {
-    stdx::lock_guard<stdx::mutex> lg(_mutex);
+    stdx::lock_guard<Latch> lg(_mutex);
     const auto itDb = _collectionsByDb.find(nss.db());
     uassert(StaleConfigInfo(nss, targetCollectionVersion, boost::none),
             str::stream() << "could not act as router for " << nss.ns()
-                          << ", no entry for database "
-                          << nss.db(),
+                          << ", no entry for database " << nss.db(),
             itDb != _collectionsByDb.end());
 
     auto itColl = itDb->second.find(nss.ns());
@@ -392,14 +391,13 @@ void CatalogCache::checkEpochOrThrow(const NamespaceString& nss,
     auto foundVersion = itColl->second->routingInfo->getVersion();
     uassert(StaleConfigInfo(nss, targetCollectionVersion, foundVersion),
             str::stream() << "could not act as router for " << nss.ns() << ", wanted "
-                          << targetCollectionVersion.toString()
-                          << ", but found "
+                          << targetCollectionVersion.toString() << ", but found "
                           << foundVersion.toString(),
             foundVersion.epoch() == targetCollectionVersion.epoch());
 }
 
 void CatalogCache::invalidateDatabaseEntry(const StringData dbName) {
-    stdx::lock_guard<stdx::mutex> lg(_mutex);
+    stdx::lock_guard<Latch> lg(_mutex);
     auto itDbEntry = _databases.find(dbName);
     if (itDbEntry == _databases.end()) {
         // The database was dropped.
@@ -409,7 +407,7 @@ void CatalogCache::invalidateDatabaseEntry(const StringData dbName) {
 }
 
 void CatalogCache::invalidateShardedCollection(const NamespaceString& nss) {
-    stdx::lock_guard<stdx::mutex> lg(_mutex);
+    stdx::lock_guard<Latch> lg(_mutex);
 
     auto itDb = _collectionsByDb.find(nss.db());
     if (itDb == _collectionsByDb.end()) {
@@ -422,8 +420,48 @@ void CatalogCache::invalidateShardedCollection(const NamespaceString& nss) {
     itDb->second[nss.ns()]->needsRefresh = true;
 }
 
+void CatalogCache::invalidateEntriesThatReferenceShard(const ShardId& shardId) {
+    stdx::lock_guard<Latch> lg(_mutex);
+
+    log() << "Starting to invalidate databases and collections with data on shard: " << shardId;
+
+    // Invalidate databases with this shard as their primary.
+    for (const auto& [dbNs, dbInfoEntry] : _databases) {
+        LOG(3) << "Checking if database " << dbNs << "has primary shard: " << shardId;
+        if (!dbInfoEntry->needsRefresh && dbInfoEntry->dbt->getPrimary() == shardId) {
+            LOG(3) << "Database " << dbNs << "has primary shard " << shardId
+                   << ", invalidating cache entry";
+            dbInfoEntry->needsRefresh = true;
+        }
+    }
+
+    // Invalidate collections which contain data on this shard.
+    for (const auto& [db, collInfoMap] : _collectionsByDb) {
+        for (const auto& [collNs, collRoutingInfoEntry] : collInfoMap) {
+
+            LOG(3) << "Checking if " << collNs << "has data on shard: " << shardId;
+
+            if (!collRoutingInfoEntry->needsRefresh) {
+                // The set of shards on which this collection contains chunks.
+                std::set<ShardId> shardsOwningDataForCollection;
+                collRoutingInfoEntry->routingInfo->getAllShardIds(&shardsOwningDataForCollection);
+
+                if (shardsOwningDataForCollection.find(shardId) !=
+                    shardsOwningDataForCollection.end()) {
+                    LOG(3) << collNs << "has data on shard " << shardId
+                           << ", invalidating cache entry";
+
+                    collRoutingInfoEntry->needsRefresh = true;
+                }
+            }
+        }
+    }
+
+    log() << "Finished invalidating databases and collections with data on shard: " << shardId;
+}
+
 void CatalogCache::purgeCollection(const NamespaceString& nss) {
-    stdx::lock_guard<stdx::mutex> lg(_mutex);
+    stdx::lock_guard<Latch> lg(_mutex);
 
     auto itDb = _collectionsByDb.find(nss.db());
     if (itDb == _collectionsByDb.end()) {
@@ -434,13 +472,13 @@ void CatalogCache::purgeCollection(const NamespaceString& nss) {
 }
 
 void CatalogCache::purgeDatabase(StringData dbName) {
-    stdx::lock_guard<stdx::mutex> lg(_mutex);
+    stdx::lock_guard<Latch> lg(_mutex);
     _databases.erase(dbName);
     _collectionsByDb.erase(dbName);
 }
 
 void CatalogCache::purgeAllDatabases() {
-    stdx::lock_guard<stdx::mutex> lg(_mutex);
+    stdx::lock_guard<Latch> lg(_mutex);
     _databases.clear();
     _collectionsByDb.clear();
 }
@@ -451,7 +489,7 @@ void CatalogCache::report(BSONObjBuilder* builder) const {
     size_t numDatabaseEntries;
     size_t numCollectionEntries{0};
     {
-        stdx::lock_guard<stdx::mutex> ul(_mutex);
+        stdx::lock_guard<Latch> ul(_mutex);
         numDatabaseEntries = _databases.size();
         for (const auto& entry : _collectionsByDb) {
             numCollectionEntries += entry.second.size();
@@ -464,16 +502,11 @@ void CatalogCache::report(BSONObjBuilder* builder) const {
     _stats.report(&cacheStatsBuilder);
 }
 
-void CatalogCache::_scheduleDatabaseRefresh(WithLock,
+void CatalogCache::_scheduleDatabaseRefresh(WithLock lk,
                                             const std::string& dbName,
                                             std::shared_ptr<DatabaseInfoEntry> dbEntry) {
-
-    LOG_CATALOG_REFRESH(1) << "Refreshing cached database entry for " << dbName
-                           << "; current cached database info is "
-                           << (dbEntry->dbt ? dbEntry->dbt->toBSON() : BSONObj());
-
-    const auto onRefreshCompleted =
-        [ this, t = Timer(), dbName, dbEntry ](const StatusWith<DatabaseType>& swDbt) {
+    const auto onRefreshCompleted = [this, t = Timer(), dbName, dbEntry](
+                                        const StatusWith<DatabaseType>& swDbt) {
         // TODO (SERVER-34164): Track and increment stats for database refreshes.
         if (!swDbt.isOK()) {
             LOG_CATALOG_REFRESH(0) << "Refresh for database " << dbName << " took " << t.millis()
@@ -494,8 +527,11 @@ void CatalogCache::_scheduleDatabaseRefresh(WithLock,
             << dbVersionAfterRefresh.toBSON() << " took " << t.millis() << " ms";
     };
 
+    // Invoked if getDatabase resulted in error or threw and exception
     const auto onRefreshFailed =
-        [ this, dbName, dbEntry ](WithLock lk, const Status& status) noexcept {
+        [ this, dbName, dbEntry, onRefreshCompleted ](WithLock, const Status& status) noexcept {
+        onRefreshCompleted(status);
+
         // Clear the notification so the next 'getDatabase' kicks off a new refresh attempt.
         dbEntry->refreshCompletionNotification->set(status);
         dbEntry->refreshCompletionNotification = nullptr;
@@ -508,33 +544,34 @@ void CatalogCache::_scheduleDatabaseRefresh(WithLock,
         }
     };
 
-    const auto onRefreshSucceeded = [this, dbName, dbEntry](WithLock lk, DatabaseType dbt) {
-        // Update the cached entry with the refreshed metadata and mark the entry as fresh.
-        dbEntry->dbt = std::move(dbt);
-        dbEntry->needsRefresh = false;
-        dbEntry->refreshCompletionNotification->set(Status::OK());
-        dbEntry->refreshCompletionNotification = nullptr;
-    };
+    const auto refreshCallback = [ this, dbName, dbEntry, onRefreshFailed, onRefreshCompleted ](
+        OperationContext * opCtx, StatusWith<DatabaseType> swDbt) noexcept {
+        stdx::lock_guard<Latch> lg(_mutex);
 
-    const auto updateCatalogCacheFn =
-        [ this, dbName, dbEntry, onRefreshFailed, onRefreshSucceeded, onRefreshCompleted ](
-            OperationContext * opCtx, StatusWith<DatabaseType> swDbt) noexcept {
-        onRefreshCompleted(swDbt);
-        stdx::lock_guard<stdx::mutex> lg(_mutex);
         if (!swDbt.isOK()) {
             onRefreshFailed(lg, swDbt.getStatus());
             return;
         }
-        onRefreshSucceeded(lg, std::move(swDbt.getValue()));
+
+        onRefreshCompleted(swDbt);
+
+        dbEntry->needsRefresh = false;
+        dbEntry->refreshCompletionNotification->set(Status::OK());
+        dbEntry->refreshCompletionNotification = nullptr;
+
+        dbEntry->dbt = std::move(swDbt.getValue());
     };
 
+    LOG_CATALOG_REFRESH(1) << "Refreshing cached database entry for " << dbName
+                           << "; current cached database info is "
+                           << (dbEntry->dbt ? dbEntry->dbt->toBSON() : BSONObj());
+
     try {
-        _cacheLoader.getDatabase(dbName, updateCatalogCacheFn);
+        _cacheLoader.getDatabase(dbName, refreshCallback);
     } catch (const DBException& ex) {
         const auto status = ex.toStatus();
-        stdx::lock_guard<stdx::mutex> lg(_mutex);
-        onRefreshCompleted(status);
-        onRefreshFailed(lg, status);
+
+        onRefreshFailed(lk, status);
     }
 }
 
@@ -557,8 +594,9 @@ void CatalogCache::_scheduleCollectionRefresh(WithLock lk,
     }
 
     // Invoked when one iteration of getChunksSince has completed, whether with success or error
-    const auto onRefreshCompleted = [ this, t = Timer(), nss, isIncremental, existingRoutingInfo ](
-        const Status& status, RoutingTableHistory* routingInfoAfterRefresh) {
+    const auto onRefreshCompleted = [this, t = Timer(), nss, isIncremental, existingRoutingInfo](
+                                        const Status& status,
+                                        RoutingTableHistory* routingInfoAfterRefresh) {
         if (isIncremental) {
             _stats.numActiveIncrementalRefreshes.subtractAndFetch(1);
         } else {
@@ -571,9 +609,10 @@ void CatalogCache::_scheduleCollectionRefresh(WithLock lk,
             LOG_CATALOG_REFRESH(0) << "Refresh for collection " << nss << " took " << t.millis()
                                    << " ms and failed" << causedBy(redact(status));
         } else if (routingInfoAfterRefresh) {
-            const int logLevel = (!existingRoutingInfo || (existingRoutingInfo &&
-                                                           routingInfoAfterRefresh->getVersion() !=
-                                                               existingRoutingInfo->getVersion()))
+            const int logLevel =
+                (!existingRoutingInfo ||
+                 (existingRoutingInfo &&
+                  routingInfoAfterRefresh->getVersion() != existingRoutingInfo->getVersion()))
                 ? 0
                 : 1;
             LOG_CATALOG_REFRESH(logLevel)
@@ -589,7 +628,7 @@ void CatalogCache::_scheduleCollectionRefresh(WithLock lk,
         }
     };
 
-    // Invoked if getChunksSince resulted in error
+    // Invoked if getChunksSince resulted in error or threw an exception
     const auto onRefreshFailed = [ this, collEntry, nss, refreshAttempt, onRefreshCompleted ](
         WithLock lk, const Status& status) noexcept {
         onRefreshCompleted(status, nullptr);
@@ -618,12 +657,12 @@ void CatalogCache::_scheduleCollectionRefresh(WithLock lk,
 
             onRefreshCompleted(Status::OK(), newRoutingInfo.get());
         } catch (const DBException& ex) {
-            stdx::lock_guard<stdx::mutex> lg(_mutex);
+            stdx::lock_guard<Latch> lg(_mutex);
             onRefreshFailed(lg, ex.toStatus());
             return;
         }
 
-        stdx::lock_guard<stdx::mutex> lg(_mutex);
+        stdx::lock_guard<Latch> lg(_mutex);
 
         collEntry->needsRefresh = false;
         collEntry->refreshCompletionNotification->set(Status::OK());
@@ -645,8 +684,8 @@ void CatalogCache::_scheduleCollectionRefresh(WithLock lk,
     const ChunkVersion startingCollectionVersion =
         (existingRoutingInfo ? existingRoutingInfo->getVersion() : ChunkVersion::UNSHARDED());
 
-    LOG_CATALOG_REFRESH(1) << "Refreshing chunks for collection " << nss << " based on version "
-                           << startingCollectionVersion;
+    LOG_CATALOG_REFRESH(1) << "Refreshing chunks for collection " << nss
+                           << "; current collection version is " << startingCollectionVersion;
 
     try {
         _cacheLoader.getChunksSince(nss, startingCollectionVersion, refreshCallback);
@@ -658,8 +697,7 @@ void CatalogCache::_scheduleCollectionRefresh(WithLock lk,
         // attempt.
         invariant(status != ErrorCodes::ConflictingOperationInProgress);
 
-        stdx::lock_guard<stdx::mutex> lg(_mutex);
-        onRefreshFailed(lg, status);
+        onRefreshFailed(lk, status);
     }
 
     // The routing info for this collection shouldn't change, as other threads may try to use the

@@ -122,6 +122,10 @@ public:
         _testOnly = true;
     }
 
+protected:
+    // Helper for translating setParameter values from BSON to string.
+    StatusWith<std::string> coerceToString(const BSONElement&, bool redact);
+
 private:
     std::string _name;
     bool _allowedToChangeAtStartup;
@@ -168,6 +172,7 @@ public:
     Status setFromString(const std::string& str) final;
 
 private:
+    std::once_flag _warnOnce;
     ServerParameter* _sp;
 };
 

@@ -30,7 +30,6 @@
 
 #pragma once
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
 #include "mongo/bson/bsonobj.h"
@@ -49,7 +48,8 @@ namespace repl {
  * Note: Call commit when done inserting documents.
  */
 class CollectionBulkLoaderImpl : public CollectionBulkLoader {
-    MONGO_DISALLOW_COPYING(CollectionBulkLoaderImpl);
+    CollectionBulkLoaderImpl(const CollectionBulkLoaderImpl&) = delete;
+    CollectionBulkLoaderImpl& operator=(const CollectionBulkLoaderImpl&) = delete;
 
 public:
     struct Stats {
@@ -82,6 +82,20 @@ private:
 
     template <typename F>
     Status _runTaskReleaseResourcesOnFailure(const F& task) noexcept;
+
+    /**
+     * For capped collections, each document will be inserted in its own WriteUnitOfWork.
+     */
+    Status _insertDocumentsForCappedCollection(const std::vector<BSONObj>::const_iterator begin,
+                                               const std::vector<BSONObj>::const_iterator end);
+
+    /**
+     * For uncapped collections, we will insert documents in batches of size
+     * collectionBulkLoaderBatchSizeInBytes or up to one document size greater. All insertions in a
+     * given batch will be inserted in one WriteUnitOfWork.
+     */
+    Status _insertDocumentsForUncappedCollection(const std::vector<BSONObj>::const_iterator begin,
+                                                 const std::vector<BSONObj>::const_iterator end);
 
     /**
      * Adds document and associated RecordId to index blocks after inserting into RecordStore.

@@ -5,7 +5,11 @@
  * https://github.com/mongodb/specifications/blob/master/source/sessions/driver-sessions.rst#abstract
  */
 var {
-    DriverSession, SessionOptions, _DummyDriverSession, _DelegatingDriverSession,
+    DriverSession,
+    SessionOptions,
+    _DummyDriverSession,
+    _DelegatingDriverSession,
+    _ServerSession,
 } = (function() {
     "use strict";
 
@@ -155,8 +159,6 @@ var {
             "geoNear",
             "geoSearch",
             "group",
-            "mapReduce",
-            "mapreduce",
         ]);
 
         function canUseReadConcern(driverSession, cmdObj) {
@@ -310,7 +312,7 @@ var {
             if (jsTest.options().alwaysInjectTransactionNumber &&
                 serverSupports(kWireVersionSupportingRetryableWrites) &&
                 driverSession.getOptions().shouldRetryWrites() &&
-                driverSession._serverSession.canRetryWrites(cmdObj)) {
+                _ServerSession.canRetryWrites(cmdObj)) {
                 cmdObj = driverSession._serverSession.assignTransactionNumber(cmdObj);
             }
 
@@ -418,10 +420,10 @@ var {
 
                         if (writeError !== undefined) {
                             if (jsTest.options().logRetryAttempts) {
-                                jsTest.log("Retrying " + cmdName +
-                                           " due to retryable write error (code=" +
-                                           writeError.code + "), subsequent retries remaining: " +
-                                           numRetries);
+                                jsTest.log(
+                                    "Retrying " + cmdName +
+                                    " due to retryable write error (code=" + writeError.code +
+                                    "), subsequent retries remaining: " + numRetries);
                             }
                             if (client.isReplicaSetConnection()) {
                                 client._markNodeAsFailed(
@@ -597,83 +599,6 @@ var {
             return cmdObj;
         };
 
-        this.canRetryWrites = function canRetryWrites(cmdObj) {
-            let cmdName = Object.keys(cmdObj)[0];
-
-            // If the command is in a wrapped form, then we look for the actual command name inside
-            // the query/$query object.
-            if (cmdName === "query" || cmdName === "$query") {
-                cmdObj = cmdObj[cmdName];
-                cmdName = Object.keys(cmdObj)[0];
-            }
-
-            if (cmdObj.hasOwnProperty("autocommit")) {
-                return false;
-            }
-
-            if (!isAcknowledged(cmdObj)) {
-                return false;
-            }
-
-            if (cmdName === "insert") {
-                if (!Array.isArray(cmdObj.documents)) {
-                    // The command object is malformed, so we'll just leave it as-is and let the
-                    // server reject it.
-                    return false;
-                }
-
-                // Both single-statement operations (e.g. insertOne()) and multi-statement
-                // operations (e.g. insertMany()) can be retried regardless of whether they are
-                // executed in order by the server.
-                return true;
-            } else if (cmdName === "update") {
-                if (!Array.isArray(cmdObj.updates)) {
-                    // The command object is malformed, so we'll just leave it as-is and let the
-                    // server reject it.
-                    return false;
-                }
-
-                const hasMultiUpdate = cmdObj.updates.some(updateOp => updateOp.multi);
-                if (hasMultiUpdate) {
-                    // Operations that modify multiple documents (e.g. updateMany()) cannot be
-                    // retried.
-                    return false;
-                }
-
-                // Both single-statement operations (e.g. updateOne()) and multi-statement
-                // operations (e.g. bulkWrite()) can be retried regardless of whether they are
-                // executed in order by the server.
-                return true;
-            } else if (cmdName === "delete") {
-                if (!Array.isArray(cmdObj.deletes)) {
-                    // The command object is malformed, so we'll just leave it as-is and let the
-                    // server reject it.
-                    return false;
-                }
-
-                // We use bsonWoCompare() in order to handle cases where the limit is specified as a
-                // NumberInt() or NumberLong() instance.
-                const hasMultiDelete = cmdObj.deletes.some(
-                    deleteOp => bsonWoCompare({_: deleteOp.limit}, {_: 0}) === 0);
-                if (hasMultiDelete) {
-                    // Operations that modify multiple documents (e.g. deleteMany()) cannot be
-                    // retried.
-                    return false;
-                }
-
-                // Both single-statement operations (e.g. deleteOne()) and multi-statement
-                // operations (e.g. bulkWrite()) can be retried regardless of whether they are
-                // executed in order by the server.
-                return true;
-            } else if (cmdName === "findAndModify" || cmdName === "findandmodify") {
-                // Operations that modify a single document (e.g. findOneAndUpdate()) can be
-                // retried.
-                return true;
-            }
-
-            return false;
-        };
-
         this.assignTxnInfo = function assignTxnInfo(cmdObj) {
             // We will want to reset the transaction state to 'inactive' if a normal operation
             // follows a committed or aborted transaction.
@@ -793,6 +718,20 @@ var {
             return endTransaction("abortTransaction", driverSession);
         };
 
+        this.getTxnWriteConcern = function getTxnWriteConcern(driverSession) {
+            // If a writeConcern is not specified from the default transaction options, it will be
+            // inherited from the session.
+            let writeConcern = undefined;
+            const sessionAwareClient = driverSession._getSessionAwareClient();
+            if (sessionAwareClient.getWriteConcern(driverSession) !== undefined) {
+                writeConcern = sessionAwareClient.getWriteConcern(driverSession);
+            }
+            if (_txnOptions.getTxnWriteConcern() !== undefined) {
+                writeConcern = _txnOptions.getTxnWriteConcern();
+            }
+            return writeConcern;
+        };
+
         const endTransaction = (commandName, driverSession) => {
             // If commitTransaction or abortTransaction is the first statement in a
             // transaction, it should not send a command to the server and should mark the
@@ -807,22 +746,18 @@ var {
             }
 
             let cmd = {[commandName]: 1, txnNumber: this.handle.getTxnNumber()};
-            // writeConcern should only be specified on commit or abort. If a writeConcern is
-            // not specified from the default transaction options, it will be inherited from
-            // the session.
-            const sessionAwareClient = driverSession._getSessionAwareClient();
-            if (sessionAwareClient.getWriteConcern(driverSession) !== undefined) {
-                cmd.writeConcern = sessionAwareClient.getWriteConcern(driverSession);
-            }
-            if (_txnOptions.getTxnWriteConcern() !== undefined) {
-                cmd.writeConcern = _txnOptions.getTxnWriteConcern();
+            // writeConcern should only be specified on commit or abort.
+            const writeConcern = driverSession._serverSession.getTxnWriteConcern(driverSession);
+            if (writeConcern !== undefined) {
+                cmd.writeConcern = writeConcern;
             }
 
             // If commit or abort raises an error, the transaction's state should still change.
             let res;
             try {
                 // run command against the admin database.
-                res = sessionAwareClient.runCommand(driverSession, "admin", cmd, 0);
+                res = driverSession._getSessionAwareClient().runCommand(
+                    driverSession, "admin", cmd, 0);
             } finally {
                 if (commandName === "commitTransaction") {
                     setTxnState("committed");
@@ -833,6 +768,80 @@ var {
             return res;
         };
     }
+
+    ServerSession.canRetryWrites = function canRetryWrites(cmdObj) {
+        let cmdName = Object.keys(cmdObj)[0];
+
+        // If the command is in a wrapped form, then we look for the actual command name inside the
+        // query/$query object.
+        if (cmdName === "query" || cmdName === "$query") {
+            cmdObj = cmdObj[cmdName];
+            cmdName = Object.keys(cmdObj)[0];
+        }
+
+        if (cmdObj.hasOwnProperty("autocommit")) {
+            return false;
+        }
+
+        if (!isAcknowledged(cmdObj)) {
+            return false;
+        }
+
+        if (cmdName === "insert") {
+            if (!Array.isArray(cmdObj.documents)) {
+                // The command object is malformed, so we'll just leave it as-is and let the server
+                // reject it.
+                return false;
+            }
+
+            // Both single-statement operations (e.g. insertOne()) and multi-statement operations
+            // (e.g. insertMany()) can be retried regardless of whether they are executed in order
+            // by the server.
+            return true;
+        } else if (cmdName === "update") {
+            if (!Array.isArray(cmdObj.updates)) {
+                // The command object is malformed, so we'll just leave it as-is and let the server
+                // reject it.
+                return false;
+            }
+
+            const hasMultiUpdate = cmdObj.updates.some(updateOp => updateOp.multi);
+            if (hasMultiUpdate) {
+                // Operations that modify multiple documents (e.g. updateMany()) cannot be retried.
+                return false;
+            }
+
+            // Both single-statement operations (e.g. updateOne()) and multi-statement operations
+            // (e.g. bulkWrite()) can be retried regardless of whether they are executed in order by
+            // the server.
+            return true;
+        } else if (cmdName === "delete") {
+            if (!Array.isArray(cmdObj.deletes)) {
+                // The command object is malformed, so we'll just leave it as-is and let the server
+                // reject it.
+                return false;
+            }
+
+            // We use bsonWoCompare() in order to handle cases where the limit is specified as a
+            // NumberInt() or NumberLong() instance.
+            const hasMultiDelete =
+                cmdObj.deletes.some(deleteOp => bsonWoCompare({_: deleteOp.limit}, {_: 0}) === 0);
+            if (hasMultiDelete) {
+                // Operations that modify multiple documents (e.g. deleteMany()) cannot be retried.
+                return false;
+            }
+
+            // Both single-statement operations (e.g. deleteOne()) and multi-statement operations
+            // (e.g. bulkWrite()) can be retried regardless of whether they are executed in order by
+            // the server.
+            return true;
+        } else if (cmdName === "findAndModify" || cmdName === "findandmodify") {
+            // Operations that modify a single document (e.g. findOneAndUpdate()) can be retried.
+            return true;
+        }
+
+        return false;
+    };
 
     function makeDriverSessionConstructor(implMethods, defaultOptions = {}) {
         var driverSessionConstructor = function(client, options = defaultOptions) {
@@ -873,6 +882,10 @@ var {
 
             this.getTxnNumber_forTesting = function getTxnNumber_forTesting() {
                 return this._serverSession.getTxnNumber();
+            };
+
+            this.getTxnWriteConcern_forTesting = function getTxnWriteConcern_forTesting() {
+                return this._serverSession.getTxnWriteConcern(this);
             };
 
             this.setTxnNumber_forTesting = function setTxnNumber_forTesting(newTxnNumber) {
@@ -1040,54 +1053,54 @@ var {
     const DummyDriverSession =
         makeDriverSessionConstructor(  // Force clang-format to break this line.
             {
-              createServerSession: function createServerSession(client) {
-                  return {
-                      injectSessionId: function injectSessionId(cmdObj) {
-                          return cmdObj;
-                      },
+                createServerSession: function createServerSession(client) {
+                    return {
+                        injectSessionId: function injectSessionId(cmdObj) {
+                            return cmdObj;
+                        },
 
-                      assignTransactionNumber: function assignTransactionNumber(cmdObj) {
-                          return cmdObj;
-                      },
+                        assignTransactionNumber: function assignTransactionNumber(cmdObj) {
+                            return cmdObj;
+                        },
 
-                      canRetryWrites: function canRetryWrites(cmdObj) {
-                          return false;
-                      },
+                        canRetryWrites: function canRetryWrites(cmdObj) {
+                            return false;
+                        },
 
-                      assignTxnInfo: function assignTxnInfo(cmdObj) {
-                          return cmdObj;
-                      },
+                        assignTxnInfo: function assignTxnInfo(cmdObj) {
+                            return cmdObj;
+                        },
 
-                      isTxnActive: function isTxnActive() {
-                          return false;
-                      },
+                        isTxnActive: function isTxnActive() {
+                            return false;
+                        },
 
-                      isFirstStatement: function isFirstStatement() {
-                          return false;
-                      },
+                        isFirstStatement: function isFirstStatement() {
+                            return false;
+                        },
 
-                      getTxnOptions: function getTxnOptions() {
-                          return {};
-                      },
+                        getTxnOptions: function getTxnOptions() {
+                            return {};
+                        },
 
-                      startTransaction: function startTransaction() {
-                          throw new Error("Must call startSession() on the Mongo connection " +
-                                          "object before starting a transaction.");
-                      },
+                        startTransaction: function startTransaction() {
+                            throw new Error("Must call startSession() on the Mongo connection " +
+                                            "object before starting a transaction.");
+                        },
 
-                      commitTransaction: function commitTransaction() {
-                          throw new Error("Must call startSession() on the Mongo connection " +
-                                          "object before committing a transaction.");
-                      },
+                        commitTransaction: function commitTransaction() {
+                            throw new Error("Must call startSession() on the Mongo connection " +
+                                            "object before committing a transaction.");
+                        },
 
-                      abortTransaction: function abortTransaction() {
-                          throw new Error("Must call startSession() on the Mongo connection " +
-                                          "object before aborting a transaction.");
-                      },
-                  };
-              },
+                        abortTransaction: function abortTransaction() {
+                            throw new Error("Must call startSession() on the Mongo connection " +
+                                            "object before aborting a transaction.");
+                        },
+                    };
+                },
 
-              endSession: function endSession(serverSession) {},
+                endSession: function endSession(serverSession) {},
             },
             {causalConsistency: false, retryWrites: false});
 
@@ -1101,5 +1114,6 @@ var {
         SessionOptions: SessionOptions,
         _DummyDriverSession: DummyDriverSession,
         _DelegatingDriverSession: DelegatingDriverSession,
+        _ServerSession: ServerSession,
     };
 })();

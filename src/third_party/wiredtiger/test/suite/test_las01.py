@@ -37,8 +37,8 @@ def timestamp_str(t):
 # Smoke tests to ensure lookaside tables are working.
 class test_las01(wttest.WiredTigerTestCase):
     # Force a small cache.
-    def conn_config(self):
-        return 'cache_size=50MB'
+    conn_config = 'cache_size=50MB'
+    session_config = 'isolation=snapshot'
 
     def large_updates(self, session, uri, value, ds, nrows, timestamp=False):
         # Update a large number of records, we'll hang if the lookaside table
@@ -49,7 +49,7 @@ class test_las01(wttest.WiredTigerTestCase):
                 session.begin_transaction()
             cursor.set_key(ds.key(nrows + i))
             cursor.set_value(value)
-            self.assertEquals(cursor.update(), 0)
+            self.assertEqual(cursor.update(), 0)
             if timestamp == True:
                 session.commit_transaction('commit_timestamp=' + timestamp_str(i + 1))
         cursor.close()
@@ -82,11 +82,12 @@ class test_las01(wttest.WiredTigerTestCase):
         cursor = session.open_cursor(uri, None)
         # Skip the initial rows, which were not updated
         for i in range(0, nrows+1):
-            self.assertEquals(cursor.next(), 0)
-        if (check_value != cursor.get_value()):
-            print "Check value : " + str(check_value)
-            print "value : " + str(cursor.get_value())
-        self.assertTrue(check_value == cursor.get_value())
+            self.assertEqual(cursor.next(), 0)
+        if check_value != cursor.get_value():
+            session.breakpoint()
+        self.assertTrue(check_value == cursor.get_value(),
+            "for key " + str(i) + ", expected " + str(check_value) +
+            ", got " + str(cursor.get_value()))
         cursor.close()
         session.close()
         conn.close()
@@ -97,64 +98,64 @@ class test_las01(wttest.WiredTigerTestCase):
         nrows = 100
         ds = SimpleDataSet(self, uri, nrows, key_format="S", value_format='u')
         ds.populate()
-        bigvalue = "aaaaa" * 100
+        bigvalue = b"aaaaa" * 100
 
-        # Initially load huge data
+        # Initially load huge data.
         cursor = self.session.open_cursor(uri)
         for i in range(1, 10000):
             cursor.set_key(ds.key(nrows + i))
             cursor.set_value(bigvalue)
-            self.assertEquals(cursor.insert(), 0)
+            self.assertEqual(cursor.insert(), 0)
         cursor.close()
         self.session.checkpoint()
 
         # Scenario: 1
-        # Check to see LAS working with old snapshot
-        bigvalue1 = "bbbbb" * 100
+        # Check to see if LAS is working with the old snapshot.
+        bigvalue1 = b"bbbbb" * 100
         self.session.snapshot("name=xxx")
-        # Update the values in different session after snapshot
+        # Update the values in different session after snapshot.
         self.large_updates(self.session, uri, bigvalue1, ds, nrows)
-        # Check to see the value after recovery
+        # Check to see the value after recovery.
         self.durable_check(bigvalue1, uri, ds, nrows)
         self.session.snapshot("drop=(all)")
 
         # Scenario: 2
-        # Check to see LAS working with old reader
-        bigvalue2 = "ccccc" * 100
+        # Check to see if LAS is working with the old reader.
+        bigvalue2 = b"ccccc" * 100
         session2 = self.conn.open_session()
         session2.begin_transaction('isolation=snapshot')
         self.large_updates(self.session, uri, bigvalue2, ds, nrows)
-        # Check to see the value after recovery
+        # Check to see the value after recovery.
         self.durable_check(bigvalue2, uri, ds, nrows)
         session2.rollback_transaction()
         session2.close()
 
         # Scenario: 3
-        # Check to see LAS working with modify operations
-        bigvalue3 = "ccccc" * 100
-        bigvalue3 = 'AA' + bigvalue3[2:]
+        # Check to see LAS working with modify operations.
+        bigvalue3 = b"ccccc" * 100
+        bigvalue3 = b'AA' + bigvalue3[2:]
         session2 = self.conn.open_session()
         session2.begin_transaction('isolation=snapshot')
-        # Apply two modify operations - replacing the first two items with 'A'
+        # Apply two modify operations - replacing the first two items with 'A'.
         self.session.begin_transaction()
         self.large_modifies(self.session, uri, 0, ds, nrows)
         self.large_modifies(self.session, uri, 1, ds, nrows)
         self.session.commit_transaction()
-        # Check to see the value after recovery
+        # Check to see the value after recovery.
         self.durable_check(bigvalue3, uri, ds, nrows)
         session2.rollback_transaction()
         session2.close()
 
         # Scenario: 4
-        # Check to see LAS working with old timestamp
-        bigvalue4 = "ddddd" * 100
+        # Check to see if LAS is working with the old timestamp.
+        bigvalue4 = b"ddddd" * 100
         self.conn.set_timestamp('stable_timestamp=' + timestamp_str(1))
         self.large_updates(self.session, uri, bigvalue4, ds, nrows, timestamp=True)
         # Check to see data can be see only till the stable_timestamp
         self.durable_check(bigvalue3, uri, ds, nrows)
 
         self.conn.set_timestamp('stable_timestamp=' + timestamp_str(i + 1))
-        # Check to see latest data can be seen
+        # Check that the latest data can be seen.
         self.durable_check(bigvalue4, uri, ds, nrows)
 
 if __name__ == '__main__':

@@ -85,8 +85,8 @@ function testShardedLookup(shardingTest) {
         barBulk.insert({_id: i});
         lookupShouldReturn.push({_id: i, bar_docs: [{_id: i}]});
     }
-    assert.writeOK(fooBulk.execute());
-    assert.writeOK(barBulk.execute());
+    assert.commandWorked(fooBulk.execute());
+    assert.commandWorked(barBulk.execute());
 
     var docs =
         lookupdb.foo
@@ -115,7 +115,8 @@ function mixedShardTest(options1, options2, shouldSucceed) {
         // authorized to do if auth is enabled.
         //
         // Once SERVER-14017 is fixed the "enableBalancer" line can be removed.
-        // TODO: Remove 'shardAsReplicaSet: false' when SERVER-32672 is fixed.
+        // TODO: SERVER-43899 Make sharding_with_x509.js and mixed_mode_sharded_transition.js start
+        // shards as replica sets.
         var st = new ShardingTest({
             mongos: [options1],
             config: [options1],
@@ -154,7 +155,7 @@ function mixedShardTest(options1, options2, shouldSucceed) {
         for (var i = 0; i < 128; i++) {
             bulk.insert({_id: i, string: bigstr});
         }
-        assert.writeOK(bulk.execute());
+        assert.commandWorked(bulk.execute());
         assert.eq(128, db1.col.count(), "error retrieving documents from cluster");
 
         // Split chunk to make it small enough to move
@@ -225,7 +226,20 @@ function detectDefaultTLSProtocol() {
         sslDisabledProtocols: 'none',
         useLogFiles: true,
         tlsLogVersions: "TLS1_0,TLS1_1,TLS1_2,TLS1_3",
+        waitForConnect: true,
     });
+
+    assert.eq(0,
+              runMongoProgram('mongo',
+                              '--ssl',
+                              '--port',
+                              conn.port,
+                              '--sslPEMKeyFile',
+                              'jstests/libs/client.pem',
+                              '--sslCAFile',
+                              'jstests/libs/ca.pem',
+                              '--eval',
+                              ';'));
 
     const res = conn.getDB("admin").serverStatus().transportSecurity;
 
@@ -243,4 +257,35 @@ function detectDefaultTLSProtocol() {
     } else {
         return "TLS1_3";
     }
+}
+
+function isRHEL8() {
+    if (_isWindows()) {
+        return false;
+    }
+
+    // RHEL 8 disables TLS 1.0 and TLS 1.1 as part their default crypto policy
+    // We skip tests on RHEL 8 that require these versions as a result.
+    const grep_result = runProgram('grep', 'Ootpa', '/etc/redhat-release');
+    if (grep_result == 0) {
+        return true;
+    }
+
+    return false;
+}
+
+function sslProviderSupportsTLS1_0() {
+    if (isRHEL8()) {
+        return false;
+    }
+
+    return true;
+}
+
+function sslProviderSupportsTLS1_1() {
+    if (isRHEL8()) {
+        return false;
+    }
+
+    return true;
 }

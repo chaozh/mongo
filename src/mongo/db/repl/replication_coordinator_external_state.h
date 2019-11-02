@@ -31,13 +31,12 @@
 
 #include <boost/optional.hpp>
 #include <cstddef>
+#include <functional>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/bson/timestamp.h"
 #include "mongo/db/repl/member_state.h"
 #include "mongo/db/repl/optime.h"
 #include "mongo/executor/task_executor.h"
-#include "mongo/stdx/functional.h"
 #include "mongo/util/concurrency/thread_pool.h"
 #include "mongo/util/time_support.h"
 
@@ -65,7 +64,9 @@ class ReplicationCoordinator;
  * ReplicationCoordinatorImpl should be moved here.
  */
 class ReplicationCoordinatorExternalState {
-    MONGO_DISALLOW_COPYING(ReplicationCoordinatorExternalState);
+    ReplicationCoordinatorExternalState(const ReplicationCoordinatorExternalState&) = delete;
+    ReplicationCoordinatorExternalState& operator=(const ReplicationCoordinatorExternalState&) =
+        delete;
 
 public:
     ReplicationCoordinatorExternalState() {}
@@ -158,6 +159,12 @@ public:
      */
     virtual Status storeLocalConfigDocument(OperationContext* opCtx, const BSONObj& config) = 0;
 
+
+    /**
+     * Creates the collection for "lastVote" documents and initializes it, or returns an error.
+     */
+    virtual Status createLocalLastVoteCollection(OperationContext* opCtx) = 0;
+
     /**
      * Gets the replica set lastVote document from local storage, or returns an error.
      */
@@ -185,10 +192,10 @@ public:
     virtual bool oplogExists(OperationContext* opCtx) = 0;
 
     /**
-     * Gets the last optime of an operation performed on this host, from stable
-     * storage.
+     * Gets the last optime, and corresponding wall clock time, of an operation performed on this
+     * host, from stable storage.
      */
-    virtual StatusWith<OpTime> loadLastOpTime(OperationContext* opCtx) = 0;
+    virtual StatusWith<OpTimeAndWallTime> loadLastOpTimeAndWallTime(OperationContext* opCtx) = 0;
 
     /**
      * Returns the HostAndPort of the remote client connected to us that initiated the operation
@@ -224,6 +231,11 @@ public:
      * Start bgsync's producer if it's stopped.
      */
     virtual void startProducerIfStopped() = 0;
+
+    /**
+     * True if we have discovered that no sync source's oplog overlaps with ours.
+     */
+    virtual bool tooStale() = 0;
 
     /**
      * Drops all snapshots and clears the "committed" snapshot.

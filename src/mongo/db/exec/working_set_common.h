@@ -42,18 +42,6 @@ class SeekableRecordCursor;
 class WorkingSetCommon {
 public:
     /**
-     * This must be called as part of "saveState" operations after all nodes in the tree save their
-     * state.
-     *
-     * Iterates over WorkingSetIDs in 'workingSet' which are "sensitive to yield". These are ids
-     * that have transitioned into the RID_AND_IDX state since the previous yield.
-     *
-     * The RID_AND_IDX members are tagged as suspicious so that they can be handled properly in case
-     * the document keyed by the index key is deleted or updated during the yield.
-     */
-    static void prepareForSnapshotChange(WorkingSet* workingSet);
-
-    /**
      * Transitions the WorkingSetMember with WorkingSetID 'id' from the RID_AND_IDX state to the
      * RID_AND_OBJ state by fetching a document. Does the fetch using 'cursor'.
      *
@@ -68,9 +56,9 @@ public:
                       unowned_ptr<SeekableRecordCursor> cursor);
 
     /**
-     * Build a BSONObj which represents a Status to return in a WorkingSet.
+     * Build a Document which represents a Status to return in a WorkingSet.
      */
-    static BSONObj buildMemberStatusObject(const Status& status);
+    static Document buildMemberStatusObject(const Status& status);
 
     /**
      * Allocate a new WSM and initialize it with
@@ -87,21 +75,22 @@ public:
     /**
      * Returns true if object was created by allocateStatusMember().
      */
+    static bool isValidStatusMemberObject(const Document& obj);
     static bool isValidStatusMemberObject(const BSONObj& obj);
 
     /**
-     * Returns object in working set member created with allocateStatusMember().
-     * Does not assume isValidStatusMemberObject.
-     * If the WSID is invalid or the working set member is created by
-     * allocateStatusMember, objOut will not be updated.
+     * If the working set member represents an error status, returns it as a Document (which can
+     * subsequently be converted to Status). Otherwise returns boost::none.
      */
-    static void getStatusMemberObject(const WorkingSet& ws, WorkingSetID wsid, BSONObj* objOut);
+    static boost::optional<Document> getStatusMemberDocument(const WorkingSet& ws,
+                                                             WorkingSetID wsid);
 
     /**
      * Returns status from working set member object.
      * Assumes isValidStatusMemberObject().
      */
     static Status getMemberObjectStatus(const BSONObj& memberObj);
+    static Status getMemberObjectStatus(const Document& memberObj);
 
     /**
      * Returns status from working set member created with allocateStatusMember().

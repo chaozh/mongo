@@ -60,8 +60,8 @@
 #include "mongo/db/write_concern.h"
 #include "mongo/executor/task_executor.h"
 #include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
 #include "mongo/util/scopeguard.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -73,6 +73,8 @@ using DeleteNotification = CollectionRangeDeleter::DeleteNotification;
 const WriteConcernOptions kMajorityWriteConcern(WriteConcernOptions::kMajority,
                                                 WriteConcernOptions::SyncMode::UNSET,
                                                 WriteConcernOptions::kWriteConcernTimeoutSharding);
+
+MONGO_FAIL_POINT_DEFINE(hangBeforeDoingDeletion);
 
 boost::optional<DeleteNotification> checkOverlap(std::list<Deletion> const& deletions,
                                                  ChunkRange const& range) {
@@ -93,7 +95,7 @@ CollectionRangeDeleter::CollectionRangeDeleter() = default;
 
 CollectionRangeDeleter::~CollectionRangeDeleter() {
     // Notify anybody still sleeping on orphan ranges
-    clear({ErrorCodes::InterruptedDueToStepDown, "Collection sharding metadata discarded"});
+    clear({ErrorCodes::InterruptedDueToReplStateChange, "Collection sharding metadata discarded"});
 }
 
 boost::optional<Date_t> CollectionRangeDeleter::cleanUpNextRange(
@@ -110,7 +112,7 @@ boost::optional<Date_t> CollectionRangeDeleter::cleanUpNextRange(
         }
     }
 
-    StatusWith<int> wrote = 0;
+    StatusWith<int> swNumDeleted = 0;
 
     auto range = boost::optional<ChunkRange>(boost::none);
     auto notification = DeleteNotification();
@@ -123,7 +125,7 @@ boost::optional<Date_t> CollectionRangeDeleter::cleanUpNextRange(
         auto& metadataManager = csr->_metadataManager;
 
         if (!_checkCollectionMetadataStillValid(
-                opCtx, nss, epoch, forTestOnly, collection, metadataManager)) {
+                nss, epoch, forTestOnly, collection, metadataManager)) {
             return boost::none;
         }
 
@@ -132,7 +134,7 @@ boost::optional<Date_t> CollectionRangeDeleter::cleanUpNextRange(
         bool writeOpLog = false;
 
         {
-            stdx::lock_guard<stdx::mutex> scopedLock(csr->_metadataManager->_managerLock);
+            stdx::lock_guard<Latch> scopedLock(csr->_metadataManager->_managerLock);
             if (self->isEmpty()) {
                 LOG(1) << "No further range deletions scheduled on " << nss.ns();
                 return boost::none;
@@ -176,16 +178,10 @@ boost::optional<Date_t> CollectionRangeDeleter::cleanUpNextRange(
                                 NamespaceString::kServerConfigurationNamespace.ns(),
                                 BSON("_id"
                                      << "startRangeDeletion"
-                                     << "ns"
-                                     << nss.ns()
-                                     << "epoch"
-                                     << epoch
-                                     << "min"
-                                     << range->getMin()
-                                     << "max"
-                                     << range->getMax()));
+                                     << "ns" << nss.ns() << "epoch" << epoch << "min"
+                                     << range->getMin() << "max" << range->getMax()));
             } catch (const DBException& e) {
-                stdx::lock_guard<stdx::mutex> scopedLock(csr->_metadataManager->_managerLock);
+                stdx::lock_guard<Latch> scopedLock(csr->_metadataManager->_managerLock);
                 csr->_metadataManager->_clearAllCleanups(
                     scopedLock,
                     e.toStatus("cannot push startRangeDeletion record to Op Log,"
@@ -199,22 +195,31 @@ boost::optional<Date_t> CollectionRangeDeleter::cleanUpNextRange(
         const auto& metadata = *scopedCollectionMetadata;
 
         try {
-            wrote = self->_doDeletion(
+            swNumDeleted = self->_doDeletion(
                 opCtx, collection, metadata->getKeyPattern(), *range, maxToDelete);
         } catch (const DBException& e) {
-            wrote = e.toStatus();
+            swNumDeleted = e.toStatus();
             warning() << e.what();
         }
     }  // drop autoColl
 
-    if (!wrote.isOK() || wrote.getValue() == 0) {
-        if (wrote.isOK()) {
+    bool continueDeleting = swNumDeleted.isOK() && swNumDeleted.getValue() > 0;
+
+    if (swNumDeleted == ErrorCodes::WriteConflict) {
+        CurOp::get(opCtx)->debug().additiveMetrics.incrementWriteConflicts(1);
+        continueDeleting = true;
+    }
+
+    // If there's an error or if there are no more documents to delete, take this branch.
+    // This branch means that we will NOT continue deleting documents from this range.
+    if (!continueDeleting) {
+        if (swNumDeleted.isOK()) {
             LOG(0) << "No documents remain to delete in " << nss << " range "
                    << redact(range->toString());
         }
 
-        // Wait for majority replication even when wrote isn't OK or == 0, because it might have
-        // been OK and/or > 0 previously, and the deletions must be persistent before notifying
+        // Wait for majority replication even when swNumDeleted isn't OK or == 0, because it might
+        // have been OK and/or > 0 previously, and the deletions must be persistent before notifying
         // clients in _pop().
 
         LOG(0) << "Waiting for majority replication of local deletions in " << nss.ns() << " range "
@@ -243,13 +248,13 @@ boost::optional<Date_t> CollectionRangeDeleter::cleanUpNextRange(
         auto& metadataManager = csr->_metadataManager;
 
         if (!_checkCollectionMetadataStillValid(
-                opCtx, nss, epoch, forTestOnly, collection, metadataManager)) {
+                nss, epoch, forTestOnly, collection, metadataManager)) {
             return boost::none;
         }
 
         auto* const self = forTestOnly ? forTestOnly : &metadataManager->_rangesToClean;
 
-        stdx::lock_guard<stdx::mutex> scopedLock(csr->_metadataManager->_managerLock);
+        stdx::lock_guard<Latch> scopedLock(csr->_metadataManager->_managerLock);
 
         if (!replicationStatus.isOK()) {
             LOG(0) << "Error when waiting for write concern after removing " << nss << " range "
@@ -268,7 +273,7 @@ boost::optional<Date_t> CollectionRangeDeleter::cleanUpNextRange(
             LOG(0) << "Finished deleting documents in " << nss.ns() << " range "
                    << redact(range->toString());
 
-            self->_pop(wrote.getStatus());
+            self->_pop(swNumDeleted.getStatus());
         }
 
         if (!self->_orphans.empty()) {
@@ -280,15 +285,13 @@ boost::optional<Date_t> CollectionRangeDeleter::cleanUpNextRange(
     }
 
     invariant(range);
-    invariant(wrote.getStatus());
-    invariant(wrote.getValue() > 0);
+    invariant(continueDeleting);
 
     notification.abandon();
     return Date_t::now() + Milliseconds(rangeDeleterBatchDelayMS.load());
 }
 
 bool CollectionRangeDeleter::_checkCollectionMetadataStillValid(
-    OperationContext* opCtx,
     const NamespaceString& nss,
     OID const& epoch,
     CollectionRangeDeleter* forTestOnly,
@@ -301,7 +304,7 @@ bool CollectionRangeDeleter::_checkCollectionMetadataStillValid(
     if (!scopedCollectionMetadata) {
         LOG(0) << "Abandoning any range deletions because the metadata for " << nss.ns()
                << " was reset";
-        stdx::lock_guard<stdx::mutex> lk(metadataManager->_managerLock);
+        stdx::lock_guard<Latch> lk(metadataManager->_managerLock);
         metadataManager->_clearAllCleanups(lk);
         return false;
     }
@@ -316,7 +319,7 @@ bool CollectionRangeDeleter::_checkCollectionMetadataStillValid(
                    << nss.ns();
         }
 
-        stdx::lock_guard<stdx::mutex> lk(metadataManager->_managerLock);
+        stdx::lock_guard<Latch> lk(metadataManager->_managerLock);
         metadataManager->_clearAllCleanups(lk);
         return false;
     }
@@ -345,8 +348,8 @@ StatusWith<int> CollectionRangeDeleter::_doDeletion(OperationContext* opCtx,
     auto catalog = collection->getIndexCatalog();
     const IndexDescriptor* idx = catalog->findShardKeyPrefixedIndex(opCtx, keyPattern, false);
     if (!idx) {
-        std::string msg = str::stream() << "Unable to find shard key index for "
-                                        << keyPattern.toString() << " in " << nss.ns();
+        std::string msg = str::stream()
+            << "Unable to find shard key index for " << keyPattern.toString() << " in " << nss.ns();
         LOG(0) << msg;
         return {ErrorCodes::InternalError, msg};
     }
@@ -366,8 +369,8 @@ StatusWith<int> CollectionRangeDeleter::_doDeletion(OperationContext* opCtx,
     const IndexDescriptor* descriptor =
         collection->getIndexCatalog()->findIndexByName(opCtx, indexName);
     if (!descriptor) {
-        std::string msg = str::stream() << "shard key index with name " << indexName << " on '"
-                                        << nss.ns() << "' was dropped";
+        std::string msg = str::stream()
+            << "shard key index with name " << indexName << " on '" << nss.ns() << "' was dropped";
         LOG(0) << msg;
         return {ErrorCodes::InternalError, msg};
     }
@@ -392,11 +395,21 @@ StatusWith<int> CollectionRangeDeleter::_doDeletion(OperationContext* opCtx,
                                                      PlanExecutor::YIELD_MANUAL,
                                                      InternalPlanner::FORWARD);
 
+    if (MONGO_unlikely(hangBeforeDoingDeletion.shouldFail())) {
+        LOG(0) << "Hit hangBeforeDoingDeletion failpoint";
+        hangBeforeDoingDeletion.pauseWhileSet(opCtx);
+    }
+
     PlanYieldPolicy planYieldPolicy(exec.get(), PlanExecutor::YIELD_MANUAL);
 
     int numDeleted = 0;
     do {
         BSONObj deletedObj;
+
+        // TODO SERVER-41606: Remove this function when we refactor CollectionRangeDeleter.
+        if (_throwWriteConflictForTest)
+            throw WriteConflictException();
+
         PlanExecutor::ExecState state = exec->getNext(&deletedObj, nullptr);
 
         if (state == PlanExecutor::IS_EOF) {

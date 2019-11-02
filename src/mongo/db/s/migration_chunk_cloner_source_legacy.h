@@ -30,6 +30,7 @@
 #pragma once
 
 #include <list>
+#include <memory>
 #include <set>
 
 #include "mongo/bson/bsonobj.h"
@@ -39,11 +40,10 @@
 #include "mongo/db/s/migration_chunk_cloner_source.h"
 #include "mongo/db/s/migration_session_id.h"
 #include "mongo/db/s/session_catalog_migration_source.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/s/request_types/move_chunk_request.h"
 #include "mongo/s/shard_key_pattern.h"
 #include "mongo/stdx/condition_variable.h"
-#include "mongo/stdx/memory.h"
-#include "mongo/stdx/mutex.h"
 #include "mongo/util/net/hostandport.h"
 
 namespace mongo {
@@ -54,8 +54,33 @@ class Collection;
 class Database;
 class RecordId;
 
+/**
+ * Used to commit work for LogOpForSharding. Used to keep track of changes in documents that are
+ * part of a chunk being migrated.
+ */
+class LogTransactionOperationsForShardingHandler final : public RecoveryUnit::Change {
+public:
+    /**
+     * Invariant: idObj should belong to a document that is part of the active chunk being migrated
+     */
+    LogTransactionOperationsForShardingHandler(ServiceContext* svcCtx,
+                                               const std::vector<repl::ReplOperation>& stmts,
+                                               const repl::OpTime& prepareOrCommitOpTime)
+        : _svcCtx(svcCtx), _stmts(stmts), _prepareOrCommitOpTime(prepareOrCommitOpTime) {}
+
+    void commit(boost::optional<Timestamp>) override;
+
+    void rollback() override{};
+
+private:
+    ServiceContext* _svcCtx;
+    std::vector<repl::ReplOperation> _stmts;
+    const repl::OpTime _prepareOrCommitOpTime;
+};
+
 class MigrationChunkClonerSourceLegacy final : public MigrationChunkClonerSource {
-    MONGO_DISALLOW_COPYING(MigrationChunkClonerSourceLegacy);
+    MigrationChunkClonerSourceLegacy(const MigrationChunkClonerSourceLegacy&) = delete;
+    MigrationChunkClonerSourceLegacy& operator=(const MigrationChunkClonerSourceLegacy&) = delete;
 
 public:
     MigrationChunkClonerSourceLegacy(MoveChunkRequest request,
@@ -80,7 +105,8 @@ public:
                     const repl::OpTime& opTime) override;
 
     void onUpdateOp(OperationContext* opCtx,
-                    const BSONObj& updatedDoc,
+                    boost::optional<BSONObj> preImageDoc,
+                    const BSONObj& postImageDoc,
                     const repl::OpTime& opTime,
                     const repl::OpTime& prePostImageOpTime) override;
 
@@ -119,7 +145,8 @@ public:
 
     /**
      * Called by the recipient shard. Populates the passed BSONArrayBuilder with a set of documents,
-     * which are part of the initial clone sequence.
+     * which are part of the initial clone sequence. Assumes that there is only one active caller
+     * to this method at a time (otherwise, it can cause corruption/crash).
      *
      * Returns OK status on success. If there were documents returned in the result argument, this
      * method should be called more times until the result is empty. If it returns failure, it is
@@ -164,8 +191,19 @@ public:
     boost::optional<repl::OpTime> nextSessionMigrationBatch(OperationContext* opCtx,
                                                             BSONArrayBuilder* arrBuilder);
 
+    /**
+     * Returns a notification that can be used to wait for new oplog that needs to be migrated.
+     * If the value in the notification returns true, it means that there are no more new batches
+     * that needs to be fetched because the migration has already entered the critical section or
+     * aborted.
+     *
+     * Returns nullptr if there is no session migration associated with this migration.
+     */
+    std::shared_ptr<Notification<bool>> getNotificationForNextSessionMigrationBatch();
+
 private:
     friend class LogOpForShardingHandler;
+    friend class LogTransactionOperationsForShardingHandler;
 
     // Represents the states in which the cloner can be
     enum State { kNew, kCloning, kDone };
@@ -191,33 +229,27 @@ private:
     Status _storeCurrentLocs(OperationContext* opCtx);
 
     /**
-     * Insert items from docIdList to a new array with the given fieldName in the given builder. If
-     * explode is true, the inserted object will be the full version of the document. Note that
-     * whenever an item from the docList is inserted to the array, it will also be removed from
-     * docList.
-     *
-     * Should be holding the collection lock for ns if explode is true.
+     * Adds the OpTime to the list of OpTimes for oplog entries that we should consider migrating as
+     * part of session migration.
      */
-    void _xfer(OperationContext* opCtx,
-               Database* db,
-               std::list<BSONObj>* docIdList,
-               BSONObjBuilder* builder,
-               const char* fieldName,
-               long long* sizeAccumulator,
-               bool explode);
+    void _addToSessionMigrationOptimeQueue(
+        const repl::OpTime& opTime,
+        SessionCatalogMigrationSource::EntryAtOpTimeType entryAtOpTimeType);
+
+    void _addToSessionMigrationOptimeQueueForTransactionCommit(
+        const repl::OpTime& opTime,
+        SessionCatalogMigrationSource::EntryAtOpTimeType entryAtOpTimeType);
 
     /*
-     * Consumes the operation track request and appends the relevant document changes to
-     * the appropriate internal data structures (known colloquially as the 'transfer mods queue').
-     * These structures track document changes that are part of a part of a chunk being migrated.
-     * In doing so, this the method also removes the corresponding operation track request from the
-     * operation track requests queue.
+     * Appends the relevant document changes to the appropriate internal data structures (known
+     * colloquially as the 'transfer mods queue'). These structures track document changes that are
+     * part of a part of a chunk being migrated. In doing so, this the method also removes the
+     * corresponding operation track request from the operation track requests queue.
      */
-    void _consumeOperationTrackRequestAndAddToTransferModsQueue(
-        const BSONObj& idObj,
-        const char op,
-        const repl::OpTime& opTime,
-        const repl::OpTime& prePostImageOpTime);
+    void _addToTransferModsQueue(const BSONObj& idObj,
+                                 const char op,
+                                 const repl::OpTime& opTime,
+                                 const repl::OpTime& prePostImageOpTime);
 
     /**
      * Adds an operation to the outstanding operation track requests. Returns false if the cloner
@@ -253,7 +285,27 @@ private:
      * function. Should only be used in the cleanup for this class. Should use a lock wrapped
      * around this class's mutex.
      */
-    void _drainAllOutstandingOperationTrackRequests(stdx::unique_lock<stdx::mutex>& lk);
+    void _drainAllOutstandingOperationTrackRequests(stdx::unique_lock<Latch>& lk);
+
+    /**
+     * Appends to the builder the list of _id of documents that were deleted during migration.
+     * Entries appended to the builder are removed from the list.
+     * Returns the total size of the documents that were appended + initialSize.
+     */
+    long long _xferDeletes(BSONObjBuilder* builder,
+                           std::list<BSONObj>* removeList,
+                           long long initialSize);
+
+    /**
+     * Appends to the builder the list of full documents that were modified/inserted during the
+     * migration. Entries appended to the builder are removed from the list.
+     * Returns the total size of the documents that were appended + initialSize.
+     */
+    long long _xferUpdates(OperationContext* opCtx,
+                           Database* db,
+                           BSONObjBuilder* builder,
+                           std::list<BSONObj>* updateList,
+                           long long initialSize);
 
     // The original move chunk request
     const MoveChunkRequest _args;
@@ -273,7 +325,7 @@ private:
     std::unique_ptr<SessionCatalogMigrationSource> _sessionCatalogSource;
 
     // Protects the entries below
-    stdx::mutex _mutex;
+    Mutex _mutex = MONGO_MAKE_LATCH("MigrationChunkClonerSourceLegacy::_mutex");
 
     // The current state of the cloner
     State _state{kNew};

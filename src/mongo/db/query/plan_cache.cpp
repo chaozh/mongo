@@ -42,11 +42,13 @@
 
 #include "mongo/base/owned_pointer_vector.h"
 #include "mongo/base/string_data_comparator_interface.h"
+#include "mongo/db/commands/server_status_metric.h"
 #include "mongo/db/matcher/expression_array.h"
 #include "mongo/db/matcher/expression_geo.h"
 #include "mongo/db/query/canonical_query_encoder.h"
 #include "mongo/db/query/collation/collator_interface.h"
 #include "mongo/db/query/plan_ranker.h"
+#include "mongo/db/query/planner_ixselect.h"
 #include "mongo/db/query/query_knobs_gen.h"
 #include "mongo/db/query/query_solution.h"
 #include "mongo/util/assert_util.h"
@@ -56,6 +58,9 @@
 
 namespace mongo {
 namespace {
+
+ServerStatusMetricField<Counter64> totalPlanCacheSizeEstimateBytesMetric(
+    "query.planCacheTotalSizeEstimateBytes", &PlanCacheEntry::planCacheTotalSizeEstimateBytes);
 
 // Delimiters for cache key encoding.
 const char kEncodeDiscriminatorsBegin = '<';
@@ -85,6 +90,12 @@ void encodeIndexability(const MatchExpression* tree,
 
             *keyBuilder << kEncodeDiscriminatorsEnd;
         }
+    } else if (tree->matchType() == MatchExpression::MatchType::NOT) {
+        // If the node is not compatible with any type of index, add a single '0' discriminator
+        // here. Otherwise add a '1'.
+        *keyBuilder << kEncodeDiscriminatorsBegin;
+        *keyBuilder << QueryPlannerIXSelect::logicalNodeMayBeSupportedByAnIndex(tree);
+        *keyBuilder << kEncodeDiscriminatorsEnd;
     }
 
     for (size_t i = 0; i < tree->numChildren(); ++i) {
@@ -185,59 +196,125 @@ CachedSolution::~CachedSolution() {
 // PlanCacheEntry
 //
 
-PlanCacheEntry::PlanCacheEntry(const std::vector<QuerySolution*>& solutions,
-                               PlanRankingDecision* why,
-                               uint32_t queryHash,
-                               uint32_t planCacheKey)
-    : plannerData(solutions.size()),
-      queryHash(queryHash),
-      planCacheKey(planCacheKey),
-      decision(why) {
-    invariant(why);
+std::unique_ptr<PlanCacheEntry> PlanCacheEntry::create(
+    const std::vector<QuerySolution*>& solutions,
+    std::unique_ptr<const PlanRankingDecision> decision,
+    const CanonicalQuery& query,
+    uint32_t queryHash,
+    uint32_t planCacheKey,
+    Date_t timeOfCreation,
+    bool isActive,
+    size_t works) {
+    invariant(decision);
 
     // The caller of this constructor is responsible for ensuring
     // that the QuerySolution 's' has valid cacheData. If there's no
     // data to cache you shouldn't be trying to construct a PlanCacheEntry.
 
     // Copy the solution's cache data into the plan cache entry.
+    std::vector<std::unique_ptr<const SolutionCacheData>> solutionCacheData(solutions.size());
     for (size_t i = 0; i < solutions.size(); ++i) {
         invariant(solutions[i]->cacheData.get());
-        plannerData[i] = solutions[i]->cacheData->clone();
+        solutionCacheData[i] =
+            std::unique_ptr<const SolutionCacheData>(solutions[i]->cacheData->clone());
     }
+
+    // Strip projections on $-prefixed fields, as these are added by internal callers of the
+    // system and are not considered part of the user projection.
+    const QueryRequest& qr = query.getQueryRequest();
+    BSONObjBuilder projBuilder;
+    for (auto elem : qr.getProj()) {
+        if (elem.fieldName()[0] == '$') {
+            continue;
+        }
+        projBuilder.append(elem);
+    }
+
+    return std::unique_ptr<PlanCacheEntry>(new PlanCacheEntry(
+        std::move(solutionCacheData),
+        qr.getFilter(),
+        qr.getSort(),
+        projBuilder.obj(),
+        query.getCollator() ? query.getCollator()->getSpec().toBSON() : BSONObj(),
+        timeOfCreation,
+        queryHash,
+        planCacheKey,
+        std::move(decision),
+        {},
+        isActive,
+        works));
+}
+
+PlanCacheEntry::PlanCacheEntry(std::vector<std::unique_ptr<const SolutionCacheData>> plannerData,
+                               const BSONObj& query,
+                               const BSONObj& sort,
+                               const BSONObj& projection,
+                               const BSONObj& collation,
+                               const Date_t timeOfCreation,
+                               const uint32_t queryHash,
+                               const uint32_t planCacheKey,
+                               std::unique_ptr<const PlanRankingDecision> decision,
+                               std::vector<double> feedback,
+                               const bool isActive,
+                               const size_t works)
+    : plannerData(std::move(plannerData)),
+      query(query),
+      sort(sort),
+      projection(projection),
+      collation(collation),
+      timeOfCreation(timeOfCreation),
+      queryHash(queryHash),
+      planCacheKey(planCacheKey),
+      decision(std::move(decision)),
+      feedback(std::move(feedback)),
+      isActive(isActive),
+      works(works),
+      _entireObjectSize(_estimateObjectSizeInBytes()) {
+    // Account for the object in the global metric for estimating the server's total plan cache
+    // memory consumption.
+    planCacheTotalSizeEstimateBytes.increment(_entireObjectSize);
 }
 
 PlanCacheEntry::~PlanCacheEntry() {
-    for (size_t i = 0; i < plannerData.size(); ++i) {
-        delete plannerData[i];
-    }
+    planCacheTotalSizeEstimateBytes.decrement(_entireObjectSize);
 }
 
-PlanCacheEntry* PlanCacheEntry::clone() const {
-    std::vector<std::unique_ptr<QuerySolution>> solutions;
+std::unique_ptr<PlanCacheEntry> PlanCacheEntry::clone() const {
+    std::vector<std::unique_ptr<const SolutionCacheData>> solutionCacheData(plannerData.size());
     for (size_t i = 0; i < plannerData.size(); ++i) {
-        auto qs = stdx::make_unique<QuerySolution>();
-        qs->cacheData.reset(plannerData[i]->clone());
-        solutions.push_back(std::move(qs));
+        invariant(plannerData[i]);
+        solutionCacheData[i] = std::unique_ptr<const SolutionCacheData>(plannerData[i]->clone());
     }
-    PlanCacheEntry* entry =
-        new PlanCacheEntry(transitional_tools_do_not_use::unspool_vector(solutions),
-                           decision->clone(),
-                           queryHash,
-                           planCacheKey);
 
-    // Copy query shape.
-    entry->query = query.getOwned();
-    entry->sort = sort.getOwned();
-    entry->projection = projection.getOwned();
-    entry->collation = collation.getOwned();
-    entry->timeOfCreation = timeOfCreation;
-    entry->isActive = isActive;
-    entry->works = works;
+    auto decisionPtr = std::unique_ptr<PlanRankingDecision>(decision->clone());
+    return std::unique_ptr<PlanCacheEntry>(new PlanCacheEntry(std::move(solutionCacheData),
+                                                              query,
+                                                              sort,
+                                                              projection,
+                                                              collation,
+                                                              timeOfCreation,
+                                                              queryHash,
+                                                              planCacheKey,
+                                                              std::move(decisionPtr),
+                                                              feedback,
+                                                              isActive,
+                                                              works));
+}
 
-    // Copy performance stats.
-    entry->feedback = feedback;
-
-    return entry;
+uint64_t PlanCacheEntry::_estimateObjectSizeInBytes() const {
+    return  // Add the size of each entry in 'plannerData' vector.
+        container_size_helper::estimateObjectSizeInBytes(
+            plannerData,
+            [](const auto& cacheData) { return cacheData->estimateObjectSizeInBytes(); },
+            true) +
+        // Add size of each entry in '_feedback' vector.
+        container_size_helper::estimateObjectSizeInBytes(feedback) +
+        // Add the entire size of 'decision' object.
+        (decision ? decision->estimateObjectSizeInBytes() : 0) +
+        // Add the size of all the owned BSON objects.
+        query.objsize() + sort.objsize() + projection.objsize() + collation.objsize() +
+        // Add size of the object.
+        sizeof(*this);
 }
 
 std::string PlanCacheEntry::toString() const {
@@ -262,7 +339,7 @@ void PlanCacheIndexTree::setIndexEntry(const IndexEntry& ie) {
 
 PlanCacheIndexTree* PlanCacheIndexTree::clone() const {
     PlanCacheIndexTree* root = new PlanCacheIndexTree();
-    if (NULL != entry.get()) {
+    if (nullptr != entry.get()) {
         root->index_pos = index_pos;
         root->setIndexEntry(*entry.get());
         root->canCombineBounds = canCombineBounds;
@@ -291,7 +368,7 @@ std::string PlanCacheIndexTree::toString(int indents) const {
         return result.str();
     } else {
         result << std::string(3 * indents, '-') << "Leaf ";
-        if (NULL != entry.get()) {
+        if (nullptr != entry.get()) {
             result << entry->identifier << ", pos: " << index_pos << ", can combine? "
                    << canCombineBounds;
         }
@@ -319,7 +396,7 @@ std::string PlanCacheIndexTree::toString(int indents) const {
 
 SolutionCacheData* SolutionCacheData::clone() const {
     SolutionCacheData* other = new SolutionCacheData();
-    if (NULL != this->tree.get()) {
+    if (nullptr != this->tree.get()) {
         // 'tree' could be NULL if the cached solution
         // is a collection scan.
         other->tree.reset(this->tree->clone());
@@ -354,8 +431,6 @@ std::string SolutionCacheData::toString() const {
 PlanCache::PlanCache() : PlanCache(internalQueryCacheSize.load()) {}
 
 PlanCache::PlanCache(size_t size) : _cache(size) {}
-
-PlanCache::PlanCache(const std::string& ns) : _cache(internalQueryCacheSize.load()), _ns(ns) {}
 
 PlanCache::~PlanCache() {}
 
@@ -465,18 +540,20 @@ Status PlanCache::set(const CanonicalQuery& query,
         return Status(ErrorCodes::BadValue, "number of stats in decision must match solutions");
     }
 
-    if (why->scores.size() != solns.size()) {
-        return Status(ErrorCodes::BadValue, "number of scores in decision must match solutions");
+    if (why->scores.size() != why->candidateOrder.size()) {
+        return Status(ErrorCodes::BadValue,
+                      "number of scores in decision must match viable candidates");
     }
 
-    if (why->candidateOrder.size() != solns.size()) {
+    if (why->candidateOrder.size() + why->failedCandidates.size() != solns.size()) {
         return Status(ErrorCodes::BadValue,
-                      "candidate ordering entries in decision must match solutions");
+                      "the number of viable candidates plus the number of failed candidates must "
+                      "match the number of solutions");
     }
 
     const auto key = computeKey(query);
     const size_t newWorks = why->stats[0]->common.works;
-    stdx::lock_guard<stdx::mutex> cacheLock(_cacheMutex);
+    stdx::lock_guard<Latch> cacheLock(_cacheMutex);
     bool isNewEntryActive = false;
     uint32_t queryHash;
     uint32_t planCacheKey;
@@ -511,32 +588,13 @@ Status PlanCache::set(const CanonicalQuery& query,
         isNewEntryActive = newState.shouldBeActive;
     }
 
-    auto newEntry = std::make_unique<PlanCacheEntry>(solns, why.release(), queryHash, planCacheKey);
-    const QueryRequest& qr = query.getQueryRequest();
-    newEntry->query = qr.getFilter().getOwned();
-    newEntry->sort = qr.getSort().getOwned();
-    newEntry->isActive = isNewEntryActive;
-    newEntry->works = newWorks;
-    if (query.getCollator()) {
-        newEntry->collation = query.getCollator()->getSpec().toBSON();
-    }
-    newEntry->timeOfCreation = now;
-
-    // Strip projections on $-prefixed fields, as these are added by internal callers of the query
-    // system and are not considered part of the user projection.
-    BSONObjBuilder projBuilder;
-    for (auto elem : qr.getProj()) {
-        if (elem.fieldName()[0] == '$') {
-            continue;
-        }
-        projBuilder.append(elem);
-    }
-    newEntry->projection = projBuilder.obj();
+    auto newEntry(PlanCacheEntry::create(
+        solns, std::move(why), query, queryHash, planCacheKey, now, isNewEntryActive, newWorks));
 
     std::unique_ptr<PlanCacheEntry> evictedEntry = _cache.add(key, newEntry.release());
 
-    if (NULL != evictedEntry.get()) {
-        LOG(1) << _ns << ": plan cache maximum size exceeded - "
+    if (nullptr != evictedEntry.get()) {
+        LOG(1) << query.nss() << ": plan cache maximum size exceeded - "
                << "removed least recently used entry " << redact(evictedEntry->toString());
     }
 
@@ -550,7 +608,7 @@ void PlanCache::deactivate(const CanonicalQuery& query) {
     }
 
     PlanCacheKey key = computeKey(query);
-    stdx::lock_guard<stdx::mutex> cacheLock(_cacheMutex);
+    stdx::lock_guard<Latch> cacheLock(_cacheMutex);
     PlanCacheEntry* entry = nullptr;
     Status cacheStatus = _cache.get(key, &entry);
     if (!cacheStatus.isOK()) {
@@ -567,7 +625,7 @@ PlanCache::GetResult PlanCache::get(const CanonicalQuery& query) const {
 }
 
 PlanCache::GetResult PlanCache::get(const PlanCacheKey& key) const {
-    stdx::lock_guard<stdx::mutex> cacheLock(_cacheMutex);
+    stdx::lock_guard<Latch> cacheLock(_cacheMutex);
     PlanCacheEntry* entry = nullptr;
     Status cacheStatus = _cache.get(key, &entry);
     if (!cacheStatus.isOK()) {
@@ -578,13 +636,13 @@ PlanCache::GetResult PlanCache::get(const PlanCacheKey& key) const {
 
     auto state =
         entry->isActive ? CacheEntryState::kPresentActive : CacheEntryState::kPresentInactive;
-    return {state, stdx::make_unique<CachedSolution>(key, *entry)};
+    return {state, std::make_unique<CachedSolution>(key, *entry)};
 }
 
 Status PlanCache::feedback(const CanonicalQuery& cq, double score) {
     PlanCacheKey ck = computeKey(cq);
 
-    stdx::lock_guard<stdx::mutex> cacheLock(_cacheMutex);
+    stdx::lock_guard<Latch> cacheLock(_cacheMutex);
     PlanCacheEntry* entry;
     Status cacheStatus = _cache.get(ck, &entry);
     if (!cacheStatus.isOK()) {
@@ -601,12 +659,12 @@ Status PlanCache::feedback(const CanonicalQuery& cq, double score) {
 }
 
 Status PlanCache::remove(const CanonicalQuery& canonicalQuery) {
-    stdx::lock_guard<stdx::mutex> cacheLock(_cacheMutex);
+    stdx::lock_guard<Latch> cacheLock(_cacheMutex);
     return _cache.remove(computeKey(canonicalQuery));
 }
 
 void PlanCache::clear() {
-    stdx::lock_guard<stdx::mutex> cacheLock(_cacheMutex);
+    stdx::lock_guard<Latch> cacheLock(_cacheMutex);
     _cache.clear();
 }
 
@@ -621,7 +679,7 @@ PlanCacheKey PlanCache::computeKey(const CanonicalQuery& cq) const {
 StatusWith<std::unique_ptr<PlanCacheEntry>> PlanCache::getEntry(const CanonicalQuery& query) const {
     PlanCacheKey key = computeKey(query);
 
-    stdx::lock_guard<stdx::mutex> cacheLock(_cacheMutex);
+    stdx::lock_guard<Latch> cacheLock(_cacheMutex);
     PlanCacheEntry* entry;
     Status cacheStatus = _cache.get(key, &entry);
     if (!cacheStatus.isOK()) {
@@ -633,7 +691,7 @@ StatusWith<std::unique_ptr<PlanCacheEntry>> PlanCache::getEntry(const CanonicalQ
 }
 
 std::vector<std::unique_ptr<PlanCacheEntry>> PlanCache::getAllEntries() const {
-    stdx::lock_guard<stdx::mutex> cacheLock(_cacheMutex);
+    stdx::lock_guard<Latch> cacheLock(_cacheMutex);
     std::vector<std::unique_ptr<PlanCacheEntry>> entries;
 
     for (auto&& cacheEntry : _cache) {
@@ -645,7 +703,7 @@ std::vector<std::unique_ptr<PlanCacheEntry>> PlanCache::getAllEntries() const {
 }
 
 size_t PlanCache::size() const {
-    stdx::lock_guard<stdx::mutex> cacheLock(_cacheMutex);
+    stdx::lock_guard<Latch> cacheLock(_cacheMutex);
     return _cache.size();
 }
 
@@ -657,7 +715,7 @@ std::vector<BSONObj> PlanCache::getMatchingStats(
     const std::function<BSONObj(const PlanCacheEntry&)>& serializationFunc,
     const std::function<bool(const BSONObj&)>& filterFunc) const {
     std::vector<BSONObj> results;
-    stdx::lock_guard<stdx::mutex> cacheLock(_cacheMutex);
+    stdx::lock_guard<Latch> cacheLock(_cacheMutex);
 
     for (auto&& cacheEntry : _cache) {
         const auto entry = cacheEntry.second;

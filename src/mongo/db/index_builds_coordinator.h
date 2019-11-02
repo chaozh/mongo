@@ -42,12 +42,14 @@
 #include "mongo/db/database_index_builds_tracker.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/repl_index_build_state.h"
+#include "mongo/db/storage/durable_catalog.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/stdx/condition_variable.h"
-#include "mongo/stdx/mutex.h"
 #include "mongo/util/concurrency/with_lock.h"
-#include "mongo/util/fail_point_service.h"
+#include "mongo/util/fail_point.h"
 #include "mongo/util/future.h"
 #include "mongo/util/net/hostandport.h"
+#include "mongo/util/string_map.h"
 #include "mongo/util/uuid.h"
 
 namespace mongo {
@@ -72,6 +74,7 @@ public:
      */
     struct IndexBuildOptions {
         boost::optional<CommitQuorumOptions> commitQuorum;
+        bool replSetAndNotPrimaryAtStart = false;
     };
 
     /**
@@ -98,6 +101,12 @@ public:
     static IndexBuildsCoordinator* get(OperationContext* operationContext);
 
     /**
+     * Returns true if two phase index builds are supported.
+     * This is determined by the current FCV and the server parameter 'enableTwoPhaseIndexBuild'.
+     */
+    bool supportsTwoPhaseIndexBuild() const;
+
+    /**
      * Sets up the in-memory and persisted state of the index build. A Future is returned upon which
      * the user can await the build result.
      *
@@ -108,6 +117,7 @@ public:
      */
     virtual StatusWith<SharedSemiFuture<ReplIndexBuildState::IndexCatalogStats>> startIndexBuild(
         OperationContext* opCtx,
+        StringData dbName,
         CollectionUUID collectionUUID,
         const std::vector<BSONObj>& specs,
         const UUID& buildUUID,
@@ -117,43 +127,38 @@ public:
     /**
      * Sets up the in-memory and persisted state of the index build.
      *
-     * This function should only be called when in recovery mode, because we use the DatabaseHolder
-     * to create a temporary collection using the collection catalog entry to allow us to rebuild
-     * the indexes on the collection without initializing it fully.
+     * This function should only be called when in recovery mode, because we create new Collection
+     * objects and replace old ones after dropping existing indexes.
      *
      * Returns the number of records and the size of the data iterated over, if successful.
      */
     StatusWith<std::pair<long long, long long>> startIndexRebuildForRecovery(
         OperationContext* opCtx,
-        DatabaseCatalogEntry* dbce,
-        CollectionCatalogEntry* cce,
+        const NamespaceString& nss,
         const std::vector<BSONObj>& specs,
         const UUID& buildUUID);
 
     /**
-     * TODO: not yet implemented.
+     * Waits for the index build identified by 'buildUUID' to complete.
      */
-    Future<void> joinIndexBuilds(const NamespaceString& nss,
-                                 const std::vector<BSONObj>& indexSpecs);
+    void joinIndexBuild(OperationContext* opCtx, const UUID& buildUUID);
 
     /**
      * Commits the index build identified by 'buildUUID'.
-     *
-     * TODO: not yet implemented.
      */
-    virtual Status commitIndexBuild(OperationContext* opCtx,
-                                    const std::vector<BSONObj>& specs,
-                                    const UUID& buildUUID) = 0;
+    void commitIndexBuild(OperationContext* opCtx,
+                          const std::vector<BSONObj>& specs,
+                          const UUID& buildUUID);
 
     /**
-     * Signals all the index builds to stop and then waits for them to finish. Leaves the index
-     * builds in a recoverable state.
+     * Waits for all index builds to stop after they have been interrupted during shutdown.
+     * Leaves the index builds in a recoverable state.
      *
      * This should only be called when certain the server will not start any new index builds --
      * i.e. when the server is not accepting user requests and no internal operations are
      * concurrently starting new index builds.
      */
-    void interruptAllIndexBuilds(const std::string& reason);
+    void waitForAllIndexBuildsToStopForShutdown();
 
     /**
      * Signals all of the index builds on the specified collection to abort and then waits until the
@@ -199,27 +204,23 @@ public:
     void abortDatabaseIndexBuilds(StringData db, const std::string& reason);
 
     /**
-     * Aborts a given index build by name on the given collection.
-     *
-     * TODO: This is not yet implemented.
-     */
-    Future<void> abortIndexBuildByName(const NamespaceString& nss,
-                                       const std::vector<std::string>& indexNames,
-                                       const std::string& reason);
-
-    /**
      * Aborts a given index build by index build UUID.
-     *
-     * TODO: This is not yet implemented.
      */
-    Future<void> abortIndexBuildByBuildUUID(const UUID& buildUUID, const std::string& reason);
+    void abortIndexBuildByBuildUUID(OperationContext* opCtx,
+                                    const UUID& buildUUID,
+                                    const std::string& reason);
 
     /**
-     * Signal replica set member state changes that affect cross replica set index building.
+     * Invoked when the node enters the primary state.
+     * Unblocks index builds that have been waiting to commit/abort during the secondary state.
      */
-    virtual void signalChangeToPrimaryMode() = 0;
-    virtual void signalChangeToSecondaryMode() = 0;
-    virtual void signalChangeToInitialSyncMode() = 0;
+    void onStepUp(OperationContext* opCtx);
+
+    /**
+     * Invoked when the node enters the rollback state.
+     * Unblocks index builds that have been waiting to commit/abort during the secondary state.
+     */
+    void onRollback(OperationContext* opCtx);
 
     /**
      * TODO: This is not yet implemented.
@@ -263,6 +264,11 @@ public:
     bool inProgForDb(StringData db) const;
 
     /**
+     * Uasserts if any index builds are in progress on any database.
+     */
+    void assertNoIndexBuildInProgress() const;
+
+    /**
      * Uasserts if any index builds is in progress on the specified collection.
      */
     void assertNoIndexBuildInProgForCollection(const UUID& collectionUUID) const;
@@ -274,13 +280,8 @@ public:
 
     /**
      * Waits for all index builds on a specified collection to finish.
-     *
-     * Momentarily takes the collection IS lock for 'ns', to fetch the collection UUID.
      */
-    void awaitNoBgOpInProgForNs(OperationContext* opCtx, StringData ns) const;
-    void awaitNoBgOpInProgForNs(OperationContext* opCtx, const NamespaceString& ns) const {
-        awaitNoBgOpInProgForNs(opCtx, ns.ns());
-    }
+    void awaitNoIndexBuildInProgressForCollection(const UUID& collectionUUID) const;
 
     /**
      * Waits for all index builds on a specified database to finish.
@@ -323,7 +324,13 @@ private:
     void _allowIndexBuildsOnDatabase(StringData dbName);
     void _allowIndexBuildsOnCollection(const UUID& collectionUUID);
 
-private:
+    /**
+     * Updates CurOp's 'opDescription' field with the current state of this index build.
+     */
+    void _updateCurOpOpDescription(OperationContext* opCtx,
+                                   const NamespaceString& nss,
+                                   const std::vector<BSONObj>& indexSpecs) const;
+
     /**
      * Registers an index build so that the rest of the system can discover it.
      *
@@ -349,6 +356,7 @@ protected:
      */
     StatusWith<boost::optional<SharedSemiFuture<ReplIndexBuildState::IndexCatalogStats>>>
     _registerAndSetUpIndexBuild(OperationContext* opCtx,
+                                StringData dbName,
                                 CollectionUUID collectionUUID,
                                 const std::vector<BSONObj>& specs,
                                 const UUID& buildUUID,
@@ -358,23 +366,28 @@ protected:
     /**
      * Runs the index build on the caller thread. Handles unregistering the index build and setting
      * the index build's Promise with the outcome of the index build.
+     * 'IndexBuildOptios::replSetAndNotPrimary' is determined at the start of the index build.
      */
-    void _runIndexBuild(OperationContext* opCtx, const UUID& buildUUID) noexcept;
+    void _runIndexBuild(OperationContext* opCtx,
+                        const UUID& buildUUID,
+                        const IndexBuildOptions& indexBuildOptions) noexcept;
 
     /**
      * Acquires locks and runs index build. Throws on error.
+     * 'IndexBuildOptios::replSetAndNotPrimary' is determined at the start of the index build.
      */
     void _runIndexBuildInner(OperationContext* opCtx,
-                             std::shared_ptr<ReplIndexBuildState> replState);
+                             std::shared_ptr<ReplIndexBuildState> replState,
+                             const IndexBuildOptions& indexBuildOptions);
 
     /**
      * Modularizes the _indexBuildsManager calls part of _runIndexBuildInner. Throws on error.
      */
     void _buildIndex(OperationContext* opCtx,
-                     Collection* collection,
-                     const NamespaceString& nss,
+                     const NamespaceStringOrUUID& dbAndUUID,
                      std::shared_ptr<ReplIndexBuildState> replState,
-                     Lock::DBLock* dbLock);
+                     const IndexBuildOptions& indexBuildOptions,
+                     boost::optional<Lock::CollectionLock>* collLock);
     /**
      * Returns total number of indexes in collection, including unfinished/in-progress indexes.
      *
@@ -412,8 +425,19 @@ protected:
         ReplIndexBuildState::IndexCatalogStats& indexCatalogStats,
         const UUID& buildUUID) noexcept;
 
+    /**
+     * Looks up active index build by UUID.
+     */
+    StatusWith<std::shared_ptr<ReplIndexBuildState>> _getIndexBuild(const UUID& buildUUID) const;
+
+    /**
+     * Returns a snapshot of active index builds. Since each index build state is reference counted,
+     * it is fine to examine the returned index builds without re-locking 'mutex'.
+     */
+    std::vector<std::shared_ptr<ReplIndexBuildState>> _getIndexBuilds() const;
+
     // Protects the below state.
-    mutable stdx::mutex _mutex;
+    mutable Mutex _mutex = MONGO_MAKE_LATCH("IndexBuildsCoordinator::_mutex");
 
     // New index builds are not allowed on a collection or database if the collection or database is
     // in either of these maps. These are used when concurrent operations need to abort index builds
@@ -458,7 +482,8 @@ protected:
  * builds should be scheduled.
  */
 class ScopedStopNewDatabaseIndexBuilds {
-    MONGO_DISALLOW_COPYING(ScopedStopNewDatabaseIndexBuilds);
+    ScopedStopNewDatabaseIndexBuilds(const ScopedStopNewDatabaseIndexBuilds&) = delete;
+    ScopedStopNewDatabaseIndexBuilds& operator=(const ScopedStopNewDatabaseIndexBuilds&) = delete;
 
 public:
     /**
@@ -488,7 +513,9 @@ private:
  * builds should be scheduled.
  */
 class ScopedStopNewCollectionIndexBuilds {
-    MONGO_DISALLOW_COPYING(ScopedStopNewCollectionIndexBuilds);
+    ScopedStopNewCollectionIndexBuilds(const ScopedStopNewCollectionIndexBuilds&) = delete;
+    ScopedStopNewCollectionIndexBuilds& operator=(const ScopedStopNewCollectionIndexBuilds&) =
+        delete;
 
 public:
     /**
@@ -509,8 +536,8 @@ private:
 
 // These fail points are used to control index build progress. Declared here to be shared
 // temporarily between createIndexes command and IndexBuildsCoordinator.
-MONGO_FAIL_POINT_DECLARE(hangAfterIndexBuildFirstDrain);
-MONGO_FAIL_POINT_DECLARE(hangAfterIndexBuildSecondDrain);
-MONGO_FAIL_POINT_DECLARE(hangAfterIndexBuildDumpsInsertsFromBulk);
+extern FailPoint hangAfterIndexBuildFirstDrain;
+extern FailPoint hangAfterIndexBuildSecondDrain;
+extern FailPoint hangAfterIndexBuildDumpsInsertsFromBulk;
 
 }  // namespace mongo

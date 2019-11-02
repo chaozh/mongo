@@ -29,9 +29,9 @@
 
 #pragma once
 
+#include <functional>
 #include <memory>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/base/status_with.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/repl/data_replicator_external_state.h"
@@ -42,9 +42,9 @@
 #include "mongo/db/repl/optime.h"
 #include "mongo/db/repl/rollback_impl.h"
 #include "mongo/db/repl/sync_source_resolver.h"
+#include "mongo/platform/atomic_word.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/stdx/condition_variable.h"
-#include "mongo/stdx/functional.h"
-#include "mongo/stdx/mutex.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/util/net/hostandport.h"
 
@@ -62,7 +62,8 @@ class ReplicationProcess;
 class StorageInterface;
 
 class BackgroundSync {
-    MONGO_DISALLOW_COPYING(BackgroundSync);
+    BackgroundSync(const BackgroundSync&) = delete;
+    BackgroundSync& operator=(const BackgroundSync&) = delete;
 
 public:
     /**
@@ -115,6 +116,11 @@ public:
      * Once this returns true, nothing more will be added to the queue and consumers must shutdown.
      */
     bool inShutdown() const;
+
+    /**
+     * Returns true if we have discovered that no sync source's oplog overlaps with ours.
+     */
+    bool tooStale() const;
 
     // starts the sync target notifying thread
     void notifierThread();
@@ -215,22 +221,22 @@ private:
     ReplicationProcess* _replicationProcess;
 
     /**
-      * All member variables are labeled with one of the following codes indicating the
-      * synchronization rules for accessing them:
-      *
-      * (PR) Completely private to BackgroundSync. Can be read or written to from within the main
-      *      BackgroundSync thread without synchronization. Shouldn't be accessed outside of this
-      *      thread.
-      *
-      * (S)  Self-synchronizing; access in any way from any context.
-      *
-      * (M)  Reads and writes guarded by _mutex
-      *
+     * All member variables are labeled with one of the following codes indicating the
+     * synchronization rules for accessing them:
+     *
+     * (PR) Completely private to BackgroundSync. Can be read or written to from within the main
+     *      BackgroundSync thread without synchronization. Shouldn't be accessed outside of this
+     *      thread.
+     *
+     * (S)  Self-synchronizing; access in any way from any context.
+     *
+     * (M)  Reads and writes guarded by _mutex
+     *
      */
 
     // Protects member data of BackgroundSync.
     // Never hold the BackgroundSync mutex when trying to acquire the ReplicationCoordinator mutex.
-    mutable stdx::mutex _mutex;  // (S)
+    mutable Mutex _mutex = MONGO_MAKE_LATCH("BackgroundSync::_mutex");  // (S)
 
     OpTime _lastOpTimeFetched;  // (M)
 
@@ -242,7 +248,7 @@ private:
 
     // Flag that marks whether a node's oplog has no common point with any
     // potential sync sources.
-    bool _tooStale = false;  // (PR)
+    AtomicWord<bool> _tooStale{false};  // (S)
 
     ProducerState _state = ProducerState::Starting;  // (M)
 

@@ -34,8 +34,8 @@
 #include <boost/optional.hpp>
 
 #include "mongo/base/init.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/stdx/condition_variable.h"
-#include "mongo/stdx/mutex.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/unittest/barrier.h"
 #include "mongo/unittest/death_test.h"
@@ -52,7 +52,7 @@ using namespace mongo;
 
 MONGO_INITIALIZER(ThreadPoolCommonTests)(InitializerContext*) {
     addTestsForThreadPool("ThreadPoolCommon",
-                          []() { return stdx::make_unique<ThreadPool>(ThreadPool::Options()); });
+                          []() { return std::make_unique<ThreadPool>(ThreadPool::Options()); });
     return Status::OK();
 }
 
@@ -70,7 +70,7 @@ protected:
     }
 
     void blockingWork() {
-        stdx::unique_lock<stdx::mutex> lk(mutex);
+        stdx::unique_lock<Latch> lk(mutex);
         ++count1;
         cv1.notify_all();
         while (!flag2) {
@@ -78,7 +78,7 @@ protected:
         }
     }
 
-    stdx::mutex mutex;
+    Mutex mutex = MONGO_MAKE_LATCH("ThreadPoolTest::mutex");
     stdx::condition_variable cv1;
     stdx::condition_variable cv2;
     size_t count1 = 0U;
@@ -86,7 +86,7 @@ protected:
 
 private:
     void tearDown() override {
-        stdx::unique_lock<stdx::mutex> lk(mutex);
+        stdx::unique_lock<Latch> lk(mutex);
         flag2 = true;
         cv2.notify_all();
         lk.unlock();
@@ -103,15 +103,18 @@ TEST_F(ThreadPoolTest, MinPoolSize0) {
     auto& pool = makePool(options);
     pool.startup();
     ASSERT_EQ(0U, pool.getStats().numThreads);
-    stdx::unique_lock<stdx::mutex> lk(mutex);
-    ASSERT_OK(pool.schedule([this] { blockingWork(); }));
+    stdx::unique_lock<Latch> lk(mutex);
+    pool.schedule([this](auto status) {
+        ASSERT_OK(status);
+        blockingWork();
+    });
     while (count1 != 1U) {
         cv1.wait(lk);
     }
     auto stats = pool.getStats();
     ASSERT_EQUALS(1U, stats.numThreads);
     ASSERT_EQUALS(0U, stats.numPendingTasks);
-    ASSERT_OK(pool.schedule([] {}));
+    pool.schedule([](auto status) { ASSERT_OK(status); });
     stats = pool.getStats();
     ASSERT_EQUALS(1U, stats.numThreads);
     ASSERT_EQUALS(0U, stats.numIdleThreads);
@@ -129,7 +132,10 @@ TEST_F(ThreadPoolTest, MinPoolSize0) {
     lk.lock();
     flag2 = false;
     count1 = 0;
-    ASSERT_OK(pool.schedule([this] { blockingWork(); }));
+    pool.schedule([this](auto status) {
+        ASSERT_OK(status);
+        blockingWork();
+    });
     while (count1 == 0) {
         cv1.wait(lk);
     }
@@ -149,9 +155,12 @@ TEST_F(ThreadPoolTest, MaxPoolSize20MinPoolSize15) {
     options.maxIdleThreadAge = Milliseconds(100);
     auto& pool = makePool(options);
     pool.startup();
-    stdx::unique_lock<stdx::mutex> lk(mutex);
+    stdx::unique_lock<Latch> lk(mutex);
     for (size_t i = 0U; i < 30U; ++i) {
-        ASSERT_OK(pool.schedule([this] { blockingWork(); })) << i;
+        pool.schedule([this, i](auto status) {
+            ASSERT_OK(status) << i;
+            blockingWork();
+        });
     }
     while (count1 < 20U) {
         cv1.wait(lk);
@@ -214,7 +223,7 @@ DEATH_TEST(ThreadPoolTest,
     // mutex-lock is blocked waiting for the mutex, so the independent thread must be blocked inside
     // of join(), until the pool thread finishes. At this point, if we destroy the pool, its
     // destructor should trigger a fatal error due to double-join.
-    stdx::mutex mutex;
+    auto mutex = MONGO_MAKE_LATCH();
     ThreadPool::Options options;
     options.minThreads = 2;
     options.poolName = "DoubleJoinPool";
@@ -224,8 +233,11 @@ DEATH_TEST(ThreadPoolTest,
     while (pool->getStats().numThreads < 2U) {
         sleepmillis(50);
     }
-    stdx::unique_lock<stdx::mutex> lk(mutex);
-    ASSERT_OK(pool->schedule([&mutex] { stdx::lock_guard<stdx::mutex> lk(mutex); }));
+    stdx::unique_lock<Latch> lk(mutex);
+    pool->schedule([&mutex](auto status) {
+        ASSERT_OK(status);
+        stdx::lock_guard<Latch> lk(mutex);
+    });
     stdx::thread t([&pool] {
         pool->shutdown();
         pool->join();
@@ -257,7 +269,10 @@ TEST_F(ThreadPoolTest, ThreadPoolRunsOnCreateThreadFunctionBeforeConsumingTasks)
     ThreadPool pool(options);
     pool.startup();
 
-    ASSERT_OK(pool.schedule([&barrier] { barrier.countDownAndWait(); }));
+    pool.schedule([&barrier](auto status) {
+        ASSERT_OK(status);
+        barrier.countDownAndWait();
+    });
     barrier.countDownAndWait();
 
     ASSERT_TRUE(onCreateThreadCalled);

@@ -38,9 +38,8 @@
 #include <ostream>
 #include <sstream>
 
-#include "mongo/platform/process_id.h"
 #include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 #include "mongo/util/text.h"
 
 namespace mongo {
@@ -109,8 +108,7 @@ Status StorageEngineLockFile::open() {
     } catch (const std::exception& ex) {
         return Status(ErrorCodes::UnknownError,
                       str::stream() << "Unable to check existence of data directory " << _dbpath
-                                    << ": "
-                                    << ex.what());
+                                    << ": " << ex.what());
     }
 
     HANDLE lockFileHandle = CreateFileW(toNativeString(_filespec.c_str()).c_str(),
@@ -131,13 +129,11 @@ Status StorageEngineLockFile::open() {
         }
         return Status(ErrorCodes::DBPathInUse,
                       str::stream() << "Unable to create/open the lock file: " << _filespec << " ("
-                                    << errnoWithDescription(errorcode)
-                                    << ")."
+                                    << errnoWithDescription(errorcode) << ")."
                                     << " Ensure the user executing mongod is the owner of the lock "
                                        "file and has the appropriate permissions. Also make sure "
                                        "that another mongod instance is not already running on the "
-                                    << _dbpath
-                                    << " directory");
+                                    << _dbpath << " directory");
     }
     _lockFileHandle->_handle = lockFileHandle;
     return Status::OK();
@@ -151,10 +147,10 @@ void StorageEngineLockFile::close() {
     _lockFileHandle->clear();
 }
 
-Status StorageEngineLockFile::writePid() {
+Status StorageEngineLockFile::writeString(StringData str) {
     if (!_lockFileHandle->isValid()) {
         return Status(ErrorCodes::FileNotOpen,
-                      str::stream() << "Unable to write process ID to " << _filespec
+                      str::stream() << "Unable to write string to " << _filespec
                                     << " because file has not been opened.");
     }
 
@@ -163,28 +159,19 @@ Status StorageEngineLockFile::writePid() {
         return status;
     }
 
-    ProcessId pid = ProcessId::getCurrent();
-    std::stringstream ss;
-    ss << pid << std::endl;
-    std::string pidStr = ss.str();
     DWORD bytesWritten = 0;
     if (::WriteFile(_lockFileHandle->_handle,
-                    static_cast<LPCVOID>(pidStr.c_str()),
-                    static_cast<DWORD>(pidStr.size()),
+                    static_cast<LPCVOID>(str.rawData()),
+                    static_cast<DWORD>(str.size()),
                     &bytesWritten,
                     NULL) == FALSE) {
         int errorcode = GetLastError();
         return Status(ErrorCodes::FileStreamFailed,
-                      str::stream() << "Unable to write process id " << pid.toString()
-                                    << " to file: "
-                                    << _filespec
-                                    << ' '
-                                    << errnoWithDescription(errorcode));
+                      str::stream() << "Unable to write string " << str << " to file: " << _filespec
+                                    << ' ' << errnoWithDescription(errorcode));
     } else if (bytesWritten == 0) {
         return Status(ErrorCodes::FileStreamFailed,
-                      str::stream() << "Unable to write process id " << pid.toString()
-                                    << " to file: "
-                                    << _filespec
+                      str::stream() << "Unable to write string " << str << " to file: " << _filespec
                                     << " no data written.");
     }
 

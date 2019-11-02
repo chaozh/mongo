@@ -29,13 +29,13 @@
 
 #pragma once
 
+#include <functional>
 #include <iosfwd>
 #include <memory>
 #include <string>
 #include <utility>
 #include <vector>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
 #include "mongo/db/jsobj.h"
@@ -43,9 +43,8 @@
 #include "mongo/db/repl/oplog_entry.h"
 #include "mongo/db/service_context.h"
 #include "mongo/executor/task_executor.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/stdx/condition_variable.h"
-#include "mongo/stdx/functional.h"
-#include "mongo/stdx/mutex.h"
 
 namespace mongo {
 namespace repl {
@@ -53,7 +52,8 @@ namespace repl {
 class OpTime;
 
 class MultiApplier {
-    MONGO_DISALLOW_COPYING(MultiApplier);
+    MultiApplier(const MultiApplier&) = delete;
+    MultiApplier& operator=(const MultiApplier&) = delete;
 
 public:
     /**
@@ -69,7 +69,7 @@ public:
     using CallbackFn = unique_function<void(const Status&)>;
 
     using MultiApplyFn =
-        stdx::function<StatusWith<OpTime>(OperationContext*, MultiApplier::Operations)>;
+        std::function<StatusWith<OpTime>(OperationContext*, MultiApplier::Operations)>;
 
     /**
      * Creates MultiApplier in inactive state.
@@ -149,7 +149,7 @@ private:
     CallbackFn _onCompletion;
 
     // Protects member data of this MultiApplier.
-    mutable stdx::mutex _mutex;
+    mutable Mutex _mutex = MONGO_MAKE_LATCH("MultiApplier::_mutex");
 
     stdx::condition_variable _condition;
 

@@ -42,6 +42,7 @@
 #include "mongo/db/storage/record_store.h"
 
 namespace mongo {
+
 class Client;
 class Collection;
 
@@ -85,8 +86,8 @@ enum class IndexBuildMethod {
  * To inspect the contents of this IndexCatalog, callers may obtain an iterator from
  * getIndexIterator().
  *
- * Index building functionality is supported by the IndexBuildBlockInterface interface. However, it
- * is recommended to use the higher level MultiIndexBlock interface.
+ * Index building functionality is supported by the IndexBuildBlock interface. However, it is
+ * recommended to use the higher level MultiIndexBlock interface.
  *
  * Due to the resource-intensive nature of the index building process, this interface also provides
  * information on which indexes are available for queries through the following functions:
@@ -148,61 +149,6 @@ public:
         std::unique_ptr<std::vector<IndexCatalogEntry*>> _ownedContainer;
     };
 
-    /**
-     * Interface for building a single index from an index spec and persisting its state to disk.
-     */
-    class IndexBuildBlockInterface {
-    public:
-        virtual ~IndexBuildBlockInterface() = default;
-
-        /**
-         * Must be called before the object is destructed if init() has been called.
-         * Cleans up the temporary tables that are created for an index build.
-         */
-        virtual void deleteTemporaryTables(OperationContext* opCtx) = 0;
-
-        /**
-         * Initializes a new entry for the index in the IndexCatalog.
-         *
-         * On success, holds pointer to newly created IndexCatalogEntry that can be accessed using
-         * getEntry(). IndexCatalog will still own the entry.
-         *
-         * Must be called from within a `WriteUnitOfWork`
-         */
-        virtual Status init(OperationContext* opCtx, Collection* collection) = 0;
-
-        /**
-         * Marks the state of the index as 'ready' and commits the index to disk.
-         *
-         * Must be called from within a `WriteUnitOfWork`
-         */
-        virtual void success(OperationContext* opCtx, Collection* collection) = 0;
-
-        /**
-         * Aborts the index build and removes any on-disk state where applicable.
-         *
-         * Must be called from within a `WriteUnitOfWork`
-         */
-        virtual void fail(OperationContext* opCtx, const Collection* collection) = 0;
-
-        /**
-         * Returns the IndexCatalogEntry that was created in init().
-         *
-         * This entry is owned by the IndexCatalog.
-         */
-        virtual IndexCatalogEntry* getEntry() = 0;
-
-        /**
-         * Returns the name of the index managed by this index builder.
-         */
-        virtual const std::string& getIndexName() const = 0;
-
-        /**
-         * Returns the index spec used to build this index.
-         */
-        virtual const BSONObj& getSpec() const = 0;
-    };
-
     IndexCatalog() = default;
     virtual ~IndexCatalog() = default;
 
@@ -212,11 +158,11 @@ public:
     // Must be called before used.
     virtual Status init(OperationContext* const opCtx) = 0;
 
-    virtual bool ok() const = 0;
-
     // ---- accessors -----
 
     virtual bool haveAnyIndexes() const = 0;
+
+    virtual bool haveAnyIndexesInProgress() const = 0;
 
     virtual int numIndexesTotal(OperationContext* const opCtx) const = 0;
 
@@ -301,6 +247,9 @@ public:
      * Use this method to notify the IndexCatalog that the spec for this index has changed.
      *
      * It is invalid to dereference 'oldDesc' after calling this method.
+     *
+     * The caller must hold the collection X lock and ensure no index builds are in progress
+     * on the collection.
      */
     virtual const IndexDescriptor* refreshEntry(OperationContext* const opCtx,
                                                 const IndexDescriptor* const oldDesc) = 0;
@@ -325,18 +274,26 @@ public:
         const = 0;
 
     /**
-     * Returns a not-ok Status if there are any unfinished index builds. No new indexes should
-     * be built when in this state.
-     */
-    virtual Status checkUnfinished() const = 0;
-
-    /**
      * Returns an iterator for the index descriptors in this IndexCatalog.
      */
     virtual std::unique_ptr<IndexIterator> getIndexIterator(
         OperationContext* const opCtx, const bool includeUnfinishedIndexes) const = 0;
 
     // ---- index set modifiers ------
+
+    /*
+     * Creates an index entry with the provided descriptor on the catalog's collection.
+     *
+     * 'initFromDisk' avoids registering a change to undo this operation when set to true. You must
+     * set this flag if calling this function outside of a WriteUnitOfWork.
+     *
+     * 'isReadyIndex' controls whether the index will be directly available for query usage without
+     * needing to complete the IndexBuildBlock process.
+     */
+    virtual IndexCatalogEntry* createIndexEntry(OperationContext* opCtx,
+                                                std::unique_ptr<IndexDescriptor> descriptor,
+                                                bool initFromDisk,
+                                                bool isReadyIndex) = 0;
 
     /**
      * Call this only on an empty collection from inside a WriteUnitOfWork. Index creation on an
@@ -346,21 +303,48 @@ public:
     virtual StatusWith<BSONObj> createIndexOnEmptyCollection(OperationContext* const opCtx,
                                                              const BSONObj spec) = 0;
 
+    /**
+     * Checks the spec 'original' to make sure nothing is incorrectly set and cleans up any legacy
+     * fields. Lastly, checks whether the spec conflicts with ready and in-progress indexes.
+     *
+     * Returns an error Status or the cleaned up version of the non-conflicting spec. Returns
+     * IndexAlreadyExists if the index already exists; IndexBuildAlreadyInProgress if the index is
+     * already being built.
+     */
     virtual StatusWith<BSONObj> prepareSpecForCreate(OperationContext* const opCtx,
                                                      const BSONObj& original) const = 0;
 
     /**
-     * Returns a copy of 'indexSpecsToBuild' that does not contain index specifications already
-     * existing in this index catalog. If this isn't done, an index build using 'indexSpecsToBuild'
-     * may fail with error code IndexAlreadyExists.
+     * Returns a copy of 'indexSpecsToBuild' that does not contain index specifications that already
+     * exist or are already being built. If this is not done, an index build using
+     * 'indexSpecsToBuild' may fail with an IndexAlreadyExists or IndexBuildAlreadyInProgress error.
+     * If {buildIndexes:false} is set in the replica set config, also filters non-_id index specs
+     * out of the results.
      *
-     * If 'throwOnErrors' is set to true, any validation errors on a non-duplicate index
-     * will result in this function throwing an exception.
+     * Additionally verifies the specs are valid. Throws on any spec validation errors or conflicts
+     * other than IndexAlreadyExists, which indicates that the index spec already exists is what
+     * this function filters out.
+     *
+     * 'removeIndexBuildsToo' controls whether in-progress index builds are also filtered out. If
+     * they are not, then IndexBuildAlreadyInProgress errors can be thrown.
      */
     virtual std::vector<BSONObj> removeExistingIndexes(
         OperationContext* const opCtx,
         const std::vector<BSONObj>& indexSpecsToBuild,
-        bool throwOnErrors = false) const = 0;
+        const bool removeIndexBuildsToo) const = 0;
+
+    /**
+     * Filters out ready and in-progress indexes that already exist and returns the remaining
+     * indexes. Additionally filters out non-_id indexes if the replica set member config has
+     * {buildIndexes:false} set.
+     *
+     * Does no correctness verification of the provided specs, nor modifications for legacy reasons.
+     *
+     * This should only be used when we are confident in the specs, such as when specs are received
+     * via replica set cloning or chunk migrations.
+     */
+    virtual std::vector<BSONObj> removeExistingIndexesNoChecks(
+        OperationContext* const opCtx, const std::vector<BSONObj>& indexSpecsToBuild) const = 0;
 
     /**
      * Drops all indexes in the index catalog, optionally dropping the id index depending on the
@@ -369,22 +353,35 @@ public:
      */
     virtual void dropAllIndexes(OperationContext* opCtx,
                                 bool includingIdIndex,
-                                stdx::function<void(const IndexDescriptor*)> onDropFn) = 0;
+                                std::function<void(const IndexDescriptor*)> onDropFn) = 0;
     virtual void dropAllIndexes(OperationContext* opCtx, bool includingIdIndex) = 0;
 
+    /**
+     * Drops the index given its descriptor.
+     *
+     * The caller must hold the collection X lock and ensure no index builds are in progress on the
+     * collection.
+     */
     virtual Status dropIndex(OperationContext* const opCtx, const IndexDescriptor* const desc) = 0;
 
     /**
-     * Drops all incomplete indexes and returns specs. After this, the indexes can be rebuilt.
+     * Drops the index given its catalog entry.
+     *
+     * The caller must hold the collection X lock.
      */
-    virtual std::vector<BSONObj> getAndClearUnfinishedIndexes(OperationContext* const opCtx) = 0;
+    virtual Status dropIndexEntry(OperationContext* opCtx, IndexCatalogEntry* entry) = 0;
+
+    /**
+     * Deletes the index from the durable catalog on disk.
+     */
+    virtual void deleteIndexFromDisk(OperationContext* opCtx, const std::string& indexName) = 0;
 
     // ---- modify single index
 
     /**
      * Returns true if the index 'idx' is multikey, and returns false otherwise.
      */
-    virtual bool isMultikey(OperationContext* const opCtx, const IndexDescriptor* const idx) = 0;
+    virtual bool isMultikey(const IndexDescriptor* const idx) = 0;
 
     /**
      * Returns the path components that cause the index 'idx' to be multikey if the index supports
@@ -450,13 +447,6 @@ public:
 
     virtual std::string getAccessMethodName(const BSONObj& keyPattern) = 0;
 
-    /**
-     * Creates an instance of IndexBuildBlockInterface for building an index with the provided index
-     * spex and OperationContext.
-     */
-    virtual std::unique_ptr<IndexBuildBlockInterface> createIndexBuildBlock(
-        OperationContext* opCtx, const BSONObj& spec, IndexBuildMethod method) = 0;
-
     // public helpers
 
     /**
@@ -477,8 +467,6 @@ public:
     virtual void prepareInsertDeleteOptions(OperationContext* opCtx,
                                             const IndexDescriptor* desc,
                                             InsertDeleteOptions* options) const = 0;
-
-    virtual void setNs(NamespaceString ns) = 0;
 
     virtual void indexBuildSuccess(OperationContext* opCtx, IndexCatalogEntry* index) = 0;
 };

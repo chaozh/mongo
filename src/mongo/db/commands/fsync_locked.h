@@ -29,18 +29,18 @@
 
 #pragma once
 
-#include "mongo/stdx/functional.h"
+#include <functional>
 
 namespace mongo {
 /**
-* Returns true if mongod is currently fsyncLocked.
-*/
+ * Returns true if mongod is currently fsyncLocked.
+ */
 bool lockedForWriting();
 
 /**
-* Sets the implementation for lockedForWriting(). Should be done once during startup in a
-* MONGO_INITIALIZER.
-*/
-void setLockedForWritingImpl(stdx::function<bool()> impl);
+ * Sets the implementation for lockedForWriting(). Should be done once during startup in a
+ * MONGO_INITIALIZER.
+ */
+void setLockedForWritingImpl(std::function<bool()> impl);
 
 }  // namespace mongo

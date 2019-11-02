@@ -84,12 +84,10 @@ std::string nextFileName() {
 }  // namespace
 
 const char* DocumentSourceBucketAuto::getSourceName() const {
-    return "$bucketAuto";
+    return kStageName.rawData();
 }
 
-DocumentSource::GetNextResult DocumentSourceBucketAuto::getNext() {
-    pExpCtx->checkForInterrupt();
-
+DocumentSource::GetNextResult DocumentSourceBucketAuto::doGetNext() {
     if (!_populated) {
         const auto populationResult = populateSorter();
         if (populationResult.isPaused()) {
@@ -157,7 +155,7 @@ Value DocumentSourceBucketAuto::extractKey(const Document& doc) {
         return Value(BSONNULL);
     }
 
-    Value key = _groupByExpression->evaluate(doc);
+    Value key = _groupByExpression->evaluate(doc, &pExpCtx->variables);
 
     if (_granularityRounder) {
         uassert(40258,
@@ -190,7 +188,8 @@ void DocumentSourceBucketAuto::addDocumentToBucket(const pair<Value, Document>& 
 
     const size_t numAccumulators = _accumulatedFields.size();
     for (size_t k = 0; k < numAccumulators; k++) {
-        bucket._accums[k]->process(_accumulatedFields[k].expression->evaluate(entry.second), false);
+        bucket._accums[k]->process(
+            _accumulatedFields[k].expression->evaluate(entry.second, &pExpCtx->variables), false);
     }
 }
 
@@ -312,7 +311,7 @@ DocumentSourceBucketAuto::Bucket::Bucket(
     : _min(min), _max(max) {
     _accums.reserve(accumulationStatements.size());
     for (auto&& accumulationStatement : accumulationStatements) {
-        _accums.push_back(accumulationStatement.makeAccumulator(expCtx));
+        _accums.push_back(accumulationStatement.makeAccumulator());
     }
 }
 
@@ -383,7 +382,7 @@ Value DocumentSourceBucketAuto::serialize(
 
     MutableDocument outputSpec(_accumulatedFields.size());
     for (auto&& accumulatedField : _accumulatedFields) {
-        intrusive_ptr<Accumulator> accum = accumulatedField.makeAccumulator(pExpCtx);
+        intrusive_ptr<Accumulator> accum = accumulatedField.makeAccumulator();
         outputSpec[accumulatedField.fieldName] =
             Value{Document{{accum->getOpName(),
                             accumulatedField.expression->serialize(static_cast<bool>(explain))}}};
@@ -408,7 +407,7 @@ intrusive_ptr<DocumentSourceBucketAuto> DocumentSourceBucketAuto::create(
     if (accumulationStatements.empty()) {
         accumulationStatements.emplace_back("count",
                                             ExpressionConstant::create(pExpCtx, Value(1)),
-                                            AccumulationStatement::getFactory("$sum"));
+                                            [pExpCtx] { return AccumulatorSum::create(pExpCtx); });
     }
     return new DocumentSourceBucketAuto(pExpCtx,
                                         groupByExpression,
@@ -425,7 +424,7 @@ DocumentSourceBucketAuto::DocumentSourceBucketAuto(
     std::vector<AccumulationStatement> accumulationStatements,
     const boost::intrusive_ptr<GranularityRounder>& granularityRounder,
     uint64_t maxMemoryUsageBytes)
-    : DocumentSource(pExpCtx),
+    : DocumentSource(kStageName, pExpCtx),
       _nBuckets(numBuckets),
       _maxMemoryUsageBytes(maxMemoryUsageBytes),
       _groupByExpression(groupByExpression),
@@ -435,6 +434,14 @@ DocumentSourceBucketAuto::DocumentSourceBucketAuto(
     for (auto&& accumulationStatement : accumulationStatements) {
         _accumulatedFields.push_back(accumulationStatement);
     }
+}
+
+const boost::intrusive_ptr<Expression> DocumentSourceBucketAuto::getGroupByExpression() const {
+    return _groupByExpression;
+}
+
+const std::vector<AccumulationStatement>& DocumentSourceBucketAuto::getAccumulatedFields() const {
+    return _accumulatedFields;
 }
 
 intrusive_ptr<DocumentSource> DocumentSourceBucketAuto::createFromBson(

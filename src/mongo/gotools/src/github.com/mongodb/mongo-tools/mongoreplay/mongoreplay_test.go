@@ -15,7 +15,7 @@ import (
 
 	mgo "github.com/10gen/llmgo"
 	"github.com/10gen/llmgo/bson"
-	"github.com/mongodb/mongo-tools/common/testtype"
+	"github.com/mongodb/mongo-tools/legacy/testtype"
 )
 
 type testDoc struct {
@@ -332,7 +332,7 @@ func TestOpMsg(t *testing.T) {
 			inputOp: mgo.MsgOp{
 				Flags: 0,
 				Sections: []mgo.MsgSection{
-					mgo.MsgSection{
+					{
 						PayloadType: mgo.MsgPayload0,
 						Data:        bson.D{{"doc", 1}},
 					},
@@ -345,11 +345,11 @@ func TestOpMsg(t *testing.T) {
 			inputOp: mgo.MsgOp{
 				Flags: 0,
 				Sections: []mgo.MsgSection{
-					mgo.MsgSection{
+					{
 						PayloadType: mgo.MsgPayload0,
 						Data:        bson.D{{"doc", 1}},
 					},
-					mgo.MsgSection{
+					{
 						PayloadType: mgo.MsgPayload1,
 						Data:        payloadType1Tester,
 					},
@@ -362,7 +362,7 @@ func TestOpMsg(t *testing.T) {
 			inputOp: mgo.MsgOp{
 				Flags: mgo.MsgFlagChecksumPresent,
 				Sections: []mgo.MsgSection{
-					mgo.MsgSection{
+					{
 						PayloadType: mgo.MsgPayload0,
 						Data:        bson.D{{"doc", 1}},
 					},
@@ -376,7 +376,7 @@ func TestOpMsg(t *testing.T) {
 			inputOp: mgo.MsgOp{
 				Flags: 0,
 				Sections: []mgo.MsgSection{
-					mgo.MsgSection{
+					{
 						PayloadType: mgo.MsgPayload0,
 						Data: bson.D{
 							{"doc", 1},

@@ -39,7 +39,7 @@
 #include "mongo/stdx/chrono.h"
 #include "mongo/stdx/type_traits.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -55,6 +55,7 @@ using Milliseconds = Duration<std::milli>;
 using Seconds = Duration<std::ratio<1>>;
 using Minutes = Duration<std::ratio<60>>;
 using Hours = Duration<std::ratio<3600>>;
+using Days = Duration<std::ratio<86400>>;
 
 //
 // Streaming output operators for common duration types. Writes the numerical value followed by
@@ -70,6 +71,7 @@ std::ostream& operator<<(std::ostream& os, Milliseconds ms);
 std::ostream& operator<<(std::ostream& os, Seconds s);
 std::ostream& operator<<(std::ostream& os, Minutes m);
 std::ostream& operator<<(std::ostream& os, Hours h);
+std::ostream& operator<<(std::ostream& os, Days h);
 
 template <typename Allocator>
 StringBuilderImpl<Allocator>& operator<<(StringBuilderImpl<Allocator>& os, Nanoseconds ns);
@@ -89,6 +91,9 @@ StringBuilderImpl<Allocator>& operator<<(StringBuilderImpl<Allocator>& os, Minut
 template <typename Allocator>
 StringBuilderImpl<Allocator>& operator<<(StringBuilderImpl<Allocator>& os, Hours h);
 
+template <typename Allocator>
+StringBuilderImpl<Allocator>& operator<<(StringBuilderImpl<Allocator>& os, Days h);
+
 
 template <typename Duration1, typename Duration2>
 using HigherPrecisionDuration =
@@ -104,20 +109,20 @@ using HigherPrecisionDuration =
  * attempting to cast that value to Milliseconds will throw an exception.
  */
 template <typename ToDuration, typename FromPeriod>
-ToDuration duration_cast(const Duration<FromPeriod>& from) {
+constexpr ToDuration duration_cast(const Duration<FromPeriod>& from) {
     using FromOverTo = std::ratio_divide<FromPeriod, typename ToDuration::period>;
     if (ToDuration::template isHigherPrecisionThan<Duration<FromPeriod>>()) {
-        typename ToDuration::rep toCount;
+        typename ToDuration::rep toCount = 0;
         uassert(ErrorCodes::DurationOverflow,
                 "Overflow casting from a lower-precision duration to a higher-precision duration",
-                !mongoSignedMultiplyOverflow64(from.count(), FromOverTo::num, &toCount));
+                !overflow::mul(from.count(), FromOverTo::num, &toCount));
         return ToDuration{toCount};
     }
     return ToDuration{from.count() / FromOverTo::den};
 }
 
 template <typename ToDuration, typename FromRep, typename FromPeriod>
-inline ToDuration duration_cast(const stdx::chrono::duration<FromRep, FromPeriod>& d) {
+constexpr ToDuration duration_cast(const stdx::chrono::duration<FromRep, FromPeriod>& d) {
     return duration_cast<ToDuration>(Duration<FromPeriod>{d.count()});
 }
 
@@ -232,16 +237,14 @@ public:
     }
 
     /**
-     * Constructs a higher-precision duration from a lower-precision one, as by duration_cast.
+     * Implicit converting constructor from a lower-precision duration to a higher-precision one, as
+     * by duration_cast.
      *
-     * Throws a AssertionException if "from" is out of the range of this duration type.
-     *
-     * It is a compilation error to attempt a conversion from higher-precision to lower-precision by
-     * this constructor.
+     * It is a compilation error to convert from higher precision to lower, or if the conversion
+     * would cause an integer overflow.
      */
     template <typename FromPeriod>
-    /*implicit*/ Duration(const Duration<FromPeriod>& from)
-        : Duration(duration_cast<Duration>(from)) {
+    constexpr Duration(const Duration<FromPeriod>& from) : Duration(duration_cast<Duration>(from)) {
         MONGO_STATIC_ASSERT_MSG(
             !isLowerPrecisionThan<Duration<FromPeriod>>(),
             "Use duration_cast to convert from higher precision Duration types to lower "
@@ -283,7 +286,7 @@ public:
         }
         using OtherOverThis = std::ratio_divide<OtherPeriod, period>;
         rep otherCount;
-        if (mongoSignedMultiplyOverflow64(other.count(), OtherOverThis::num, &otherCount)) {
+        if (overflow::mul(other.count(), OtherOverThis::num, &otherCount)) {
             return other.count() < 0 ? 1 : -1;
         }
         if (count() < otherCount) {
@@ -331,14 +334,14 @@ public:
     Duration& operator+=(const Duration& other) {
         uassert(ErrorCodes::DurationOverflow,
                 str::stream() << "Overflow while adding " << other << " to " << *this,
-                !mongoSignedAddOverflow64(count(), other.count(), &_count));
+                !overflow::add(count(), other.count(), &_count));
         return *this;
     }
 
     Duration& operator-=(const Duration& other) {
         uassert(ErrorCodes::DurationOverflow,
                 str::stream() << "Overflow while subtracting " << other << " from " << *this,
-                !mongoSignedSubtractOverflow64(count(), other.count(), &_count));
+                !overflow::sub(count(), other.count(), &_count));
         return *this;
     }
 
@@ -349,7 +352,7 @@ public:
             "Durations may only be multiplied by values of signed integral type");
         uassert(ErrorCodes::DurationOverflow,
                 str::stream() << "Overflow while multiplying " << *this << " by " << scale,
-                !mongoSignedMultiplyOverflow64(count(), scale, &_count));
+                !overflow::mul(count(), scale, &_count));
         return *this;
     }
 

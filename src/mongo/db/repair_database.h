@@ -29,17 +29,17 @@
 
 #pragma once
 
+#include <functional>
 #include <string>
 
 #include "mongo/bson/bsonobj.h"
-#include "mongo/stdx/functional.h"
 
 namespace mongo {
-class CollectionCatalogEntry;
-class DatabaseCatalogEntry;
+class Collection;
+class StorageEngine;
+class NamespaceString;
 class OperationContext;
 class Status;
-class StorageEngine;
 class StringData;
 
 typedef std::pair<std::vector<std::string>, std::vector<BSONObj>> IndexNameObjs;
@@ -52,9 +52,8 @@ typedef std::pair<std::vector<std::string>, std::vector<BSONObj>> IndexNameObjs;
  *               should be included in the result.
  */
 StatusWith<IndexNameObjs> getIndexNameObjs(OperationContext* opCtx,
-                                           DatabaseCatalogEntry* dbce,
-                                           CollectionCatalogEntry* cce,
-                                           stdx::function<bool(const std::string&)> filter =
+                                           const NamespaceString& nss,
+                                           std::function<bool(const std::string&)> filter =
                                                [](const std::string& indexName) { return true; });
 
 /**
@@ -62,8 +61,7 @@ StatusWith<IndexNameObjs> getIndexNameObjs(OperationContext* opCtx,
  * One example usage is when a 'dropIndex' command is rolled back. The dropped index must be remade.
  */
 Status rebuildIndexesOnCollection(OperationContext* opCtx,
-                                  DatabaseCatalogEntry* dbce,
-                                  CollectionCatalogEntry* cce,
+                                  Collection* collection,
                                   const std::vector<BSONObj>& indexSpecs);
 
 /**
@@ -71,14 +69,8 @@ Status rebuildIndexesOnCollection(OperationContext* opCtx,
  * Some data may be lost or modified in the process but the output will
  * be structurally valid on successful return.
  *
- * Calls 'onRecordStoreRepair' after repairing all the collection record stores for each database
- * before rebuilding the appropriate indexes.
- *
  * It is expected that the local database will be repaired first when running in repair mode.
  */
-Status repairDatabase(OperationContext* opCtx,
-                      StorageEngine* engine,
-                      const std::string& dbName,
-                      stdx::function<void(const std::string& dbName)> onRecordStoreRepair);
+Status repairDatabase(OperationContext* opCtx, StorageEngine* engine, const std::string& dbName);
 
 }  // namespace mongo

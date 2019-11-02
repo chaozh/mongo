@@ -33,6 +33,7 @@
 
 #include <boost/optional.hpp>
 #include <cstdint>
+#include <memory>
 
 #include "mongo/base/init.h"
 #include "mongo/base/initializer.h"
@@ -40,12 +41,11 @@
 #include "mongo/db/operation_context.h"
 #include "mongo/db/service_context.h"
 #include "mongo/platform/atomic_word.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/platform/random.h"
 #include "mongo/rpc/factory.h"
 #include "mongo/rpc/message.h"
 #include "mongo/rpc/reply_builder_interface.h"
-#include "mongo/stdx/memory.h"
-#include "mongo/stdx/mutex.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/tools/bridge_commands.h"
 #include "mongo/tools/mongobridge_options.h"
@@ -56,9 +56,9 @@
 #include "mongo/util/assert_util.h"
 #include "mongo/util/exit.h"
 #include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
 #include "mongo/util/quick_exit.h"
 #include "mongo/util/signal_handlers.h"
+#include "mongo/util/str.h"
 #include "mongo/util/text.h"
 #include "mongo/util/time_support.h"
 #include "mongo/util/timer.h"
@@ -116,7 +116,7 @@ public:
 
     HostSettings getHostSettings(boost::optional<HostAndPort> host) {
         if (host) {
-            stdx::lock_guard<stdx::mutex> lk(_settingsMutex);
+            stdx::lock_guard<Latch> lk(_settingsMutex);
             return (_settings)[*host];
         }
         return {};
@@ -132,7 +132,7 @@ public:
 private:
     static const ServiceContext::Decoration<BridgeContext> _get;
 
-    stdx::mutex _settingsMutex;
+    Mutex _settingsMutex = MONGO_MAKE_LATCH("BridgeContext::_settingsMutex");
     HostSettingsMap _settings;
 };
 
@@ -383,6 +383,10 @@ DbResponse ServiceEntryPointBridge::handleRequest(OperationContext* opCtx, const
         } else {
             dest.setExhaust(false);
         }
+
+        // The original checksum won't be valid once the network layer replaces requestId. Remove it
+        // because the network layer re-checksums the response.
+        OpMsg::removeChecksum(&response);
         return {std::move(response), exhaustNS};
     } else {
         return {Message()};

@@ -27,10 +27,13 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
 #include "mongo/db/pipeline/variables.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/db/client.h"
+#include "mongo/db/logical_clock.h"
+#include "mongo/platform/basic.h"
+#include "mongo/platform/random.h"
+#include "mongo/util/str.h"
+#include "mongo/util/time_support.h"
 
 namespace mongo {
 
@@ -38,7 +41,10 @@ constexpr Variables::Id Variables::kRootId;
 constexpr Variables::Id Variables::kRemoveId;
 
 const StringMap<Variables::Id> Variables::kBuiltinVarNameToId = {{"ROOT", kRootId},
-                                                                 {"REMOVE", kRemoveId}};
+                                                                 {"REMOVE", kRemoveId},
+                                                                 {"NOW", kNowId},
+                                                                 {"CLUSTER_TIME", kClusterTimeId},
+                                                                 {"JS_SCOPE", kJsScopeId}};
 
 void Variables::uassertValidNameForUserWrite(StringData varName) {
     // System variables users allowed to write to (currently just one)
@@ -65,9 +71,7 @@ void Variables::uassertValidNameForUserWrite(StringData varName) {
 
         uassert(16868,
                 str::stream() << "'" << varName << "' contains an invalid character "
-                              << "for a variable name: '"
-                              << varName[i]
-                              << "'",
+                              << "for a variable name: '" << varName[i] << "'",
                 charIsValid);
     }
 }
@@ -92,9 +96,7 @@ void Variables::uassertValidNameForUserRead(StringData varName) {
 
         uassert(16871,
                 str::stream() << "'" << varName << "' contains an invalid character "
-                              << "for a variable name: '"
-                              << varName[i]
-                              << "'",
+                              << "for a variable name: '" << varName[i] << "'",
                 charIsValid);
     }
 }
@@ -141,6 +143,16 @@ Value Variables::getValue(Id id, const Document& root) const {
                 return Value(root);
             case Variables::kRemoveId:
                 return Value();
+            case Variables::kNowId:
+            case Variables::kClusterTimeId:
+                if (auto it = _runtimeConstants.find(id); it != _runtimeConstants.end()) {
+                    return it->second;
+                }
+
+                uasserted(51144,
+                          str::stream() << "Builtin variable '$$" << getBuiltinVariableName(id)
+                                        << "' is not available");
+                MONGO_UNREACHABLE;
             default:
                 MONGO_UNREACHABLE;
         }
@@ -160,6 +172,55 @@ Document Variables::getDocument(Id id, const Document& root) const {
         return var.getDocument();
 
     return Document();
+}
+
+RuntimeConstants Variables::getRuntimeConstants() const {
+    RuntimeConstants constants;
+
+    if (auto it = _runtimeConstants.find(kNowId); it != _runtimeConstants.end()) {
+        constants.setLocalNow(it->second.getDate());
+    }
+    if (auto it = _runtimeConstants.find(kClusterTimeId); it != _runtimeConstants.end()) {
+        constants.setClusterTime(it->second.getTimestamp());
+    }
+    if (auto it = _runtimeConstants.find(kJsScopeId); it != _runtimeConstants.end()) {
+        constants.setJsScope(it->second.getDocument().toBson());
+    }
+
+    return constants;
+}
+
+void Variables::setRuntimeConstants(const RuntimeConstants& constants) {
+    _runtimeConstants[kNowId] = Value(constants.getLocalNow());
+    // We use a null Timestamp to indicate that the clusterTime is not available; this can happen if
+    // the logical clock is not running. We do not use boost::optional because this would allow the
+    // IDL to serialize a RuntimConstants without clusterTime, which should always be an error.
+    if (!constants.getClusterTime().isNull()) {
+        _runtimeConstants[kClusterTimeId] = Value(constants.getClusterTime());
+    }
+
+    if (constants.getJsScope()) {
+        _runtimeConstants[kJsScopeId] = Value(constants.getJsScope().get());
+    }
+}
+
+void Variables::setDefaultRuntimeConstants(OperationContext* opCtx) {
+    setRuntimeConstants(Variables::generateRuntimeConstants(opCtx));
+}
+
+RuntimeConstants Variables::generateRuntimeConstants(OperationContext* opCtx) {
+    // On a standalone, the clock may not be running and $$CLUSTER_TIME is unavailable. If the
+    // logical clock is available, set the clusterTime in the runtime constants. Otherwise, the
+    // clusterTime is set to the null Timestamp.
+    if (opCtx->getClient()) {
+        if (auto logicalClock = LogicalClock::get(opCtx); logicalClock) {
+            auto clusterTime = logicalClock->getClusterTime();
+            if (clusterTime != LogicalTime::kUninitialized) {
+                return {Date_t::now(), clusterTime.asTimestamp()};
+            }
+        }
+    }
+    return {Date_t::now(), Timestamp()};
 }
 
 Variables::Id VariablesParseState::defineVariable(StringData name) {
@@ -203,4 +264,4 @@ std::set<Variables::Id> VariablesParseState::getDefinedVariableIDs() const {
 
     return ids;
 }
-}
+}  // namespace mongo

@@ -29,7 +29,6 @@
 
 #pragma once
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/util/periodic_runner.h"
 
 namespace mongo {
@@ -38,7 +37,8 @@ class OperationContext;
 class ServiceContext;
 
 class PeriodicBalancerConfigRefresher final {
-    MONGO_DISALLOW_COPYING(PeriodicBalancerConfigRefresher);
+    PeriodicBalancerConfigRefresher(const PeriodicBalancerConfigRefresher&) = delete;
+    PeriodicBalancerConfigRefresher& operator=(const PeriodicBalancerConfigRefresher&) = delete;
 
 public:
     PeriodicBalancerConfigRefresher() = default;
@@ -80,6 +80,6 @@ private:
     bool _isPrimary{false};
 
     // Periodic job for refreshing the balancer configuration
-    std::unique_ptr<PeriodicRunner::PeriodicJobHandle> _balancerConfigRefresher;
+    PeriodicJobAnchor _balancerConfigRefresher;
 };
 }  // namespace mongo

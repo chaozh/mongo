@@ -45,7 +45,7 @@
 #include "mongo/logger/logger.h"
 #include "mongo/logger/parse_log_component_settings.h"
 #include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 using std::string;
 using std::stringstream;
@@ -185,7 +185,7 @@ Status setLogComponentVerbosity(const BSONObj& bsonSettings) {
 }
 
 // for automationServiceDescription
-stdx::mutex autoServiceDescriptorMutex;
+Mutex autoServiceDescriptorMutex;
 std::string autoServiceDescriptorValue;
 }  // namespace
 
@@ -306,8 +306,8 @@ public:
 
             // Make sure we are allowed to change this parameter
             if (!foundParameter->second->allowedToChangeAtRuntime()) {
-                errmsg = str::stream() << "not allowed to change [" << parameterName
-                                       << "] at runtime";
+                errmsg = str::stream()
+                    << "not allowed to change [" << parameterName << "] at runtime";
                 return false;
             }
 
@@ -365,9 +365,8 @@ public:
 
             log() << "successfully set parameter " << parameterName << " to "
                   << redact(parameter.toString(false))
-                  << (oldValue ? std::string(str::stream() << " (was "
-                                                           << redact(oldValue.toString(false))
-                                                           << ")")
+                  << (oldValue ? std::string(str::stream()
+                                             << " (was " << redact(oldValue.toString(false)) << ")")
                                : "");
 
             numSet++;
@@ -392,8 +391,7 @@ Status LogLevelServerParameter::set(const BSONElement& newValueElement) {
     int newValue;
     if (!newValueElement.coerce(&newValue) || newValue < 0)
         return Status(ErrorCodes::BadValue,
-                      mongoutils::str::stream() << "Invalid value for logLevel: "
-                                                << newValueElement);
+                      str::stream() << "Invalid value for logLevel: " << newValueElement);
     LogSeverity newSeverity = (newValue > 0) ? LogSeverity::Debug(newValue) : LogSeverity::Log();
     globalLogDomain()->setMinimumLoggedSeverity(newSeverity);
     return Status::OK();
@@ -401,12 +399,12 @@ Status LogLevelServerParameter::set(const BSONElement& newValueElement) {
 
 Status LogLevelServerParameter::setFromString(const std::string& strLevel) {
     int newValue;
-    Status status = parseNumberFromString(strLevel, &newValue);
+    Status status = NumberParser{}(strLevel, &newValue);
     if (!status.isOK())
         return status;
     if (newValue < 0)
         return Status(ErrorCodes::BadValue,
-                      mongoutils::str::stream() << "Invalid value for logLevel: " << newValue);
+                      str::stream() << "Invalid value for logLevel: " << newValue);
     LogSeverity newSeverity = (newValue > 0) ? LogSeverity::Debug(newValue) : LogSeverity::Log();
     globalLogDomain()->setMinimumLoggedSeverity(newSeverity);
     return Status::OK();
@@ -423,8 +421,8 @@ void LogComponentVerbosityServerParameter::append(OperationContext*,
 Status LogComponentVerbosityServerParameter::set(const BSONElement& newValueElement) {
     if (!newValueElement.isABSONObj()) {
         return Status(ErrorCodes::TypeMismatch,
-                      mongoutils::str::stream() << "log component verbosity is not a BSON object: "
-                                                << newValueElement);
+                      str::stream()
+                          << "log component verbosity is not a BSON object: " << newValueElement);
     }
     return setLogComponentVerbosity(newValueElement.Obj());
 }
@@ -438,7 +436,7 @@ Status LogComponentVerbosityServerParameter::setFromString(const std::string& st
 void AutomationServiceDescriptorServerParameter::append(OperationContext*,
                                                         BSONObjBuilder& builder,
                                                         const std::string& name) {
-    const stdx::lock_guard<stdx::mutex> lock(autoServiceDescriptorMutex);
+    const stdx::lock_guard<Latch> lock(autoServiceDescriptorMutex);
     if (!autoServiceDescriptorValue.empty()) {
         builder.append(name, autoServiceDescriptorValue);
     }
@@ -456,13 +454,11 @@ Status AutomationServiceDescriptorServerParameter::setFromString(const std::stri
     auto kMaxSize = 64U;
     if (str.size() > kMaxSize)
         return {ErrorCodes::Overflow,
-                mongoutils::str::stream() << "Value for parameter automationServiceDescriptor"
-                                          << " must be no more than "
-                                          << kMaxSize
-                                          << " bytes"};
+                str::stream() << "Value for parameter automationServiceDescriptor"
+                              << " must be no more than " << kMaxSize << " bytes"};
 
     {
-        const stdx::lock_guard<stdx::mutex> lock(autoServiceDescriptorMutex);
+        const stdx::lock_guard<Latch> lock(autoServiceDescriptorMutex);
         autoServiceDescriptorValue = str;
     }
 

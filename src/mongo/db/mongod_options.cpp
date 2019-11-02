@@ -40,7 +40,9 @@
 #include "mongo/bson/json.h"
 #include "mongo/bson/util/builder.h"
 #include "mongo/config.h"
+#include "mongo/db/cluster_auth_mode_option_gen.h"
 #include "mongo/db/global_settings.h"
+#include "mongo/db/keyfile_option_gen.h"
 #include "mongo/db/mongod_options_general_gen.h"
 #include "mongo/db/mongod_options_legacy_gen.h"
 #include "mongo/db/mongod_options_replication_gen.h"
@@ -49,12 +51,12 @@
 #include "mongo/db/repl/repl_settings.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/server_options_base.h"
+#include "mongo/db/server_options_nongeneral_gen.h"
 #include "mongo/db/server_options_server_helpers.h"
 #include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
 #include "mongo/util/net/ssl_options.h"
 #include "mongo/util/options_parser/startup_options.h"
-#include "mongo/util/stringutils.h"
+#include "mongo/util/str.h"
 #include "mongo/util/version.h"
 
 namespace mongo {
@@ -78,11 +80,14 @@ std::string storageDBPathDescription() {
 
 Status addMongodOptions(moe::OptionSection* options) try {
     uassertStatusOK(addGeneralServerOptions(options));
+    uassertStatusOK(addNonGeneralServerOptions(options));
     uassertStatusOK(addMongodGeneralOptions(options));
     uassertStatusOK(addMongodReplicationOptions(options));
     uassertStatusOK(addMongodShardingOptions(options));
     uassertStatusOK(addMongodStorageOptions(options));
     uassertStatusOK(addMongodLegacyOptions(options));
+    uassertStatusOK(addKeyfileServerOption(options));
+    uassertStatusOK(addClusterAuthModeServerOption(options));
 
     return Status::OK();
 } catch (const AssertionException& ex) {
@@ -237,6 +242,20 @@ Status canonicalizeMongodOptions(moe::Environment* params) {
             return ret;
         }
         ret = params->remove("moveParanoia");
+        if (!ret.isOK()) {
+            return ret;
+        }
+    }
+
+    // "storage.indexBuildRetry" comes from the config file, so override it if "noIndexBuildRetry"
+    // is set since that comes from the command line.
+    if (params->count("noIndexBuildRetry")) {
+        Status ret = params->set("storage.indexBuildRetry",
+                                 moe::Value(!(*params)["noIndexBuildRetry"].as<bool>()));
+        if (!ret.isOK()) {
+            return ret;
+        }
+        ret = params->remove("noIndexBuildRetry");
         if (!ret.isOK()) {
             return ret;
         }
@@ -398,8 +417,7 @@ Status storeMongodOptions(const moe::Environment& params) {
             storageGlobalParams.syncdelay > StorageGlobalParams::kMaxSyncdelaySecs) {
             return Status(ErrorCodes::BadValue,
                           str::stream() << "syncdelay out of allowed range (0-"
-                                        << StorageGlobalParams::kMaxSyncdelaySecs
-                                        << "s)");
+                                        << StorageGlobalParams::kMaxSyncdelaySecs << "s)");
         }
     }
 
@@ -421,6 +439,10 @@ Status storeMongodOptions(const moe::Environment& params) {
         serverGlobalParams.cpu = params["cpu"].as<bool>();
     }
 
+    if (params.count("storage.indexBuildRetry")) {
+        serverGlobalParams.indexBuildRetry = params["storage.indexBuildRetry"].as<bool>();
+    }
+
     if (params.count("storage.journal.enabled")) {
         storageGlobalParams.dur = params["storage.journal.enabled"].as<bool>();
     }
@@ -434,9 +456,9 @@ Status storeMongodOptions(const moe::Environment& params) {
         if (journalCommitIntervalMs < 1 ||
             journalCommitIntervalMs > StorageGlobalParams::kMaxJournalCommitIntervalMs) {
             return Status(ErrorCodes::BadValue,
-                          str::stream() << "--journalCommitInterval out of allowed range (1-"
-                                        << StorageGlobalParams::kMaxJournalCommitIntervalMs
-                                        << "ms)");
+                          str::stream()
+                              << "--journalCommitInterval out of allowed range (1-"
+                              << StorageGlobalParams::kMaxJournalCommitIntervalMs << "ms)");
         }
     }
 
@@ -449,7 +471,7 @@ Status storeMongodOptions(const moe::Environment& params) {
         for (const std::string& whitelistEntry :
              params["security.clusterIpSourceWhitelist"].as<std::vector<std::string>>()) {
             std::vector<std::string> intermediates;
-            splitStringDelim(whitelistEntry, &intermediates, ',');
+            str::splitStringDelim(whitelistEntry, &intermediates, ',');
             std::copy(intermediates.begin(),
                       intermediates.end(),
                       std::back_inserter(*mongodGlobalParams.whitelistedClusterNetwork));
@@ -468,12 +490,29 @@ Status storeMongodOptions(const moe::Environment& params) {
     }
 
     repl::ReplSettings replSettings;
-    if (params.count("replication.replSetName")) {
-        replSettings.setReplSetString(params["replication.replSetName"].as<std::string>().c_str());
-    }
     if (params.count("replication.replSet")) {
         /* seed list of hosts for the repl set */
         replSettings.setReplSetString(params["replication.replSet"].as<std::string>().c_str());
+    } else if (params.count("replication.replSetName")) {
+        // "replSetName" is previously removed if "replSet" and "replSetName" are both found to be
+        // set by the user. Therefore, we only need to check for it if "replSet" in not found.
+        replSettings.setReplSetString(params["replication.replSetName"].as<std::string>().c_str());
+    } else {
+        // If neither "replication.replSet" nor "replication.replSetName" is set, then we are in
+        // standalone mode.
+        //
+        // A standalone node does not use the oplog collection, so special truncation handling for
+        // the capped collection is unnecessary.
+        //
+        // A standalone node that will be reintroduced to its replica set must not allow oplog
+        // truncation while in standalone mode because oplog history needed for startup recovery as
+        // a replica set member could be deleted. Replication can need history older than the last
+        // checkpoint to support transactions.
+        //
+        // Note: we only use this to defer oplog collection truncation via OplogStones in WT. Non-WT
+        // storage engines will continue to perform regular capped collection handling for the oplog
+        // collection, regardless of this parameter setting.
+        storageGlobalParams.allowOplogTruncation = false;
     }
 
     if (params.count("replication.enableMajorityReadConcern")) {

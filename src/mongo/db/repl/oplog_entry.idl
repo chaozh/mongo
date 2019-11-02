@@ -34,6 +34,7 @@ global:
 imports:
     - "mongo/idl/basic_types.idl"
     - "mongo/db/logical_session_id.idl"
+    - "mongo/db/repl/optime_and_wall_time_base.idl"
     - "mongo/db/repl/replication_types.idl"
 
 enums:
@@ -48,8 +49,9 @@ enums:
             kNoop: "n"
 
 structs:
-    ReplOperation:
-        description: A document that represents an operation in transaction.
+    DurableReplOperation:
+        description: "A document that represents an operation in a transaction. Should never be
+                      used directly in server code. Instead, create an instance of ReplOperation."
         fields:
             op:
                 cpp_name: opType
@@ -78,25 +80,19 @@ structs:
                 type: bool
                 optional: true
                 description: "If true, treats this update operation as an upsert.
-                              Added for backwards compatibility with updates from 3.6 and before."
+                              Used when extracting individual update oplog entries from the oplog
+                              entry of an applyOps command that was executed with alwaysUpsert true
+                              (the default). Originally added for backwards compatibility with
+                              updates from 3.6 and before."
 
     OplogEntryBase:
         description: A document in which the server stores an oplog entry.
-        immutable: true
         inline_chained_structs: true
         chained_structs:
             OperationSessionInfo : OperationSessionInfo
-            ReplOperation: ReplOperation
+            DurableReplOperation: DurableReplOperation
+            OpTimeAndWallTimeBase: OpTimeAndWallTimeBase
         fields:
-            ts:
-                cpp_name: timestamp
-                type: timestamp
-                description: "The time when the oplog entry was created"
-            t:
-                cpp_name: term
-                type: long
-                optional: true # The term is optional for PV0 oplog entries.
-                description: "The term of the primary that created the oplog entry"
             h:
                 cpp_name: hash
                 type: long
@@ -105,7 +101,7 @@ structs:
             v:
                 cpp_name: version
                 type: safeInt64
-                default: 1
+                default: 2
                 description: "The version of the oplog"
             fromMigrate:
                 type: bool
@@ -115,16 +111,10 @@ structs:
                 type: objectid
                 optional: true
                 description: "An optional _id field for tests that manually insert oplog entries"
-            wall:
-                cpp_name: wallClockTime
-                type: date
-                optional: true # Optional for older than 3.6 releases
-                description: "A wallclock time with MS resolution"
             stmtId:
                 cpp_name: statementId
                 type: StmtId
-                optional: true # If txnNumber is missing, this will also be absent, otherwise it
-                               # must exist.
+                optional: true
                 description: "Identifier of the transaction statement which generated this oplog
                               entry"
             prevOpTime:
@@ -142,13 +132,3 @@ structs:
                 optional: true
                 description: "The optime of another oplog entry that contains the document
                               after an update was applied."
-            prepare:
-                type: bool
-                optional: true
-                description: "Specifies that this operation should be put into a 'prepare' state"
-
-            inTxn:
-                type: bool
-                optional: true
-                description: "Specifies that this oplog entry is part of a multi-statement
-                              transaction that has not yet been committed or prepared."

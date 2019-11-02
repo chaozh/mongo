@@ -58,25 +58,27 @@ function testProperAuthorization(conn, t, testcase, r) {
     assert(r.db.auth("user|" + r.key, "password"));
     authCommandsLib.authenticatedSetup(t, runOnDb);
     var command = t.command;
-    if (typeof(command) === "function") {
+    if (typeof (command) === "function") {
         command = t.command(state, testcase.commandArgs);
     }
     var res = runOnDb.runCommand(command);
 
     if (testcase.roles[r.key]) {
         if (res.ok == 0 && res.code == authErrCode) {
-            out = "expected authorization success" + " but received " + tojson(res) + " on db " +
-                testcase.runOnDb + " with role " + r.key;
+            out = "expected authorization success" +
+                " but received " + tojson(res) + " on db " + testcase.runOnDb + " with role " +
+                r.key;
         } else if (res.ok == 0 && !testcase.expectFail && res.code != commandNotSupportedCode) {
             // don't error if the test failed with code commandNotSupported since
-            // some storage engines (e.g wiredTiger) don't support some commands (e.g. touch)
+            // some storage engines don't support some commands.
             out = "command failed with " + tojson(res) + " on db " + testcase.runOnDb +
                 " with role " + r.key;
         }
     } else {
         if (res.ok == 1 || (res.ok == 0 && res.code != authErrCode)) {
-            out = "expected authorization failure" + " but received result " + tojson(res) +
-                " on db " + testcase.runOnDb + " with role " + r.key;
+            out = "expected authorization failure" +
+                " but received result " + tojson(res) + " on db " + testcase.runOnDb +
+                " with role " + r.key;
         }
     }
 
@@ -160,7 +162,8 @@ authCommandsLib.runTests(conn, impls);
 MongoRunner.stopMongod(conn);
 
 // run all tests sharded
-// TODO: Remove 'shardAsReplicaSet: false' when SERVER-32672 is fixed.
+// TODO: SERVER-43897 Make commands_user_defined_roles.js and commands_builtin_roles.js start shards
+// as replica sets.
 conn = new ShardingTest({
     shards: 2,
     mongos: 1,

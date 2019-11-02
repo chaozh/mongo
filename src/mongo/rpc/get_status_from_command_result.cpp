@@ -36,7 +36,7 @@
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/rpc/write_concern_error_detail.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -55,7 +55,7 @@ Status getStatusFromCommandResult(const BSONObj& result) {
 
     if (okElement.eoo() && dollarErrElement.eoo()) {
         return Status(ErrorCodes::CommandResultSchemaViolation,
-                      mongoutils::str::stream() << "No \"ok\" field in command result " << result);
+                      str::stream() << "No \"ok\" field in command result " << result);
     }
     if (okElement.trueValue()) {
         return Status::OK();
@@ -98,14 +98,14 @@ Status getWriteConcernStatusFromCommandResult(const BSONObj& obj) {
     std::string wcErrorParseMsg;
     if (!wcError.parseBSON(wcErrObj, &wcErrorParseMsg)) {
         return Status(ErrorCodes::UnsupportedFormat,
-                      str::stream() << "Failed to parse write concern section due to "
-                                    << wcErrorParseMsg);
+                      str::stream()
+                          << "Failed to parse write concern section due to " << wcErrorParseMsg);
     }
     std::string wcErrorInvalidMsg;
     if (!wcError.isValid(&wcErrorInvalidMsg)) {
         return Status(ErrorCodes::UnsupportedFormat,
-                      str::stream() << "Failed to parse write concern section due to "
-                                    << wcErrorInvalidMsg);
+                      str::stream()
+                          << "Failed to parse write concern section due to " << wcErrorInvalidMsg);
     }
     return wcError.toStatus();
 }

@@ -91,14 +91,12 @@ public:
                     KVPrefix prefix,
                     bool readOnly);
 
-    virtual StatusWith<SpecialFormatInserted> insert(OperationContext* opCtx,
-                                                     const BSONObj& key,
-                                                     const RecordId& id,
-                                                     bool dupsAllowed);
+    virtual Status insert(OperationContext* opCtx,
+                          const KeyString::Value& keyString,
+                          bool dupsAllowed);
 
     virtual void unindex(OperationContext* opCtx,
-                         const BSONObj& key,
-                         const RecordId& id,
+                         const KeyString::Value& keyString,
                          bool dupsAllowed);
 
     virtual void fullValidate(OperationContext* opCtx,
@@ -107,11 +105,9 @@ public:
     virtual bool appendCustomStats(OperationContext* opCtx,
                                    BSONObjBuilder* output,
                                    double scale) const;
-    virtual Status dupKeyCheck(OperationContext* opCtx, const BSONObj& key);
+    virtual Status dupKeyCheck(OperationContext* opCtx, const KeyString::Value& keyString);
 
     virtual bool isEmpty(OperationContext* opCtx);
-
-    virtual Status touch(OperationContext* opCtx) const;
 
     virtual long long getSpaceUsedBytes(OperationContext* opCtx) const;
 
@@ -125,20 +121,13 @@ public:
 
     // WiredTigerIndex additions
 
-    virtual bool isDup(OperationContext* opCtx, WT_CURSOR* c, const BSONObj& key);
+    virtual bool isDup(OperationContext* opCtx, WT_CURSOR* c, const KeyString::Value& keyString);
 
     uint64_t tableId() const {
         return _tableId;
     }
-    Ordering ordering() const {
-        return _ordering;
-    }
 
-    KeyString::Version keyStringVersion() const {
-        return _keyStringVersion;
-    }
-
-    std::string collectionNamespace() const {
+    const NamespaceString& collectionNamespace() const {
         return _collectionNamespace;
     }
 
@@ -158,33 +147,40 @@ public:
     virtual bool isTimestampSafeUniqueIdx() const = 0;
 
 protected:
-    virtual StatusWith<SpecialFormatInserted> _insert(OperationContext* opCtx,
-                                                      WT_CURSOR* c,
-                                                      const BSONObj& key,
-                                                      const RecordId& id,
-                                                      bool dupsAllowed) = 0;
+    virtual Status _insert(OperationContext* opCtx,
+                           WT_CURSOR* c,
+                           const KeyString::Value& keyString,
+                           bool dupsAllowed) = 0;
 
     virtual void _unindex(OperationContext* opCtx,
                           WT_CURSOR* c,
-                          const BSONObj& key,
-                          const RecordId& id,
+                          const KeyString::Value& keyString,
                           bool dupsAllowed) = 0;
 
     void setKey(WT_CURSOR* cursor, const WT_ITEM* item);
     void getKey(WT_CURSOR* cursor, WT_ITEM* key);
 
+    /*
+     * Determines the data format version from application metadata and verifies compatibility.
+     * Returns the corresponding KeyString version.
+     */
+    KeyString::Version _handleVersionInfo(OperationContext* ctx,
+                                          const std::string& uri,
+                                          const IndexDescriptor* desc,
+                                          bool isReadOnly);
+
     class BulkBuilder;
     class StandardBulkBuilder;
     class UniqueBulkBuilder;
 
-    const Ordering _ordering;
-    // The keystring and data format version are effectively const after the WiredTigerIndex
-    // instance is constructed.
-    KeyString::Version _keyStringVersion;
+    /*
+     * The data format version is effectively const after the WiredTigerIndex instance is
+     * constructed.
+     */
     int _dataFormatVersion;
     std::string _uri;
     uint64_t _tableId;
-    const std::string _collectionNamespace;
+    const NamespaceString _collectionNamespace;
     const std::string _indexName;
     const BSONObj _keyPattern;
     KVPrefix _prefix;
@@ -210,49 +206,43 @@ public:
 
     bool isTimestampSafeUniqueIdx() const override;
 
-    bool isDup(OperationContext* opCtx, WT_CURSOR* c, const BSONObj& key) override;
+    bool isDup(OperationContext* opCtx, WT_CURSOR* c, const KeyString::Value& keyString) override;
 
-    StatusWith<SpecialFormatInserted> _insert(OperationContext* opCtx,
-                                              WT_CURSOR* c,
-                                              const BSONObj& key,
-                                              const RecordId& id,
-                                              bool dupsAllowed) override;
+    Status _insert(OperationContext* opCtx,
+                   WT_CURSOR* c,
+                   const KeyString::Value& keyString,
+                   bool dupsAllowed) override;
 
-    StatusWith<SpecialFormatInserted> _insertTimestampUnsafe(OperationContext* opCtx,
-                                                             WT_CURSOR* c,
-                                                             const BSONObj& key,
-                                                             const RecordId& id,
-                                                             bool dupsAllowed);
+    Status _insertTimestampUnsafe(OperationContext* opCtx,
+                                  WT_CURSOR* c,
+                                  const KeyString::Value& keyString,
+                                  bool dupsAllowed);
 
-    StatusWith<SpecialFormatInserted> _insertTimestampSafe(OperationContext* opCtx,
-                                                           WT_CURSOR* c,
-                                                           const BSONObj& key,
-                                                           const RecordId& id,
-                                                           bool dupsAllowed);
+    Status _insertTimestampSafe(OperationContext* opCtx,
+                                WT_CURSOR* c,
+                                const KeyString::Value& keyString,
+                                bool dupsAllowed);
 
     void _unindex(OperationContext* opCtx,
                   WT_CURSOR* c,
-                  const BSONObj& key,
-                  const RecordId& id,
+                  const KeyString::Value& keyString,
                   bool dupsAllowed) override;
 
     void _unindexTimestampUnsafe(OperationContext* opCtx,
                                  WT_CURSOR* c,
-                                 const BSONObj& key,
-                                 const RecordId& id,
+                                 const KeyString::Value& keyString,
                                  bool dupsAllowed);
 
     void _unindexTimestampSafe(OperationContext* opCtx,
                                WT_CURSOR* c,
-                               const BSONObj& key,
-                               const RecordId& id,
+                               const KeyString::Value& keyString,
                                bool dupsAllowed);
 
 private:
     /**
      * If this returns true, the cursor will be positioned on the first matching the input 'key'.
      */
-    bool _keyExists(OperationContext* opCtx, WT_CURSOR* c, const KeyString& key);
+    bool _keyExists(OperationContext* opCtx, WT_CURSOR* c, const char* buffer, size_t size);
 
     bool _partial;
 };
@@ -278,17 +268,15 @@ public:
         return false;
     }
 
-    StatusWith<SpecialFormatInserted> _insert(OperationContext* opCtx,
-                                              WT_CURSOR* c,
-                                              const BSONObj& key,
-                                              const RecordId& id,
-                                              bool dupsAllowed) override;
+    Status _insert(OperationContext* opCtx,
+                   WT_CURSOR* c,
+                   const KeyString::Value& keyString,
+                   bool dupsAllowed) override;
 
     void _unindex(OperationContext* opCtx,
                   WT_CURSOR* c,
-                  const BSONObj& key,
-                  const RecordId& id,
+                  const KeyString::Value& keyString,
                   bool dupsAllowed) override;
 };
 
-}  // namespace
+}  // namespace mongo

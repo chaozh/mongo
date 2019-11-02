@@ -29,6 +29,7 @@
 
 #include "mongo/platform/basic.h"
 
+#include <functional>
 #include <memory>
 
 #include "mongo/base/status.h"
@@ -38,9 +39,8 @@
 #include "mongo/db/repl/vote_requester.h"
 #include "mongo/executor/remote_command_request.h"
 #include "mongo/executor/remote_command_response.h"
-#include "mongo/stdx/functional.h"
 #include "mongo/unittest/unittest.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 namespace repl {
@@ -59,31 +59,23 @@ class VoteRequesterTest : public mongo::unittest::Test {
 public:
     virtual void setUp() {
         ReplSetConfig config;
-        ASSERT_OK(config.initialize(BSON("_id"
-                                         << "rs0"
-                                         << "version"
-                                         << 2
-                                         << "protocolVersion"
-                                         << 1
-                                         << "members"
-                                         << BSON_ARRAY(BSON("_id" << 0 << "host"
-                                                                  << "host0")
-                                                       << BSON("_id" << 1 << "host"
-                                                                     << "host1")
-                                                       << BSON("_id" << 2 << "host"
-                                                                     << "host2")
-                                                       << BSON("_id" << 3 << "host"
-                                                                     << "host3"
-                                                                     << "votes"
-                                                                     << 0
-                                                                     << "priority"
-                                                                     << 0)
-                                                       << BSON("_id" << 4 << "host"
-                                                                     << "host4"
-                                                                     << "votes"
-                                                                     << 0
-                                                                     << "priority"
-                                                                     << 0)))));
+        ASSERT_OK(
+            config.initialize(BSON("_id"
+                                   << "rs0"
+                                   << "version" << 2 << "protocolVersion" << 1 << "members"
+                                   << BSON_ARRAY(BSON("_id" << 0 << "host"
+                                                            << "host0")
+                                                 << BSON("_id" << 1 << "host"
+                                                               << "host1")
+                                                 << BSON("_id" << 2 << "host"
+                                                               << "host2")
+                                                 << BSON("_id" << 3 << "host"
+                                                               << "host3"
+                                                               << "votes" << 0 << "priority" << 0)
+                                                 << BSON("_id" << 4 << "host"
+                                                               << "host4"
+                                                               << "votes" << 0 << "priority"
+                                                               << 0)))));
         ASSERT_OK(config.validate());
         long long candidateId = 0;
         long long term = 2;
@@ -98,7 +90,7 @@ public:
     }
 
     virtual void tearDown() {
-        _requester.reset(NULL);
+        _requester.reset(nullptr);
     }
 
 protected:
@@ -163,7 +155,8 @@ protected:
         response.setVoteGranted(true);
         response.setTerm(1);
         response.addToBSON(&result);
-        auto status = Status(ErrorCodes::InterruptedDueToStepDown, "operation was interrupted");
+        auto status =
+            Status(ErrorCodes::InterruptedDueToReplStateChange, "operation was interrupted");
         CommandHelpers::appendCommandStatusNoThrow(result, status);
         return RemoteCommandResponse(result.obj(), Milliseconds(10));
     }
@@ -215,31 +208,23 @@ class VoteRequesterDryRunTest : public VoteRequesterTest {
 public:
     virtual void setUp() {
         ReplSetConfig config;
-        ASSERT_OK(config.initialize(BSON("_id"
-                                         << "rs0"
-                                         << "version"
-                                         << 2
-                                         << "protocolVersion"
-                                         << 1
-                                         << "members"
-                                         << BSON_ARRAY(BSON("_id" << 0 << "host"
-                                                                  << "host0")
-                                                       << BSON("_id" << 1 << "host"
-                                                                     << "host1")
-                                                       << BSON("_id" << 2 << "host"
-                                                                     << "host2")
-                                                       << BSON("_id" << 3 << "host"
-                                                                     << "host3"
-                                                                     << "votes"
-                                                                     << 0
-                                                                     << "priority"
-                                                                     << 0)
-                                                       << BSON("_id" << 4 << "host"
-                                                                     << "host4"
-                                                                     << "votes"
-                                                                     << 0
-                                                                     << "priority"
-                                                                     << 0)))));
+        ASSERT_OK(
+            config.initialize(BSON("_id"
+                                   << "rs0"
+                                   << "version" << 2 << "protocolVersion" << 1 << "members"
+                                   << BSON_ARRAY(BSON("_id" << 0 << "host"
+                                                            << "host0")
+                                                 << BSON("_id" << 1 << "host"
+                                                               << "host1")
+                                                 << BSON("_id" << 2 << "host"
+                                                               << "host2")
+                                                 << BSON("_id" << 3 << "host"
+                                                               << "host3"
+                                                               << "votes" << 0 << "priority" << 0)
+                                                 << BSON("_id" << 4 << "host"
+                                                               << "host4"
+                                                               << "votes" << 0 << "priority"
+                                                               << 0)))));
         ASSERT_OK(config.validate());
         long long candidateId = 0;
         long long term = 2;
@@ -260,11 +245,7 @@ public:
         ReplSetConfig config;
         ASSERT_OK(config.initialize(BSON("_id"
                                          << "rs0"
-                                         << "version"
-                                         << 2
-                                         << "protocolVersion"
-                                         << 1
-                                         << "members"
+                                         << "version" << 2 << "protocolVersion" << 1 << "members"
                                          << BSON_ARRAY(BSON("_id" << 0 << "host"
                                                                   << "host0")
                                                        << BSON("_id" << 1 << "host"

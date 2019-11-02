@@ -13,7 +13,6 @@ load('jstests/concurrency/fsm_libs/extend_workload.js');                // for e
 load('jstests/concurrency/fsm_workloads/sharded_base_partitioned.js');  // for $config
 
 var $config = extendWorkload($config, function($config, $super) {
-
     $config.iterations = 8;
     $config.threadCount = 5;
 
@@ -102,7 +101,7 @@ var $config = extendWorkload($config, function($config, $super) {
         }
 
         // Grab a chunk and its upper neighbor.
-        chunk1 = this.getRandomChunkInPartition(config);
+        chunk1 = this.getRandomChunkInPartition(collName, config);
         // If we randomly chose the last chunk, choose the one before it.
         if (chunk1.max._id === this.partition.chunkUpper) {
             chunk1 = configDB.chunks.findOne({ns: ns, 'max._id': chunk1.min._id});
@@ -250,7 +249,6 @@ var $config = extendWorkload($config, function($config, $super) {
                 assertWhenOwnColl.eq(numChunksAfter, numChunksBefore, msg);
             }
         }
-
     };
 
     $config.transitions = {init: {mergeChunks: 1}, mergeChunks: {mergeChunks: 1}};

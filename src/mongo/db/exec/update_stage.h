@@ -47,7 +47,7 @@ struct PlanSummaryStats;
 
 struct UpdateStageParams {
     UpdateStageParams(const UpdateRequest* r, UpdateDriver* d, OpDebug* o)
-        : request(r), driver(d), opDebug(o), canonicalQuery(NULL) {}
+        : request(r), driver(d), opDebug(o), canonicalQuery(nullptr) {}
 
     // Contains update parameters like whether it's a multi update or an upsert. Not owned.
     // Must outlive the UpdateStage.
@@ -77,7 +77,8 @@ private:
  * Callers of doWork() must be holding a write lock.
  */
 class UpdateStage final : public RequiresMutableCollectionStage {
-    MONGO_DISALLOW_COPYING(UpdateStage);
+    UpdateStage(const UpdateStage&) = delete;
+    UpdateStage& operator=(const UpdateStage&) = delete;
 
 public:
     UpdateStage(OperationContext* opCtx,
@@ -130,8 +131,6 @@ public:
      *
      * Set 'isInternalRequest' to true if the upsert was issued by the replication or
      * sharding systems.
-     *
-     * Fills out whether or not this is a fastmodinsert in 'stats'.
      *
      * Returns the document to insert.
      */
@@ -198,12 +197,18 @@ private:
     StageState prepareToRetryWSM(WorkingSetID idToRetry, WorkingSetID* out);
 
     /**
-     * Checks if the updated doc still belongs to this node and throws if it does not. This means
-     * that one or more shard key field values have been updated causing this doc to belong to
-     * a chunk that is not owned by this shard. We cannot apply this update atomically.
+     * Checks that the updated doc has all required shard key fields and throws if it does not.
+     *
+     * Also checks if the updated doc still belongs to this node and throws if it does not. If the
+     * doc no longer belongs to this shard, this means that one or more shard key field values have
+     * been updated to a value belonging to a chunk that is not owned by this shard. We cannot apply
+     * this update atomically.
+     *
+     * If the update changes shard key fields but the new shard key remains on the same node,
+     * returns true. If the update does not change shard key fields, returns false.
      */
-    void assertDocStillBelongsToNode(ScopedCollectionMetadata metadata,
-                                     const Snapshotted<BSONObj>& oldObj);
+    bool checkUpdateChangesShardKeyFields(ScopedCollectionMetadata metadata,
+                                          const Snapshotted<BSONObj>& oldObj);
 
     UpdateStageParams _params;
 
@@ -221,6 +226,9 @@ private:
 
     // True if updated documents should be validated with storage_validation::storageValid().
     bool _enforceOkForStorage;
+
+    // True if the request should be checked for an update to the shard key.
+    bool _shouldCheckForShardKeyUpdate;
 
     // If the update was in-place, we may see it again.  This only matters if we're doing
     // a multi-update; if we're not doing a multi-update we stop after one update and we

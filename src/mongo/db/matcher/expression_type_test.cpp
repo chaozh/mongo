@@ -27,8 +27,8 @@
  *    it in the license file.
  */
 
-#include "mongo/db/matcher/expression_type.h"
 #include "mongo/bson/json.h"
+#include "mongo/db/matcher/expression_type.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
@@ -75,17 +75,17 @@ TEST(ExpressionTypeTest, MatchesElementNumber) {
 
 TEST(ExpressionTypeTest, MatchesScalar) {
     TypeMatchExpression type("a", Bool);
-    ASSERT(type.matchesBSON(BSON("a" << true), NULL));
-    ASSERT(!type.matchesBSON(BSON("a" << 1), NULL));
+    ASSERT(type.matchesBSON(BSON("a" << true), nullptr));
+    ASSERT(!type.matchesBSON(BSON("a" << 1), nullptr));
 }
 
 TEST(ExpressionTypeTest, MatchesArray) {
     TypeMatchExpression type("a", NumberInt);
-    ASSERT(type.matchesBSON(BSON("a" << BSON_ARRAY(4)), NULL));
-    ASSERT(type.matchesBSON(BSON("a" << BSON_ARRAY(4 << "a")), NULL));
-    ASSERT(type.matchesBSON(BSON("a" << BSON_ARRAY("a" << 4)), NULL));
-    ASSERT(!type.matchesBSON(BSON("a" << BSON_ARRAY("a")), NULL));
-    ASSERT(!type.matchesBSON(BSON("a" << BSON_ARRAY(BSON_ARRAY(4))), NULL));
+    ASSERT(type.matchesBSON(BSON("a" << BSON_ARRAY(4)), nullptr));
+    ASSERT(type.matchesBSON(BSON("a" << BSON_ARRAY(4 << "a")), nullptr));
+    ASSERT(type.matchesBSON(BSON("a" << BSON_ARRAY("a" << 4)), nullptr));
+    ASSERT(!type.matchesBSON(BSON("a" << BSON_ARRAY("a")), nullptr));
+    ASSERT(!type.matchesBSON(BSON("a" << BSON_ARRAY(BSON_ARRAY(4))), nullptr));
 }
 
 TEST(ExpressionTypeTest, TypeArrayMatchesOuterAndInnerArray) {
@@ -100,39 +100,39 @@ TEST(ExpressionTypeTest, TypeArrayMatchesOuterAndInnerArray) {
 
 TEST(ExpressionTypeTest, MatchesObject) {
     TypeMatchExpression type("a", Object);
-    ASSERT(type.matchesBSON(BSON("a" << BSON("b" << 1)), NULL));
-    ASSERT(!type.matchesBSON(BSON("a" << 1), NULL));
+    ASSERT(type.matchesBSON(BSON("a" << BSON("b" << 1)), nullptr));
+    ASSERT(!type.matchesBSON(BSON("a" << 1), nullptr));
 }
 
 TEST(ExpressionTypeTest, MatchesDotNotationFieldObject) {
     TypeMatchExpression type("a.b", Object);
-    ASSERT(type.matchesBSON(BSON("a" << BSON("b" << BSON("c" << 1))), NULL));
-    ASSERT(!type.matchesBSON(BSON("a" << BSON("b" << 1)), NULL));
+    ASSERT(type.matchesBSON(BSON("a" << BSON("b" << BSON("c" << 1))), nullptr));
+    ASSERT(!type.matchesBSON(BSON("a" << BSON("b" << 1)), nullptr));
 }
 
 TEST(ExpressionTypeTest, MatchesDotNotationArrayElementArray) {
     TypeMatchExpression type("a.0", Array);
-    ASSERT(type.matchesBSON(BSON("a" << BSON_ARRAY(BSON_ARRAY(1))), NULL));
-    ASSERT(!type.matchesBSON(BSON("a" << BSON_ARRAY("b")), NULL));
+    ASSERT(type.matchesBSON(BSON("a" << BSON_ARRAY(BSON_ARRAY(1))), nullptr));
+    ASSERT(!type.matchesBSON(BSON("a" << BSON_ARRAY("b")), nullptr));
 }
 
 TEST(ExpressionTypeTest, MatchesDotNotationArrayElementScalar) {
     TypeMatchExpression type("a.0", String);
-    ASSERT(type.matchesBSON(BSON("a" << BSON_ARRAY("b")), NULL));
-    ASSERT(!type.matchesBSON(BSON("a" << BSON_ARRAY(1)), NULL));
+    ASSERT(type.matchesBSON(BSON("a" << BSON_ARRAY("b")), nullptr));
+    ASSERT(!type.matchesBSON(BSON("a" << BSON_ARRAY(1)), nullptr));
 }
 
 TEST(ExpressionTypeTest, MatchesDotNotationArrayElementObject) {
     TypeMatchExpression type("a.0", Object);
-    ASSERT(type.matchesBSON(BSON("a" << BSON_ARRAY(BSON("b" << 1))), NULL));
-    ASSERT(!type.matchesBSON(BSON("a" << BSON_ARRAY(1)), NULL));
+    ASSERT(type.matchesBSON(BSON("a" << BSON_ARRAY(BSON("b" << 1))), nullptr));
+    ASSERT(!type.matchesBSON(BSON("a" << BSON_ARRAY(1)), nullptr));
 }
 
 TEST(ExpressionTypeTest, MatchesNull) {
     TypeMatchExpression type("a", jstNULL);
-    ASSERT(type.matchesBSON(BSON("a" << BSONNULL), NULL));
-    ASSERT(!type.matchesBSON(BSON("a" << 4), NULL));
-    ASSERT(!type.matchesBSON(BSONObj(), NULL));
+    ASSERT(type.matchesBSON(BSON("a" << BSONNULL), nullptr));
+    ASSERT(!type.matchesBSON(BSON("a" << 4), nullptr));
+    ASSERT(!type.matchesBSON(BSONObj(), nullptr));
 }
 
 TEST(ExpressionTypeTest, ElemMatchKey) {
@@ -218,48 +218,48 @@ TEST(ExpressionTypeTest, InternalSchemaTypeExprWithMultipleTypesMatchesAllSuchTy
 }
 
 TEST(ExpressionBinDataSubTypeTest, MatchesBinDataGeneral) {
-    BSONObj match = BSON("a" << BSONBinData(NULL, 0, BinDataType::BinDataGeneral));
-    BSONObj notMatch = BSON("a" << BSONBinData(NULL, 0, BinDataType::bdtCustom));
+    BSONObj match = BSON("a" << BSONBinData(nullptr, 0, BinDataType::BinDataGeneral));
+    BSONObj notMatch = BSON("a" << BSONBinData(nullptr, 0, BinDataType::bdtCustom));
     InternalSchemaBinDataSubTypeExpression type("", BinDataType::BinDataGeneral);
     ASSERT_TRUE(type.matchesSingleElement(match["a"]));
     ASSERT_FALSE(type.matchesSingleElement(notMatch["a"]));
 }
 
 TEST(ExpressionBinDataSubTypeTest, MatchesBinDataFunction) {
-    BSONObj match = BSON("a" << BSONBinData(NULL, 0, BinDataType::Function));
-    BSONObj notMatch = BSON("a" << BSONBinData(NULL, 0, BinDataType::MD5Type));
+    BSONObj match = BSON("a" << BSONBinData(nullptr, 0, BinDataType::Function));
+    BSONObj notMatch = BSON("a" << BSONBinData(nullptr, 0, BinDataType::MD5Type));
     InternalSchemaBinDataSubTypeExpression type("", BinDataType::Function);
     ASSERT_TRUE(type.matchesSingleElement(match["a"]));
     ASSERT_FALSE(type.matchesSingleElement(notMatch["a"]));
 }
 
 TEST(ExpressionBinDataSubTypeTest, MatchesBinDataNewUUID) {
-    BSONObj match = BSON("a" << BSONBinData(NULL, 0, BinDataType::newUUID));
-    BSONObj notMatch = BSON("a" << BSONBinData(NULL, 0, BinDataType::BinDataGeneral));
+    BSONObj match = BSON("a" << BSONBinData(nullptr, 0, BinDataType::newUUID));
+    BSONObj notMatch = BSON("a" << BSONBinData(nullptr, 0, BinDataType::BinDataGeneral));
     InternalSchemaBinDataSubTypeExpression type("", BinDataType::newUUID);
     ASSERT_TRUE(type.matchesSingleElement(match["a"]));
     ASSERT_FALSE(type.matchesSingleElement(notMatch["a"]));
 }
 
 TEST(ExpressionBinDataSubTypeTest, MatchesBinDataMD5Type) {
-    BSONObj match = BSON("a" << BSONBinData(NULL, 0, BinDataType::MD5Type));
-    BSONObj notMatch = BSON("a" << BSONBinData(NULL, 0, BinDataType::newUUID));
+    BSONObj match = BSON("a" << BSONBinData(nullptr, 0, BinDataType::MD5Type));
+    BSONObj notMatch = BSON("a" << BSONBinData(nullptr, 0, BinDataType::newUUID));
     InternalSchemaBinDataSubTypeExpression type("", BinDataType::MD5Type);
     ASSERT_TRUE(type.matchesSingleElement(match["a"]));
     ASSERT_FALSE(type.matchesSingleElement(notMatch["a"]));
 }
 
 TEST(ExpressionBinDataSubTypeTest, MatchesBinDataEncryptType) {
-    BSONObj match = BSON("a" << BSONBinData(NULL, 0, BinDataType::Encrypt));
-    BSONObj notMatch = BSON("a" << BSONBinData(NULL, 0, BinDataType::newUUID));
+    BSONObj match = BSON("a" << BSONBinData(nullptr, 0, BinDataType::Encrypt));
+    BSONObj notMatch = BSON("a" << BSONBinData(nullptr, 0, BinDataType::newUUID));
     InternalSchemaBinDataSubTypeExpression type("", BinDataType::Encrypt);
     ASSERT_TRUE(type.matchesSingleElement(match["a"]));
     ASSERT_FALSE(type.matchesSingleElement(notMatch["a"]));
 }
 
 TEST(ExpressionBinDataSubTypeTest, MatchesBinDataBdtCustom) {
-    BSONObj match = BSON("a" << BSONBinData(NULL, 0, BinDataType::bdtCustom));
-    BSONObj notMatch = BSON("a" << BSONBinData(NULL, 0, BinDataType::Function));
+    BSONObj match = BSON("a" << BSONBinData(nullptr, 0, BinDataType::bdtCustom));
+    BSONObj notMatch = BSON("a" << BSONBinData(nullptr, 0, BinDataType::Function));
     InternalSchemaBinDataSubTypeExpression type("", BinDataType::bdtCustom);
     ASSERT_TRUE(type.matchesSingleElement(match["a"]));
     ASSERT_FALSE(type.matchesSingleElement(notMatch["a"]));
@@ -268,11 +268,11 @@ TEST(ExpressionBinDataSubTypeTest, MatchesBinDataBdtCustom) {
 TEST(ExpressionBinDataSubTypeTest, DoesNotMatchArrays) {
     InternalSchemaBinDataSubTypeExpression type("a", BinDataType::BinDataGeneral);
     ASSERT_FALSE(type.matchesBSON(
-        BSON("a" << BSON_ARRAY(BSONBinData(NULL, 0, BinDataType::BinDataGeneral)
-                               << BSONBinData(NULL, 0, BinDataType::BinDataGeneral)))));
-    ASSERT_FALSE(
-        type.matchesBSON(BSON("a" << BSON_ARRAY(BSONBinData(NULL, 0, BinDataType::BinDataGeneral)
-                                                << BSONBinData(NULL, 0, BinDataType::Function)))));
+        BSON("a" << BSON_ARRAY(BSONBinData(nullptr, 0, BinDataType::BinDataGeneral)
+                               << BSONBinData(nullptr, 0, BinDataType::BinDataGeneral)))));
+    ASSERT_FALSE(type.matchesBSON(
+        BSON("a" << BSON_ARRAY(BSONBinData(nullptr, 0, BinDataType::BinDataGeneral)
+                               << BSONBinData(nullptr, 0, BinDataType::Function)))));
 }
 
 TEST(ExpressionBinDataSubTypeTest, DoesNotMatchString) {
@@ -292,5 +292,26 @@ TEST(ExpressionBinDataSubTypeTest, Equivalent) {
     ASSERT(!e1.equivalent(&e3));
 }
 
+TEST(InternalSchemaBinDataEncryptedTypeTest, DoesNotTraverseLeafArrays) {
+    MatcherTypeSet typeSet;
+    typeSet.bsonTypes.insert(BSONType::String);
+    typeSet.bsonTypes.insert(BSONType::Date);
+    InternalSchemaBinDataEncryptedTypeExpression expr("a", std::move(typeSet));
+
+    FleBlobHeader blob;
+    blob.fleBlobSubtype = FleBlobSubtype::Deterministic;
+    memset(blob.keyUUID, 0, sizeof(blob.keyUUID));
+    blob.originalBsonType = BSONType::String;
+    auto binData = BSONBinData(
+        reinterpret_cast<const void*>(&blob), sizeof(FleBlobHeader), BinDataType::Encrypt);
+
+    BSONObj matchingDoc = BSON("a" << BSONBinData(reinterpret_cast<const void*>(&blob),
+                                                  sizeof(FleBlobHeader),
+                                                  BinDataType::Encrypt));
+    ASSERT_TRUE(expr.matchesBSON(BSON("a" << binData)));
+    ASSERT_FALSE(expr.matchesBSON(BSON("a" << BSON_ARRAY(binData))));
+    ASSERT_FALSE(expr.matchesBSON(BSON("a" << BSONArray())));
+}
+
 }  // namespace
-}  // namepace mongo
+}  // namespace mongo

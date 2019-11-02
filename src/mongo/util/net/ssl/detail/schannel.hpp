@@ -308,10 +308,25 @@ public:
     }
 
     /**
+     * Returns the SNI captured in doServerHandshake.
+     */
+    boost::optional<std::string> getSNI() const {
+        if (!_sni) {
+            return boost::none;
+        }
+        auto sni_data = reinterpret_cast<const char*>(_sni->data());
+        return std::string(sni_data);
+    }
+
+    /**
      * Get data to sent over the network.
      */
     void readOutputBuffer(void* data, size_t inLength, size_t& outLength) {
         _pOutBuffer->readInto(data, inLength, outLength);
+    }
+
+    static void setSslGetServerIdentityFn(SslGetServerIdentityFn sslGetServerIdentityFn) {
+        _sslGetServerIdentityFn = sslGetServerIdentityFn;
     }
 
 private:
@@ -361,9 +376,12 @@ private:
      * +----------------+     +-----------------------+     +-------------------+     +------+
      * | HandshakeStart | --> | NeedMoreHandshakeData | --> | HaveEncryptedData | --> | Done |
      * +----------------+     +-----------------------+     +-------------------+     +------+
+     *                          ^                   |
+     *                          +-------------------+
      *
-     * "[ HandshakeStart ] --> [ NeedMoreHandshakeData ] --> [HaveEncryptedData] -> [
-     * NeedMoreHandshakeData], [Done] " | graph-easy
+     * echo "[ HandshakeStart ] --> [ NeedMoreHandshakeData ] --> [ NeedMoreHandshakeData ] -->
+     * [HaveEncryptedData] -> [NeedMoreHandshakeData], [Done]" | graph-easy "[ HandshakeStart ] -->
+     * [ NeedMoreHandshakeData ] --> [HaveEncryptedData] -> [
      */
     enum class State {
         // Initial state
@@ -385,7 +403,7 @@ private:
     void setState(State s) {
         ASSERT_STATE_TRANSITION(_state == State::HandshakeStart, s == State::NeedMoreHandshakeData);
         ASSERT_STATE_TRANSITION(_state == State::NeedMoreHandshakeData,
-                                s == State::HaveEncryptedData);
+                                s == State::HaveEncryptedData || s == State::NeedMoreHandshakeData);
         ASSERT_STATE_TRANSITION(_state == State::HaveEncryptedData,
                                 s == State::NeedMoreHandshakeData || s == State::Done);
         _state = s;
@@ -400,6 +418,15 @@ private:
 
     // Server name for TLS SNI purposes
     std::wstring& _serverName;
+
+    // For reading in the SNI from client hello
+    boost::optional<std::vector<BYTE>> _sni;
+
+    // Checks whether the sni has been set.
+    bool _sni_set = false;
+
+    // SChannel function to get the SNI from the client hello
+    static SslGetServerIdentityFn _sslGetServerIdentityFn;
 
     // Buffer of data received from remote side
     ReusableBuffer* _pInBuffer;

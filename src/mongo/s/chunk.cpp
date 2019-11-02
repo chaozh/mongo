@@ -35,7 +35,7 @@
 
 #include "mongo/platform/random.h"
 #include "mongo/s/chunk_writes_tracker.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -88,8 +88,7 @@ void ChunkInfo::throwIfMovedSince(const Timestamp& ts) const {
 
     uasserted(ErrorCodes::MigrationConflict,
               str::stream() << "Chunk has moved since timestamp: " << ts.toString()
-                            << ", most recently at timestamp: "
-                            << latestValidAfter.toString());
+                            << ", most recently at timestamp: " << latestValidAfter.toString());
 }
 
 bool ChunkInfo::containsKey(const BSONObj& shardKey) const {

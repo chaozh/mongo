@@ -31,9 +31,9 @@
 
 #include "mongo/db/pipeline/accumulator.h"
 
+#include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/pipeline/accumulation_statement.h"
 #include "mongo/db/pipeline/expression.h"
-#include "mongo/db/pipeline/value.h"
 
 namespace mongo {
 
@@ -41,7 +41,8 @@ using boost::intrusive_ptr;
 
 /* ------------------------- AccumulatorMergeObjects ----------------------------- */
 
-REGISTER_ACCUMULATOR(mergeObjects, AccumulatorMergeObjects::create);
+REGISTER_ACCUMULATOR(mergeObjects,
+                     genericParseSingleExpressionAccumulator<AccumulatorMergeObjects>);
 REGISTER_EXPRESSION(mergeObjects, ExpressionFromAccumulator<AccumulatorMergeObjects>::parse);
 
 const char* AccumulatorMergeObjects::getOpName() const {
@@ -71,8 +72,7 @@ void AccumulatorMergeObjects::processInternal(const Value& input, bool merging) 
 
     uassert(40400,
             str::stream() << "$mergeObjects requires object inputs, but input " << input.toString()
-                          << " is of type "
-                          << typeName(input.getType()),
+                          << " is of type " << typeName(input.getType()),
             (input.getType() == BSONType::Object));
 
     FieldIterator iter = input.getDocument().fieldIterator();
@@ -90,5 +90,4 @@ void AccumulatorMergeObjects::processInternal(const Value& input, bool merging) 
 Value AccumulatorMergeObjects::getValue(bool toBeMerged) {
     return _output.freezeToValue();
 }
-
 }  // namespace mongo

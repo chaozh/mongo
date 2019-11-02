@@ -39,7 +39,8 @@ namespace mongo {
  * facilitate testing of classes that use a CatalogCacheLoader.
  */
 class CatalogCacheLoaderMock final : public CatalogCacheLoader {
-    MONGO_DISALLOW_COPYING(CatalogCacheLoaderMock);
+    CatalogCacheLoaderMock(const CatalogCacheLoaderMock&) = delete;
+    CatalogCacheLoaderMock& operator=(const CatalogCacheLoaderMock&) = delete;
 
 public:
     CatalogCacheLoaderMock();
@@ -51,6 +52,7 @@ public:
     void initializeReplicaSetRole(bool isPrimary) override;
     void onStepDown() override;
     void onStepUp() override;
+    void shutDown() override;
     void notifyOfCollectionVersionUpdate(const NamespaceString& nss) override;
     void waitForCollectionFlush(OperationContext* opCtx, const NamespaceString& nss) override;
     void waitForDatabaseFlush(OperationContext* opCtx, StringData dbName) override;
@@ -62,7 +64,7 @@ public:
 
     void getDatabase(
         StringData dbName,
-        stdx::function<void(OperationContext*, StatusWith<DatabaseType>)> callbackFn) override;
+        std::function<void(OperationContext*, StatusWith<DatabaseType>)> callbackFn) override;
 
     /**
      * Sets the mocked collection entry result that getChunksSince will use to construct its return

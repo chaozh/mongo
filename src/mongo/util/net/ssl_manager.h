@@ -37,7 +37,6 @@
 
 #ifdef MONGO_CONFIG_SSL
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/base/string_data.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/db/service_context.h"
@@ -70,7 +69,7 @@ Status validateOpensslCipherConfig(const std::string&);
  * Validation callback for setParameter 'disableNonTLSConnectionLogging'.
  */
 Status validateDisableNonTLSConnectionLogging(const bool&);
-}
+}  // namespace mongo
 
 #ifdef MONGO_CONFIG_SSL
 namespace mongo {
@@ -114,8 +113,6 @@ struct OpenSSLDeleter {
 class SSLConnectionInterface {
 public:
     virtual ~SSLConnectionInterface();
-
-    virtual std::string getSNIServerName() const = 0;
 };
 
 class SSLConfiguration {
@@ -137,6 +134,15 @@ private:
     SSLX509Name _serverSubjectName;
     std::vector<SSLX509Name::Entry> _canonicalServerSubjectName;
 };
+
+// These represent the ASN.1 type bytes for strings used in an X509 DirectoryString
+constexpr int kASN1BMPString = 30;
+constexpr int kASN1IA5String = 22;
+constexpr int kASN1OctetString = 4;
+constexpr int kASN1PrintableString = 19;
+constexpr int kASN1TeletexString = 20;
+constexpr int kASN1UTF8String = 12;
+constexpr int kASN1UniversalString = 28;
 
 /**
  * Stores information about a globally unique OID.
@@ -211,10 +217,19 @@ public:
      */
     virtual const SSLConfiguration& getSSLConfiguration() const = 0;
 
+#if MONGO_CONFIG_SSL_PROVIDER == MONGO_CONFIG_SSL_PROVIDER_OPENSSL
     /**
-    * Fetches the error text for an error code, in a thread-safe manner.
-    */
-    static std::string getSSLErrorMessage(int code);
+     * Fetches the error text for an error code, in a thread-safe manner.
+     */
+    static std::string getSSLErrorMessage(int code) {
+        // 120 from the SSL documentation for ERR_error_string
+        static const size_t msglen = 120;
+
+        char msg[msglen];
+        ERR_error_string_n(code, msg, msglen);
+        return msg;
+    }
+#endif
 
     /**
      * SSL wrappers
@@ -238,13 +253,15 @@ public:
 
     /**
      * Fetches a peer certificate and validates it if it exists. If validation fails, but weak
-     * validation is enabled, boost::none will be returned. If validation fails, and invalid
+     * validation is enabled, the `subjectName` will be empty. If validation fails, and invalid
      * certificates are not allowed, a non-OK status will be returned. If validation is successful,
-     * an engaged optional containing the certificate's subject name, and any roles acquired by
-     * X509 authorization will be returned.
+     * the `subjectName` will contain  the certificate's subject name, and any roles acquired by
+     * X509 authorization will be returned in `roles`.
+     * Further, the SNI Name will be captured into the `sni` value, when available.
      */
-    virtual StatusWith<boost::optional<SSLPeerInfo>> parseAndValidatePeerCertificate(
+    virtual StatusWith<SSLPeerInfo> parseAndValidatePeerCertificate(
         SSLConnectionType ssl,
+        boost::optional<std::string> sni,
         const std::string& remoteHost,
         const HostAndPort& hostForLogging) = 0;
 };
@@ -311,6 +328,11 @@ StatusWith<TLSVersion> mapTLSVersion(SSLConnectionType conn);
  */
 void recordTLSVersion(TLSVersion version, const HostAndPort& hostForLogging);
 
+/**
+ * Emit a warning() explaining that a client certificate is about to expire.
+ */
+void tlsEmitWarningExpiringClientCertificate(const SSLX509Name& peer);
+void tlsEmitWarningExpiringClientCertificate(const SSLX509Name& peer, Days days);
 
 }  // namespace mongo
 #endif  // #ifdef MONGO_CONFIG_SSL

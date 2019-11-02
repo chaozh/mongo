@@ -38,8 +38,8 @@ def timestamp_str(t):
 # Ensure checkpoints don't read too unnecessary lookaside entries.
 class test_las03(wttest.WiredTigerTestCase):
     # Force a small cache.
-    def conn_config(self):
-        return 'cache_size=50MB,statistics=(fast)'
+    conn_config = 'cache_size=50MB,statistics=(fast)'
+    session_config = 'isolation=snapshot'
 
     def get_stat(self, stat):
         stat_cursor = self.session.open_cursor('statistics:')
@@ -63,22 +63,22 @@ class test_las03(wttest.WiredTigerTestCase):
         nrows = 100
         ds = SimpleDataSet(self, uri, nrows, key_format="S", value_format='u')
         ds.populate()
-        bigvalue = "aaaaa" * 100
+        bigvalue = b"aaaaa" * 100
 
-        # Initially load huge data
+        # Initially load huge data.
         cursor = self.session.open_cursor(uri)
         for i in range(1, 10000):
             cursor[ds.key(nrows + i)] = bigvalue
         cursor.close()
         self.session.checkpoint()
 
-        # Check to see LAS working with old timestamp
-        bigvalue2 = "ddddd" * 100
+        # Check to see LAS working with old timestamp.
+        bigvalue2 = b"ddddd" * 100
         self.conn.set_timestamp('stable_timestamp=' + timestamp_str(1))
         las_writes_start = self.get_stat(stat.conn.cache_write_lookaside)
         self.large_updates(self.session, uri, bigvalue2, ds, nrows, 10000)
 
-        # If the test sizing is correct, the history will overflow the cache
+        # If the test sizing is correct, the history will overflow the cache.
         self.session.checkpoint()
         las_writes = self.get_stat(stat.conn.cache_write_lookaside) - las_writes_start
         self.assertGreaterEqual(las_writes, 0)
@@ -86,7 +86,7 @@ class test_las03(wttest.WiredTigerTestCase):
         for ts in range(2, 4):
             self.conn.set_timestamp('stable_timestamp=' + timestamp_str(ts))
 
-            # Now just update one record and checkpoint again
+            # Now just update one record and checkpoint again.
             self.large_updates(self.session, uri, bigvalue2, ds, nrows, 1)
 
             las_reads_start = self.get_stat(stat.conn.cache_read_lookaside)
@@ -96,7 +96,7 @@ class test_las03(wttest.WiredTigerTestCase):
             # Since we're dealing with eviction concurrent with checkpoints
             # and skewing is controlled by a heuristic, we can't put too tight
             # a bound on this.
-            self.assertLessEqual(las_reads, 100)
+            self.assertLessEqual(las_reads, 200)
 
 if __name__ == '__main__':
     wttest.run()

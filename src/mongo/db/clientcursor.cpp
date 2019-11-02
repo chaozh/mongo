@@ -87,11 +87,13 @@ ClientCursor::ClientCursor(ClientCursorParams params,
       _authenticatedUsers(std::move(params.authenticatedUsers)),
       _lsid(operationUsingCursor->getLogicalSessionId()),
       _txnNumber(operationUsingCursor->getTxnNumber()),
-      _readConcernArgs(params.readConcernArgs),
+      _writeConcernOptions(std::move(params.writeConcernOptions)),
+      _readConcernArgs(std::move(params.readConcernArgs)),
       _originatingCommand(params.originatingCommandObj),
       _originatingPrivileges(std::move(params.originatingPrivileges)),
       _queryOptions(params.queryOptions),
       _lockPolicy(params.lockPolicy),
+      _needsMerge(params.needsMerge),
       _exec(std::move(params.exec)),
       _operationUsingCursor(operationUsingCursor),
       _lastUseDate(now),
@@ -298,7 +300,7 @@ void _appendCursorStats(BSONObjBuilder& b) {
     b.appendNumber("totalNoTimeout", cursorStatsOpenNoTimeout.get());
     b.appendNumber("timedOut", cursorStatsTimedOut.get());
 }
-}
+}  // namespace
 
 void startClientCursorMonitor() {
     clientCursorMonitor.go();

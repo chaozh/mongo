@@ -54,7 +54,7 @@ namespace SnapshotWindowUtil {
  * tracked and attempts to increase the window are limited to once in
  * minMillisBetweenSnapshotWindowInc. This is to protect against a sudden wave of function calls due
  * to simultaneous SnapshotTooOld errors. Some time must be allowed for the increased target
- * snapshot window size to have an effect. The target size can also never exceed
+ * snapshot window size setting to have an effect. The target size can also never exceed
  * maxTargetSnapshotHistoryWindowInSeconds.
  */
 void increaseTargetSnapshotWindowSize(OperationContext* opCtx);
@@ -73,6 +73,14 @@ void increaseTargetSnapshotWindowSize(OperationContext* opCtx);
  * Implements a multiplicative decrease algorithm.
  */
 void decreaseTargetSnapshotWindowSize(OperationContext* opCtx);
+
+/**
+ * Increments a counter of SnapshotTooOld errors encountered in the command layer. Used for
+ * statistics purposes. Continuing SnapshotTooOld errors can indicate cache pressure.
+ *
+ * Concurrency safe, the internal counter is atomic.
+ */
+void incrementSnapshotTooOldErrorCount();
 
 }  // namespace SnapshotWindowUtil
 }  // namespace mongo

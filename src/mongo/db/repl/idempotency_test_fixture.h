@@ -40,9 +40,9 @@
 #include "mongo/db/catalog/collection_options.h"
 #include "mongo/db/logical_session_id.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/repl/oplog_applier_impl_test_fixture.h"
 #include "mongo/db/repl/oplog_entry.h"
 #include "mongo/db/repl/optime.h"
-#include "mongo/db/repl/sync_tail_test_fixture.h"
 #include "mongo/util/duration.h"
 #include "mongo/util/uuid.h"
 
@@ -87,7 +87,7 @@ std::ostream& operator<<(std::ostream& stream, const CollectionState& state);
 StringBuilderImpl<SharedBufferAllocator>& operator<<(StringBuilderImpl<SharedBufferAllocator>& sb,
                                                      const CollectionState& state);
 
-class IdempotencyTest : public SyncTailTest {
+class IdempotencyTest : public OplogApplierImplTest {
 protected:
     enum class SequenceType : int { kEntireSequence, kAnyPrefix, kAnySuffix, kAnyPrefixOrSuffix };
     OplogEntry createCollection(CollectionUUID uuid = UUID::gen());
@@ -95,8 +95,31 @@ protected:
     OplogEntry insert(const BSONObj& obj);
     template <class IdType>
     OplogEntry update(IdType _id, const BSONObj& obj);
-    OplogEntry buildIndex(const BSONObj& indexSpec, const BSONObj& options, UUID uuid);
-    OplogEntry dropIndex(const std::string& indexName);
+    OplogEntry buildIndex(const BSONObj& indexSpec, const BSONObj& options, const UUID& uuid);
+    OplogEntry dropIndex(const std::string& indexName, const UUID& uuid);
+    OplogEntry prepare(LogicalSessionId lsid,
+                       TxnNumber txnNum,
+                       StmtId stmtId,
+                       const BSONArray& ops,
+                       OpTime prevOpTime = OpTime());
+    OplogEntry commitUnprepared(LogicalSessionId lsid,
+                                TxnNumber txnNum,
+                                StmtId stmtId,
+                                const BSONArray& ops,
+                                OpTime prevOpTime = OpTime());
+    OplogEntry commitPrepared(LogicalSessionId lsid,
+                              TxnNumber txnNum,
+                              StmtId stmtId,
+                              OpTime prepareOpTime);
+    OplogEntry abortPrepared(LogicalSessionId lsid,
+                             TxnNumber txnNum,
+                             StmtId stmtId,
+                             OpTime prepareOpTime);
+    OplogEntry partialTxn(LogicalSessionId lsid,
+                          TxnNumber txnNum,
+                          StmtId stmtId,
+                          OpTime prevOpTime,
+                          const BSONArray& ops);
     virtual Status resetState();
 
     /**
@@ -117,13 +140,14 @@ protected:
     };
 
     std::string computeDataHash(Collection* collection);
-    virtual std::string getStateString(const CollectionState& state1,
-                                       const CollectionState& state2,
-                                       const std::vector<OplogEntry>& ops);
+    virtual std::string getStatesString(const std::vector<CollectionState>& state1,
+                                        const std::vector<CollectionState>& state2,
+                                        const std::vector<OplogEntry>& ops);
     /**
      * Validate data and indexes. Return the MD5 hash of the documents ordered by _id.
      */
-    CollectionState validate();
+    CollectionState validate(const NamespaceString& nss = NamespaceString("test.foo"));
+    std::vector<CollectionState> validateAllCollections();
 
     NamespaceString nss{"test.foo"};
 };
@@ -156,17 +180,30 @@ OplogEntry makeCommandOplogEntry(OpTime opTime,
                                  const BSONObj& command,
                                  boost::optional<UUID> uuid = boost::none);
 
+OplogEntry makeCommandOplogEntryWithSessionInfoAndStmtId(
+    OpTime opTime,
+    const NamespaceString& nss,
+    const BSONObj& command,
+    LogicalSessionId lsid,
+    TxnNumber txnNum,
+    StmtId stmtId,
+    boost::optional<OpTime> prevOpTime = boost::none);
+
 OplogEntry makeInsertDocumentOplogEntryWithSessionInfo(OpTime opTime,
                                                        const NamespaceString& nss,
                                                        const BSONObj& documentToInsert,
                                                        OperationSessionInfo info);
 
-OplogEntry makeInsertDocumentOplogEntryWithSessionInfoAndStmtId(OpTime opTime,
-                                                                const NamespaceString& nss,
-                                                                const BSONObj& documentToInsert,
-                                                                LogicalSessionId lsid,
-                                                                TxnNumber txnNum,
-                                                                StmtId stmtId);
+OplogEntry makeInsertDocumentOplogEntryWithSessionInfoAndStmtId(
+    OpTime opTime,
+    const NamespaceString& nss,
+    boost::optional<UUID> uuid,
+    const BSONObj& documentToInsert,
+    LogicalSessionId lsid,
+    TxnNumber txnNum,
+    StmtId stmtId,
+    boost::optional<OpTime> prevOpTime = boost::none);
 
+BSONObj makeInsertApplyOpsEntry(const NamespaceString& nss, const UUID& uuid, const BSONObj& doc);
 }  // namespace repl
 }  // namespace mongo

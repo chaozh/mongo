@@ -27,14 +27,23 @@ import mongo.platform as mongo_platform
 import mongo.toolchain as mongo_toolchain
 import mongo.generators as mongo_generators
 
-EnsurePythonVersion(2, 7)
-EnsureSConsVersion(3, 0, 4)
+EnsurePythonVersion(3, 6)
+EnsureSConsVersion(3, 1, 1)
+
+# Monkey patch SCons.FS.File.release_target_info to be a no-op.
+# See https://github.com/SCons/scons/issues/3454
+def release_target_info_noop(self):
+    pass
+SCons.Node.FS.File.release_target_info = release_target_info_noop
 
 from buildscripts import utils
 from buildscripts import moduleconfig
 
 import libdeps
 import psutil
+
+scons_invocation = '{} {}'.format(sys.executable, ' '.join(sys.argv))
+print('scons: running with args {}'.format(scons_invocation))
 
 atexit.register(mongo.print_build_failures)
 
@@ -92,9 +101,38 @@ SetOption('random', 1)
 #   using the nargs='const' mechanism.
 #
 
-add_option('prefix',
-    default='$BUILD_ROOT/install',
-    help='installation prefix',
+add_option('ninja',
+    choices=['true', 'false'],
+    default='false',
+    nargs='?',
+    const='true',
+    type='choice',
+    help='Enable the build.ninja generator tool',
+)
+
+add_option('ccache',
+    choices=['true', 'false'],
+    default='false',
+    nargs='?',
+    const='true',
+    type='choice',
+    help='Enable ccache support',
+)
+
+add_option('legacy-tarball',
+    choices=['true', 'false'],
+    default='false',
+    const='true',
+    nargs='?',
+    type='choice',
+    help='Build a tarball matching the old MongoDB dist targets',
+)
+
+add_option('lint-scope',
+    choices=['all', 'changed'],
+    default='all',
+    type='choice',
+    help='Lint files in the current git diff instead of all files'
 )
 
 add_option('install-mode',
@@ -125,11 +163,6 @@ add_option('lto',
     nargs=0,
 )
 
-add_option('dynamic-windows',
-    help='dynamically link on Windows',
-    nargs=0,
-)
-
 add_option('endian',
     choices=['big', 'little', 'auto'],
     default='auto',
@@ -157,15 +190,6 @@ add_option('ssl-provider',
     default='auto',
     help='Select the SSL engine to use',
     nargs=1,
-    type='choice',
-)
-
-add_option('mmapv1',
-    choices=['auto', 'on', 'off'],
-    const='on',
-    default='auto',
-    help='Enable MMapV1',
-    nargs='?',
     type='choice',
 )
 
@@ -262,6 +286,11 @@ add_option('sanitize',
     metavar='san1,san2,...sanN',
 )
 
+add_option('sanitize-coverage',
+    help='enable selected coverage sanitizers',
+    metavar='cov1,cov2,...covN',
+)
+
 add_option('llvm-symbolizer',
     default='llvm-symbolizer',
     help='name of (or path to) the LLVM symbolizer',
@@ -308,87 +337,38 @@ add_option('use-sasl-client',
     nargs=0,
 )
 
-add_option('use-system-tcmalloc',
-    help='use system version of tcmalloc library',
-    nargs=0,
-)
-
-add_option('use-system-pcre',
-    help='use system version of pcre library',
-    nargs=0,
-)
-
-add_option('use-system-wiredtiger',
-    help='use system version of wiredtiger library',
-    nargs=0,
-)
+# Most of the "use-system-*" options follow a simple form.
+for pack in [
+    ('abseil-cpp',),
+    ('asio', 'ASIO',),
+    ('boost',),
+    ('fmt',),
+    ('google-benchmark', 'Google benchmark'),
+    ('icu', 'ICU'),
+    ('intel_decimal128', 'intel decimal128'),
+    ('kms-message',),
+    ('pcre',),
+    ('snappy',),
+    ('sqlite',),
+    ('stemmer',),
+    ('tcmalloc',),
+    ('libunwind',),
+    ('valgrind',),
+    ('wiredtiger',),
+    ('yaml',),
+    ('zlib',),
+    ('zstd', 'Zstandard'),
+    ]:
+    name = pack[0]
+    pretty = name
+    if len(pack) == 2:
+        pretty = pack[1]
+    add_option(f'use-system-{name}',
+               help=f'use system version of {pretty} library',
+               nargs=0)
 
 add_option('system-boost-lib-search-suffixes',
     help='Comma delimited sequence of boost library suffixes to search',
-)
-
-add_option('use-system-abseil-cpp',
-    help='use system version of abseil-cpp libraries',
-    nargs=0,
-)
-
-add_option('use-system-boost',
-    help='use system version of boost libraries',
-    nargs=0,
-)
-
-add_option('use-system-snappy',
-    help='use system version of snappy library',
-    nargs=0,
-)
-
-add_option('use-system-valgrind',
-    help='use system version of valgrind library',
-    nargs=0,
-)
-
-add_option('use-system-google-benchmark',
-    help='use system version of Google benchmark library',
-    nargs=0,
-)
-
-add_option('use-system-zlib',
-    help='use system version of zlib library',
-    nargs=0,
-)
-
-add_option('use-system-zstd',
-    help="use system version of Zstandard library",
-    nargs=0,
-)
-
-add_option('use-system-sqlite',
-    help='use system version of sqlite library',
-    nargs=0,
-)
-
-add_option('use-system-stemmer',
-    help='use system version of stemmer',
-    nargs=0)
-
-add_option('use-system-yaml',
-    help='use system version of yaml',
-    nargs=0,
-)
-
-add_option('use-system-asio',
-    help="use system version of ASIO",
-    nargs=0,
-)
-
-add_option('use-system-icu',
-    help="use system version of ICU",
-    nargs=0,
-)
-
-add_option('use-system-intel_decimal128',
-    help='use system version of intel decimal128',
-    nargs=0,
 )
 
 add_option('use-system-mongo-c',
@@ -456,7 +436,7 @@ win_version_min_choices = {
 }
 
 add_option('win-version-min',
-    choices=win_version_min_choices.keys(),
+    choices=list(win_version_min_choices.keys()),
     default=None,
     help='minimum Windows version to support',
     type='choice',
@@ -548,6 +528,15 @@ add_option('msvc-debugging-format',
     type='choice',
 )
 
+add_option('use-libunwind',
+    choices=["on", "off"],
+    const="on",
+    default="off",
+    help="Enable libunwind for backtraces (experimental)",
+    nargs="?",
+    type='choice',
+)
+
 add_option('jlink',
         help="Limit link concurrency. Takes either an integer to limit to or a"
         " float between 0 and 1.0 whereby jobs will be multiplied to get the final"
@@ -557,6 +546,15 @@ add_option('jlink',
         default=None,
         nargs='?',
         type=float)
+
+add_option('enable-usdt-probes',
+	choices=["on", "off", "auto"],
+	default="auto",
+	help='Enables USDT probes. Default is auto, which is enabled only on Linux with SystemTap headers',
+	type='choice',
+    nargs='?',
+    const='on',
+)
 
 try:
     with open("version.json", "r") as version_fp:
@@ -571,7 +569,7 @@ try:
 except IOError as e:
     # If the file error wasn't because the file is missing, error out
     if e.errno != errno.ENOENT:
-        print("Error opening version.json: {0}".format(e.strerror))
+        print(("Error opening version.json: {0}".format(e.strerror)))
         Exit(1)
 
     version_data = {
@@ -580,14 +578,14 @@ except IOError as e:
     }
 
 except ValueError as e:
-    print("Error decoding version.json: {0}".format(e))
+    print(("Error decoding version.json: {0}".format(e)))
     Exit(1)
 
 # Setup the command-line variables
 def variable_shlex_converter(val):
     # If the argument is something other than a string, propogate
     # it literally.
-    if not isinstance(val, basestring):
+    if not isinstance(val, str):
         return val
     parse_mode = get_option('variable-parse-mode')
     if parse_mode == 'auto':
@@ -641,6 +639,7 @@ def variable_tools_converter(val):
         "mongo_benchmark",
         "mongo_integrationtest",
         "mongo_unittest",
+        "mongo_libfuzzer",
         "textfile",
     ]
 
@@ -651,7 +650,7 @@ def variable_distsrc_converter(val):
 
 variables_files = variable_shlex_converter(get_option('variables-files'))
 for file in variables_files:
-    print("Using variable customization file %s" % file)
+    print("Using variable customization file {}".format(file))
 
 env_vars = Variables(
     files=variables_files,
@@ -660,7 +659,7 @@ env_vars = Variables(
 
 sconsflags = os.environ.get('SCONSFLAGS', None)
 if sconsflags:
-    print("Using SCONSFLAGS environment variable arguments: %s" % sconsflags)
+    print(("Using SCONSFLAGS environment variable arguments: %s" % sconsflags))
 
 env_vars.Add('ABIDW',
     help="Configures the path to the 'abidw' (a libabigail) utility")
@@ -671,6 +670,9 @@ env_vars.Add('AR',
 env_vars.Add('ARFLAGS',
     help='Sets flags for the archiver',
     converter=variable_shlex_converter)
+
+env_vars.Add('CCACHE',
+    help='Path to ccache used for the --ccache option. Defaults to first ccache in PATH.')
 
 env_vars.Add(
     'CACHE_SIZE',
@@ -713,6 +715,14 @@ env_vars.Add('CXXFLAGS',
     help='Sets flags for the C++ compiler',
     converter=variable_shlex_converter)
 
+env_vars.Add('DESTDIR',
+    help='Where hygienic builds will install files',
+    default='$BUILD_ROOT/install')
+
+env_vars.Add('GITDIFFFLAGS',
+    help='Sets flags for git diff',
+    default='')
+
 # Note: This probably is only really meaningful when configured via a variables file. It will
 # also override whatever the SCons platform defaults would be.
 env_vars.Add('ENV',
@@ -743,6 +753,12 @@ env_vars.Add('ICECC_CREATE_ENV',
 
 env_vars.Add('ICECC_SCHEDULER',
     help='Tell ICECC where the sceduler daemon is running')
+
+env_vars.Add('ICECC_VERSION',
+    help='Tell ICECC where the compiler package is')
+
+env_vars.Add('ICECC_VERSION_ARCH',
+    help='Tell ICECC the target archicture for the compiler package, if non-native')
 
 env_vars.Add('LIBPATH',
     help='Adds paths to the linker search path',
@@ -790,7 +806,7 @@ env_vars.Add('MONGO_DISTNAME',
 def validate_mongo_version(key, val, env):
     regex = r'^(\d+)\.(\d+)\.(\d+)-?((?:(rc)(\d+))?.*)?'
     if not re.match(regex, val):
-        print("Invalid MONGO_VERSION '{}', or could not derive from version.json or git metadata. Please add a conforming MONGO_VERSION=x.y.z[-extra] as an argument to SCons".format(val))
+        print(("Invalid MONGO_VERSION '{}', or could not derive from version.json or git metadata. Please add a conforming MONGO_VERSION=x.y.z[-extra] as an argument to SCons".format(val)))
         Exit(1)
 
 env_vars.Add('MONGO_VERSION',
@@ -808,9 +824,27 @@ env_vars.Add('MSVC_USE_SCRIPT',
 env_vars.Add('MSVC_VERSION',
     help='Sets the version of Visual Studio to use (e.g.  12.0, 11.0, 10.0)')
 
+env_vars.Add('NINJA_SUFFIX',
+    help="""A suffix to add to the end of generated build.ninja
+files. Useful for when compiling multiple build ninja files for
+different configurations, for instance:
+
+    scons --sanitize=asan --ninja NINJA_SUFFIX=asan ninja-install-all-meta
+    scons --sanitize=tsan --ninja NINJA_SUFFIX=tsan ninja-install-all-meta
+
+Will generate the files (respectively):
+
+    install-all-meta.build.ninja.asan
+    install-all-meta.build.ninja.tsan
+""")
+
 env_vars.Add('OBJCOPY',
     help='Sets the path to objcopy',
     default=WhereIs('objcopy'))
+
+env_vars.Add('PREFIX',
+    help='Final installation location of files, will be made into a sub dir of $DESTDIR',
+    default='')
 
 # Exposed to be able to cross compile Android/*nix from Windows without ending up with the .exe suffix.
 env_vars.Add('PROGSUFFIX',
@@ -918,23 +952,17 @@ if cacheDir[0] not in ['$', '#']:
         print("Do not use relative paths with --cache-dir")
         Exit(1)
 
-installDir = get_option('prefix').rstrip('/')
-if installDir[0] not in ['$', '#']:
-    if not os.path.isabs(installDir):
-        print("Do not use relative paths with --prefix")
-        Exit(1)
-
 sconsDataDir = Dir(buildDir).Dir('scons')
-SConsignFile(str(sconsDataDir.File('sconsign')))
+SConsignFile(str(sconsDataDir.File('sconsign.py3')))
 
 def printLocalInfo():
     import sys, SCons
-    print( "scons version: " + SCons.__version__ )
-    print( "python version: " + " ".join( [ `i` for i in sys.version_info ] ) )
+    print(( "scons version: " + SCons.__version__ ))
+    print(( "python version: " + " ".join( [ repr(i) for i in sys.version_info ] ) ))
 
 printLocalInfo()
 
-boostLibs = [ "filesystem", "program_options", "system", "iostreams" ]
+boostLibs = [ "filesystem", "program_options", "system", "iostreams", "thread", "log" ]
 
 onlyServer = len( COMMAND_LINE_TARGETS ) == 0 or ( len( COMMAND_LINE_TARGETS ) == 1 and str( COMMAND_LINE_TARGETS[0] ) in [ "mongod" , "mongos" , "test" ] )
 
@@ -969,6 +997,17 @@ usemozjs = (jsEngine.startswith('mozjs'))
 if not serverJs and not usemozjs:
     print("Warning: --server-js=off is not needed with --js-engine=none")
 
+use_libunwind = get_option("use-libunwind") == "on"
+if use_libunwind:
+    use_system_libunwind = use_system_version_of_library("libunwind")
+    use_vendored_libunwind = not use_system_libunwind
+else:
+    if use_system_version_of_library("libunwind"):
+        print("Error: --use-system-libunwind requires --use-libunwind")
+        Exit(1)
+
+    use_system_libunwind = use_vendored_libunwind = False
+
 # We defer building the env until we have determined whether we want certain values. Some values
 # in the env actually have semantics for 'None' that differ from being absent, so it is better
 # to build it up via a dict, and then construct the Environment in one shot with kwargs.
@@ -992,19 +1031,40 @@ envDict = dict(BUILD_ROOT=buildDir,
                # TODO: Move unittests.txt to $BUILD_DIR, but that requires
                # changes to MCI.
                UNITTEST_LIST='$BUILD_ROOT/unittests.txt',
+               LIBFUZZER_TEST_ALIAS='libfuzzer_tests',
+               LIBFUZZER_TEST_LIST='$BUILD_ROOT/libfuzzer_tests.txt',
                INTEGRATION_TEST_ALIAS='integration_tests',
                INTEGRATION_TEST_LIST='$BUILD_ROOT/integration_tests.txt',
                BENCHMARK_ALIAS='benchmarks',
                BENCHMARK_LIST='$BUILD_ROOT/benchmarks.txt',
                CONFIGUREDIR='$BUILD_ROOT/scons/$VARIANT_DIR/sconf_temp',
                CONFIGURELOG='$BUILD_ROOT/scons/config.log',
-               INSTALL_DIR=installDir,
                CONFIG_HEADER_DEFINES={},
                LIBDEPS_TAG_EXPANSIONS=[],
+               AIB_PACKAGE_PREFIX='mongodb-',
                )
 
 env = Environment(variables=env_vars, **envDict)
+
+
 del envDict
+
+for var in ['CC', 'CXX']:
+    if var not in env:
+        continue
+    path = env[var]
+    print('{} is {}'.format(var, path))
+    if not os.path.isabs(path):
+        which = shutil.which(path)
+        if which is None:
+            print('{} was not found in $PATH'.format(path))
+        else:
+            print('{} found in $PATH at {}'.format(path, which))
+            path = which
+
+    realpath = os.path.realpath(path)
+    if realpath != path:
+        print('{} resolves to {}'.format(path, realpath))
 
 env.AddMethod(mongo_platform.env_os_is_wrapper, 'TargetOSIs')
 env.AddMethod(mongo_platform.env_get_os_name_wrapper, 'GetTargetOSName')
@@ -1039,7 +1099,7 @@ if has_option('variables-help'):
 
 unknown_vars = env_vars.UnknownVariables()
 if unknown_vars:
-    env.FatalError("Unknown variables specified: {0}", ", ".join(unknown_vars.keys()))
+    env.FatalError("Unknown variables specified: {0}", ", ".join(list(unknown_vars.keys())))
 
 def set_config_header_define(env, varname, varval = 1):
     env['CONFIG_HEADER_DEFINES'][varname] = varval
@@ -1081,11 +1141,6 @@ endian = get_option( "endian" )
 if endian == "auto":
     endian = sys.byteorder
 
-if endian == "little":
-    env.SetConfigHeaderDefine("MONGO_CONFIG_BYTE_ORDER", "1234")
-elif endian == "big":
-    env.SetConfigHeaderDefine("MONGO_CONFIG_BYTE_ORDER", "4321")
-
 # These preprocessor macros came from
 # http://nadeausoftware.com/articles/2012/02/c_c_tip_how_detect_processor_type_using_compiler_predefined_macros
 #
@@ -1125,7 +1180,7 @@ def CheckForProcessor(context, which_arch):
         context.Result(ret)
         return ret;
 
-    for k in processor_macros.keys():
+    for k in list(processor_macros.keys()):
         ret = run_compile_check(k)
         if ret:
             context.Result('Detected a %s processor' % k)
@@ -1300,6 +1355,15 @@ if link_model == "auto":
 if env.TargetOSIs('windows') and link_model not in ['object', 'static', 'dynamic-sdk']:
     env.FatalError("Windows builds must use the 'object', 'dynamic-sdk', or 'static' link models")
 
+
+# The mongodbtoolchain currently doesn't produce working binaries if
+# you combine a dynamic build with a non-system allocator, but the
+# failure mode is non-obvious. For now, prevent people from wandering
+# inadvertantly into this trap. Remove this constraint when
+# https://jira.mongodb.org/browse/SERVER-27675 is resolved.
+if (link_model == 'dynamic') and ('mongodbtoolchain' in env['CXX']) and (env['MONGO_ALLOCATOR'] != 'system'):
+    env.FatalError('Cannot combine the MongoDB toolchain, a dynamic build, and a non-system allocator. Choose two.')
+
 # The 'object' mode for libdeps is enabled by setting _LIBDEPS to $_LIBDEPS_OBJS. The other two
 # modes operate in library mode, enabled by setting _LIBDEPS to $_LIBDEPS_LIBS.
 env['_LIBDEPS'] = '$_LIBDEPS_OBJS' if link_model == "object" else '$_LIBDEPS_LIBS'
@@ -1433,12 +1497,17 @@ if link_model.startswith("dynamic"):
 if optBuild:
     env.SetConfigHeaderDefine("MONGO_CONFIG_OPTIMIZED_BUILD")
 
-# Enable the fast decider if exlicltly requested or if in 'auto' mode and not in conflict with other
-# options.
-if get_option('build-fast-and-loose') == 'on' or \
-   (get_option('build-fast-and-loose') == 'auto' and \
-    not has_option('release') and \
-    not has_option('cache')):
+# Enable the fast decider if explicitly requested or if in 'auto' mode
+# and not in conflict with other options like the ninja option which
+# sets it's own decider
+if (
+        not get_option('ninja') == 'true' and
+        get_option('build-fast-and-loose') == 'on' or
+        (
+            get_option('build-fast-and-loose') == 'auto' and
+            not has_option('release')
+         )
+):
     # See http://www.scons.org/wiki/GoFastButton for details
     env.Decider('MD5-timestamp')
     env.SetOption('max_drift', 1)
@@ -1454,11 +1523,18 @@ if get_option('git-decider') == 'on':
 # executable (like -fPIE), vs those being used to target a (shared) library (like -fPIC). To do so,
 # we inject a new family of SCons variables PROG*FLAGS, by reaching into the various COMs.
 if not env.TargetOSIs('windows'):
-    env["CCCOM"] = env["CCCOM"].replace("$CFLAGS", "$CFLAGS $PROGCFLAGS")
-    env["CXXCOM"] = env["CXXCOM"].replace("$CXXFLAGS", "$CXXFLAGS $PROGCXXFLAGS")
-    env["CCCOM"] = env["CCCOM"].replace("$CCFLAGS", "$CCFLAGS $PROGCCFLAGS")
-    env["CXXCOM"] = env["CXXCOM"].replace("$CCFLAGS", "$CCFLAGS $PROGCCFLAGS")
-    env["LINKCOM"] = env["LINKCOM"].replace("$LINKFLAGS", "$LINKFLAGS $PROGLINKFLAGS")
+    env["CCCOM"] = env["CCCOM"].replace("$CCFLAGS", "$PROGCCFLAGS")
+    env["CXXCOM"] = env["CXXCOM"].replace("$CCFLAGS", "$PROGCCFLAGS")
+    env["PROGCCFLAGS"] = ['$CCFLAGS']
+
+    env["CCCOM"] = env["CCCOM"].replace("$CFLAGS", "$PROGCFLAGS")
+    env["PROGCFLAGS"] = ['$CFLAGS']
+
+    env["CXXCOM"] = env["CXXCOM"].replace("$CXXFLAGS", "$PROGCXXFLAGS")
+    env['PROGCXXFLAGS'] = ['$CXXFLAGS']
+
+    env["LINKCOM"] = env["LINKCOM"].replace("$LINKFLAGS", "$PROGLINKFLAGS")
+    env["PROGLINKFLAGS"] = ['$LINKFLAGS']
 
 if not env.Verbose():
     env.Append( CCCOMSTR = "Compiling $TARGET" )
@@ -1497,12 +1573,9 @@ if env['_LIBDEPS'] == '$_LIBDEPS_OBJS':
             fake_lib.write(str(uuid.uuid4()))
             fake_lib.write('\n')
 
-    def noop_action(env, target, source):
-        pass
-
     env['ARCOM'] = write_uuid_to_file
     env['ARCOMSTR'] = 'Generating placeholder library $TARGET'
-    env['RANLIBCOM'] = noop_action
+    env['RANLIBCOM'] = ''
     env['RANLIBCOMSTR'] = 'Skipping ranlib for $TARGET'
 
 libdeps.setup_environment(env, emitting_shared=(link_model.startswith("dynamic")))
@@ -1567,14 +1640,12 @@ elif env.TargetOSIs('freebsd'):
     env.Append( CCFLAGS=[ "-fno-omit-frame-pointer" ] )
 
 elif env.TargetOSIs('darwin'):
-     env.Append( LIBS=["resolv"] )
+    env.Append( LIBS=["resolv"] )
 
 elif env.TargetOSIs('openbsd'):
     env.Append( LIBS=[ "kvm" ] )
 
 elif env.TargetOSIs('windows'):
-    dynamicCRT = has_option("dynamic-windows")
-
     env['DIST_ARCHIVE_SUFFIX'] = '.zip'
 
     # If tools configuration fails to set up 'cl' in the path, fall back to importing the whole
@@ -1719,20 +1790,9 @@ elif env.TargetOSIs('windows'):
     env.Append( LINKFLAGS=["/DEBUG"] )
 
     # /MD:  use the multithreaded, DLL version of the run-time library (MSVCRT.lib/MSVCR###.DLL)
-    # /MT:  use the multithreaded, static version of the run-time library (LIBCMT.lib)
     # /MDd: Defines _DEBUG, _MT, _DLL, and uses MSVCRTD.lib/MSVCRD###.DLL
-    # /MTd: Defines _DEBUG, _MT, and causes your application to use the
-    #       debug multithread version of the run-time library (LIBCMTD.lib)
 
-    winRuntimeLibMap = {
-          #dyn   #dbg
-        ( False, False ) : "/MT",
-        ( False, True  ) : "/MTd",
-        ( True,  False ) : "/MD",
-        ( True,  True  ) : "/MDd",
-    }
-
-    env.Append(CCFLAGS=[winRuntimeLibMap[(dynamicCRT, debugBuild)]])
+    env.Append(CCFLAGS=["/MDd" if debugBuild else "/MD"])
 
     if optBuild:
         # /O1:  optimize for size
@@ -1759,14 +1819,22 @@ elif env.TargetOSIs('windows'):
     # file contains invalid UTF-8.
     env.Append( CCFLAGS=["/utf-8" ])
 
-    # Enforce type conversion rules for rvalue reference types as a result of a cast operation.
-    env.Append( CCFLAGS=["/Zc:rvalueCast"] )
+    # Specify standards conformance mode to the compiler.
+    env.Append( CCFLAGS=["/permissive-"] )
 
-    # Disable string literal type conversion, instead const_cast must be explicitly specified.
-    env.Append( CCFLAGS=["/Zc:strictStrings"] )
+    # Enables the __cplusplus preprocessor macro to report an updated value for recent C++ language
+    # standards support.
+    env.Append( CCFLAGS=["/Zc:__cplusplus"] )
+
+    # Tells the compiler to preferentially call global operator delete or operator delete[]
+    # functions that have a second parameter of type size_t when the size of the object is available.
+    env.Append( CCFLAGS=["/Zc:sizedDealloc"] )
 
     # Treat volatile according to the ISO standard and do not guarantee acquire/release semantics.
     env.Append( CCFLAGS=["/volatile:iso"] )
+
+    # Tell CL to produce more useful error messages.
+    env.Append( CCFLAGS=["/diagnostics:caret"] )
 
     # This gives 32-bit programs 4 GB of user address space in WOW64, ignored in 64-bit builds.
     env.Append( LINKFLAGS=["/LARGEADDRESSAWARE"] )
@@ -1819,8 +1887,19 @@ if env.TargetOSIs('posix'):
             ],
         )
 
-    # Everything on OS X is position independent by default. Solaris doesn't support PIE.
-    if not env.TargetOSIs('darwin', 'solaris'):
+    # If shared and static object files stripped of their rightmost
+    # dot-delimited suffix would collide, modify the shared library
+    # ones so that they won't. We do this because if split dwarf is in
+    # play, static and dynamic builds would otherwise overwrite each
+    # other's .dwo files, because GCC strips the last suffix and adds
+    # .dwo, rather than simply appending .dwo to the full filename.
+    objsuffelts = env.subst('$OBJSUFFIX').split('.')
+    shobjsuffelts = env.subst('$SHOBJSUFFIX').split('.')
+    if objsuffelts[0:-1] == shobjsuffelts[0:-1]:
+        env['SHOBJSUFFIX'] = '.dyn${OBJSUFFIX}'
+
+    # Everything on OS X is position independent by default.
+    if not env.TargetOSIs('darwin'):
         if get_option('runtime-hardening') == "on":
             # If runtime hardening is requested, then build anything
             # destined for an executable with the necessary flags for PIE.
@@ -1832,6 +1911,7 @@ if env.TargetOSIs('posix'):
     # -Winvalid-pch Warn if a precompiled header (see Precompiled Headers) is found in the search path but can't be used.
     env.Append( CCFLAGS=["-fno-omit-frame-pointer",
                          "-fno-strict-aliasing",
+                         "-fasynchronous-unwind-tables",
                          "-ggdb" if not env.TargetOSIs('emscripten') else "-g",
                          "-pthread",
                          "-Wall",
@@ -1871,9 +1951,18 @@ if env.TargetOSIs('posix'):
         except KeyError:
             pass
 
+    # Python uses APPDATA to determine the location of user installed
+    # site-packages. If we do not pass this variable down to Python
+    # subprocesses then anything installed with `pip install --user`
+    # will be inaccessible leading to import errors.
+    if env.TargetOSIs('windows'):
+        appdata = os.getenv('APPDATA', None)
+        if appdata is not None:
+            env['ENV']['APPDATA'] = appdata
+
     if env.TargetOSIs('linux') and has_option( "gcov" ):
-        env.Append( CCFLAGS=["-fprofile-arcs", "-ftest-coverage"] )
-        env.Append( LINKFLAGS=["-fprofile-arcs", "-ftest-coverage"] )
+        env.Append( CCFLAGS=["-fprofile-arcs", "-ftest-coverage", "-fprofile-update=single"] )
+        env.Append( LINKFLAGS=["-fprofile-arcs", "-ftest-coverage", "-fprofile-update=single"] )
 
     if optBuild and not optBuildForSize:
         env.Append( CCFLAGS=["-O2"] )
@@ -1890,15 +1979,6 @@ if env.TargetOSIs('posix'):
                 '-Wl,-fatal_warnings' if env.TargetOSIs('darwin') else "-Wl,--fatal-warnings",
             ]
         )
-
-mmapv1 = False
-if get_option('mmapv1') == 'auto':
-    # The mmapv1 storage engine is only supported on x86
-    # targets. Unless explicitly requested, disable it on all other
-    # platforms.
-    mmapv1 = (env['TARGET_ARCH'] in ['i386', 'x86_64'])
-elif get_option('mmapv1') == 'on':
-    mmapv1 = True
 
 wiredtiger = False
 if get_option('wiredtiger') == 'on':
@@ -1956,6 +2036,15 @@ mongo_modules = moduleconfig.discover_modules('src/mongo/db/modules', get_option
 ssl_provider = None
 free_monitoring = get_option("enable-free-mon")
 http_client = get_option("enable-http-client")
+
+def isSanitizerEnabled(self, sanitizerName):
+    if 'SANITIZERS_ENABLED' not in self:
+        return False
+    if sanitizerName == 'fuzzer':
+        return 'fuzzer-no-link' in self['SANITIZERS_ENABLED']
+    return sanitizerName in self['SANITIZERS_ENABLED']
+
+env.AddMethod(isSanitizerEnabled, 'IsSanitizerEnabled')
 
 def doConfigure(myenv):
     global wiredtiger
@@ -2063,6 +2152,7 @@ def doConfigure(myenv):
         env['WIN_VERSION_MIN'] = win_version_min
         win_version_min = win_version_min_choices[win_version_min]
         env.Append( CPPDEFINES=[("_WIN32_WINNT", "0x" + win_version_min[0])] )
+        env.Append( CPPDEFINES=[("BOOST_USE_WINAPI_VERSION", "0x" + win_version_min[0])] )
         env.Append( CPPDEFINES=[("NTDDI_VERSION", "0x" + win_version_min[0] + win_version_min[1])] )
 
     conf.Finish()
@@ -2141,7 +2231,7 @@ def doConfigure(myenv):
             # form -Wno-xxx (but not -Wno-error=xxx), we also add -Wxxx to the flags. GCC does
             # warn on unknown -Wxxx style flags, so this lets us probe for availablity of
             # -Wno-xxx.
-            for kw in test_mutation.keys():
+            for kw in list(test_mutation.keys()):
                 test_flags = test_mutation[kw]
                 for test_flag in test_flags:
                     if test_flag.startswith("-Wno-") and not test_flag.startswith("-Wno-error="):
@@ -2155,7 +2245,7 @@ def doConfigure(myenv):
         # to make them real errors.
         cloned.Append(CCFLAGS=['-Werror'])
         conf = Configure(cloned, help=False, custom_tests = {
-                'CheckFlag' : lambda(ctx) : CheckFlagTest(ctx, tool, extension, flag)
+                'CheckFlag' : lambda ctx : CheckFlagTest(ctx, tool, extension, flag)
         })
         available = conf.CheckFlag()
         conf.Finish()
@@ -2263,6 +2353,12 @@ def doConfigure(myenv):
         # exceptionToStatus(). See https://bugs.llvm.org/show_bug.cgi?id=34804
         AddToCCFLAGSIfSupported(myenv, "-Wno-exceptions")
 
+        # Enable sized deallocation support.
+        AddToCXXFLAGSIfSupported(myenv, '-fsized-deallocation')
+
+        # This warning was added in Apple clang version 11 and flags many explicitly defaulted move
+        # constructors and assignment operators for being implicitly deleted, which is not useful.
+        AddToCXXFLAGSIfSupported(myenv, "-Wno-defaulted-function-deleted")
 
         # Check if we can set "-Wnon-virtual-dtor" when "-Werror" is set. The only time we can't set it is on
         # clang 3.4, where a class with virtual function(s) and a non-virtual destructor throws a warning when
@@ -2390,7 +2486,6 @@ def doConfigure(myenv):
         conf.Finish()
 
     if myenv.ToolchainIs('msvc'):
-        myenv.AppendUnique(CCFLAGS=['/Zc:__cplusplus', '/permissive-'])
         if get_option('cxx-std') == "17":
             myenv.AppendUnique(CCFLAGS=['/std:c++17'])
     else:
@@ -2596,6 +2691,7 @@ def doConfigure(myenv):
         using_asan = 'address' in sanitizer_list or using_lsan
         using_tsan = 'thread' in sanitizer_list
         using_ubsan = 'undefined' in sanitizer_list
+        using_fsan = 'fuzzer' in sanitizer_list
 
         if env['MONGO_ALLOCATOR'] in ['tcmalloc', 'tcmalloc-experimental'] and (using_lsan or using_asan):
             # There are multiply defined symbols between the sanitizer and
@@ -2617,6 +2713,47 @@ def doConfigure(myenv):
             if 'address' in sanitizer_list:
                 sanitizer_list.remove('leak')
 
+        if using_fsan:
+            def CheckForFuzzerCompilerSupport(context):
+
+                test_body = """
+                #include <stddef.h>
+                #include <stdint.h>
+
+                // fuzz_target.cc
+                extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size) {
+                    return 0;
+                }
+                """
+
+                context.Message("Checking if libfuzzer is supported by the compiler... ")
+
+                context.env.AppendUnique(LINKFLAGS=['-fprofile-instr-generate',
+                                                    '-fcoverage-mapping',
+                                                    '-fsanitize=fuzzer'],
+                                         CCFLAGS=['-fprofile-instr-generate','-fcoverage-mapping'])
+
+                ret = context.TryLink(textwrap.dedent(test_body), ".cpp")
+                context.Result(ret)
+                return ret
+
+            confEnv = myenv.Clone()
+            fuzzerConf = Configure(confEnv, help=False, custom_tests = {
+                    'CheckForFuzzerCompilerSupport': CheckForFuzzerCompilerSupport,
+                })
+            if not fuzzerConf.CheckForFuzzerCompilerSupport():
+                myenv.FatalError("libfuzzer is not supported by the compiler")
+            fuzzerConf.Finish()
+
+            # We can't include the fuzzer flag with the other sanitize flags
+            # The libfuzzer library already has a main function, which will cause the dependencies check
+            # to fail
+            sanitizer_list.remove('fuzzer')
+            sanitizer_list.append('fuzzer-no-link')
+            # These flags are needed to generate a coverage report
+            myenv.Append(LINKFLAGS=['-fprofile-instr-generate','-fcoverage-mapping'])
+            myenv.Append(CCFLAGS=['-fprofile-instr-generate','-fcoverage-mapping'])
+
         sanitizer_option = '-fsanitize=' + ','.join(sanitizer_list)
 
         if AddToCCFLAGSIfSupported(myenv, sanitizer_option):
@@ -2624,6 +2761,17 @@ def doConfigure(myenv):
             myenv.Append(CCFLAGS=['-fno-omit-frame-pointer'])
         else:
             myenv.ConfError('Failed to enable sanitizers with flag: {0}', sanitizer_option )
+
+        myenv['SANITIZERS_ENABLED'] = sanitizer_list
+
+        if has_option('sanitize-coverage') and using_fsan:
+            sanitize_coverage_list = get_option('sanitize-coverage')
+            sanitize_coverage_option = '-fsanitize-coverage=' + sanitize_coverage_list
+            if AddToCCFLAGSIfSupported(myenv,sanitize_coverage_option):
+                myenv.Append(LINKFLAGS=[sanitize_coverage_option])
+            else:
+                myenv.ConfError('Failed to enable -fsanitize-coverage with flag: {0}', sanitize_coverage_option )
+
 
         blackfiles_map = {
             "address" : myenv.File("#etc/asan.blacklist"),
@@ -2635,7 +2783,7 @@ def doConfigure(myenv):
         # Select those unique black files that are associated with the
         # currently enabled sanitizers, but filter out those that are
         # zero length.
-        blackfiles = {v for (k, v) in blackfiles_map.iteritems() if k in sanitizer_list}
+        blackfiles = {v for (k, v) in blackfiles_map.items() if k in sanitizer_list}
         blackfiles = [f for f in blackfiles if os.stat(f.path).st_size != 0]
 
         # Filter out any blacklist options that the toolchain doesn't support.
@@ -2696,7 +2844,9 @@ def doConfigure(myenv):
             # By default, undefined behavior sanitizer doesn't stop on
             # the first error. Make it so. Newer versions of clang
             # have renamed the flag.
-            if not AddToCCFLAGSIfSupported(myenv, "-fno-sanitize-recover"):
+            # However, this flag cannot be included when using the fuzzer sanitizer
+            # if we want to suppress errors to uncover new ones.
+            if not using_fsan and not AddToCCFLAGSIfSupported(myenv, "-fno-sanitize-recover"):
                 AddToCCFLAGSIfSupported(myenv, "-fno-sanitize-recover=undefined")
             myenv.AppendUnique(CPPDEFINES=['UNDEFINED_BEHAVIOR_SANITIZER'])
 
@@ -2715,7 +2865,12 @@ def doConfigure(myenv):
         # because it is much faster. Don't use it if the user has already configured another linker
         # selection manually.
         if not any(flag.startswith('-fuse-ld=') for flag in env['LINKFLAGS']):
-            AddToLINKFLAGSIfSupported(myenv, '-fuse-ld=gold')
+            if AddToLINKFLAGSIfSupported(myenv, '-fuse-ld=lld') or AddToLINKFLAGSIfSupported(myenv, '-fuse-ld=gold'):
+                if link_model.startswith("dynamic"):
+                    AddToLINKFLAGSIfSupported(myenv, '-Wl,--gdb-index')
+
+            # Our build is already parallel.
+            AddToLINKFLAGSIfSupported(myenv, '-Wl,--no-threads')
 
         # Explicitly enable GNU build id's if the linker supports it.
         AddToLINKFLAGSIfSupported(myenv, '-Wl,--build-id')
@@ -2874,29 +3029,6 @@ def doConfigure(myenv):
     if conf.CheckCXX14EnableIfT():
         conf.env.SetConfigHeaderDefine('MONGO_CONFIG_HAVE_STD_ENABLE_IF_T')
 
-    myenv = conf.Finish()
-
-    def CheckCXX14MakeUnique(context):
-        test_body = """
-        #include <memory>
-        int main(int argc, char **argv) {
-            auto foo = std::make_unique<int>(5);
-            return 0;
-        }
-        """
-        context.Message('Checking for C++14 std::make_unique support... ')
-        ret = context.TryCompile(textwrap.dedent(test_body), '.cpp')
-        context.Result(ret)
-        return ret
-
-    # Check for std::make_unique support without using the __cplusplus macro
-    conf = Configure(myenv, help=False, custom_tests = {
-        'CheckCXX14MakeUnique': CheckCXX14MakeUnique,
-    })
-
-    if conf.CheckCXX14MakeUnique():
-        conf.env.SetConfigHeaderDefine('MONGO_CONFIG_HAVE_STD_MAKE_UNIQUE')
-
     # pthread_setname_np was added in GLIBC 2.12, and Solaris 11.3
     if posix_system:
         myenv = conf.Finish()
@@ -2987,7 +3119,7 @@ def doConfigure(myenv):
                         # TODO: If we could programmatically extract the paths from the info output
                         # we could give a better message here, but brew info's machine readable output
                         # doesn't seem to include the whole 'caveats' section.
-                        message = subprocess.check_output([brew, "info", "openssl"])
+                        message = subprocess.check_output([brew, "info", "openssl"]).decode('utf-8')
                         advice = textwrap.dedent(
                             """\
                             NOTE: HomeBrew installed to {0} appears to have OpenSSL installed.
@@ -3119,12 +3251,12 @@ def doConfigure(myenv):
     if ssl_provider == 'native':
         if conf.env.TargetOSIs('windows'):
             ssl_provider = 'windows'
-            env.SetConfigHeaderDefine("MONGO_CONFIG_SSL_PROVIDER", "MONGO_CONFIG_SSL_PROVIDER_WINDOWS")
+            conf.env.SetConfigHeaderDefine("MONGO_CONFIG_SSL_PROVIDER", "MONGO_CONFIG_SSL_PROVIDER_WINDOWS")
             conf.env.Append( MONGO_CRYPTO=["windows"] )
 
         elif conf.env.TargetOSIs('darwin', 'macOS'):
             ssl_provider = 'apple'
-            env.SetConfigHeaderDefine("MONGO_CONFIG_SSL_PROVIDER", "MONGO_CONFIG_SSL_PROVIDER_APPLE")
+            conf.env.SetConfigHeaderDefine("MONGO_CONFIG_SSL_PROVIDER", "MONGO_CONFIG_SSL_PROVIDER_APPLE")
             conf.env.Append( MONGO_CRYPTO=["apple"] )
             conf.env.AppendUnique(FRAMEWORKS=[
                 'CoreFoundation',
@@ -3138,7 +3270,7 @@ def doConfigure(myenv):
         if require_ssl:
             checkOpenSSL(conf)
             # Working OpenSSL available, use it.
-            env.SetConfigHeaderDefine("MONGO_CONFIG_SSL_PROVIDER", "MONGO_CONFIG_SSL_PROVIDER_OPENSSL")
+            conf.env.SetConfigHeaderDefine("MONGO_CONFIG_SSL_PROVIDER", "MONGO_CONFIG_SSL_PROVIDER_OPENSSL")
 
             conf.env.Append( MONGO_CRYPTO=["openssl"] )
         else:
@@ -3153,9 +3285,8 @@ def doConfigure(myenv):
     else:
         ssl_provider = "none"
 
-    # The Windows build needs the openssl binaries if it targets openssl or includes the tools
-    # since the tools link against openssl
-    if conf.env.TargetOSIs('windows') and (ssl_provider == "openssl" or has_option("use-new-tools")):
+    # The Windows build needs the openssl binaries if it targets openssl
+    if conf.env.TargetOSIs('windows') and ssl_provider == "openssl":
         # Add the SSL binaries to the zip file distribution
         def addOpenSslLibraryToDistArchive(file_name):
             openssl_bin_path = os.path.normpath(env['WINDOWS_OPENSSL_BIN'].lower())
@@ -3213,6 +3344,12 @@ def doConfigure(myenv):
     if use_system_version_of_library("yaml"):
         conf.FindSysLibDep("yaml", ["yaml-cpp"])
 
+    if use_system_version_of_library("fmt"):
+        conf.FindSysLibDep("fmt", ["fmt"])
+
+    if use_system_version_of_library("libunwind"):
+        conf.FindSysLibDep("unwind", ["unwind"])
+
     if use_system_version_of_library("intel_decimal128"):
         conf.FindSysLibDep("intel_decimal128", ["bid"])
 
@@ -3239,10 +3376,22 @@ def doConfigure(myenv):
 
     conf.env.Append(
         CPPDEFINES=[
+            ("BOOST_THREAD_VERSION", "5"),
+            "BOOST_THREAD_USES_DATETIME",
             "BOOST_SYSTEM_NO_DEPRECATED",
             "BOOST_MATH_NO_LONG_DOUBLE_MATH_FUNCTIONS",
+            "BOOST_ENABLE_ASSERT_DEBUG_HANDLER",
+            "BOOST_LOG_NO_SHORTHAND_NAMES",
+            "BOOST_LOG_USE_NATIVE_SYSLOG",
             "ABSL_FORCE_ALIGNED_ACCESS",
         ]
+    )
+
+    if link_model.startswith("dynamic") and not link_model == 'dynamic-sdk':
+        conf.env.AppendUnique(
+            CPPDEFINES=[
+                "BOOST_LOG_DYN_LINK",
+            ]
     )
 
     if use_system_version_of_library("boost"):
@@ -3468,7 +3617,7 @@ def doConfigure(myenv):
 
     # Resolve --enable-free-mon
     if free_monitoring == "auto":
-        if 'enterprise' not in env['MONGO_MODULES']:
+        if 'enterprise' not in conf.env['MONGO_MODULES']:
             free_monitoring = "on"
         else:
             free_monitoring = "off"
@@ -3545,13 +3694,93 @@ def doConfigure(myenv):
 
         outputIndex = next((idx for idx in [0,1] if conf.CheckAltivecVbpermqOutput(idx)), None)
         if outputIndex is not None:
-	    conf.env.SetConfigHeaderDefine("MONGO_CONFIG_ALTIVEC_VEC_VBPERMQ_OUTPUT_INDEX", outputIndex)
+            conf.env.SetConfigHeaderDefine("MONGO_CONFIG_ALTIVEC_VEC_VBPERMQ_OUTPUT_INDEX", outputIndex)
         else:
             myenv.ConfError("Running on ppc64le, but can't find a correct vec_vbpermq output index.  Compiler or platform not supported")
 
+    myenv = conf.Finish()
+
+    conf = Configure(myenv)
+    usdt_enabled = get_option('enable-usdt-probes')
+    usdt_provider = None
+    if usdt_enabled in ('auto', 'on'):
+        if env.TargetOSIs('linux'):
+            if conf.CheckHeader('sys/sdt.h'):
+                usdt_provider = 'SDT'
+        # can put other OS targets here
+        if usdt_enabled == 'on' and not usdt_provider:
+             myenv.ConfError("enable-usdt-probes flag was set to on, but no USDT provider could be found")
+        elif usdt_provider:
+            conf.env.SetConfigHeaderDefine("MONGO_CONFIG_USDT_ENABLED")
+            conf.env.SetConfigHeaderDefine("MONGO_CONFIG_USDT_PROVIDER", usdt_provider)
     return conf.Finish()
 
+
 env = doConfigure( env )
+env["NINJA_SYNTAX"] = "#site_scons/third_party/ninja_syntax.py"
+
+# Now that we are done with configure checks, enable icecream, if available.
+env.Tool('icecream')
+
+if get_option('ninja') == 'true':
+    env.Tool("ninja")
+    def test_txt_writer(alias_name):
+        """Find all the tests registered to alias_name and write them to a file via ninja."""
+        rule_written = False
+
+        def wrapper(env, ninja, node, dependencies):
+            """Make a Ninja-able version of the test files."""
+            rule = alias_name.upper() + "_GENERATOR"
+            if not rule_written:
+                ninja.rule(
+                    rule,
+                    description="Generate test list text file",
+                    command="echo $in > $out",
+                )
+                rule_written = True
+
+            alias = env.Alias(alias_name)
+            paths = []
+            children = alias.children()
+            for child in children:
+                paths.append('\t' + str(child))
+
+            ninja.build(
+                str(node),
+                rule,
+                inputs='\n'.join(paths),
+                implicit=dependencies,
+            )
+
+        return wrapper
+    env.NinjaRegisterFunctionHandler("unit_test_list_builder_action", test_txt_writer('$UNITTEST_ALIAS'))
+    env.NinjaRegisterFunctionHandler("integration_test_list_builder_action", test_txt_writer('$INTEGRATION_TEST_ALIAS'))
+    env.NinjaRegisterFunctionHandler("benchmark_list_builder_action", test_txt_writer('$BENCHMARK_ALIAS'))
+
+    def fakelib_in_ninja():
+        """Generates empty .a files"""
+        rule_written = False
+
+        def wrapper(env, ninja, node, dependencies):
+            if not rule_written:
+                cmd = "touch $out"
+                if not env.TargetOSIs("posix"):
+                    cmd = "cmd /c copy NUL $out"
+                ninja.rule(
+                    "FAKELIB",
+                    command=cmd,
+                )
+                rule_written = True
+
+            ninja.build(node.get_path(), rule='FAKELIB', implicit=dependencies)
+
+        return wrapper
+
+    env.NinjaRegisterFunctionHandler("write_uuid_to_file", fakelib_in_ninja())
+
+    # Load ccache after icecream since order matters when we're both changing CCCOM
+    if get_option('ccache') == 'true':
+        env.Tool('ccache')
 
 # TODO: Later, this should live somewhere more graceful.
 if get_option('install-mode') == 'hygienic':
@@ -3559,11 +3788,112 @@ if get_option('install-mode') == 'hygienic':
     if get_option('separate-debug') == "on":
         env.Tool('separate_debug')
 
+    env["AIB_TARBALL_SUFFIX"] = "tgz"
     env.Tool('auto_install_binaries')
+
+    env.DeclareRoles(
+        roles=[
+
+            env.Role(
+                name="base",
+            ),
+
+            env.Role(
+                name="debug",
+            ),
+
+            env.Role(
+                name="dev",
+                dependencies=[
+                    "runtime"
+                ],
+            ),
+
+            env.Role(
+                name="meta",
+            ),
+
+            env.Role(
+                name="runtime",
+                dependencies=[
+                    # On windows, we want the runtime role to depend
+                    # on the debug role so that PDBs end in the
+                    # runtime package.
+                    "debug" if env.TargetOSIs('windows') else None,
+                ],
+                transitive=True,
+                silent=True,
+            ),
+        ],
+        base_role="base",
+        meta_role="meta",
+    )
+
+    env.AddSuffixMapping({
+        "$PROGSUFFIX": env.SuffixMap(
+            directory="$PREFIX_BINDIR",
+            default_roles=[
+                "runtime",
+            ]
+        ),
+
+        "$LIBSUFFIX": env.SuffixMap(
+            directory="$PREFIX_LIBDIR",
+            default_roles=[
+                "dev",
+            ]
+        ),
+
+        "$SHLIBSUFFIX": env.SuffixMap(
+            directory="$PREFIX_BINDIR" \
+            if mongo_platform.get_running_os_name() == "windows" \
+            else "$PREFIX_LIBDIR",
+            default_roles=[
+                "runtime",
+            ]
+        ),
+
+        ".debug": env.SuffixMap(
+            directory="$PREFIX_DEBUGDIR",
+            default_roles=[
+                "debug",
+            ]
+        ),
+
+        ".dSYM": env.SuffixMap(
+            directory="$PREFIX_DEBUGDIR",
+            default_roles=[
+                "debug"
+            ]
+        ),
+
+        ".pdb": env.SuffixMap(
+            directory="$PREFIX_DEBUGDIR",
+            default_roles=[
+                "debug"
+            ]
+        ),
+
+    })
+
+    env.AddPackageNameAlias(
+        component="dist",
+        role="runtime",
+        name="${{SERVER_DIST_BASENAME[{PREFIX_LEN}:]}}".format(PREFIX_LEN=len(env.get("AIB_PACKAGE_PREFIX")))
+    )
+
+    env.AddPackageNameAlias(
+        component="dist",
+        role="debug",
+        name="${{SERVER_DIST_BASENAME[{PREFIX_LEN}:]}}-debugsymbols".format(PREFIX_LEN=len(env.get("AIB_PACKAGE_PREFIX")))
+    )
+
     if env['PLATFORM'] == 'posix':
         env.AppendUnique(
             RPATH=[
-                env.Literal('\\$$ORIGIN/../lib')
+                # In the future when we want to improve dynamic builds
+                # we should set this to $PREFIX ideally
+                 env.Literal('\\$$ORIGIN/../lib'),
             ],
             LINKFLAGS=[
                 # Most systems *require* -z,origin to make origin work, but android
@@ -3591,8 +3921,6 @@ if get_option('install-mode') == 'hygienic':
 elif get_option('separate-debug') == "on":
     env.FatalError('Cannot use --separate-debug without --install-mode=hygienic')
 
-# Now that we are done with configure checks, enable icecream, if available.
-env.Tool('icecream')
 
 # If the flags in the environment are configured for -gsplit-dwarf,
 # inject the necessary emitter.
@@ -3633,24 +3961,79 @@ env.AddMethod(env_windows_resource_file, 'WindowsResourceFile')
 
 # --- lint ----
 
-def doLint( env , target , source ):
-    import buildscripts.eslint
-    if not buildscripts.eslint.lint(None, dirmode=True, glob=["jstests/", "src/mongo/"]):
-        raise Exception("ESLint errors")
+if get_option('lint-scope') == 'changed':
+    patch_file = env.Command(
+        target="$BUILD_DIR/current.git.patch",
+        source=[env.WhereIs("git")],
+        action="${SOURCES[0]} diff $GITDIFFFLAGS > $TARGET"
+    )
 
-    import buildscripts.clang_format
-    if not buildscripts.clang_format.lint_all(None):
-        raise Exception("clang-format lint errors")
+    env.AlwaysBuild(patch_file)
 
-    import buildscripts.pylinters
-    buildscripts.pylinters.lint_all(None, {}, [])
+    pylinters = env.Command(
+        target="#lint-pylinters",
+        source=[
+            "buildscripts/pylinters.py",
+            patch_file,
+        ],
+        action="$PYTHON ${SOURCES[0]} lint-patch ${SOURCES[1]}"
+    )
 
-    import buildscripts.lint
-    if not buildscripts.lint.run_lint( [ "src/mongo/" ] ):
-        raise Exception( "lint errors" )
+    clang_format = env.Command(
+        target="#lint-clang-format",
+        source=[
+            "buildscripts/clang_format.py",
+            patch_file,
+        ],
+        action="$PYTHON ${SOURCES[0]} lint-patch ${SOURCES[1]}"
+    )
 
-env.Alias( "lint" , [] , [ doLint ] )
+    eslint = env.Command(
+        target="#lint-eslint",
+        source=[
+            "buildscripts/eslint.py",
+            patch_file,
+        ],
+        action="$PYTHON ${SOURCES[0]} lint-patch ${SOURCES[1]}"
+    )
+
+else:
+    pylinters = env.Command(
+        target="#lint-pylinters",
+        source=[
+            "buildscripts/pylinters.py",
+        ],
+        action="$PYTHON ${SOURCES[0]} lint-all"
+    )
+
+    clang_format = env.Command(
+        target="#lint-clang-format",
+        source=[
+            "buildscripts/clang_format.py",
+        ],
+        action="$PYTHON ${SOURCES[0]} lint-all"
+    )
+
+    eslint = env.Command(
+        target="#lint-eslint",
+        source=[
+            "buildscripts/eslint.py",
+            "jstests/",
+            "src/mongo/",
+        ],
+        action="$PYTHON ${SOURCES[0]} --dirmode lint ${SOURCES[1:]}",
+    )
+
+lint_py = env.Command(
+    target="#lint-lint.py",
+    source=["buildscripts/quickcpplint.py"],
+    action="$PYTHON ${SOURCES[0]} lint",
+)
+
+env.Alias( "lint" , [ lint_py, eslint, clang_format, pylinters ] )
+env.Alias( "lint-fast" , [ eslint, clang_format, pylinters ] )
 env.AlwaysBuild( "lint" )
+env.AlwaysBuild( "lint-fast" )
 
 
 #  ----  INSTALL -------
@@ -3701,6 +4084,12 @@ def add_version_to_distsrc(env, archive):
 env.AddDistSrcCallback(add_version_to_distsrc)
 
 env['SERVER_DIST_BASENAME'] = env.subst('mongodb-%s-$MONGO_DISTNAME' % (getSystemInstallName()))
+if get_option('legacy-tarball') == 'true':
+    if ('tar-dist' not in COMMAND_LINE_TARGETS and
+        'zip-dist' not in COMMAND_LINE_TARGETS and
+        'archive-dist' not in COMMAND_LINE_TARGETS):
+        env.FatalError('option --legacy-tarball only valid with an archive-dist target')
+    env['PREFIX'] = '$SERVER_DIST_BASENAME'
 
 module_sconscripts = moduleconfig.get_module_sconscripts(mongo_modules)
 
@@ -3712,20 +4101,25 @@ module_sconscripts = moduleconfig.get_module_sconscripts(mongo_modules)
 # Currently, however, the SConscript files do need some predicates for
 # conditional decision making that hasn't been moved up to this SConstruct file,
 # and they are exported here, as well.
-Export("get_option")
-Export("has_option")
-Export("use_system_version_of_library")
-Export("serverJs")
-Export("usemozjs")
-Export('module_sconscripts')
-Export("debugBuild optBuild")
-Export("wiredtiger")
-Export("mmapv1")
-Export("mobile_se")
-Export("endian")
-Export("ssl_provider")
-Export("free_monitoring")
-Export("http_client")
+Export([
+    'debugBuild',
+    'endian',
+    'free_monitoring',
+    'get_option',
+    'has_option',
+    'http_client',
+    'mobile_se',
+    'module_sconscripts',
+    'optBuild',
+    'serverJs',
+    'ssl_provider',
+    'use_libunwind',
+    'use_system_libunwind',
+    'use_system_version_of_library',
+    'use_vendored_libunwind',
+    'usemozjs',
+    'wiredtiger',
+])
 
 def injectMongoIncludePaths(thisEnv):
     thisEnv.AppendUnique(CPPPATH=['$BUILD_DIR'])
@@ -3772,10 +4166,19 @@ env.Alias("distsrc", "distsrc-tgz")
 # reports the number of CPUs for the host system. Perhaps in a future version of
 # psutil it will instead report the correct number when in a container.
 #
+# The presence of the variable ICECC means the icecream tool is
+# enabled and so the default j value should scale accordingly. In this
+# scenario multiply the cpu count by 8 to set a reasonable default since the
+# cluster can handle many more jobs than your local machine but is
+# still throttled by your cpu count in the sense that you can only
+# handle so many python threads sending out jobs.
+#
 # psutil.cpu_count returns None when it can't determine the number. This always
 # fails on BSD's for example.
-if psutil.cpu_count() is not None:
+if psutil.cpu_count() is not None and 'ICECC' not in env:
     env.SetOption('num_jobs', psutil.cpu_count())
+elif psutil.cpu_count() and 'ICECC' in env:
+    env.SetOption('num_jobs', 8 * psutil.cpu_count())
 
 
 # Do this as close to last as possible before reading SConscripts, so
@@ -3860,6 +4263,19 @@ env.SConscript(
     variant_dir='$BUILD_DIR',
 )
 
+# TODO: find a way to consolidate SConscript calls to one call in
+# SConstruct so they all use variant_dir
+env.SConscript(
+    dirs=[
+        'jstests',
+    ],
+    duplicate=False,
+    exports=[
+        'env',
+    ],
+)
+
+
 allTargets = ['core', 'tools', 'unittests', 'integration_tests', 'benchmarks']
 
 if not has_option('noshell') and usemozjs:
@@ -3872,10 +4288,6 @@ if should_dagger:
     dependencyDb = env.Alias("dagger", env.Dagger('library_dependency_graph.json'))
     # Require everything to be built before trying to extract build dependency information
     env.Requires(dependencyDb, allTargets)
-
-# We don't want installing files to cause them to flow into the cache,
-# since presumably we can re-install them from the origin if needed.
-env.NoCache(env.FindInstalledFiles())
 
 # Declare the cache prune target
 cachePrune = env.Command(
@@ -3890,10 +4302,25 @@ cachePrune = env.Command(
 env.AlwaysBuild(cachePrune)
 env.Alias('cache-prune', cachePrune)
 
+if get_option('install-mode') == 'hygienic':
+    env.FinalizeInstallDependencies()
+    # TODO: Remove once hygienic is driving all builds and we can make
+    # the evergreen.yml make this decision
+    if env.TargetOSIs("windows"):
+        env.Alias("archive-dist", "zip-dist")
+        env.Alias("archive-dist-debug", "zip-dist-debug")
+    else:
+        env.Alias("archive-dist", "tar-dist")
+        env.Alias("archive-dist-debug", "tar-dist-debug")
+
+# We don't want installing files to cause them to flow into the cache,
+# since presumably we can re-install them from the origin if needed.
+env.NoCache(env.FindInstalledFiles())
+
 # Substitute environment variables in any build targets so that we can
 # say, for instance:
 #
-# > scons --prefix=/foo/bar '$INSTALL_DIR'
+# > scons --prefix=/foo/bar '$DESTDIR'
 # or
 # > scons \$BUILD_DIR/mongo/base
 #

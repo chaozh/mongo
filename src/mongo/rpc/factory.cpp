@@ -31,6 +31,8 @@
 
 #include "mongo/rpc/factory.h"
 
+#include <memory>
+
 #include "mongo/rpc/legacy_reply.h"
 #include "mongo/rpc/legacy_reply_builder.h"
 #include "mongo/rpc/legacy_request.h"
@@ -38,9 +40,8 @@
 #include "mongo/rpc/message.h"
 #include "mongo/rpc/op_msg_rpc_impls.h"
 #include "mongo/rpc/protocol.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 namespace rpc {
@@ -58,9 +59,9 @@ Message messageFromOpMsgRequest(Protocol proto, const OpMsgRequest& request) {
 std::unique_ptr<ReplyInterface> makeReply(const Message* unownedMessage) {
     switch (unownedMessage->operation()) {
         case mongo::dbMsg:
-            return stdx::make_unique<OpMsgReply>(OpMsg::parseOwned(*unownedMessage));
+            return std::make_unique<OpMsgReply>(OpMsg::parseOwned(*unownedMessage));
         case mongo::opReply:
-            return stdx::make_unique<LegacyReply>(unownedMessage);
+            return std::make_unique<LegacyReply>(unownedMessage);
         default:
             uasserted(ErrorCodes::UnsupportedFormat,
                       str::stream() << "Received a reply message with unexpected opcode: "
@@ -71,7 +72,7 @@ std::unique_ptr<ReplyInterface> makeReply(const Message* unownedMessage) {
 OpMsgRequest opMsgRequestFromAnyProtocol(const Message& unownedMessage) {
     switch (unownedMessage.operation()) {
         case mongo::dbMsg:
-            return OpMsgRequest::parse(unownedMessage);
+            return OpMsgRequest::parseOwned(unownedMessage);
         case mongo::dbQuery:
             return opMsgRequestFromLegacyRequest(unownedMessage);
         default:
@@ -84,9 +85,9 @@ OpMsgRequest opMsgRequestFromAnyProtocol(const Message& unownedMessage) {
 std::unique_ptr<ReplyBuilderInterface> makeReplyBuilder(Protocol protocol) {
     switch (protocol) {
         case Protocol::kOpMsg:
-            return stdx::make_unique<OpMsgReplyBuilder>();
+            return std::make_unique<OpMsgReplyBuilder>();
         case Protocol::kOpQuery:
-            return stdx::make_unique<LegacyReplyBuilder>();
+            return std::make_unique<LegacyReplyBuilder>();
     }
     MONGO_UNREACHABLE;
 }

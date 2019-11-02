@@ -38,32 +38,32 @@
 
 #include "mongo/bson/simple_bsonelement_comparator.h"
 #include "mongo/db/background.h"
-#include "mongo/db/catalog/collection_catalog_entry.h"
 #include "mongo/db/catalog/collection_options.h"
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/client.h"
 #include "mongo/db/command_generic_argument.h"
+#include "mongo/db/concurrency/write_conflict_exception.h"
+#include "mongo/db/curop_failpoint_helpers.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/index/index_descriptor.h"
+#include "mongo/db/index_builds_coordinator.h"
 #include "mongo/db/op_observer.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/service_context.h"
+#include "mongo/db/storage/durable_catalog.h"
 #include "mongo/db/storage/recovery_unit.h"
 #include "mongo/db/views/view_catalog.h"
-#include "mongo/util/fail_point_service.h"
+#include "mongo/util/fail_point.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
 
 namespace {
 
-// Causes the server to hang when it attempts to assign UUIDs to the provided database (or all
-// databases if none are provided).
-MONGO_FAIL_POINT_DEFINE(hangBeforeDatabaseUpgrade);
-
+MONGO_FAIL_POINT_DEFINE(hangAfterDatabaseLock);
 MONGO_FAIL_POINT_DEFINE(assertAfterIndexUpdate);
 
 struct CollModRequest {
@@ -74,8 +74,6 @@ struct CollModRequest {
     BSONElement collValidator = {};
     std::string collValidationAction = {};
     std::string collValidationLevel = {};
-    BSONElement usePowerOf2Sizes = {};
-    BSONElement noPadding = {};
 };
 
 StatusWith<CollModRequest> parseCollModRequest(OperationContext* opCtx,
@@ -138,8 +136,8 @@ StatusWith<CollModRequest> parseCollModRequest(OperationContext* opCtx,
                 cmr.idx = coll->getIndexCatalog()->findIndexByName(opCtx, indexName);
                 if (!cmr.idx) {
                     return Status(ErrorCodes::IndexNotFound,
-                                  str::stream() << "cannot find index " << indexName << " for ns "
-                                                << nss);
+                                  str::stream()
+                                      << "cannot find index " << indexName << " for ns " << nss);
                 }
             } else {
                 std::vector<const IndexDescriptor*> indexes;
@@ -149,17 +147,14 @@ StatusWith<CollModRequest> parseCollModRequest(OperationContext* opCtx,
                 if (indexes.size() > 1) {
                     return Status(ErrorCodes::AmbiguousIndexKeyPattern,
                                   str::stream() << "index keyPattern " << keyPattern << " matches "
-                                                << indexes.size()
-                                                << " indexes,"
+                                                << indexes.size() << " indexes,"
                                                 << " must use index name. "
-                                                << "Conflicting indexes:"
-                                                << indexes[0]->infoObj()
-                                                << ", "
-                                                << indexes[1]->infoObj());
+                                                << "Conflicting indexes:" << indexes[0]->infoObj()
+                                                << ", " << indexes[1]->infoObj());
                 } else if (indexes.empty()) {
                     return Status(ErrorCodes::IndexNotFound,
-                                  str::stream() << "cannot find index " << keyPattern << " for ns "
-                                                << nss);
+                                  str::stream()
+                                      << "cannot find index " << keyPattern << " for ns " << nss);
                 }
 
                 cmr.idx = indexes[0];
@@ -178,14 +173,14 @@ StatusWith<CollModRequest> parseCollModRequest(OperationContext* opCtx,
             // Save this to a variable to avoid reading the atomic variable multiple times.
             const auto currentFCV = serverGlobalParams.featureCompatibility.getVersion();
 
-            // If the feature compatibility version is not 4.2, and we are validating features as
-            // master, ban the use of new agg features introduced in 4.2 to prevent them from being
+            // If the feature compatibility version is not 4.4, and we are validating features as
+            // master, ban the use of new agg features introduced in 4.4 to prevent them from being
             // persisted in the catalog.
             boost::optional<ServerGlobalParams::FeatureCompatibility::Version>
                 maxFeatureCompatibilityVersion;
             if (serverGlobalParams.validateFeaturesAsMaster.load() &&
                 currentFCV !=
-                    ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo42) {
+                    ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo44) {
                 maxFeatureCompatibilityVersion = currentFCV;
             }
             auto statusW = coll->parseValidator(opCtx,
@@ -232,17 +227,9 @@ StatusWith<CollModRequest> parseCollModRequest(OperationContext* opCtx,
                 return Status(ErrorCodes::InvalidOptions,
                               str::stream() << "option not supported on a view: " << fieldName);
             }
-            // As of SERVER-17312 we only support these two options. When SERVER-17320 is
-            // resolved this will need to be enhanced to handle other options.
-            typedef CollectionOptions CO;
 
-            if (fieldName == "usePowerOf2Sizes")
-                cmr.usePowerOf2Sizes = e;
-            else if (fieldName == "noPadding")
-                cmr.noPadding = e;
-            else
-                return Status(ErrorCodes::InvalidOptions,
-                              str::stream() << "unknown option to collMod: " << fieldName);
+            return Status(ErrorCodes::InvalidOptions,
+                          str::stream() << "unknown option to collMod: " << fieldName);
         }
 
         oplogEntryBuilder->append(e);
@@ -251,60 +238,39 @@ StatusWith<CollModRequest> parseCollModRequest(OperationContext* opCtx,
     return {std::move(cmr)};
 }
 
-/**
- * Set a collection option flag for 'UsePowerOf2Sizes' or 'NoPadding'. Appends both the new and
- * old flag setting to the given 'result' builder.
- */
-void setCollectionOptionFlag(OperationContext* opCtx,
-                             Collection* coll,
-                             BSONElement& collOptionElement,
-                             BSONObjBuilder* result) {
-    const StringData flagName = collOptionElement.fieldNameStringData();
+class CollModResultChange : public RecoveryUnit::Change {
+public:
+    CollModResultChange(const BSONElement& oldExpireSecs,
+                        const BSONElement& newExpireSecs,
+                        BSONObjBuilder* result)
+        : _oldExpireSecs(oldExpireSecs), _newExpireSecs(newExpireSecs), _result(result) {}
 
-    int flag;
-
-    if (flagName == "usePowerOf2Sizes") {
-        flag = CollectionOptions::Flag_UsePowerOf2Sizes;
-    } else if (flagName == "noPadding") {
-        flag = CollectionOptions::Flag_NoPadding;
-    } else {
-        flag = 0;
+    void commit(boost::optional<Timestamp>) override {
+        // add the fields to BSONObjBuilder result
+        _result->appendAs(_oldExpireSecs, "expireAfterSeconds_old");
+        _result->appendAs(_newExpireSecs, "expireAfterSeconds_new");
     }
 
-    CollectionCatalogEntry* cce = coll->getCatalogEntry();
+    void rollback() override {}
 
-    const int oldFlags = cce->getCollectionOptions(opCtx).flags;
-    const bool oldSetting = oldFlags & flag;
-    const bool newSetting = collOptionElement.trueValue();
+private:
+    const BSONElement _oldExpireSecs;
+    const BSONElement _newExpireSecs;
+    BSONObjBuilder* _result;
+};
 
-    result->appendBool(flagName.toString() + "_old", oldSetting);
-    result->appendBool(flagName.toString() + "_new", newSetting);
-
-    const int newFlags = newSetting ? (oldFlags | flag)    // set flag
-                                    : (oldFlags & ~flag);  // clear flag
-
-    // NOTE we do this unconditionally to ensure that we note that the user has
-    // explicitly set flags, even if they are just setting the default.
-    cce->updateFlags(opCtx, newFlags);
-
-    const CollectionOptions newOptions = cce->getCollectionOptions(opCtx);
-    invariant(newOptions.flags == newFlags);
-    invariant(newOptions.flagsSet);
-}
-
-/**
- * If uuid is specified, add it to the collection specified by nss. This will error if the
- * collection already has a UUID.
- */
 Status _collModInternal(OperationContext* opCtx,
                         const NamespaceString& nss,
                         const BSONObj& cmdObj,
-                        BSONObjBuilder* result,
-                        bool upgradeUniqueIndexes) {
+                        BSONObjBuilder* result) {
     StringData dbName = nss.db();
     AutoGetDb autoDb(opCtx, dbName, MODE_X);
     Database* const db = autoDb.getDb();
-    Collection* coll = db ? db->getCollection(opCtx, nss) : nullptr;
+    Collection* coll =
+        db ? CollectionCatalog::get(opCtx).lookupCollectionByNamespace(nss) : nullptr;
+
+    CurOpFailpointHelpers::waitWhileFailPointEnabled(
+        &hangAfterDatabaseLock, opCtx, "hangAfterDatabaseLock", []() {}, false, nss);
 
     // May also modify a view instead of a collection.
     boost::optional<ViewDefinition> view;
@@ -319,6 +285,9 @@ Status _collModInternal(OperationContext* opCtx,
     // This can kill all cursors so don't allow running it while a background operation is in
     // progress.
     BackgroundOperation::assertNoBgOpInProgForNs(nss);
+    if (coll) {
+        IndexBuildsCoordinator::get(opCtx)->assertNoIndexBuildInProgForCollection(coll->uuid());
+    }
 
     // If db/collection/view does not exist, short circuit and return.
     if (!db || (!coll && !view)) {
@@ -341,125 +310,98 @@ Status _collModInternal(OperationContext* opCtx,
     if (!statusW.isOK()) {
         return statusW.getStatus();
     }
+    auto oplogEntryObj = oplogEntryBuilder.obj();
 
-    CollModRequest cmr = statusW.getValue();
+    // Save both states of the CollModRequest to allow writeConflictRetries.
+    const CollModRequest cmrOld = statusW.getValue();
+    CollModRequest cmrNew = statusW.getValue();
 
-    WriteUnitOfWork wunit(opCtx);
+    return writeConflictRetry(opCtx, "collMod", nss.ns(), [&] {
+        WriteUnitOfWork wunit(opCtx);
 
-    // Handle collMod on a view and return early. The View Catalog handles the creation of oplog
-    // entries for modifications on a view.
-    if (view) {
-        if (!cmr.viewPipeLine.eoo())
-            view->setPipeline(cmr.viewPipeLine);
+        // Handle collMod on a view and return early. The View Catalog handles the creation of oplog
+        // entries for modifications on a view.
+        if (view) {
+            if (!cmrOld.viewPipeLine.eoo())
+                view->setPipeline(cmrOld.viewPipeLine);
 
-        if (!cmr.viewOn.empty())
-            view->setViewOn(NamespaceString(dbName, cmr.viewOn));
+            if (!cmrOld.viewOn.empty())
+                view->setViewOn(NamespaceString(dbName, cmrOld.viewOn));
 
-        ViewCatalog* catalog = ViewCatalog::get(db);
+            ViewCatalog* catalog = ViewCatalog::get(db);
 
-        BSONArrayBuilder pipeline;
-        for (auto& item : view->pipeline()) {
-            pipeline.append(item);
+            BSONArrayBuilder pipeline;
+            for (auto& item : view->pipeline()) {
+                pipeline.append(item);
+            }
+            auto errorStatus =
+                catalog->modifyView(opCtx, nss, view->viewOn(), BSONArray(pipeline.obj()));
+            if (!errorStatus.isOK()) {
+                return errorStatus;
+            }
+
+            wunit.commit();
+            return Status::OK();
         }
-        auto errorStatus =
-            catalog->modifyView(opCtx, nss, view->viewOn(), BSONArray(pipeline.obj()));
-        if (!errorStatus.isOK()) {
-            return errorStatus;
+
+        // In order to facilitate the replication rollback process, which makes a best effort
+        // attempt to "undo" a set of oplog operations, we store a snapshot of the old collection
+        // options to provide to the OpObserver. TTL index updates aren't a part of collection
+        // options so we save the relevant TTL index data in a separate object.
+
+        CollectionOptions oldCollOptions =
+            DurableCatalog::get(opCtx)->getCollectionOptions(opCtx, nss);
+
+        boost::optional<TTLCollModInfo> ttlInfo;
+
+        // Handle collMod operation type appropriately.
+
+        // TTLIndex
+        if (!cmrOld.indexExpireAfterSeconds.eoo()) {
+            BSONElement newExpireSecs = cmrOld.indexExpireAfterSeconds;
+            BSONElement oldExpireSecs = cmrOld.idx->infoObj().getField("expireAfterSeconds");
+
+            if (SimpleBSONElementComparator::kInstance.evaluate(oldExpireSecs != newExpireSecs)) {
+                // Change the value of "expireAfterSeconds" on disk.
+                DurableCatalog::get(opCtx)->updateTTLSetting(
+                    opCtx, coll->ns(), cmrOld.idx->indexName(), newExpireSecs.safeNumberLong());
+
+                // Notify the index catalog that the definition of this index changed. This will
+                // invalidate the idx pointer in cmrOld. On rollback of this WUOW, the idx pointer
+                // in cmrNew will be invalidated and the idx pointer in cmrOld will be valid again.
+                cmrNew.idx = coll->getIndexCatalog()->refreshEntry(opCtx, cmrOld.idx);
+                opCtx->recoveryUnit()->registerChange(
+                    std::make_unique<CollModResultChange>(oldExpireSecs, newExpireSecs, result));
+
+                if (MONGO_unlikely(assertAfterIndexUpdate.shouldFail())) {
+                    log() << "collMod - assertAfterIndexUpdate fail point enabled.";
+                    uasserted(50970, "trigger rollback after the index update");
+                }
+            }
+
+
+            // Save previous TTL index expiration.
+            ttlInfo = TTLCollModInfo{Seconds(newExpireSecs.safeNumberLong()),
+                                     Seconds(oldExpireSecs.safeNumberLong()),
+                                     cmrNew.idx->indexName()};
         }
+
+        // The Validator, ValidationAction and ValidationLevel are already parsed and must be OK.
+        if (!cmrNew.collValidator.eoo())
+            invariant(coll->setValidator(opCtx, cmrNew.collValidator.Obj()));
+        if (!cmrNew.collValidationAction.empty())
+            invariant(coll->setValidationAction(opCtx, cmrNew.collValidationAction));
+        if (!cmrNew.collValidationLevel.empty())
+            invariant(coll->setValidationLevel(opCtx, cmrNew.collValidationLevel));
+
+        // Only observe non-view collMods, as view operations are observed as operations on the
+        // system.views collection.
+        getGlobalServiceContext()->getOpObserver()->onCollMod(
+            opCtx, nss, coll->uuid(), oplogEntryObj, oldCollOptions, ttlInfo);
 
         wunit.commit();
         return Status::OK();
-    }
-
-    // In order to facilitate the replication rollback process, which makes a best effort attempt to
-    // "undo" a set of oplog operations, we store a snapshot of the old collection options to
-    // provide to the OpObserver. TTL index updates aren't a part of collection options so we
-    // save the relevant TTL index data in a separate object.
-
-    CollectionOptions oldCollOptions = coll->getCatalogEntry()->getCollectionOptions(opCtx);
-    boost::optional<TTLCollModInfo> ttlInfo;
-
-    // Handle collMod operation type appropriately.
-
-    // TTLIndex
-    if (!cmr.indexExpireAfterSeconds.eoo()) {
-        BSONElement& newExpireSecs = cmr.indexExpireAfterSeconds;
-        BSONElement oldExpireSecs = cmr.idx->infoObj().getField("expireAfterSeconds");
-
-        if (SimpleBSONElementComparator::kInstance.evaluate(oldExpireSecs != newExpireSecs)) {
-            result->appendAs(oldExpireSecs, "expireAfterSeconds_old");
-
-            // Change the value of "expireAfterSeconds" on disk.
-            coll->getCatalogEntry()->updateTTLSetting(
-                opCtx, cmr.idx->indexName(), newExpireSecs.safeNumberLong());
-
-            // Notify the index catalog that the definition of this index changed.
-            cmr.idx = coll->getIndexCatalog()->refreshEntry(opCtx, cmr.idx);
-            result->appendAs(newExpireSecs, "expireAfterSeconds_new");
-
-            if (MONGO_FAIL_POINT(assertAfterIndexUpdate)) {
-                log() << "collMod - assertAfterIndexUpdate fail point enabled.";
-                uasserted(50970, "trigger rollback after the index update");
-            }
-        }
-
-
-        // Save previous TTL index expiration.
-        ttlInfo = TTLCollModInfo{Seconds(newExpireSecs.safeNumberLong()),
-                                 Seconds(oldExpireSecs.safeNumberLong()),
-                                 cmr.idx->indexName()};
-    }
-
-    // The Validator, ValidationAction and ValidationLevel are already parsed and must be OK.
-    if (!cmr.collValidator.eoo())
-        invariant(coll->setValidator(opCtx, cmr.collValidator.Obj()));
-    if (!cmr.collValidationAction.empty())
-        invariant(coll->setValidationAction(opCtx, cmr.collValidationAction));
-    if (!cmr.collValidationLevel.empty())
-        invariant(coll->setValidationLevel(opCtx, cmr.collValidationLevel));
-
-    // UsePowerof2Sizes
-    if (!cmr.usePowerOf2Sizes.eoo())
-        setCollectionOptionFlag(opCtx, coll, cmr.usePowerOf2Sizes, result);
-
-    // NoPadding
-    if (!cmr.noPadding.eoo())
-        setCollectionOptionFlag(opCtx, coll, cmr.noPadding, result);
-
-    // Upgrade unique indexes
-    if (upgradeUniqueIndexes) {
-        // A cmdObj with an empty collMod, i.e. nFields = 1, implies that it is a Unique Index
-        // upgrade collMod.
-        invariant(cmdObj.nFields() == 1);
-        std::vector<std::string> indexNames;
-        coll->getCatalogEntry()->getAllUniqueIndexes(opCtx, &indexNames);
-
-        for (size_t i = 0; i < indexNames.size(); i++) {
-            const IndexDescriptor* desc =
-                coll->getIndexCatalog()->findIndexByName(opCtx, indexNames[i]);
-            invariant(desc);
-
-            // Update index metadata in storage engine.
-            coll->getCatalogEntry()->updateIndexMetadata(opCtx, desc);
-
-            // Refresh the in-memory instance of the index.
-            desc = coll->getIndexCatalog()->refreshEntry(opCtx, desc);
-
-            if (MONGO_FAIL_POINT(assertAfterIndexUpdate)) {
-                log() << "collMod - assertAfterIndexUpdate fail point enabled.";
-                uasserted(50971, "trigger rollback for unique index update");
-            }
-        }
-    }
-
-    // Only observe non-view collMods, as view operations are observed as operations on the
-    // system.views collection.
-    getGlobalServiceContext()->getOpObserver()->onCollMod(
-        opCtx, nss, coll->uuid(), oplogEntryBuilder.obj(), oldCollOptions, ttlInfo);
-
-    wunit.commit();
-
-    return Status::OK();
+    });
 }
 
 }  // namespace
@@ -468,159 +410,7 @@ Status collMod(OperationContext* opCtx,
                const NamespaceString& nss,
                const BSONObj& cmdObj,
                BSONObjBuilder* result) {
-    return _collModInternal(opCtx,
-                            nss,
-                            cmdObj,
-                            result,
-                            /*upgradeUniqueIndexes*/ false);
-}
-
-Status collModWithUpgrade(OperationContext* opCtx,
-                          const NamespaceString& nss,
-                          const BSONObj& cmdObj) {
-    // An empty collMod is used to upgrade unique index during FCV upgrade. If an application
-    // executes the empty collMod when the secondary is upgrading FCV it is fine to upgrade the
-    // unique index becuase the secondary will eventually get the real empty collMod. If the
-    // application issues an empty collMod when FCV is not upgrading or upgraded to 4.2 then the
-    // unique index should not be upgraded due to this collMod on the secondary.
-    bool upgradeUniqueIndex =
-        (cmdObj.nFields() == 1 && serverGlobalParams.featureCompatibility.isVersionInitialized() &&
-         serverGlobalParams.featureCompatibility.isVersionUpgradingOrUpgraded());
-
-    // Update all non-replicated unique indexes on upgrade i.e. setFCV=4.2.
-    if (upgradeUniqueIndex && nss == NamespaceString::kServerConfigurationNamespace) {
-        auto schemaStatus = updateNonReplicatedUniqueIndexes(opCtx);
-        if (!schemaStatus.isOK()) {
-            return schemaStatus;
-        }
-    }
-
-    BSONObjBuilder resultWeDontCareAbout;
-    return _collModInternal(opCtx, nss, cmdObj, &resultWeDontCareAbout, upgradeUniqueIndex);
-}
-
-Status _updateNonReplicatedIndexPerCollection(OperationContext* opCtx, Collection* coll) {
-    BSONObjBuilder collModObjBuilder;
-    collModObjBuilder.append("collMod", coll->ns().coll());
-    BSONObj collModObj = collModObjBuilder.done();
-
-    BSONObjBuilder resultWeDontCareAbout;
-    auto collModStatus = _collModInternal(opCtx,
-                                          coll->ns(),
-                                          collModObj,
-                                          &resultWeDontCareAbout,
-                                          /*upgradeUniqueIndexes*/ true);
-    return collModStatus;
-}
-
-Status _updateNonReplicatedUniqueIndexesPerDatabase(OperationContext* opCtx,
-                                                    const std::string& dbName) {
-    AutoGetDb autoDb(opCtx, dbName, MODE_X);
-    Database* const db = autoDb.getDb();
-
-    // Iterate through all collections if we're in the "local" database.
-    if (dbName == "local") {
-        for (auto collectionIt = db->begin(); collectionIt != db->end(); ++collectionIt) {
-            Collection* coll = *collectionIt;
-
-            auto collModStatus = _updateNonReplicatedIndexPerCollection(opCtx, coll);
-            if (!collModStatus.isOK())
-                return collModStatus;
-        }
-    } else {
-        // If we're not in the "local" database, the only non-replicated collection
-        // could be system.profile.
-        Collection* coll =
-            db ? db->getCollection(opCtx, NamespaceString(dbName, "system.profile")) : nullptr;
-        if (!coll)
-            return Status::OK();
-
-        auto collModStatus = _updateNonReplicatedIndexPerCollection(opCtx, coll);
-        if (!collModStatus.isOK())
-            return collModStatus;
-    }
-    return Status::OK();
-}
-
-void _updateUniqueIndexesForDatabase(OperationContext* opCtx, const std::string& dbname) {
-    // Iterate through all replicated collections of the database, for unique index update.
-    // Non-replicated unique indexes are updated via the upgrade of admin.system.version
-    // collection.
-    {
-        AutoGetDb autoDb(opCtx, dbname, MODE_X);
-        Database* const db = autoDb.getDb();
-        // If the database no longer exists, nothing more to do.
-        if (!db)
-            return;
-
-        for (auto collectionIt = db->begin(); collectionIt != db->end(); ++collectionIt) {
-            Collection* coll = *collectionIt;
-            NamespaceString collNSS = coll->ns();
-
-            // Skip non-replicated collection.
-            if (collNSS.coll() == "system.profile")
-                continue;
-
-            BSONObjBuilder collModObjBuilder;
-            collModObjBuilder.append("collMod", collNSS.coll());
-            BSONObj collModObj = collModObjBuilder.done();
-
-            uassertStatusOK(collModWithUpgrade(opCtx, collNSS, collModObj));
-        }
-    }
-}
-
-void updateUniqueIndexesOnUpgrade(OperationContext* opCtx) {
-    // Update all unique indexes except the _id index.
-    std::vector<std::string> dbNames;
-    StorageEngine* storageEngine = opCtx->getServiceContext()->getStorageEngine();
-    {
-        Lock::GlobalLock lk(opCtx, MODE_IS);
-        storageEngine->listDatabases(&dbNames);
-    }
-
-    for (auto it = dbNames.begin(); it != dbNames.end(); ++it) {
-        auto dbName = *it;
-
-        // Non-replicated unique indexes are updated via the upgrade of admin.system.version
-        // collection.
-        if (dbName != "local")
-            _updateUniqueIndexesForDatabase(opCtx, dbName);
-    }
-
-    const auto& clientInfo = repl::ReplClientInfo::forClient(opCtx->getClient());
-    auto awaitOpTime = clientInfo.getLastOp();
-
-    log() << "Finished updating version of unique indexes for upgrade, waiting for all"
-          << " index updates to be committed at optime " << awaitOpTime;
-
-    auto timeout = opCtx->getWriteConcern().usedDefault ? WriteConcernOptions::kNoTimeout
-                                                        : opCtx->getWriteConcern().wTimeout;
-    const WriteConcernOptions writeConcern(
-        WriteConcernOptions::kMajority, WriteConcernOptions::SyncMode::UNSET, timeout);
-
-    uassertStatusOK(repl::ReplicationCoordinator::get(opCtx)
-                        ->awaitReplication(opCtx, awaitOpTime, writeConcern)
-                        .status);
-}
-
-Status updateNonReplicatedUniqueIndexes(OperationContext* opCtx) {
-    // Update all unique indexes belonging to all non-replicated collections.
-    // (_id indexes are not updated).
-    std::vector<std::string> dbNames;
-    StorageEngine* storageEngine = opCtx->getServiceContext()->getStorageEngine();
-    {
-        Lock::GlobalLock lk(opCtx, MODE_IS);
-        storageEngine->listDatabases(&dbNames);
-    }
-    for (auto it = dbNames.begin(); it != dbNames.end(); ++it) {
-        auto dbName = *it;
-        auto schemaStatus = _updateNonReplicatedUniqueIndexesPerDatabase(opCtx, dbName);
-        if (!schemaStatus.isOK()) {
-            return schemaStatus;
-        }
-    }
-    return Status::OK();
+    return _collModInternal(opCtx, nss, cmdObj, result);
 }
 
 }  // namespace mongo

@@ -29,6 +29,7 @@
 
 #pragma once
 
+#include <functional>
 #include <list>
 #include <memory>
 #include <string>
@@ -38,12 +39,13 @@
 
 #include "mongo/bson/ordering.h"
 #include "mongo/bson/timestamp.h"
+#include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/storage/kv/kv_engine.h"
+#include "mongo/db/storage/storage_engine.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_oplog_manager.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_session_cache.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_util.h"
-#include "mongo/stdx/functional.h"
-#include "mongo/stdx/mutex.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/util/elapsed_tracker.h"
 
 namespace mongo {
@@ -55,7 +57,7 @@ class WiredTigerSessionCache;
 class WiredTigerSizeStorer;
 
 struct WiredTigerFileVersion {
-    enum class StartupVersion { IS_34, IS_36, IS_40, IS_42 };
+    enum class StartupVersion { IS_34, IS_36, IS_40, IS_42, IS_44 };
 
     StartupVersion _startupVersion;
     bool shouldDowngrade(bool readOnly, bool repairMode, bool hasRecoveryTimestamp);
@@ -64,20 +66,22 @@ struct WiredTigerFileVersion {
 
 class WiredTigerKVEngine final : public KVEngine {
 public:
-    static const int kDefaultJournalDelayMillis;
     static StringData kTableUriPrefix;
 
     WiredTigerKVEngine(const std::string& canonicalName,
                        const std::string& path,
                        ClockSource* cs,
                        const std::string& extraOpenOptions,
-                       size_t cacheSizeGB,
+                       size_t cacheSizeMB,
+                       size_t maxCacheOverflowFileSizeMB,
                        bool durable,
                        bool ephemeral,
                        bool repair,
                        bool readOnly);
 
     ~WiredTigerKVEngine();
+
+    void startAsyncThreads() override;
 
     void setRecordStoreExtraOptions(const std::string& options);
     void setSortedDataInterfaceExtraOptions(const std::string& options);
@@ -86,6 +90,13 @@ public:
 
     bool supportsDirectoryPerDB() const override;
 
+    /**
+     * WiredTiger supports checkpoints when it isn't running in memory.
+     */
+    bool supportsCheckpoints() const override {
+        return !isEphemeral();
+    }
+
     bool isDurable() const override {
         return _durable;
     }
@@ -93,6 +104,9 @@ public:
     bool isEphemeral() const override {
         return _ephemeral;
     }
+
+    void setOldestActiveTransactionTimestampCallback(
+        StorageEngine::OldestActiveTransactionTimestampCallback callback) override;
 
     RecoveryUnit* newRecoveryUnit() override;
 
@@ -114,14 +128,15 @@ public:
                                                           StringData ident) override;
 
     Status createSortedDataInterface(OperationContext* opCtx,
+                                     const CollectionOptions& collOptions,
                                      StringData ident,
                                      const IndexDescriptor* desc) override {
-        return createGroupedSortedDataInterface(opCtx, ident, desc, KVPrefix::kNotPrefixed);
+        return createGroupedSortedDataInterface(
+            opCtx, collOptions, ident, desc, KVPrefix::kNotPrefixed);
     }
 
-    SortedDataInterface* getSortedDataInterface(OperationContext* opCtx,
-                                                StringData ident,
-                                                const IndexDescriptor* desc) override {
+    std::unique_ptr<SortedDataInterface> getSortedDataInterface(
+        OperationContext* opCtx, StringData ident, const IndexDescriptor* desc) override {
         return getGroupedSortedDataInterface(opCtx, ident, desc, KVPrefix::kNotPrefixed);
     }
 
@@ -138,20 +153,17 @@ public:
                                                        KVPrefix prefix) override;
 
     Status createGroupedSortedDataInterface(OperationContext* opCtx,
+                                            const CollectionOptions& collOptions,
                                             StringData ident,
                                             const IndexDescriptor* desc,
                                             KVPrefix prefix) override;
 
-    SortedDataInterface* getGroupedSortedDataInterface(OperationContext* opCtx,
-                                                       StringData ident,
-                                                       const IndexDescriptor* desc,
-                                                       KVPrefix prefix) override;
+    std::unique_ptr<SortedDataInterface> getGroupedSortedDataInterface(OperationContext* opCtx,
+                                                                       StringData ident,
+                                                                       const IndexDescriptor* desc,
+                                                                       KVPrefix prefix) override;
 
     Status dropIdent(OperationContext* opCtx, StringData ident) override;
-
-    void alterIdentMetadata(OperationContext* opCtx,
-                            StringData ident,
-                            const IndexDescriptor* desc) override;
 
     Status okToRename(OperationContext* opCtx,
                       StringData fromNS,
@@ -165,7 +177,8 @@ public:
 
     void endBackup(OperationContext* opCtx) override;
 
-    StatusWith<std::vector<std::string>> beginNonBlockingBackup(OperationContext* opCtx) override;
+    StatusWith<std::vector<StorageEngine::BackupBlock>> beginNonBlockingBackup(
+        OperationContext* opCtx) override;
 
     void endNonBlockingBackup(OperationContext* opCtx) override;
 
@@ -177,7 +190,7 @@ public:
     Status repairIdent(OperationContext* opCtx, StringData ident) override;
 
     Status recoverOrphanedIdent(OperationContext* opCtx,
-                                StringData ns,
+                                const NamespaceString& nss,
                                 StringData ident,
                                 const CollectionOptions& options) override;
 
@@ -193,9 +206,7 @@ public:
 
     void setJournalListener(JournalListener* jl) final;
 
-    void setStableTimestamp(Timestamp stableTimestamp,
-                            boost::optional<Timestamp> maximumTruncationTimestamp,
-                            bool force) override;
+    void setStableTimestamp(Timestamp stableTimestamp, bool force) override;
 
     void setInitialDataTimestamp(Timestamp initialDataTimestamp) override;
 
@@ -230,11 +241,13 @@ public:
      */
     boost::optional<Timestamp> getLastStableRecoveryTimestamp() const override;
 
-    Timestamp getAllCommittedTimestamp() const override;
+    Timestamp getAllDurableTimestamp() const override;
 
     Timestamp getOldestOpenReadTimestamp() const override;
 
     bool supportsReadConcernSnapshot() const final override;
+
+    bool supportsOplogStones() const final override;
 
     /*
      * This function is called when replication has completed a batch.  In this function, we
@@ -289,21 +302,6 @@ public:
         return _oplogManager.get();
     }
 
-    /**
-     * Sets the implementation for `initRsOplogBackgroundThread` (allowing tests to skip the
-     * background job, for example). Intended to be called from a MONGO_INITIALIZER and therefore in
-     * a single threaded context.
-     */
-    static void setInitRsOplogBackgroundThreadCallback(stdx::function<bool(StringData)> cb);
-
-    /**
-     * Initializes a background job to remove excess documents in the oplog collections.
-     * This applies to the capped collections in the local.oplog.* namespaces (specifically
-     * local.oplog.rs for replica sets).
-     * Returns true if a background job is running for the namespace.
-     */
-    static bool initRsOplogBackgroundThread(StringData ns);
-
     static void appendGlobalStats(BSONObjBuilder& b);
 
     Timestamp getStableTimestamp() const override;
@@ -321,10 +319,11 @@ public:
 
     /**
      * Returns the minimum possible Timestamp value in the oplog that replication may need for
-     * recovery in the event of a rollback. This value gets updated on every `setStableTimestamp`
-     * call.
+     * recovery in the event of a rollback. This value depends on the timestamp passed to
+     * `setStableTimestamp` and on the set of active MongoDB transactions. Returns an error if it
+     * times out querying the active transctions.
      */
-    Timestamp getOplogNeededForRollback() const;
+    StatusWith<Timestamp> getOplogNeededForRollback() const;
 
     /**
      * Returns the minimum possible Timestamp value in the oplog that replication may need for
@@ -333,7 +332,7 @@ public:
      *
      * Returns boost::none when called on an ephemeral database.
      */
-    boost::optional<Timestamp> getOplogNeededForCrashRecovery() const;
+    boost::optional<Timestamp> getOplogNeededForCrashRecovery() const final;
 
     /**
      * Returns oplog that may not be truncated. This method is a function of oplog needed for
@@ -349,6 +348,22 @@ public:
     ClockSource* getClockSource() const {
         return _clockSource;
     }
+
+    /**
+     * Returns a CheckpointLockImpl RAII instance holding the _checkpointMutex.
+     */
+    std::unique_ptr<StorageEngine::CheckpointLock> getCheckpointLock(
+        OperationContext* opCtx) override;
+
+    void addIndividuallyCheckpointedIndexToList(const std::string& ident) override {
+        _checkpointedIndexes.push_back(ident);
+    }
+
+    void clearIndividuallyCheckpointedIndexesList() override {
+        _checkpointedIndexes.clear();
+    }
+
+    bool isInIndividuallyCheckpointedIndexesList(const std::string& ident) const override;
 
 private:
     class WiredTigerSessionSweeper;
@@ -405,6 +420,11 @@ private:
 
     std::uint64_t _getCheckpointTimestamp() const;
 
+    mutable Mutex _oldestActiveTransactionTimestampCallbackMutex =
+        MONGO_MAKE_LATCH("::_oldestActiveTransactionTimestampCallbackMutex");
+    StorageEngine::OldestActiveTransactionTimestampCallback
+        _oldestActiveTransactionTimestampCallback;
+
     WT_CONNECTION* _conn;
     WiredTigerFileVersion _fileVersion;
     WiredTigerEventHandler _eventHandler;
@@ -412,7 +432,7 @@ private:
     ClockSource* const _clockSource;
 
     // Mutex to protect use of _oplogManagerCount by this instance of KV engine.
-    mutable stdx::mutex _oplogManagerMutex;
+    mutable Mutex _oplogManagerMutex = MONGO_MAKE_LATCH("::_oplogManagerMutex");
     std::size_t _oplogManagerCount = 0;
     std::unique_ptr<WiredTigerOplogManager> _oplogManager;
 
@@ -443,25 +463,36 @@ private:
     std::string _rsOptions;
     std::string _indexOptions;
 
-    mutable stdx::mutex _dropAllQueuesMutex;
-    mutable stdx::mutex _identToDropMutex;
+    mutable Mutex _dropAllQueuesMutex = MONGO_MAKE_LATCH("WiredTigerKVEngine::_dropAllQueuesMutex");
+    mutable Mutex _identToDropMutex = MONGO_MAKE_LATCH("WiredTigerKVEngine::_identToDropMutex");
     std::list<std::string> _identToDrop;
 
     mutable Date_t _previousCheckedDropsQueued;
 
     std::unique_ptr<WiredTigerSession> _backupSession;
     WT_CURSOR* _backupCursor;
-    mutable stdx::mutex _oplogPinnedByBackupMutex;
+    mutable Mutex _oplogPinnedByBackupMutex =
+        MONGO_MAKE_LATCH("WiredTigerKVEngine::_oplogPinnedByBackupMutex");
     boost::optional<Timestamp> _oplogPinnedByBackup;
     Timestamp _recoveryTimestamp;
 
     // Tracks the stable and oldest timestamps we've set on the storage engine.
     AtomicWord<std::uint64_t> _oldestTimestamp;
     AtomicWord<std::uint64_t> _stableTimestamp;
-    AtomicWord<std::uint64_t> _oplogNeededForRollback{Timestamp::min().asULL()};
 
     // Timestamp of data at startup. Used internally to advise checkpointing and recovery to a
     // timestamp. Provided by replication layer because WT does not persist timestamps.
     AtomicWord<std::uint64_t> _initialDataTimestamp;
+
+    // Required for taking a checkpoint; and can be used to ensure multiple checkpoint cursors
+    // target the same checkpoint.
+    Lock::ResourceMutex _checkpointMutex = Lock::ResourceMutex("checkpointCursorMutex");
+
+    // A list of indexes that were individually checkpoint'ed and are not consistent with the rest
+    // of the checkpoint's PIT view of the storage data. This list is reset when a storage-wide WT
+    // checkpoint is taken that makes the PIT view consistent again.
+    //
+    // Access must be protected by the CheckpointLock.
+    std::list<std::string> _checkpointedIndexes;
 };
-}
+}  // namespace mongo

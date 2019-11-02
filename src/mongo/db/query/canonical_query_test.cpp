@@ -57,7 +57,7 @@ MatchExpression* parseMatchExpression(const BSONObj& obj) {
                                      ExtensionsCallbackNoop(),
                                      MatchExpressionParser::kAllowAllSpecialFeatures);
     if (!status.isOK()) {
-        mongoutils::str::stream ss;
+        str::stream ss;
         ss << "failed to parse query: " << obj.toString()
            << ". Reason: " << status.getStatus().toString();
         FAIL(ss);
@@ -72,10 +72,10 @@ void assertEquivalent(const char* queryStr,
     if (actual->equivalent(expected)) {
         return;
     }
-    mongoutils::str::stream ss;
+    str::stream ss;
     ss << "Match expressions are not equivalent."
-       << "\nOriginal query: " << queryStr << "\nExpected: " << expected->toString()
-       << "\nActual: " << actual->toString();
+       << "\nOriginal query: " << queryStr << "\nExpected: " << expected->debugString()
+       << "\nActual: " << actual->debugString();
     FAIL(ss);
 }
 
@@ -85,10 +85,10 @@ void assertNotEquivalent(const char* queryStr,
     if (!actual->equivalent(expected)) {
         return;
     }
-    mongoutils::str::stream ss;
+    str::stream ss;
     ss << "Match expressions are equivalent."
-       << "\nOriginal query: " << queryStr << "\nExpected: " << expected->toString()
-       << "\nActual: " << actual->toString();
+       << "\nOriginal query: " << queryStr << "\nExpected: " << expected->debugString()
+       << "\nActual: " << actual->debugString();
     FAIL(ss);
 }
 
@@ -182,7 +182,7 @@ unique_ptr<CanonicalQuery> canonicalize(const char* queryStr,
     QueryTestServiceContext serviceContext;
     auto opCtx = serviceContext.makeOperationContext();
 
-    auto qr = stdx::make_unique<QueryRequest>(nss);
+    auto qr = std::make_unique<QueryRequest>(nss);
     qr->setFilter(fromjson(queryStr));
 
     auto statusWithCQ = CanonicalQuery::canonicalize(
@@ -198,7 +198,7 @@ std::unique_ptr<CanonicalQuery> canonicalize(const char* queryStr,
     QueryTestServiceContext serviceContext;
     auto opCtx = serviceContext.makeOperationContext();
 
-    auto qr = stdx::make_unique<QueryRequest>(nss);
+    auto qr = std::make_unique<QueryRequest>(nss);
     qr->setFilter(fromjson(queryStr));
     qr->setSort(fromjson(sortStr));
     qr->setProj(fromjson(projStr));
@@ -290,7 +290,7 @@ TEST(CanonicalQueryTest, CanonicalQueryFromQRWithNoCollation) {
     QueryTestServiceContext serviceContext;
     auto opCtx = serviceContext.makeOperationContext();
 
-    auto qr = stdx::make_unique<QueryRequest>(nss);
+    auto qr = std::make_unique<QueryRequest>(nss);
     auto cq = assertGet(CanonicalQuery::canonicalize(opCtx.get(), std::move(qr)));
     ASSERT_TRUE(cq->getCollator() == nullptr);
 }
@@ -299,7 +299,7 @@ TEST(CanonicalQueryTest, CanonicalQueryFromQRWithCollation) {
     QueryTestServiceContext serviceContext;
     auto opCtx = serviceContext.makeOperationContext();
 
-    auto qr = stdx::make_unique<QueryRequest>(nss);
+    auto qr = std::make_unique<QueryRequest>(nss);
     qr->setCollation(BSON("locale"
                           << "reverse"));
     auto cq = assertGet(CanonicalQuery::canonicalize(opCtx.get(), std::move(qr)));
@@ -311,7 +311,7 @@ TEST(CanonicalQueryTest, CanonicalQueryFromBaseQueryWithNoCollation) {
     QueryTestServiceContext serviceContext;
     auto opCtx = serviceContext.makeOperationContext();
 
-    auto qr = stdx::make_unique<QueryRequest>(nss);
+    auto qr = std::make_unique<QueryRequest>(nss);
     qr->setFilter(fromjson("{$or:[{a:1,b:1},{a:1,c:1}]}"));
     auto baseCq = assertGet(CanonicalQuery::canonicalize(opCtx.get(), std::move(qr)));
     MatchExpression* firstClauseExpr = baseCq->root()->getChild(0);
@@ -324,7 +324,7 @@ TEST(CanonicalQueryTest, CanonicalQueryFromBaseQueryWithCollation) {
     QueryTestServiceContext serviceContext;
     auto opCtx = serviceContext.makeOperationContext();
 
-    auto qr = stdx::make_unique<QueryRequest>(nss);
+    auto qr = std::make_unique<QueryRequest>(nss);
     qr->setFilter(fromjson("{$or:[{a:1,b:1},{a:1,c:1}]}"));
     qr->setCollation(BSON("locale"
                           << "reverse"));
@@ -340,7 +340,7 @@ TEST(CanonicalQueryTest, SettingCollatorUpdatesCollatorAndMatchExpression) {
     QueryTestServiceContext serviceContext;
     auto opCtx = serviceContext.makeOperationContext();
 
-    auto qr = stdx::make_unique<QueryRequest>(nss);
+    auto qr = std::make_unique<QueryRequest>(nss);
     qr->setFilter(fromjson("{a: 'foo', b: {$in: ['bar', 'baz']}}"));
     auto cq = assertGet(CanonicalQuery::canonicalize(opCtx.get(), std::move(qr)));
     ASSERT_EQUALS(2U, cq->root()->numChildren());

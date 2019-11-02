@@ -31,17 +31,18 @@
 
 #include "mongo/db/pipeline/document_source_graph_lookup.h"
 
+#include <memory>
+
 #include "mongo/base/init.h"
 #include "mongo/db/bson/dotted_path_support.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/document_comparator.h"
+#include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/db/pipeline/document.h"
-#include "mongo/db/pipeline/document_comparator.h"
 #include "mongo/db/pipeline/document_path_support.h"
 #include "mongo/db/pipeline/expression.h"
 #include "mongo/db/pipeline/expression_context.h"
-#include "mongo/db/pipeline/value.h"
 #include "mongo/db/query/query_planner_common.h"
-#include "mongo/stdx/memory.h"
 
 namespace mongo {
 
@@ -49,7 +50,7 @@ using boost::intrusive_ptr;
 
 namespace dps = ::mongo::dotted_path_support;
 
-std::unique_ptr<LiteParsedDocumentSourceForeignCollections> DocumentSourceGraphLookUp::liteParse(
+std::unique_ptr<DocumentSourceGraphLookUp::LiteParsed> DocumentSourceGraphLookUp::liteParse(
     const AggregationRequest& request, const BSONElement& spec) {
     uassert(ErrorCodes::FailedToParse,
             str::stream() << "the $graphLookup stage specification must be an object, but found "
@@ -75,8 +76,7 @@ std::unique_ptr<LiteParsedDocumentSourceForeignCollections> DocumentSourceGraphL
     PrivilegeVector privileges{
         Privilege(ResourcePattern::forExactNamespace(nss), ActionType::find)};
 
-    return std::make_unique<LiteParsedDocumentSourceForeignCollections>(std::move(nss),
-                                                                        std::move(privileges));
+    return std::make_unique<LiteParsed>(std::move(nss), std::move(privileges));
 }
 
 REGISTER_DOCUMENT_SOURCE(graphLookup,
@@ -84,12 +84,10 @@ REGISTER_DOCUMENT_SOURCE(graphLookup,
                          DocumentSourceGraphLookUp::createFromBson);
 
 const char* DocumentSourceGraphLookUp::getSourceName() const {
-    return "$graphLookup";
+    return kStageName.rawData();
 }
 
-DocumentSource::GetNextResult DocumentSourceGraphLookUp::getNext() {
-    pExpCtx->checkForInterrupt();
-
+DocumentSource::GetNextResult DocumentSourceGraphLookUp::doGetNext() {
     if (_unwind) {
         return getNextUnwound();
     }
@@ -211,8 +209,7 @@ void DocumentSourceGraphLookUp::doBreadthFirstSearch() {
             while (auto next = pipeline->getNext()) {
                 uassert(40271,
                         str::stream()
-                            << "Documents in the '"
-                            << _from.ns()
+                            << "Documents in the '" << _from.ns()
                             << "' namespace must contain an _id for de-duplication in $graphLookup",
                         !(*next)["_id"].missing());
 
@@ -334,7 +331,7 @@ void DocumentSourceGraphLookUp::performSearch() {
     // Make sure _input is set before calling performSearch().
     invariant(_input);
 
-    Value startingValue = _startWith->evaluate(*_input);
+    Value startingValue = _startWith->evaluate(*_input, &pExpCtx->variables);
 
     // If _startWith evaluates to an array, treat each value as a separate starting point.
     if (startingValue.isArray()) {
@@ -365,6 +362,10 @@ Pipeline::SourceContainer::iterator DocumentSourceGraphLookUp::doOptimizeAt(
     Pipeline::SourceContainer::iterator itr, Pipeline::SourceContainer* container) {
     invariant(*itr == this);
 
+    if (std::next(itr) == container->end()) {
+        return container->end();
+    }
+
     // If we are not already handling an $unwind stage internally, we can combine with the following
     // $unwind stage.
     auto nextUnwind = dynamic_cast<DocumentSourceUnwind*>((*std::next(itr)).get());
@@ -374,18 +375,6 @@ Pipeline::SourceContainer::iterator DocumentSourceGraphLookUp::doOptimizeAt(
         return itr;
     }
     return std::next(itr);
-}
-
-BSONObjSet DocumentSourceGraphLookUp::getOutputSorts() {
-    std::set<std::string> fields{_as.fullPath()};
-    if (_depthField) {
-        fields.insert(_depthField->fullPath());
-    }
-    if (_unwind && (*_unwind)->indexPath()) {
-        fields.insert((*_unwind)->indexPath()->fullPath());
-    }
-
-    return DocumentSource::truncateSortSet(pSource->getOutputSorts(), fields);
 }
 
 void DocumentSourceGraphLookUp::checkMemoryUsage() {
@@ -400,10 +389,8 @@ void DocumentSourceGraphLookUp::serializeToArray(
     std::vector<Value>& array, boost::optional<ExplainOptions::Verbosity> explain) const {
     // Serialize default options.
     MutableDocument spec(DOC("from" << _from.coll() << "as" << _as.fullPath() << "connectToField"
-                                    << _connectToField.fullPath()
-                                    << "connectFromField"
-                                    << _connectFromField.fullPath()
-                                    << "startWith"
+                                    << _connectToField.fullPath() << "connectFromField"
+                                    << _connectFromField.fullPath() << "startWith"
                                     << _startWith->serialize(false)));
 
     // depthField is optional; serialize it if it was specified.
@@ -422,10 +409,10 @@ void DocumentSourceGraphLookUp::serializeToArray(
     // If we are explaining, include an absorbed $unwind inside the $graphLookup specification.
     if (_unwind && explain) {
         const boost::optional<FieldPath> indexPath = (*_unwind)->indexPath();
-        spec["unwinding"] = Value(DOC("preserveNullAndEmptyArrays"
-                                      << (*_unwind)->preserveNullAndEmptyArrays()
-                                      << "includeArrayIndex"
-                                      << (indexPath ? Value((*indexPath).fullPath()) : Value())));
+        spec["unwinding"] =
+            Value(DOC("preserveNullAndEmptyArrays"
+                      << (*_unwind)->preserveNullAndEmptyArrays() << "includeArrayIndex"
+                      << (indexPath ? Value((*indexPath).fullPath()) : Value())));
     }
 
     array.push_back(Value(DOC(getSourceName() << spec.freeze())));
@@ -456,7 +443,7 @@ DocumentSourceGraphLookUp::DocumentSourceGraphLookUp(
     boost::optional<FieldPath> depthField,
     boost::optional<long long> maxDepth,
     boost::optional<boost::intrusive_ptr<DocumentSourceUnwind>> unwindSrc)
-    : DocumentSource(expCtx),
+    : DocumentSource(kStageName, expCtx),
       _from(std::move(from)),
       _as(std::move(as)),
       _connectFromField(std::move(connectFromField)),
@@ -471,10 +458,10 @@ DocumentSourceGraphLookUp::DocumentSourceGraphLookUp(
       _unwind(unwindSrc) {
     const auto& resolvedNamespace = pExpCtx->getResolvedNamespace(_from);
     _fromExpCtx = pExpCtx->copyWith(resolvedNamespace.ns);
-    _fromPipeline = resolvedNamespace.pipeline;
 
     // We append an additional BSONObj to '_fromPipeline' as a placeholder for the $match stage
     // we'll eventually construct from the input document.
+    _fromPipeline = resolvedNamespace.pipeline;
     _fromPipeline.reserve(_fromPipeline.size() + 1);
     _fromPipeline.push_back(BSON("$match" << BSONObj()));
 }
@@ -558,8 +545,8 @@ intrusive_ptr<DocumentSource> DocumentSourceGraphLookUp::createFromBson(
             argName == "depthField" || argName == "connectToField") {
             // All remaining arguments to $graphLookup are expected to be strings.
             uassert(40103,
-                    str::stream() << "expected string as argument for " << argName << ", found: "
-                                  << argument.toString(false, false),
+                    str::stream() << "expected string as argument for " << argName
+                                  << ", found: " << argument.toString(false, false),
                     argument.type() == String);
         }
 
@@ -575,8 +562,8 @@ intrusive_ptr<DocumentSource> DocumentSourceGraphLookUp::createFromBson(
             depthField = boost::optional<FieldPath>(FieldPath(argument.String()));
         } else {
             uasserted(40104,
-                      str::stream() << "Unknown argument to $graphLookup: "
-                                    << argument.fieldName());
+                      str::stream()
+                          << "Unknown argument to $graphLookup: " << argument.fieldName());
         }
     }
 

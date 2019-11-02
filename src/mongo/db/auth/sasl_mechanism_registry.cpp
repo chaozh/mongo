@@ -59,8 +59,9 @@ void SASLServerMechanismRegistry::set(ServiceContext* service,
     getSASLServerMechanismRegistry(service) = std::move(registry);
 }
 
-SASLServerMechanismRegistry::SASLServerMechanismRegistry(std::vector<std::string> enabledMechanisms)
-    : _enabledMechanisms(std::move(enabledMechanisms)) {}
+SASLServerMechanismRegistry::SASLServerMechanismRegistry(ServiceContext* svcCtx,
+                                                         std::vector<std::string> enabledMechanisms)
+    : _svcCtx(svcCtx), _enabledMechanisms(std::move(enabledMechanisms)) {}
 
 void SASLServerMechanismRegistry::setEnabledMechanisms(std::vector<std::string> enabledMechanisms) {
     _enabledMechanisms = std::move(enabledMechanisms);
@@ -78,10 +79,9 @@ StatusWith<std::unique_ptr<ServerMechanismBase>> SASLServerMechanismRegistry::ge
     }
 
     return Status(ErrorCodes::BadValue,
-                  mongoutils::str::stream() << "Unsupported mechanism '" << mechanismName
-                                            << "' on authentication database '"
-                                            << authenticationDatabase
-                                            << "'");
+                  str::stream() << "Unsupported mechanism '" << mechanismName
+                                << "' on authentication database '" << authenticationDatabase
+                                << "'");
 }
 
 void SASLServerMechanismRegistry::advertiseMechanismNamesForUser(OperationContext* opCtx,
@@ -90,7 +90,16 @@ void SASLServerMechanismRegistry::advertiseMechanismNamesForUser(OperationContex
     BSONElement saslSupportedMechs = isMasterCmd["saslSupportedMechs"];
     if (saslSupportedMechs.type() == BSONType::String) {
 
-        const auto userName = uassertStatusOK(UserName::parse(saslSupportedMechs.String()));
+        UserName userName = uassertStatusOK(UserName::parse(saslSupportedMechs.String()));
+
+
+        // Authenticating the __system@local user to the admin database on mongos is required
+        // by the auth passthrough test suite.
+        if (getTestCommandsEnabled() &&
+            userName.getUser() == internalSecurity.user->getName().getUser() &&
+            userName.getDB() == "admin") {
+            userName = internalSecurity.user->getName();
+        }
 
         AuthorizationManager* authManager = AuthorizationManager::get(opCtx->getServiceContext());
 
@@ -138,12 +147,10 @@ bool SASLServerMechanismRegistry::_mechanismSupportedByConfig(StringData mechNam
 
 namespace {
 ServiceContext::ConstructorActionRegisterer SASLServerMechanismRegistryInitializer{
-    "CreateSASLServerMechanismRegistry",
-    {"EndStartupOptionStorage"},
-    [](ServiceContext* service) {
+    "CreateSASLServerMechanismRegistry", {"EndStartupOptionStorage"}, [](ServiceContext* service) {
         SASLServerMechanismRegistry::set(service,
                                          std::make_unique<SASLServerMechanismRegistry>(
-                                             saslGlobalParams.authenticationMechanisms));
+                                             service, saslGlobalParams.authenticationMechanisms));
     }};
 }  // namespace
 

@@ -36,7 +36,7 @@
 #include "mongo/db/logical_clock.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/s/client/shard_registry.h"
-#include "mongo/util/fail_point_service.h"
+#include "mongo/util/fail_point.h"
 
 namespace mongo {
 
@@ -76,12 +76,12 @@ KeyGenerator::KeyGenerator(std::string purpose,
 
 Status KeyGenerator::generateNewKeysIfNeeded(OperationContext* opCtx) {
 
-    if (MONGO_FAIL_POINT(disableKeyGeneration)) {
+    if (MONGO_unlikely(disableKeyGeneration.shouldFail())) {
         return {ErrorCodes::FailPointEnabled, "key generation disabled"};
     }
 
     auto currentTime = LogicalClock::get(opCtx)->getClusterTime();
-    auto keyStatus = _client->getNewKeys(opCtx, _purpose, currentTime);
+    auto keyStatus = _client->getNewKeys(opCtx, _purpose, currentTime, false);
 
     if (!keyStatus.isOK()) {
         return keyStatus.getStatus();

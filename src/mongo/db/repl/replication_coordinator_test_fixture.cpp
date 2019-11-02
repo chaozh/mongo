@@ -33,6 +33,9 @@
 
 #include "mongo/db/repl/replication_coordinator_test_fixture.h"
 
+#include <functional>
+#include <memory>
+
 #include "mongo/db/logical_clock.h"
 #include "mongo/db/operation_context_noop.h"
 #include "mongo/db/repl/is_master_response.h"
@@ -40,7 +43,6 @@
 #include "mongo/db/repl/repl_settings.h"
 #include "mongo/db/repl/replication_consistency_markers_mock.h"
 #include "mongo/db/repl/replication_coordinator_external_state_mock.h"
-#include "mongo/db/repl/replication_coordinator_impl.h"
 #include "mongo/db/repl/replication_process.h"
 #include "mongo/db/repl/replication_recovery_mock.h"
 #include "mongo/db/repl/storage_interface_mock.h"
@@ -50,10 +52,8 @@
 #include "mongo/executor/network_interface_mock.h"
 #include "mongo/executor/thread_pool_mock.h"
 #include "mongo/executor/thread_pool_task_executor.h"
-#include "mongo/stdx/functional.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/unittest/unittest.h"
-#include "mongo/util/fail_point_service.h"
+#include "mongo/util/fail_point.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
@@ -86,9 +86,9 @@ ReplCoordTest::ReplCoordTest() {
 }
 
 ReplCoordTest::~ReplCoordTest() {
-    getGlobalFailPointRegistry()
-        ->getFailPoint("blockHeartbeatReconfigFinish")
-        ->setMode(FailPoint::off);
+    logger::globalLogDomain()->clearMinimumLoggedSeverity(
+        logger::LogComponent::kReplicationElection);
+    globalFailPointRegistry().find("blockHeartbeatReconfigFinish")->setMode(FailPoint::off);
 
     if (_callShutdown) {
         auto opCtx = makeOperationContext();
@@ -122,43 +122,43 @@ void ReplCoordTest::init() {
     StorageInterface::set(service, std::unique_ptr<StorageInterface>(_storageInterface));
     ASSERT_TRUE(_storageInterface == StorageInterface::get(service));
 
-    ReplicationProcess::set(service,
-                            stdx::make_unique<ReplicationProcess>(
-                                _storageInterface,
-                                stdx::make_unique<ReplicationConsistencyMarkersMock>(),
-                                stdx::make_unique<ReplicationRecoveryMock>()));
+    ReplicationProcess::set(
+        service,
+        std::make_unique<ReplicationProcess>(_storageInterface,
+                                             std::make_unique<ReplicationConsistencyMarkersMock>(),
+                                             std::make_unique<ReplicationRecoveryMock>()));
     auto replicationProcess = ReplicationProcess::get(service);
 
     // PRNG seed for tests.
     const int64_t seed = 0;
 
-    auto logicalClock = stdx::make_unique<LogicalClock>(service);
+    auto logicalClock = std::make_unique<LogicalClock>(service);
     LogicalClock::set(service, std::move(logicalClock));
 
     TopologyCoordinator::Options settings;
-    auto topo = stdx::make_unique<TopologyCoordinator>(settings);
+    auto topo = std::make_unique<TopologyCoordinator>(settings);
     _topo = topo.get();
-    auto net = stdx::make_unique<NetworkInterfaceMock>();
+    auto net = std::make_unique<NetworkInterfaceMock>();
     _net = net.get();
-    auto externalState = stdx::make_unique<ReplicationCoordinatorExternalStateMock>();
+    auto externalState = std::make_unique<ReplicationCoordinatorExternalStateMock>();
     _externalState = externalState.get();
     executor::ThreadPoolMock::Options tpOptions;
     tpOptions.onCreateThread = []() { Client::initThread("replexec"); };
-    auto pool = stdx::make_unique<executor::ThreadPoolMock>(_net, seed, tpOptions);
+    auto pool = std::make_unique<executor::ThreadPoolMock>(_net, seed, tpOptions);
     auto replExec =
-        stdx::make_unique<executor::ThreadPoolTaskExecutor>(std::move(pool), std::move(net));
+        std::make_unique<executor::ThreadPoolTaskExecutor>(std::move(pool), std::move(net));
     _replExec = replExec.get();
-    _repl = stdx::make_unique<ReplicationCoordinatorImpl>(service,
-                                                          _settings,
-                                                          std::move(externalState),
-                                                          std::move(replExec),
-                                                          std::move(topo),
-                                                          replicationProcess,
-                                                          _storageInterface,
-                                                          seed);
-    service->setFastClockSource(stdx::make_unique<executor::NetworkInterfaceMockClockSource>(_net));
+    _repl = std::make_unique<ReplicationCoordinatorImpl>(service,
+                                                         _settings,
+                                                         std::move(externalState),
+                                                         std::move(replExec),
+                                                         std::move(topo),
+                                                         replicationProcess,
+                                                         _storageInterface,
+                                                         seed);
+    service->setFastClockSource(std::make_unique<executor::NetworkInterfaceMockClockSource>(_net));
     service->setPreciseClockSource(
-        stdx::make_unique<executor::NetworkInterfaceMockClockSource>(_net));
+        std::make_unique<executor::NetworkInterfaceMockClockSource>(_net));
 }
 
 void ReplCoordTest::init(const ReplSettings& settings) {
@@ -172,6 +172,10 @@ void ReplCoordTest::init(const std::string& replSet) {
 }
 
 void ReplCoordTest::start() {
+    // Skip reconstructing prepared transactions at the end of startup because ReplCoordTest doesn't
+    // construct ServiceEntryPoint and this causes a segmentation fault when
+    // reconstructPreparedTransactions uses DBDirectClient to call into ServiceEntryPoint.
+    FailPointEnableBlock skipReconstructPreparedTransactions("skipReconstructPreparedTransactions");
     invariant(!_callShutdown);
     // if we haven't initialized yet, do that first.
     if (!_repl) {
@@ -232,8 +236,10 @@ void ReplCoordTest::simulateEnoughHeartbeatsForAllNodesUp() {
             hbResp.setSetName(rsConfig.getReplSetName());
             hbResp.setState(MemberState::RS_SECONDARY);
             hbResp.setConfigVersion(rsConfig.getConfigVersion());
-            hbResp.setAppliedOpTime(OpTime(Timestamp(100, 2), 0));
-            hbResp.setDurableOpTime(OpTime(Timestamp(100, 2), 0));
+            hbResp.setAppliedOpTimeAndWallTime(
+                {OpTime(Timestamp(100, 2), 0), Date_t() + Seconds(100)});
+            hbResp.setDurableOpTimeAndWallTime(
+                {OpTime(Timestamp(100, 2), 0), Date_t() + Seconds(100)});
             BSONObjBuilder respObj;
             net->scheduleResponse(noi, net->now(), makeResponseStatus(hbResp.toBSON()));
         } else {
@@ -247,7 +253,7 @@ void ReplCoordTest::simulateEnoughHeartbeatsForAllNodesUp() {
 }
 
 void ReplCoordTest::simulateSuccessfulDryRun(
-    stdx::function<void(const RemoteCommandRequest& request)> onDryRunRequest) {
+    std::function<void(const RemoteCommandRequest& request)> onDryRunRequest) {
     ReplicationCoordinatorImpl* replCoord = getReplCoord();
     ReplSetConfig rsConfig = replCoord->getReplicaSetConfig_forTest();
     NetworkInterfaceMock* net = getNet();
@@ -271,14 +277,13 @@ void ReplCoordTest::simulateSuccessfulDryRun(
         if (request.cmdObj.firstElement().fieldNameStringData() == "replSetRequestVotes") {
             ASSERT_TRUE(request.cmdObj.getBoolField("dryRun"));
             onDryRunRequest(request);
-            net->scheduleResponse(noi,
-                                  net->now(),
-                                  makeResponseStatus(BSON("ok" << 1 << "reason"
-                                                               << ""
-                                                               << "term"
-                                                               << request.cmdObj["term"].Long()
-                                                               << "voteGranted"
-                                                               << true)));
+            net->scheduleResponse(
+                noi,
+                net->now(),
+                makeResponseStatus(BSON("ok" << 1 << "reason"
+                                             << ""
+                                             << "term" << request.cmdObj["term"].Long()
+                                             << "voteGranted" << true)));
             voteRequests++;
         } else if (consumeHeartbeatV1(noi)) {
             // The heartbeat has been consumed.
@@ -329,25 +334,24 @@ void ReplCoordTest::simulateSuccessfulV1ElectionWithoutExitingDrainMode(Date_t e
         log() << request.target.toString() << " processing " << request.cmdObj;
         ReplSetHeartbeatArgsV1 hbArgs;
         Status status = hbArgs.initialize(request.cmdObj);
-        if (hbArgs.initialize(request.cmdObj).isOK()) {
+        if (status.isOK()) {
             ReplSetHeartbeatResponse hbResp;
             hbResp.setSetName(rsConfig.getReplSetName());
             hbResp.setState(MemberState::RS_SECONDARY);
             // The smallest valid optime in PV1.
             OpTime opTime(Timestamp(), 0);
-            hbResp.setAppliedOpTime(opTime);
-            hbResp.setDurableOpTime(opTime);
+            hbResp.setAppliedOpTimeAndWallTime({opTime, Date_t() + Seconds(opTime.getSecs())});
+            hbResp.setDurableOpTimeAndWallTime({opTime, Date_t() + Seconds(opTime.getSecs())});
             hbResp.setConfigVersion(rsConfig.getConfigVersion());
             net->scheduleResponse(noi, net->now(), makeResponseStatus(hbResp.toBSON()));
         } else if (request.cmdObj.firstElement().fieldNameStringData() == "replSetRequestVotes") {
-            net->scheduleResponse(noi,
-                                  net->now(),
-                                  makeResponseStatus(BSON("ok" << 1 << "reason"
-                                                               << ""
-                                                               << "term"
-                                                               << request.cmdObj["term"].Long()
-                                                               << "voteGranted"
-                                                               << true)));
+            net->scheduleResponse(
+                noi,
+                net->now(),
+                makeResponseStatus(BSON("ok" << 1 << "reason"
+                                             << ""
+                                             << "term" << request.cmdObj["term"].Long()
+                                             << "voteGranted" << true)));
         } else {
             error() << "Black holing unexpected request to " << request.target << ": "
                     << request.cmdObj;
@@ -361,10 +365,11 @@ void ReplCoordTest::simulateSuccessfulV1ElectionWithoutExitingDrainMode(Date_t e
     ASSERT(replCoord->getMemberState().primary()) << replCoord->getMemberState().toString();
 
     IsMasterResponse imResponse;
-    replCoord->fillIsMasterForReplSet(&imResponse);
+    replCoord->fillIsMasterForReplSet(&imResponse, {});
     ASSERT_FALSE(imResponse.isMaster()) << imResponse.toBSON().toString();
     ASSERT_TRUE(imResponse.isSecondary()) << imResponse.toBSON().toString();
 }
+
 void ReplCoordTest::simulateSuccessfulV1ElectionAt(Date_t electionTime) {
     simulateSuccessfulV1ElectionWithoutExitingDrainMode(electionTime);
     ReplicationCoordinatorImpl* replCoord = getReplCoord();
@@ -375,7 +380,7 @@ void ReplCoordTest::simulateSuccessfulV1ElectionAt(Date_t electionTime) {
     }
     ASSERT(replCoord->getApplierState() == ReplicationCoordinator::ApplierState::Stopped);
     IsMasterResponse imResponse;
-    replCoord->fillIsMasterForReplSet(&imResponse);
+    replCoord->fillIsMasterForReplSet(&imResponse, {});
     ASSERT_TRUE(imResponse.isMaster()) << imResponse.toBSON().toString();
     ASSERT_FALSE(imResponse.isSecondary()) << imResponse.toBSON().toString();
 
@@ -383,13 +388,16 @@ void ReplCoordTest::simulateSuccessfulV1ElectionAt(Date_t electionTime) {
 }
 
 void ReplCoordTest::signalDrainComplete(OperationContext* opCtx) {
+    // Writes that occur in code paths that call signalDrainComplete are expected to be excluded
+    // from Flow Control.
+    opCtx->setShouldParticipateInFlowControl(false);
     getExternalState()->setFirstOpTimeOfMyTerm(OpTime(Timestamp(1, 1), getReplCoord()->getTerm()));
     getReplCoord()->signalDrainComplete(opCtx, getReplCoord()->getTerm());
 }
 
 void ReplCoordTest::runSingleNodeElection(OperationContext* opCtx) {
-    getReplCoord()->setMyLastAppliedOpTime(OpTime(Timestamp(1, 1), 0));
-    getReplCoord()->setMyLastDurableOpTime(OpTime(Timestamp(1, 1), 0));
+    replCoordSetMyLastAppliedOpTime(OpTime(Timestamp(1, 1), 0), Date_t() + Seconds(1));
+    replCoordSetMyLastDurableOpTime(OpTime(Timestamp(1, 1), 0), Date_t() + Seconds(1));
     ASSERT_OK(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
     getReplCoord()->waitForElectionFinish_forTest();
 
@@ -429,8 +437,8 @@ bool ReplCoordTest::consumeHeartbeatV1(const NetworkInterfaceMock::NetworkOperat
     hbResp.setSetName(rsConfig.getReplSetName());
     hbResp.setState(MemberState::RS_SECONDARY);
     hbResp.setConfigVersion(rsConfig.getConfigVersion());
-    hbResp.setAppliedOpTime(lastApplied);
-    hbResp.setDurableOpTime(lastApplied);
+    hbResp.setAppliedOpTimeAndWallTime({lastApplied, Date_t() + Seconds(lastApplied.getSecs())});
+    hbResp.setDurableOpTimeAndWallTime({lastApplied, Date_t() + Seconds(lastApplied.getSecs())});
     BSONObjBuilder respObj;
     net->scheduleResponse(noi, net->now(), makeResponseStatus(hbResp.toBSON()));
     return true;

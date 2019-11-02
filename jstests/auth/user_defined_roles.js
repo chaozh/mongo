@@ -57,7 +57,7 @@ function runTest(conn) {
     testUserAdmin.grantPrivilegesToRole(
         'testRole1', [{resource: {db: 'test', collection: 'foo'}, actions: ['insert']}]);
 
-    assert.writeOK(testDB.foo.insert({a: 1}));
+    assert.commandWorked(testDB.foo.insert({a: 1}));
     assert.eq(1, testDB.foo.findOne().a);
     assert.eq(1, testDB.foo.count());
     assert.eq(1, testDB.foo.find().itcount());
@@ -69,9 +69,9 @@ function runTest(conn) {
 
     adminUserAdmin.grantPrivilegesToRole(
         'adminRole', [{resource: {db: '', collection: 'foo'}, actions: ['update']}]);
-    assert.writeOK(testDB.foo.update({a: 1}, {$inc: {a: 1}}));
+    assert.commandWorked(testDB.foo.update({a: 1}, {$inc: {a: 1}}));
     assert.eq(2, testDB.foo.findOne().a);
-    assert.writeOK(testDB.foo.update({b: 1}, {$inc: {b: 1}}, true));  // upsert
+    assert.commandWorked(testDB.foo.update({b: 1}, {$inc: {b: 1}}, true));  // upsert
     assert.eq(2, testDB.foo.count());
     assert.eq(2, testDB.foo.findOne({b: {$exists: true}}).b);
     hasAuthzError(testDB.foo.remove({b: 2}));
@@ -79,7 +79,7 @@ function runTest(conn) {
 
     adminUserAdmin.grantPrivilegesToRole(
         'adminRole', [{resource: {db: '', collection: ''}, actions: ['remove']}]);
-    assert.writeOK(testDB.foo.remove({b: 2}));
+    assert.commandWorked(testDB.foo.remove({b: 2}));
     assert.eq(1, testDB.foo.count());
 
     // Test revoking privileges
@@ -87,7 +87,7 @@ function runTest(conn) {
         'testRole1', [{resource: {db: 'test', collection: 'foo'}, actions: ['insert']}]);
     hasAuthzError(testDB.foo.insert({a: 1}));
     assert.eq(1, testDB.foo.count());
-    assert.writeOK(testDB.foo.update({a: 2}, {$inc: {a: 1}}));
+    assert.commandWorked(testDB.foo.update({a: 2}, {$inc: {a: 1}}));
     assert.eq(3, testDB.foo.findOne({a: {$exists: true}}).a);
     hasAuthzError(testDB.foo.update({c: 1}, {$inc: {c: 1}}, true));  // upsert should fail
     assert.eq(1, testDB.foo.count());
@@ -100,10 +100,9 @@ function runTest(conn) {
         testDB.updateUser('testUser', {customData: {zipCode: 10036}});
     });
     assert.eq(null, testDB.getUser('testUser').customData);
-    testUserAdmin.grantPrivilegesToRole('testRole1',
-                                        [{
-                                           resource: {db: 'test', collection: ''},
-                                           actions: ['changeOwnPassword', 'changeOwnCustomData']
+    testUserAdmin.grantPrivilegesToRole('testRole1', [{
+                                            resource: {db: 'test', collection: ''},
+                                            actions: ['changeOwnPassword', 'changeOwnCustomData']
                                         }]);
     testDB.changeUserPassword('testUser', 'password');
     assert(!testDB.auth('testUser', 'pwd'));
@@ -146,8 +145,6 @@ runTest(conn);
 MongoRunner.stopMongod(conn);
 
 jsTest.log('Test sharding');
-// TODO: Remove 'shardAsReplicaSet: false' when SERVER-32672 is fixed.
-var st = new ShardingTest(
-    {shards: 2, config: 3, keyFile: 'jstests/libs/key1', other: {shardAsReplicaSet: false}});
+var st = new ShardingTest({shards: 2, config: 3, keyFile: 'jstests/libs/key1'});
 runTest(st.s);
 st.stop();

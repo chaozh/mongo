@@ -16,7 +16,6 @@ load('jstests/concurrency/fsm_libs/extend_workload.js');           // for extend
 load('jstests/concurrency/fsm_workloads/invalidated_cursors.js');  // for $config
 
 var $config = extendWorkload($config, function($config, $super) {
-
     /**
      * Runs the specified aggregation pipeline and stores the resulting cursor (if the command
      * is successful) in 'this.cursor'.
@@ -119,7 +118,10 @@ var $config = extendWorkload($config, function($config, $super) {
 
         var pipeline = [{
             $facet: {
-                lookup: this.makeLookupPipeline(lookupForeignCollName),
+                // The lookup pipeline computes a Cartesian product of the input collection, which
+                // can occasionally create $facet documents large enough to OOM crash the test. The
+                // $limit keeps it in check.
+                lookup: this.makeLookupPipeline(lookupForeignCollName).concat({$limit: 50}),
                 graphLookup: this.makeGraphLookupPipeline(graphLookupForeignCollName)
             }
         }];

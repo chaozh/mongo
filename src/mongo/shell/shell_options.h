@@ -80,6 +80,9 @@ struct ShellGlobalParams {
 
     int jsHeapLimitMB = 0;
     bool nokillop = false;
+    Seconds idleSessionTimeout = Seconds{0};
+
+    bool logV2 = false;
 };
 
 extern ShellGlobalParams shellGlobalParams;
@@ -97,4 +100,4 @@ bool handlePreValidationMongoShellOptions(const moe::Environment& params,
 Status storeMongoShellOptions(const moe::Environment& params, const std::vector<std::string>& args);
 
 void redactPasswordOptions(int argc, char** argv);
-}
+}  // namespace mongo

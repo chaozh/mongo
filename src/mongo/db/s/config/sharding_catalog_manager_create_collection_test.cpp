@@ -129,7 +129,7 @@ protected:
         testPrimaryShard.setName("primary");
         testPrimaryShard.setHost("b:20");
 
-        uassertStatusOK(setupShards({extraShard, testPrimaryShard}));
+        setupShards({extraShard, testPrimaryShard});
 
         // Prime the shard registry with information about the existing shards
         shardRegistry()->reload(operationContext());
@@ -178,7 +178,7 @@ TEST_F(CreateCollectionTest, BaseCase) {
     auto uuid = UUID::gen();
     auto options = fromjson("{ capped: true, size: 256 }");
     expectListCollection(primaryHost, testNS.db().toString(), options, uuid);
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 }  // namespace

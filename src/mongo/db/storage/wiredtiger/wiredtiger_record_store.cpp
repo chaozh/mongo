@@ -33,7 +33,11 @@
 
 #include "mongo/platform/basic.h"
 
+#include <fmt/format.h>
+
 #include "mongo/db/storage/wiredtiger/wiredtiger_record_store.h"
+
+#include <memory>
 
 #include "mongo/base/checked_cast.h"
 #include "mongo/base/static_assert.h"
@@ -48,6 +52,7 @@
 #include "mongo/db/server_recovery.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/oplog_hack.h"
+#include "mongo/db/storage/wiredtiger/oplog_stone_parameters_gen.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_customization_hooks.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_global_options.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_kv_engine.h"
@@ -56,20 +61,20 @@
 #include "mongo/db/storage/wiredtiger/wiredtiger_recovery_unit.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_session_cache.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_util.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/concurrency/idle_thread_block.h"
 #include "mongo/util/fail_point.h"
 #include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
 #include "mongo/util/scopeguard.h"
+#include "mongo/util/str.h"
 #include "mongo/util/time_support.h"
 #include "mongo/util/timer.h"
 
 namespace mongo {
 
-using std::unique_ptr;
+using namespace fmt::literals;
 using std::string;
+using std::unique_ptr;
 
 namespace {
 
@@ -143,7 +148,7 @@ public:
         _oplogStones->_currentRecords.store(0);
         _oplogStones->_currentBytes.store(0);
 
-        stdx::lock_guard<stdx::mutex> lk(_oplogStones->_mutex);
+        stdx::lock_guard<Latch> lk(_oplogStones->_mutex);
         _oplogStones->_stones.clear();
     }
 
@@ -155,16 +160,22 @@ private:
 
 WiredTigerRecordStore::OplogStones::OplogStones(OperationContext* opCtx, WiredTigerRecordStore* rs)
     : _rs(rs) {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
 
     invariant(rs->isCapped());
     invariant(rs->cappedMaxSize() > 0);
     unsigned long long maxSize = rs->cappedMaxSize();
 
-    const unsigned long long kMinStonesToKeep = 10ULL;
-    const unsigned long long kMaxStonesToKeep = 100ULL;
+    // The minimum oplog stone size should be BSONObjMaxInternalSize.
+    const unsigned int oplogStoneSize =
+        std::max(gOplogStoneSizeMB * 1024 * 1024, BSONObjMaxInternalSize);
 
-    unsigned long long numStones = maxSize / BSONObjMaxInternalSize;
+    // IDL does not support unsigned long long types.
+    const unsigned long long kMinStonesToKeep = static_cast<unsigned long long>(gMinOplogStones);
+    const unsigned long long kMaxStonesToKeep =
+        static_cast<unsigned long long>(gMaxOplogStonesDuringStartup);
+
+    unsigned long long numStones = maxSize / oplogStoneSize;
     size_t numStonesToKeep = std::min(kMaxStonesToKeep, std::max(kMinStonesToKeep, numStones));
     _minBytesPerStone = maxSize / numStonesToKeep;
     invariant(_minBytesPerStone > 0);
@@ -174,13 +185,13 @@ WiredTigerRecordStore::OplogStones::OplogStones(OperationContext* opCtx, WiredTi
 }
 
 bool WiredTigerRecordStore::OplogStones::isDead() {
-    stdx::lock_guard<stdx::mutex> lk(_oplogReclaimMutex);
+    stdx::lock_guard<Latch> lk(_oplogReclaimMutex);
     return _isDead;
 }
 
 void WiredTigerRecordStore::OplogStones::kill() {
     {
-        stdx::lock_guard<stdx::mutex> lk(_oplogReclaimMutex);
+        stdx::lock_guard<Latch> lk(_oplogReclaimMutex);
         _isDead = true;
     }
     _oplogReclaimCv.notify_one();
@@ -188,11 +199,11 @@ void WiredTigerRecordStore::OplogStones::kill() {
 
 void WiredTigerRecordStore::OplogStones::awaitHasExcessStonesOrDead() {
     // Wait until kill() is called or there are too many oplog stones.
-    stdx::unique_lock<stdx::mutex> lock(_oplogReclaimMutex);
+    stdx::unique_lock<Latch> lock(_oplogReclaimMutex);
     while (!_isDead) {
         {
             MONGO_IDLE_THREAD_BLOCK;
-            stdx::lock_guard<stdx::mutex> lk(_mutex);
+            stdx::lock_guard<Latch> lk(_mutex);
             if (hasExcessStones_inlock()) {
                 // There are now excess oplog stones. However, there it may be necessary to keep
                 // additional oplog.
@@ -215,7 +226,7 @@ void WiredTigerRecordStore::OplogStones::awaitHasExcessStonesOrDead() {
 
 boost::optional<WiredTigerRecordStore::OplogStones::Stone>
 WiredTigerRecordStore::OplogStones::peekOldestStoneIfNeeded() const {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
 
     if (!hasExcessStones_inlock()) {
         return {};
@@ -225,12 +236,12 @@ WiredTigerRecordStore::OplogStones::peekOldestStoneIfNeeded() const {
 }
 
 void WiredTigerRecordStore::OplogStones::popOldestStone() {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     _stones.pop_front();
 }
 
 void WiredTigerRecordStore::OplogStones::createNewStoneIfNeeded(RecordId lastRecord) {
-    stdx::unique_lock<stdx::mutex> lk(_mutex, stdx::try_to_lock);
+    stdx::unique_lock<Latch> lk(_mutex, stdx::try_to_lock);
     if (!lk) {
         // Someone else is either already creating a new stone or popping the oldest one. In the
         // latter case, we let the next insert trigger the new stone's creation.
@@ -262,16 +273,16 @@ void WiredTigerRecordStore::OplogStones::updateCurrentStoneAfterInsertOnCommit(
     RecordId highestInserted,
     int64_t countInserted) {
     opCtx->recoveryUnit()->registerChange(
-        new InsertChange(this, bytesInserted, highestInserted, countInserted));
+        std::make_unique<InsertChange>(this, bytesInserted, highestInserted, countInserted));
 }
 
 void WiredTigerRecordStore::OplogStones::clearStonesOnCommit(OperationContext* opCtx) {
-    opCtx->recoveryUnit()->registerChange(new TruncateChange(this));
+    opCtx->recoveryUnit()->registerChange(std::make_unique<TruncateChange>(this));
 }
 
 void WiredTigerRecordStore::OplogStones::updateStonesAfterCappedTruncateAfter(
     int64_t recordsRemoved, int64_t bytesRemoved, RecordId firstRemovedId) {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
 
     int64_t numStonesToRemove = 0;
     int64_t recordsInStonesToRemove = 0;
@@ -301,7 +312,7 @@ void WiredTigerRecordStore::OplogStones::updateStonesAfterCappedTruncateAfter(
 void WiredTigerRecordStore::OplogStones::setMinBytesPerStone(int64_t size) {
     invariant(size > 0);
 
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
 
     // Only allow changing the minimum bytes per stone if no data has been inserted.
     invariant(_stones.size() == 0 && _currentRecords.load() == 0);
@@ -310,6 +321,12 @@ void WiredTigerRecordStore::OplogStones::setMinBytesPerStone(int64_t size) {
 
 void WiredTigerRecordStore::OplogStones::_calculateStones(OperationContext* opCtx,
                                                           size_t numStonesToKeep) {
+    const std::uint64_t startWaitTime = curTimeMicros64();
+    ON_BLOCK_EXIT([&] {
+        auto waitTime = curTimeMicros64() - startWaitTime;
+        log() << "WiredTiger record store oplog processing took " << waitTime / 1000 << "ms";
+        _totalTimeProcessing.fetchAndAdd(waitTime);
+    });
     long long numRecords = _rs->numRecords(opCtx);
     long long dataSize = _rs->dataSize(opCtx);
 
@@ -339,6 +356,7 @@ void WiredTigerRecordStore::OplogStones::_calculateStones(OperationContext* opCt
 }
 
 void WiredTigerRecordStore::OplogStones::_calculateStonesByScanning(OperationContext* opCtx) {
+    _processBySampling.store(false);  // process by scanning
     log() << "Scanning the oplog to determine where to place markers for truncation";
 
     long long numRecords = 0;
@@ -366,6 +384,8 @@ void WiredTigerRecordStore::OplogStones::_calculateStonesByScanning(OperationCon
 void WiredTigerRecordStore::OplogStones::_calculateStonesBySampling(OperationContext* opCtx,
                                                                     int64_t estRecordsPerStone,
                                                                     int64_t estBytesPerStone) {
+    log() << "Sampling the oplog to determine where to place markers for truncation";
+    _processBySampling.store(true);  // process by sampling
     Timestamp earliestOpTime;
     Timestamp latestOpTime;
 
@@ -453,11 +473,17 @@ void WiredTigerRecordStore::OplogStones::_pokeReclaimThreadIfNeeded() {
 }
 
 void WiredTigerRecordStore::OplogStones::adjust(int64_t maxSize) {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
-    const unsigned long long kMinStonesToKeep = 10ULL;
-    const unsigned long long kMaxStonesToKeep = 100ULL;
+    stdx::lock_guard<Latch> lk(_mutex);
 
-    unsigned long long numStones = maxSize / BSONObjMaxInternalSize;
+    const unsigned int oplogStoneSize =
+        std::max(gOplogStoneSizeMB * 1024 * 1024, BSONObjMaxInternalSize);
+
+    // IDL does not support unsigned long long types.
+    const unsigned long long kMinStonesToKeep = static_cast<unsigned long long>(gMinOplogStones);
+    const unsigned long long kMaxStonesToKeep =
+        static_cast<unsigned long long>(gMaxOplogStonesAfterStartup);
+
+    unsigned long long numStones = maxSize / oplogStoneSize;
     size_t numStonesToKeep = std::min(kMaxStonesToKeep, std::max(kMinStonesToKeep, numStones));
     _minBytesPerStone = maxSize / numStonesToKeep;
     invariant(_minBytesPerStone > 0);
@@ -477,8 +503,7 @@ StatusWith<std::string> WiredTigerRecordStore::parseOptionsField(const BSONObj o
             // Return error on first unrecognized field.
             return StatusWith<std::string>(ErrorCodes::InvalidOptions,
                                            str::stream() << '\'' << elem.fieldNameStringData()
-                                                         << '\''
-                                                         << " is not a supported option.");
+                                                         << '\'' << " is not a supported option.");
         }
     }
     return StatusWith<std::string>(ss.str());
@@ -514,7 +539,7 @@ public:
     }
 
     void save() final {
-        if (_cursor && !wt_keeptxnopen()) {
+        if (_cursor) {
             try {
                 _cursor->reset(_cursor);
             } catch (const WriteConflictException&) {
@@ -641,6 +666,11 @@ WiredTigerRecordStore::WiredTigerRecordStore(WiredTigerKVEngine* kvEngine,
       _engineName(params.engineName),
       _isCapped(params.isCapped),
       _isEphemeral(params.isEphemeral),
+      _isLogged(!isTemp() &&
+                WiredTigerUtil::useTableLogging(
+                    NamespaceString(ns()),
+                    getGlobalReplSettings().usingReplSets() ||
+                        repl::ReplSettings::shouldRecoverFromOplogAsStandalone())),
       _isOplog(NamespaceString::oplog(params.ns)),
       _cappedMaxSize(params.cappedMaxSize),
       _cappedMaxSizeSlack(std::min(params.cappedMaxSize / 10, int64_t(16 * 1024 * 1024))),
@@ -651,6 +681,7 @@ WiredTigerRecordStore::WiredTigerRecordStore(WiredTigerKVEngine* kvEngine,
       _shuttingDown(false),
       _cappedDeleteCheckCount(0),
       _sizeStorer(params.sizeStorer),
+      _tracksSizeAdjustments(params.tracksSizeAdjustments),
       _kvEngine(kvEngine) {
     invariant(_ident.size() > 0);
 
@@ -675,11 +706,8 @@ WiredTigerRecordStore::WiredTigerRecordStore(WiredTigerKVEngine* kvEngine,
         invariant(_cappedMaxDocs == -1);
     }
 
-    if (!params.isReadOnly && !isTemp()) {
-        bool replicatedWrites = getGlobalReplSettings().usingReplSets() ||
-            repl::ReplSettings::shouldRecoverFromOplogAsStandalone();
-        uassertStatusOK(WiredTigerUtil::setTableLogging(
-            ctx, _uri, WiredTigerUtil::useTableLogging(NamespaceString(ns()), replicatedWrites)));
+    if (!params.isReadOnly) {
+        uassertStatusOK(WiredTigerUtil::setTableLogging(ctx, _uri, _isLogged));
     }
 
     if (_isOplog) {
@@ -689,11 +717,18 @@ WiredTigerRecordStore::WiredTigerRecordStore(WiredTigerKVEngine* kvEngine,
         sizeRecoveryState(getGlobalServiceContext())
             .markCollectionAsAlwaysNeedsSizeAdjustment(_ident);
     }
+
+    // If no SizeStorer is in use, start counting at zero. In practice, this will only ever be the
+    // the case for temporary RecordStores (those not associated with any collection) and in unit
+    // tests. Persistent size information is not required in either case. If a RecordStore needs
+    // persistent size information, we require it to use a SizeStorer.
+    _sizeInfo = _sizeStorer ? _sizeStorer->load(_uri)
+                            : std::make_shared<WiredTigerSizeStorer::SizeInfo>(0, 0);
 }
 
 WiredTigerRecordStore::~WiredTigerRecordStore() {
     {
-        stdx::lock_guard<stdx::mutex> lk(_cappedCallbackMutex);
+        stdx::lock_guard<Latch> lk(_cappedCallbackMutex);
         _shuttingDown = true;
     }
 
@@ -713,29 +748,9 @@ WiredTigerRecordStore::~WiredTigerRecordStore() {
     }
 }
 
-void WiredTigerRecordStore::postConstructorInit(OperationContext* opCtx) {
-    // Find the largest RecordId currently in use and estimate the number of records.
-    std::unique_ptr<SeekableRecordCursor> cursor = getCursor(opCtx, /*forward=*/false);
-    _sizeInfo =
-        _sizeStorer ? _sizeStorer->load(_uri) : std::make_shared<WiredTigerSizeStorer::SizeInfo>();
-
-    if (auto record = cursor->next()) {
-        int64_t max = record->id.repr();
-        _nextIdNum.store(1 + max);
-
-        if (!_sizeStorer) {
-            LOG(1) << "Doing scan of collection " << ns() << " to get size and count info";
-
-            int64_t numRecords = 0;
-            int64_t dataSize = 0;
-            do {
-                numRecords++;
-                dataSize += record->data.size();
-            } while ((record = cursor->next()));
-            _sizeInfo->numRecords.store(numRecords);
-            _sizeInfo->dataSize.store(dataSize);
-        }
-    } else {
+void WiredTigerRecordStore::checkSize(OperationContext* opCtx) {
+    std::unique_ptr<SeekableRecordCursor> cursor = getCursor(opCtx, /*forward=*/true);
+    if (!cursor->next()) {
         // We found no records in this collection; however, there may actually be documents present
         // if writes to this collection were not included in the stable checkpoint the last time
         // this node shut down. We set the data size and the record count to zero, but will adjust
@@ -754,15 +769,15 @@ void WiredTigerRecordStore::postConstructorInit(OperationContext* opCtx) {
             .markCollectionAsAlwaysNeedsSizeAdjustment(_ident);
         _sizeInfo->dataSize.store(0);
         _sizeInfo->numRecords.store(0);
-
-        // Need to start at 1 so we are always higher than RecordId::min()
-        _nextIdNum.store(1);
     }
 
     if (_sizeStorer)
         _sizeStorer->store(_uri, _sizeInfo);
+}
 
-    if (WiredTigerKVEngine::initRsOplogBackgroundThread(ns())) {
+void WiredTigerRecordStore::postConstructorInit(OperationContext* opCtx) {
+    if (NamespaceString::oplog(ns()) &&
+        !(storageGlobalParams.repair || storageGlobalParams.readOnly)) {
         _oplogStones = std::make_shared<OplogStones>(opCtx, this);
     }
 
@@ -772,12 +787,20 @@ void WiredTigerRecordStore::postConstructorInit(OperationContext* opCtx) {
     }
 }
 
+void WiredTigerRecordStore::getOplogTruncateStats(BSONObjBuilder& builder) const {
+    if (_oplogStones) {
+        _oplogStones->getOplogStonesStats(builder);
+    }
+    builder.append("totalTimeTruncatingMicros", _totalTimeTruncating.load());
+    builder.append("truncateCount", _truncateCount.load());
+}
+
 const char* WiredTigerRecordStore::name() const {
     return _engineName.c_str();
 }
 
 bool WiredTigerRecordStore::inShutdown() const {
-    stdx::lock_guard<stdx::mutex> lk(_cappedCallbackMutex);
+    stdx::lock_guard<Latch> lk(_cappedCallbackMutex);
     return _shuttingDown;
 }
 
@@ -812,11 +835,10 @@ int64_t WiredTigerRecordStore::storageSize(OperationContext* opCtx,
         return dataSize(opCtx);
     }
     WiredTigerSession* session = WiredTigerRecoveryUnit::get(opCtx)->getSessionNoTxn();
-    StatusWith<int64_t> result =
-        WiredTigerUtil::getStatisticsValueAs<int64_t>(session->getSession(),
-                                                      "statistics:" + getURI(),
-                                                      "statistics=(size)",
-                                                      WT_STAT_DSRC_BLOCK_SIZE);
+    auto result = WiredTigerUtil::getStatisticsValue(session->getSession(),
+                                                     "statistics:" + getURI(),
+                                                     "statistics=(size)",
+                                                     WT_STAT_DSRC_BLOCK_SIZE);
     uassertStatusOK(result.getStatus());
 
     int64_t size = result.getValue();
@@ -896,6 +918,10 @@ bool WiredTigerRecordStore::cappedAndNeedDelete() const {
 
 int64_t WiredTigerRecordStore::_cappedDeleteAsNeeded(OperationContext* opCtx,
                                                      const RecordId& justInserted) {
+    if (!_tracksSizeAdjustments) {
+        return 0;
+    }
+
     // If the collection does not need size adjustment, then we are in replication recovery and
     // replaying operations we've already played. This may occur after rollback or after a shutdown.
     // Any inserts beyond the stable timestamp have been undone, but any documents deleted from
@@ -965,10 +991,10 @@ void WiredTigerRecordStore::_positionAtFirstRecordId(OperationContext* opCtx,
                                                      WT_CURSOR* cursor,
                                                      const RecordId& firstRecordId,
                                                      bool forTruncate) const {
-    // Use the previous first RecordId, if available, to navigate to the current first
-    // RecordId. The straightforward algorithm of resetting the cursor and advancing to the first
-    // element will be slow for capped collections since there may be many tombstones to traverse
-    // at the beginning of the table.
+    // Use the previous first RecordId, if available, to navigate to the current first RecordId. The
+    // straightforward algorithm of resetting the cursor and advancing to the first element will be
+    // slow for capped collections since there may be many tombstones to traverse at the beginning
+    // of the table.
     if (!firstRecordId.isNull()) {
         setKey(cursor, firstRecordId);
         // Truncate does not require its cursor to be explicitly positioned.
@@ -1050,7 +1076,7 @@ int64_t WiredTigerRecordStore::_cappedDeleteAsNeeded_inlock(OperationContext* op
             ++docsRemoved;
             sizeSaved += old_value.size;
 
-            stdx::lock_guard<stdx::mutex> cappedCallbackLock(_cappedCallbackMutex);
+            stdx::lock_guard<Latch> cappedCallbackLock(_cappedCallbackMutex);
             if (_shuttingDown)
                 break;
 
@@ -1225,7 +1251,11 @@ void WiredTigerRecordStore::reclaimOplog(OperationContext* opCtx, Timestamp mayT
     LOG(1) << "Finished truncating the oplog, it now contains approximately "
            << _sizeInfo->numRecords.load() << " records totaling to " << _sizeInfo->dataSize.load()
            << " bytes";
-    log() << "WiredTiger record store oplog truncation finished in: " << timer.millis() << "ms";
+    auto elapsedMicros = timer.micros();
+    auto elapsedMillis = elapsedMicros / 1000;
+    _totalTimeTruncating.fetchAndAdd(elapsedMicros);
+    _truncateCount.fetchAndAdd(1);
+    log() << "WiredTiger record store oplog truncation finished in: " << elapsedMillis << "ms";
 }
 
 Status WiredTigerRecordStore::insertRecords(OperationContext* opCtx,
@@ -1265,10 +1295,8 @@ Status WiredTigerRecordStore::_insertRecords(OperationContext* opCtx,
             if (!status.isOK())
                 return status.getStatus();
             record.id = status.getValue();
-        } else if (_isCapped) {
-            record.id = _nextId();
         } else {
-            record.id = _nextId();
+            record.id = _nextId(opCtx);
         }
         dassert(record.id > highestId);
         highestId = record.id;
@@ -1322,58 +1350,34 @@ bool WiredTigerRecordStore::isOpHidden_forTest(const RecordId& id) const {
 }
 
 bool WiredTigerRecordStore::haveCappedWaiters() {
-    stdx::lock_guard<stdx::mutex> cappedCallbackLock(_cappedCallbackMutex);
+    stdx::lock_guard<Latch> cappedCallbackLock(_cappedCallbackMutex);
     return _cappedCallback && _cappedCallback->haveCappedWaiters();
 }
 
 void WiredTigerRecordStore::notifyCappedWaitersIfNeeded() {
-    stdx::lock_guard<stdx::mutex> cappedCallbackLock(_cappedCallbackMutex);
+    stdx::lock_guard<Latch> cappedCallbackLock(_cappedCallbackMutex);
     // This wakes up cursors blocking in await_data.
     if (_cappedCallback) {
         _cappedCallback->notifyCappedWaitersIfNeeded();
     }
 }
 
-Status WiredTigerRecordStore::insertRecordsWithDocWriter(OperationContext* opCtx,
-                                                         const DocWriter* const* docs,
-                                                         const Timestamp* timestamps,
-                                                         size_t nDocs,
-                                                         RecordId* idsOut) {
-    dassert(opCtx->lockState()->isReadLocked());
+StatusWith<Timestamp> WiredTigerRecordStore::getLatestOplogTimestamp(
+    OperationContext* opCtx) const {
+    invariant(_isOplog);
+    invariant(opCtx->lockState()->isReadLocked());
 
-    std::unique_ptr<Record[]> records(new Record[nDocs]);
+    WiredTigerSessionCache* cache = WiredTigerRecoveryUnit::get(opCtx)->getSessionCache();
+    auto sessRaii = cache->getSession();
+    WT_SESSION* sess = sessRaii->getSession();
+    WT_CURSOR* cursor;
+    invariantWTOK(sess->open_cursor(sess, _uri.c_str(), nullptr, nullptr, &cursor));
+    invariantWTOK(cursor->prev(cursor));
 
-    // First get all the sizes so we can allocate a single buffer for all documents. Eventually it
-    // would be nice if we could either hand off the buffers to WT without copying or write them
-    // in-place as we do with MMAPv1, but for now this is the best we can do.
-    size_t totalSize = 0;
-    for (size_t i = 0; i < nDocs; i++) {
-        const size_t docSize = docs[i]->documentSize();
-        records[i].data = RecordData(nullptr, docSize);  // We fill in the real ptr in next loop.
-        totalSize += docSize;
-    }
+    RecordId recordId = getKey(cursor);
+    invariantWTOK(sess->reset(sess));
 
-    std::unique_ptr<char[]> buffer(new char[totalSize]);
-    char* pos = buffer.get();
-    for (size_t i = 0; i < nDocs; i++) {
-        docs[i]->writeDocument(pos);
-        const size_t size = records[i].data.size();
-        records[i].data = RecordData(pos, size);
-        pos += size;
-    }
-    invariant(pos == (buffer.get() + totalSize));
-
-    Status s = _insertRecords(opCtx, records.get(), timestamps, nDocs);
-    if (!s.isOK())
-        return s;
-
-    if (idsOut) {
-        for (size_t i = 0; i < nDocs; i++) {
-            idsOut[i] = records[i].id;
-        }
-    }
-
-    return s;
+    return {Timestamp(static_cast<unsigned long long>(recordId.repr()))};
 }
 
 Status WiredTigerRecordStore::updateRecord(OperationContext* opCtx,
@@ -1401,8 +1405,40 @@ Status WiredTigerRecordStore::updateRecord(OperationContext* opCtx,
     }
 
     WiredTigerItem value(data, len);
-    c->set_value(c, value.Get());
-    ret = WT_OP_CHECK(c->insert(c));
+
+    // Check if we should modify rather than doing a full update.  Look for deltas for documents
+    // larger than 1KB, up to 16 changes representing up to 10% of the data.
+    //
+    // Skip modify for logged tables: don't trust WiredTiger's recovery with operations that are not
+    // idempotent.
+    const int kMinLengthForDiff = 1024;
+    const int kMaxEntries = 16;
+    const int kMaxDiffBytes = len / 10;
+
+    bool skip_update = false;
+    if (!_isLogged && len > kMinLengthForDiff && len <= old_length + kMaxDiffBytes) {
+        int nentries = kMaxEntries;
+        std::vector<WT_MODIFY> entries(nentries);
+
+        if ((ret = wiredtiger_calc_modify(
+                 c->session, &old_value, value.Get(), kMaxDiffBytes, entries.data(), &nentries)) ==
+            0) {
+            invariantWTOK(WT_OP_CHECK(nentries == 0 ? c->reserve(c)
+                                                    : c->modify(c, entries.data(), nentries)));
+            WT_ITEM new_value;
+            dassert(nentries == 0 ||
+                    (c->get_value(c, &new_value) == 0 && new_value.size == value.size &&
+                     memcmp(data, new_value.data, len) == 0));
+            skip_update = true;
+        } else if (ret != WT_NOTFOUND) {
+            invariantWTOK(ret);
+        }
+    }
+
+    if (!skip_update) {
+        c->set_value(c, value.Get());
+        ret = WT_OP_CHECK(c->insert(c));
+    }
     invariantWTOK(ret);
 
     _increaseDataSize(opCtx, len - old_length);
@@ -1470,7 +1506,7 @@ Status WiredTigerRecordStore::truncate(OperationContext* opCtx) {
     invariantWTOK(ret);
 
     WT_SESSION* session = WiredTigerRecoveryUnit::get(opCtx)->getSession()->getSession();
-    invariantWTOK(WT_OP_CHECK(session->truncate(session, NULL, start, NULL, NULL)));
+    invariantWTOK(WT_OP_CHECK(session->truncate(session, nullptr, start, nullptr, nullptr)));
     _changeNumRecords(opCtx, -numRecords(opCtx));
     _increaseDataSize(opCtx, -dataSize(opCtx));
 
@@ -1488,6 +1524,9 @@ Status WiredTigerRecordStore::compact(OperationContext* opCtx) {
     if (!cache->isEphemeral()) {
         WT_SESSION* s = WiredTigerRecoveryUnit::get(opCtx)->getSession()->getSession();
         opCtx->recoveryUnit()->abandonSnapshot();
+        // WT compact prompts WT to take checkpoints, so we need to take the checkpoint lock around
+        // WT compact calls.
+        auto checkpointLock = _kvEngine->getCheckpointLock(opCtx);
         int ret = s->compact(s, getURI().c_str(), "timeout=0");
         invariantWTOK(ret);
     }
@@ -1495,13 +1534,11 @@ Status WiredTigerRecordStore::compact(OperationContext* opCtx) {
 }
 
 void WiredTigerRecordStore::validate(OperationContext* opCtx,
-                                     ValidateCmdLevel level,
                                      ValidateResults* results,
                                      BSONObjBuilder* output) {
     dassert(opCtx->lockState()->isReadLocked());
 
-    // Only full validate should verify table.
-    if (_isEphemeral || level != kValidateFull) {
+    if (_isEphemeral) {
         return;
     }
 
@@ -1554,7 +1591,7 @@ void WiredTigerRecordStore::appendCustomStats(OperationContext* opCtx,
 
     std::string type, sourceURI;
     WiredTigerUtil::fetchTypeAndSourceURI(opCtx, _uri, &type, &sourceURI);
-    StatusWith<std::string> metadataResult = WiredTigerUtil::getMetadata(opCtx, sourceURI);
+    StatusWith<std::string> metadataResult = WiredTigerUtil::getMetadataCreate(opCtx, sourceURI);
     StringData creationStringName("creationString");
     if (!metadataResult.isOK()) {
         BSONObjBuilder creationString(bob.subobjStart(creationStringName));
@@ -1574,14 +1611,6 @@ void WiredTigerRecordStore::appendCustomStats(OperationContext* opCtx,
         bob.append("code", static_cast<int>(status.code()));
         bob.append("reason", status.reason());
     }
-}
-
-Status WiredTigerRecordStore::touch(OperationContext* opCtx, BSONObjBuilder* output) const {
-    if (_isEphemeral) {
-        // Everything is already in memory.
-        return Status::OK();
-    }
-    return Status(ErrorCodes::CommandNotSupported, "this storage engine does not support touch");
 }
 
 void WiredTigerRecordStore::waitForAllEarlierOplogWritesToBeVisible(OperationContext* opCtx) const {
@@ -1642,8 +1671,35 @@ void WiredTigerRecordStore::updateStatsAfterRepair(OperationContext* opCtx,
         _sizeStorer->store(_uri, _sizeInfo);
 }
 
-RecordId WiredTigerRecordStore::_nextId() {
+void WiredTigerRecordStore::_initNextIdIfNeeded(OperationContext* opCtx) {
+    // In the normal case, this will already be initialized, so use a weak load. Since this value
+    // will only change from 0 to a positive integer, the only risk is reading an outdated value, 0,
+    // and having to take the mutex.
+    if (_nextIdNum.loadRelaxed() > 0) {
+        return;
+    }
+
+    // Only one thread needs to do this.
+    stdx::lock_guard<Latch> lk(_initNextIdMutex);
+    if (_nextIdNum.load() > 0) {
+        return;
+    }
+
+    // Need to start at 1 so we are always higher than RecordId::min()
+    int64_t nextId = 1;
+
+    // Find the largest RecordId currently in use.
+    std::unique_ptr<SeekableRecordCursor> cursor = getCursor(opCtx, /*forward=*/false);
+    if (auto record = cursor->next()) {
+        nextId = record->id.repr() + 1;
+    }
+
+    _nextIdNum.store(nextId);
+}
+
+RecordId WiredTigerRecordStore::_nextId(OperationContext* opCtx) {
     invariant(!_isOplog);
+    _initNextIdIfNeeded(opCtx);
     RecordId out = RecordId(_nextIdNum.fetchAndAdd(1));
     invariant(out.isNormal());
     return out;
@@ -1658,7 +1714,7 @@ public:
     NumRecordsChange(WiredTigerRecordStore* rs, int64_t diff) : _rs(rs), _diff(diff) {}
     virtual void commit(boost::optional<Timestamp>) {}
     virtual void rollback() {
-        LOG(3) << "WiredTigerRecordStore: rolling back NumRecordsChange" << -_diff;
+        LOG(3) << "WiredTigerRecordStore: rolling back NumRecordsChange " << -_diff;
         _rs->_sizeInfo->numRecords.fetchAndAdd(-_diff);
     }
 
@@ -1668,11 +1724,15 @@ private:
 };
 
 void WiredTigerRecordStore::_changeNumRecords(OperationContext* opCtx, int64_t diff) {
+    if (!_tracksSizeAdjustments) {
+        return;
+    }
+
     if (!sizeRecoveryState(getGlobalServiceContext()).collectionNeedsSizeAdjustment(_ident)) {
         return;
     }
 
-    opCtx->recoveryUnit()->registerChange(new NumRecordsChange(this, diff));
+    opCtx->recoveryUnit()->registerChange(std::make_unique<NumRecordsChange>(this, diff));
     if (_sizeInfo->numRecords.fetchAndAdd(diff) < 0)
         _sizeInfo->numRecords.store(std::max(diff, int64_t(0)));
 }
@@ -1682,7 +1742,7 @@ public:
     DataSizeChange(WiredTigerRecordStore* rs, int64_t amount) : _rs(rs), _amount(amount) {}
     virtual void commit(boost::optional<Timestamp>) {}
     virtual void rollback() {
-        _rs->_increaseDataSize(NULL, -_amount);
+        _rs->_increaseDataSize(nullptr, -_amount);
     }
 
 private:
@@ -1691,12 +1751,16 @@ private:
 };
 
 void WiredTigerRecordStore::_increaseDataSize(OperationContext* opCtx, int64_t amount) {
+    if (!_tracksSizeAdjustments) {
+        return;
+    }
+
     if (!sizeRecoveryState(getGlobalServiceContext()).collectionNeedsSizeAdjustment(_ident)) {
         return;
     }
 
     if (opCtx)
-        opCtx->recoveryUnit()->registerChange(new DataSizeChange(this, amount));
+        opCtx->recoveryUnit()->registerChange(std::make_unique<DataSizeChange>(this, amount));
 
     if (_sizeInfo->dataSize.fetchAndAdd(amount) < 0)
         _sizeInfo->dataSize.store(std::max(amount, int64_t(0)));
@@ -1737,7 +1801,7 @@ void WiredTigerRecordStore::cappedTruncateAfter(OperationContext* opCtx,
 
     // Compute the number and associated sizes of the records to delete.
     {
-        stdx::lock_guard<stdx::mutex> cappedCallbackLock(_cappedCallbackMutex);
+        stdx::lock_guard<Latch> cappedCallbackLock(_cappedCallbackMutex);
         do {
             if (_cappedCallback) {
                 uassertStatusOK(
@@ -1778,22 +1842,9 @@ void WiredTigerRecordStore::cappedTruncateAfter(OperationContext* opCtx,
             const bool force = true;
             _kvEngine->setOldestTimestamp(truncTs, force);
         } else {
-            char commitTSConfigString["commit_timestamp="_sd.size() +
-                                      (8 * 2) /* 8 hexadecimal characters */ +
-                                      1 /* trailing null */];
-            auto size = std::snprintf(commitTSConfigString,
-                                      sizeof(commitTSConfigString),
-                                      "commit_timestamp=%llx",
-                                      truncTs.asULL());
-            if (size < 0) {
-                int e = errno;
-                error() << "error snprintf " << errnoWithDescription(e);
-                fassertFailedNoTrace(40662);
-            }
-
-            invariant(static_cast<std::size_t>(size) < sizeof(commitTSConfigString));
             auto conn = WiredTigerRecoveryUnit::get(opCtx)->getSessionCache()->conn();
-            invariantWTOK(conn->set_timestamp(conn, commitTSConfigString));
+            auto commitTSConfigString = "commit_timestamp={:x}"_format(truncTs.asULL());
+            invariantWTOK(conn->set_timestamp(conn, commitTSConfigString.c_str()));
         }
 
         _kvEngine->getOplogManager()->setOplogReadTimestamp(truncTs);
@@ -1835,6 +1886,7 @@ WiredTigerRecordStoreCursorBase::WiredTigerRecordStoreCursorBase(OperationContex
 }
 
 boost::optional<Record> WiredTigerRecordStoreCursorBase::next() {
+    invariant(_hasRestored);
     if (_eof)
         return {};
 
@@ -1872,6 +1924,10 @@ boost::optional<Record> WiredTigerRecordStoreCursorBase::next() {
         log() << "WTCursor::next -- c->next_key ( " << id
               << ") was not greater than _lastReturnedId (" << _lastReturnedId
               << ") which is a bug.";
+
+        // Crash when test commands are enabled.
+        invariant(!getTestCommandsEnabled());
+
         // Force a retry of the operation from our last known position by acting as-if
         // we received a WT_ROLLBACK error.
         throw WriteConflictException();
@@ -1885,6 +1941,7 @@ boost::optional<Record> WiredTigerRecordStoreCursorBase::next() {
 }
 
 boost::optional<Record> WiredTigerRecordStoreCursorBase::seekExact(const RecordId& id) {
+    invariant(_hasRestored);
     if (_oplogVisibleTs && id.repr() > *_oplogVisibleTs) {
         _eof = true;
         return {};
@@ -1916,6 +1973,7 @@ void WiredTigerRecordStoreCursorBase::save() {
         if (_cursor)
             _cursor->reset();
         _oplogVisibleTs = boost::none;
+        _hasRestored = false;
     } catch (const WriteConflictException&) {
         // Ignore since this is only called when we are about to kill our transaction
         // anyway.
@@ -1940,6 +1998,7 @@ bool WiredTigerRecordStoreCursorBase::restore() {
     // This will ensure an active session exists, so any restored cursors will bind to it
     invariant(WiredTigerRecoveryUnit::get(_opCtx)->getSession() == _cursor->getSession());
     _skipNextAdvance = false;
+    _hasRestored = true;
 
     // If we've hit EOF, then this iterator is done and need not be restored.
     if (_eof)
@@ -2025,16 +2084,17 @@ std::unique_ptr<SeekableRecordCursor> StandardWiredTigerRecordStore::getCursor(
         // If we already have a snapshot we don't know what it can see, unless we know no one
         // else could be writing (because we hold an exclusive lock).
         invariant(!wru->inActiveTxn() ||
-                  opCtx->lockState()->isCollectionLockedForMode(NamespaceString(_ns), MODE_X));
+                  opCtx->lockState()->isCollectionLockedForMode(NamespaceString(_ns), MODE_X) ||
+                  wru->getIsOplogReader());
         wru->setIsOplogReader();
     }
 
-    return stdx::make_unique<WiredTigerRecordStoreStandardCursor>(opCtx, *this, forward);
+    return std::make_unique<WiredTigerRecordStoreStandardCursor>(opCtx, *this, forward);
 }
 
 std::unique_ptr<RecordCursor> StandardWiredTigerRecordStore::getRandomCursorWithOptions(
     OperationContext* opCtx, StringData extraConfig) const {
-    return stdx::make_unique<RandomCursor>(opCtx, *this, extraConfig);
+    return std::make_unique<RandomCursor>(opCtx, *this, extraConfig);
 }
 
 WiredTigerRecordStoreStandardCursor::WiredTigerRecordStoreStandardCursor(
@@ -2076,11 +2136,12 @@ std::unique_ptr<SeekableRecordCursor> PrefixedWiredTigerRecordStore::getCursor(
         // If we already have a snapshot we don't know what it can see, unless we know no one
         // else could be writing (because we hold an exclusive lock).
         invariant(!wru->inActiveTxn() ||
-                  opCtx->lockState()->isCollectionLockedForMode(NamespaceString(_ns), MODE_X));
+                  opCtx->lockState()->isCollectionLockedForMode(NamespaceString(_ns), MODE_X) ||
+                  wru->getIsOplogReader());
         wru->setIsOplogReader();
     }
 
-    return stdx::make_unique<WiredTigerRecordStorePrefixedCursor>(opCtx, *this, _prefix, forward);
+    return std::make_unique<WiredTigerRecordStorePrefixedCursor>(opCtx, *this, _prefix, forward);
 }
 
 std::unique_ptr<RecordCursor> PrefixedWiredTigerRecordStore::getRandomCursorWithOptions(

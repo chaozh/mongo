@@ -1,6 +1,6 @@
 Name: mongodb-enterprise-unstable
 Prefix: /usr
-Conflicts: mongo-10gen, mongo-10gen-enterprise, mongo-10gen-enterprise-server, mongo-10gen-server, mongo-10gen-unstable, mongo-10gen-unstable-enterprise, mongo-10gen-unstable-enterprise-mongos, mongo-10gen-unstable-enterprise-server, mongo-10gen-unstable-enterprise-shell, mongo-10gen-unstable-enterprise-tools, mongo-10gen-unstable-mongos, mongo-10gen-unstable-server, mongo-10gen-unstable-shell, mongo-10gen-unstable-tools, mongo18-10gen, mongo18-10gen-server, mongo20-10gen, mongo20-10gen-server, mongodb, mongodb-server, mongodb-dev, mongodb-clients, mongodb-10gen, mongodb-10gen-enterprise, mongodb-10gen-unstable, mongodb-10gen-unstable-enterprise, mongodb-10gen-unstable-enterprise-mongos, mongodb-10gen-unstable-enterprise-server, mongodb-10gen-unstable-enterprise-shell, mongodb-10gen-unstable-enterprise-tools, mongodb-10gen-unstable-mongos, mongodb-10gen-unstable-server, mongodb-10gen-unstable-shell, mongodb-10gen-unstable-tools, mongodb-enterprise, mongodb-enterprise-mongos, mongodb-enterprise-server, mongodb-enterprise-shell, mongodb-enterprise-tools, mongodb-nightly, mongodb-org, mongodb-org-mongos, mongodb-org-server, mongodb-org-shell, mongodb-org-tools, mongodb-stable, mongodb18-10gen, mongodb20-10gen, mongodb-org-unstable, mongodb-org-unstable-mongos, mongodb-org-unstable-server, mongodb-org-unstable-shell, mongodb-org-unstable-tools
+Conflicts: mongo-10gen, mongo-10gen-enterprise, mongo-10gen-enterprise-server, mongo-10gen-server, mongo-10gen-unstable, mongo-10gen-unstable-enterprise, mongo-10gen-unstable-enterprise-mongos, mongo-10gen-unstable-enterprise-server, mongo-10gen-unstable-enterprise-shell, mongo-10gen-unstable-enterprise-tools, mongo-10gen-unstable-mongos, mongo-10gen-unstable-server, mongo-10gen-unstable-shell, mongo-10gen-unstable-tools, mongo18-10gen, mongo18-10gen-server, mongo20-10gen, mongo20-10gen-server, mongodb, mongodb-server, mongodb-dev, mongodb-clients, mongodb-10gen, mongodb-10gen-enterprise, mongodb-10gen-unstable, mongodb-10gen-unstable-enterprise, mongodb-10gen-unstable-enterprise-mongos, mongodb-10gen-unstable-enterprise-server, mongodb-10gen-unstable-enterprise-shell, mongodb-10gen-unstable-enterprise-tools, mongodb-10gen-unstable-mongos, mongodb-10gen-unstable-server, mongodb-10gen-unstable-shell, mongodb-10gen-unstable-tools, mongodb-enterprise, mongodb-enterprise-mongos, mongodb-enterprise-server, mongodb-enterprise-shell, mongodb-enterprise-tools, mongodb-enterprise-cryptd, mongodb-nightly, mongodb-org, mongodb-org-mongos, mongodb-org-server, mongodb-org-shell, mongodb-org-tools, mongodb-stable, mongodb18-10gen, mongodb20-10gen, mongodb-org-unstable, mongodb-org-unstable-mongos, mongodb-org-unstable-server, mongodb-org-unstable-shell, mongodb-org-unstable-tools
 Obsoletes: mongodb-enterprise-unstable,mongo-enterprise-unstable
 Version: %{dynamic_version}
 Release: %{dynamic_release}%{?dist}
@@ -8,15 +8,17 @@ Summary: MongoDB open source document-oriented database system (enterprise metap
 License: Commercial
 URL: http://www.mongodb.org
 Group: Applications/Databases
-Requires: mongodb-enterprise-unstable-server = %{version}, mongodb-enterprise-unstable-shell = %{version}, mongodb-enterprise-unstable-mongos = %{version}, mongodb-enterprise-unstable-tools = %{version}
+Requires: mongodb-enterprise-unstable-server = %{version}, mongodb-enterprise-unstable-shell = %{version}, mongodb-enterprise-unstable-mongos = %{version}, mongodb-enterprise-unstable-tools = %{version}, mongodb-enterprise-unstable-cryptd = %{version}
 
 Source0: %{name}-%{version}.tar.gz
 BuildRoot: %{_tmppath}/%{name}-%{version}-%{release}-root
 
 %if 0%{?suse_version}
 %define timezone_pkg timezone
+%define python_pkg python
 %else
 %define timezone_pkg tzdata
+%define python_pkg python2
 %endif
 
 %description
@@ -40,7 +42,7 @@ This metapackage will install the mongo shell, import/export tools, other client
 %package server
 Summary: MongoDB database server (enterprise)
 Group: Applications/Databases
-Requires: openssl, net-snmp, cyrus-sasl, cyrus-sasl-plain, cyrus-sasl-gssapi, %{timezone_pkg}
+Requires: openssl, net-snmp, cyrus-sasl, cyrus-sasl-plain, cyrus-sasl-gssapi, %{timezone_pkg}, %{python_pkg}
 Conflicts: mongo-10gen, mongo-10gen-enterprise, mongo-10gen-enterprise-server, mongo-10gen-server, mongo-10gen-unstable, mongo-10gen-unstable-enterprise, mongo-10gen-unstable-enterprise-mongos, mongo-10gen-unstable-enterprise-server, mongo-10gen-unstable-enterprise-shell, mongo-10gen-unstable-enterprise-tools, mongo-10gen-unstable-mongos, mongo-10gen-unstable-server, mongo-10gen-unstable-shell, mongo-10gen-unstable-tools, mongo18-10gen, mongo18-10gen-server, mongo20-10gen, mongo20-10gen-server, mongodb, mongodb-server, mongodb-dev, mongodb-clients, mongodb-10gen, mongodb-10gen-enterprise, mongodb-10gen-unstable, mongodb-10gen-unstable-enterprise, mongodb-10gen-unstable-enterprise-mongos, mongodb-10gen-unstable-enterprise-server, mongodb-10gen-unstable-enterprise-shell, mongodb-10gen-unstable-enterprise-tools, mongodb-10gen-unstable-mongos, mongodb-10gen-unstable-server, mongodb-10gen-unstable-shell, mongodb-10gen-unstable-tools, mongodb-enterprise, mongodb-enterprise-mongos, mongodb-enterprise-server, mongodb-enterprise-shell, mongodb-enterprise-tools, mongodb-nightly, mongodb-org, mongodb-org-mongos, mongodb-org-server, mongodb-org-shell, mongodb-org-tools, mongodb-stable, mongodb18-10gen, mongodb20-10gen, mongodb-org-unstable, mongodb-org-unstable-mongos, mongodb-org-unstable-server, mongodb-org-unstable-shell, mongodb-org-unstable-tools
 BuildRequires: systemd
 
@@ -134,6 +136,30 @@ MongoDB features:
 
 This package contains standard utilities for interacting with MongoDB.
 
+%package cryptd
+Summary: MongoDB Client Side Field Level Encryption Support Daemon (enterprise)
+Group: Applications/Databases
+Requires: openssl, cyrus-sasl
+Conflicts: mongodb-enterprise-cryptd
+
+%description cryptd
+MongoDB is built for scalability, performance and high availability, scaling from single server deployments to large, complex multi-site architectures. By leveraging in-memory computing, MongoDB provides high performance for both reads and writes. MongoDB’s native replication and automated failover enable enterprise-grade reliability and operational flexibility.
+
+MongoDB is an open-source database used by companies of all sizes, across all industries and for a wide variety of applications. It is an agile database that allows schemas to change quickly as applications evolve, while still providing the functionality developers expect from traditional databases, such as secondary indexes, a full query language and strict consistency.
+
+MongoDB has a rich client ecosystem including hadoop integration, officially supported drivers for 10 programming languages and environments, as well as 40 drivers supported by the user community.
+
+MongoDB features:
+* JSON Data Model with Dynamic Schemas
+* Auto-Sharding for Horizontal Scalability
+* Built-In Replication for High Availability
+* Rich Secondary Indexes, including geospatial
+* TTL indexes
+* Text Search
+* Aggregation Framework & Native MapReduce
+
+This package contains mongocryptd, the Client Side Field Level Encryption Support Daemon.
+
 %package devel
 Summary: Headers and libraries for MongoDB development.
 Group: Applications/Databases
@@ -218,7 +244,6 @@ fi
 %defattr(-,root,root,-)
 %config(noreplace) /etc/mongod.conf
 %{_bindir}/mongod
-%{_bindir}/mongocryptd
 %{_mandir}/man1/mongod.1*
 /lib/systemd/system/mongod.service
 %attr(0755,mongod,mongod) %dir /var/lib/mongo
@@ -248,11 +273,13 @@ fi
 %files tools
 %defattr(-,root,root,-)
 #%doc README
+%doc THIRD-PARTY-NOTICES.gotools
 
 %{_bindir}/bsondump
 %{_bindir}/install_compass
 %{_bindir}/mongodecrypt
 %{_bindir}/mongoldap
+%{_bindir}/mongokerberos
 %{_bindir}/mongodump
 %{_bindir}/mongoexport
 %{_bindir}/mongofiles
@@ -266,9 +293,15 @@ fi
 %{_mandir}/man1/mongoexport.1*
 %{_mandir}/man1/mongofiles.1*
 %{_mandir}/man1/mongoimport.1*
+%{_mandir}/man1/mongoldap.1*
+%{_mandir}/man1/mongoreplay.1*
 %{_mandir}/man1/mongorestore.1*
 %{_mandir}/man1/mongotop.1*
 %{_mandir}/man1/mongostat.1*
+
+%files cryptd
+%defattr(-,root,root,-)
+%{_bindir}/mongocryptd
 
 %changelog
 * Mon Oct 10 2016 Sam Kleinman <sam@mongodb.com>

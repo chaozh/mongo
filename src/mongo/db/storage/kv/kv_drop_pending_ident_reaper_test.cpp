@@ -34,7 +34,6 @@
 #include "mongo/db/concurrency/lock_state.h"
 #include "mongo/db/service_context_test_fixture.h"
 #include "mongo/db/storage/kv/kv_drop_pending_ident_reaper.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/unittest/death_test.h"
 #include "mongo/unittest/unittest.h"
 
@@ -72,9 +71,8 @@ public:
                                                 const CollectionOptions& options) override {
         return {};
     }
-    SortedDataInterface* getSortedDataInterface(OperationContext* opCtx,
-                                                StringData ident,
-                                                const IndexDescriptor* desc) override {
+    std::unique_ptr<SortedDataInterface> getSortedDataInterface(
+        OperationContext* opCtx, StringData ident, const IndexDescriptor* desc) override {
         return nullptr;
     }
     Status createRecordStore(OperationContext* opCtx,
@@ -88,6 +86,7 @@ public:
         return {};
     }
     Status createSortedDataInterface(OperationContext* opCtx,
+                                     const CollectionOptions& collOptions,
                                      StringData ident,
                                      const IndexDescriptor* desc) override {
         return Status::OK();
@@ -118,18 +117,22 @@ public:
     }
     void cleanShutdown() override {}
     void setJournalListener(JournalListener* jl) override {}
-    Timestamp getAllCommittedTimestamp() const override {
+    Timestamp getAllDurableTimestamp() const override {
         return {};
     }
     Timestamp getOldestOpenReadTimestamp() const override {
         return {};
     }
 
+    boost::optional<Timestamp> getOplogNeededForCrashRecovery() const override {
+        return boost::none;
+    }
+
     // List of idents removed using dropIdent().
     std::vector<std::string> droppedIdents;
 
     // Override to modify dropIdent() behavior.
-    using DropIdentFn = stdx::function<Status(OperationContext*, StringData)>;
+    using DropIdentFn = std::function<Status(OperationContext*, StringData)>;
     DropIdentFn dropIdentFn = [](OperationContext*, StringData) { return Status::OK(); };
 };
 
@@ -169,7 +172,7 @@ void KVDropPendingIdentReaperTest::setUp() {
     ServiceContextTest::setUp();
     auto service = getServiceContext();
     service->registerClientObserver(std::make_unique<ReaperTestClientObserver>());
-    _engineMock = stdx::make_unique<KVEngineMock>();
+    _engineMock = std::make_unique<KVEngineMock>();
 }
 void KVDropPendingIdentReaperTest::tearDown() {
     _engineMock = {};

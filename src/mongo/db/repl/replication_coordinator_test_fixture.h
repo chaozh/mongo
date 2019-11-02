@@ -34,6 +34,7 @@
 #include "mongo/db/client.h"
 #include "mongo/db/repl/repl_settings.h"
 #include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/repl/replication_coordinator_impl.h"
 #include "mongo/db/service_context_d_test_fixture.h"
 #include "mongo/executor/network_interface_mock.h"
 #include "mongo/executor/task_executor.h"
@@ -102,6 +103,49 @@ protected:
      */
     ReplicationCoordinatorImpl* getReplCoord() {
         return _repl.get();
+    }
+
+    void replCoordSetMyLastAppliedOpTime(const OpTime& opTime, Date_t wallTime = Date_t()) {
+        if (wallTime == Date_t()) {
+            wallTime = Date_t() + Seconds(opTime.getSecs());
+        }
+        getReplCoord()->setMyLastAppliedOpTimeAndWallTime({opTime, wallTime});
+    }
+
+    void replCoordSetMyLastAppliedOpTimeForward(const OpTime& opTime,
+                                                ReplicationCoordinator::DataConsistency consistency,
+                                                Date_t wallTime = Date_t()) {
+        if (wallTime == Date_t()) {
+            wallTime = Date_t() + Seconds(opTime.getSecs());
+        }
+        getReplCoord()->setMyLastAppliedOpTimeAndWallTimeForward({opTime, wallTime}, consistency);
+    }
+
+    void replCoordSetMyLastDurableOpTime(const OpTime& opTime, Date_t wallTime = Date_t()) {
+        if (wallTime == Date_t()) {
+            wallTime = Date_t() + Seconds(opTime.getSecs());
+        }
+        getReplCoord()->setMyLastDurableOpTimeAndWallTime({opTime, wallTime});
+    }
+
+    void replCoordSetMyLastDurableOpTimeForward(const OpTime& opTime, Date_t wallTime = Date_t()) {
+        if (wallTime == Date_t()) {
+            wallTime = Date_t() + Seconds(opTime.getSecs());
+        }
+        getReplCoord()->setMyLastDurableOpTimeAndWallTimeForward({opTime, wallTime});
+    }
+
+    void replCoordAdvanceCommitPoint(const OpTime& opTime,
+                                     Date_t wallTime = Date_t(),
+                                     bool fromSyncSource = false) {
+        if (wallTime == Date_t()) {
+            wallTime = Date_t() + Seconds(opTime.getSecs());
+        }
+        getReplCoord()->advanceCommitPoint({opTime, wallTime}, fromSyncSource);
+    }
+
+    void replCoordAdvanceCommitPoint(const OpTimeAndWallTime& opTime, bool fromSyncSource = false) {
+        getReplCoord()->advanceCommitPoint(opTime, fromSyncSource);
     }
 
     /**
@@ -189,7 +233,7 @@ protected:
      * Applicable to protocol version 1 only.
      */
     void simulateSuccessfulDryRun(
-        stdx::function<void(const executor::RemoteCommandRequest& request)> onDryRunRequest);
+        std::function<void(const executor::RemoteCommandRequest& request)> onDryRunRequest);
     void simulateSuccessfulDryRun();
 
     /**

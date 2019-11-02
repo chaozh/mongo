@@ -75,7 +75,7 @@ void TaskExecutorProxy::signalEvent(const EventHandle& event) {
 }
 
 StatusWith<executor::TaskExecutor::CallbackHandle> TaskExecutorProxy::onEvent(
-    const EventHandle& event, CallbackFn work) {
+    const EventHandle& event, CallbackFn&& work) {
     return _executor->onEvent(event, std::move(work));
 }
 
@@ -90,20 +90,20 @@ StatusWith<stdx::cv_status> TaskExecutorProxy::waitForEvent(OperationContext* op
 }
 
 StatusWith<executor::TaskExecutor::CallbackHandle> TaskExecutorProxy::scheduleWork(
-    CallbackFn work) {
+    CallbackFn&& work) {
     return _executor->scheduleWork(std::move(work));
 }
 
 StatusWith<executor::TaskExecutor::CallbackHandle> TaskExecutorProxy::scheduleWorkAt(
-    Date_t when, CallbackFn work) {
+    Date_t when, CallbackFn&& work) {
     return _executor->scheduleWorkAt(when, std::move(work));
 }
 
-StatusWith<executor::TaskExecutor::CallbackHandle> TaskExecutorProxy::scheduleRemoteCommand(
-    const executor::RemoteCommandRequest& request,
-    const RemoteCommandCallbackFn& cb,
+StatusWith<executor::TaskExecutor::CallbackHandle> TaskExecutorProxy::scheduleRemoteCommandOnAny(
+    const executor::RemoteCommandRequestOnAny& request,
+    const RemoteCommandOnAnyCallbackFn& cb,
     const BatonHandle& baton) {
-    return _executor->scheduleRemoteCommand(request, cb, baton);
+    return _executor->scheduleRemoteCommandOnAny(request, cb, baton);
 }
 
 void TaskExecutorProxy::cancel(const CallbackHandle& cbHandle) {

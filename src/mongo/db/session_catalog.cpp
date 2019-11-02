@@ -33,9 +33,9 @@
 
 #include "mongo/db/session_catalog.h"
 
-#include "mongo/db/operation_context.h"
+#include <memory>
+
 #include "mongo/db/service_context.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
@@ -49,7 +49,7 @@ const auto operationSessionDecoration =
 }  // namespace
 
 SessionCatalog::~SessionCatalog() {
-    stdx::lock_guard<stdx::mutex> lg(_mutex);
+    stdx::lock_guard<Latch> lg(_mutex);
     for (const auto& entry : _sessions) {
         ObservableSession session(lg, entry.second->session);
         invariant(!session.currentOperation());
@@ -58,7 +58,7 @@ SessionCatalog::~SessionCatalog() {
 }
 
 void SessionCatalog::reset_forTest() {
-    stdx::lock_guard<stdx::mutex> lg(_mutex);
+    stdx::lock_guard<Latch> lg(_mutex);
     _sessions.clear();
 }
 
@@ -79,17 +79,21 @@ SessionCatalog::ScopedCheckedOutSession SessionCatalog::_checkOutSession(Operati
     invariant(!opCtx->lockState()->inAWriteUnitOfWork());
     invariant(!opCtx->lockState()->isLocked());
 
-    stdx::unique_lock<stdx::mutex> ul(_mutex);
+    stdx::unique_lock<Latch> ul(_mutex);
     auto sri = _getOrCreateSessionRuntimeInfo(ul, opCtx, *opCtx->getLogicalSessionId());
 
     // Wait until the session is no longer checked out and until the previously scheduled kill has
     // completed
+    ++sri->numWaitingToCheckOut;
+    ON_BLOCK_EXIT([&] { --sri->numWaitingToCheckOut; });
+
     opCtx->waitForConditionOrInterrupt(sri->availableCondVar, ul, [&ul, &sri]() {
         ObservableSession osession(ul, sri->session);
         return !osession.currentOperation() && !osession._killed();
     });
 
     sri->session._checkoutOpCtx = opCtx;
+    sri->session._lastCheckout = Date_t::now();
 
     return ScopedCheckedOutSession(
         *this, std::move(sri), boost::none /* Not checked out for kill */);
@@ -102,35 +106,74 @@ SessionCatalog::SessionToKill SessionCatalog::checkOutSessionForKill(OperationCo
     invariant(!operationSessionDecoration(opCtx));
     invariant(!opCtx->getTxnNumber());
 
-    stdx::unique_lock<stdx::mutex> ul(_mutex);
+    stdx::unique_lock<Latch> ul(_mutex);
     auto sri = _getOrCreateSessionRuntimeInfo(ul, opCtx, killToken.lsidToKill);
     invariant(ObservableSession(ul, sri->session)._killed());
 
     // Wait until the session is no longer checked out
-    opCtx->waitForConditionOrInterrupt(sri->availableCondVar, ul, [&ul, &sri]() {
-        return !ObservableSession(ul, sri->session).currentOperation();
+    ++sri->numWaitingToCheckOut;
+    ON_BLOCK_EXIT([&] { --sri->numWaitingToCheckOut; });
+
+    opCtx->waitForConditionOrInterrupt(sri->availableCondVar, ul, [&ul, &sri] {
+        ObservableSession osession(ul, sri->session);
+        return !osession.currentOperation();
     });
 
     sri->session._checkoutOpCtx = opCtx;
+    sri->session._lastCheckout = Date_t::now();
 
     return SessionToKill(ScopedCheckedOutSession(*this, std::move(sri), std::move(killToken)));
 }
 
+void SessionCatalog::scanSession(const LogicalSessionId& lsid,
+                                 const ScanSessionsCallbackFn& workerFn) {
+    std::unique_ptr<SessionRuntimeInfo> sessionToReap;
+
+    {
+        stdx::lock_guard<Latch> lg(_mutex);
+        auto it = _sessions.find(lsid);
+        if (it != _sessions.end()) {
+            auto& sri = it->second;
+            ObservableSession osession(lg, sri->session);
+            workerFn(osession);
+
+            if (osession._markedForReap && !osession._killed() && !osession.currentOperation() &&
+                !sri->numWaitingToCheckOut) {
+                sessionToReap = std::move(sri);
+                _sessions.erase(it);
+            }
+        }
+    }
+}
+
 void SessionCatalog::scanSessions(const SessionKiller::Matcher& matcher,
                                   const ScanSessionsCallbackFn& workerFn) {
-    stdx::lock_guard<stdx::mutex> lg(_mutex);
+    std::vector<std::unique_ptr<SessionRuntimeInfo>> sessionsToReap;
 
-    LOG(2) << "Beginning scanSessions. Scanning " << _sessions.size() << " sessions.";
+    {
+        stdx::lock_guard<Latch> lg(_mutex);
 
-    for (auto& sessionEntry : _sessions) {
-        if (matcher.match(sessionEntry.first)) {
-            workerFn({lg, sessionEntry.second->session});
+        LOG(2) << "Beginning scanSessions. Scanning " << _sessions.size() << " sessions.";
+
+        for (auto it = _sessions.begin(); it != _sessions.end(); ++it) {
+            if (matcher.match(it->first)) {
+                auto& sri = it->second;
+                ObservableSession osession(lg, sri->session);
+
+                workerFn(osession);
+
+                if (osession._markedForReap && !osession._killed() &&
+                    !osession.currentOperation() && !sri->numWaitingToCheckOut) {
+                    sessionsToReap.emplace_back(std::move(sri));
+                    _sessions.erase(it++);
+                }
+            }
         }
     }
 }
 
 SessionCatalog::KillToken SessionCatalog::killSession(const LogicalSessionId& lsid) {
-    stdx::lock_guard<stdx::mutex> lg(_mutex);
+    stdx::lock_guard<Latch> lg(_mutex);
     auto it = _sessions.find(lsid);
     uassert(ErrorCodes::NoSuchSession, "Session not found", it != _sessions.end());
 
@@ -138,23 +181,28 @@ SessionCatalog::KillToken SessionCatalog::killSession(const LogicalSessionId& ls
     return ObservableSession(lg, sri->session).kill();
 }
 
-std::shared_ptr<SessionCatalog::SessionRuntimeInfo> SessionCatalog::_getOrCreateSessionRuntimeInfo(
+size_t SessionCatalog::size() const {
+    stdx::lock_guard<Latch> lg(_mutex);
+    return _sessions.size();
+}
+
+SessionCatalog::SessionRuntimeInfo* SessionCatalog::_getOrCreateSessionRuntimeInfo(
     WithLock, OperationContext* opCtx, const LogicalSessionId& lsid) {
     auto it = _sessions.find(lsid);
     if (it == _sessions.end()) {
-        it = _sessions.emplace(lsid, std::make_shared<SessionRuntimeInfo>(lsid)).first;
+        it = _sessions.emplace(lsid, std::make_unique<SessionRuntimeInfo>(lsid)).first;
     }
 
-    return it->second;
+    return it->second.get();
 }
 
-void SessionCatalog::_releaseSession(std::shared_ptr<SessionCatalog::SessionRuntimeInfo> sri,
-                                     boost::optional<SessionCatalog::KillToken> killToken) {
-    stdx::lock_guard<stdx::mutex> lg(_mutex);
+void SessionCatalog::_releaseSession(SessionRuntimeInfo* sri,
+                                     boost::optional<KillToken> killToken) {
+    stdx::lock_guard<Latch> lg(_mutex);
 
     // Make sure we have exactly the same session on the map and that it is still associated with an
     // operation context (meaning checked-out)
-    invariant(_sessions[sri->session.getSessionId()] == sri);
+    invariant(_sessions[sri->session.getSessionId()].get() == sri);
     invariant(sri->session._checkoutOpCtx);
     sri->session._checkoutOpCtx = nullptr;
     sri->availableCondVar.notify_all();
@@ -165,8 +213,8 @@ void SessionCatalog::_releaseSession(std::shared_ptr<SessionCatalog::SessionRunt
     }
 }
 
-OperationContext* ObservableSession::currentOperation() const {
-    return _session->_checkoutOpCtx;
+SessionCatalog::SessionRuntimeInfo::~SessionRuntimeInfo() {
+    invariant(!numWaitingToCheckOut);
 }
 
 SessionCatalog::KillToken ObservableSession::kill(ErrorCodes::Error reason) const {
@@ -184,6 +232,10 @@ SessionCatalog::KillToken ObservableSession::kill(ErrorCodes::Error reason) cons
     return SessionCatalog::KillToken(getSessionId());
 }
 
+void ObservableSession::markForReap() {
+    _markedForReap = true;
+}
+
 bool ObservableSession::_killed() const {
     return _session->_killsRequested > 0;
 }
@@ -198,6 +250,23 @@ OperationContextSession::OperationContextSession(OperationContext* opCtx) : _opC
     }
 
     checkOut(opCtx);
+}
+
+OperationContextSession::OperationContextSession(OperationContext* opCtx,
+                                                 SessionCatalog::KillToken killToken)
+    : _opCtx(opCtx) {
+    auto& checkedOutSession = operationSessionDecoration(opCtx);
+
+    invariant(!checkedOutSession);
+    invariant(!opCtx->getLogicalSessionId());  // lsid is specified by killToken argument.
+
+    const auto catalog = SessionCatalog::get(opCtx);
+    auto scopedSessionForKill = catalog->checkOutSessionForKill(opCtx, std::move(killToken));
+
+    // We acquire a Client lock here to guard the construction of this session so that references to
+    // this session are safe to use while the lock is held
+    stdx::lock_guard lk(*opCtx->getClient());
+    checkedOutSession.emplace(std::move(scopedSessionForKill._scos));
 }
 
 OperationContextSession::~OperationContextSession() {

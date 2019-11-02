@@ -29,20 +29,20 @@
 
 #pragma once
 
+#include <functional>
 #include <memory>
 #include <queue>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/executor/egress_tag_closer.h"
 #include "mongo/executor/egress_tag_closer_manager.h"
-#include "mongo/stdx/chrono.h"
-#include "mongo/stdx/functional.h"
-#include "mongo/stdx/mutex.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/stdx/unordered_map.h"
 #include "mongo/transport/session.h"
 #include "mongo/transport/transport_layer.h"
+#include "mongo/util/duration.h"
 #include "mongo/util/future.h"
 #include "mongo/util/net/hostandport.h"
+#include "mongo/util/out_of_line_executor.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
@@ -62,25 +62,31 @@ struct ConnectionPoolStats;
  * The overall workflow here is to manage separate pools for each unique
  * HostAndPort. See comments on the various Options for how the pool operates.
  */
-class ConnectionPool : public EgressTagCloser {
-    class SpecificPool;
+class ConnectionPool : public EgressTagCloser, public std::enable_shared_from_this<ConnectionPool> {
+    class LimitController;
 
 public:
+    class SpecificPool;
+
     class ConnectionInterface;
     class DependentTypeFactoryInterface;
     class TimerInterface;
+    class ControllerInterface;
 
-    using ConnectionHandleDeleter = stdx::function<void(ConnectionInterface* connection)>;
+    using ConnectionHandleDeleter = std::function<void(ConnectionInterface* connection)>;
     using ConnectionHandle = std::unique_ptr<ConnectionInterface, ConnectionHandleDeleter>;
 
-    using GetConnectionCallback = stdx::function<void(StatusWith<ConnectionHandle>)>;
+    using GetConnectionCallback = unique_function<void(StatusWith<ConnectionHandle>)>;
 
-    static constexpr Milliseconds kDefaultHostTimeout = Milliseconds(300000);  // 5mins
-    static const size_t kDefaultMaxConns;
-    static const size_t kDefaultMinConns;
-    static const size_t kDefaultMaxConnecting;
-    static constexpr Milliseconds kDefaultRefreshRequirement = Milliseconds(60000);  // 1min
-    static constexpr Milliseconds kDefaultRefreshTimeout = Milliseconds(20000);      // 20secs
+    using PoolId = uint64_t;
+
+    static constexpr size_t kDefaultMaxConns = std::numeric_limits<size_t>::max();
+    static constexpr size_t kDefaultMinConns = 1;
+    static constexpr size_t kDefaultMaxConnecting = 2;
+    static constexpr Milliseconds kDefaultHostTimeout = Minutes(5);
+    static constexpr Milliseconds kDefaultRefreshRequirement = Minutes(1);
+    static constexpr Milliseconds kDefaultRefreshTimeout = Seconds(20);
+    static constexpr Milliseconds kHostRetryTimeout = Seconds(1);
 
     static const Status kConnectionStateUnknown;
 
@@ -132,6 +138,85 @@ public:
          * The manager will hold this pool for the lifetime of the pool.
          */
         EgressTagCloserManager* egressTagCloserManager = nullptr;
+
+        /**
+         * Connections created through this connection pool will not attempt to authenticate.
+         */
+        bool skipAuthentication = false;
+
+        std::shared_ptr<ControllerInterface> controller;
+    };
+
+    /**
+     * A set of flags describing the health of a host pool
+     */
+    struct HostHealth {
+        /**
+         * The pool is expired and can be shutdown by updateController
+         *
+         * This flag is set to true when there have been no connection requests or in use
+         * connections for ControllerInterface::hostTimeout().
+         *
+         * This flag is set to false whenever a connection is requested.
+         */
+        bool isExpired = false;
+
+        /**
+         *  The pool has processed a failure and will not spawn new connections until requested
+         *
+         *  This flag is set to true by processFailure(), and thus also triggerShutdown().
+         *
+         *  This flag is set to false whenever a connection is requested.
+         *
+         *  As a further note, this prevents us from spamming a failed host with connection
+         *  attempts. If an external user believes a host should be available, they can request
+         *  again.
+         */
+        bool isFailed = false;
+
+        /**
+         * The pool is shutdown and will never be called by the ConnectionPool again.
+         *
+         * This flag is set to true by triggerShutdown() or updateController(). It is never unset.
+         */
+        bool isShutdown = false;
+    };
+
+    /**
+     * The state of connection pooling for a single host
+     *
+     * This should only be constructed by the SpecificPool.
+     */
+    struct HostState {
+        HostHealth health;
+        size_t requests = 0;
+        size_t pending = 0;
+        size_t ready = 0;
+        size_t active = 0;
+
+        std::string toString() const;
+    };
+
+    /**
+     * A simple set of controls to direct a single host
+     *
+     * This should only be constructed by a ControllerInterface
+     */
+    struct ConnectionControls {
+        size_t maxPendingConnections = kDefaultMaxConnecting;
+        size_t targetConnections = 0;
+
+        std::string toString() const;
+    };
+
+    /**
+     * A set of hosts and a flag canShutdown for if the group can shutdown
+     *
+     * This should only be constructed by a ControllerInterface
+     */
+    struct HostGroupState {
+        std::vector<HostAndPort> hosts;
+        bool canShutdown = false;
     };
 
     explicit ConnectionPool(std::shared_ptr<DependentTypeFactoryInterface> impl,
@@ -147,36 +232,31 @@ public:
     void dropConnections(transport::Session::TagMask tags) override;
 
     void mutateTags(const HostAndPort& hostAndPort,
-                    const stdx::function<transport::Session::TagMask(transport::Session::TagMask)>&
+                    const std::function<transport::Session::TagMask(transport::Session::TagMask)>&
                         mutateFunc) override;
 
-    Future<ConnectionHandle> get(const HostAndPort& hostAndPort,
-                                 transport::ConnectSSLMode sslMode,
-                                 Milliseconds timeout);
+    SemiFuture<ConnectionHandle> get(const HostAndPort& hostAndPort,
+                                     transport::ConnectSSLMode sslMode,
+                                     Milliseconds timeout);
     void get_forTest(const HostAndPort& hostAndPort,
                      Milliseconds timeout,
                      GetConnectionCallback cb);
-
-    boost::optional<ConnectionHandle> tryGet(const HostAndPort& hostAndPort,
-                                             transport::ConnectSSLMode sslMode);
 
     void appendConnectionStats(ConnectionPoolStats* stats) const;
 
     size_t getNumConnectionsPerHost(const HostAndPort& hostAndPort) const;
 
 private:
-    void returnConnection(ConnectionInterface* connection);
-
     std::string _name;
 
-    // Options are set at startup and never changed at run time, so these are
-    // accessed outside the lock
-    const Options _options;
-
     const std::shared_ptr<DependentTypeFactoryInterface> _factory;
+    Options _options;
+
+    std::shared_ptr<ControllerInterface> _controller;
 
     // The global mutex for specific pool access and the generation counter
-    mutable stdx::mutex _mutex;
+    mutable Mutex _mutex = MONGO_MAKE_LATCH("ConnectionPool::_mutex");
+    PoolId _nextPoolId = 0;
     stdx::unordered_map<HostAndPort, std::shared_ptr<SpecificPool>> _pools;
 
     EgressTagCloserManager* _manager;
@@ -188,12 +268,13 @@ private:
  * Minimal interface sets a timer with a callback and cancels the timer.
  */
 class ConnectionPool::TimerInterface {
-    MONGO_DISALLOW_COPYING(TimerInterface);
+    TimerInterface(const TimerInterface&) = delete;
+    TimerInterface& operator=(const TimerInterface&) = delete;
 
 public:
     TimerInterface() = default;
 
-    using TimeoutCallback = stdx::function<void()>;
+    using TimeoutCallback = std::function<void()>;
 
     virtual ~TimerInterface() = default;
 
@@ -222,7 +303,8 @@ public:
  * refresh them (issue some kind of ping) and manage a timer.
  */
 class ConnectionPool::ConnectionInterface : public TimerInterface {
-    MONGO_DISALLOW_COPYING(ConnectionInterface);
+    ConnectionInterface(const ConnectionInterface&) = delete;
+    ConnectionInterface& operator=(const ConnectionInterface&) = delete;
 
     friend class ConnectionPool;
 
@@ -292,8 +374,8 @@ protected:
      * Making these protected makes the definitions available to override in
      * children.
      */
-    using SetupCallback = stdx::function<void(ConnectionInterface*, Status)>;
-    using RefreshCallback = stdx::function<void(ConnectionInterface*, Status)>;
+    using SetupCallback = unique_function<void(ConnectionInterface*, Status)>;
+    using RefreshCallback = unique_function<void(ConnectionInterface*, Status)>;
 
     /**
      * Sets up the connection. This should include connection + auth + any
@@ -319,13 +401,82 @@ private:
 };
 
 /**
+ * An implementation of ControllerInterface directs the behavior of a SpecificPool
+ *
+ * Generally speaking, a Controller will be given HostState via updateState and then return Controls
+ * via getControls. A Controller is expected to not directly mutate its SpecificPool, including via
+ * its ConnectionPool pointer. A Controller is expected to be given to only one ConnectionPool.
+ */
+class ConnectionPool::ControllerInterface {
+public:
+    using SpecificPool = typename ConnectionPool::SpecificPool;
+    using HostState = typename ConnectionPool::HostState;
+    using ConnectionControls = typename ConnectionPool::ConnectionControls;
+    using HostGroupState = typename ConnectionPool::HostGroupState;
+    using PoolId = typename ConnectionPool::PoolId;
+
+    virtual ~ControllerInterface() = default;
+
+    /**
+     * Initialize this ControllerInterface using the given ConnectionPool
+     *
+     * ConnectionPools provide access to Executors and other DTF-provided objects.
+     */
+    virtual void init(ConnectionPool* parent);
+
+    /**
+     * Inform this Controller that a pool should be tracked
+     */
+    virtual void addHost(PoolId id, const HostAndPort& host) = 0;
+
+    /**
+     * Inform this Controller of a new State for a pool
+     *
+     * This function returns the state of the group of hosts to which this host belongs.
+     */
+    virtual HostGroupState updateHost(PoolId id, const HostState& stats) = 0;
+
+    /**
+     * Inform this Controller that a pool is no longer tracked
+     */
+    virtual void removeHost(PoolId id) = 0;
+
+    /**
+     * Get controls for the given pool
+     */
+    virtual ConnectionControls getControls(PoolId id) = 0;
+
+    /**
+     * Get the various timeouts that this controller suggests
+     */
+    virtual Milliseconds hostTimeout() const = 0;
+    virtual Milliseconds pendingTimeout() const = 0;
+    virtual Milliseconds toRefreshTimeout() const = 0;
+
+    /**
+     * Get the name for this controller
+     *
+     * This function is intended to provide increased visibility into which controller is in use
+     */
+    virtual StringData name() const = 0;
+
+    const ConnectionPool* getPool() const {
+        return _pool;
+    }
+
+protected:
+    ConnectionPool* _pool = nullptr;
+};
+
+/**
  * Implementation interface for the connection pool
  *
  * This factory provides generators for connections, timers and a clock for the
  * connection pool.
  */
 class ConnectionPool::DependentTypeFactoryInterface {
-    MONGO_DISALLOW_COPYING(DependentTypeFactoryInterface);
+    DependentTypeFactoryInterface(const DependentTypeFactoryInterface&) = delete;
+    DependentTypeFactoryInterface& operator=(const DependentTypeFactoryInterface&) = delete;
 
 public:
     DependentTypeFactoryInterface() = default;
@@ -338,6 +489,11 @@ public:
     virtual std::shared_ptr<ConnectionInterface> makeConnection(const HostAndPort& hostAndPort,
                                                                 transport::ConnectSSLMode sslMode,
                                                                 size_t generation) = 0;
+
+    /**
+     *  Return the executor for use with this factory
+     */
+    virtual const std::shared_ptr<OutOfLineExecutor>& getExecutor() = 0;
 
     /**
      * Makes a new timer

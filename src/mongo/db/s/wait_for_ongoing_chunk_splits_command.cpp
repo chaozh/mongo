@@ -39,7 +39,8 @@ namespace mongo {
 
 namespace {
 class WaitForOngoingChunksSplitsCommand final : public BasicCommand {
-    MONGO_DISALLOW_COPYING(WaitForOngoingChunksSplitsCommand);
+    WaitForOngoingChunksSplitsCommand(const WaitForOngoingChunksSplitsCommand&) = delete;
+    WaitForOngoingChunksSplitsCommand& operator=(const WaitForOngoingChunksSplitsCommand&) = delete;
 
 public:
     WaitForOngoingChunksSplitsCommand() : BasicCommand("waitForOngoingChunkSplits") {}
@@ -89,5 +90,5 @@ MONGO_INITIALIZER(RegisterWaitForOngoingChunkSplitsCommand)(InitializerContext* 
     }
     return Status::OK();
 }
-}
-}
+}  // namespace
+}  // namespace mongo

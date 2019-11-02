@@ -45,10 +45,10 @@
 #include "mongo/util/file.h"
 #include "mongo/util/log.h"
 #include "mongo/util/md5.hpp"
-#include "mongo/util/mongoutils/str.h"
 #include "mongo/util/net/socket_utils.h"
 #include "mongo/util/password.h"
 #include "mongo/util/scopeguard.h"
+#include "mongo/util/str.h"
 #include "mongo/util/text.h"
 
 namespace mongo {
@@ -78,29 +78,27 @@ BSONObj listFiles(const BSONObj& _args, void* data) {
     stringstream ss;
     ss << "listFiles: no such directory: " << rootname;
     string msg = ss.str();
-    uassert(12581, msg.c_str(), boost::filesystem::exists(root));
+    uassert(12581,
+            msg.c_str(),
+            boost::filesystem::exists(root) && boost::filesystem::is_directory(root));
 
-    boost::filesystem::directory_iterator end;
-    boost::filesystem::directory_iterator i(root);
 
-    while (i != end) {
-        boost::filesystem::path p = *i;
-        BSONObjBuilder b;
-        b << "name" << p.generic_string();
-        b << "baseName" << p.filename().generic_string();
-        b.appendBool("isDirectory", is_directory(p));
-        if (!boost::filesystem::is_directory(p)) {
-            try {
+    for (boost::filesystem::directory_iterator i(root), end; i != end; ++i)
+        try {
+            const boost::filesystem::path& p = *i;
+            BSONObjBuilder b;
+            b << "name" << p.generic_string();
+            b << "baseName" << p.filename().generic_string();
+            const bool isDirectory = is_directory(p);
+            b.appendBool("isDirectory", isDirectory);
+            if (!isDirectory) {
                 b.append("size", (double)boost::filesystem::file_size(p));
-            } catch (...) {
-                i++;
-                continue;
             }
-        }
 
-        lst.append(b.obj());
-        i++;
-    }
+            lst.append(b.obj());
+        } catch (const boost::filesystem::filesystem_error&) {
+            continue;  // Filesystem errors cause us to just skip that entry, entirely.
+        }
 
     BSONObjBuilder ret;
     ret.appendArray("", lst.done());
@@ -140,7 +138,7 @@ BSONObj cd(const BSONObj& args, void* data) {
         return BSONObj();
     }
 #endif
-    uasserted(16832, mongoutils::str::stream() << "cd command failed: " << errnoWithDescription());
+    uasserted(16832, str::stream() << "cd command failed: " << errnoWithDescription());
     return BSONObj();
 }
 
@@ -188,7 +186,7 @@ BSONObj cat(const BSONObj& args, void* data) {
             break;
         ss << ch;
         sz += 1;
-        uassert(13301, "cat() : file to big to load as a variable", sz < 1024 * 1024 * 16);
+        uassert(13301, "cat() : file too big to load as a variable", sz < 1024 * 1024 * 16);
     }
     return BSON("" << ss.str());
 }
@@ -351,7 +349,7 @@ BSONObj changeUmask(const BSONObj& a, void* data) {
             "umask takes 1 argument, the octal mode of the umask",
             a.nFields() == 1 && isNumericBSONType(a.firstElementType()));
     auto val = a.firstElement().Number();
-    return BSON("" << umask(static_cast<mode_t>(val)));
+    return BSON("" << static_cast<int>(umask(static_cast<mode_t>(val))));
 #endif
 }
 
@@ -365,8 +363,8 @@ BSONObj getFileMode(const BSONObj& a, void* data) {
     auto fileStatus = boost::filesystem::status(path, ec);
     if (ec) {
         uasserted(50974,
-                  str::stream() << "Unable to get status for file \"" << pathStr << "\": "
-                                << ec.message());
+                  str::stream() << "Unable to get status for file \"" << pathStr
+                                << "\": " << ec.message());
     }
 
     return BSON("" << fileStatus.permissions());
@@ -389,5 +387,5 @@ void installShellUtilsExtended(Scope& scope) {
     scope.injectNative("umask", changeUmask);
     scope.injectNative("getFileMode", getFileMode);
 }
-}
-}
+}  // namespace shell_utils
+}  // namespace mongo

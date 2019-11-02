@@ -30,6 +30,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 
 #include "mongo/base/string_data.h"
 #include "mongo/client/authenticate.h"
@@ -49,11 +50,10 @@
 #include "mongo/rpc/op_msg.h"
 #include "mongo/rpc/protocol.h"
 #include "mongo/rpc/unique_message.h"
-#include "mongo/stdx/functional.h"
 #include "mongo/transport/message_compressor_manager.h"
 #include "mongo/transport/session.h"
 #include "mongo/transport/transport_layer.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -77,21 +77,21 @@ class DBClientQueryInterface {
                                                   Query query,
                                                   int nToReturn = 0,
                                                   int nToSkip = 0,
-                                                  const BSONObj* fieldsToReturn = 0,
+                                                  const BSONObj* fieldsToReturn = nullptr,
                                                   int queryOptions = 0,
                                                   int batchSize = 0) = 0;
 
-    virtual unsigned long long query(stdx::function<void(const BSONObj&)> f,
+    virtual unsigned long long query(std::function<void(const BSONObj&)> f,
                                      const NamespaceStringOrUUID& nsOrUuid,
                                      Query query,
-                                     const BSONObj* fieldsToReturn = 0,
+                                     const BSONObj* fieldsToReturn = nullptr,
                                      int queryOptions = 0,
                                      int batchSize = 0) = 0;
 
-    virtual unsigned long long query(stdx::function<void(DBClientCursorBatchIterator&)> f,
+    virtual unsigned long long query(std::function<void(DBClientCursorBatchIterator&)> f,
                                      const NamespaceStringOrUUID& nsOrUuid,
                                      Query query,
-                                     const BSONObj* fieldsToReturn = 0,
+                                     const BSONObj* fieldsToReturn = nullptr,
                                      int queryOptions = 0,
                                      int batchSize = 0) = 0;
 };
@@ -100,7 +100,8 @@ class DBClientQueryInterface {
  abstract class that implements the core db operations
  */
 class DBClientBase : public DBClientQueryInterface {
-    MONGO_DISALLOW_COPYING(DBClientBase);
+    DBClientBase(const DBClientBase&) = delete;
+    DBClientBase& operator=(const DBClientBase&) = delete;
 
 public:
     DBClientBase()
@@ -117,18 +118,18 @@ public:
     */
     virtual BSONObj findOne(const std::string& ns,
                             const Query& query,
-                            const BSONObj* fieldsToReturn = 0,
+                            const BSONObj* fieldsToReturn = nullptr,
                             int queryOptions = 0);
 
     /** query N objects from the database into an array.  makes sense mostly when you want a small
      * number of results.  if a huge number, use query() and iterate the cursor.
-    */
+     */
     void findN(std::vector<BSONObj>& out,
                const std::string& ns,
                Query query,
                int nToReturn,
                int nToSkip = 0,
-               const BSONObj* fieldsToReturn = 0,
+               const BSONObj* fieldsToReturn = nullptr,
                int queryOptions = 0);
 
     /**
@@ -199,7 +200,7 @@ public:
 
     /**
      * Gets the RequestMetadataWriter that is set on this connection. This may
-     * be an uninitialized stdx::function, so it should be checked for validity
+     * be an uninitialized std::function, so it should be checked for validity
      * with operator bool() first.
      */
     const rpc::RequestMetadataWriter& getRequestMetadataWriter();
@@ -213,7 +214,7 @@ public:
 
     /**
      * Gets the ReplyMetadataReader that is set on this connection. This may
-     * be an uninitialized stdx::function, so it should be checked for validity
+     * be an uninitialized std::function, so it should be checked for validity
      * with operator bool() first.
      */
     const rpc::ReplyMetadataReader& getReplyMetadataReader();
@@ -292,9 +293,9 @@ public:
         int options = 0);
 
     /**
-    * Authenticates to another cluster member using appropriate authentication data.
-    * @return true if the authentication was successful
-    */
+     * Authenticates to another cluster member using appropriate authentication data.
+     * @return true if the authentication was successful
+     */
     virtual Status authenticateInternalUser();
 
     /**
@@ -350,11 +351,11 @@ public:
     /** count number of objects in collection ns that match the query criteria specified
         throws UserAssertion if database returns an error
     */
-    virtual unsigned long long count(const std::string& ns,
-                                     const BSONObj& query = BSONObj(),
-                                     int options = 0,
-                                     int limit = 0,
-                                     int skip = 0);
+    virtual long long count(NamespaceStringOrUUID nsOrUuid,
+                            const BSONObj& query = BSONObj(),
+                            int options = 0,
+                            int limit = 0,
+                            int skip = 0);
 
     static std::string createPasswordDigest(const std::string& username,
                                             const std::string& clearTextPassword);
@@ -367,7 +368,7 @@ public:
 
        returns true if command invoked successfully.
     */
-    virtual bool isMaster(bool& isMaster, BSONObj* info = 0);
+    virtual bool isMaster(bool& isMaster, BSONObj* info = nullptr);
 
     /**
        Create a new collection in the database.  Normally, collection creation is automatic.  You
@@ -389,7 +390,7 @@ public:
                           long long size = 0,
                           bool capped = false,
                           int max = 0,
-                          BSONObj* info = 0);
+                          BSONObj* info = nullptr);
 
     /** Get error result from the last write operation (insert/update/delete) on this connection.
         db doesn't change the command's behavior - it is just for auth checks.
@@ -448,8 +449,8 @@ public:
     /** validate a collection, checking for errors and reporting back statistics.
         this operation is slow and blocking.
      */
-    bool validate(const std::string& ns, bool scandata = true) {
-        BSONObj cmd = BSON("validate" << nsGetCollection(ns) << "scandata" << scandata);
+    bool validate(const std::string& ns) {
+        BSONObj cmd = BSON("validate" << nsGetCollection(ns));
         BSONObj info;
         return runCommand(nsGetDB(ns).c_str(), cmd, info);
     }
@@ -460,6 +461,16 @@ public:
      * }
      */
     std::list<BSONObj> getCollectionInfos(const std::string& db, const BSONObj& filter = BSONObj());
+
+    /**
+     * Lists databases available on the server.
+     * @param filter A filter for the results
+     * @param nameOnly Only return the names of the databases
+     * @param authorizedDatabases Only return the databases the user is authorized on
+     */
+    std::vector<BSONObj> getDatabaseInfos(const BSONObj& filter = BSONObj(),
+                                          const bool nameOnly = false,
+                                          const bool authorizedDatabases = false);
 
     bool exists(const std::string& ns);
 
@@ -499,7 +510,8 @@ public:
      */
     virtual void createIndexes(StringData ns, const std::vector<BSONObj>& specs);
 
-    virtual std::list<BSONObj> getIndexSpecs(const std::string& ns, int options = 0);
+    virtual std::list<BSONObj> getIndexSpecs(const NamespaceStringOrUUID& nsOrUuid,
+                                             int options = 0);
 
     virtual void dropIndex(const std::string& ns, BSONObj keys);
     virtual void dropIndex(const std::string& ns, const std::string& indexName);
@@ -559,6 +571,10 @@ public:
     virtual int getMinWireVersion() = 0;
     virtual int getMaxWireVersion() = 0;
 
+    const std::vector<std::string>& getIsMasterSaslMechanisms() const {
+        return _saslMechsForAuth;
+    }
+
     /** send a query to the database.
      @param ns namespace to query, format is <dbname>.<collectname>[.<collectname>]*
      @param query query to perform on the collection.  this is a BSONObj (binary JSON)
@@ -578,7 +594,7 @@ public:
                                           Query query,
                                           int nToReturn = 0,
                                           int nToSkip = 0,
-                                          const BSONObj* fieldsToReturn = 0,
+                                          const BSONObj* fieldsToReturn = nullptr,
                                           int queryOptions = 0,
                                           int batchSize = 0) override;
 
@@ -597,17 +613,17 @@ public:
         The version that takes a BSONObj cannot return the namespace queried when the query is
         is done by UUID.  If this is required, use the DBClientBatchIterator version.
      */
-    unsigned long long query(stdx::function<void(const BSONObj&)> f,
+    unsigned long long query(std::function<void(const BSONObj&)> f,
                              const NamespaceStringOrUUID& nsOrUuid,
                              Query query,
-                             const BSONObj* fieldsToReturn = 0,
+                             const BSONObj* fieldsToReturn = nullptr,
                              int queryOptions = QueryOption_Exhaust,
                              int batchSize = 0) final;
 
-    unsigned long long query(stdx::function<void(DBClientCursorBatchIterator&)> f,
+    unsigned long long query(std::function<void(DBClientCursorBatchIterator&)> f,
                              const NamespaceStringOrUUID& nsOrUuid,
                              Query query,
-                             const BSONObj* fieldsToReturn = 0,
+                             const BSONObj* fieldsToReturn = nullptr,
                              int queryOptions = QueryOption_Exhaust,
                              int batchSize = 0) override;
 
@@ -682,8 +698,11 @@ protected:
     /** if the element contains a not master error */
     bool isNotMasterErrorString(const BSONElement& e);
 
-    BSONObj _countCmd(
-        const std::string& ns, const BSONObj& query, int options, int limit, int skip);
+    BSONObj _countCmd(const NamespaceStringOrUUID nsOrUuid,
+                      const BSONObj& query,
+                      int options,
+                      int limit,
+                      int skip);
 
     /**
      * Look up the options available on this client.  Caches the answer from
@@ -703,6 +722,8 @@ protected:
 
     static AtomicWord<long long> ConnectionIdSequence;
     long long _connectionId;  // unique connection id for this connection
+
+    std::vector<std::string> _saslMechsForAuth;
 
 private:
     auth::RunCommandHook _makeAuthRunCommandHook();

@@ -16,7 +16,7 @@
  */
 "use strict";
 
-load("jstests/libs/check_log.js");            // For 'checkLog'.
+load("jstests/libs/fail_point_util.js");
 load("jstests/libs/fixture_helpers.js");      // For 'FixtureHelpers'.
 load("jstests/aggregation/extras/utils.js");  // For 'arrayEq'.
 
@@ -60,9 +60,8 @@ class TwoPhaseDropCollectionTest {
      * Pause oplog application on a specified node.
      */
     pauseOplogApplication(node) {
-        assert.commandWorked(node.adminCommand(
-            {configureFailPoint: this.oplogApplicationFailpoint, mode: "alwaysOn"}));
-        checkLog.contains(node, this.oplogApplicationFailpoint + " fail point enabled");
+        let failPoint = configureFailPoint(node, this.oplogApplicationFailpoint);
+        failPoint.wait();
     }
 
     /**
@@ -182,8 +181,8 @@ class TwoPhaseDropCollectionTest {
             TwoPhaseDropCollectionTest.listCollections(db, {includePendingDrops: true});
 
         TwoPhaseDropCollectionTest._testLog("Checking presence of drop-pending collection for " +
-                                            collName + " in the collection list: " +
-                                            tojson(collections));
+                                            collName +
+                                            " in the collection list: " + tojson(collections));
 
         let pendingDropRegex = TwoPhaseDropCollectionTest.pendingDropRegex(collName);
         return collections.find(c => pendingDropRegex.test(c.name));

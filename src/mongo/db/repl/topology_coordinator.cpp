@@ -48,26 +48,25 @@
 #include "mongo/db/mongod_options.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/heartbeat_response_action.h"
-#include "mongo/db/repl/is_master_response.h"
 #include "mongo/db/repl/isself.h"
 #include "mongo/db/repl/member_data.h"
-#include "mongo/db/repl/repl_set_heartbeat_args_v1.h"
-#include "mongo/db/repl/repl_set_heartbeat_response.h"
-#include "mongo/db/repl/repl_set_request_votes_args.h"
 #include "mongo/db/repl/rslog.h"
 #include "mongo/rpc/metadata/oplog_query_metadata.h"
 #include "mongo/rpc/metadata/repl_set_metadata.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/fail_point_service.h"
+#include "mongo/util/fail_point.h"
 #include "mongo/util/hex.h"
 #include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/net/socket_utils.h"
 #include "mongo/util/scopeguard.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 namespace repl {
 
 MONGO_FAIL_POINT_DEFINE(forceSyncSourceCandidate);
+MONGO_FAIL_POINT_DEFINE(voteNoInElection);
+MONGO_FAIL_POINT_DEFINE(voteYesInDryRunButNoInRealElection);
 
 // If this fail point is enabled, TopologyCoordinator::shouldChangeSyncSource() will ignore
 // the option TopologyCoordinator::Options::maxSyncSourceLagSecs. The sync source will not be
@@ -136,6 +135,15 @@ bool _hasOnlyAuthErrorUpHeartbeats(const std::vector<MemberData>& hbdata, const 
 void appendOpTime(BSONObjBuilder* bob, const char* elemName, const OpTime& opTime) {
     opTime.append(bob, elemName);
 }
+
+void appendIP(BSONObjBuilder* bob, const char* elemName, const HostAndPort& hostAndPort) {
+    auto ip = hostbyname(hostAndPort.host().c_str());
+    if (ip == "") {
+        bob->appendNull("ip");
+    } else {
+        bob->append("ip", ip);
+    }
+}
 }  // namespace
 
 void TopologyCoordinator::PingStats::start(Date_t now) {
@@ -198,8 +206,8 @@ HostAndPort TopologyCoordinator::chooseNewSyncSource(Date_t now,
         return HostAndPort();
     }
 
-    MONGO_FAIL_POINT_BLOCK(forceSyncSourceCandidate, customArgs) {
-        const auto& data = customArgs.getData();
+    if (auto sfp = forceSyncSourceCandidate.scoped(); MONGO_unlikely(sfp.isActive())) {
+        const auto& data = sfp.getData();
         const auto hostAndPortElem = data["hostAndPort"];
         if (!hostAndPortElem) {
             severe() << "'forceSyncSoureCandidate' parameter set with invalid host and port: "
@@ -239,8 +247,8 @@ HostAndPort TopologyCoordinator::chooseNewSyncSource(Date_t now,
         _syncSource = _rsConfig.getMemberAt(_forceSyncSourceIndex).getHostAndPort();
         _forceSyncSourceIndex = -1;
         log() << "choosing sync source candidate by request: " << _syncSource;
-        std::string msg(str::stream() << "syncing from: " << _syncSource.toString()
-                                      << " by request");
+        std::string msg(str::stream()
+                        << "syncing from: " << _syncSource.toString() << " by request");
         setMyHeartbeatMessage(now, msg);
         return _syncSource;
     }
@@ -562,8 +570,7 @@ Status TopologyCoordinator::prepareHeartbeatResponseV1(Date_t now,
               << "; remote node's: " << rshb;
         return Status(ErrorCodes::InconsistentReplicaSetNames,
                       str::stream() << "Our set name of " << ourSetName << " does not match name "
-                                    << rshb
-                                    << " reported by remote node");
+                                    << rshb << " reported by remote node");
     }
 
     const MemberState myState = getMemberState();
@@ -573,7 +580,7 @@ Status TopologyCoordinator::prepareHeartbeatResponseV1(Date_t now,
                           "Our replica set configuration is invalid or does not include us");
         }
     } else {
-        if (args.getSenderId() == _selfConfig().getId()) {
+        if (args.getSenderId() == _selfConfig().getId().getData()) {
             return Status(ErrorCodes::BadValue,
                           str::stream() << "Received heartbeat from member with the same "
                                            "member ID as ourself: "
@@ -589,13 +596,13 @@ Status TopologyCoordinator::prepareHeartbeatResponseV1(Date_t now,
         response->setElectionTime(_electionTime);
     }
 
-    const OpTime lastOpApplied = getMyLastAppliedOpTime();
-    const OpTime lastOpDurable = getMyLastDurableOpTime();
-    response->setAppliedOpTime(lastOpApplied);
-    response->setDurableOpTime(lastOpDurable);
+    const OpTimeAndWallTime lastOpApplied = getMyLastAppliedOpTimeAndWallTime();
+    const OpTimeAndWallTime lastOpDurable = getMyLastDurableOpTimeAndWallTime();
+    response->setAppliedOpTimeAndWallTime(lastOpApplied);
+    response->setDurableOpTimeAndWallTime(lastOpDurable);
 
     if (_currentPrimaryIndex != -1) {
-        response->setPrimaryId(_rsConfig.getMemberAt(_currentPrimaryIndex).getId());
+        response->setPrimaryId(_rsConfig.getMemberAt(_currentPrimaryIndex).getId().getData());
     }
 
     response->setTerm(_term);
@@ -638,7 +645,7 @@ int TopologyCoordinator::_getMemberIndex(int id) const {
     int index = 0;
     for (ReplSetConfig::MemberIterator it = _rsConfig.membersBegin(); it != _rsConfig.membersEnd();
          ++it, ++index) {
-        if (it->getId() == id) {
+        if (it->getId() == MemberId(id)) {
             return index;
         }
     }
@@ -662,7 +669,7 @@ std::pair<ReplSetHeartbeatArgsV1, Milliseconds> TopologyCoordinator::prepareHear
         hbArgs.setConfigVersion(_rsConfig.getConfigVersion());
         if (_selfIndex >= 0) {
             const MemberConfig& me = _selfConfig();
-            hbArgs.setSenderId(me.getId());
+            hbArgs.setSenderId(me.getId().getData());
             hbArgs.setSenderHost(me.getHostAndPort());
         }
         hbArgs.setTerm(_term);
@@ -772,8 +779,9 @@ HeartbeatResponseAction TopologyCoordinator::processHeartbeatResponse(
     }
     const int memberIndex = _rsConfig.findMemberIndexByHostAndPort(target);
     if (memberIndex == -1) {
-        LOG(1) << "Could not find " << target << " in current config so ignoring --"
-                                                 " current config: "
+        LOG(1) << "Could not find " << target
+               << " in current config so ignoring --"
+                  " current config: "
                << _rsConfig.toBSON();
         HeartbeatResponseAction nextAction = HeartbeatResponseAction::makeNoAction();
         nextAction.setNextHeartbeatStartDate(nextHeartbeatStartDate);
@@ -822,8 +830,14 @@ bool TopologyCoordinator::haveNumNodesReachedOpTime(const OpTime& targetOpTime,
         return false;
     }
 
+    // Invariants that we only wait for an OpTime in the term that this node is currently writing
+    // to. In other words, we do not support waiting for an OpTime written by a previous primary
+    // because comparing members' lastApplied/lastDurable alone is not sufficient to tell if the
+    // OpTime has been replicated.
+    invariant(targetOpTime.getTerm() == getMyLastAppliedOpTime().getTerm());
+
     for (auto&& memberData : _memberData) {
-        const auto isArbiter = _rsConfig.getMemberAt(memberData.getMemberId()).isArbiter();
+        const auto isArbiter = _rsConfig.getMemberAt(memberData.getConfigIndex()).isArbiter();
 
         // We do not count arbiters towards the write concern.
         if (isArbiter) {
@@ -833,7 +847,14 @@ bool TopologyCoordinator::haveNumNodesReachedOpTime(const OpTime& targetOpTime,
         const OpTime& memberOpTime =
             durablyWritten ? memberData.getLastDurableOpTime() : memberData.getLastAppliedOpTime();
 
-        if (memberOpTime >= targetOpTime) {
+        // In addition to checking if a member has a greater/equal timestamp field we also need to
+        // make sure that the memberOpTime is in the same term as the OpTime we wait for. If a
+        // member's OpTime has a higher term, it indicates that this node will be stepping down. And
+        // thus we do not know if the target OpTime in our previous term has been replicated to the
+        // member because the memberOpTime in a higher term could correspond to an operation in a
+        // divergent branch of history regardless of its timestamp.
+        if (memberOpTime.getTerm() == targetOpTime.getTerm() &&
+            memberOpTime.getTimestamp() >= targetOpTime.getTimestamp()) {
             --numNodes;
         }
 
@@ -848,10 +869,25 @@ bool TopologyCoordinator::haveTaggedNodesReachedOpTime(const OpTime& opTime,
                                                        const ReplSetTagPattern& tagPattern,
                                                        bool durablyWritten) {
     ReplSetTagMatch matcher(tagPattern);
+
+    // Invariants that we only wait for an OpTime in the term that this node is currently writing
+    // to. In other words, we do not support waiting for an OpTime written by a previous primary
+    // because comparing members' lastApplied/lastDurable alone is not sufficient to tell if the
+    // OpTime has been replicated.
+    invariant(opTime.getTerm() == getMyLastAppliedOpTime().getTerm());
+
     for (auto&& memberData : _memberData) {
         const OpTime& memberOpTime =
             durablyWritten ? memberData.getLastDurableOpTime() : memberData.getLastAppliedOpTime();
-        if (memberOpTime >= opTime) {
+
+        // In addition to checking if a member has a greater/equal timestamp field we also need to
+        // make sure that the memberOpTime is in the same term as the OpTime we wait for. If a
+        // member's OpTime has a higher term, it indicates that this node will be stepping down. And
+        // thus we do not know if the target OpTime in our previous term has been replicated to the
+        // member because the memberOpTime in a higher term could correspond to an operation in a
+        // divergent branch of history regardless of its timestamp.
+        if (memberOpTime.getTerm() == opTime.getTerm() &&
+            memberOpTime.getTimestamp() >= opTime.getTimestamp()) {
             // This node has reached the desired optime, now we need to check if it is a part
             // of the tagPattern.
             int memberIndex = memberData.getConfigIndex();
@@ -912,16 +948,17 @@ bool TopologyCoordinator::setMemberAsDown(Date_t now, const int memberIndex) {
     MemberData& hbData = _memberData.at(memberIndex);
     hbData.setDownValues(now, "no response within election timeout period");
 
-    if (CannotSeeMajority & _getMyUnelectableReason(now, StartElectionReason::kElectionTimeout)) {
+    if (CannotSeeMajority &
+        _getMyUnelectableReason(now, StartElectionReasonEnum::kElectionTimeout)) {
         return true;
     }
 
     return false;
 }
 
-std::pair<int, Date_t> TopologyCoordinator::getStalestLiveMember() const {
+std::pair<MemberId, Date_t> TopologyCoordinator::getStalestLiveMember() const {
     Date_t earliestDate = Date_t::max();
-    int earliestMemberId = -1;
+    MemberId earliestMemberId;
     for (const auto& memberData : _memberData) {
         if (memberData.isSelf()) {
             continue;
@@ -957,9 +994,14 @@ OpTime TopologyCoordinator::getMyLastAppliedOpTime() const {
     return _selfMemberData().getLastAppliedOpTime();
 }
 
-void TopologyCoordinator::setMyLastAppliedOpTime(OpTime opTime,
-                                                 Date_t now,
-                                                 bool isRollbackAllowed) {
+OpTimeAndWallTime TopologyCoordinator::getMyLastAppliedOpTimeAndWallTime() const {
+    return {_selfMemberData().getLastAppliedOpTime(), _selfMemberData().getLastAppliedWallTime()};
+}
+
+void TopologyCoordinator::setMyLastAppliedOpTimeAndWallTime(OpTimeAndWallTime opTimeAndWallTime,
+                                                            Date_t now,
+                                                            bool isRollbackAllowed) {
+    auto opTime = opTimeAndWallTime.opTime;
     auto& myMemberData = _selfMemberData();
     auto myLastAppliedOpTime = myMemberData.getLastAppliedOpTime();
 
@@ -972,19 +1014,25 @@ void TopologyCoordinator::setMyLastAppliedOpTime(OpTime opTime,
                   myLastAppliedOpTime.getTerm() == OpTime::kUninitializedTerm ||
                   opTime.getTimestamp() > myLastAppliedOpTime.getTimestamp());
     }
-    myMemberData.setLastAppliedOpTime(opTime, now);
+
+    myMemberData.setLastAppliedOpTimeAndWallTime(opTimeAndWallTime, now);
 }
 
 OpTime TopologyCoordinator::getMyLastDurableOpTime() const {
     return _selfMemberData().getLastDurableOpTime();
 }
 
-void TopologyCoordinator::setMyLastDurableOpTime(OpTime opTime,
-                                                 Date_t now,
-                                                 bool isRollbackAllowed) {
+OpTimeAndWallTime TopologyCoordinator::getMyLastDurableOpTimeAndWallTime() const {
+    return {_selfMemberData().getLastDurableOpTime(), _selfMemberData().getLastDurableWallTime()};
+}
+
+void TopologyCoordinator::setMyLastDurableOpTimeAndWallTime(OpTimeAndWallTime opTimeAndWallTime,
+                                                            Date_t now,
+                                                            bool isRollbackAllowed) {
+    auto opTime = opTimeAndWallTime.opTime;
     auto& myMemberData = _selfMemberData();
     invariant(isRollbackAllowed || opTime >= myMemberData.getLastDurableOpTime());
-    myMemberData.setLastDurableOpTime(opTime, now);
+    myMemberData.setLastDurableOpTimeAndWallTime(opTimeAndWallTime, now);
 }
 
 StatusWith<bool> TopologyCoordinator::setLastOptime(const UpdatePositionArgs::UpdateInfo& args,
@@ -997,27 +1045,26 @@ StatusWith<bool> TopologyCoordinator::setLastOptime(const UpdatePositionArgs::Up
     }
     invariant(_rsConfig.isInitialized());  // Can only use setLastOptime in replSet mode.
 
-    if (args.memberId < 0) {
-        std::string errmsg = str::stream()
-            << "Received replSetUpdatePosition for node with memberId " << args.memberId
-            << " which is negative and therefore invalid";
-        LOG(1) << errmsg;
-        return Status(ErrorCodes::NodeNotFound, errmsg);
+    MemberId memberId;
+    try {
+        memberId = MemberId(args.memberId);
+    } catch (const DBException& ex) {
+        return ex.toStatus();
     }
 
-    if (args.memberId == _rsConfig.getMemberAt(_selfIndex).getId()) {
+    if (memberId == _rsConfig.getMemberAt(_selfIndex).getId()) {
         // Do not let remote nodes tell us what our optime is.
         return false;
     }
 
-    LOG(2) << "received notification that node with memberID " << args.memberId
+    LOG(2) << "received notification that node with memberID " << memberId
            << " in config with version " << args.cfgver
            << " has reached optime: " << args.appliedOpTime
            << " and is durable through: " << args.durableOpTime;
 
     if (args.cfgver != _rsConfig.getConfigVersion()) {
         std::string errmsg = str::stream()
-            << "Received replSetUpdatePosition for node with memberId " << args.memberId
+            << "Received replSetUpdatePosition for node with memberId " << memberId
             << " whose config version of " << args.cfgver << " doesn't match our config version of "
             << _rsConfig.getConfigVersion();
         LOG(1) << errmsg;
@@ -1025,28 +1072,29 @@ StatusWith<bool> TopologyCoordinator::setLastOptime(const UpdatePositionArgs::Up
         return Status(ErrorCodes::InvalidReplicaSetConfig, errmsg);
     }
 
-    auto* memberData = _findMemberDataByMemberId(args.memberId);
+    auto* memberData = _findMemberDataByMemberId(memberId.getData());
     if (!memberData) {
-        invariant(!_rsConfig.findMemberByID(args.memberId));
+        invariant(!_rsConfig.findMemberByID(memberId.getData()));
 
         std::string errmsg = str::stream()
-            << "Received replSetUpdatePosition for node with memberId " << args.memberId
+            << "Received replSetUpdatePosition for node with memberId " << memberId
             << " which doesn't exist in our config";
         LOG(1) << errmsg;
         return Status(ErrorCodes::NodeNotFound, errmsg);
     }
 
-    invariant(args.memberId == memberData->getMemberId());
+    invariant(memberId == memberData->getMemberId());
 
-    LOG(3) << "Node with memberID " << args.memberId << " currently has optime "
+    LOG(3) << "Node with memberID " << memberId << " currently has optime "
            << memberData->getLastAppliedOpTime() << " durable through "
            << memberData->getLastDurableOpTime() << "; updating to optime " << args.appliedOpTime
            << " and durable through " << args.durableOpTime;
 
-
-    bool advancedOpTime = memberData->advanceLastAppliedOpTime(args.appliedOpTime, now);
-    advancedOpTime =
-        memberData->advanceLastDurableOpTime(args.durableOpTime, now) || advancedOpTime;
+    bool advancedOpTime = memberData->advanceLastAppliedOpTimeAndWallTime(
+        {args.appliedOpTime, args.appliedWallTime}, now);
+    advancedOpTime = memberData->advanceLastDurableOpTimeAndWallTime(
+                         {args.durableOpTime, args.durableWallTime}, now) ||
+        advancedOpTime;
     return advancedOpTime;
 }
 
@@ -1110,8 +1158,9 @@ HeartbeatResponseAction TopologyCoordinator::_updatePrimaryFromHBDataV1(
         bool scheduleCatchupTakeover = false;
         bool schedulePriorityTakeover = false;
 
-        if (!catchupTakeoverDisabled && (_memberData.at(primaryIndex).getLastAppliedOpTime() <
-                                         _memberData.at(_selfIndex).getLastAppliedOpTime())) {
+        if (!catchupTakeoverDisabled &&
+            (_memberData.at(primaryIndex).getLastAppliedOpTime() <
+             _memberData.at(_selfIndex).getLastAppliedOpTime())) {
             LOG_FOR_ELECTION(2) << "I can take over the primary due to fresher data."
                                 << " Current primary index: " << primaryIndex << " in term "
                                 << _memberData.at(primaryIndex).getTerm() << "."
@@ -1191,7 +1240,7 @@ int TopologyCoordinator::_findHealthyPrimaryOfEqualOrGreaterPriority(
 }
 
 bool TopologyCoordinator::_amIFreshEnoughForPriorityTakeover() const {
-    const OpTime latestKnownOpTime = _latestKnownOpTime();
+    const OpTime ourLatestKnownOpTime = latestKnownOpTime();
 
     // Rules are:
     // - If the terms don't match, we don't call for priority takeover.
@@ -1205,23 +1254,24 @@ bool TopologyCoordinator::_amIFreshEnoughForPriorityTakeover() const {
     // passes the timestamp component of the last oplog entry.
 
     const OpTime ourLastOpApplied = getMyLastAppliedOpTime();
-    if (ourLastOpApplied.getTerm() != latestKnownOpTime.getTerm()) {
+    if (ourLastOpApplied.getTerm() != ourLatestKnownOpTime.getTerm()) {
         return false;
     }
 
-    if (ourLastOpApplied.getTimestamp().getSecs() != latestKnownOpTime.getTimestamp().getSecs()) {
+    if (ourLastOpApplied.getTimestamp().getSecs() !=
+        ourLatestKnownOpTime.getTimestamp().getSecs()) {
         return ourLastOpApplied.getTimestamp().getSecs() +
             gPriorityTakeoverFreshnessWindowSeconds >=
-            latestKnownOpTime.getTimestamp().getSecs();
+            ourLatestKnownOpTime.getTimestamp().getSecs();
     } else {
         return ourLastOpApplied.getTimestamp().getInc() + 1000 >=
-            latestKnownOpTime.getTimestamp().getInc();
+            ourLatestKnownOpTime.getTimestamp().getInc();
     }
 }
 
 bool TopologyCoordinator::_amIFreshEnoughForCatchupTakeover() const {
 
-    const OpTime latestKnownOpTime = _latestKnownOpTime();
+    const OpTime ourLatestKnownOpTime = latestKnownOpTime();
 
     // Rules are:
     // - We must have the freshest optime of all the up nodes.
@@ -1233,7 +1283,7 @@ bool TopologyCoordinator::_amIFreshEnoughForCatchupTakeover() const {
     // There is no point to a catchup takeover if we aren't the freshest node because
     // another node would immediately perform another catchup takeover when we become primary.
     const OpTime ourLastOpApplied = getMyLastAppliedOpTime();
-    if (ourLastOpApplied < latestKnownOpTime) {
+    if (ourLastOpApplied < ourLatestKnownOpTime) {
         return false;
     }
 
@@ -1262,41 +1312,14 @@ bool TopologyCoordinator::_iAmPrimary() const {
     return false;
 }
 
-OpTime TopologyCoordinator::_latestKnownOpTime() const {
-    OpTime latest = getMyLastAppliedOpTime();
-    for (std::vector<MemberData>::const_iterator it = _memberData.begin(); it != _memberData.end();
-         ++it) {
-        // Ignore self
-        // TODO(russotto): Simplify when heartbeat and spanning tree times are combined.
-        if (it->isSelf()) {
-            continue;
-        }
-        // Ignore down members
-        if (!it->up()) {
-            continue;
-        }
-        // Ignore removed nodes (not in config, so not valid).
-        if (it->getState().removed()) {
-            continue;
-        }
-
-        OpTime optime = it->getHeartbeatAppliedOpTime();
-
-        if (optime > latest) {
-            latest = optime;
-        }
-    }
-
-    return latest;
-}
-
 bool TopologyCoordinator::prepareForUnconditionalStepDown() {
     if (_leaderMode == LeaderMode::kSteppingDown) {
         // Can only be processing one required stepdown at a time.
         return false;
     }
-    // Heartbeat-initiated stepdowns take precedence over stepdown command initiated stepdowns, so
-    // it's safe to transition from kAttemptingStepDown to kSteppingDown.
+    // Heartbeat and reconfig (via cmd or heartbeat) initiated stepdowns take precedence over
+    // stepdown command initiated stepdowns, so it's safe to transition from kAttemptingStepDown
+    // to kSteppingDown.
     _setLeaderMode(LeaderMode::kSteppingDown);
     return true;
 }
@@ -1373,7 +1396,8 @@ void TopologyCoordinator::setCurrentPrimary_forTest(int primaryIndex,
             ReplSetHeartbeatResponse hbResponse;
             hbResponse.setState(MemberState::RS_PRIMARY);
             hbResponse.setElectionTime(electionTime);
-            hbResponse.setAppliedOpTime(_memberData.at(primaryIndex).getHeartbeatAppliedOpTime());
+            hbResponse.setAppliedOpTimeAndWallTime(
+                {_memberData.at(primaryIndex).getHeartbeatAppliedOpTime(), Date_t() + Seconds(1)});
             hbResponse.setSyncingTo(HostAndPort());
             _memberData.at(primaryIndex)
                 .setUpValues(_memberData.at(primaryIndex).getLastHeartbeat(),
@@ -1385,7 +1409,7 @@ void TopologyCoordinator::setCurrentPrimary_forTest(int primaryIndex,
 
 const MemberConfig* TopologyCoordinator::_currentPrimaryMember() const {
     if (_currentPrimaryIndex == -1)
-        return NULL;
+        return nullptr;
 
     return &(_rsConfig.getMemberAt(_currentPrimaryIndex));
 }
@@ -1393,7 +1417,8 @@ const MemberConfig* TopologyCoordinator::_currentPrimaryMember() const {
 std::string TopologyCoordinator::_getReplSetStatusString() {
     // Construct a ReplSetStatusArgs using default parameters. Missing parameters will not be
     // included in the status string.
-    ReplSetStatusArgs rsStatusArgs{Date_t::now(), 0U, OpTime(), BSONObj(), boost::none};
+    ReplSetStatusArgs rsStatusArgs{
+        Date_t::now(), 0U, OpTimeAndWallTime(), BSONObj(), BSONObj(), BSONObj(), boost::none};
     BSONObjBuilder builder;
     Status result(ErrorCodes::InternalError, "didn't set status in prepareStatusResponse");
     prepareStatusResponse(rsStatusArgs, &builder, &result);
@@ -1411,18 +1436,20 @@ void TopologyCoordinator::prepareStatusResponse(const ReplSetStatusArgs& rsStatu
     const MemberState myState = getMemberState();
     const Date_t now = rsStatusArgs.now;
     const OpTime lastOpApplied = getMyLastAppliedOpTime();
+    const Date_t lastOpAppliedWall = getMyLastAppliedOpTimeAndWallTime().wallTime;
     const OpTime lastOpDurable = getMyLastDurableOpTime();
+    const Date_t lastOpDurableWall = getMyLastDurableOpTimeAndWallTime().wallTime;
     const BSONObj& initialSyncStatus = rsStatusArgs.initialSyncStatus;
+    const BSONObj& electionCandidateMetrics = rsStatusArgs.electionCandidateMetrics;
+    const BSONObj& electionParticipantMetrics = rsStatusArgs.electionParticipantMetrics;
     const boost::optional<Timestamp>& lastStableRecoveryTimestamp =
         rsStatusArgs.lastStableRecoveryTimestamp;
-    const boost::optional<Timestamp>& lastStableCheckpointTimestampDeprecated =
-        rsStatusArgs.lastStableCheckpointTimestampDeprecated;
 
     if (_selfIndex == -1) {
         // We're REMOVED or have an invalid config
         response->append("state", static_cast<int>(myState.s));
         response->append("stateStr", myState.toString());
-        response->append("uptime", rsStatusArgs.selfUptime);
+        response->append("uptime", static_cast<int>(rsStatusArgs.selfUptime));
 
         appendOpTime(response, "optime", lastOpApplied);
 
@@ -1448,12 +1475,13 @@ void TopologyCoordinator::prepareStatusResponse(const ReplSetStatusArgs& rsStatu
         if (itIndex == _selfIndex) {
             // add self
             BSONObjBuilder bb;
-            bb.append("_id", _selfConfig().getId());
+            bb.append("_id", _selfConfig().getId().getData());
             bb.append("name", _selfConfig().getHostAndPort().toString());
+            appendIP(&bb, "ip", _selfConfig().getHostAndPort());
             bb.append("health", 1.0);
             bb.append("state", static_cast<int>(myState.s));
             bb.append("stateStr", myState.toString());
-            bb.append("uptime", rsStatusArgs.selfUptime);
+            bb.append("uptime", static_cast<int>(rsStatusArgs.selfUptime));
             if (!_selfConfig().isArbiter()) {
                 appendOpTime(&bb, "optime", lastOpApplied);
                 bb.appendDate("optimeDate",
@@ -1464,7 +1492,7 @@ void TopologyCoordinator::prepareStatusResponse(const ReplSetStatusArgs& rsStatu
                 bb.append("syncingTo", _syncSource.toString());
                 bb.append("syncSourceHost", _syncSource.toString());
                 const MemberConfig* member = _rsConfig.findMemberByHostAndPort(_syncSource);
-                bb.append("syncSourceId", member ? member->getId() : -1);
+                bb.append("syncSourceId", member ? member->getId().getData() : -1);
             } else {
                 bb.append("syncingTo", "");
                 bb.append("syncSourceHost", "");
@@ -1490,8 +1518,9 @@ void TopologyCoordinator::prepareStatusResponse(const ReplSetStatusArgs& rsStatu
             // add non-self member
             const MemberConfig& itConfig = _rsConfig.getMemberAt(itIndex);
             BSONObjBuilder bb;
-            bb.append("_id", itConfig.getId());
+            bb.append("_id", itConfig.getId().getData());
             bb.append("name", itConfig.getHostAndPort().toString());
+            appendIP(&bb, "ip", itConfig.getHostAndPort());
             double h = it->getHealth();
             bb.append("health", h);
             const MemberState state = it->getState();
@@ -1504,7 +1533,7 @@ void TopologyCoordinator::prepareStatusResponse(const ReplSetStatusArgs& rsStatu
                 bb.append("stateStr", it->getState().toString());
             }
 
-            const unsigned int uptime = static_cast<unsigned int>((
+            const int uptime = static_cast<int>((
                 it->getUpSince() != Date_t() ? durationCount<Seconds>(now - it->getUpSince()) : 0));
             bb.append("uptime", uptime);
             if (!itConfig.isArbiter()) {
@@ -1531,7 +1560,7 @@ void TopologyCoordinator::prepareStatusResponse(const ReplSetStatusArgs& rsStatu
                 bb.append("syncingTo", syncSource.toString());
                 bb.append("syncSourceHost", syncSource.toString());
                 const MemberConfig* member = _rsConfig.findMemberByHostAndPort(syncSource);
-                bb.append("syncSourceId", member ? member->getId() : -1);
+                bb.append("syncSourceId", member ? member->getId().getData() : -1);
             } else {
                 bb.append("syncingTo", "");
                 bb.append("syncSourceHost", "");
@@ -1559,12 +1588,16 @@ void TopologyCoordinator::prepareStatusResponse(const ReplSetStatusArgs& rsStatu
     response->append("myState", myState.s);
     response->append("term", _term);
 
+    if (rsStatusArgs.tooStale) {
+        response->append("tooStale", true);
+    }
+
     // Add sync source info
     if (!_syncSource.empty() && !myState.primary() && !myState.removed()) {
         response->append("syncingTo", _syncSource.toString());
         response->append("syncSourceHost", _syncSource.toString());
         const MemberConfig* member = _rsConfig.findMemberByHostAndPort(_syncSource);
-        response->append("syncSourceId", member ? member->getId() : -1);
+        response->append("syncSourceId", member ? member->getId().getData() : -1);
     } else {
         response->append("syncingTo", "");
         response->append("syncSourceHost", "");
@@ -1578,27 +1611,43 @@ void TopologyCoordinator::prepareStatusResponse(const ReplSetStatusArgs& rsStatu
     response->append("heartbeatIntervalMillis",
                      durationCount<Milliseconds>(_rsConfig.getHeartbeatInterval()));
 
+    response->append("majorityVoteCount", _rsConfig.getMajorityVoteCount());
+    response->append("writeMajorityCount", _rsConfig.getWriteMajority());
+
     // New optimes, to hold them all.
     BSONObjBuilder optimes;
-    _lastCommittedOpTime.append(&optimes, "lastCommittedOpTime");
-    if (!rsStatusArgs.readConcernMajorityOpTime.isNull()) {
-        rsStatusArgs.readConcernMajorityOpTime.append(&optimes, "readConcernMajorityOpTime");
+    _lastCommittedOpTimeAndWallTime.opTime.append(&optimes, "lastCommittedOpTime");
+
+    optimes.appendDate("lastCommittedWallTime", _lastCommittedOpTimeAndWallTime.wallTime);
+
+    if (!rsStatusArgs.readConcernMajorityOpTime.opTime.isNull()) {
+        rsStatusArgs.readConcernMajorityOpTime.opTime.append(&optimes, "readConcernMajorityOpTime");
+        optimes.appendDate("readConcernMajorityWallTime",
+                           rsStatusArgs.readConcernMajorityOpTime.wallTime);
     }
 
     appendOpTime(&optimes, "appliedOpTime", lastOpApplied);
     appendOpTime(&optimes, "durableOpTime", lastOpDurable);
+
+    optimes.appendDate("lastAppliedWallTime", lastOpAppliedWall);
+    optimes.appendDate("lastDurableWallTime", lastOpDurableWall);
+
     response->append("optimes", optimes.obj());
     if (lastStableRecoveryTimestamp) {
         // Only include this field if the storage engine supports RTT.
         response->append("lastStableRecoveryTimestamp", *lastStableRecoveryTimestamp);
     }
-    if (lastStableCheckpointTimestampDeprecated) {
-        // Only include this field if the storage engine supports RTT and persists data.
-        response->append("lastStableCheckpointTimestamp", *lastStableCheckpointTimestampDeprecated);
-    }
 
     if (!initialSyncStatus.isEmpty()) {
         response->append("initialSyncStatus", initialSyncStatus);
+    }
+
+    if (!electionCandidateMetrics.isEmpty()) {
+        response->append("electionCandidateMetrics", electionCandidateMetrics);
+    }
+
+    if (!electionParticipantMetrics.isEmpty()) {
+        response->append("electionParticipantMetrics", electionParticipantMetrics);
     }
 
     response->append("members", membersOut);
@@ -1630,9 +1679,13 @@ StatusWith<BSONObj> TopologyCoordinator::prepareReplSetUpdatePositionCommand(
         BSONObjBuilder entry(arrayBuilder.subobjStart());
         memberData.getLastDurableOpTime().append(&entry,
                                                  UpdatePositionArgs::kDurableOpTimeFieldName);
+        entry.appendDate(UpdatePositionArgs::kDurableWallTimeFieldName,
+                         memberData.getLastDurableWallTime());
         memberData.getLastAppliedOpTime().append(&entry,
                                                  UpdatePositionArgs::kAppliedOpTimeFieldName);
-        entry.append(UpdatePositionArgs::kMemberIdFieldName, memberData.getMemberId());
+        entry.appendDate(UpdatePositionArgs::kAppliedWallTimeFieldName,
+                         memberData.getLastAppliedWallTime());
+        entry.append(UpdatePositionArgs::kMemberIdFieldName, memberData.getMemberId().getData());
         entry.append(UpdatePositionArgs::kConfigVersionFieldName, _rsConfig.getConfigVersion());
     }
     arrayBuilder.done();
@@ -1664,40 +1717,45 @@ void TopologyCoordinator::fillMemberData(BSONObjBuilder* result) {
             entry.append("heartbeatDurableOpTime", heartbeatDurableOpTime.toBSON());
 
             if (_selfIndex >= 0) {
-                const int memberId = memberData.getMemberId();
-                invariant(memberId >= 0);
-                entry.append("memberId", memberId);
+                entry.append("memberId", memberData.getMemberId().getData());
             }
         }
     }
 }
 
-void TopologyCoordinator::fillIsMasterForReplSet(IsMasterResponse* response) {
+void TopologyCoordinator::fillIsMasterForReplSet(IsMasterResponse* const response,
+                                                 const SplitHorizon::Parameters& horizonParams) {
     const MemberState myState = getMemberState();
     if (!_rsConfig.isInitialized()) {
         response->markAsNoConfig();
         return;
     }
 
-    for (ReplSetConfig::MemberIterator it = _rsConfig.membersBegin(); it != _rsConfig.membersEnd();
-         ++it) {
-        if (it->isHidden() || it->getSlaveDelay() > Seconds{0}) {
-            continue;
-        }
-
-        if (it->isElectable()) {
-            response->addHost(it->getHostAndPort());
-        } else if (it->isArbiter()) {
-            response->addArbiter(it->getHostAndPort());
-        } else {
-            response->addPassive(it->getHostAndPort());
-        }
-    }
-
     response->setReplSetName(_rsConfig.getReplSetName());
     if (myState.removed()) {
         response->markAsNoConfig();
         return;
+    }
+
+    invariant(!_rsConfig.members().empty());
+
+    const auto& self = _rsConfig.members()[_selfIndex];
+
+    const auto horizon = self.determineHorizon(horizonParams);
+
+    for (const auto& member : _rsConfig.members()) {
+        if (member.isHidden() || member.getSlaveDelay() > Seconds{0}) {
+            continue;
+        }
+        auto hostView = member.getHostAndPort(horizon);
+
+        if (member.isElectable()) {
+            response->addHost(std::move(hostView));
+        } else if (member.isArbiter()) {
+            response->addArbiter(std::move(hostView));
+        } else {
+            response->addPassive(std::move(hostView));
+        }
     }
 
     response->setReplSetVersion(_rsConfig.getConfigVersion());
@@ -1709,7 +1767,7 @@ void TopologyCoordinator::fillIsMasterForReplSet(IsMasterResponse* response) {
 
     const MemberConfig* curPrimary = _currentPrimaryMember();
     if (curPrimary) {
-        response->setPrimary(curPrimary->getHostAndPort());
+        response->setPrimary(curPrimary->getHostAndPort(horizon));
     }
 
     const MemberConfig& selfConfig = _rsConfig.getMemberAt(_selfIndex);
@@ -1928,7 +1986,7 @@ TopologyCoordinator::UnelectableReasonMask TopologyCoordinator::_getUnelectableR
 }
 
 TopologyCoordinator::UnelectableReasonMask TopologyCoordinator::_getMyUnelectableReason(
-    const Date_t now, StartElectionReason reason) const {
+    const Date_t now, StartElectionReasonEnum reason) const {
     UnelectableReasonMask result = None;
     const OpTime lastApplied = getMyLastAppliedOpTime();
     if (lastApplied.isNull()) {
@@ -1956,11 +2014,13 @@ TopologyCoordinator::UnelectableReasonMask TopologyCoordinator::_getMyUnelectabl
         result |= NotSecondary;
     }
 
-    if (reason == StartElectionReason::kPriorityTakeover && !_amIFreshEnoughForPriorityTakeover()) {
+    if (reason == StartElectionReasonEnum::kPriorityTakeover &&
+        !_amIFreshEnoughForPriorityTakeover()) {
         result |= NotCloseEnoughToLatestForPriorityTakeover;
     }
 
-    if (reason == StartElectionReason::kCatchupTakeover && !_amIFreshEnoughForCatchupTakeover()) {
+    if (reason == StartElectionReasonEnum::kCatchupTakeover &&
+        !_amIFreshEnoughForCatchupTakeover()) {
         result |= NotFreshEnoughForCatchupTakeover;
     }
     return result;
@@ -2061,9 +2121,12 @@ int TopologyCoordinator::_getTotalPings() {
     return totalPings;
 }
 
+bool TopologyCoordinator::isSteppingDownUnconditionally() const {
+    return _leaderMode == LeaderMode::kSteppingDown;
+}
+
 bool TopologyCoordinator::isSteppingDown() const {
-    return _leaderMode == LeaderMode::kAttemptingStepDown ||
-        _leaderMode == LeaderMode::kSteppingDown;
+    return isSteppingDownUnconditionally() || _leaderMode == LeaderMode::kAttemptingStepDown;
 }
 
 void TopologyCoordinator::_setLeaderMode(TopologyCoordinator::LeaderMode newMode) {
@@ -2133,6 +2196,10 @@ MemberState TopologyCoordinator::getMemberState() const {
     return _followerMode;
 }
 
+std::vector<MemberData> TopologyCoordinator::getMemberData() const {
+    return _memberData;
+}
+
 bool TopologyCoordinator::canAcceptWrites() const {
     return _leaderMode == LeaderMode::kMaster;
 }
@@ -2166,7 +2233,7 @@ void TopologyCoordinator::processLoseElection() {
     _role = Role::kFollower;
 }
 
-bool TopologyCoordinator::attemptStepDown(
+bool TopologyCoordinator::tryToStartStepDown(
     long long termAtStart, Date_t now, Date_t waitUntil, Date_t stepDownUntil, bool force) {
 
     if (_role != Role::kLeader || _leaderMode == LeaderMode::kSteppingDown ||
@@ -2202,7 +2269,7 @@ bool TopologyCoordinator::attemptStepDown(
 
     // Stepdown attempt success!
     _stepDownUntil = stepDownUntil;
-    _stepDownSelfAndReplaceWith(-1);
+    prepareForUnconditionalStepDown();
     return true;
 }
 
@@ -2354,7 +2421,7 @@ void TopologyCoordinator::_stepDownSelfAndReplaceWith(int newPrimary) {
     _setLeaderMode(LeaderMode::kNotLeader);
 }
 
-bool TopologyCoordinator::updateLastCommittedOpTime() {
+bool TopologyCoordinator::updateLastCommittedOpTimeAndWallTime() {
     // If we're not primary or we're stepping down due to learning of a new term then we must not
     // advance the commit point.  If we are stepping down due to a user request, however, then it
     // is safe to advance the commit point, and in fact we must since the stepdown request may be
@@ -2366,71 +2433,88 @@ bool TopologyCoordinator::updateLastCommittedOpTime() {
     // Whether we use the applied or durable OpTime for the commit point is decided here.
     const bool useDurableOpTime = _rsConfig.getWriteConcernMajorityShouldJournal();
 
-    std::vector<OpTime> votingNodesOpTimes;
+    std::vector<OpTimeAndWallTime> votingNodesOpTimesAndWallTimes;
     for (const auto& memberData : _memberData) {
         int memberIndex = memberData.getConfigIndex();
         invariant(memberIndex >= 0);
         const auto& memberConfig = _rsConfig.getMemberAt(memberIndex);
         if (memberConfig.isVoter()) {
-            const auto opTime = useDurableOpTime ? memberData.getLastDurableOpTime()
-                                                 : memberData.getLastAppliedOpTime();
-            votingNodesOpTimes.push_back(opTime);
+            const OpTimeAndWallTime durableOpTime = {memberData.getLastDurableOpTime(),
+                                                     memberData.getLastDurableWallTime()};
+            const OpTimeAndWallTime appliedOpTime = {memberData.getLastAppliedOpTime(),
+                                                     memberData.getLastAppliedWallTime()};
+            const OpTimeAndWallTime opTime = useDurableOpTime ? durableOpTime : appliedOpTime;
+            votingNodesOpTimesAndWallTimes.push_back(opTime);
         }
     }
 
-    invariant(votingNodesOpTimes.size() > 0);
-    if (votingNodesOpTimes.size() < static_cast<unsigned long>(_rsConfig.getWriteMajority())) {
+    invariant(votingNodesOpTimesAndWallTimes.size() > 0);
+    if (votingNodesOpTimesAndWallTimes.size() <
+        static_cast<unsigned long>(_rsConfig.getWriteMajority())) {
         return false;
     }
-    std::sort(votingNodesOpTimes.begin(), votingNodesOpTimes.end());
+    std::sort(votingNodesOpTimesAndWallTimes.begin(), votingNodesOpTimesAndWallTimes.end());
 
     // need the majority to have this OpTime
-    OpTime committedOpTime =
-        votingNodesOpTimes[votingNodesOpTimes.size() - _rsConfig.getWriteMajority()];
-    return advanceLastCommittedOpTime(committedOpTime);
+    OpTimeAndWallTime committedOpTime =
+        votingNodesOpTimesAndWallTimes[votingNodesOpTimesAndWallTimes.size() -
+                                       _rsConfig.getWriteMajority()];
+
+    const bool fromSyncSource = false;
+    return advanceLastCommittedOpTimeAndWallTime(committedOpTime, fromSyncSource);
 }
 
-bool TopologyCoordinator::advanceLastCommittedOpTime(const OpTime& committedOpTime) {
+bool TopologyCoordinator::advanceLastCommittedOpTimeAndWallTime(OpTimeAndWallTime committedOpTime,
+                                                                bool fromSyncSource) {
     if (_selfIndex == -1) {
         // The config hasn't been installed or we are not in the config. This could happen
         // on heartbeats before installing a config.
         return false;
     }
 
-    if (committedOpTime == _lastCommittedOpTime) {
-        return false;  // Hasn't changed, so ignore it.
-    }
-
-    if (committedOpTime < _lastCommittedOpTime) {
-        LOG(1) << "Ignoring older committed snapshot optime: " << committedOpTime
-               << ", currentCommittedOpTime: " << _lastCommittedOpTime;
-        return false;  // This may have come from an out-of-order heartbeat. Ignore it.
-    }
-
     // This check is performed to ensure primaries do not commit an OpTime from a previous term.
-    if (_iAmPrimary() && committedOpTime < _firstOpTimeOfMyTerm) {
+    if (_iAmPrimary() && committedOpTime.opTime < _firstOpTimeOfMyTerm) {
         LOG(1) << "Ignoring older committed snapshot from before I became primary, optime: "
-               << committedOpTime << ", firstOpTimeOfMyTerm: " << _firstOpTimeOfMyTerm;
+               << committedOpTime.opTime << ", firstOpTimeOfMyTerm: " << _firstOpTimeOfMyTerm;
         return false;
     }
 
     // Arbiters don't have data so they always advance their commit point via heartbeats.
-    // Otherwise, only update the commit point if it's on the same oplog branch as our last applied.
     if (!_selfConfig().isArbiter() &&
-        getMyLastAppliedOpTime().getTerm() != committedOpTime.getTerm()) {
-        LOG(1) << "Ignoring commit point with different term than my lastApplied, since it may "
-                  "not be on the same oplog branch as mine. optime: "
-               << committedOpTime << ", my last applied: " << getMyLastAppliedOpTime();
+        getMyLastAppliedOpTime().getTerm() != committedOpTime.opTime.getTerm()) {
+        if (fromSyncSource) {
+            committedOpTime = std::min(committedOpTime, getMyLastAppliedOpTimeAndWallTime());
+        } else {
+            LOG(1) << "Ignoring commit point with different term than my lastApplied, since it "
+                      "may "
+                      "not be on the same oplog branch as mine. optime: "
+                   << committedOpTime
+                   << ", my last applied: " << getMyLastAppliedOpTimeAndWallTime();
+            return false;
+        }
+    }
+
+    if (committedOpTime.opTime == _lastCommittedOpTimeAndWallTime.opTime) {
+        return false;  // Hasn't changed, so ignore it.
+    }
+
+    if (committedOpTime.opTime < _lastCommittedOpTimeAndWallTime.opTime) {
+        LOG(1) << "Ignoring older committed snapshot optime: " << committedOpTime
+               << ", currentCommittedOpTime: " << _lastCommittedOpTimeAndWallTime;
         return false;
     }
 
-    LOG(2) << "Updating _lastCommittedOpTime to " << committedOpTime;
-    _lastCommittedOpTime = committedOpTime;
+    LOG(2) << "Updating _lastCommittedOpTimeAndWallTime to " << committedOpTime;
+    _lastCommittedOpTimeAndWallTime = committedOpTime;
     return true;
 }
 
 OpTime TopologyCoordinator::getLastCommittedOpTime() const {
-    return _lastCommittedOpTime;
+    return _lastCommittedOpTimeAndWallTime.opTime;
+}
+
+OpTimeAndWallTime TopologyCoordinator::getLastCommittedOpTimeAndWallTime() const {
+    return _lastCommittedOpTimeAndWallTime;
 }
 
 bool TopologyCoordinator::canCompleteTransitionToPrimary(long long termWhenDrainCompleted) const {
@@ -2582,7 +2666,7 @@ bool TopologyCoordinator::shouldChangeSyncSource(
         return true;
     }
 
-    if (MONGO_FAIL_POINT(disableMaxSyncSourceLagSecs)) {
+    if (MONGO_unlikely(disableMaxSyncSourceLagSecs.shouldFail())) {
         log() << "disableMaxSyncSourceLagSecs fail point enabled - not checking the most recent "
                  "OpTime, "
               << currentSourceOpTime.toString() << ", of our current sync source, " << currentSource
@@ -2619,7 +2703,7 @@ bool TopologyCoordinator::shouldChangeSyncSource(
 rpc::ReplSetMetadata TopologyCoordinator::prepareReplSetMetadata(
     const OpTime& lastVisibleOpTime) const {
     return rpc::ReplSetMetadata(_term,
-                                _lastCommittedOpTime,
+                                _lastCommittedOpTimeAndWallTime,
                                 lastVisibleOpTime,
                                 _rsConfig.getConfigVersion(),
                                 _rsConfig.getReplicaSetId(),
@@ -2628,7 +2712,7 @@ rpc::ReplSetMetadata TopologyCoordinator::prepareReplSetMetadata(
 }
 
 rpc::OplogQueryMetadata TopologyCoordinator::prepareOplogQueryMetadata(int rbid) const {
-    return rpc::OplogQueryMetadata(_lastCommittedOpTime,
+    return rpc::OplogQueryMetadata(_lastCommittedOpTimeAndWallTime,
                                    getMyLastAppliedOpTime(),
                                    rbid,
                                    _currentPrimaryIndex,
@@ -2639,41 +2723,56 @@ void TopologyCoordinator::processReplSetRequestVotes(const ReplSetRequestVotesAr
                                                      ReplSetRequestVotesResponse* response) {
     response->setTerm(_term);
 
+    if (MONGO_unlikely(voteNoInElection.shouldFail())) {
+        log() << "failpoint voteNoInElection enabled";
+        response->setVoteGranted(false);
+        response->setReason(str::stream() << "forced to vote no during dry run election due to "
+                                             "failpoint voteNoInElection set");
+        return;
+    }
+
+    if (MONGO_unlikely(voteYesInDryRunButNoInRealElection.shouldFail())) {
+        log() << "failpoint voteYesInDryRunButNoInRealElection enabled";
+        if (args.isADryRun()) {
+            response->setVoteGranted(true);
+            response->setReason(str::stream() << "forced to vote yes in dry run due to failpoint "
+                                                 "voteYesInDryRunButNoInRealElection set");
+        } else {
+            response->setVoteGranted(false);
+            response->setReason(str::stream()
+                                << "forced to vote no in real election due to failpoint "
+                                   "voteYesInDryRunButNoInRealElection set");
+        }
+        return;
+    }
+
     if (args.getTerm() < _term) {
         response->setVoteGranted(false);
         response->setReason(str::stream() << "candidate's term (" << args.getTerm()
-                                          << ") is lower than mine ("
-                                          << _term
-                                          << ")");
+                                          << ") is lower than mine (" << _term << ")");
     } else if (args.getConfigVersion() != _rsConfig.getConfigVersion()) {
         response->setVoteGranted(false);
-        response->setReason(str::stream() << "candidate's config version ("
-                                          << args.getConfigVersion()
-                                          << ") differs from mine ("
-                                          << _rsConfig.getConfigVersion()
-                                          << ")");
+        response->setReason(str::stream()
+                            << "candidate's config version (" << args.getConfigVersion()
+                            << ") differs from mine (" << _rsConfig.getConfigVersion() << ")");
     } else if (args.getSetName() != _rsConfig.getReplSetName()) {
         response->setVoteGranted(false);
-        response->setReason(str::stream() << "candidate's set name (" << args.getSetName()
-                                          << ") differs from mine ("
-                                          << _rsConfig.getReplSetName()
-                                          << ")");
+        response->setReason(str::stream()
+                            << "candidate's set name (" << args.getSetName()
+                            << ") differs from mine (" << _rsConfig.getReplSetName() << ")");
     } else if (args.getLastDurableOpTime() < getMyLastAppliedOpTime()) {
         response->setVoteGranted(false);
         response
             ->setReason(str::stream()
                         << "candidate's data is staler than mine. candidate's last applied OpTime: "
                         << args.getLastDurableOpTime().toString()
-                        << ", my last applied OpTime: "
-                        << getMyLastAppliedOpTime().toString());
+                        << ", my last applied OpTime: " << getMyLastAppliedOpTime().toString());
     } else if (!args.isADryRun() && _lastVote.getTerm() == args.getTerm()) {
         response->setVoteGranted(false);
         response->setReason(str::stream()
                             << "already voted for another candidate ("
                             << _rsConfig.getMemberAt(_lastVote.getCandidateIndex()).getHostAndPort()
-                            << ") this term ("
-                            << _lastVote.getTerm()
-                            << ")");
+                            << ") this term (" << _lastVote.getTerm() << ")");
     } else {
         int betterPrimary = _findHealthyPrimaryOfEqualOrGreaterPriority(args.getCandidateIndex());
         if (_selfConfig().isArbiter() && betterPrimary >= 0) {
@@ -2710,7 +2809,7 @@ void TopologyCoordinator::setPrimaryIndex(long long primaryIndex) {
 }
 
 Status TopologyCoordinator::becomeCandidateIfElectable(const Date_t now,
-                                                       StartElectionReason reason) {
+                                                       StartElectionReasonEnum reason) {
     if (_role == Role::kLeader) {
         return {ErrorCodes::NodeNotElectable, "Not standing for election again; already primary"};
     }
@@ -2743,6 +2842,33 @@ void TopologyCoordinator::restartHeartbeats() {
     }
 }
 
+OpTime TopologyCoordinator::latestKnownOpTime() const {
+    OpTime latest = getMyLastAppliedOpTime();
+    for (std::vector<MemberData>::const_iterator it = _memberData.begin(); it != _memberData.end();
+         ++it) {
+        // Ignore self
+        if (it->isSelf()) {
+            continue;
+        }
+        // Ignore down members
+        if (!it->up()) {
+            continue;
+        }
+        // Ignore removed nodes (not in config, so not valid).
+        if (it->getState().removed()) {
+            continue;
+        }
+
+        OpTime optime = it->getHeartbeatAppliedOpTime();
+
+        if (optime > latest) {
+            latest = optime;
+        }
+    }
+
+    return latest;
+}
+
 boost::optional<OpTime> TopologyCoordinator::latestKnownOpTimeSinceHeartbeatRestart() const {
     // The smallest OpTime in PV1.
     OpTime latest(Timestamp(0, 0), 0);
@@ -2767,12 +2893,12 @@ boost::optional<OpTime> TopologyCoordinator::latestKnownOpTimeSinceHeartbeatRest
     return latest;
 }
 
-std::map<int, boost::optional<OpTime>>
+std::map<MemberId, boost::optional<OpTime>>
 TopologyCoordinator::latestKnownOpTimeSinceHeartbeatRestartPerMember() const {
-    std::map<int, boost::optional<OpTime>> opTimesPerMember;
+    std::map<MemberId, boost::optional<OpTime>> opTimesPerMember;
     for (size_t i = 0; i < _memberData.size(); i++) {
         auto& member = _memberData[i];
-        int memberId = _rsConfig.getMemberAt(i).getId();
+        MemberId memberId = _rsConfig.getMemberAt(i).getId();
 
         if (!member.isUpdatedSinceRestart()) {
             opTimesPerMember[memberId] = boost::none;
@@ -2829,24 +2955,6 @@ bool TopologyCoordinator::checkIfCommitQuorumCanBeSatisfied(
         }
         return false;
     }
-}
-
-bool TopologyCoordinator::checkIfCommitQuorumIsSatisfied(
-    const CommitQuorumOptions& commitQuorum,
-    const std::vector<HostAndPort>& commitReadyMembers) const {
-    std::vector<MemberConfig> commitReadyMemberConfigs;
-    for (auto& commitReadyMember : commitReadyMembers) {
-        const MemberConfig* memberConfig = _rsConfig.findMemberByHostAndPort(commitReadyMember);
-
-        invariant(memberConfig);
-        commitReadyMemberConfigs.push_back(*memberConfig);
-    }
-
-    // Calling this with commit ready members only is the same as checking if the commit quorum is
-    // satisfied. Because the 'commitQuorum' is based on the participation of all the replica set
-    // members, and if the 'commitQuorum' can be satisfied with all the commit ready members, then
-    // the commit quorum is satisfied in this replica set configuration.
-    return checkIfCommitQuorumCanBeSatisfied(commitQuorum, commitReadyMemberConfigs);
 }
 
 }  // namespace repl

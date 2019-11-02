@@ -31,16 +31,16 @@
 
 #include "mongo/db/pipeline/accumulator.h"
 
+#include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/pipeline/accumulation_statement.h"
 #include "mongo/db/pipeline/expression.h"
-#include "mongo/db/pipeline/value.h"
 
 namespace mongo {
 
 using boost::intrusive_ptr;
 
-REGISTER_ACCUMULATOR(max, AccumulatorMax::create);
-REGISTER_ACCUMULATOR(min, AccumulatorMin::create);
+REGISTER_ACCUMULATOR(max, genericParseSingleExpressionAccumulator<AccumulatorMax>);
+REGISTER_ACCUMULATOR(min, genericParseSingleExpressionAccumulator<AccumulatorMin>);
 REGISTER_EXPRESSION(max, ExpressionFromAccumulator<AccumulatorMax>::parse);
 REGISTER_EXPRESSION(min, ExpressionFromAccumulator<AccumulatorMin>::parse);
 
@@ -89,4 +89,4 @@ intrusive_ptr<Accumulator> AccumulatorMax::create(
     const boost::intrusive_ptr<ExpressionContext>& expCtx) {
     return new AccumulatorMax(expCtx);
 }
-}
+}  // namespace mongo

@@ -43,7 +43,7 @@
 #include "mongo/db/service_context.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 namespace repl {
@@ -84,7 +84,7 @@ ReplicationProcess::ReplicationProcess(
       _rbid(kUninitializedRollbackId) {}
 
 Status ReplicationProcess::refreshRollbackID(OperationContext* opCtx) {
-    stdx::lock_guard<stdx::mutex> lock(_mutex);
+    stdx::lock_guard<Latch> lock(_mutex);
 
     auto rbidResult = _storageInterface->getRollbackID(opCtx);
     if (!rbidResult.isOK()) {
@@ -102,7 +102,7 @@ Status ReplicationProcess::refreshRollbackID(OperationContext* opCtx) {
 }
 
 int ReplicationProcess::getRollbackID() const {
-    stdx::lock_guard<stdx::mutex> lock(_mutex);
+    stdx::lock_guard<Latch> lock(_mutex);
     if (kUninitializedRollbackId == _rbid) {
         // This may happen when serverStatus is called by an internal client before we have a chance
         // to read the rollback ID from storage.
@@ -112,7 +112,7 @@ int ReplicationProcess::getRollbackID() const {
 }
 
 Status ReplicationProcess::initializeRollbackID(OperationContext* opCtx) {
-    stdx::lock_guard<stdx::mutex> lock(_mutex);
+    stdx::lock_guard<Latch> lock(_mutex);
 
     invariant(kUninitializedRollbackId == _rbid);
 
@@ -132,7 +132,7 @@ Status ReplicationProcess::initializeRollbackID(OperationContext* opCtx) {
 }
 
 Status ReplicationProcess::incrementRollbackID(OperationContext* opCtx) {
-    stdx::lock_guard<stdx::mutex> lock(_mutex);
+    stdx::lock_guard<Latch> lock(_mutex);
 
     auto status = _storageInterface->incrementRollbackID(opCtx);
 

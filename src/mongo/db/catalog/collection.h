@@ -30,6 +30,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -39,7 +40,6 @@
 #include "mongo/base/string_data.h"
 #include "mongo/bson/mutable/damage_vector.h"
 #include "mongo/bson/timestamp.h"
-#include "mongo/db/catalog/collection_info_cache.h"
 #include "mongo/db/catalog/collection_options.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/logical_session_id.h"
@@ -51,14 +51,12 @@
 #include "mongo/db/storage/capped_callback.h"
 #include "mongo/db/storage/record_store.h"
 #include "mongo/db/storage/snapshot.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/stdx/condition_variable.h"
-#include "mongo/stdx/functional.h"
-#include "mongo/stdx/mutex.h"
+#include "mongo/util/decorable.h"
 
 namespace mongo {
 class CappedCallback;
-class CollectionCatalogEntry;
-class DatabaseCatalogEntry;
 class ExtentManager;
 class IndexCatalog;
 class IndexCatalogEntry;
@@ -138,7 +136,7 @@ private:
     mutable stdx::condition_variable _notifier;
 
     // Mutex used with '_notifier'. Protects access to '_version'.
-    mutable stdx::mutex _mutex;
+    mutable Mutex _mutex = MONGO_MAKE_LATCH("CappedInsertNotifier::_mutex");
 
     // A counter, incremented on insertion of new data into the capped collection.
     //
@@ -150,7 +148,7 @@ private:
     bool _dead = false;
 };
 
-class Collection {
+class Collection : public Decorable<Collection> {
 public:
     enum class StoreDeletedDoc { Off, On };
 
@@ -163,20 +161,34 @@ public:
     };
 
     /**
+     * A Collection::Factory is a factory class that constructs Collection objects.
+     */
+    class Factory {
+    public:
+        Factory() = default;
+        virtual ~Factory() = default;
+
+        static Factory* get(ServiceContext* service);
+        static Factory* get(OperationContext* opCtx);
+        static void set(ServiceContext* service, std::unique_ptr<Factory> factory);
+
+        /**
+         * Constructs a Collection object. This does not persist any state to the storage engine,
+         * only constructs an in-memory representation of what already exists on disk.
+         */
+        virtual std::unique_ptr<Collection> make(OperationContext* opCtx,
+                                                 const NamespaceString& nss,
+                                                 CollectionUUID uuid,
+                                                 std::unique_ptr<RecordStore> rs) const = 0;
+    };
+
+    /**
      * Callback function for callers of insertDocumentForBulkLoader().
      */
-    using OnRecordInsertedFn = stdx::function<Status(const RecordId& loc)>;
+    using OnRecordInsertedFn = std::function<Status(const RecordId& loc)>;
 
     Collection() = default;
     virtual ~Collection() = default;
-
-    virtual bool ok() const = 0;
-
-    virtual CollectionCatalogEntry* getCatalogEntry() = 0;
-    virtual const CollectionCatalogEntry* getCatalogEntry() const = 0;
-
-    virtual CollectionInfoCache* infoCache() = 0;
-    virtual const CollectionInfoCache* infoCache() const = 0;
 
     virtual const NamespaceString& ns() const = 0;
 
@@ -184,18 +196,20 @@ public:
      * Sets a new namespace on this Collection, in the case that the Collection is being renamed.
      * In general, reads and writes to Collection objects are synchronized using locks from the lock
      * manager. However, there is special synchronization for ns() and setNs() so that the
-     * UUIDCatalog can perform UUID to namespace lookup without holding a Collection lock. See
-     * UUIDCatalog::setCollectionNamespace().
+     * CollectionCatalog can perform UUID to namespace lookup without holding a Collection lock. See
+     * CollectionCatalog::setCollectionNamespace().
      */
     virtual void setNs(NamespaceString nss) = 0;
 
-    virtual OptionalCollectionUUID uuid() const = 0;
+    virtual UUID uuid() const = 0;
 
     virtual const IndexCatalog* getIndexCatalog() const = 0;
     virtual IndexCatalog* getIndexCatalog() = 0;
 
     virtual const RecordStore* getRecordStore() const = 0;
     virtual RecordStore* getRecordStore() = 0;
+
+    virtual const BSONObj getValidatorDoc() const = 0;
 
     virtual bool requiresIdIndex() const = 0;
 
@@ -260,9 +274,8 @@ public:
      * this method.
      */
     virtual Status insertDocumentsForOplog(OperationContext* const opCtx,
-                                           const DocWriter* const* const docs,
-                                           Timestamp* timestamps,
-                                           const size_t nDocs) = 0;
+                                           std::vector<Record>* records,
+                                           const std::vector<Timestamp>& timestamps) = 0;
 
     /**
      * Inserts a document into the record store for a bulk loader that manages the index building
@@ -315,34 +328,20 @@ public:
      * removes all documents as fast as possible
      * indexes before and after will be the same
      * as will other characteristics.
+     *
+     * The caller should hold a collection X lock and ensure there are no index builds in progress
+     * on the collection.
      */
     virtual Status truncate(OperationContext* const opCtx) = 0;
-
-    /**
-     * @return OK if the validate run successfully
-     *         OK will be returned even if corruption is found
-     *         deatils will be in result.
-     */
-    virtual Status validate(OperationContext* const opCtx,
-                            const ValidateCmdLevel level,
-                            bool background,
-                            std::unique_ptr<Lock::CollectionLock> collLk,
-                            ValidateResults* const results,
-                            BSONObjBuilder* const output) = 0;
-
-    /**
-     * forces data into cache.
-     */
-    virtual Status touch(OperationContext* const opCtx,
-                         const bool touchData,
-                         const bool touchIndexes,
-                         BSONObjBuilder* const output) const = 0;
 
     /**
      * Truncate documents newer than the document at 'end' from the capped
      * collection.  The collection cannot be completely emptied using this
      * function.  An assertion will be thrown if that is attempted.
      * @param inclusive - Truncate 'end' as well iff true
+     *
+     * The caller should hold a collection X lock and ensure there are no index builds in progress
+     * on the collection.
      */
     virtual void cappedTruncateAfter(OperationContext* const opCtx,
                                      RecordId end,
@@ -381,7 +380,13 @@ public:
                                    StringData newLevel,
                                    StringData newAction) = 0;
 
-    // -----------
+    /**
+     * Returns true if this is a temporary collection.
+     *
+     * Calling this function is somewhat costly because it requires accessing the storage engine's
+     * cache of collection information.
+     */
+    virtual bool isTemporary(OperationContext* opCtx) const = 0;
 
     //
     // Stats
@@ -411,7 +416,7 @@ public:
 
     virtual uint64_t getIndexSize(OperationContext* const opCtx,
                                   BSONObjBuilder* const details = nullptr,
-                                  const int scale = 1) = 0;
+                                  const int scale = 1) const = 0;
 
     /**
      * If return value is not boost::none, reads with majority read concern using an older snapshot
@@ -457,7 +462,11 @@ public:
      */
     virtual void establishOplogCollectionForLogging(OperationContext* opCtx) = 0;
 
-    virtual DatabaseCatalogEntry* dbce() const = 0;
+    virtual void init(OperationContext* opCtx) {}
+
+    virtual bool isInitialized() const {
+        return false;
+    }
 };
 
 }  // namespace mongo

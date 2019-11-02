@@ -10,7 +10,6 @@ selector:
   # The following tests fail because a certain command or functionality is not supported by
   # mongos. This command or functionality is placed in a comment next to the failing test.
   - jstests/core/apitest_db.js  # serverStatus output doesn't have storageEngine.
-  - jstests/core/apitest_db_profile_level.js  # profiling.
   - jstests/core/apply_ops*.js  # applyOps, SERVER-1439.
   - jstests/core/awaitdata_getmore_cmd.js  # capped collections.
   - jstests/core/bypass_doc_validation.js  # sharded $out output not permitted
@@ -24,7 +23,6 @@ selector:
   - jstests/core/dbhash.js  # dbhash.
   - jstests/core/dbhash2.js  # dbhash.
   - jstests/core/diagdata.js # Command not supported in mongos
-  - jstests/core/do_txn*.js  # doTxn
   - jstests/core/dropdb_race.js  # syncdelay.
   - jstests/core/fsync.js  # uses fsync.
   - jstests/core/geo_haystack*.js  # geoSearch.
@@ -33,9 +31,7 @@ selector:
   - jstests/core/index_id_options.js  # "local" database.
   - jstests/core/index9.js  # "local" database.
   - jstests/core/max_time_ms.js  # sleep, SERVER-2212.
-  - jstests/core/mr_replaceIntoDB.js  # MapReduceResult, SERVER-20495.
   - jstests/core/notablescan.js  # notablescan.
-  - jstests/core/profile*.js  # profiling.
   - jstests/core/queryoptimizera.js  # "local" database.
   - jstests/core/rename*.js # renameCollection.
   - jstests/core/stages*.js  # stageDebug.
@@ -59,13 +55,13 @@ selector:
   - jstests/core/bad_index_plugin.js
   - jstests/core/create_indexes.js
   - jstests/core/list_indexes_non_existent_ns.js
+  - jstests/core/mr_preserve_indexes.js
   - jstests/core/rename6.js
   # The following tests fail because they expect no databases to be created. However a DB is created
   # automatically when we shard a collection.
   - jstests/core/dbcase.js
   - jstests/core/dbcase2.js
   - jstests/core/no_db_created.js
-  - jstests/core/ns_length.js
   - jstests/core/views/*.js # Views tests aren't expected to work when collections are implicitly sharded.
   - jstests/core/killop_drop_collection.js # Uses fsyncLock.
   # These tests fail because sharded clusters do not clean up correctly after failed index builds.
@@ -88,10 +84,11 @@ selector:
   - jstests/core/index_multikey.js
   - jstests/core/optimized_match_explain.js
   - jstests/core/sort_array.js
-  # TODO: SERVER-16605 MapReduce into sharded collection with hashed index fails
-  - jstests/core/mr1.js
-  - jstests/core/mr3.js
-  - jstests/core/mr4.js
+  # mapReduce requires sharded output collections to be sharded by {_id: 1}. {_id: "hashed"} is not
+  # supported.
+  - jstests/core/mr_correctness.js
+  - jstests/core/mr_fail_invalid_js.js
+  - jstests/core/mr_scope.js
 
   ##
   ## Limitations with the way the runner file injects transactions.
@@ -104,6 +101,8 @@ selector:
   - jstests/core/bulk_legacy_enforce_gle.js
   - jstests/core/capped5.js
   - jstests/core/commands_with_uuid.js
+  - jstests/core/dbcase.js
+  - jstests/core/dbcase2.js
   - jstests/core/explain_execution_error.js
   - jstests/core/expr.js
   - jstests/core/find9.js
@@ -153,26 +152,8 @@ selector:
   # SERVER-38096 Mongos opCounter doesn't increase when last op causes the transaction to implicitly abort
   - jstests/core/opcounters_write_cmd.js
 
-  # Consecutive writes totalling more than the size upper threshold will cause the txn to
-  # abort with a TransactionTooLarge error.
-  - jstests/core/batch_size.js
-  - jstests/core/single_batch.js
-  # For insert1.js, only Windows DEBUG builds are affected. We compute the in-memory size
-  # of the transaction, which uses the size of the oplog entry and is 8 bytes larger on
-  # Windows debug builds than other builds.
-  - jstests/core/insert1.js
-
   # TODO: SERVER-38207 Cannot insert document with MaxKey shard key.
   - jstests/core/type8.js
-
-  # TODO: SERVER-38326 mapReduce cleanup doesn't obey writeConcern, rendering
-  # txn_passthrough_cmd_massage.js ineffective for preventing 2 phase drops
-  # from contesting db/coll locks.
-  - jstests/core/function_string_representations.js
-  - jstests/core/geo_mapreduce2.js
-  - jstests/core/mr*.js
-  - jstests/core/or4.js
-  - jstests/core/temp_cleanup.js
 
   # TODO: SERVER-38690 Mongos should throw write targeting errors in a transaction.
   - jstests/core/update_setOnInsert.js
@@ -229,7 +210,6 @@ selector:
   - jstests/core/doc_validation_options.js
   - jstests/core/geo_multinest0.js
   - jstests/core/insert_illegal_doc.js
-  - jstests/core/ns_length.js
   - jstests/core/push2.js
   - jstests/core/remove6.js
   - jstests/core/removeb.js
@@ -305,9 +285,6 @@ selector:
   - jstests/core/max_time_ms.js
   - jstests/core/oro.js
 
-  # Expects certain number of operations in the system.profile collection.
-  - jstests/core/profile*.js
-
   # Parallel Shell - we do not signal the override to end a txn when a parallel shell closes.
   - jstests/core/awaitdata_getmore_cmd.js
   - jstests/core/compact_keeps_indexes.js
@@ -334,6 +311,16 @@ selector:
   # op3 will still be using the snapshot from op1, and not see op2 at all.
   - jstests/core/cursora.js
   - jstests/core/bench_test1.js
+  - jstests/core/benchrun_pipeline_updates.js
+
+  # The tests below use applyOps, SERVER-1439.
+  - jstests/core/list_collections1.js
+  - jstests/core/list_collections_filter.js
+  - jstests/core/rename_stayTemp.js
+  - jstests/core/txns/prepare_transaction_fails_on_temp_collections.js
+
+  # Does not support tojson of command objects.
+  - jstests/core/SERVER-23626.js
 
   exclude_with_any_tags:
   # "Cowardly refusing to override read concern of command: ..."
@@ -346,8 +333,22 @@ selector:
   - assumes_no_implicit_index_creation
   - assumes_unsharded_collection
   - cannot_create_unique_index_when_using_hashed_shard_key
+  # Retrying a query can change whether a plan cache entry is active.
+  - inspects_whether_plan_cache_entry_is_active
+  # system.profile collection doesn't exist on mongos.
+  - requires_profiling
+  # The following tests can't work in this suite. One override of this suite changes the
+  # writeConcern of all commands, and the other attempts to adjust certain mapReduce commands to use
+  # majority write concern. Note that in sharded deployments even non "replace" output modes may use
+  # temporary collections for intermediate results.
+  - uses_map_reduce_with_temp_collections
 
 executor:
+  archive:
+    hooks:
+      - CheckReplDBHashInBackground
+      - CheckReplDBHash
+      - ValidateCollections
   config:
     shell_options:
       eval: >-
@@ -355,13 +356,15 @@ executor:
         load('jstests/libs/override_methods/implicitly_shard_accessed_collections.js');
         load('jstests/libs/override_methods/enable_sessions.js');
         load('jstests/libs/override_methods/txn_passthrough_cmd_massage.js');
-        load('jstests/libs/txns/txn_override.js');
+        load('jstests/libs/override_methods/network_error_and_txn_override.js');
       global_vars:
         TestData:
           defaultReadConcernLevel: "local"
           defaultTransactionReadConcernLevel: "local"
           defaultTransactionWriteConcernW: 1
           defaultWriteConcernW: 1
+          networkErrorAndTxnOverrideConfig:
+            wrapCRUDinTransactions: true
           sessionOptions:
             # Causal consistency is not required because tests in this suite only read from
             # primaries, only one node is electable in each shard, and they use transactions with
@@ -370,6 +373,7 @@ executor:
             causalConsistency: false
       readMode: commands
   hooks:
+  - class: CheckReplDBHashInBackground
   # The CheckReplDBHash hook waits until all operations have replicated to and have been applied
   # on the secondaries, so we run the ValidateCollections hook after it to ensure we're
   # validating the entire contents of the collection.
@@ -397,10 +401,5 @@ executor:
           transaction: 4
         enableTestCommands: 1
         numInitialSyncAttempts: 1
-        # TODO SERVER-38302: Disable the no-op writer.
-        writePeriodicNoops: true
-        # TODO: SERVER-38588 Hybrid index builds can conflict with prepared transactions on
-        # secondaries and miss documents.
-        enableHybridIndexBuilds: false
     num_rs_nodes_per_shard: 2
     num_shards: 2

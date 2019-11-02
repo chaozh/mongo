@@ -1,4 +1,5 @@
 test_kind: js_test
+use_in_multiversion_burn_in_tests: true
 
 selector:
   roots:
@@ -9,9 +10,6 @@ selector:
   - jstests/core/opcounters_write_cmd.js
   - jstests/core/read_after_optime.js
   - jstests/core/capped_update.js
-  # These tests change the featureCompatibilityVersion which makes it so transactions aren't
-  # supported.
-  - jstests/core/txns/abort_transactions_on_FCV_downgrade.js
   # These tests change the transactionLifetimeLimitSeconds server parameter which conflicts with how
   # the CheckReplDBHashInBackground hook doesn't want transactions to be reaped while it is running.
   - jstests/core/txns/abort_expired_transaction.js
@@ -21,13 +19,12 @@ selector:
   # command multiple times, which may observe the change to the "transactionLifetimeLimitSeconds"
   # server parameter.
   - jstests/core/set_param1.js
-  # TODO SERVER-35217: Attempting to kill a session while multiple transactions have been started on
-  # the server may lead to deadlock.
-  - jstests/core/txns/kill_sessions_kills_transaction.js
 
 executor:
   archive:
     hooks:
+      - CheckReplDBHashInBackground
+      - ValidateCollectionsInBackground
       - CheckReplDBHash
       - CheckReplOplogs
       - ValidateCollections
@@ -39,7 +36,8 @@ executor:
   # The CheckReplDBHash hook waits until all operations have replicated to and have been applied
   # on the secondaries, so we run the ValidateCollections hook after it to ensure we're
   # validating the entire contents of the collection.
-  # TODO SERVER-39321: Re-enable and archive the CheckReplDBHashInBackground hook.
+  - class: CheckReplDBHashInBackground
+  - class: ValidateCollectionsInBackground
   - class: CheckReplOplogs
   - class: CheckReplDBHash
   - class: ValidateCollections
@@ -50,11 +48,4 @@ executor:
     mongod_options:
       set_parameters:
         enableTestCommands: 1
-        # TODO SERVER-39321: Remove the following block now that SERVER-35377 has been resolved.
-        #
-        # When running tests that intentionally trigger a DuplicateKeyError, we somehow end up
-        # performing an atClusterTime read in the CheckReplDBHashInBackground hook based on an
-        # operationTime that is greater than anything in the oplog. The periodic no-op writer must
-        # be enabled to ensure that we eventually reach the clusterTime we are waiting for.
-        writePeriodicNoops: 1
     num_nodes: 2

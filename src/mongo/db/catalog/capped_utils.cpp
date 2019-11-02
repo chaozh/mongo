@@ -35,7 +35,6 @@
 
 #include "mongo/base/error_codes.h"
 #include "mongo/db/background.h"
-#include "mongo/db/catalog/collection_catalog_entry.h"
 #include "mongo/db/catalog/create_collection.h"
 #include "mongo/db/catalog/document_validation.h"
 #include "mongo/db/catalog/drop_collection.h"
@@ -45,11 +44,13 @@
 #include "mongo/db/client.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/curop.h"
+#include "mongo/db/index_builds_coordinator.h"
 #include "mongo/db/op_observer.h"
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/query/plan_yield_policy.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/service_context.h"
+#include "mongo/db/storage/durable_catalog.h"
 #include "mongo/db/views/view_catalog.h"
 #include "mongo/util/scopeguard.h"
 
@@ -63,14 +64,15 @@ Status emptyCapped(OperationContext* opCtx, const NamespaceString& collectionNam
 
     if (userInitiatedWritesAndNotPrimary) {
         return Status(ErrorCodes::NotMaster,
-                      str::stream() << "Not primary while truncating collection: "
-                                    << collectionName);
+                      str::stream()
+                          << "Not primary while truncating collection: " << collectionName);
     }
 
     Database* db = autoDb.getDb();
     uassert(ErrorCodes::NamespaceNotFound, "no such database", db);
 
-    Collection* collection = db->getCollection(opCtx, collectionName);
+    Collection* collection =
+        CollectionCatalog::get(opCtx).lookupCollectionByNamespace(collectionName);
     uassert(ErrorCodes::CommandNotSupportedOnView,
             str::stream() << "emptycapped not supported on view: " << collectionName.ns(),
             collection || !ViewCatalog::get(db)->lookup(opCtx, collectionName.ns()));
@@ -81,20 +83,16 @@ Status emptyCapped(OperationContext* opCtx, const NamespaceString& collectionNam
                       str::stream() << "Cannot truncate a system collection: " << collectionName);
     }
 
-    if (collectionName.isVirtualized()) {
-        return Status(ErrorCodes::IllegalOperation,
-                      str::stream() << "Cannot truncate a virtual collection: " << collectionName);
-    }
-
     if ((repl::ReplicationCoordinator::get(opCtx)->getReplicationMode() !=
          repl::ReplicationCoordinator::modeNone) &&
         collectionName.isOplog()) {
         return Status(ErrorCodes::OplogOperationUnsupported,
-                      str::stream() << "Cannot truncate a live oplog while replicating: "
-                                    << collectionName);
+                      str::stream()
+                          << "Cannot truncate a live oplog while replicating: " << collectionName);
     }
 
     BackgroundOperation::assertNoBgOpInProgForNs(collectionName.ns());
+    IndexBuildsCoordinator::get(opCtx)->assertNoIndexBuildInProgForCollection(collection->uuid());
 
     WriteUnitOfWork wuow(opCtx);
 
@@ -120,7 +118,7 @@ void cloneCollectionAsCapped(OperationContext* opCtx,
     NamespaceString fromNss(db->name(), shortFrom);
     NamespaceString toNss(db->name(), shortTo);
 
-    Collection* fromCollection = db->getCollection(opCtx, fromNss);
+    Collection* fromCollection = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(fromNss);
     if (!fromCollection) {
         uassert(ErrorCodes::CommandNotSupportedOnView,
                 str::stream() << "cloneCollectionAsCapped not supported for views: " << fromNss,
@@ -137,13 +135,12 @@ void cloneCollectionAsCapped(OperationContext* opCtx,
 
     uassert(ErrorCodes::NamespaceExists,
             str::stream() << "cloneCollectionAsCapped failed - destination collection " << toNss
-                          << " already exists. source collection: "
-                          << fromNss,
-            !db->getCollection(opCtx, toNss));
+                          << " already exists. source collection: " << fromNss,
+            !CollectionCatalog::get(opCtx).lookupCollectionByNamespace(toNss));
 
     // create new collection
     {
-        auto options = fromCollection->getCatalogEntry()->getCollectionOptions(opCtx);
+        auto options = DurableCatalog::get(opCtx)->getCollectionOptions(opCtx, fromNss);
         // The capped collection will get its own new unique id, as the conversion isn't reversible,
         // so it can't be rolled back.
         options.uuid.reset();
@@ -158,7 +155,7 @@ void cloneCollectionAsCapped(OperationContext* opCtx,
         uassertStatusOK(createCollection(opCtx, toNss.db().toString(), cmd.done()));
     }
 
-    Collection* toCollection = db->getCollection(opCtx, toNss);
+    Collection* toCollection = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(toNss);
     invariant(toCollection);  // we created above
 
     // how much data to ignore because it won't fit anyway
@@ -258,6 +255,7 @@ void convertToCapped(OperationContext* opCtx,
         ErrorCodes::NamespaceNotFound, str::stream() << "database " << dbname << " not found", db);
 
     BackgroundOperation::assertNoBgOpInProgForDb(dbname);
+    IndexBuildsCoordinator::get(opCtx)->assertNoBgOpInProgForDb(dbname);
 
     // Generate a temporary collection name that will not collide with any existing collections.
     auto tmpNameResult =
@@ -265,8 +263,7 @@ void convertToCapped(OperationContext* opCtx,
     uassertStatusOKWithContext(tmpNameResult,
                                str::stream()
                                    << "Cannot generate temporary collection namespace to convert "
-                                   << collectionName
-                                   << " to a capped collection");
+                                   << collectionName << " to a capped collection");
 
     const auto& longTmpName = tmpNameResult.getValue();
     const auto shortTmpName = longTmpName.coll().toString();

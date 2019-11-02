@@ -77,7 +77,7 @@ struct QuerySolutionNode {
      *
      * TODO: Consider outputting into a BSONObj or builder thereof.
      */
-    virtual void appendToString(mongoutils::str::stream* ss, int indent) const = 0;
+    virtual void appendToString(str::stream* ss, int indent) const = 0;
 
     //
     // Computed properties
@@ -147,7 +147,7 @@ struct QuerySolutionNode {
         for (size_t i = 0; i < this->children.size(); i++) {
             other->children.push_back(this->children[i]->clone());
         }
-        if (NULL != this->filter) {
+        if (nullptr != this->filter) {
             other->filter = this->filter->shallowClone();
         }
     }
@@ -179,16 +179,17 @@ protected:
     /**
      * Formatting helper used by toString().
      */
-    static void addIndent(mongoutils::str::stream* ss, int level);
+    static void addIndent(str::stream* ss, int level);
 
     /**
      * Every solution node has properties and this adds the debug info for the
      * properties.
      */
-    void addCommon(mongoutils::str::stream* ss, int indent) const;
+    void addCommon(str::stream* ss, int indent) const;
 
 private:
-    MONGO_DISALLOW_COPYING(QuerySolutionNode);
+    QuerySolutionNode(const QuerySolutionNode&) = delete;
+    QuerySolutionNode& operator=(const QuerySolutionNode&) = delete;
 };
 
 /**
@@ -228,17 +229,18 @@ struct QuerySolution {
      * Output a human-readable std::string representing the plan.
      */
     std::string toString() {
-        if (NULL == root) {
+        if (nullptr == root) {
             return "empty query solution";
         }
 
-        mongoutils::str::stream ss;
+        str::stream ss;
         root->appendToString(&ss, 0);
         return ss;
     }
 
 private:
-    MONGO_DISALLOW_COPYING(QuerySolution);
+    QuerySolution(const QuerySolution&) = delete;
+    QuerySolution& operator=(const QuerySolution&) = delete;
 };
 
 struct TextNode : public QuerySolutionNode {
@@ -251,7 +253,7 @@ struct TextNode : public QuerySolutionNode {
         return STAGE_TEXT;
     }
 
-    virtual void appendToString(mongoutils::str::stream* ss, int indent) const;
+    virtual void appendToString(str::stream* ss, int indent) const;
 
     // Text's return is LOC_AND_OBJ so it's fetched and has all fields.
     bool fetched() const {
@@ -295,7 +297,7 @@ struct CollectionScanNode : public QuerySolutionNode {
         return STAGE_COLLSCAN;
     }
 
-    virtual void appendToString(mongoutils::str::stream* ss, int indent) const;
+    virtual void appendToString(str::stream* ss, int indent) const;
 
     bool fetched() const {
         return true;
@@ -317,6 +319,15 @@ struct CollectionScanNode : public QuerySolutionNode {
     // Name of the namespace.
     std::string name;
 
+    // If present, the collection scan will seek directly to the RecordId of an oplog entry as
+    // close to 'minTs' as possible without going higher. Should only be set on forward oplog scans.
+    boost::optional<Timestamp> minTs;
+
+    // If present the collection scan will stop and return EOF the first time it sees a document
+    // that does not pass the filter and has 'ts' greater than 'maxTs'. Should only be set on
+    // forward oplog scans.
+    boost::optional<Timestamp> maxTs;
+
     // Should we make a tailable cursor?
     bool tailable;
 
@@ -325,10 +336,13 @@ struct CollectionScanNode : public QuerySolutionNode {
     // across a sharded cluster.
     bool shouldTrackLatestOplogTimestamp = false;
 
-    int direction;
+    int direction{1};
 
     // Whether or not to wait for oplog visibility on oplog collection scans.
     bool shouldWaitForOplogVisibility = false;
+
+    // Once the first matching document is found, assume that all documents after it must match.
+    bool stopApplyingFilterAfterFirstMatch = false;
 };
 
 struct AndHashNode : public QuerySolutionNode {
@@ -339,7 +353,7 @@ struct AndHashNode : public QuerySolutionNode {
         return STAGE_AND_HASH;
     }
 
-    virtual void appendToString(mongoutils::str::stream* ss, int indent) const;
+    virtual void appendToString(str::stream* ss, int indent) const;
 
     bool fetched() const;
     bool hasField(const std::string& field) const;
@@ -363,7 +377,7 @@ struct AndSortedNode : public QuerySolutionNode {
         return STAGE_AND_SORTED;
     }
 
-    virtual void appendToString(mongoutils::str::stream* ss, int indent) const;
+    virtual void appendToString(str::stream* ss, int indent) const;
 
     bool fetched() const;
     bool hasField(const std::string& field) const;
@@ -387,7 +401,7 @@ struct OrNode : public QuerySolutionNode {
         return STAGE_OR;
     }
 
-    virtual void appendToString(mongoutils::str::stream* ss, int indent) const;
+    virtual void appendToString(str::stream* ss, int indent) const;
 
     bool fetched() const;
     bool hasField(const std::string& field) const;
@@ -415,7 +429,7 @@ struct MergeSortNode : public QuerySolutionNode {
         return STAGE_SORT_MERGE;
     }
 
-    virtual void appendToString(mongoutils::str::stream* ss, int indent) const;
+    virtual void appendToString(str::stream* ss, int indent) const;
 
     bool fetched() const;
     bool hasField(const std::string& field) const;
@@ -451,7 +465,7 @@ struct FetchNode : public QuerySolutionNode {
         return STAGE_FETCH;
     }
 
-    virtual void appendToString(mongoutils::str::stream* ss, int indent) const;
+    virtual void appendToString(str::stream* ss, int indent) const;
 
     bool fetched() const {
         return true;
@@ -481,7 +495,7 @@ struct IndexScanNode : public QuerySolutionNode {
         return STAGE_IXSCAN;
     }
 
-    virtual void appendToString(mongoutils::str::stream* ss, int indent) const;
+    virtual void appendToString(str::stream* ss, int indent) const;
 
     bool fetched() const {
         return false;
@@ -526,6 +540,35 @@ struct IndexScanNode : public QuerySolutionNode {
     std::set<StringData> multikeyFields;
 };
 
+struct ReturnKeyNode : public QuerySolutionNode {
+    ReturnKeyNode(std::unique_ptr<QuerySolutionNode> child,
+                  std::vector<FieldPath> sortKeyMetaFields)
+        : QuerySolutionNode(std::move(child)), sortKeyMetaFields(std::move(sortKeyMetaFields)) {}
+
+    StageType getType() const final {
+        return STAGE_RETURN_KEY;
+    }
+
+    void appendToString(str::stream* ss, int indent) const final;
+
+    bool fetched() const final {
+        return children[0]->fetched();
+    }
+    bool hasField(const std::string& field) const final {
+        return false;
+    }
+    bool sortedByDiskLoc() const final {
+        return children[0]->sortedByDiskLoc();
+    }
+    const BSONObjSet& getSort() const final {
+        return children[0]->getSort();
+    }
+
+    QuerySolutionNode* clone() const final;
+
+    std::vector<FieldPath> sortKeyMetaFields;
+};
+
 /**
  * We have a few implementations of the projection functionality. They are chosen by constructing
  * a type derived from this abstract struct. The most general implementation 'ProjectionNodeDefault'
@@ -535,17 +578,15 @@ struct IndexScanNode : public QuerySolutionNode {
 struct ProjectionNode : QuerySolutionNode {
     ProjectionNode(std::unique_ptr<QuerySolutionNode> child,
                    const MatchExpression& fullExpression,
-                   BSONObj projection,
-                   ParsedProjection parsed)
+                   projection_ast::Projection proj)
         : QuerySolutionNode(std::move(child)),
           _sorts(SimpleBSONObjComparator::kInstance.makeBSONObjSet()),
           fullExpression(fullExpression),
-          projection(std::move(projection)),
-          parsed(parsed) {}
+          proj(std::move(proj)) {}
 
     void computeProperties() final;
 
-    void appendToString(mongoutils::str::stream* ss, int indent) const final;
+    void appendToString(str::stream* ss, int indent) const final;
 
     /**
      * Data from the projection node is considered fetch iff the child provides fetched data.
@@ -591,11 +632,7 @@ public:
     // Owned in the CanonicalQuery, not here.
     const MatchExpression& fullExpression;
 
-    // Given that we don't yet have a MatchExpression analogue for the expression language, we
-    // use a BSONObj.
-    BSONObj projection;
-
-    ParsedProjection parsed;
+    projection_ast::Projection proj;
 };
 
 /**
@@ -621,10 +658,9 @@ struct ProjectionNodeDefault final : ProjectionNode {
 struct ProjectionNodeCovered final : ProjectionNode {
     ProjectionNodeCovered(std::unique_ptr<QuerySolutionNode> child,
                           const MatchExpression& fullExpression,
-                          BSONObj projection,
-                          ParsedProjection parsed,
+                          projection_ast::Projection proj,
                           BSONObj coveredKeyObj)
-        : ProjectionNode(std::move(child), fullExpression, projection, parsed),
+        : ProjectionNode(std::move(child), fullExpression, std::move(proj)),
           coveredKeyObj(std::move(coveredKeyObj)) {}
 
     StageType getType() const final {
@@ -682,7 +718,7 @@ struct SortKeyGeneratorNode : public QuerySolutionNode {
 
     QuerySolutionNode* clone() const final;
 
-    void appendToString(mongoutils::str::stream* ss, int indent) const final;
+    void appendToString(str::stream* ss, int indent) const final;
 
     // The user-supplied sort pattern.
     BSONObj sortSpec;
@@ -697,7 +733,7 @@ struct SortNode : public QuerySolutionNode {
         return STAGE_SORT;
     }
 
-    virtual void appendToString(mongoutils::str::stream* ss, int indent) const;
+    virtual void appendToString(str::stream* ss, int indent) const;
 
     bool fetched() const {
         return children[0]->fetched();
@@ -739,7 +775,7 @@ struct LimitNode : public QuerySolutionNode {
         return STAGE_LIMIT;
     }
 
-    virtual void appendToString(mongoutils::str::stream* ss, int indent) const;
+    virtual void appendToString(str::stream* ss, int indent) const;
 
     bool fetched() const {
         return children[0]->fetched();
@@ -766,7 +802,7 @@ struct SkipNode : public QuerySolutionNode {
     virtual StageType getType() const {
         return STAGE_SKIP;
     }
-    virtual void appendToString(mongoutils::str::stream* ss, int indent) const;
+    virtual void appendToString(str::stream* ss, int indent) const;
 
     bool fetched() const {
         return children[0]->fetched();
@@ -799,7 +835,7 @@ struct GeoNear2DNode : public QuerySolutionNode {
     virtual StageType getType() const {
         return STAGE_GEO_NEAR_2D;
     }
-    virtual void appendToString(mongoutils::str::stream* ss, int indent) const;
+    virtual void appendToString(str::stream* ss, int indent) const;
 
     bool fetched() const {
         return true;
@@ -840,7 +876,7 @@ struct GeoNear2DSphereNode : public QuerySolutionNode {
     virtual StageType getType() const {
         return STAGE_GEO_NEAR_2DSPHERE;
     }
-    virtual void appendToString(mongoutils::str::stream* ss, int indent) const;
+    virtual void appendToString(str::stream* ss, int indent) const;
 
     bool fetched() const {
         return true;
@@ -885,7 +921,7 @@ struct ShardingFilterNode : public QuerySolutionNode {
     virtual StageType getType() const {
         return STAGE_SHARDING_FILTER;
     }
-    virtual void appendToString(mongoutils::str::stream* ss, int indent) const;
+    virtual void appendToString(str::stream* ss, int indent) const;
 
     bool fetched() const {
         return children[0]->fetched();
@@ -916,7 +952,7 @@ struct DistinctNode : public QuerySolutionNode {
     virtual StageType getType() const {
         return STAGE_DISTINCT_SCAN;
     }
-    virtual void appendToString(mongoutils::str::stream* ss, int indent) const;
+    virtual void appendToString(str::stream* ss, int indent) const;
 
     // This stage is created "on top" of normal planning and as such the properties
     // below don't really matter.
@@ -962,7 +998,7 @@ struct CountScanNode : public QuerySolutionNode {
     virtual StageType getType() const {
         return STAGE_COUNT_SCAN;
     }
-    virtual void appendToString(mongoutils::str::stream* ss, int indent) const;
+    virtual void appendToString(str::stream* ss, int indent) const;
 
     bool fetched() const {
         return false;
@@ -1001,7 +1037,7 @@ struct EnsureSortedNode : public QuerySolutionNode {
         return STAGE_ENSURE_SORTED;
     }
 
-    virtual void appendToString(mongoutils::str::stream* ss, int indent) const;
+    virtual void appendToString(str::stream* ss, int indent) const;
 
     bool fetched() const {
         return children[0]->fetched();

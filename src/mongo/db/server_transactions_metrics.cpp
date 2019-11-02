@@ -149,139 +149,19 @@ void ServerTransactionsMetrics::decrementCurrentPrepared() {
     _currentPrepared.fetchAndSubtract(1);
 }
 
-boost::optional<repl::OpTime> ServerTransactionsMetrics::_calculateOldestActiveOpTime(
-    WithLock) const {
-    if (_oldestActiveOplogEntryOpTimes.empty()) {
-        return boost::none;
+void ServerTransactionsMetrics::updateLastTransaction(size_t operationCount,
+                                                      size_t oplogOperationBytes,
+                                                      BSONObj writeConcern) {
+    stdx::lock_guard<Latch> lg(_mutex);
+    if (!_lastCommittedTransaction) {
+        _lastCommittedTransaction = LastCommittedTransaction();
     }
-    return *(_oldestActiveOplogEntryOpTimes.begin());
+    _lastCommittedTransaction->setOperationCount(operationCount);
+    _lastCommittedTransaction->setOplogOperationBytes(oplogOperationBytes);
+    _lastCommittedTransaction->setWriteConcern(std::move(writeConcern));
 }
 
-void ServerTransactionsMetrics::addActiveOpTime(repl::OpTime oldestOplogEntryOpTime) {
-    stdx::lock_guard<stdx::mutex> lm(_mutex);
-    auto ret = _oldestActiveOplogEntryOpTimes.insert(oldestOplogEntryOpTime);
-    // If ret.second is false, the OpTime we tried to insert already existed.
-    invariant(ret.second,
-              str::stream() << "This oplog entry OpTime already exists in "
-                            << "oldestActiveOplogEntryOpTimes."
-                            << "oldestOplogEntryOpTime: "
-                            << oldestOplogEntryOpTime.toString());
-
-    // Add this OpTime to the oldestNonMajorityCommittedOpTimes set with a finishOpTime of
-    // Timestamp::max() to signify that it has not been committed/aborted.
-    std::pair<repl::OpTime, repl::OpTime> nonMajCommittedOpTime(oldestOplogEntryOpTime,
-                                                                repl::OpTime::max());
-    auto ret2 = _oldestNonMajorityCommittedOpTimes.insert(nonMajCommittedOpTime);
-    // If ret2.second is false, the OpTime we tried to insert already existed.
-    invariant(ret2.second,
-              str::stream() << "This oplog entry OpTime already exists in "
-                            << "oldestNonMajorityCommittedOpTimes."
-                            << "oldestOplogEntryOpTime: "
-                            << oldestOplogEntryOpTime.toString());
-    _oldestActiveOplogEntryOpTime = _calculateOldestActiveOpTime(lm);
-}
-
-void ServerTransactionsMetrics::removeActiveOpTime(repl::OpTime oldestOplogEntryOpTime,
-                                                   boost::optional<repl::OpTime> finishOpTime) {
-    stdx::lock_guard<stdx::mutex> lm(_mutex);
-    auto it = _oldestActiveOplogEntryOpTimes.find(oldestOplogEntryOpTime);
-    invariant(it != _oldestActiveOplogEntryOpTimes.end(),
-              str::stream() << "This oplog entry OpTime does not exist in or has already been "
-                            << "removed from oldestActiveOplogEntryOpTimes."
-                            << "OpTime: "
-                            << oldestOplogEntryOpTime.toString());
-    _oldestActiveOplogEntryOpTimes.erase(it);
-
-    if (!finishOpTime) {
-        return;
-    }
-
-    // The transaction's oldestOplogEntryOpTime now has a corresponding finishTime, which will
-    // be its commit or abort oplog entry OpTime. Add this pair to the
-    // oldestNonMajorityCommittedOpTimes.
-    // Currently, the oldestOplogEntryOpTime will be a prepareOpTime so we will only have a
-    // finishOpTime if we are committing a prepared transaction or aborting an active prepared
-    // transaction.
-    std::pair<repl::OpTime, repl::OpTime> opTimeToRemove(oldestOplogEntryOpTime,
-                                                         repl::OpTime::max());
-    auto it2 = _oldestNonMajorityCommittedOpTimes.find(opTimeToRemove);
-    invariant(it2 != _oldestNonMajorityCommittedOpTimes.end(),
-              str::stream() << "This oplog entry OpTime does not exist in or has already been "
-                            << "removed from oldestNonMajorityCommittedOpTimes"
-                            << "oldestOplogEntryOpTime: "
-                            << oldestOplogEntryOpTime.toString());
-    _oldestNonMajorityCommittedOpTimes.erase(it2);
-
-    std::pair<repl::OpTime, repl::OpTime> nonMajCommittedOpTime(oldestOplogEntryOpTime,
-                                                                *finishOpTime);
-    auto ret = _oldestNonMajorityCommittedOpTimes.insert(nonMajCommittedOpTime);
-    // If ret.second is false, the OpTime we tried to insert already existed.
-    invariant(ret.second,
-              str::stream() << "This oplog entry OpTime pair already exists in "
-                            << "oldestNonMajorityCommittedOpTimes."
-                            << "oldestOplogEntryOpTime: "
-                            << oldestOplogEntryOpTime.toString()
-                            << "finishOpTime: "
-                            << finishOpTime->toString());
-    _oldestActiveOplogEntryOpTime = _calculateOldestActiveOpTime(lm);
-}
-
-boost::optional<repl::OpTime> ServerTransactionsMetrics::getOldestNonMajorityCommittedOpTime()
-    const {
-    stdx::lock_guard<stdx::mutex> lm(_mutex);
-    if (_oldestNonMajorityCommittedOpTimes.empty()) {
-        return boost::none;
-    }
-    const auto oldestNonMajorityCommittedOpTime = _oldestNonMajorityCommittedOpTimes.begin()->first;
-    invariant(!oldestNonMajorityCommittedOpTime.isNull());
-    return oldestNonMajorityCommittedOpTime;
-}
-
-void ServerTransactionsMetrics::removeOpTimesLessThanOrEqToCommittedOpTime(
-    repl::OpTime committedOpTime) {
-    stdx::lock_guard<stdx::mutex> lm(_mutex);
-    // Iterate through oldestNonMajorityCommittedOpTimes and remove all pairs whose "finishOpTime"
-    // is now less than or equal to the commit point.
-    for (auto it = _oldestNonMajorityCommittedOpTimes.begin();
-         it != _oldestNonMajorityCommittedOpTimes.end();) {
-        if (it->second <= committedOpTime) {
-            it = _oldestNonMajorityCommittedOpTimes.erase(it);
-        } else {
-            ++it;
-        }
-    }
-}
-
-boost::optional<repl::OpTime>
-ServerTransactionsMetrics::getFinishOpTimeOfOldestNonMajCommitted_forTest() const {
-    stdx::lock_guard<stdx::mutex> lm(_mutex);
-    if (_oldestNonMajorityCommittedOpTimes.empty()) {
-        return boost::none;
-    }
-    const auto oldestNonMajorityCommittedOpTime =
-        _oldestNonMajorityCommittedOpTimes.begin()->second;
-    return oldestNonMajorityCommittedOpTime;
-}
-
-boost::optional<repl::OpTime> ServerTransactionsMetrics::getOldestActiveOpTime() const {
-    stdx::lock_guard<stdx::mutex> lm(_mutex);
-    return _oldestActiveOplogEntryOpTime;
-}
-
-unsigned int ServerTransactionsMetrics::getTotalActiveOpTimes() const {
-    stdx::lock_guard<stdx::mutex> lm(_mutex);
-    return _oldestActiveOplogEntryOpTimes.size();
-}
-
-Timestamp ServerTransactionsMetrics::_getOldestOpenUnpreparedReadTimestamp(
-    OperationContext* opCtx) {
-    // The history is not pinned in memory once a transaction has been prepared since reads
-    // are no longer possible. Therefore, the timestamp returned by the storage engine refers
-    // to the oldest read timestamp for any open unprepared transaction.
-    return opCtx->getServiceContext()->getStorageEngine()->getOldestOpenReadTimestamp();
-}
-
-void ServerTransactionsMetrics::updateStats(TransactionsStats* stats, OperationContext* opCtx) {
+void ServerTransactionsMetrics::updateStats(TransactionsStats* stats) {
     stats->setCurrentActive(_currentActive.load());
     stats->setCurrentInactive(_currentInactive.load());
     stats->setCurrentOpen(_currentOpen.load());
@@ -292,23 +172,11 @@ void ServerTransactionsMetrics::updateStats(TransactionsStats* stats, OperationC
     stats->setTotalPreparedThenCommitted(_totalPreparedThenCommitted.load());
     stats->setTotalPreparedThenAborted(_totalPreparedThenAborted.load());
     stats->setCurrentPrepared(_currentPrepared.load());
-    stats->setOldestOpenUnpreparedReadTimestamp(
-        ServerTransactionsMetrics::_getOldestOpenUnpreparedReadTimestamp(opCtx));
-    // Acquire _mutex before reading _oldestActiveOplogEntryOpTime.
-    stdx::lock_guard<stdx::mutex> lm(_mutex);
-    // To avoid compression loss, we use the null OpTime if no oldest active transaction optime is
-    // stored.
-    repl::OpTime oldestActiveOplogEntryOpTime = (_oldestActiveOplogEntryOpTime != boost::none)
-        ? _oldestActiveOplogEntryOpTime.get()
-        : repl::OpTime();
-    stats->setOldestActiveOplogEntryOpTime(oldestActiveOplogEntryOpTime);
-}
 
-void ServerTransactionsMetrics::clearOpTimes() {
-    stdx::lock_guard<stdx::mutex> lm(_mutex);
-    _oldestActiveOplogEntryOpTime = boost::none;
-    _oldestActiveOplogEntryOpTimes.clear();
-    _oldestNonMajorityCommittedOpTimes.clear();
+    stdx::lock_guard<Latch> lg(_mutex);
+    if (_lastCommittedTransaction) {
+        stats->setLastCommittedTransaction(*_lastCommittedTransaction);
+    }
 }
 
 namespace {
@@ -331,7 +199,7 @@ public:
         // lifecycle within a session. Both are assigned transaction numbers, and so both are often
         // referred to as “transactions”.
         RetryableWritesStats::get(opCtx)->updateStats(&stats);
-        ServerTransactionsMetrics::get(opCtx)->updateStats(&stats, opCtx);
+        ServerTransactionsMetrics::get(opCtx)->updateStats(&stats);
         return stats.toBSON();
     }
 

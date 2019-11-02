@@ -50,6 +50,7 @@
 #include "mongo/db/server_options.h"
 #include "mongo/logger/console_appender.h"
 #include "mongo/logger/logger.h"
+#include "mongo/logger/logv2_appender.h"
 #include "mongo/logger/message_event.h"
 #include "mongo/logger/message_event_utf8_encoder.h"
 #include "mongo/logger/ramlog.h"
@@ -57,12 +58,13 @@
 #include "mongo/logger/rotatable_file_manager.h"
 #include "mongo/logger/rotatable_file_writer.h"
 #include "mongo/logger/syslog_appender.h"
+#include "mongo/logv2/log_domain_global.h"
 #include "mongo/platform/process_id.h"
 #include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
 #include "mongo/util/processinfo.h"
 #include "mongo/util/quick_exit.h"
 #include "mongo/util/signal_handlers_synchronous.h"
+#include "mongo/util/str.h"
 
 #if defined(__APPLE__)
 #include <TargetConditionals.h>
@@ -177,21 +179,21 @@ static bool forkServer() {
         // this is run in the final child process (the server)
 
         FILE* f = freopen("/dev/null", "w", stdout);
-        if (f == NULL) {
+        if (f == nullptr) {
             cout << "Cant reassign stdout while forking server process: " << strerror(errno)
                  << endl;
             return false;
         }
 
         f = freopen("/dev/null", "w", stderr);
-        if (f == NULL) {
+        if (f == nullptr) {
             cout << "Cant reassign stderr while forking server process: " << strerror(errno)
                  << endl;
             return false;
         }
 
         f = freopen("/dev/null", "r", stdin);
-        if (f == NULL) {
+        if (f == nullptr) {
             cout << "Cant reassign stdin while forking server process: " << strerror(errno) << endl;
             return false;
         }
@@ -205,16 +207,13 @@ void forkServerOrDie() {
         quickExit(EXIT_FAILURE);
 }
 
-// On POSIX platforms we need to set our umask before opening any log files, so this
-// should depend on MungeUmask above, but not on Windows.
-MONGO_INITIALIZER_GENERAL(
-    ServerLogRedirection,
-    ("GlobalLogManager", "EndStartupOptionHandling", "ForkServer", "MungeUmask"),
-    ("default"))
+MONGO_INITIALIZER_GENERAL(ServerLogRedirection,
+                          ("GlobalLogManager", "EndStartupOptionHandling", "ForkServer"),
+                          ("default"))
 (InitializerContext*) {
     using logger::LogManager;
-    using logger::MessageEventEphemeral;
     using logger::MessageEventDetailsEncoder;
+    using logger::MessageEventEphemeral;
     using logger::MessageEventWithContextEncoder;
     using logger::MessageLogDomain;
     using logger::RotatableFileAppender;
@@ -222,25 +221,42 @@ MONGO_INITIALIZER_GENERAL(
 
     // Hook up this global into our logging encoder
     MessageEventDetailsEncoder::setMaxLogSizeKBSource(gMaxLogSizeKB);
+    LogManager* manager = logger::globalLogManager();
+    auto& lv2Manager = logv2::LogManager::global();
+    logv2::LogDomainGlobal::ConfigurationOptions lv2Config;
 
     if (serverGlobalParams.logWithSyslog) {
 #ifdef _WIN32
         return Status(ErrorCodes::InternalError,
                       "Syslog requested in Windows build; command line processor logic error");
 #else
-        using logger::SyslogAppender;
+        std::unique_ptr<logger::Appender<MessageEventEphemeral>> appender;
+        std::unique_ptr<logger::Appender<MessageEventEphemeral>> javascriptAppender;
 
-        StringBuilder sb;
-        sb << serverGlobalParams.binaryName << "." << serverGlobalParams.port;
-        openlog(strdup(sb.str().c_str()), LOG_PID | LOG_CONS, serverGlobalParams.syslogFacility);
-        LogManager* manager = logger::globalLogManager();
+        if (serverGlobalParams.logV2) {
+            appender = std::make_unique<logger::LogV2Appender<MessageEventEphemeral>>(
+                &(lv2Manager.getGlobalDomain()));
+            javascriptAppender = std::make_unique<logger::LogV2Appender<MessageEventEphemeral>>(
+                &(lv2Manager.getGlobalDomain()));
+
+            lv2Config._consoleEnabled = false;
+            lv2Config._syslogEnabled = true;
+            lv2Config._syslogFacility = serverGlobalParams.syslogFacility;
+        } else {
+            using logger::SyslogAppender;
+            StringBuilder sb;
+            sb << serverGlobalParams.binaryName << "." << serverGlobalParams.port;
+            openlog(
+                strdup(sb.str().c_str()), LOG_PID | LOG_CONS, serverGlobalParams.syslogFacility);
+            appender = std::make_unique<SyslogAppender<MessageEventEphemeral>>(
+                std::make_unique<MessageEventDetailsEncoder>());
+            javascriptAppender = std::make_unique<SyslogAppender<MessageEventEphemeral>>(
+                std::make_unique<MessageEventDetailsEncoder>());
+        }
         manager->getGlobalDomain()->clearAppenders();
-        manager->getGlobalDomain()->attachAppender(
-            std::make_unique<SyslogAppender<MessageEventEphemeral>>(
-                std::make_unique<logger::MessageEventDetailsEncoder>()));
-        manager->getNamedDomain("javascriptOutput")
-            ->attachAppender(std::make_unique<SyslogAppender<MessageEventEphemeral>>(
-                std::make_unique<logger::MessageEventDetailsEncoder>()));
+        manager->getGlobalDomain()->attachAppender(std::move(appender));
+        manager->getNamedDomain("javascriptOutput")->attachAppender(std::move(javascriptAppender));
+
 #endif  // defined(_WIN32)
     } else if (!serverGlobalParams.logpath.empty()) {
         fassert(16448, !serverGlobalParams.logWithSyslog);
@@ -254,17 +270,15 @@ MONGO_INITIALIZER_GENERAL(
             exists = boost::filesystem::exists(absoluteLogpath);
         } catch (boost::filesystem::filesystem_error& e) {
             return Status(ErrorCodes::FileNotOpen,
-                          mongoutils::str::stream() << "Failed probe for \"" << absoluteLogpath
-                                                    << "\": "
-                                                    << e.code().message());
+                          str::stream() << "Failed probe for \"" << absoluteLogpath
+                                        << "\": " << e.code().message());
         }
 
         if (exists) {
             if (boost::filesystem::is_directory(absoluteLogpath)) {
-                return Status(
-                    ErrorCodes::FileNotOpen,
-                    mongoutils::str::stream() << "logpath \"" << absoluteLogpath
-                                              << "\" should name a file, not a directory.");
+                return Status(ErrorCodes::FileNotOpen,
+                              str::stream() << "logpath \"" << absoluteLogpath
+                                            << "\" should name a file, not a directory.");
             }
 
             if (!serverGlobalParams.logAppend && boost::filesystem::is_regular(absoluteLogpath)) {
@@ -276,47 +290,91 @@ MONGO_INITIALIZER_GENERAL(
                           << renameTarget << "\".";
                 } else {
                     return Status(ErrorCodes::FileRenameFailed,
-                                  mongoutils::str::stream()
+                                  str::stream()
                                       << "Could not rename preexisting log file \""
-                                      << absoluteLogpath
-                                      << "\" to \""
-                                      << renameTarget
+                                      << absoluteLogpath << "\" to \"" << renameTarget
                                       << "\"; run with --logappend or manually remove file: "
                                       << ec.message());
                 }
             }
         }
 
-        StatusWithRotatableFileWriter writer = logger::globalRotatableFileManager()->openFile(
-            absoluteLogpath, serverGlobalParams.logAppend);
-        if (!writer.isOK()) {
-            return writer.getStatus();
+        std::unique_ptr<logger::Appender<MessageEventEphemeral>> appender;
+        std::unique_ptr<logger::Appender<MessageEventEphemeral>> javascriptAppender;
+
+        if (serverGlobalParams.logV2) {
+
+            appender = std::make_unique<logger::LogV2Appender<MessageEventEphemeral>>(
+                &(lv2Manager.getGlobalDomain()));
+            javascriptAppender = std::make_unique<logger::LogV2Appender<MessageEventEphemeral>>(
+                &(lv2Manager.getGlobalDomain()));
+
+            lv2Config._consoleEnabled = false;
+            lv2Config._fileEnabled = true;
+            lv2Config._filePath = absoluteLogpath;
+            lv2Config._fileRotationMode = serverGlobalParams.logRenameOnRotate
+                ? logv2::LogDomainGlobal::ConfigurationOptions::RotationMode::kRename
+                : logv2::LogDomainGlobal::ConfigurationOptions::RotationMode::kReopen;
+            lv2Config._fileOpenMode = serverGlobalParams.logAppend
+                ? logv2::LogDomainGlobal::ConfigurationOptions::OpenMode::kAppend
+                : logv2::LogDomainGlobal::ConfigurationOptions::OpenMode::kTruncate;
+
+            if (serverGlobalParams.logAppend && exists) {
+                log() << "***** SERVER RESTARTED *****";
+                // FIXME rewrite for logv2
+                // Status status = logger::RotatableFileWriter::Use(writer.getValue()).status();
+                // if (!status.isOK())
+                //    return status;
+            }
+
+        } else {
+            StatusWithRotatableFileWriter writer = logger::globalRotatableFileManager()->openFile(
+                absoluteLogpath, serverGlobalParams.logAppend);
+            if (!writer.isOK()) {
+                return writer.getStatus();
+            }
+            appender = std::make_unique<RotatableFileAppender<MessageEventEphemeral>>(
+                std::make_unique<MessageEventDetailsEncoder>(), writer.getValue());
+            javascriptAppender = std::make_unique<RotatableFileAppender<MessageEventEphemeral>>(
+                std::make_unique<MessageEventDetailsEncoder>(), writer.getValue());
+            if (serverGlobalParams.logAppend && exists) {
+                log() << "***** SERVER RESTARTED *****";
+                Status status = logger::RotatableFileWriter::Use(writer.getValue()).status();
+                if (!status.isOK())
+                    return status;
+            }
         }
 
-        LogManager* manager = logger::globalLogManager();
         manager->getGlobalDomain()->clearAppenders();
-        manager->getGlobalDomain()->attachAppender(
-            std::make_unique<RotatableFileAppender<MessageEventEphemeral>>(
-                std::make_unique<MessageEventDetailsEncoder>(), writer.getValue()));
-        manager->getNamedDomain("javascriptOutput")
-            ->attachAppender(std::make_unique<RotatableFileAppender<MessageEventEphemeral>>(
-                std::make_unique<MessageEventDetailsEncoder>(), writer.getValue()));
+        manager->getGlobalDomain()->attachAppender(std::move(appender));
+        manager->getNamedDomain("javascriptOutput")->attachAppender(std::move(javascriptAppender));
 
-        if (serverGlobalParams.logAppend && exists) {
-            log() << "***** SERVER RESTARTED *****";
-            Status status = logger::RotatableFileWriter::Use(writer.getValue()).status();
-            if (!status.isOK())
-                return status;
-        }
     } else {
-        logger::globalLogManager()
-            ->getNamedDomain("javascriptOutput")
-            ->attachAppender(std::make_unique<logger::ConsoleAppender<MessageEventEphemeral>>(
-                std::make_unique<MessageEventDetailsEncoder>()));
+        if (serverGlobalParams.logV2) {
+            manager->getGlobalDomain()->clearAppenders();
+            manager->getGlobalDomain()->attachAppender(
+                std::make_unique<logger::LogV2Appender<MessageEventEphemeral>>(
+                    &(lv2Manager.getGlobalDomain())));
+            manager->getNamedDomain("javascriptOutput")
+                ->attachAppender(std::make_unique<logger::LogV2Appender<MessageEventEphemeral>>(
+                    &(lv2Manager.getGlobalDomain())));
+        } else {
+            logger::globalLogManager()
+                ->getNamedDomain("javascriptOutput")
+                ->attachAppender(std::make_unique<logger::ConsoleAppender<MessageEventEphemeral>>(
+                    std::make_unique<MessageEventDetailsEncoder>()));
+        }
+    }
+    if (!serverGlobalParams.logV2) {
+        logger::globalLogDomain()->attachAppender(
+            std::make_unique<RamLogAppender>(RamLog::get("global")));
     }
 
-    logger::globalLogDomain()->attachAppender(
-        std::make_unique<RamLogAppender>(RamLog::get("global")));
+
+    if (serverGlobalParams.logV2) {
+        lv2Config._format = serverGlobalParams.logFormat;
+        return lv2Manager.getGlobalDomainInternal().configure(lv2Config);
+    }
 
     return Status::OK();
 }
@@ -341,28 +399,7 @@ MONGO_INITIALIZER(RegisterShortCircuitExitHandler)(InitializerContext*) {
     return Status::OK();
 }
 
-// On non-windows platforms, drop rwx for group and other unless the
-// user has opted into using the system umask. To do so, we first read
-// out the current umask (by temporarily setting it to
-// no-permissions), and then or the returned umask with the
-// restrictions we want to apply and set it back. The overall effect
-// is to set the bits for 'other' and 'group', but leave umask bits
-// bits for 'user' unaltered.
-namespace {
-
-MONGO_INITIALIZER_WITH_PREREQUISITES(MungeUmask, ("EndStartupOptionHandling"))
-(InitializerContext*) {
-#ifndef _WIN32
-    if (!gHonorSystemUmask) {
-        umask(umask(S_IRWXU | S_IRWXG | S_IRWXO) | S_IRWXG | S_IRWXO);
-    }
-#endif
-
-    return Status::OK();
-}
-}  // namespace
-
-bool initializeServerGlobalState(ServiceContext* service) {
+bool initializeServerGlobalState(ServiceContext* service, PidFileWrite pidWrite) {
 #ifndef _WIN32
     if (!serverGlobalParams.noUnixSocket && !fs::is_directory(serverGlobalParams.socket)) {
         cout << serverGlobalParams.socket << " must be a directory" << endl;
@@ -370,7 +407,7 @@ bool initializeServerGlobalState(ServiceContext* service) {
     }
 #endif
 
-    if (!serverGlobalParams.pidFile.empty()) {
+    if (!serverGlobalParams.pidFile.empty() && pidWrite == PidFileWrite::kWrite) {
         if (!writePidFile(serverGlobalParams.pidFile)) {
             // error message logged in writePidFile
             return false;
@@ -378,6 +415,119 @@ bool initializeServerGlobalState(ServiceContext* service) {
     }
 
     return true;
+}
+
+#ifndef _WIN32
+namespace {
+// Handling for `honorSystemUmask` and `processUmask` setParameters.
+// Non-Windows platforms only.
+//
+// If honorSystemUmask is true, processUmask may not be set
+// and the umask will be left exactly as set by the OS.
+//
+// If honorSystemUmask is false, then we will still honor the 'user'
+// portion of the current umask, but the group/other bits will be
+// set to 1, or whatever value is provided by processUmask if specified.
+
+// processUmask set parameter may only override group/other bits.
+constexpr mode_t kValidUmaskBits = S_IRWXG | S_IRWXO;
+
+// By default, honorSystemUmask==false masks all group/other bits.
+constexpr mode_t kDefaultProcessUmask = S_IRWXG | S_IRWXO;
+
+bool honorSystemUmask = false;
+boost::optional<mode_t> umaskOverride;
+
+mode_t getUmaskOverride() {
+    return umaskOverride ? *umaskOverride : kDefaultProcessUmask;
+}
+
+// We need to set our umask before opening any log files.
+MONGO_INITIALIZER_GENERAL(MungeUmask, ("EndStartupOptionHandling"), ("ServerLogRedirection"))
+(InitializerContext*) {
+    if (!honorSystemUmask) {
+        // POSIX does not provide a mechanism for reading the current umask
+        // without modifying it.
+        // Do this conservatively by setting a short-lived umask of 0777
+        // in order to pull out the user portion of the current umask.
+        umask((umask(S_IRWXU | S_IRWXG | S_IRWXO) & S_IRWXU) | getUmaskOverride());
+    }
+
+    return Status::OK();
+}
+}  // namespace
+#endif
+
+// --setParameter honorSystemUmask
+Status HonorSystemUMaskServerParameter::setFromString(const std::string& value) {
+#ifndef _WIN32
+    if ((value == "0") || (value == "false")) {
+        // false may be specified with processUmask
+        // since it defines precisely how we're not honoring system umask.
+        honorSystemUmask = false;
+        return Status::OK();
+    }
+
+    if ((value == "1") || (value == "true")) {
+        if (umaskOverride) {
+            return {ErrorCodes::BadValue,
+                    "honorSystemUmask and processUmask may not be specified together"};
+        } else {
+            honorSystemUmask = true;
+            return Status::OK();
+        }
+    }
+
+    return {ErrorCodes::BadValue, "honorSystemUmask must be 'true' or 'false'"};
+#else
+    return {ErrorCodes::InternalError, "honerSystemUmask is not available on windows"};
+#endif
+}
+
+void HonorSystemUMaskServerParameter::append(OperationContext*,
+                                             BSONObjBuilder& b,
+                                             const std::string& name) {
+#ifndef _WIN32
+    b << name << honorSystemUmask;
+#endif
+}
+
+// --setParameter processUmask
+Status ProcessUMaskServerParameter::setFromString(const std::string& value) {
+#ifndef _WIN32
+    if (honorSystemUmask) {
+        return {ErrorCodes::BadValue,
+                "honorSystemUmask and processUmask may not be specified together"};
+    }
+
+    // Convert base from octal
+    const char* val = value.c_str();
+    char* end = nullptr;
+
+    auto mask = std::strtoul(val, &end, 8);
+    if (end && (end != (val + value.size()))) {
+        return {ErrorCodes::BadValue,
+                str::stream() << "'" << value << "' is not a valid octal value"};
+    }
+
+    if ((mask & kValidUmaskBits) != mask) {
+        return {ErrorCodes::BadValue,
+                str::stream() << "'" << value << "' attempted to set invalid umask bits"};
+    }
+
+    umaskOverride = static_cast<mode_t>(mask);
+    return Status::OK();
+#else
+    return {ErrorCodes::InternalError, "processUmask is not available on windows"};
+#endif
+}
+
+void ProcessUMaskServerParameter::append(OperationContext*,
+                                         BSONObjBuilder& b,
+                                         const std::string& name) {
+#ifndef _WIN32
+    b << name << static_cast<int>(getUmaskOverride());
+#endif
 }
 
 }  // namespace mongo

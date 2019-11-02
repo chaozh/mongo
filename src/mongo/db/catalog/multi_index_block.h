@@ -29,29 +29,30 @@
 
 #pragma once
 
+#include <functional>
 #include <iosfwd>
 #include <memory>
 #include <set>
 #include <string>
 #include <vector>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
 #include "mongo/base/string_data.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/db/background.h"
 #include "mongo/db/catalog/collection_options.h"
+#include "mongo/db/catalog/index_build_block.h"
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/index/index_access_method.h"
+#include "mongo/db/index/index_build_interceptor.h"
 #include "mongo/db/record_id.h"
-#include "mongo/stdx/functional.h"
-#include "mongo/stdx/mutex.h"
-#include "mongo/util/fail_point_service.h"
+#include "mongo/platform/mutex.h"
+#include "mongo/util/fail_point.h"
 
 namespace mongo {
 
-MONGO_FAIL_POINT_DECLARE(leaveIndexBuildUnfinishedForShutdown);
+extern FailPoint leaveIndexBuildUnfinishedForShutdown;
 
 class Collection;
 class MatchExpression;
@@ -70,7 +71,8 @@ class OperationContext;
  * (as it is itself essentially a form of rollback, you don't want to "rollback the rollback").
  */
 class MultiIndexBlock {
-    MONGO_DISALLOW_COPYING(MultiIndexBlock);
+    MultiIndexBlock(const MultiIndexBlock&) = delete;
+    MultiIndexBlock& operator=(const MultiIndexBlock&) = delete;
 
 public:
     MultiIndexBlock() = default;
@@ -84,8 +86,17 @@ public:
      *
      * By only requiring this call after init(), we allow owners of the object to exit without
      * further handling if they never use the object.
+     *
+     * `onCleanUp` will be called after all indexes have been removed from the catalog.
      */
-    void cleanUpAfterBuild(OperationContext* opCtx, Collection* collection);
+    using OnCleanUpFn = std::function<void()>;
+    void cleanUpAfterBuild(OperationContext* opCtx, Collection* collection, OnCleanUpFn onCleanUp);
+
+    /**
+     * Not all index aborts need this function, in particular index builds that do not need
+     * to timestamp catalog writes. This is a no-op.
+     */
+    static OnCleanUpFn kNoopOnCleanUpFn;
 
     static bool areHybridIndexBuildsEnabled();
 
@@ -111,7 +122,7 @@ public:
      *
      * Requires holding an exclusive database lock.
      */
-    using OnInitFn = stdx::function<Status(std::vector<BSONObj>& specs)>;
+    using OnInitFn = std::function<Status(std::vector<BSONObj>& specs)>;
     StatusWith<std::vector<BSONObj>> init(OperationContext* opCtx,
                                           Collection* collection,
                                           const std::vector<BSONObj>& specs,
@@ -185,9 +196,9 @@ public:
      *
      * Must not be in a WriteUnitOfWork.
      */
-    Status drainBackgroundWrites(
-        OperationContext* opCtx,
-        RecoveryUnit::ReadSource readSource = RecoveryUnit::ReadSource::kUnset);
+    Status drainBackgroundWrites(OperationContext* opCtx,
+                                 RecoveryUnit::ReadSource readSource,
+                                 IndexBuildInterceptor::DrainYieldPolicy drainYieldPolicy);
 
     /**
      * Check any constraits that may have been temporarily violated during the index build for
@@ -210,8 +221,8 @@ public:
      *
      * Requires holding an exclusive database lock.
      */
-    using OnCommitFn = stdx::function<void()>;
-    using OnCreateEachFn = stdx::function<void(const BSONObj& spec)>;
+    using OnCommitFn = std::function<void()>;
+    using OnCreateEachFn = std::function<void(const BSONObj& spec)>;
     Status commit(OperationContext* opCtx,
                   Collection* collection,
                   OnCreateEachFn onCreateEach,
@@ -273,6 +284,8 @@ public:
      */
     bool isBackgroundBuilding() const;
 
+    void setIndexBuildMethod(IndexBuildMethod indexBuildMethod);
+
     /**
      * State transitions:
      *
@@ -295,9 +308,9 @@ public:
 
 private:
     struct IndexToBuild {
-        std::unique_ptr<IndexCatalog::IndexBuildBlockInterface> block;
+        std::unique_ptr<IndexBuildBlock> block;
 
-        IndexAccessMethod* real = NULL;           // owned elsewhere
+        IndexAccessMethod* real = nullptr;        // owned elsewhere
         const MatchExpression* filterExpression;  // might be NULL, owned elsewhere
         std::unique_ptr<IndexAccessMethod::BulkBuilder> bulk;
 
@@ -322,14 +335,6 @@ private:
      */
     void _setStateToAbortedIfNotCommitted(StringData reason);
 
-    /**
-     * Updates CurOp's 'opDescription' field with the current state of this index build.
-     */
-    void _updateCurOpOpDescription(OperationContext* opCtx,
-                                   const NamespaceString& nss,
-                                   const std::vector<BSONObj>& indexSpecs,
-                                   bool isBuildingPhaseComplete) const;
-
     // Is set during init() and ensures subsequent function calls act on the same Collection.
     boost::optional<UUID> _collectionUUID;
 
@@ -347,8 +352,11 @@ private:
     // incorrect state set anywhere.
     bool _buildIsCleanedUp = true;
 
+    // Duplicate key constraints should be checked at least once in the MultiIndexBlock.
+    bool _constraintsChecked = false;
+
     // Protects member variables of this class declared below.
-    mutable stdx::mutex _mutex;
+    mutable Mutex _mutex = MONGO_MAKE_LATCH("MultiIndexBlock::_mutex");
 
     State _state = State::kUninitialized;
     std::string _abortReason;

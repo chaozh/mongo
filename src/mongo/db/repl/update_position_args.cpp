@@ -43,15 +43,24 @@ namespace repl {
 const char UpdatePositionArgs::kCommandFieldName[] = "replSetUpdatePosition";
 const char UpdatePositionArgs::kUpdateArrayFieldName[] = "optimes";
 const char UpdatePositionArgs::kAppliedOpTimeFieldName[] = "appliedOpTime";
+const char UpdatePositionArgs::kAppliedWallTimeFieldName[] = "appliedWallTime";
 const char UpdatePositionArgs::kDurableOpTimeFieldName[] = "durableOpTime";
+const char UpdatePositionArgs::kDurableWallTimeFieldName[] = "durableWallTime";
 const char UpdatePositionArgs::kMemberIdFieldName[] = "memberId";
 const char UpdatePositionArgs::kConfigVersionFieldName[] = "cfgver";
 
 UpdatePositionArgs::UpdateInfo::UpdateInfo(const OpTime& applied,
+                                           const Date_t& appliedWall,
                                            const OpTime& durable,
+                                           const Date_t& durableWall,
                                            long long aCfgver,
                                            long long aMemberId)
-    : appliedOpTime(applied), durableOpTime(durable), cfgver(aCfgver), memberId(aMemberId) {}
+    : appliedOpTime(applied),
+      appliedWallTime(appliedWall),
+      durableOpTime(durable),
+      durableWallTime(durableWall),
+      cfgver(aCfgver),
+      memberId(aMemberId) {}
 
 Status UpdatePositionArgs::initialize(const BSONObj& argsObj) {
     // grab the array of changes
@@ -67,8 +76,26 @@ Status UpdatePositionArgs::initialize(const BSONObj& argsObj) {
 
         OpTime appliedOpTime;
         status = bsonExtractOpTimeField(entry, kAppliedOpTimeFieldName, &appliedOpTime);
-        if (!status.isOK())
+        if (!status.isOK()) {
             return status;
+        }
+        Date_t appliedWallTime = Date_t();
+        BSONElement appliedWallTimeElement;
+        status = bsonExtractTypedField(
+            entry, kAppliedWallTimeFieldName, BSONType::Date, &appliedWallTimeElement);
+        if (!status.isOK()) {
+            return status;
+        }
+        appliedWallTime = appliedWallTimeElement.Date();
+
+        Date_t durableWallTime = Date_t();
+        BSONElement durableWallTimeElement;
+        status = bsonExtractTypedField(
+            entry, kDurableWallTimeFieldName, BSONType::Date, &durableWallTimeElement);
+        if (!status.isOK()) {
+            return status;
+        }
+        durableWallTime = durableWallTimeElement.Date();
 
         OpTime durableOpTime;
         status = bsonExtractOpTimeField(entry, kDurableOpTimeFieldName, &durableOpTime);
@@ -87,7 +114,8 @@ Status UpdatePositionArgs::initialize(const BSONObj& argsObj) {
         if (!status.isOK())
             return status;
 
-        _updates.push_back(UpdateInfo(appliedOpTime, durableOpTime, cfgver, memberID));
+        _updates.push_back(UpdateInfo(
+            appliedOpTime, appliedWallTime, durableOpTime, durableWallTime, cfgver, memberID));
     }
 
     return Status::OK();

@@ -28,6 +28,8 @@
 
 global:
     cpp_namespace: "mongo"
+    cpp_includes:
+    - "mongo/db/transaction_participant.h"
 
 server_parameters:
     maxTransactionLockRequestTimeoutMillis:
@@ -48,16 +50,28 @@ server_parameters:
             Lifetime given to each transaction.
             Transactions must eventually expire to preempt storage cache pressure immobilizing the system.
         set_at: [ startup, runtime ]
-        cpp_vartype: AtomicWord<std::int32_t>
+        cpp_vartype: AtomicWord<decltype(TransactionParticipant::observeTransactionLifetimeLimitSeconds)::Argument>
         cpp_varname: gTransactionLifetimeLimitSeconds
         validator:
             gte: 1
+        on_update: std::ref(TransactionParticipant::observeTransactionLifetimeLimitSeconds)
         default: 60
 
-    useMultipleOplogEntryFormatForTransactions:
+    maxNumberOfTransactionOperationsInSingleOplogEntry:
         description: >-
-            Use multi oplog format for transactions to allow transactions > 16MB.
+            Maximum number of operations to pack into a single oplog entry, when multi-oplog
+            format for transactions is in use.
         set_at: startup
-        cpp_vartype: bool
-        cpp_varname: gUseMultipleOplogEntryFormatForTransactions
-        default: false
+        cpp_vartype: int
+        cpp_varname: gMaxNumberOfTransactionOperationsInSingleOplogEntry
+        default: 2147483647  # INT_MAX
+        validator: { gte: 1 }
+
+    transactionSizeLimitBytes:
+        description: >-
+            Maximum total size of operations in a multi-document transaction.
+        set_at: [ startup, runtime ]
+        cpp_vartype: AtomicWord<long long>
+        cpp_varname: gTransactionSizeLimitBytes
+        default:
+          expr: std::numeric_limits<long long>::max()

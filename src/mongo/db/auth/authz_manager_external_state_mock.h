@@ -29,17 +29,16 @@
 
 #pragma once
 
+#include <functional>
 #include <map>
 #include <string>
 #include <vector>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/base/status.h"
 #include "mongo/db/auth/authz_manager_external_state_local.h"
 #include "mongo/db/auth/role_graph.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/stdx/functional.h"
 
 namespace mongo {
 
@@ -49,7 +48,8 @@ class AuthorizationManager;
  * Mock of the AuthzManagerExternalState class used only for testing.
  */
 class AuthzManagerExternalStateMock : public AuthzManagerExternalStateLocal {
-    MONGO_DISALLOW_COPYING(AuthzManagerExternalStateMock);
+    AuthzManagerExternalStateMock(const AuthzManagerExternalStateMock&) = delete;
+    AuthzManagerExternalStateMock& operator=(const AuthzManagerExternalStateMock&) = delete;
 
 public:
     AuthzManagerExternalStateMock();
@@ -70,7 +70,7 @@ public:
                          const NamespaceString& collectionName,
                          const BSONObj& query,
                          const BSONObj& projection,  // Currently unused in mock
-                         const stdx::function<void(const BSONObj&)>& resultProcessor);
+                         const std::function<void(const BSONObj&)>& resultProcessor);
 
     /**
      * Inserts the given user object into the "admin" database.

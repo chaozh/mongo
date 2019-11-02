@@ -98,6 +98,14 @@ repos:
       - yum/redhat/7/mongodb-org
       - yum/redhat/7Server/mongodb-org
 
+  - name: rhel80
+    type: rpm
+    edition: org
+    bucket: repo.mongodb.org
+    repos:
+      - yum/redhat/8/mongodb-org
+      - yum/redhat/8Server/mongodb-org
+
   - name: amazon
     type: rpm
     edition: org
@@ -126,6 +134,13 @@ repos:
     repos:
       - zypper/suse/12/mongodb-org
 
+  - name: suse15
+    type: rpm
+    edition: org
+    bucket: repo.mongodb.org
+    repos:
+      - zypper/suse/15/mongodb-org
+
   - name: debian81
     type: deb
     code_name: "jessie"
@@ -148,6 +163,17 @@ repos:
       - amd64
     repos:
       - apt/debian/dists/stretch/mongodb-org
+
+  - name: debian10
+    type: deb
+    code_name: "buster"
+    bucket: repo.mongodb.org
+    edition: org
+    component: main
+    architectures:
+      - amd64
+    repos:
+      - apt/debian/dists/buster/mongodb-org
 
   - name: debian71
     type: deb
@@ -258,6 +284,14 @@ repos:
       - yum/redhat/7/mongodb-enterprise
       - yum/redhat/7Server/mongodb-enterprise
 
+  - name: rhel80
+    type: rpm
+    edition: enterprise
+    bucket: repo.mongodb.com
+    repos:
+      - yum/redhat/8/mongodb-enterprise
+      - yum/redhat/8Server/mongodb-enterprise
+
   - name: amazon
     type: rpm
     edition: enterprise
@@ -285,6 +319,13 @@ repos:
     bucket: repo.mongodb.com
     repos:
       - zypper/suse/12/mongodb-enterprise
+
+  - name: suse15
+    type: rpm
+    edition: enterprise
+    bucket: repo.mongodb.com
+    repos:
+      - zypper/suse/15/mongodb-enterprise
 
   - name: debian92
     type: deb
@@ -376,6 +417,7 @@ repos:
     component: multiverse
     architectures:
       - amd64
+      - ppc64el
       - i386
       - s390x
       - arm64

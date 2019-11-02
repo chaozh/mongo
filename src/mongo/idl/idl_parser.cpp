@@ -35,7 +35,7 @@
 
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/command_generic_argument.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -76,9 +76,7 @@ bool IDLParserErrorContext::checkAndAssertTypeSlowPath(const BSONElement& elemen
     std::string path = getElementPath(element);
     uasserted(ErrorCodes::TypeMismatch,
               str::stream() << "BSON field '" << path << "' is the wrong type '"
-                            << typeName(elementType)
-                            << "', expected type '"
-                            << typeName(type)
+                            << typeName(elementType) << "', expected type '" << typeName(type)
                             << "'");
 }
 
@@ -93,10 +91,8 @@ bool IDLParserErrorContext::checkAndAssertBinDataTypeSlowPath(const BSONElement&
         std::string path = getElementPath(element);
         uasserted(ErrorCodes::TypeMismatch,
                   str::stream() << "BSON field '" << path << "' is the wrong bindData type '"
-                                << typeName(element.binDataType())
-                                << "', expected type '"
-                                << typeName(type)
-                                << "'");
+                                << typeName(element.binDataType()) << "', expected type '"
+                                << typeName(type) << "'");
     }
 
     return true;
@@ -117,9 +113,7 @@ bool IDLParserErrorContext::checkAndAssertTypes(const BSONElement& element,
         std::string type_str = toCommaDelimitedList(types);
         uasserted(ErrorCodes::TypeMismatch,
                   str::stream() << "BSON field '" << path << "' is the wrong type '"
-                                << typeName(element.type())
-                                << "', expected types '["
-                                << type_str
+                                << typeName(element.type()) << "', expected types '[" << type_str
                                 << "']");
     }
 
@@ -204,10 +198,8 @@ void IDLParserErrorContext::throwBadArrayFieldNumberSequence(std::uint32_t actua
     std::string path = getElementPath(StringData());
     uasserted(40423,
               str::stream() << "BSON array field '" << path << "' has a non-sequential value '"
-                            << actualValue
-                            << "' for an array field name, expected value '"
-                            << expectedValue
-                            << "'.");
+                            << actualValue << "' for an array field name, expected value '"
+                            << expectedValue << "'.");
 }
 
 void IDLParserErrorContext::throwBadEnumValue(int enumValue) const {
@@ -243,6 +235,17 @@ NamespaceString IDLParserErrorContext::parseNSCollectionRequired(StringData dbNa
             nss.isValid());
 
     return nss;
+}
+
+NamespaceStringOrUUID IDLParserErrorContext::parseNsOrUUID(StringData dbname,
+                                                           const BSONElement& element) {
+    if (element.type() == BinData && element.binDataType() == BinDataType::newUUID) {
+        return {dbname.toString(), uassertStatusOK(UUID::parse(element))};
+    } else {
+        // Ensure collection identifier is not a Command
+        const NamespaceString nss(parseNSCollectionRequired(dbname, element));
+        return nss;
+    }
 }
 
 void IDLParserErrorContext::appendGenericCommandArguments(
@@ -283,7 +286,7 @@ std::vector<ConstDataRange> transformVector(const std::vector<std::vector<std::u
     output.reserve(input.size());
 
     std::transform(begin(input), end(input), std::back_inserter(output), [](auto&& vec) {
-        return makeCDR(vec);
+        return ConstDataRange(vec);
     });
 
     return output;

@@ -31,6 +31,9 @@
 
 #include "mongo/db/query/query_solution.h"
 
+#include <boost/algorithm/string/join.hpp>
+#include <boost/range/adaptor/transformed.hpp>
+
 #include "mongo/bson/bsontypes.h"
 #include "mongo/bson/mutable/document.h"
 #include "mongo/bson/simple_bsonelement_comparator.h"
@@ -40,6 +43,7 @@
 #include "mongo/db/query/index_bounds_builder.h"
 #include "mongo/db/query/planner_analysis.h"
 #include "mongo/db/query/planner_wildcard_helpers.h"
+#include "mongo/db/query/projection_ast_util.h"
 #include "mongo/db/query/query_planner_common.h"
 
 namespace mongo {
@@ -154,22 +158,22 @@ void addEqualityFieldSorts(const BSONObj& sortPattern,
         sortsOut->insert(prefixBob.obj());
     }
 }
-}
+}  // namespace
 
 string QuerySolutionNode::toString() const {
-    mongoutils::str::stream ss;
+    str::stream ss;
     appendToString(&ss, 0);
     return ss;
 }
 
 // static
-void QuerySolutionNode::addIndent(mongoutils::str::stream* ss, int level) {
+void QuerySolutionNode::addIndent(str::stream* ss, int level) {
     for (int i = 0; i < level; ++i) {
         *ss << "---";
     }
 }
 
-void QuerySolutionNode::addCommon(mongoutils::str::stream* ss, int indent) const {
+void QuerySolutionNode::addCommon(str::stream* ss, int indent) const {
     addIndent(ss, indent + 1);
     *ss << "fetched = " << fetched() << '\n';
     addIndent(ss, indent + 1);
@@ -186,7 +190,7 @@ void QuerySolutionNode::addCommon(mongoutils::str::stream* ss, int indent) const
 // TextNode
 //
 
-void TextNode::appendToString(mongoutils::str::stream* ss, int indent) const {
+void TextNode::appendToString(str::stream* ss, int indent) const {
     addIndent(ss, indent);
     *ss << "TEXT\n";
     addIndent(ss, indent + 1);
@@ -203,9 +207,9 @@ void TextNode::appendToString(mongoutils::str::stream* ss, int indent) const {
     *ss << "diacriticSensitive= " << ftsQuery->getDiacriticSensitive() << '\n';
     addIndent(ss, indent + 1);
     *ss << "indexPrefix = " << indexPrefix.toString() << '\n';
-    if (NULL != filter) {
+    if (nullptr != filter) {
         addIndent(ss, indent + 1);
-        *ss << " filter = " << filter->toString();
+        *ss << " filter = " << filter->debugString();
     }
     addCommon(ss, indent);
 }
@@ -228,14 +232,14 @@ QuerySolutionNode* TextNode::clone() const {
 CollectionScanNode::CollectionScanNode()
     : _sort(SimpleBSONObjComparator::kInstance.makeBSONObjSet()), tailable(false), direction(1) {}
 
-void CollectionScanNode::appendToString(mongoutils::str::stream* ss, int indent) const {
+void CollectionScanNode::appendToString(str::stream* ss, int indent) const {
     addIndent(ss, indent);
     *ss << "COLLSCAN\n";
     addIndent(ss, indent + 1);
     *ss << "ns = " << name << '\n';
-    if (NULL != filter) {
+    if (nullptr != filter) {
         addIndent(ss, indent + 1);
-        *ss << "filter = " << filter->toString();
+        *ss << "filter = " << filter->debugString();
     }
     addCommon(ss, indent);
 }
@@ -262,12 +266,12 @@ AndHashNode::AndHashNode() : _sort(SimpleBSONObjComparator::kInstance.makeBSONOb
 
 AndHashNode::~AndHashNode() {}
 
-void AndHashNode::appendToString(mongoutils::str::stream* ss, int indent) const {
+void AndHashNode::appendToString(str::stream* ss, int indent) const {
     addIndent(ss, indent);
     *ss << "AND_HASH\n";
-    if (NULL != filter) {
+    if (nullptr != filter) {
         addIndent(ss, indent + 1);
-        *ss << " filter = " << filter->toString() << '\n';
+        *ss << " filter = " << filter->debugString() << '\n';
     }
     addCommon(ss, indent);
     for (size_t i = 0; i < children.size(); ++i) {
@@ -316,7 +320,7 @@ AndSortedNode::AndSortedNode() : _sort(SimpleBSONObjComparator::kInstance.makeBS
 
 AndSortedNode::~AndSortedNode() {}
 
-void AndSortedNode::appendToString(mongoutils::str::stream* ss, int indent) const {
+void AndSortedNode::appendToString(str::stream* ss, int indent) const {
     addIndent(ss, indent);
     *ss << "AND_SORTED\n";
     addCommon(ss, indent);
@@ -366,12 +370,12 @@ OrNode::OrNode() : _sort(SimpleBSONObjComparator::kInstance.makeBSONObjSet()), d
 
 OrNode::~OrNode() {}
 
-void OrNode::appendToString(mongoutils::str::stream* ss, int indent) const {
+void OrNode::appendToString(str::stream* ss, int indent) const {
     addIndent(ss, indent);
     *ss << "OR\n";
-    if (NULL != filter) {
+    if (nullptr != filter) {
         addIndent(ss, indent + 1);
-        *ss << " filter = " << filter->toString() << '\n';
+        *ss << " filter = " << filter->debugString() << '\n';
     }
     addCommon(ss, indent);
     for (size_t i = 0; i < children.size(); ++i) {
@@ -427,12 +431,12 @@ MergeSortNode::MergeSortNode()
 
 MergeSortNode::~MergeSortNode() {}
 
-void MergeSortNode::appendToString(mongoutils::str::stream* ss, int indent) const {
+void MergeSortNode::appendToString(str::stream* ss, int indent) const {
     addIndent(ss, indent);
     *ss << "MERGE_SORT\n";
-    if (NULL != filter) {
+    if (nullptr != filter) {
         addIndent(ss, indent + 1);
-        *ss << " filter = " << filter->toString() << '\n';
+        *ss << " filter = " << filter->debugString() << '\n';
     }
     addCommon(ss, indent);
     for (size_t i = 0; i < children.size(); ++i) {
@@ -486,10 +490,10 @@ QuerySolutionNode* MergeSortNode::clone() const {
 
 FetchNode::FetchNode() : _sorts(SimpleBSONObjComparator::kInstance.makeBSONObjSet()) {}
 
-void FetchNode::appendToString(mongoutils::str::stream* ss, int indent) const {
+void FetchNode::appendToString(str::stream* ss, int indent) const {
     addIndent(ss, indent);
     *ss << "FETCH\n";
-    if (NULL != filter) {
+    if (nullptr != filter) {
         addIndent(ss, indent + 1);
         StringBuilder sb;
         *ss << "filter:\n";
@@ -523,15 +527,15 @@ IndexScanNode::IndexScanNode(IndexEntry index)
       shouldDedup(index.multikey),
       queryCollator(nullptr) {}
 
-void IndexScanNode::appendToString(mongoutils::str::stream* ss, int indent) const {
+void IndexScanNode::appendToString(str::stream* ss, int indent) const {
     addIndent(ss, indent);
     *ss << "IXSCAN\n";
     addIndent(ss, indent + 1);
     *ss << "indexName = " << index.identifier.catalogName << '\n';
     *ss << "keyPattern = " << index.keyPattern << '\n';
-    if (NULL != filter) {
+    if (nullptr != filter) {
         addIndent(ss, indent + 1);
-        *ss << "filter = " << filter->toString();
+        *ss << "filter = " << filter->debugString();
     }
     addIndent(ss, indent + 1);
     *ss << "direction = " << direction << '\n';
@@ -848,14 +852,41 @@ bool IndexScanNode::operator==(const IndexScanNode& other) const {
 }
 
 //
+// ReturnKeyNode
+//
+
+void ReturnKeyNode::appendToString(str::stream* ss, int indent) const {
+    addIndent(ss, indent);
+    *ss << "RETURN_KEY\n";
+    addIndent(ss, indent + 1);
+
+    *ss << "sortKeyMetaFields = ["
+        << boost::algorithm::join(
+               sortKeyMetaFields |
+                   boost::adaptors::transformed([](const auto& field) { return field.fullPath(); }),
+               ", ");
+    *ss << "]\n";
+    addCommon(ss, indent);
+    addIndent(ss, indent + 1);
+    *ss << "Child:" << '\n';
+    children[0]->appendToString(ss, indent + 2);
+}
+
+QuerySolutionNode* ReturnKeyNode::clone() const {
+    auto copy = std::make_unique<ReturnKeyNode>(
+        std::unique_ptr<QuerySolutionNode>(children[0]->clone()), std::vector(sortKeyMetaFields));
+    return copy.release();
+}
+
+//
 // ProjectionNode
 //
 
-void ProjectionNode::appendToString(mongoutils::str::stream* ss, int indent) const {
+void ProjectionNode::appendToString(str::stream* ss, int indent) const {
     addIndent(ss, indent);
     *ss << "PROJ\n";
     addIndent(ss, indent + 1);
-    *ss << "proj = " << projection.toString() << '\n';
+    *ss << "proj = " << projection_ast::astToDebugBSON(proj.root()).toString() << '\n';
     addIndent(ss, indent + 1);
     *ss << "type = " << projectionImplementationTypeToString() << '\n';
     addCommon(ss, indent);
@@ -877,7 +908,7 @@ void ProjectionNode::computeProperties() {
     for (auto&& sort : inputSorts) {
         bool sortCompatible = true;
         for (auto&& key : sort) {
-            if (!parsed.isFieldRetainedExactly(key.fieldNameStringData())) {
+            if (!proj.isFieldRetainedExactly(key.fieldNameStringData())) {
                 sortCompatible = false;
                 break;
             }
@@ -898,10 +929,7 @@ void ProjectionNode::cloneProjectionData(ProjectionNode* copy) const {
 
 ProjectionNode* ProjectionNodeDefault::clone() const {
     auto copy = std::make_unique<ProjectionNodeDefault>(
-        std::unique_ptr<QuerySolutionNode>(children[0]->clone()),
-        fullExpression,
-        projection,
-        parsed);
+        std::unique_ptr<QuerySolutionNode>(children[0]->clone()), fullExpression, proj);
     ProjectionNode::cloneProjectionData(copy.get());
     return copy.release();
 }
@@ -910,8 +938,7 @@ ProjectionNode* ProjectionNodeCovered::clone() const {
     auto copy = std::make_unique<ProjectionNodeCovered>(
         std::unique_ptr<QuerySolutionNode>(children[0]->clone()),
         fullExpression,
-        projection,
-        parsed,
+        proj,
         coveredKeyObj);
     ProjectionNode::cloneProjectionData(copy.get());
     return copy.release();
@@ -919,10 +946,7 @@ ProjectionNode* ProjectionNodeCovered::clone() const {
 
 ProjectionNode* ProjectionNodeSimple::clone() const {
     auto copy = std::make_unique<ProjectionNodeSimple>(
-        std::unique_ptr<QuerySolutionNode>(children[0]->clone()),
-        fullExpression,
-        projection,
-        parsed);
+        std::unique_ptr<QuerySolutionNode>(children[0]->clone()), fullExpression, proj);
     ProjectionNode::cloneProjectionData(copy.get());
     return copy.release();
 }
@@ -932,7 +956,7 @@ ProjectionNode* ProjectionNodeSimple::clone() const {
 // SortKeyGeneratorNode
 //
 
-void SortKeyGeneratorNode::appendToString(mongoutils::str::stream* ss, int indent) const {
+void SortKeyGeneratorNode::appendToString(str::stream* ss, int indent) const {
     addIndent(ss, indent);
     *ss << "SORT_KEY_GENERATOR\n";
     addIndent(ss, indent + 1);
@@ -954,7 +978,7 @@ QuerySolutionNode* SortKeyGeneratorNode::clone() const {
 // SortNode
 //
 
-void SortNode::appendToString(mongoutils::str::stream* ss, int indent) const {
+void SortNode::appendToString(str::stream* ss, int indent) const {
     addIndent(ss, indent);
     *ss << "SORT\n";
     addIndent(ss, indent + 1);
@@ -983,7 +1007,7 @@ QuerySolutionNode* SortNode::clone() const {
 //
 
 
-void LimitNode::appendToString(mongoutils::str::stream* ss, int indent) const {
+void LimitNode::appendToString(str::stream* ss, int indent) const {
     addIndent(ss, indent);
     *ss << "LIMIT\n";
     addIndent(ss, indent + 1);
@@ -1008,7 +1032,7 @@ QuerySolutionNode* LimitNode::clone() const {
 // SkipNode
 //
 
-void SkipNode::appendToString(mongoutils::str::stream* ss, int indent) const {
+void SkipNode::appendToString(str::stream* ss, int indent) const {
     addIndent(ss, indent);
     *ss << "SKIP\n";
     addIndent(ss, indent + 1);
@@ -1032,7 +1056,7 @@ QuerySolutionNode* SkipNode::clone() const {
 // GeoNear2DNode
 //
 
-void GeoNear2DNode::appendToString(mongoutils::str::stream* ss, int indent) const {
+void GeoNear2DNode::appendToString(str::stream* ss, int indent) const {
     addIndent(ss, indent);
     *ss << "GEO_NEAR_2D\n";
     addIndent(ss, indent + 1);
@@ -1041,9 +1065,9 @@ void GeoNear2DNode::appendToString(mongoutils::str::stream* ss, int indent) cons
     *ss << "keyPattern = " << index.keyPattern.toString() << '\n';
     addCommon(ss, indent);
     *ss << "nearQuery = " << nq->toString() << '\n';
-    if (NULL != filter) {
+    if (nullptr != filter) {
         addIndent(ss, indent + 1);
-        *ss << " filter = " << filter->toString();
+        *ss << " filter = " << filter->debugString();
     }
 }
 
@@ -1064,7 +1088,7 @@ QuerySolutionNode* GeoNear2DNode::clone() const {
 // GeoNear2DSphereNode
 //
 
-void GeoNear2DSphereNode::appendToString(mongoutils::str::stream* ss, int indent) const {
+void GeoNear2DSphereNode::appendToString(str::stream* ss, int indent) const {
     addIndent(ss, indent);
     *ss << "GEO_NEAR_2DSPHERE\n";
     addIndent(ss, indent + 1);
@@ -1075,9 +1099,9 @@ void GeoNear2DSphereNode::appendToString(mongoutils::str::stream* ss, int indent
     *ss << "baseBounds = " << baseBounds.toString() << '\n';
     addIndent(ss, indent + 1);
     *ss << "nearQuery = " << nq->toString() << '\n';
-    if (NULL != filter) {
+    if (nullptr != filter) {
         addIndent(ss, indent + 1);
-        *ss << " filter = " << filter->toString();
+        *ss << " filter = " << filter->debugString();
     }
 }
 
@@ -1098,10 +1122,10 @@ QuerySolutionNode* GeoNear2DSphereNode::clone() const {
 // ShardingFilterNode
 //
 
-void ShardingFilterNode::appendToString(mongoutils::str::stream* ss, int indent) const {
+void ShardingFilterNode::appendToString(str::stream* ss, int indent) const {
     addIndent(ss, indent);
     *ss << "SHARDING_FILTER\n";
-    if (NULL != filter) {
+    if (nullptr != filter) {
         addIndent(ss, indent + 1);
         StringBuilder sb;
         *ss << "filter:\n";
@@ -1124,7 +1148,7 @@ QuerySolutionNode* ShardingFilterNode::clone() const {
 // DistinctNode
 //
 
-void DistinctNode::appendToString(mongoutils::str::stream* ss, int indent) const {
+void DistinctNode::appendToString(str::stream* ss, int indent) const {
     addIndent(ss, indent);
     *ss << "DISTINCT\n";
     addIndent(ss, indent + 1);
@@ -1162,7 +1186,7 @@ void DistinctNode::computeProperties() {
 // CountScanNode
 //
 
-void CountScanNode::appendToString(mongoutils::str::stream* ss, int indent) const {
+void CountScanNode::appendToString(str::stream* ss, int indent) const {
     addIndent(ss, indent);
     *ss << "COUNT\n";
     addIndent(ss, indent + 1);
@@ -1192,7 +1216,7 @@ QuerySolutionNode* CountScanNode::clone() const {
 // EnsureSortedNode
 //
 
-void EnsureSortedNode::appendToString(mongoutils::str::stream* ss, int indent) const {
+void EnsureSortedNode::appendToString(str::stream* ss, int indent) const {
     addIndent(ss, indent);
     *ss << "ENSURE_SORTED\n";
     addIndent(ss, indent + 1);

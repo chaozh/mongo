@@ -39,7 +39,7 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/s/database_sharding_state.h"
 #include "mongo/s/request_types/get_database_version_gen.h"
-#include "mongo/util/stringutils.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 namespace {
@@ -78,13 +78,12 @@ public:
                     serverGlobalParams.clusterRole == ClusterRole::ShardServer);
             BSONObj versionObj;
             AutoGetDb autoDb(opCtx, _targetDb(), MODE_IS);
-            if (auto db = autoDb.getDb()) {
-                auto& dss = DatabaseShardingState::get(db);
-                auto dssLock = DatabaseShardingState::DSSLock::lock(opCtx, &dss);
 
-                if (auto dbVersion = dss.getDbVersion(opCtx, dssLock)) {
-                    versionObj = dbVersion->toBSON();
-                }
+            const auto dss = DatabaseShardingState::get(opCtx, _targetDb());
+            auto dssLock = DatabaseShardingState::DSSLock::lockShared(opCtx, dss);
+
+            if (auto dbVersion = dss->getDbVersion(opCtx, dssLock)) {
+                versionObj = dbVersion->toBSON();
             }
             result->getBodyBuilder().append("dbVersion", versionObj);
         }

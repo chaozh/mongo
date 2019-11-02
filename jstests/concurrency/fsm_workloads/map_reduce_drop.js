@@ -11,9 +11,12 @@
  *
  * This workload serves as a regression test for SERVER-6757, SERVER-15087,
  * and SERVER-15842.
+ * @tags: [
+ *   # mapReduce does not support afterClusterTime.
+ *   does_not_support_causal_consistency,
+ * ]
  */
 var $config = (function() {
-
     var data = {
         mapper: function mapper() {
             emit(this.key, 1);
@@ -27,7 +30,6 @@ var $config = (function() {
     };
 
     var states = (function() {
-
         function dropColl(db, collName) {
             var mapReduceDb = db.getSiblingDB(this.mapReduceDBName);
 
@@ -39,8 +41,8 @@ var $config = (function() {
         function dropDB(db, collName) {
             var mapReduceDb = db.getSiblingDB(this.mapReduceDBName);
 
-            var res = mapReduceDb.dropDatabase();
-            assertAlways.commandWorked(res);
+            // Concurrent dropDatabase calls can result in transient errors.
+            mapReduceDb.dropDatabase();
         }
 
         function mapReduce(db, collName) {
@@ -56,7 +58,7 @@ var $config = (function() {
                 bulk.insert({key: Random.randInt(10000)});
             }
             var res = bulk.execute();
-            assertAlways.writeOK(res);
+            assertAlways.commandWorked(res);
 
             var options = {
                 finalize: function finalize(key, reducedValue) {
@@ -74,7 +76,6 @@ var $config = (function() {
         }
 
         return {dropColl: dropColl, dropDB: dropDB, mapReduce: mapReduce};
-
     })();
 
     var transitions = {
@@ -96,5 +97,4 @@ var $config = (function() {
         startState: 'mapReduce',
         transitions: transitions,
     };
-
 })();

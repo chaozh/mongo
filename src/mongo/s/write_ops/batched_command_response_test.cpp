@@ -29,12 +29,12 @@
 
 #include "mongo/platform/basic.h"
 
+#include <memory>
 #include <string>
 
 #include "mongo/db/jsobj.h"
 #include "mongo/s/write_ops/batched_command_response.h"
 #include "mongo/s/write_ops/write_error_detail.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
@@ -58,17 +58,13 @@ TEST(BatchedCommandResponse, Basic) {
     BSONObj writeConcernError(
         BSON("code" << 8 << "codeName" << ErrorCodes::errorString(ErrorCodes::Error(8)) << "errmsg"
                     << "norepl"
-                    << "errInfo"
-                    << BSON("a" << 1)));
+                    << "errInfo" << BSON("a" << 1)));
 
     BSONObj origResponseObj =
-        BSON(BatchedCommandResponse::n(0) << "opTime" << mongo::Timestamp(1ULL)
-                                          << BatchedCommandResponse::writeErrors()
-                                          << writeErrorsArray
-                                          << BatchedCommandResponse::writeConcernError()
-                                          << writeConcernError
-                                          << "ok"
-                                          << 1.0);
+        BSON(BatchedCommandResponse::n(0)
+             << "opTime" << mongo::Timestamp(1ULL) << BatchedCommandResponse::writeErrors()
+             << writeErrorsArray << BatchedCommandResponse::writeConcernError() << writeConcernError
+             << "ok" << 1.0);
 
     string errMsg;
     BatchedCommandResponse response;
@@ -88,7 +84,7 @@ TEST(BatchedCommandResponse, TooManySmallErrors) {
     const auto bigstr = std::string(1024, 'x');
 
     for (int i = 0; i < 100'000; i++) {
-        auto errDetail = stdx::make_unique<WriteErrorDetail>();
+        auto errDetail = std::make_unique<WriteErrorDetail>();
         errDetail->setIndex(i);
         errDetail->setStatus({ErrorCodes::BadValue, bigstr});
         response.addToErrDetails(errDetail.release());
@@ -120,7 +116,7 @@ TEST(BatchedCommandResponse, TooManyBigErrors) {
     const auto smallstr = std::string(10, 'x');
 
     for (int i = 0; i < 100'000; i++) {
-        auto errDetail = stdx::make_unique<WriteErrorDetail>();
+        auto errDetail = std::make_unique<WriteErrorDetail>();
         errDetail->setIndex(i);
         errDetail->setStatus({ErrorCodes::BadValue,          //
                               i < 10 ? bigstr : smallstr});  // Don't waste too much RAM.

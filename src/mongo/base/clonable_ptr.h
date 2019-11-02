@@ -63,7 +63,7 @@ struct detect_clone_factory_type_member_impl {
     template <typename U>
     static Yes& test(U*);
 
-    static constexpr bool value = sizeof(test<Derived>(0)) == sizeof(Yes);
+    static constexpr bool value = sizeof(test<Derived>(nullptr)) == sizeof(Yes);
 
     using type = typename std::integral_constant<bool, value>::type;
 };
@@ -264,8 +264,9 @@ public:
      * NOTE: This constructor is disabled for types with a stateless `CloneFactory` type.
      */
     template <typename CloneFactory_ = CloneFactory>
-    inline clonable_ptr(typename std::enable_if<!std::is_empty<CloneFactory_>::value,
-                                                std::nullptr_t>::type) = delete;
+    inline clonable_ptr(
+        typename std::enable_if<!std::is_empty<CloneFactory_>::value, std::nullptr_t>::type) =
+        delete;
 
     /*!
      * Constructs a pointer to nothing, with a default `CloneFactory`.

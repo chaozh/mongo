@@ -41,11 +41,7 @@ REGISTER_DOCUMENT_SOURCE(listLocalSessions,
                          DocumentSourceListLocalSessions::LiteParsed::parse,
                          DocumentSourceListLocalSessions::createFromBson);
 
-const char* DocumentSourceListLocalSessions::kStageName = "$listLocalSessions";
-
-DocumentSource::GetNextResult DocumentSourceListLocalSessions::getNext() {
-    pExpCtx->checkForInterrupt();
-
+DocumentSource::GetNextResult DocumentSourceListLocalSessions::doGetNext() {
     while (!_ids.empty()) {
         const auto& id = _ids.back();
         _ids.pop_back();
@@ -75,7 +71,7 @@ boost::intrusive_ptr<DocumentSource> DocumentSourceListLocalSessions::createFrom
 
 DocumentSourceListLocalSessions::DocumentSourceListLocalSessions(
     const boost::intrusive_ptr<ExpressionContext>& pExpCtx, const ListSessionsSpec& spec)
-    : DocumentSource(pExpCtx), _spec(spec) {
+    : DocumentSource(kStageName, pExpCtx), _spec(spec) {
     const auto& opCtx = pExpCtx->opCtx;
     _cache = LogicalSessionCache::get(opCtx);
     if (_spec.getAllUsers()) {
@@ -155,6 +151,18 @@ mongo::ListSessionsSpec mongo::listSessionsParseSpec(StringData stageName,
             str::stream() << stageName
                           << " may not specify {allUsers:true} and {users:[...]} at the same time",
             !ret.getAllUsers() || !ret.getUsers() || ret.getUsers()->empty());
+
+    // Verify that the correct state is set on the client.
+    uassert(
+        31106,
+        str::stream() << "The " << DocumentSourceListLocalSessions::kStageName
+                      << " stage is not allowed in this context :: missing an AuthorizationManager",
+        AuthorizationManager::get(Client::getCurrent()->getServiceContext()));
+    uassert(
+        31111,
+        str::stream() << "The " << DocumentSourceListLocalSessions::kStageName
+                      << " stage is not allowed in this context :: missing a LogicalSessionCache",
+        LogicalSessionCache::get(Client::getCurrent()->getOperationContext()));
 
     if (!ret.getAllUsers() && (!ret.getUsers() || ret.getUsers()->empty())) {
         // Implicit request for self

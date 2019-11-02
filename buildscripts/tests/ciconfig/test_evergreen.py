@@ -1,7 +1,5 @@
 """Unit tests for the buildscripts.ciconfig.evergreen module."""
 
-from __future__ import absolute_import
-
 import datetime
 import os
 import unittest
@@ -40,14 +38,6 @@ class TestEvergreenProjectConfig(unittest.TestCase):
         self.assertEqual(1, len(self.conf.task_group_names))
         self.assertIn("tg_1", self.conf.task_group_names)
 
-    def test_list_lifecycle_task_names(self):
-        self.assertEqual(5, len(self.conf.lifecycle_task_names))
-        self.assertIn("compile", self.conf.task_names)
-        self.assertIn("passing_test", self.conf.task_names)
-        self.assertIn("failing_test", self.conf.task_names)
-        self.assertIn("timeout_test", self.conf.task_names)
-        self.assertIn("resmoke_task", self.conf.task_names)
-
     def test_list_variants(self):
         self.assertEqual(4, len(self.conf.variants))
         self.assertEqual(4, len(self.conf.variant_names))
@@ -71,7 +61,7 @@ class TestEvergreenProjectConfig(unittest.TestCase):
         self.assertIn("amazon", self.conf.distro_names)
 
 
-class TestTask(unittest.TestCase):  #pylint: disable=too-many-public-methods
+class TestTask(unittest.TestCase):  # pylint: disable=too-many-public-methods
     """Unit tests for the Task class."""
 
     def test_from_dict(self):
@@ -99,6 +89,46 @@ class TestTask(unittest.TestCase):  #pylint: disable=too-many-public-methods
         self.assertEqual("--suites=core --shellWriteMode=commands", task.resmoke_args)
         self.assertEqual("core", task.resmoke_suite)
 
+    def test_resmoke_suite(self):
+        suite = "core"
+        task_dict = {
+            "name":
+                "jsCore", "commands": [{
+                    "func": "run tests",
+                    "vars": {"resmoke_args": "--suites={} --shellWriteMode=commands".format(suite)}
+                }]
+        }
+        task = _evergreen.Task(task_dict)
+
+        self.assertEqual(suite, task.resmoke_suite)
+
+    def test_resmoke_suite_multiple(self):
+        task_dict = {
+            "name":
+                "jsCore",
+            "commands": [{
+                "func": "run tests",
+                "vars": {"resmoke_args": "--suites=core --suites=core2--shellWriteMode=commands"}
+            }]
+        }
+        task = _evergreen.Task(task_dict)
+
+        with self.assertRaises(RuntimeError):
+            self.assertIsNone(task.resmoke_suite)
+
+    def test_resmoke_suite_with_comma(self):
+        task_dict = {
+            "name":
+                "jsCore", "commands": [{
+                    "func": "run tests",
+                    "vars": {"resmoke_args": "--suites=core,core2--shellWriteMode=commands"}
+                }]
+        }
+        task = _evergreen.Task(task_dict)
+
+        with self.assertRaises(RuntimeError):
+            self.assertIsNone(task.resmoke_suite)
+
     def test_is_run_tests_task(self):
         task_commands = [{
             "func": "run tests",
@@ -122,12 +152,13 @@ class TestTask(unittest.TestCase):  #pylint: disable=too-many-public-methods
 
     def test_run_tests_multiversion(self):
         multiversion_path = "/data/multiversion"
-        task_commands = [{"func": "do multiversion setup"}, {
-            "func": "run tests", "vars": {
-                "task_path_suffix": multiversion_path,
-                "resmoke_args": "--suites=core --shellWriteMode=commands"
-            }
-        }]
+        task_commands = [{"func": "do multiversion setup"},
+                         {
+                             "func": "run tests", "vars": {
+                                 "task_path_suffix": multiversion_path,
+                                 "resmoke_args": "--suites=core --shellWriteMode=commands"
+                             }
+                         }]
         task_dict = {"name": "jsCore", "commands": task_commands}
         task = _evergreen.Task(task_dict)
 
@@ -147,30 +178,15 @@ class TestTask(unittest.TestCase):  #pylint: disable=too-many-public-methods
         self.assertIsNone(task.multiversion_setup_command)
         self.assertIsNone(task.multiversion_path)
 
-    def test_get_vars_suite_name_run_tests(self):
-        suite_name = "core"
-        task_commands = [{
-            "func": "run tests",
-            "vars": {"resmoke_args": "--suites={} --shellWriteMode=commands".format(suite_name)}
-        }]
-
-        task_dict = {"name": "jsCore", "commands": task_commands}
-        task = _evergreen.Task(task_dict)
-
-        with self.assertRaises(ValueError):
-            task.get_vars_suite_name(task_commands[0]["vars"])
-
     def test_resmoke_args_gen(self):
-        task_name = "core"
         task_commands = [{
-            "func": "generate resmoke tasks",
-            "vars": {"task": task_name, "resmoke_args": "--shellWriteMode=commands"}
+            "func": "generate resmoke tasks", "vars": {"resmoke_args": "--shellWriteMode=commands"}
         }]
-        task_dict = {"name": "jsCore", "commands": task_commands}
+        task_dict = {"name": "jsCore_gen", "commands": task_commands}
         task = _evergreen.Task(task_dict)
 
-        self.assertEqual("--suites=core --shellWriteMode=commands", task.resmoke_args)
-        self.assertEqual("core", task.resmoke_suite)
+        self.assertEqual("--suites=jsCore --shellWriteMode=commands", task.resmoke_args)
+        self.assertEqual("jsCore", task.resmoke_suite)
 
     def test_is_generate_resmoke_task(self):
         task_name = "core"
@@ -185,16 +201,14 @@ class TestTask(unittest.TestCase):  #pylint: disable=too-many-public-methods
         self.assertFalse(task.is_run_tests_task)
 
     def test_generate_resmoke_tasks_command(self):
-        task_name = "core"
         task_commands = [{
-            "func": "generate resmoke tasks",
-            "vars": {"task": task_name, "resmoke_args": "--shellWriteMode=commands"}
+            "func": "generate resmoke tasks", "vars": {"resmoke_args": "--shellWriteMode=commands"}
         }]
-        task_dict = {"name": "jsCore", "commands": task_commands}
+        task_dict = {"name": "jsCore_gen", "commands": task_commands}
         task = _evergreen.Task(task_dict)
 
         self.assertDictEqual(task_commands[0], task.generate_resmoke_tasks_command)
-        self.assertEqual(task_name, task.get_vars_task_name(task_commands[0]["vars"]))
+        self.assertEqual("jsCore", task.generated_task_name)
 
     def test_resmoke_args_gen_with_suite(self):
         task_name = "jsCore"
@@ -239,51 +253,17 @@ class TestTask(unittest.TestCase):  #pylint: disable=too-many-public-methods
         self.assertEqual(len(task_dict["tags"]), len(tag_set))
 
     def test_generate_resmoke_tasks_command_with_suite(self):
-        task_name = "jsCore"
+        task_name = "jsCore_gen"
         suite_name = "core"
         task_commands = [{
-            "func": "generate resmoke tasks", "vars": {
-                "task": task_name, "suite": suite_name, "resmoke_args": "--shellWriteMode=commands"
-            }
+            "func": "generate resmoke tasks",
+            "vars": {"suite": suite_name, "resmoke_args": "--shellWriteMode=commands"}
         }]
         task_dict = {"name": task_name, "commands": task_commands}
         task = _evergreen.Task(task_dict)
 
         self.assertDictEqual(task_commands[0], task.generate_resmoke_tasks_command)
-        self.assertEqual(task_name, task.get_vars_task_name(task_commands[0]["vars"]))
-
-    def test_get_vars_suite_name_generate_resmoke_tasks(self):
-        task_name = "jsCore"
-        suite_name = "core"
-        task_commands = [{
-            "func": "generate resmoke tasks", "vars": {
-                "task": task_name, "suite": suite_name, "resmoke_args": "--shellWriteMode=commands"
-            }
-        }]
-        task_dict = {"name": task_name, "commands": task_commands}
-        task = _evergreen.Task(task_dict)
-
-        self.assertEqual(suite_name, task.get_vars_suite_name(task_commands[0]["vars"]))
-
-    def test_get_vars_suite_name_gen_resmoke_no_vars(self):
-        task_name = "jsCore"
-        task_commands = [{"func": "generate resmoke tasks"}]
-        task_dict = {"name": task_name, "commands": task_commands}
-        task = _evergreen.Task(task_dict)
-
-        with self.assertRaises(TypeError):
-            task.get_vars_suite_name(None)
-
-    def test_get_vars_suite_name_gen_resmoke_notasksuite(self):
-        task_name = "jsCore"
-        task_commands = [{
-            "func": "generate resmoke tasks", "vars": {"resmoke_args": "--shellWriteMode=commands"}
-        }]
-        task_dict = {"name": task_name, "commands": task_commands}
-        task = _evergreen.Task(task_dict)
-
-        with self.assertRaises(ValueError):
-            task.get_vars_suite_name(task_commands[0]["vars"])
+        self.assertEqual("jsCore", task.generated_task_name)
 
     def test_gen_resmoke_multiversion(self):
         multiversion_path = "/data/multiversion"
@@ -312,31 +292,44 @@ class TestTask(unittest.TestCase):  #pylint: disable=too-many-public-methods
         self.assertFalse(task.is_multiversion_task)
         self.assertIsNone(task.multiversion_path)
 
-    def test_get_vars_task_name(self):
-        task_name = "task_name"
+    def test_get_vars_suite_name_generate_resmoke_tasks(self):
+        task_name = "jsCore"
+        suite_name = "core"
         task_commands = [{
-            "func": "generate resmoke tasks",
-            "vars": {"task": task_name, "resmoke_args": "--shellWriteMode=commands"}
+            "func": "generate resmoke tasks", "vars": {
+                "task": task_name, "suite": suite_name, "resmoke_args": "--shellWriteMode=commands"
+            }
         }]
-        task_dict = {"name": "jsCore", "commands": task_commands}
+        task_dict = {"name": task_name, "commands": task_commands}
         task = _evergreen.Task(task_dict)
-        self.assertEqual(task_name, task.get_vars_task_name(task_commands[0]["vars"]))
 
-    def test_get_vars_task_name_no_task(self):
-        task_commands = [{
-            "func": "generate resmoke tasks", "vars": {"resmoke_args": "--shellWriteMode=commands"}
-        }]
-        task_dict = {"name": "jsCore", "commands": task_commands}
-        task = _evergreen.Task(task_dict)
-        with self.assertRaises(ValueError):
-            task.get_vars_task_name(task_commands[0]["vars"])
+        self.assertEqual(suite_name, task.get_vars_suite_name(task_commands[0]["vars"]))
 
-    def test_get_vars_task_name_no_vars(self):
+    def test_get_vars_suite_name_gen_resmoke_no_vars(self):
+        task_name = "jsCore"
         task_commands = [{"func": "generate resmoke tasks"}]
-        task_dict = {"name": "jsCore", "commands": task_commands}
+        task_dict = {"name": task_name, "commands": task_commands}
         task = _evergreen.Task(task_dict)
+
         with self.assertRaises(TypeError):
-            task.get_vars_task_name(None)
+            task.get_vars_suite_name(None)
+
+    def test_generate_task_name_non_gen_tasks(self):
+        task_name = "jsCore"
+        task_commands = [{"func": "run tasks"}]
+        task_dict = {"name": task_name, "commands": task_commands}
+        task = _evergreen.Task(task_dict)
+
+        with self.assertRaises(TypeError):
+            task.generated_task_name  # pylint: disable=pointless-statement
+
+    def test_generate_task_name(self):
+        task_name = "jsCore_gen"
+        task_commands = [{"func": "generate resmoke tasks"}]
+        task_dict = {"name": task_name, "commands": task_commands}
+        task = _evergreen.Task(task_dict)
+
+        self.assertEqual("jsCore", task.generated_task_name)
 
 
 class TestTaskGroup(unittest.TestCase):
@@ -352,58 +345,6 @@ class TestTaskGroup(unittest.TestCase):
         self.assertEqual("my_group", task_group.name)
         self.assertEqual(2, len(task_group.tasks))
         self.assertEqual(task_group_dict, task_group.raw)
-
-    def test_resmoke_args(self):
-        task_dict = {
-            "name":
-                "jsCore", "commands": [{
-                    "func": "run tests",
-                    "vars": {"resmoke_args": "--suites=core --shellWriteMode=commands"}
-                }]
-        }
-        task = _evergreen.Task(task_dict)
-
-        self.assertEqual("--suites=core --shellWriteMode=commands", task.resmoke_args)
-
-    def test_resmoke_suite(self):
-        suite = "core"
-        task_dict = {
-            "name":
-                "jsCore", "commands": [{
-                    "func": "run tests",
-                    "vars": {"resmoke_args": "--suites={} --shellWriteMode=commands".format(suite)}
-                }]
-        }
-        task = _evergreen.Task(task_dict)
-
-        self.assertEqual(suite, task.resmoke_suite)
-
-    def test_resmoke_suite_multiple(self):
-        task_dict = {
-            "name":
-                "jsCore",
-            "commands": [{
-                "func": "run tests",
-                "vars": {"resmoke_args": "--suites=core --suites=core2--shellWriteMode=commands"}
-            }]
-        }
-        task = _evergreen.Task(task_dict)
-
-        with self.assertRaises(RuntimeError):
-            self.assertIsNone(task.resmoke_suite)
-
-    def test_resmoke_suite_with_comma(self):
-        task_dict = {
-            "name":
-                "jsCore", "commands": [{
-                    "func": "run tests",
-                    "vars": {"resmoke_args": "--suites=core,core2--shellWriteMode=commands"}
-                }]
-        }
-        task = _evergreen.Task(task_dict)
-
-        with self.assertRaises(RuntimeError):
-            self.assertIsNone(task.resmoke_suite)
 
 
 class TestVariant(unittest.TestCase):
@@ -445,6 +386,15 @@ class TestVariant(unittest.TestCase):
 
         variant_osx = self.conf.get_variant("osx-108")
         self.assertIsNone(variant_osx.batchtime)
+
+    def test_expansion(self):
+        variant_ubuntu = self.conf.get_variant("ubuntu")
+        self.assertEqual("--param=value --ubuntu", variant_ubuntu.expansion("test_flags"))
+        self.assertEqual(None, variant_ubuntu.expansion("not_a_valid_expansion_name"))
+
+    def test_expansions(self):
+        variant_ubuntu = self.conf.get_variant("ubuntu")
+        self.assertEqual({"test_flags": "--param=value --ubuntu"}, variant_ubuntu.expansions)
 
     def test_modules(self):
         variant_ubuntu = self.conf.get_variant("ubuntu")

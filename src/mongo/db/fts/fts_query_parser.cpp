@@ -30,8 +30,7 @@
 #include <string>
 
 #include "mongo/db/fts/fts_query_parser.h"
-#include "mongo/util/mongoutils/str.h"
-#include "mongo/util/stringutils.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -103,5 +102,5 @@ QueryToken::Type FTSQueryParser::getType(char c) const {
             return QueryToken::TEXT;
     }
 }
-}
-}
+}  // namespace fts
+}  // namespace mongo

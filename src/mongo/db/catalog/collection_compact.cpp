@@ -31,124 +31,97 @@
 
 #include "mongo/db/catalog/collection_compact.h"
 
+#include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/catalog/document_validation.h"
 #include "mongo/db/catalog/index_key_validate.h"
 #include "mongo/db/catalog/multi_index_block.h"
+#include "mongo/db/db_raii.h"
 #include "mongo/db/index/index_access_method.h"
 #include "mongo/db/index/index_descriptor.h"
+#include "mongo/db/index_builds_coordinator.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/views/view_catalog.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
 
-StatusWith<CompactStats> compactCollection(OperationContext* opCtx,
-                                           Collection* collection,
-                                           const CompactOptions* compactOptions) {
-    dassert(opCtx->lockState()->isCollectionLockedForMode(collection->ns(), MODE_X));
+using logger::LogComponent;
 
+namespace {
+
+Collection* getCollectionForCompact(OperationContext* opCtx,
+                                    Database* database,
+                                    const NamespaceString& collectionNss) {
+    invariant(opCtx->lockState()->isCollectionLockedForMode(collectionNss, MODE_IX));
+
+    CollectionCatalog& collectionCatalog = CollectionCatalog::get(opCtx);
+    Collection* collection = collectionCatalog.lookupCollectionByNamespace(collectionNss);
+
+    if (!collection) {
+        std::shared_ptr<ViewDefinition> view =
+            ViewCatalog::get(database)->lookup(opCtx, collectionNss.ns());
+        uassert(ErrorCodes::CommandNotSupportedOnView, "can't compact a view", !view);
+        uasserted(ErrorCodes::NamespaceNotFound, "collection does not exist");
+    }
+
+    return collection;
+}
+
+}  // namespace
+
+StatusWith<int64_t> compactCollection(OperationContext* opCtx,
+                                      const NamespaceString& collectionNss) {
+    AutoGetDb autoDb(opCtx, collectionNss.db(), MODE_IX);
+    Database* database = autoDb.getDb();
+    uassert(ErrorCodes::NamespaceNotFound, "database does not exist", database);
+
+    // The collection lock will be downgraded to an intent lock if the record store supports
+    // online compaction.
+    boost::optional<Lock::CollectionLock> collLk;
+    collLk.emplace(opCtx, collectionNss, MODE_X);
+
+    Collection* collection = getCollectionForCompact(opCtx, database, collectionNss);
     DisableDocumentValidation validationDisabler(opCtx);
 
     auto recordStore = collection->getRecordStore();
-    auto indexCatalog = collection->getIndexCatalog();
+
+    OldClientContext ctx(opCtx, collectionNss.ns());
 
     if (!recordStore->compactSupported())
-        return StatusWith<CompactStats>(ErrorCodes::CommandNotSupported,
-                                        str::stream()
-                                            << "cannot compact collection with record store: "
-                                            << recordStore->name());
+        return Status(ErrorCodes::CommandNotSupported,
+                      str::stream() << "cannot compact collection with record store: "
+                                    << recordStore->name());
 
-    if (recordStore->compactsInPlace()) {
-        CompactStats stats;
-        Status status = recordStore->compact(opCtx);
-        if (!status.isOK())
-            return StatusWith<CompactStats>(status);
+    if (recordStore->supportsOnlineCompaction()) {
+        // Storage engines that allow online compaction should do so using an intent lock on the
+        // collection.
+        collLk.emplace(opCtx, collectionNss, MODE_IX);
 
-        // Compact all indexes (not including unfinished indexes)
-        status = indexCatalog->compactIndexes(opCtx);
-        if (!status.isOK())
-            return StatusWith<CompactStats>(status);
-
-        return StatusWith<CompactStats>(stats);
+        // Ensure the collection was not dropped during the re-lock.
+        collection = getCollectionForCompact(opCtx, database, collectionNss);
+        recordStore = collection->getRecordStore();
     }
 
-    if (indexCatalog->numIndexesInProgress(opCtx))
-        return StatusWith<CompactStats>(ErrorCodes::BadValue,
-                                        "cannot compact when indexes in progress");
+    log(LogComponent::kCommand) << "compact " << collectionNss << " begin";
 
-    std::vector<BSONObj> indexSpecs;
-    {
-        std::unique_ptr<IndexCatalog::IndexIterator> ii(
-            indexCatalog->getIndexIterator(opCtx, false));
-        while (ii->more()) {
-            const IndexDescriptor* descriptor = ii->next()->descriptor();
+    auto oldTotalSize = recordStore->storageSize(opCtx) + collection->getIndexSize(opCtx);
+    auto indexCatalog = collection->getIndexCatalog();
 
-            // Compact always creates the new index in the foreground.
-            const BSONObj spec =
-                descriptor->infoObj().removeField(IndexDescriptor::kBackgroundFieldName);
-            const BSONObj key = spec.getObjectField("key");
-            const Status keyStatus =
-                index_key_validate::validateKeyPattern(key, descriptor->version());
-            if (!keyStatus.isOK()) {
-                return StatusWith<CompactStats>(
-                    ErrorCodes::CannotCreateIndex,
-                    str::stream() << "Cannot compact collection due to invalid index " << spec
-                                  << ": "
-                                  << keyStatus.reason()
-                                  << " For more info see"
-                                  << " http://dochub.mongodb.org/core/index-validation");
-            }
-            indexSpecs.push_back(spec);
-        }
-    }
-
-    // Give a chance to be interrupted *before* we drop all indexes.
-    opCtx->checkForInterrupt();
-
-    {
-        // note that the drop indexes call also invalidates all clientcursors for the namespace,
-        // which is important and wanted here
-        WriteUnitOfWork wunit(opCtx);
-        log() << "compact dropping indexes";
-        indexCatalog->dropAllIndexes(opCtx, true);
-        wunit.commit();
-    }
-
-    CompactStats stats;
-
-    MultiIndexBlock indexer;
-    indexer.ignoreUniqueConstraint();  // in compact we should be doing no checking
-
-    // The 'indexer' could throw, so ensure build cleanup occurs.
-    ON_BLOCK_EXIT([&] { indexer.cleanUpAfterBuild(opCtx, collection); });
-
-    Status status =
-        indexer.init(opCtx, collection, indexSpecs, MultiIndexBlock::kNoopOnInitFn).getStatus();
+    Status status = recordStore->compact(opCtx);
     if (!status.isOK())
-        return StatusWith<CompactStats>(status);
+        return status;
 
-    status = recordStore->compact(opCtx);
+    // Compact all indexes (not including unfinished indexes)
+    status = indexCatalog->compactIndexes(opCtx);
     if (!status.isOK())
-        return StatusWith<CompactStats>(status);
+        return status;
 
-    log() << "starting index commits";
-    status = indexer.dumpInsertsFromBulk(opCtx);
-    if (!status.isOK())
-        return StatusWith<CompactStats>(status);
-
-    {
-        WriteUnitOfWork wunit(opCtx);
-        status = indexer.commit(opCtx,
-                                collection,
-                                MultiIndexBlock::kNoopOnCreateEachFn,
-                                MultiIndexBlock::kNoopOnCommitFn);
-        if (!status.isOK()) {
-            return StatusWith<CompactStats>(status);
-        }
-        wunit.commit();
-    }
-
-    return StatusWith<CompactStats>(stats);
+    auto totalSizeDiff =
+        oldTotalSize - recordStore->storageSize(opCtx) - collection->getIndexSize(opCtx);
+    log() << "compact " << collectionNss << " bytes freed: " << totalSizeDiff;
+    log() << "compact " << collectionNss << " end";
+    return totalSizeDiff;
 }
 
 }  // namespace mongo

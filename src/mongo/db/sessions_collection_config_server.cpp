@@ -47,20 +47,20 @@
 
 namespace mongo {
 
-// Returns an error if the collection didn't exist and we couldn't
-// shard it into existence, either.
-Status SessionsCollectionConfigServer::_shardCollectionIfNeeded(OperationContext* opCtx) {
+void SessionsCollectionConfigServer::_shardCollectionIfNeeded(OperationContext* opCtx) {
     // First, check if the collection is already sharded.
-    auto res = _checkCacheForSessionsCollection(opCtx);
-    if (res.isOK()) {
-        return res;
+    try {
+        checkSessionsCollectionExists(opCtx);
+        return;
+    } catch (const DBException&) {
+        // If the sessions collection doesn't exist, create it
     }
 
     // If we don't have any shards, we can't set up this collection yet.
-    if (Grid::get(opCtx)->shardRegistry()->getNumShards() == 0) {
-        return {ErrorCodes::ShardNotFound,
-                "Cannot create config.system.sessions until there are shards"};
-    }
+    uassert(ErrorCodes::ShardNotFound,
+            str::stream() << "Failed to create " << NamespaceString::kLogicalSessionsNamespace
+                          << ": cannot create the collection until there are shards",
+            Grid::get(opCtx)->shardRegistry()->getNumShards() != 0);
 
     // First, shard the sessions collection to create it.
     ConfigsvrShardCollectionRequest shardCollection;
@@ -71,60 +71,36 @@ Status SessionsCollectionConfigServer::_shardCollectionIfNeeded(OperationContext
     BSONObj info;
     if (!client.runCommand(
             "admin", CommandHelpers::appendMajorityWriteConcern(shardCollection.toBSON()), info)) {
-        return getStatusFromCommandResult(info);
+        uassertStatusOKWithContext(getStatusFromCommandResult(info),
+                                   str::stream() << "Failed to create "
+                                                 << NamespaceString::kLogicalSessionsNamespace);
     }
-
-    return Status::OK();
 }
 
-Status SessionsCollectionConfigServer::_generateIndexesIfNeeded(OperationContext* opCtx) {
+void SessionsCollectionConfigServer::_generateIndexesIfNeeded(OperationContext* opCtx) {
     try {
-        scatterGatherOnlyVersionIfUnsharded(opCtx,
-                                            NamespaceString::kLogicalSessionsNamespace,
-                                            SessionsCollection::generateCreateIndexesCmd(),
-                                            ReadPreferenceSetting::get(opCtx),
-                                            Shard::RetryPolicy::kNoRetry);
-        return Status::OK();
-    } catch (const DBException& ex) {
-        return ex.toStatus();
+        dispatchCommandAssertCollectionExistsOnAtLeastOneShard(
+            opCtx,
+            NamespaceString::kLogicalSessionsNamespace,
+            SessionsCollection::generateCreateIndexesCmd());
+    } catch (DBException& ex) {
+        ex.addContext(str::stream()
+                      << "Failed to generate TTL index for "
+                      << NamespaceString::kLogicalSessionsNamespace << " on all shards");
+        throw;
     }
 }
 
-Status SessionsCollectionConfigServer::setupSessionsCollection(OperationContext* opCtx) {
+void SessionsCollectionConfigServer::setupSessionsCollection(OperationContext* opCtx) {
     // If the sharding state is not yet initialized, fail.
-    if (!Grid::get(opCtx)->isShardingInitialized()) {
-        return {ErrorCodes::ShardingStateNotInitialized, "sharding state is not yet initialized"};
-    }
+    uassert(ErrorCodes::ShardingStateNotInitialized,
+            "sharding state is not yet initialized",
+            Grid::get(opCtx)->isShardingInitialized());
 
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
-    {
-        // Only try to set up this collection until we have done so successfully once.
-        // Note: if there is a config server election, it's possible that two different
-        // primaries could both run the createIndexes scatter-gather query; this is ok.
-        if (_collectionSetUp) {
-            return Status::OK();
-        }
+    stdx::lock_guard<Latch> lk(_mutex);
 
-        auto res = _shardCollectionIfNeeded(opCtx);
-        if (!res.isOK()) {
-            log() << "Failed to create config.system.sessions: " << res.reason()
-                  << ", will try again at the next refresh interval";
-            return res;
-        }
-
-        res = _generateIndexesIfNeeded(opCtx);
-        if (!res.isOK()) {
-            log() << "Failed to generate TTL index for config.system.sessions on all shards, "
-                  << "will try again on the next refresh interval";
-        }
-
-        _collectionSetUp = true;
-        return res;
-    }
-}
-
-Status SessionsCollectionConfigServer::checkSessionsCollectionExists(OperationContext* opCtx) {
-    return _checkCacheForSessionsCollection(opCtx);
+    _shardCollectionIfNeeded(opCtx);
+    _generateIndexesIfNeeded(opCtx);
 }
 
 }  // namespace mongo

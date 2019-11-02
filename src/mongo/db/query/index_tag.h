@@ -88,7 +88,7 @@ public:
 // used internally
 class RelevantTag : public MatchExpression::TagData {
 public:
-    RelevantTag() : elemMatchExpr(NULL), pathPrefix("") {}
+    RelevantTag() : elemMatchExpr(nullptr), pathPrefix("") {}
 
     std::vector<size_t> first;
     std::vector<size_t> notFirst;
@@ -207,7 +207,7 @@ public:
     }
 
     MatchExpression::TagData* clone() const override {
-        std::unique_ptr<OrPushdownTag> clone = stdx::make_unique<OrPushdownTag>();
+        std::unique_ptr<OrPushdownTag> clone = std::make_unique<OrPushdownTag>();
         for (const auto& dest : _destinations) {
             clone->addDestination(dest.clone());
         }

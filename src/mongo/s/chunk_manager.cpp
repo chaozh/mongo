@@ -64,7 +64,7 @@ std::string extractKeyStringInternal(const BSONObj& shardKeyValue, Ordering orde
         strippedKeyValue.appendAs(elem, ""_sd);
     }
 
-    KeyString ks(KeyString::Version::V1, strippedKeyValue.done(), ordering);
+    KeyString::Builder ks(KeyString::Version::V1, strippedKeyValue.done(), ordering);
     return {ks.getBuffer(), ks.getSize()};
 }
 
@@ -95,14 +95,15 @@ Chunk ChunkManager::findIntersectingChunk(const BSONObj& shardKey, const BSONObj
         for (BSONElement elt : shardKey) {
             uassert(ErrorCodes::ShardKeyNotFound,
                     str::stream() << "Cannot target single shard due to collation of key "
-                                  << elt.fieldNameStringData(),
+                                  << elt.fieldNameStringData() << " for namespace " << getns(),
                     !CollationIndexKey::isCollatableType(elt.type()));
         }
     }
 
     const auto it = _rt->getChunkMap().upper_bound(_rt->_extractKeyString(shardKey));
     uassert(ErrorCodes::ShardKeyNotFound,
-            str::stream() << "Cannot target single shard using key " << shardKey,
+            str::stream() << "Cannot target single shard using key " << shardKey
+                          << " for namespace " << getns(),
             it != _rt->getChunkMap().end() && it->second->containsKey(shardKey));
 
     return Chunk(*(it->second), _clusterTime);
@@ -125,7 +126,7 @@ void ChunkManager::getShardIdsForQuery(OperationContext* opCtx,
                                        const BSONObj& query,
                                        const BSONObj& collation,
                                        std::set<ShardId>* shardIds) const {
-    auto qr = stdx::make_unique<QueryRequest>(_rt->getns());
+    auto qr = std::make_unique<QueryRequest>(_rt->getns());
     qr->setFilter(query);
 
     if (!collation.isEmpty()) {
@@ -454,15 +455,13 @@ ShardVersionMap RoutingTableHistory::_constructShardVersionMap() const {
                           str::stream()
                               << "Gap exists in the routing table between chunks "
                               << _chunkMap.at(_extractKeyString(*lastMax))->getRange().toString()
-                              << " and "
-                              << rangeLast->second->getRange().toString());
+                              << " and " << rangeLast->second->getRange().toString());
             else
                 uasserted(ErrorCodes::ConflictingOperationInProgress,
                           str::stream()
                               << "Overlap exists in the routing table between chunks "
                               << _chunkMap.at(_extractKeyString(*lastMax))->getRange().toString()
-                              << " and "
-                              << rangeLast->second->getRange().toString());
+                              << " and " << rangeLast->second->getRange().toString());
         }
 
         if (!firstMin)
@@ -520,7 +519,8 @@ std::shared_ptr<RoutingTableHistory> RoutingTableHistory::makeUpdated(
         const auto& chunkVersion = chunk.getVersion();
 
         uassert(ErrorCodes::ConflictingOperationInProgress,
-                str::stream() << "Chunk " << chunk.genID(getns(), chunk.getMin())
+                str::stream() << "Chunk with namespace " << chunk.getNS().ns() << " and min key "
+                              << chunk.getMin()
                               << " has epoch different from that of the collection "
                               << chunkVersion.epoch(),
                 collectionVersion.epoch() == chunkVersion.epoch());

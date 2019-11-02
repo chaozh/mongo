@@ -29,15 +29,14 @@
 
 #pragma once
 
+#include <list>
 #include <string>
 #include <vector>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/base/string_data.h"
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/user.h"
 #include "mongo/db/auth/user_name.h"
-#include "mongo/stdx/list.h"
 
 namespace mongo {
 
@@ -47,11 +46,12 @@ namespace mongo {
  * synchronizing access.
  */
 class UserSet {
-    MONGO_DISALLOW_COPYING(UserSet);
+    UserSet(const UserSet&) = delete;
+    UserSet& operator=(const UserSet&) = delete;
 
 public:
-    using iterator = stdx::list<UserHandle>::iterator;
-    using const_iterator = stdx::list<UserHandle>::const_iterator;
+    using iterator = std::list<UserHandle>::iterator;
+    using const_iterator = std::list<UserHandle>::const_iterator;
 
     UserSet() = default;
 
@@ -112,7 +112,7 @@ public:
 private:
     // The UserSet maintains ownership of the Users in it, and is responsible for
     // returning them to the AuthorizationManager when done with them.
-    stdx::list<UserHandle> _users;
+    std::list<UserHandle> _users;
 };
 
 }  // namespace mongo

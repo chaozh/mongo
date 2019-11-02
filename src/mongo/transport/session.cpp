@@ -54,7 +54,7 @@ void Session::unsetTags(TagMask tagsToUnset) {
     mutateTags([tagsToUnset](TagMask originalTags) { return (originalTags & ~tagsToUnset); });
 }
 
-void Session::mutateTags(const stdx::function<TagMask(TagMask)>& mutateFunc) {
+void Session::mutateTags(const std::function<TagMask(TagMask)>& mutateFunc) {
     TagMask oldValue, newValue;
     do {
         oldValue = _tags.load();
@@ -62,7 +62,7 @@ void Session::mutateTags(const stdx::function<TagMask(TagMask)>& mutateFunc) {
 
         // Any change to the session tags automatically clears kPending status.
         newValue &= ~kPending;
-    } while (_tags.compareAndSwap(oldValue, newValue) != oldValue);
+    } while (!_tags.compareAndSwap(&oldValue, newValue));
 }
 
 Session::TagMask Session::getTags() const {

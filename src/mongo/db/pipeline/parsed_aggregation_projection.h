@@ -38,6 +38,7 @@
 #include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/field_path.h"
 #include "mongo/db/pipeline/transformer_interface.h"
+#include "mongo/db/query/projection_policies.h"
 
 namespace mongo {
 
@@ -55,10 +56,11 @@ namespace parsed_aggregation_projection {
 class ProjectionSpecValidator {
 public:
     /**
-     * Throws if the specification is not valid for a projection. The stageName is used to provide a
-     * more helpful error message.
+     * Throws if the specification is not valid for a projection. Because this validator is meant to
+     * be generic, the error thrown is generic.  Callers at the DocumentSource level should modify
+     * the error message if they want to include information specific to the stage name used.
      */
-    static void uassertValid(const BSONObj& spec, StringData stageName);
+    static void uassertValid(const BSONObj& spec);
 
 private:
     ProjectionSpecValidator(const BSONObj& spec) : _rawObj(spec) {}
@@ -141,39 +143,11 @@ private:
  */
 class ParsedAggregationProjection : public TransformerInterface {
 public:
-    struct ProjectionPolicies {
-        // Allows the caller to indicate whether the projection should default to including or
-        // excluding the _id field in the event that the projection spec does not specify the
-        // desired behavior. For instance, given a projection {a: 1}, specifying 'kExcludeId' is
-        // equivalent to projecting {a: 1, _id: 0} while 'kIncludeId' is equivalent to the
-        // projection {a: 1, _id: 1}. If the user explicitly specifies a projection on _id, then
-        // this will override the default policy; for instance, {a: 1, _id: 0} will exclude _id for
-        // both 'kExcludeId' and 'kIncludeId'.
-        enum class DefaultIdPolicy { kIncludeId, kExcludeId };
-
-        // Allows the caller to specify how the projection should handle nested arrays; that is, an
-        // array whose immediate parent is itself an array. For example, in the case of sample
-        // document {a: [1, 2, [3, 4], {b: [5, 6]}]} the array [3, 4] is a nested array. The array
-        // [5, 6] is not, because there is an intervening object between it and its closest array
-        // ancestor.
-        enum class ArrayRecursionPolicy { kRecurseNestedArrays, kDoNotRecurseNestedArrays };
-
-        // Allows the caller to specify whether computed fields should be allowed within inclusion
-        // projections. Computed fields are implicitly prohibited by exclusion projections.
-        enum class ComputedFieldsPolicy { kBanComputedFields, kAllowComputedFields };
-
-        ProjectionPolicies(
-            DefaultIdPolicy idPolicy = DefaultIdPolicy::kIncludeId,
-            ArrayRecursionPolicy arrayRecursionPolicy = ArrayRecursionPolicy::kRecurseNestedArrays,
-            ComputedFieldsPolicy computedFieldsPolicy = ComputedFieldsPolicy::kAllowComputedFields)
-            : idPolicy(idPolicy),
-              arrayRecursionPolicy(arrayRecursionPolicy),
-              computedFieldsPolicy(computedFieldsPolicy) {}
-
-        DefaultIdPolicy idPolicy;
-        ArrayRecursionPolicy arrayRecursionPolicy;
-        ComputedFieldsPolicy computedFieldsPolicy;
-    };
+    /**
+     * The name of an internal variable to bind a projection post image to, which is used by the
+     * '_rootReplacementExpression' to replace the content of the transformed document.
+     */
+    static constexpr StringData kProjectionPostImageVarName{"INTERNAL_PROJ_POST_IMAGE"_sd};
 
     /**
      * Main entry point for a ParsedAggregationProjection.
@@ -198,7 +172,11 @@ public:
     /**
      * Optimize any expressions contained within this projection.
      */
-    virtual void optimize() {}
+    virtual void optimize() {
+        if (_rootReplacementExpression) {
+            _rootReplacementExpression->optimize();
+        }
+    }
 
     /**
      * Add any dependencies needed by this projection or any sub-expressions to 'deps'.
@@ -211,13 +189,30 @@ public:
      * Apply the projection transformation.
      */
     Document applyTransformation(const Document& input) {
-        return applyProjection(input);
+        auto output = applyProjection(input);
+        if (_rootReplacementExpression) {
+            return _applyRootReplacementExpression(input, output);
+        }
+        return output;
+    }
+
+    /**
+     * Sets 'expr' as a root-replacement expression to this tree. A root-replacement expression,
+     * once evaluated, will replace an entire output document. A projection post image document
+     * will be accessible via the special variable, whose name is stored in
+     * 'kProjectionPostImageVarName', if this expression needs access to it.
+     */
+    void setRootReplacementExpression(boost::intrusive_ptr<Expression> expr) {
+        _rootReplacementExpression = expr;
     }
 
 protected:
     ParsedAggregationProjection(const boost::intrusive_ptr<ExpressionContext>& expCtx,
                                 ProjectionPolicies policies)
-        : _expCtx(expCtx), _policies(policies){};
+        : _expCtx(expCtx),
+          _policies(policies),
+          _projectionPostImageVarId{
+              _expCtx->variablesParseState.defineVariable(kProjectionPostImageVarName)} {}
 
     /**
      * Apply the projection to 'input'.
@@ -227,6 +222,26 @@ protected:
     boost::intrusive_ptr<ExpressionContext> _expCtx;
 
     ProjectionPolicies _policies;
+
+    boost::intrusive_ptr<Expression> _rootReplacementExpression;
+
+private:
+    Document _applyRootReplacementExpression(const Document& input, const Document& output) {
+        using namespace fmt::literals;
+
+        _expCtx->variables.setValue(_projectionPostImageVarId, Value{output});
+        auto val = _rootReplacementExpression->evaluate(input, &_expCtx->variables);
+        uassert(51254,
+                "Root-replacement expression must return a document, but got {}"_format(
+                    typeName(val.getType())),
+                val.getType() == BSONType::Object);
+        return val.getDocument();
+    }
+
+    // This variable id is used to bind a projection post-image so that it can be accessed by
+    // root-replacement expressions which apply projection to the entire post-image document, rather
+    // than to a specific field.
+    Variables::Id _projectionPostImageVarId;
 };
 }  // namespace parsed_aggregation_projection
 }  // namespace mongo

@@ -34,8 +34,9 @@
 namespace mongo {
 constexpr StringData InternalSchemaUniqueItemsMatchExpression::kName;
 
-void InternalSchemaUniqueItemsMatchExpression::debugString(StringBuilder& debug, int level) const {
-    _debugAddSpace(debug, level);
+void InternalSchemaUniqueItemsMatchExpression::debugString(StringBuilder& debug,
+                                                           int indentationLevel) const {
+    _debugAddSpace(debug, indentationLevel);
 
     BSONObjBuilder builder;
     serialize(&builder);
@@ -65,7 +66,7 @@ BSONObj InternalSchemaUniqueItemsMatchExpression::getSerializedRightHandSide() c
 }
 
 std::unique_ptr<MatchExpression> InternalSchemaUniqueItemsMatchExpression::shallowClone() const {
-    auto clone = stdx::make_unique<InternalSchemaUniqueItemsMatchExpression>(path());
+    auto clone = std::make_unique<InternalSchemaUniqueItemsMatchExpression>(path());
     if (getTag()) {
         clone->setTag(getTag()->clone());
     }

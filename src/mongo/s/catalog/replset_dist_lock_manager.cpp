@@ -33,6 +33,8 @@
 
 #include "mongo/s/catalog/replset_dist_lock_manager.h"
 
+#include <memory>
+
 #include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
 #include "mongo/db/operation_context_noop.h"
@@ -43,12 +45,11 @@
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
 #include "mongo/stdx/chrono.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/util/concurrency/idle_thread_block.h"
 #include "mongo/util/concurrency/thread_name.h"
-#include "mongo/util/fail_point_service.h"
+#include "mongo/util/fail_point.h"
 #include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 #include "mongo/util/time_support.h"
 #include "mongo/util/timer.h"
 
@@ -87,13 +88,13 @@ ReplSetDistLockManager::~ReplSetDistLockManager() = default;
 
 void ReplSetDistLockManager::startUp() {
     if (!_execThread) {
-        _execThread = stdx::make_unique<stdx::thread>(&ReplSetDistLockManager::doTask, this);
+        _execThread = std::make_unique<stdx::thread>(&ReplSetDistLockManager::doTask, this);
     }
 }
 
 void ReplSetDistLockManager::shutDown(OperationContext* opCtx) {
     {
-        stdx::lock_guard<stdx::mutex> lk(_mutex);
+        stdx::lock_guard<Latch> lk(_mutex);
         _isShutDown = true;
         _shutDownCV.notify_all();
     }
@@ -117,7 +118,7 @@ std::string ReplSetDistLockManager::getProcessID() {
 }
 
 bool ReplSetDistLockManager::isShutDown() {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     return _isShutDown;
 }
 
@@ -146,7 +147,7 @@ void ReplSetDistLockManager::doTask() {
 
             std::deque<std::pair<DistLockHandle, boost::optional<std::string>>> toUnlockBatch;
             {
-                stdx::unique_lock<stdx::mutex> lk(_mutex);
+                stdx::unique_lock<Latch> lk(_mutex);
                 toUnlockBatch.swap(_unlockList);
             }
 
@@ -165,7 +166,10 @@ void ReplSetDistLockManager::doTask() {
                 if (!unlockStatus.isOK()) {
                     warning() << "Failed to unlock lock with " << LocksType::lockID() << ": "
                               << toUnlock.first << nameMessage << causedBy(unlockStatus);
-                    queueUnlock(toUnlock.first, toUnlock.second);
+                    // Queue another attempt, unless the problem was no longer being primary.
+                    if (unlockStatus != ErrorCodes::NotMaster) {
+                        queueUnlock(toUnlock.first, toUnlock.second);
+                    }
                 } else {
                     LOG(0) << "distributed lock with " << LocksType::lockID() << ": "
                            << toUnlock.first << nameMessage << " unlocked.";
@@ -178,7 +182,7 @@ void ReplSetDistLockManager::doTask() {
         }
 
         MONGO_IDLE_THREAD_BLOCK;
-        stdx::unique_lock<stdx::mutex> lk(_mutex);
+        stdx::unique_lock<Latch> lk(_mutex);
         _shutDownCV.wait_for(lk, _pingInterval.toSystemDuration(), [this] { return _isShutDown; });
     }
 }
@@ -221,7 +225,7 @@ StatusWith<bool> ReplSetDistLockManager::isLockExpired(OperationContext* opCtx,
 
     const auto& serverInfo = serverInfoStatus.getValue();
 
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     auto pingIter = _pingHistory.find(lockDoc.getName());
 
     if (pingIter == _pingHistory.end()) {
@@ -303,10 +307,9 @@ StatusWith<DistLockHandle> ReplSetDistLockManager::lockWithSessionID(OperationCo
         const string who = str::stream() << _processID << ":" << getThreadName();
 
         auto lockExpiration = _lockExpiration;
-        MONGO_FAIL_POINT_BLOCK(setDistLockTimeout, customTimeout) {
-            const BSONObj& data = customTimeout.getData();
+        setDistLockTimeout.execute([&](const BSONObj& data) {
             lockExpiration = Milliseconds(data["timeoutMs"].numberInt());
-        }
+        });
 
         LOG(1) << "trying to acquire new distributed lock for " << name
                << " ( lock timeout : " << durationCount<Milliseconds>(lockExpiration)
@@ -504,7 +507,7 @@ Status ReplSetDistLockManager::checkStatus(OperationContext* opCtx,
 
 void ReplSetDistLockManager::queueUnlock(const DistLockHandle& lockSessionID,
                                          const boost::optional<std::string>& name) {
-    stdx::unique_lock<stdx::mutex> lk(_mutex);
+    stdx::unique_lock<Latch> lk(_mutex);
     _unlockList.push_back(std::make_pair(lockSessionID, name));
 }
 

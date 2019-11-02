@@ -29,11 +29,13 @@
 
 #pragma once
 
+#include "mongo/db/exec/sort_executor.h"
 #include "mongo/db/index/sort_key_generator.h"
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/document_source_limit.h"
 #include "mongo/db/pipeline/expression.h"
 #include "mongo/db/query/query_knobs_gen.h"
+#include "mongo/db/query/sort_pattern.h"
 #include "mongo/db/sorter/sorter.h"
 
 namespace mongo {
@@ -41,13 +43,18 @@ namespace mongo {
 class DocumentSourceSort final : public DocumentSource {
 public:
     static constexpr StringData kStageName = "$sort"_sd;
-    enum class SortKeySerialization {
-        kForExplain,
-        kForPipelineSerialization,
-        kForSortKeyMerging,
-    };
 
-    GetNextResult getNext() final;
+    /**
+     * If there are any $limit stages that could be logically swapped forward to the position of the
+     * pipeline pointed to by 'itr' without changing the meaning of the query, removes these $limit
+     * stages from the Pipeline and returns the resulting limit. A single limit value is computed by
+     * taking the minimum after swapping each individual $limit stage forward.
+     *
+     * This method also implements the ability to swap a $limit before a $skip, by adding the value
+     * of the $skip to the value of the $limit.
+     */
+    static boost::optional<long long> extractLimitForPushdown(
+        Pipeline::SourceContainer::iterator itr, Pipeline::SourceContainer* container);
 
     const char* getSourceName() const final {
         return kStageName.rawData();
@@ -69,27 +76,26 @@ public:
                                      DiskUseRequirement::kWritesTmpData,
                                      FacetRequirement::kAllowed,
                                      TransactionRequirement::kAllowed,
+                                     LookupRequirement::kAllowed,
                                      ChangeStreamRequirement::kBlacklist);
 
         // Can't swap with a $match if a limit has been absorbed, as $match can't swap with $limit.
-        constraints.canSwapWithMatch = !_limitSrc;
+        constraints.canSwapWithMatch = !_sortExecutor->hasLimit();
         return constraints;
-    }
-
-    BSONObjSet getOutputSorts() final {
-        return allPrefixes(_rawSort);
     }
 
     DepsTracker::State getDependencies(DepsTracker* deps) const final;
 
-    boost::optional<MergingLogic> mergingLogic() final;
-    bool canRunInParallelBeforeOut(
+    boost::optional<DistributedPlanLogic> distributedPlanLogic() final;
+    bool canRunInParallelBeforeWriteStage(
         const std::set<std::string>& nameOfShardKeyFieldsUponEntryToStage) const final;
 
     /**
-     * Write out a Document whose contents are the sort key pattern.
+     * Returns the sort key pattern.
      */
-    Document sortKeyPattern(SortKeySerialization) const;
+    const SortPattern& getSortKeyPattern() const {
+        return _sortExecutor->sortPattern();
+    }
 
     /**
      * Parses a $sort stage from the user-supplied BSON.
@@ -99,18 +105,19 @@ public:
 
     /**
      * Convenience method for creating a $sort stage. If maxMemoryUsageBytes is boost::none,
-     * then it will actually use the value of internalDocumentSourceSortMaxBlockingSortBytes.
+     * then it will actually use the value of 'internalQueryMaxBlockingSortMemoryUsageBytes'.
      */
     static boost::intrusive_ptr<DocumentSourceSort> create(
         const boost::intrusive_ptr<ExpressionContext>& pExpCtx,
         BSONObj sortOrder,
-        long long limit = -1,
+        uint64_t limit = 0,
         boost::optional<uint64_t> maxMemoryUsageBytes = boost::none);
 
     /**
-     * Returns -1 for no limit.
+     * Returns the the limit, if a subsequent $limit stage has been coalesced with this $sort stage.
+     * Otherwise, returns boost::none.
      */
-    long long getLimit() const;
+    boost::optional<long long> getLimit() const;
 
     /**
      * Loads a document to be sorted. This can be used to sort a stream of documents that are not
@@ -130,55 +137,27 @@ public:
      */
     bool usedDisk() final;
 
-    /**
-     * Instructs the sort stage to use the given set of cursors as inputs, to merge documents that
-     * have already been sorted.
-     */
-    void populateFromCursors(const std::vector<DBClientCursor*>& cursors);
-
     bool isPopulated() {
         return _populated;
     };
 
-    boost::intrusive_ptr<DocumentSourceLimit> getLimitSrc() const {
-        return _limitSrc;
+    bool hasLimit() const {
+        return _sortExecutor->hasLimit();
     }
 
 protected:
+    GetNextResult doGetNext() final;
     /**
-     * Attempts to absorb a subsequent $limit stage so that it an perform a top-k sort.
+     * Attempts to absorb a subsequent $limit stage so that it can perform a top-k sort.
      */
     Pipeline::SourceContainer::iterator doOptimizeAt(Pipeline::SourceContainer::iterator itr,
                                                      Pipeline::SourceContainer* container) final;
-    void doDispose() final;
 
 private:
-    using MySorter = Sorter<Value, Document>;
-
-    // For MySorter.
-    class Comparator {
-    public:
-        explicit Comparator(const DocumentSourceSort& source) : _source(source) {}
-        int operator()(const MySorter::Data& lhs, const MySorter::Data& rhs) const {
-            return _source.compare(lhs.first, rhs.first);
-        }
-
-    private:
-        const DocumentSourceSort& _source;
-    };
-
-    // Represents one of the components in a compound sort pattern. Each component is either the
-    // field path by which we are sorting, or an Expression which can be used to retrieve the sort
-    // value in the case of a $meta-sort (but not both).
-    struct SortPatternPart {
-        bool isAscending = true;
-        boost::optional<FieldPath> fieldPath;
-        boost::intrusive_ptr<Expression> expression;
-    };
-
-    using SortPattern = std::vector<SortPatternPart>;
-
-    explicit DocumentSourceSort(const boost::intrusive_ptr<ExpressionContext>& pExpCtx);
+    DocumentSourceSort(const boost::intrusive_ptr<ExpressionContext>& pExpCtx,
+                       const BSONObj& sortOrder,
+                       uint64_t limit,
+                       uint64_t maxMemoryUsageBytes);
 
     Value serialize(boost::optional<ExplainOptions::Verbosity> explain = boost::none) const final {
         MONGO_UNREACHABLE;  // Should call serializeToArray instead.
@@ -194,74 +173,19 @@ private:
      */
     GetNextResult populate();
 
-    SortOptions makeSortOptions() const;
-
     /**
      * Returns the sort key for 'doc', as well as the document that should be entered into the
      * sorter to eventually be returned. If we will need to later merge the sorted results with
      * other results, this method adds the sort key as metadata onto 'doc' to speed up the merge
      * later.
-     *
-     * Attempts to generate the key using a fast path that does not handle arrays. If an array is
-     * encountered, falls back on extractKeyWithArray().
      */
     std::pair<Value, Document> extractSortKey(Document&& doc) const;
 
-    /**
-     * Returns the sort key for 'doc' based on the SortPattern, or ErrorCodes::InternalError if an
-     * array is encountered during sort key generation.
-     */
-    StatusWith<Value> extractKeyFast(const Document& doc) const;
-
-    /**
-     * Extracts the sort key component described by 'keyPart' from 'doc' and returns it. Returns
-     * ErrorCodes::Internal error if the path for 'keyPart' contains an array in 'doc'.
-     */
-    StatusWith<Value> extractKeyPart(const Document& doc, const SortPatternPart& keyPart) const;
-
-    /**
-     * Returns the sort key for 'doc' based on the SortPattern. Note this is in the BSONObj format -
-     * with empty field names.
-     */
-    BSONObj extractKeyWithArray(const Document& doc) const;
-
-    /**
-     * Returns the comparison key used to sort 'val' with the collation of the ExpressionContext.
-     * Note that these comparison keys should always be sorted with the simple (i.e. binary)
-     * collation.
-     */
-    Value getCollationComparisonKey(const Value& val) const;
-
-    int compare(const Value& lhs, const Value& rhs) const;
-
-    /**
-     * Absorbs 'limit', enabling a top-k sort. It is safe to call this multiple times, it will keep
-     * the smallest limit.
-     */
-    void setLimitSrc(boost::intrusive_ptr<DocumentSourceLimit> limit) {
-        if (!_limitSrc || limit->getLimit() < _limitSrc->getLimit()) {
-            _limitSrc = limit;
-        }
-    }
-
     bool _populated = false;
 
-    BSONObj _rawSort;
+    boost::optional<SortExecutor> _sortExecutor;
 
     boost::optional<SortKeyGenerator> _sortKeyGen;
-
-    SortPattern _sortPattern;
-
-    // The set of paths on which we're sorting.
-    std::set<std::string> _paths;
-
-    boost::intrusive_ptr<DocumentSourceLimit> _limitSrc;
-
-    uint64_t _maxMemoryUsageBytes;
-    bool _done;
-    std::unique_ptr<MySorter> _sorter;
-    std::unique_ptr<MySorter::Iterator> _output;
-    bool _usedDisk = false;
 };
 
 }  // namespace mongo

@@ -31,7 +31,6 @@
 
 #include "mongo/db/ops/parsed_update.h"
 
-#include "mongo/db/matcher/extensions_callback_real.h"
 #include "mongo/db/ops/update_request.h"
 #include "mongo/db/query/canonical_query.h"
 #include "mongo/db/query/collation/collator_factory_interface.h"
@@ -40,11 +39,14 @@
 
 namespace mongo {
 
-ParsedUpdate::ParsedUpdate(OperationContext* opCtx, const UpdateRequest* request)
+ParsedUpdate::ParsedUpdate(OperationContext* opCtx,
+                           const UpdateRequest* request,
+                           const ExtensionsCallback& extensionsCallback)
     : _opCtx(opCtx),
       _request(request),
-      _driver(new ExpressionContext(opCtx, nullptr)),
-      _canonicalQuery() {}
+      _driver(new ExpressionContext(opCtx, nullptr, _request->getRuntimeConstants())),
+      _canonicalQuery(),
+      _extensionsCallback(extensionsCallback) {}
 
 Status ParsedUpdate::parseRequest() {
     // It is invalid to request that the UpdateStage return the prior or newly-updated version
@@ -95,15 +97,14 @@ Status ParsedUpdate::parseQuery() {
 Status ParsedUpdate::parseQueryToCQ() {
     dassert(!_canonicalQuery.get());
 
-    const ExtensionsCallbackReal extensionsCallback(_opCtx, &_request->getNamespaceString());
-
     // The projection needs to be applied after the update operation, so we do not specify a
     // projection during canonicalization.
-    auto qr = stdx::make_unique<QueryRequest>(_request->getNamespaceString());
+    auto qr = std::make_unique<QueryRequest>(_request->getNamespaceString());
     qr->setFilter(_request->getQuery());
     qr->setSort(_request->getSort());
     qr->setCollation(_request->getCollation());
     qr->setExplain(_request->isExplain());
+    qr->setHint(_request->getHint());
 
     // Limit should only used for the findAndModify command when a sort is specified. If a sort
     // is requested, we want to use a top-k sort for efficiency reasons, so should pass the
@@ -123,9 +124,14 @@ Status ParsedUpdate::parseQueryToCQ() {
         allowedMatcherFeatures &= ~MatchExpressionParser::AllowedFeatures::kExpr;
     }
 
+    // If the update request has runtime constants attached to it, pass them to the QueryRequest.
+    if (auto& runtimeConstants = _request->getRuntimeConstants()) {
+        qr->setRuntimeConstants(*runtimeConstants);
+    }
+
     boost::intrusive_ptr<ExpressionContext> expCtx;
     auto statusWithCQ = CanonicalQuery::canonicalize(
-        _opCtx, std::move(qr), std::move(expCtx), extensionsCallback, allowedMatcherFeatures);
+        _opCtx, std::move(qr), std::move(expCtx), _extensionsCallback, allowedMatcherFeatures);
     if (statusWithCQ.isOK()) {
         _canonicalQuery = std::move(statusWithCQ.getValue());
     }
@@ -145,7 +151,10 @@ void ParsedUpdate::parseUpdate() {
     _driver.setLogOp(true);
     _driver.setFromOplogApplication(_request->isFromOplogApplication());
 
-    _driver.parse(_request->getUpdates(), _arrayFilters, _request->isMulti());
+    _driver.parse(_request->getUpdateModification(),
+                  _arrayFilters,
+                  _request->getUpdateConstants(),
+                  _request->isMulti());
 }
 
 StatusWith<std::map<StringData, std::unique_ptr<ExpressionWithPlaceholder>>>
@@ -195,11 +204,11 @@ PlanExecutor::YieldPolicy ParsedUpdate::yieldPolicy() const {
 }
 
 bool ParsedUpdate::hasParsedQuery() const {
-    return _canonicalQuery.get() != NULL;
+    return _canonicalQuery.get() != nullptr;
 }
 
 std::unique_ptr<CanonicalQuery> ParsedUpdate::releaseParsedQuery() {
-    invariant(_canonicalQuery.get() != NULL);
+    invariant(_canonicalQuery.get() != nullptr);
     return std::move(_canonicalQuery);
 }
 

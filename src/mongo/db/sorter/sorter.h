@@ -29,6 +29,8 @@
 
 #pragma once
 
+#include <third_party/murmurhash3/MurmurHash3.h>
+
 #include <deque>
 #include <fstream>
 #include <memory>
@@ -36,8 +38,8 @@
 #include <utility>
 #include <vector>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/bson/util/builder.h"
+#include "mongo/util/bufreader.h"
 
 /**
  * This is the public API for the Sorter (both in-memory and external)
@@ -46,7 +48,7 @@
  * require the following public members:
  *
  * // A type carrying extra information used by the deserializer. Contents are
- * // up to you, but  it should be cheap to copy. Use an empty struct if your
+ * // up to you, but it should be cheap to copy. Use an empty struct if your
  * // deserializer doesn't need extra data.
  * struct SorterDeserializeSettings {};
  *
@@ -59,8 +61,9 @@
  * // How much memory is used by your type? Include sizeof(*this) and any memory you reference.
  * int memUsageForSorter() const;
  *
- * // For types with owned and unowned states, such as BSON, return an owned version.
- * // Return *this if your type doesn't have an unowned state
+ * // For types with owned and unowned states, such as BSON, return an owned version. The Sorter
+ * // is responsible for converting any unowned data to an owned state if it needs to be buffered.
+ * // Return *this if your type doesn't have an unowned state.
  * Type getOwned() const;
  *
  * Comparators are functors that that compare std::pair<Key, Value> and return an
@@ -130,11 +133,32 @@ struct SortOptions {
 };
 
 /**
+ * This is a 0-sized dummy object that satisfies Sorter's Key/Value interface.
+ */
+class NullValue {
+public:
+    struct SorterDeserializeSettings {};  // unused
+    void serializeForSorter(BufBuilder& buf) const {
+        return;
+    }
+    static NullValue deserializeForSorter(BufReader& buf, const SorterDeserializeSettings&) {
+        return {};
+    }
+    int memUsageForSorter() const {
+        return 0;
+    }
+    NullValue getOwned() const {
+        return {};
+    }
+};
+
+/**
  * This is the sorted output iterator from the sorting framework.
  */
 template <typename Key, typename Value>
 class SortIteratorInterface {
-    MONGO_DISALLOW_COPYING(SortIteratorInterface);
+    SortIteratorInterface(const SortIteratorInterface&) = delete;
+    SortIteratorInterface& operator=(const SortIteratorInterface&) = delete;
 
 public:
     typedef std::pair<Key, Value> Data;
@@ -179,7 +203,8 @@ protected:
  */
 template <typename Key, typename Value>
 class Sorter {
-    MONGO_DISALLOW_COPYING(Sorter);
+    Sorter(const Sorter&) = delete;
+    Sorter& operator=(const Sorter&) = delete;
 
 public:
     typedef std::pair<Key, Value> Data;
@@ -204,13 +229,14 @@ public:
 
     virtual ~Sorter() {}
 
-    bool usedDisk() {
+    bool usedDisk() const {
         return _usedDisk;
     }
 
 protected:
+    Sorter() {}  // can only be constructed as a base
+
     bool _usedDisk{false};  // Keeps track of whether the sorter used disk or not
-    Sorter() {}             // can only be constructed as a base
 };
 
 /**
@@ -219,7 +245,8 @@ protected:
  */
 template <typename Key, typename Value>
 class SortedFileWriter {
-    MONGO_DISALLOW_COPYING(SortedFileWriter);
+    SortedFileWriter(const SortedFileWriter&) = delete;
+    SortedFileWriter& operator=(const SortedFileWriter&) = delete;
 
 public:
     typedef SortIteratorInterface<Key, Value> Iterator;
@@ -258,13 +285,17 @@ private:
     std::ofstream _file;
     BufBuilder _buffer;
 
+    // Keeps track of the hash of all data objects spilled to disk. Passed to the FileIterator
+    // to ensure data has not been corrupted after reading from disk.
+    uint32_t _checksum = 0;
+
     // Tracks where in the file we started and finished writing the sorted data range so that the
     // information can be given to the Iterator in done(), and to the user via getFileEndOffset()
     // for the next SortedFileWriter instance using the same file.
     std::streampos _fileStartOffset;
     std::streampos _fileEndOffset;
 };
-}
+}  // namespace mongo
 
 /**
  * #include "mongo/db/sorter/sorter.cpp" and call this in a single translation

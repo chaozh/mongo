@@ -38,22 +38,27 @@
 namespace mongo {
 
 WildcardAccessMethod::WildcardAccessMethod(IndexCatalogEntry* wildcardState,
-                                           SortedDataInterface* btree)
-    : AbstractIndexAccessMethod(wildcardState, btree),
-      _keyGen(
-          _descriptor->keyPattern(), _descriptor->pathProjection(), _btreeState->getCollator()) {}
+                                           std::unique_ptr<SortedDataInterface> btree)
+    : AbstractIndexAccessMethod(wildcardState, std::move(btree)),
+      _keyGen(_descriptor->keyPattern(),
+              _descriptor->pathProjection(),
+              _btreeState->getCollator(),
+              getSortedDataInterface()->getKeyStringVersion(),
+              getSortedDataInterface()->getOrdering()) {}
 
-bool WildcardAccessMethod::shouldMarkIndexAsMultikey(const BSONObjSet& keys,
-                                                     const BSONObjSet& multikeyMetadataKeys,
-                                                     const MultikeyPaths& multikeyPaths) const {
+bool WildcardAccessMethod::shouldMarkIndexAsMultikey(
+    size_t numberOfKeys,
+    const std::vector<KeyString::Value>& multikeyMetadataKeys,
+    const MultikeyPaths& multikeyPaths) const {
     return !multikeyMetadataKeys.empty();
 }
 
 void WildcardAccessMethod::doGetKeys(const BSONObj& obj,
-                                     BSONObjSet* keys,
-                                     BSONObjSet* multikeyMetadataKeys,
-                                     MultikeyPaths* multikeyPaths) const {
-    _keyGen.generateKeys(obj, keys, multikeyMetadataKeys);
+                                     KeyStringSet* keys,
+                                     KeyStringSet* multikeyMetadataKeys,
+                                     MultikeyPaths* multikeyPaths,
+                                     boost::optional<RecordId> id) const {
+    _keyGen.generateKeys(obj, keys, multikeyMetadataKeys, id);
 }
 
 FieldRef WildcardAccessMethod::extractMultikeyPathFromIndexKey(const IndexKeyEntry& entry) {
@@ -85,51 +90,63 @@ std::set<FieldRef> WildcardAccessMethod::_getMultikeyPathSet(
     OperationContext* opCtx,
     const IndexBounds& indexBounds,
     MultikeyMetadataAccessStats* stats) const {
-    return writeConflictRetry(opCtx,
-                              "wildcard multikey path retrieval",
-                              _descriptor->parentNS(),
-                              [&]() -> std::set<FieldRef> {
-                                  stats->numSeeks = 0;
-                                  stats->keysExamined = 0;
-                                  auto cursor = newCursor(opCtx);
+    return writeConflictRetry(
+        opCtx,
+        "wildcard multikey path retrieval",
+        _descriptor->parentNS().ns(),
+        [&]() -> std::set<FieldRef> {
+            stats->numSeeks = 0;
+            stats->keysExamined = 0;
+            auto cursor = newCursor(opCtx);
 
-                                  constexpr int kForward = 1;
-                                  const auto keyPattern = BSON("" << 1 << "" << 1);
-                                  IndexBoundsChecker checker(&indexBounds, keyPattern, kForward);
-                                  IndexSeekPoint seekPoint;
-                                  if (!checker.getStartSeekPoint(&seekPoint)) {
-                                      return {};
-                                  }
+            constexpr int kForward = 1;
+            const auto keyPattern = BSON("" << 1 << "" << 1);
+            IndexBoundsChecker checker(&indexBounds, keyPattern, kForward);
+            IndexSeekPoint seekPoint;
+            if (!checker.getStartSeekPoint(&seekPoint)) {
+                return {};
+            }
 
-                                  std::set<FieldRef> multikeyPaths{};
-                                  auto entry = cursor->seek(seekPoint);
-                                  ++stats->numSeeks;
-                                  while (entry) {
-                                      ++stats->keysExamined;
+            std::set<FieldRef> multikeyPaths{};
+            auto entry = cursor->seek(IndexEntryComparison::makeKeyStringFromSeekPointForSeek(
+                seekPoint,
+                getSortedDataInterface()->getKeyStringVersion(),
+                getSortedDataInterface()->getOrdering(),
+                kForward));
 
-                                      switch (checker.checkKey(entry->key, &seekPoint)) {
-                                          case IndexBoundsChecker::VALID:
-                                              multikeyPaths.emplace(
-                                                  extractMultikeyPathFromIndexKey(*entry));
-                                              entry = cursor->next();
-                                              break;
 
-                                          case IndexBoundsChecker::MUST_ADVANCE:
-                                              ++stats->numSeeks;
-                                              entry = cursor->seek(seekPoint);
-                                              break;
+            ++stats->numSeeks;
+            while (entry) {
+                ++stats->keysExamined;
 
-                                          case IndexBoundsChecker::DONE:
-                                              entry = boost::none;
-                                              break;
+                switch (checker.checkKey(entry->key, &seekPoint)) {
+                    case IndexBoundsChecker::VALID:
+                        multikeyPaths.emplace(extractMultikeyPathFromIndexKey(*entry));
+                        entry = cursor->next();
+                        break;
 
-                                          default:
-                                              MONGO_UNREACHABLE;
-                                      }
-                                  }
+                    case IndexBoundsChecker::MUST_ADVANCE:
+                        ++stats->numSeeks;
+                        entry =
+                            cursor->seek(IndexEntryComparison::makeKeyStringFromSeekPointForSeek(
+                                seekPoint,
+                                getSortedDataInterface()->getKeyStringVersion(),
+                                getSortedDataInterface()->getOrdering(),
+                                kForward));
 
-                                  return multikeyPaths;
-                              });
+                        break;
+
+                    case IndexBoundsChecker::DONE:
+                        entry = boost::none;
+                        break;
+
+                    default:
+                        MONGO_UNREACHABLE;
+                }
+            }
+
+            return multikeyPaths;
+        });
 }
 
 
@@ -207,7 +224,7 @@ std::set<FieldRef> WildcardAccessMethod::getMultikeyPathSet(
 std::set<FieldRef> WildcardAccessMethod::getMultikeyPathSet(
     OperationContext* opCtx, MultikeyMetadataAccessStats* stats) const {
     return writeConflictRetry(
-        opCtx, "wildcard multikey path retrieval", _descriptor->parentNS(), [&]() {
+        opCtx, "wildcard multikey path retrieval", _descriptor->parentNS().ns(), [&]() {
             invariant(stats);
             stats->numSeeks = 0;
             stats->keysExamined = 0;
@@ -221,7 +238,14 @@ std::set<FieldRef> WildcardAccessMethod::getMultikeyPathSet(
 
             constexpr bool inclusive = true;
             cursor->setEndPosition(metadataKeyRangeEnd, inclusive);
-            auto entry = cursor->seek(metadataKeyRangeBegin, inclusive);
+
+            auto keyStringForSeek = IndexEntryComparison::makeKeyStringFromBSONKeyForSeek(
+                metadataKeyRangeBegin,
+                getSortedDataInterface()->getKeyStringVersion(),
+                getSortedDataInterface()->getOrdering(),
+                true, /* forward */
+                inclusive);
+            auto entry = cursor->seek(keyStringForSeek);
             ++stats->numSeeks;
 
             // Iterate the cursor, copying the multikey paths into an in-memory set.

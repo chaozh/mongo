@@ -32,7 +32,7 @@
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/stdx/mutex.h"
+#include "mongo/platform/mutex.h"
 
 namespace mongo {
 
@@ -57,7 +57,8 @@ class ThreadPool;
  * improper use of the ctor, `flush` and `shutdown` methods below.
  */
 class DeferredWriter {
-    MONGO_DISALLOW_COPYING(DeferredWriter);
+    DeferredWriter(const DeferredWriter&) = delete;
+    DeferredWriter& operator=(const DeferredWriter&) = delete;
 
 public:
     /**
@@ -157,7 +158,7 @@ private:
     /**
      * Guards all non-const, non-thread-safe members.
      */
-    stdx::mutex _mutex;
+    Mutex _mutex = MONGO_MAKE_LATCH("DeferredWriter::_mutex");
 
     /**
      * The number of bytes currently in the in-memory buffer.

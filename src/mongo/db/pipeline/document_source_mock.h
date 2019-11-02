@@ -31,51 +31,40 @@
 
 #include <deque>
 
-#include "mongo/db/pipeline/document_source.h"
+#include "mongo/db/pipeline/document_source_queue.h"
 
 namespace mongo {
 
 /**
- * Used in testing to store documents without using the storage layer. Methods are not marked as
- * final in order to allow tests to intercept calls if needed.
+ * A mock DocumentSource which is useful for testing. In addition to re-spooling documents like
+ * DocumentSourceQueue, it tracks some state about which methods have been called.
  */
-class DocumentSourceMock : public DocumentSource {
+class DocumentSourceMock : public DocumentSourceQueue {
 public:
-    DocumentSourceMock(std::deque<GetNextResult> results);
-    DocumentSourceMock(std::deque<GetNextResult> results,
-                       const boost::intrusive_ptr<ExpressionContext>& expCtx);
+    // Constructors which create their own ExpressionContextForTest. Do _not_ use these outside of
+    // tests, as they will spin up ServiceContexts (TODO SERVER-41060).
+    static boost::intrusive_ptr<DocumentSourceMock> createForTest();
 
-    GetNextResult getNext() override;
-    const char* getSourceName() const override;
-    Value serialize(
-        boost::optional<ExplainOptions::Verbosity> explain = boost::none) const override;
+    static boost::intrusive_ptr<DocumentSourceMock> createForTest(Document doc);
 
-    StageConstraints constraints(Pipeline::SplitState pipeState) const override {
-        StageConstraints constraints(StreamType::kStreaming,
-                                     PositionRequirement::kFirst,
-                                     HostTypeRequirement::kNone,
-                                     DiskUseRequirement::kNoDiskUse,
-                                     FacetRequirement::kNotAllowed,
-                                     TransactionRequirement::kAllowed);
+    static boost::intrusive_ptr<DocumentSourceMock> createForTest(const GetNextResult& result);
+    static boost::intrusive_ptr<DocumentSourceMock> createForTest(
+        std::deque<GetNextResult> results);
 
-        constraints.requiresInputDocSource = false;
-        return constraints;
-    }
-
-    BSONObjSet getOutputSorts() override {
-        return sorts;
-    }
-
-    static boost::intrusive_ptr<DocumentSourceMock> create();
-
-    static boost::intrusive_ptr<DocumentSourceMock> create(Document doc);
-
-    static boost::intrusive_ptr<DocumentSourceMock> create(const GetNextResult& result);
-    static boost::intrusive_ptr<DocumentSourceMock> create(std::deque<GetNextResult> results);
-
-    static boost::intrusive_ptr<DocumentSourceMock> create(const char* json);
-    static boost::intrusive_ptr<DocumentSourceMock> create(
+    static boost::intrusive_ptr<DocumentSourceMock> createForTest(const char* json);
+    static boost::intrusive_ptr<DocumentSourceMock> createForTest(
         const std::initializer_list<const char*>& jsons);
+
+    using DocumentSourceQueue::DocumentSourceQueue;
+    DocumentSourceMock(std::deque<GetNextResult>);
+
+    Value serialize(
+        boost::optional<ExplainOptions::Verbosity> explain = boost::none) const override {
+        // Unlike the queue, it's okay to serialize this stage for testing purposes.
+        return Value(Document{{getSourceName(), Document()}});
+    }
+
+    const char* getSourceName() const override;
 
     void reattachToOperationContext(OperationContext* opCtx) {
         isDetachedFromOpCtx = false;
@@ -97,22 +86,24 @@ public:
         return {GetModPathsReturn::Type::kFiniteSet, std::set<std::string>{}, {}};
     }
 
-    boost::optional<MergingLogic> mergingLogic() override {
+    boost::optional<DistributedPlanLogic> distributedPlanLogic() override {
         return boost::none;
     }
-
-    // Return documents from front of queue.
-    std::deque<GetNextResult> queue;
 
     bool isDisposed = false;
     bool isDetachedFromOpCtx = false;
     bool isOptimized = false;
-    bool isExpCtxInjected = false;
-
-    BSONObjSet sorts;
 
 protected:
-    void doDispose() override;
+    GetNextResult doGetNext() override {
+        invariant(!isDisposed);
+        invariant(!isDetachedFromOpCtx);
+        return DocumentSourceQueue::doGetNext();
+    }
+
+    void doDispose() override {
+        isDisposed = true;
+    }
 };
 
 }  // namespace mongo

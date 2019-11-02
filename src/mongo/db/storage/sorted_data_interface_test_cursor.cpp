@@ -54,8 +54,7 @@ TEST(SortedDataInterface, CursorIsEOFWhenEmpty) {
     {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
         const std::unique_ptr<SortedDataInterface::Cursor> cursor(sorted->newCursor(opCtx.get()));
-
-        ASSERT(!cursor->seek(kMinBSONKey, true));
+        ASSERT(!cursor->seek(makeKeyStringForSeek(sorted.get(), BSONObj(), true, true)));
 
         // Cursor at EOF should remain at EOF when advanced
         ASSERT(!cursor->next());
@@ -78,7 +77,7 @@ TEST(SortedDataInterface, CursorIsEOFWhenEmptyReversed) {
         const std::unique_ptr<SortedDataInterface::Cursor> cursor(
             sorted->newCursor(opCtx.get(), false));
 
-        ASSERT(!cursor->seek(kMaxBSONKey, true));
+        ASSERT(!cursor->seek(makeKeyStringForSeek(sorted.get(), kMaxBSONKey, false, true)));
 
         // Cursor at EOF should remain at EOF when advanced
         ASSERT(!cursor->next());
@@ -104,7 +103,7 @@ TEST(SortedDataInterface, ExhaustCursor) {
             WriteUnitOfWork uow(opCtx.get());
             BSONObj key = BSON("" << i);
             RecordId loc(42, i * 2);
-            ASSERT_OK(sorted->insert(opCtx.get(), key, loc, true));
+            ASSERT_OK(sorted->insert(opCtx.get(), makeKeyString(sorted.get(), key, loc), true));
             uow.commit();
         }
     }
@@ -118,13 +117,62 @@ TEST(SortedDataInterface, ExhaustCursor) {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
         const std::unique_ptr<SortedDataInterface::Cursor> cursor(sorted->newCursor(opCtx.get()));
         for (int i = 0; i < nToInsert; i++) {
-            auto entry = i == 0 ? cursor->seek(kMinBSONKey, true) : cursor->next();
+            auto entry = i == 0
+                ? cursor->seek(makeKeyStringForSeek(sorted.get(), BSONObj(), true, true))
+                : cursor->next();
             ASSERT_EQ(entry, IndexKeyEntry(BSON("" << i), RecordId(42, i * 2)));
         }
         ASSERT(!cursor->next());
 
         // Cursor at EOF should remain at EOF when advanced
         ASSERT(!cursor->next());
+    }
+}
+
+TEST(SortedDataInterface, ExhaustKeyStringCursor) {
+    const auto harnessHelper(newSortedDataInterfaceHarnessHelper());
+    const std::unique_ptr<SortedDataInterface> sorted(
+        harnessHelper->newSortedDataInterface(/*unique=*/false, /*partial=*/false));
+
+    {
+        const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        ASSERT(sorted->isEmpty(opCtx.get()));
+    }
+
+    std::vector<KeyString::Value> keyStrings;
+    int nToInsert = 10;
+    for (int i = 0; i < nToInsert; i++) {
+        const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        {
+            WriteUnitOfWork uow(opCtx.get());
+            BSONObj key = BSON("" << i);
+            RecordId loc(42, i * 2);
+            KeyString::Value ks = makeKeyString(sorted.get(), key, loc);
+            keyStrings.push_back(ks);
+            ASSERT_OK(sorted->insert(opCtx.get(), ks, true));
+            uow.commit();
+        }
+    }
+
+    {
+        const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        ASSERT_EQUALS(nToInsert, sorted->numEntries(opCtx.get()));
+    }
+
+    {
+        const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        const std::unique_ptr<SortedDataInterface::Cursor> cursor(sorted->newCursor(opCtx.get()));
+        for (int i = 0; i < nToInsert; i++) {
+            auto entry = i == 0 ? cursor->seekForKeyString(
+                                      makeKeyStringForSeek(sorted.get(), BSONObj(), true, true))
+                                : cursor->nextKeyString();
+            ASSERT(entry);
+            ASSERT_EQ(entry->keyString, keyStrings.at(i));
+        }
+        ASSERT(!cursor->nextKeyString());
+
+        // Cursor at EOF should remain at EOF when advanced
+        ASSERT(!cursor->nextKeyString());
     }
 }
 
@@ -147,7 +195,7 @@ TEST(SortedDataInterface, ExhaustCursorReversed) {
             WriteUnitOfWork uow(opCtx.get());
             BSONObj key = BSON("" << i);
             RecordId loc(42, i * 2);
-            ASSERT_OK(sorted->insert(opCtx.get(), key, loc, true));
+            ASSERT_OK(sorted->insert(opCtx.get(), makeKeyString(sorted.get(), key, loc), true));
             uow.commit();
         }
     }
@@ -162,13 +210,63 @@ TEST(SortedDataInterface, ExhaustCursorReversed) {
         const std::unique_ptr<SortedDataInterface::Cursor> cursor(
             sorted->newCursor(opCtx.get(), false));
         for (int i = nToInsert - 1; i >= 0; i--) {
-            auto entry = (i == nToInsert - 1) ? cursor->seek(kMaxBSONKey, true) : cursor->next();
+            auto entry = (i == nToInsert - 1)
+                ? cursor->seek(makeKeyStringForSeek(sorted.get(), kMaxBSONKey, false, true))
+                : cursor->next();
             ASSERT_EQ(entry, IndexKeyEntry(BSON("" << i), RecordId(42, i * 2)));
         }
         ASSERT(!cursor->next());
 
         // Cursor at EOF should remain at EOF when advanced
         ASSERT(!cursor->next());
+    }
+}
+
+TEST(SortedDataInterface, ExhaustKeyStringCursorReversed) {
+    const auto harnessHelper(newSortedDataInterfaceHarnessHelper());
+    const std::unique_ptr<SortedDataInterface> sorted(
+        harnessHelper->newSortedDataInterface(/*unique=*/false, /*partial=*/false));
+
+    {
+        const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        ASSERT(sorted->isEmpty(opCtx.get()));
+    }
+
+    std::vector<KeyString::Value> keyStrings;
+    int nToInsert = 10;
+    for (int i = 0; i < nToInsert; i++) {
+        const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        {
+            WriteUnitOfWork uow(opCtx.get());
+            BSONObj key = BSON("" << i);
+            RecordId loc(42, i * 2);
+            KeyString::Value ks = makeKeyString(sorted.get(), key, loc);
+            keyStrings.push_back(ks);
+            ASSERT_OK(sorted->insert(opCtx.get(), ks, true));
+            uow.commit();
+        }
+    }
+
+    {
+        const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        ASSERT_EQUALS(nToInsert, sorted->numEntries(opCtx.get()));
+    }
+
+    {
+        const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        const std::unique_ptr<SortedDataInterface::Cursor> cursor(
+            sorted->newCursor(opCtx.get(), false));
+        for (int i = nToInsert - 1; i >= 0; i--) {
+            auto entry = (i == nToInsert - 1) ? cursor->seekForKeyString(makeKeyStringForSeek(
+                                                    sorted.get(), kMaxBSONKey, false, true))
+                                              : cursor->nextKeyString();
+            ASSERT(entry);
+            ASSERT_EQ(entry->keyString, keyStrings.at(i));
+        }
+        ASSERT(!cursor->nextKeyString());
+
+        // Cursor at EOF should remain at EOF when advanced
+        ASSERT(!cursor->nextKeyString());
     }
 }
 
@@ -185,7 +283,7 @@ void testBoundaries(bool unique, bool forward, bool inclusive) {
         WriteUnitOfWork uow(opCtx.get());
         BSONObj key = BSON("" << i);
         RecordId loc(42 + i * 2);
-        ASSERT_OK(sorted->insert(opCtx.get(), key, loc, true));
+        ASSERT_OK(sorted->insert(opCtx.get(), makeKeyString(sorted.get(), key, loc), true));
         uow.commit();
     }
 
@@ -201,7 +299,7 @@ void testBoundaries(bool unique, bool forward, bool inclusive) {
         auto endKey = BSON("" << endVal);
         cursor->setEndPosition(endKey, inclusive);
 
-        auto entry = cursor->seek(startKey, inclusive);
+        auto entry = cursor->seek(makeKeyStringForSeek(sorted.get(), startKey, forward, inclusive));
 
         // Check that the cursor returns the expected values in range.
         int step = forward ? 1 : -1;

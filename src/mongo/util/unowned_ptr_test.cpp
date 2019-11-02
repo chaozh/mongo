@@ -46,7 +46,7 @@ TEST(UnownedPtr, Construction) {
     ASSERT_EQUALS(aNullPtr, unowned_ptr<int>());
     ASSERT_EQUALS(aNullPtr, unowned_ptr<int>({}));
     ASSERT_EQUALS(aNullPtr, unowned_ptr<int>(nullptr));
-    ASSERT_EQUALS(aNullPtr, unowned_ptr<int>(NULL));
+    ASSERT_EQUALS(aNullPtr, unowned_ptr<int>(nullptr));
     ASSERT_EQUALS(p1.get(), unowned_ptr<int>(p1.get()));
     ASSERT_EQUALS(p1.get(), unowned_ptr<int>(p1));
     ASSERT_EQUALS(p2.get(), unowned_ptr<int>(p2));
@@ -59,7 +59,7 @@ TEST(UnownedPtr, Construction) {
     ASSERT_EQUALS(aNullPtr, unowned_ptr<const int>());
     ASSERT_EQUALS(aNullPtr, unowned_ptr<const int>({}));
     ASSERT_EQUALS(aNullPtr, unowned_ptr<const int>(nullptr));
-    ASSERT_EQUALS(aNullPtr, unowned_ptr<const int>(NULL));
+    ASSERT_EQUALS(aNullPtr, unowned_ptr<const int>(nullptr));
     ASSERT_EQUALS(p1.get(), unowned_ptr<const int>(p1.get()));
     ASSERT_EQUALS(cp1.get(), unowned_ptr<const int>(cp1.get()));
     ASSERT_EQUALS(p1.get(), unowned_ptr<const int>(p1));
@@ -86,7 +86,7 @@ TEST(UnownedPtr, Assignment) {
 
     ASSERT_EQUALS(aNullPtr, (unowned_ptr<int>() = {}));
     ASSERT_EQUALS(aNullPtr, (unowned_ptr<int>() = nullptr));
-    ASSERT_EQUALS(aNullPtr, (unowned_ptr<int>() = NULL));
+    ASSERT_EQUALS(aNullPtr, (unowned_ptr<int>() = nullptr));
     ASSERT_EQUALS(p1.get(), (unowned_ptr<int>() = p1.get()));
     ASSERT_EQUALS(p1.get(), (unowned_ptr<int>() = p1));
     ASSERT_EQUALS(p2.get(), (unowned_ptr<int>() = p2));
@@ -98,7 +98,7 @@ TEST(UnownedPtr, Assignment) {
 
     ASSERT_EQUALS(aNullPtr, (unowned_ptr<const int>() = {}));
     ASSERT_EQUALS(aNullPtr, (unowned_ptr<const int>() = nullptr));
-    ASSERT_EQUALS(aNullPtr, (unowned_ptr<const int>() = NULL));
+    ASSERT_EQUALS(aNullPtr, (unowned_ptr<const int>() = nullptr));
     ASSERT_EQUALS(p1.get(), (unowned_ptr<const int>() = p1.get()));
     ASSERT_EQUALS(cp1.get(), (unowned_ptr<const int>() = cp1.get()));
     ASSERT_EQUALS(p1.get(), (unowned_ptr<const int>() = p1));
@@ -155,4 +155,4 @@ TEST(UnownedPtr, Equality) {
     ASSERT_NE(unowned_ptr<int>(), unowned_ptr<int>(&i));    // NULL != non-NULL
     ASSERT_NE(unowned_ptr<int>(&i), unowned_ptr<int>(&j));  // two distinct non-NULLs
 }
-}
+}  // namespace mongo

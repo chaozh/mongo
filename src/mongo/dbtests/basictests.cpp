@@ -35,21 +35,21 @@
 #include "mongo/dbtests/dbtests.h"
 #include "mongo/util/base64.h"
 #include "mongo/util/queue.h"
-#include "mongo/util/stringutils.h"
+#include "mongo/util/str.h"
 #include "mongo/util/text.h"
 #include "mongo/util/thread_safe_string.h"
 #include "mongo/util/timer.h"
 
 namespace BasicTests {
 
-using std::unique_ptr;
-using std::shared_ptr;
 using std::cout;
 using std::dec;
 using std::endl;
 using std::hex;
+using std::shared_ptr;
 using std::string;
 using std::stringstream;
+using std::unique_ptr;
 using std::vector;
 
 class RarelyTest {
@@ -356,9 +356,9 @@ public:
     }
 };
 
-class All : public Suite {
+class All : public OldStyleSuiteSpecification {
 public:
-    All() : Suite("basic") {}
+    All() : OldStyleSuiteSpecification("basic") {}
 
     void setupTests() {
         add<RarelyTest>();
@@ -382,6 +382,6 @@ public:
     }
 };
 
-SuiteInstance<All> myall;
+OldStyleSuiteInitializer<All> myall;
 
 }  // namespace BasicTests

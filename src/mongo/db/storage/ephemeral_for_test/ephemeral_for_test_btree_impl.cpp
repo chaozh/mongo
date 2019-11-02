@@ -31,13 +31,14 @@
 
 #include "mongo/db/storage/ephemeral_for_test/ephemeral_for_test_btree_impl.h"
 
+#include <memory>
 #include <set>
 
 #include "mongo/db/catalog/index_catalog_entry.h"
 #include "mongo/db/storage/ephemeral_for_test/ephemeral_for_test_recovery_unit.h"
 #include "mongo/db/storage/index_entry_comparison.h"
-#include "mongo/stdx/memory.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/db/storage/key_string.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -46,26 +47,6 @@ using std::string;
 using std::vector;
 
 namespace {
-
-
-bool hasFieldNames(const BSONObj& obj) {
-    BSONForEach(e, obj) {
-        if (e.fieldName()[0])
-            return true;
-    }
-    return false;
-}
-
-BSONObj stripFieldNames(const BSONObj& query) {
-    if (!hasFieldNames(query))
-        return query;
-
-    BSONObjBuilder bb;
-    BSONForEach(e, query) {
-        bb.appendAs(e, StringData());
-    }
-    return bb.obj();
-}
 
 typedef std::set<IndexKeyEntry, IndexEntryComparison> IndexSet;
 
@@ -90,12 +71,14 @@ class EphemeralForTestBtreeBuilderImpl : public SortedDataBuilderInterface {
 public:
     EphemeralForTestBtreeBuilderImpl(IndexSet* data,
                                      long long* currentKeySize,
+                                     const Ordering& ordering,
                                      bool dupsAllowed,
-                                     const std::string& collectionNamespace,
+                                     const NamespaceString& collectionNamespace,
                                      const std::string& indexName,
                                      const BSONObj& keyPattern)
         : _data(data),
           _currentKeySize(currentKeySize),
+          _ordering(ordering),
           _dupsAllowed(dupsAllowed),
           _comparator(_data->key_comp()),
           _collectionNamespace(collectionNamespace),
@@ -104,11 +87,11 @@ public:
         invariant(_data->empty());
     }
 
-    StatusWith<SpecialFormatInserted> addKey(const BSONObj& key, const RecordId& loc) {
+    Status _addKey(const BSONObj& key, const RecordId& loc) {
         // inserts should be in ascending (key, RecordId) order.
 
         invariant(loc.isValid());
-        invariant(!hasFieldNames(key));
+        invariant(!key.hasFieldNames());
 
         if (!_data->empty()) {
             // Compare specified key with last inserted key, ignoring its RecordId
@@ -125,18 +108,29 @@ public:
         _last = _data->insert(_data->end(), IndexKeyEntry(owned, loc));
         *_currentKeySize += key.objsize();
 
-        return StatusWith<SpecialFormatInserted>(SpecialFormatInserted::NoSpecialFormatInserted);
+        return Status::OK();
+    }
+
+    Status addKey(const KeyString::Value& keyString) {
+        dassert(
+            KeyString::decodeRecordIdAtEnd(keyString.getBuffer(), keyString.getSize()).isValid());
+        RecordId loc = KeyString::decodeRecordIdAtEnd(keyString.getBuffer(), keyString.getSize());
+
+        auto key = KeyString::toBson(keyString, _ordering);
+
+        return _addKey(key, loc);
     }
 
 private:
     IndexSet* const _data;
     long long* _currentKeySize;
+    const Ordering& _ordering;
     const bool _dupsAllowed;
 
     IndexEntryComparison _comparator;  // used by the bulk builder to detect duplicate keys
     IndexSet::const_iterator _last;    // or (key, RecordId) ordering violations
 
-    const std::string _collectionNamespace;
+    const NamespaceString _collectionNamespace;
     const std::string _indexName;
     const BSONObj _keyPattern;
 };
@@ -144,11 +138,13 @@ private:
 class EphemeralForTestBtreeImpl : public SortedDataInterface {
 public:
     EphemeralForTestBtreeImpl(IndexSet* data,
+                              const Ordering& ordering,
                               bool isUnique,
-                              const std::string& collectionNamespace,
+                              const NamespaceString& collectionNamespace,
                               const std::string& indexName,
                               const BSONObj& keyPattern)
-        : _data(data),
+        : SortedDataInterface(KeyString::Version::kLatestVersion, ordering),
+          _data(data),
           _isUnique(isUnique),
           _collectionNamespace(collectionNamespace),
           _indexName(indexName),
@@ -157,16 +153,21 @@ public:
     }
 
     virtual SortedDataBuilderInterface* getBulkBuilder(OperationContext* opCtx, bool dupsAllowed) {
-        return new EphemeralForTestBtreeBuilderImpl(
-            _data, &_currentKeySize, dupsAllowed, _collectionNamespace, _indexName, _keyPattern);
+        return new EphemeralForTestBtreeBuilderImpl(_data,
+                                                    &_currentKeySize,
+                                                    _ordering,
+                                                    dupsAllowed,
+                                                    _collectionNamespace,
+                                                    _indexName,
+                                                    _keyPattern);
     }
 
-    virtual StatusWith<SpecialFormatInserted> insert(OperationContext* opCtx,
-                                                     const BSONObj& key,
-                                                     const RecordId& loc,
-                                                     bool dupsAllowed) {
+    virtual Status insert(OperationContext* opCtx,
+                          const BSONObj& key,
+                          const RecordId& loc,
+                          bool dupsAllowed) {
         invariant(loc.isValid());
-        invariant(!hasFieldNames(key));
+        invariant(!key.hasFieldNames());
 
 
         // TODO optimization: save the iterator from the dup-check to speed up insert
@@ -176,9 +177,20 @@ public:
         IndexKeyEntry entry(key.getOwned(), loc);
         if (_data->insert(entry).second) {
             _currentKeySize += key.objsize();
-            opCtx->recoveryUnit()->registerChange(new IndexChange(_data, entry, true));
+            opCtx->recoveryUnit()->registerChange(
+                std::make_unique<IndexChange>(_data, entry, true));
         }
-        return StatusWith<SpecialFormatInserted>(SpecialFormatInserted::NoSpecialFormatInserted);
+        return Status::OK();
+    }
+
+    virtual Status insert(OperationContext* opCtx,
+                          const KeyString::Value& keyString,
+                          bool dupsAllowed) {
+        RecordId loc = KeyString::decodeRecordIdAtEnd(keyString.getBuffer(), keyString.getSize());
+
+        auto key = KeyString::toBson(keyString, _ordering);
+
+        return insert(opCtx, key, loc, dupsAllowed);
     }
 
     virtual void unindex(OperationContext* opCtx,
@@ -186,15 +198,26 @@ public:
                          const RecordId& loc,
                          bool dupsAllowed) {
         invariant(loc.isValid());
-        invariant(!hasFieldNames(key));
+        invariant(!key.hasFieldNames());
 
         IndexKeyEntry entry(key.getOwned(), loc);
         const size_t numDeleted = _data->erase(entry);
         invariant(numDeleted <= 1);
         if (numDeleted == 1) {
             _currentKeySize -= key.objsize();
-            opCtx->recoveryUnit()->registerChange(new IndexChange(_data, entry, false));
+            opCtx->recoveryUnit()->registerChange(
+                std::make_unique<IndexChange>(_data, entry, false));
         }
+    }
+
+    virtual void unindex(OperationContext* opCtx,
+                         const KeyString::Value& keyString,
+                         bool dupsAllowed) {
+        RecordId loc = KeyString::decodeRecordIdAtEnd(keyString.getBuffer(), keyString.getSize());
+
+        auto key = KeyString::toBson(keyString, _ordering);
+
+        return unindex(opCtx, key, loc, dupsAllowed);
     }
 
     virtual void fullValidate(OperationContext* opCtx,
@@ -214,29 +237,35 @@ public:
         return _currentKeySize + (sizeof(IndexKeyEntry) * _data->size());
     }
 
-    virtual Status dupKeyCheck(OperationContext* opCtx, const BSONObj& key) {
-        invariant(!hasFieldNames(key));
+    Status _dupKeyCheck(OperationContext* opCtx, const BSONObj& key) {
+        invariant(!key.hasFieldNames());
         if (isDup(*_data, key))
             return buildDupKeyErrorStatus(key, _collectionNamespace, _indexName, _keyPattern);
         return Status::OK();
+    }
+
+    virtual Status dupKeyCheck(OperationContext* opCtx, const KeyString::Value& keyString) {
+        const BSONObj key = KeyString::toBson(
+            keyString.getBuffer(), keyString.getSize(), _ordering, keyString.getTypeBits());
+        return _dupKeyCheck(opCtx, key);
     }
 
     virtual bool isEmpty(OperationContext* opCtx) {
         return _data->empty();
     }
 
-    virtual Status touch(OperationContext* opCtx) const {
-        // already in memory...
-        return Status::OK();
-    }
-
     class Cursor final : public SortedDataInterface::Cursor {
     public:
-        Cursor(OperationContext* opCtx, const IndexSet& data, bool isForward, bool isUnique)
+        Cursor(OperationContext* opCtx,
+               const IndexSet& data,
+               bool isForward,
+               bool isUnique,
+               const Ordering ordering)
             : _opCtx(opCtx),
               _data(data),
               _forward(isForward),
               _isUnique(isUnique),
+              _ordering(ordering),
               _it(data.end()) {}
 
         boost::optional<IndexKeyEntry> next(RequestedInfo parts) override {
@@ -254,6 +283,18 @@ public:
             return *_it;
         }
 
+        boost::optional<KeyStringEntry> nextKeyString() override {
+            boost::optional<IndexKeyEntry> indexKeyEntry = next(RequestedInfo::kKeyAndLoc);
+            if (!indexKeyEntry) {
+                return {};
+            }
+
+            KeyString::Builder builder(
+                KeyString::Version::kLatestVersion, indexKeyEntry->key, _ordering);
+            builder.appendRecordId(indexKeyEntry->loc);
+            return KeyStringEntry(builder.getValueCopy(), indexKeyEntry->loc);
+        }
+
         void setEndPosition(const BSONObj& key, bool inclusive) override {
             if (key.isEmpty()) {
                 // This means scan to end of index.
@@ -263,14 +304,12 @@ public:
 
             // NOTE: this uses the opposite min/max rules as a normal seek because a forward
             // scan should land after the key if inclusive and before if exclusive.
-            _endState = EndState(stripFieldNames(key),
+            _endState = EndState(BSONObj::stripFieldNames(key),
                                  _forward == inclusive ? RecordId::max() : RecordId::min());
             seekEndCursor();
         }
 
-        boost::optional<IndexKeyEntry> seek(const BSONObj& key,
-                                            bool inclusive,
-                                            RequestedInfo parts) override {
+        boost::optional<IndexKeyEntry> _seek(const BSONObj& key, bool inclusive, RequestedInfo) {
             if (key.isEmpty()) {
                 _it = inclusive ? _data.begin() : _data.end();
                 _isEOF = (_it == _data.end());
@@ -278,7 +317,7 @@ public:
                     return {};
                 }
             } else {
-                const BSONObj query = stripFieldNames(key);
+                const BSONObj query = BSONObj::stripFieldNames(key);
                 locate(query, _forward == inclusive ? RecordId::min() : RecordId::max());
                 _lastMoveWasRestore = false;
                 if (_isEOF)
@@ -290,16 +329,78 @@ public:
             return *_it;
         }
 
-        boost::optional<IndexKeyEntry> seek(const IndexSeekPoint& seekPoint,
-                                            RequestedInfo parts) override {
-            // Query encodes exclusive case so it can be treated as an inclusive query.
-            const BSONObj query = IndexEntryComparison::makeQueryObject(seekPoint, _forward);
+        boost::optional<IndexKeyEntry> seek(
+            const KeyString::Value& keyString,
+            RequestedInfo parts = RequestedInfo::kKeyAndLoc) override {
+            const BSONObj query = KeyString::toBsonSafeWithDiscriminator(
+                keyString.getBuffer(), keyString.getSize(), _ordering, keyString.getTypeBits());
+            if (query.isEmpty()) {
+                KeyString::Discriminator discriminator = KeyString::decodeDiscriminator(
+                    keyString.getBuffer(), keyString.getSize(), _ordering, keyString.getTypeBits());
+                // Deduce `inclusive` based on `discriminator` and `_forward`.
+                bool inclusive = (discriminator == KeyString::Discriminator::kInclusive) ||
+                    (_forward ^ (discriminator == KeyString::Discriminator::kExclusiveAfter));
+                _it = inclusive ? _data.begin() : _data.end();
+                _isEOF = (_it == _data.end());
+                if (_isEOF) {
+                    return {};
+                }
+                return *_it;
+            }
             locate(query, _forward ? RecordId::min() : RecordId::max());
             _lastMoveWasRestore = false;
             if (_isEOF)
                 return {};
             dassert(compareKeys(_it->key, query) >= 0);
             return *_it;
+        }
+
+        boost::optional<KeyStringEntry> seekForKeyString(const KeyString::Value& keyStringValue) {
+            auto indexKeyEntry = seek(keyStringValue);
+            if (indexKeyEntry) {
+                KeyString::Builder builder(KeyString::Version::V1, indexKeyEntry->key, _ordering);
+                builder.appendRecordId(indexKeyEntry->loc);
+                return KeyStringEntry(builder.getValueCopy(), indexKeyEntry->loc);
+            } else {
+                return {};
+            }
+        }
+
+        boost::optional<IndexKeyEntry> _seekExact(const BSONObj& key, RequestedInfo parts) {
+            auto kv = _seek(key, true, parts);
+            if (!kv || kv->key.woCompare(key, BSONObj(), /*considerFieldNames*/ false) != 0)
+                return {};
+
+            if (parts & SortedDataInterface::Cursor::kWantKey) {
+                return kv;
+            }
+            return IndexKeyEntry{{}, kv->loc};
+        }
+
+        boost::optional<KeyStringEntry> seekExactForKeyString(
+            const KeyString::Value& keyStringValue) override {
+            const BSONObj query = KeyString::toBson(keyStringValue.getBuffer(),
+                                                    keyStringValue.getSize(),
+                                                    _ordering,
+                                                    keyStringValue.getTypeBits());
+            auto kv = _seekExact(query, kKeyAndLoc);
+            if (kv) {
+                // We have retrived a valid result from _seekExact(). Convert to KeyString
+                // and return
+                KeyString::Builder ks(KeyString::Version::V1, kv->key, _ordering);
+                ks.appendRecordId(kv->loc);
+                return KeyStringEntry(ks.getValueCopy(), kv->loc);
+            }
+            return {};
+        }
+
+        boost::optional<IndexKeyEntry> seekExact(const KeyString::Value& keyStringValue,
+                                                 RequestedInfo parts) override {
+            const BSONObj query = KeyString::toBson(keyStringValue.getBuffer(),
+                                                    keyStringValue.getSize(),
+                                                    _ordering,
+                                                    keyStringValue.getTypeBits());
+            return _seekExact(query, parts);
         }
 
         void save() override {
@@ -457,6 +558,7 @@ public:
         const IndexSet& _data;
         const bool _forward;
         const bool _isUnique;
+        const Ordering _ordering;
         bool _isEOF = true;
         IndexSet::const_iterator _it;
 
@@ -481,7 +583,7 @@ public:
 
     virtual std::unique_ptr<SortedDataInterface::Cursor> newCursor(OperationContext* opCtx,
                                                                    bool isForward) const {
-        return stdx::make_unique<Cursor>(opCtx, *_data, isForward, _isUnique);
+        return std::make_unique<Cursor>(opCtx, *_data, isForward, _isUnique, _ordering);
     }
 
     virtual Status initAsEmpty(OperationContext* opCtx) {
@@ -513,7 +615,7 @@ private:
     long long _currentKeySize;
     const bool _isUnique;
 
-    const std::string _collectionNamespace;
+    const NamespaceString _collectionNamespace;
     const std::string _indexName;
     const BSONObj _keyPattern;
 };
@@ -521,21 +623,23 @@ private:
 
 // IndexCatalogEntry argument taken by non-const pointer for consistency with other Btree
 // factories. We don't actually modify it.
-SortedDataInterface* getEphemeralForTestBtreeImpl(const Ordering& ordering,
-                                                  bool isUnique,
-                                                  const std::string& collectionNamespace,
-                                                  const std::string& indexName,
-                                                  const BSONObj& keyPattern,
-                                                  std::shared_ptr<void>* dataInOut) {
+std::unique_ptr<SortedDataInterface> getEphemeralForTestBtreeImpl(
+    const Ordering& ordering,
+    bool isUnique,
+    const NamespaceString& collectionNamespace,
+    const std::string& indexName,
+    const BSONObj& keyPattern,
+    std::shared_ptr<void>* dataInOut) {
     invariant(dataInOut);
     if (!*dataInOut) {
         *dataInOut = std::make_shared<IndexSet>(IndexEntryComparison(ordering));
     }
-    return new EphemeralForTestBtreeImpl(static_cast<IndexSet*>(dataInOut->get()),
-                                         isUnique,
-                                         collectionNamespace,
-                                         indexName,
-                                         keyPattern);
+    return std::make_unique<EphemeralForTestBtreeImpl>(static_cast<IndexSet*>(dataInOut->get()),
+                                                       ordering,
+                                                       isUnique,
+                                                       collectionNamespace,
+                                                       indexName,
+                                                       keyPattern);
 }
 
 }  // namespace mongo

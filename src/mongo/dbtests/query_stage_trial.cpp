@@ -38,7 +38,6 @@
 #include "mongo/db/operation_context.h"
 #include "mongo/db/query/plan_yield_policy.h"
 #include "mongo/db/service_context_d_test_fixture.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
@@ -60,7 +59,7 @@ protected:
             }
             const auto id = _ws.allocate();
             auto* member = _ws.get(id);
-            member->obj.setValue(result.getOwned());
+            member->doc.setValue(Document{result});
             _ws.transitionToOwnedObj(id);
             queuedData->pushBack(id);
         }
@@ -74,7 +73,7 @@ protected:
             state = trialStage->work(&id);
             if (state == PlanStage::ADVANCED) {
                 auto* member = _ws.get(id);
-                return member->obj.value();
+                return member->doc.value().toBson();
             }
         } while (state == PlanStage::NEED_TIME);
 

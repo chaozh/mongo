@@ -50,9 +50,9 @@
 #include "mongo/util/assert_util.h"
 #include "mongo/util/errno_util.h"
 #include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
 #include "mongo/util/net/http_client.h"
 #include "mongo/util/scopeguard.h"
+#include "mongo/util/str.h"
 #include "mongo/util/text.h"
 #include "mongo/util/winutil.h"
 
@@ -60,7 +60,8 @@ namespace mongo {
 namespace {
 
 const LPCWSTR kAcceptTypes[] = {
-    L"application/octet-stream", nullptr,
+    L"application/octet-stream",
+    nullptr,
 };
 
 struct ProcessedUrl {
@@ -253,8 +254,7 @@ private:
             const auto msg = errnoWithDescription(err);
             uasserted(ErrorCodes::OperationFailed,
                       str::stream() << "Failed receiving response from server"
-                                    << ": "
-                                    << msg);
+                                    << ": " << msg);
         }
 
         DWORD statusCode = 0;

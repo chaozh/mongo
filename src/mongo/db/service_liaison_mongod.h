@@ -68,7 +68,9 @@ protected:
      * Returns the service context.
      */
     ServiceContext* _context() override;
-    std::vector<std::unique_ptr<PeriodicRunner::PeriodicJobHandle>> _jobs;
+
+    Mutex _mutex = MONGO_MAKE_LATCH("ServiceLiaisonMongod::_mutex");
+    std::vector<PeriodicJobAnchor> _jobs;
 };
 
 }  // namespace mongo

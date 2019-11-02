@@ -29,6 +29,7 @@
 
 #pragma once
 
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -36,10 +37,10 @@
 #include "mongo/base/string_data.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/db/jsobj.h"
+#include "mongo/rpc/write_concern_error_detail.h"
 #include "mongo/s/async_requests_sender.h"
 #include "mongo/s/catalog_cache.h"
 #include "mongo/s/commands/strategy.h"
-#include "mongo/stdx/memory.h"
 
 namespace mongo {
 
@@ -49,6 +50,11 @@ namespace mongo {
 void appendWriteConcernErrorToCmdResponse(const ShardId& shardID,
                                           const BSONElement& wcErrorElem,
                                           BSONObjBuilder& responseBuilder);
+
+/**
+ * Creates and returns a WriteConcernErrorDetail object from a BSONObj.
+ */
+std::unique_ptr<WriteConcernErrorDetail> getWriteConcernErrorDetailFromBSONObj(const BSONObj& obj);
 
 /**
  * Dispatches all the specified requests in parallel and waits until all complete, returning a
@@ -61,7 +67,18 @@ std::vector<AsyncRequestsSender::Response> gatherResponses(
     StringData dbName,
     const ReadPreferenceSetting& readPref,
     Shard::RetryPolicy retryPolicy,
-    const std::vector<AsyncRequestsSender::Request>& requests);
+    const std::vector<AsyncRequestsSender::Request>& requests,
+    const std::set<ErrorCodes::Error>& ignorableErrors = {});
+
+/**
+ * Returns a copy of 'cmdObj' with dbVersion appended if it exists in 'dbInfo'
+ */
+BSONObj appendDbVersionIfPresent(BSONObj cmdObj, const CachedDatabaseInfo& dbInfo);
+
+/**
+ * Returns a copy of 'cmdObj' with 'databaseVersion' appended.
+ */
+BSONObj appendDbVersionIfPresent(BSONObj cmdObj, DatabaseVersion dbVersion);
 
 /**
  * Returns a copy of 'cmdObj' with 'version' appended.
@@ -128,7 +145,8 @@ std::vector<AsyncRequestsSender::Response> scatterGatherOnlyVersionIfUnsharded(
     const NamespaceString& nss,
     const BSONObj& cmdObj,
     const ReadPreferenceSetting& readPref,
-    Shard::RetryPolicy retryPolicy);
+    Shard::RetryPolicy retryPolicy,
+    const std::set<ErrorCodes::Error>& ignorableErrors = {});
 
 /**
  * Utility for dispatching commands against the primary of a database and attach the appropriate
@@ -157,7 +175,7 @@ AsyncRequestsSender::Response executeCommandAgainstDatabasePrimary(
 bool appendRawResponses(OperationContext* opCtx,
                         std::string* errmsg,
                         BSONObjBuilder* output,
-                        std::vector<AsyncRequestsSender::Response> shardResponses,
+                        const std::vector<AsyncRequestsSender::Response>& shardResponses,
                         std::set<ErrorCodes::Error> ignoredErrors = {});
 
 /**
@@ -190,10 +208,10 @@ bool appendEmptyResultSet(OperationContext* opCtx,
                           const std::string& ns);
 
 /**
- * If the specified database exists already, loads it in the cache (if not already there) and
- * returns it. Otherwise, if it does not exist, this call will implicitly create it as non-sharded.
+ * If the specified database exists already, loads it in the cache (if not already there).
+ * Otherwise, if it does not exist, this call will implicitly create it as non-sharded.
  */
-StatusWith<CachedDatabaseInfo> createShardDatabase(OperationContext* opCtx, StringData dbName);
+void createShardDatabase(OperationContext* opCtx, StringData dbName);
 
 /**
  * Returns the shards that would be targeted for the given query according to the given routing
@@ -214,5 +232,13 @@ std::set<ShardId> getTargetedShardsForQuery(OperationContext* opCtx,
  */
 StatusWith<CachedCollectionRoutingInfo> getCollectionRoutingInfoForTxnCmd(
     OperationContext* opCtx, const NamespaceString& nss);
+
+/**
+ * Utility for dispatching a command on a namespace that is sent to all shards. If all shards return
+ * CannotImplicitlyCreateCollection, will throw. If at least one shard succeeds, will ignore
+ * CannotImplicitlyCreateCollection errors.
+ */
+std::vector<AsyncRequestsSender::Response> dispatchCommandAssertCollectionExistsOnAtLeastOneShard(
+    OperationContext* opCtx, const NamespaceString& nss, const BSONObj& cmdObj);
 
 }  // namespace mongo

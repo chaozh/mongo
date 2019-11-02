@@ -33,7 +33,6 @@
 #include <utility>
 #include <vector>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/base/initializer_function.h"
 #include "mongo/base/status.h"
 #include "mongo/stdx/unordered_map.h"
@@ -84,7 +83,8 @@ private:
  * thread is executing those functions or addInitializer on the same instance.
  */
 class InitializerDependencyGraph {
-    MONGO_DISALLOW_COPYING(InitializerDependencyGraph);
+    InitializerDependencyGraph(const InitializerDependencyGraph&) = delete;
+    InitializerDependencyGraph& operator=(const InitializerDependencyGraph&) = delete;
 
 public:
     InitializerDependencyGraph();
@@ -131,15 +131,6 @@ public:
 private:
     typedef stdx::unordered_map<std::string, InitializerDependencyNode> NodeMap;
     typedef NodeMap::value_type Node;
-
-    /**
-     * Helper function to recursively top-sort a graph.  Used by topSort().
-     */
-    static Status recursiveTopSort(const NodeMap& nodeMap,
-                                   const Node& currentNode,
-                                   std::vector<std::string>* inProgressNodeNames,
-                                   stdx::unordered_set<std::string>* visitedNodeNames,
-                                   std::vector<std::string>* sortedNames);
 
     /**
      * Map of all named nodes.  Nodes named as prerequisites or dependents but not explicitly

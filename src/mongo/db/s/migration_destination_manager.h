@@ -31,7 +31,6 @@
 
 #include <string>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/base/string_data.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
@@ -42,9 +41,9 @@
 #include "mongo/db/s/collection_sharding_runtime.h"
 #include "mongo/db/s/migration_session_id.h"
 #include "mongo/db/s/session_catalog_migration_destination.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/s/shard_id.h"
 #include "mongo/stdx/condition_variable.h"
-#include "mongo/stdx/mutex.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/util/concurrency/with_lock.h"
 #include "mongo/util/timer.h"
@@ -64,7 +63,8 @@ class OpTime;
  * Drives the receiving side of the MongoD migration process. One instance exists per shard.
  */
 class MigrationDestinationManager {
-    MONGO_DISALLOW_COPYING(MigrationDestinationManager);
+    MigrationDestinationManager(const MigrationDestinationManager&) = delete;
+    MigrationDestinationManager& operator=(const MigrationDestinationManager&) = delete;
 
 public:
     enum State { READY, CLONE, CATCHUP, STEADY, COMMIT_START, DONE, FAIL, ABORT };
@@ -111,10 +111,10 @@ public:
     /**
      * Clones documents from a donor shard.
      */
-    static void cloneDocumentsFromDonor(
+    static repl::OpTime cloneDocumentsFromDonor(
         OperationContext* opCtx,
-        stdx::function<void(OperationContext*, BSONObj)> insertBatchFn,
-        stdx::function<BSONObj(OperationContext*)> fetchBatchFn);
+        std::function<void(OperationContext*, BSONObj)> insertBatchFn,
+        std::function<BSONObj(OperationContext*)> fetchBatchFn);
 
     /**
      * Idempotent method, which causes the current ongoing migration to abort only if it has the
@@ -178,7 +178,7 @@ private:
     bool _isActive(WithLock) const;
 
     // Mutex to guard all fields
-    mutable stdx::mutex _mutex;
+    mutable Mutex _mutex = MONGO_MAKE_LATCH("MigrationDestinationManager::_mutex");
 
     // Migration session ID uniquely identifies the migration and indicates whether the prepare
     // method has been called.

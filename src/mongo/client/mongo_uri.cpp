@@ -49,7 +49,7 @@
 #include "mongo/util/dns_name.h"
 #include "mongo/util/dns_query.h"
 #include "mongo/util/hex.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 using namespace std::literals::string_literals;
 
@@ -169,8 +169,7 @@ MongoURI::OptionsMap parseOptions(StringData options, StringData url) {
         if (opt.empty()) {
             uasserted(ErrorCodes::FailedToParse,
                       str::stream()
-                          << "Missing a key/value pair in the options for mongodb:// URL: "
-                          << url);
+                          << "Missing a key/value pair in the options for mongodb:// URL: " << url);
         }
 
         const auto kvPair = partitionForward(opt, '=');
@@ -190,8 +189,7 @@ MongoURI::OptionsMap parseOptions(StringData options, StringData url) {
         if (valRaw.empty()) {
             uasserted(ErrorCodes::FailedToParse,
                       str::stream() << "Missing value for key '" << keyRaw
-                                    << "' in the options for mongodb:// URL: "
-                                    << url);
+                                    << "' in the options for mongodb:// URL: " << url);
         }
         const auto val = uassertStatusOKWithContext(
             uriDecode(valRaw),
@@ -259,8 +257,7 @@ URIParts::URIParts(StringData uri) {
     if (schemeEnd == std::string::npos) {
         uasserted(ErrorCodes::FailedToParse,
                   str::stream() << "URI must begin with " << kURIPrefix << " or " << kURISRVPrefix
-                                << ": "
-                                << uri);
+                                << ": " << uri);
     }
     const auto uriWithoutPrefix = uri.substr(schemeEnd + 3);
     scheme = uri.substr(0, schemeEnd);
@@ -297,6 +294,9 @@ URIParts::URIParts(StringData uri) {
     options = databaseAndOptions.second;
 }
 }  // namespace
+
+MongoURI::CaseInsensitiveString::CaseInsensitiveString(std::string str)
+    : _original(std::move(str)), _lowercase(boost::algorithm::to_lower_copy(_original)) {}
 
 bool MongoURI::isMongoURI(StringData uri) {
     return (uri.startsWith(kURIPrefix) || uri.startsWith(kURISRVPrefix));
@@ -377,10 +377,10 @@ MongoURI MongoURI::parseImpl(const std::string& url) {
         }
 
         if ((host.find('/') != std::string::npos) && !StringData(host).endsWith(".sock")) {
-            uasserted(
-                ErrorCodes::FailedToParse,
-                str::stream() << "'" << host << "' in '" << url
-                              << "' appears to be a unix socket, but does not end in '.sock'");
+            uasserted(ErrorCodes::FailedToParse,
+                      str::stream()
+                          << "'" << host << "' in '" << url
+                          << "' appears to be a unix socket, but does not end in '.sock'");
         }
 
         servers.push_back(uassertStatusOK(HostAndPort::parse(host)));

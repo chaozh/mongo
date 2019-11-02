@@ -33,15 +33,15 @@
 
 #include <boost/intrusive_ptr.hpp>
 #include <boost/optional.hpp>
+#include <functional>
 #include <vector>
 
 #include "mongo/base/init.h"
 #include "mongo/bson/bsontypes.h"
+#include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/exec/document_value/value_comparator.h"
 #include "mongo/db/pipeline/expression.h"
 #include "mongo/db/pipeline/expression_context.h"
-#include "mongo/db/pipeline/value.h"
-#include "mongo/db/pipeline/value_comparator.h"
-#include "mongo/stdx/functional.h"
 #include "mongo/stdx/unordered_set.h"
 #include "mongo/util/summation.h"
 
@@ -65,8 +65,7 @@ enum class AccumulatorDocumentsNeeded {
 
 class Accumulator : public RefCountable {
 public:
-    using Factory = boost::intrusive_ptr<Accumulator> (*)(
-        const boost::intrusive_ptr<ExpressionContext>& expCtx);
+    using Factory = std::function<boost::intrusive_ptr<Accumulator>()>;
 
     Accumulator(const boost::intrusive_ptr<ExpressionContext>& expCtx) : _expCtx(expCtx) {}
 
@@ -121,6 +120,19 @@ private:
     boost::intrusive_ptr<ExpressionContext> _expCtx;
 };
 
+/**
+ * A default parser for any accumulator that only takes a single expression as an argument. Returns
+ * the expression to be evaluated by the accumulator and an Accumulator::Factory.
+ */
+template <class AccName>
+std::pair<boost::intrusive_ptr<Expression>, Accumulator::Factory>
+genericParseSingleExpressionAccumulator(boost::intrusive_ptr<ExpressionContext> expCtx,
+                                        BSONElement elem,
+                                        VariablesParseState vps) {
+    auto exprValue = Expression::parseOperand(expCtx, elem, vps);
+    return {exprValue, [expCtx]() { return AccName::create(expCtx); }};
+}
+
 
 class AccumulatorAddToSet final : public Accumulator {
 public:
@@ -145,7 +157,6 @@ public:
 private:
     ValueUnorderedSet _set;
 };
-
 
 class AccumulatorFirst final : public Accumulator {
 public:
@@ -303,7 +314,6 @@ private:
     long long _count;
 };
 
-
 class AccumulatorStdDev : public Accumulator {
 public:
     AccumulatorStdDev(const boost::intrusive_ptr<ExpressionContext>& expCtx, bool isSamp);
@@ -351,4 +361,30 @@ public:
 private:
     MutableDocument _output;
 };
-}
+
+class AccumulatorInternalJsReduce final : public Accumulator {
+public:
+    static constexpr auto kAccumulatorName = "$_internalJsReduce"_sd;
+
+    static boost::intrusive_ptr<Accumulator> create(
+        const boost::intrusive_ptr<ExpressionContext>& expCtx);
+
+    explicit AccumulatorInternalJsReduce(const boost::intrusive_ptr<ExpressionContext>& expCtx)
+        : Accumulator(expCtx) {
+        _memUsageBytes = sizeof(*this);
+    }
+
+    const char* getOpName() const final {
+        return kAccumulatorName.rawData();
+    }
+    void processInternal(const Value& input, bool merging) final;
+    Value getValue(bool toBeMerged) final;
+    void reset() final;
+
+private:
+    std::vector<Value> _values;
+
+    std::string _funcSource;
+    Value _key;
+};
+}  // namespace mongo

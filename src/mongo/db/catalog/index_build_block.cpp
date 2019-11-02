@@ -31,44 +31,57 @@
 
 #include "mongo/platform/basic.h"
 
-#include "mongo/db/catalog/index_catalog_impl.h"
+#include "mongo/db/catalog/index_build_block.h"
 
 #include <vector>
 
 #include "mongo/db/catalog/collection.h"
-#include "mongo/db/catalog/collection_catalog_entry.h"
 #include "mongo/db/catalog_raii.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/logical_clock.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/query/collection_query_info.h"
+#include "mongo/db/storage/durable_catalog.h"
+#include "mongo/db/ttl_collection_cache.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
-IndexCatalogImpl::IndexBuildBlock::IndexBuildBlock(IndexCatalogImpl* catalog,
-                                                   const NamespaceString& nss,
-                                                   const BSONObj& spec,
-                                                   IndexBuildMethod method)
-    : _catalog(catalog), _ns(nss.ns()), _spec(spec.getOwned()), _method(method), _entry(nullptr) {}
 
-void IndexCatalogImpl::IndexBuildBlock::deleteTemporaryTables(OperationContext* opCtx) {
+class IndexCatalog;
+
+IndexBuildBlock::IndexBuildBlock(IndexCatalog* indexCatalog,
+                                 const NamespaceString& nss,
+                                 const BSONObj& spec,
+                                 IndexBuildMethod method)
+    : _indexCatalog(indexCatalog),
+      _nss(nss),
+      _spec(spec.getOwned()),
+      _method(method),
+      _indexCatalogEntry(nullptr) {}
+
+void IndexBuildBlock::deleteTemporaryTables(OperationContext* opCtx) {
     if (_indexBuildInterceptor) {
         _indexBuildInterceptor->deleteTemporaryTables(opCtx);
     }
 }
 
-Status IndexCatalogImpl::IndexBuildBlock::init(OperationContext* opCtx, Collection* collection) {
+Status IndexBuildBlock::init(OperationContext* opCtx, Collection* collection) {
     // Being in a WUOW means all timestamping responsibility can be pushed up to the caller.
     invariant(opCtx->lockState()->inAWriteUnitOfWork());
 
     // need this first for names, etc...
     BSONObj keyPattern = _spec.getObjectField("key");
-    auto descriptor = stdx::make_unique<IndexDescriptor>(
+    auto descriptor = std::make_unique<IndexDescriptor>(
         collection, IndexNames::findPluginName(keyPattern), _spec);
 
     _indexName = descriptor->indexName();
-    _indexNamespace = descriptor->indexNamespace();
+
+    if (_spec.hasField("expireAfterSeconds")) {
+        TTLCollectionCache::get(getGlobalServiceContext())
+            .registerTTLInfo(std::make_pair(collection->uuid(), _indexName));
+    }
 
     bool isBackgroundIndex =
         _method == IndexBuildMethod::kHybrid || _method == IndexBuildMethod::kBackground;
@@ -76,41 +89,45 @@ Status IndexCatalogImpl::IndexBuildBlock::init(OperationContext* opCtx, Collecti
     if (auto replCoord = repl::ReplicationCoordinator::get(opCtx)) {
         isBackgroundSecondaryBuild =
             replCoord->getReplicationMode() == repl::ReplicationCoordinator::Mode::modeReplSet &&
-            replCoord->getMemberState().secondary() && isBackgroundIndex;
+            !replCoord->getMemberState().primary() && isBackgroundIndex;
     }
 
     // Setup on-disk structures.
-    const auto protocol = IndexBuildProtocol::kTwoPhase;
-    Status status = collection->getCatalogEntry()->prepareForIndexBuild(
-        opCtx, descriptor.get(), protocol, isBackgroundSecondaryBuild);
+    const auto protocol = IndexBuildProtocol::kSinglePhase;
+    Status status = DurableCatalog::get(opCtx)->prepareForIndexBuild(
+        opCtx, _nss, descriptor.get(), protocol, isBackgroundSecondaryBuild);
     if (!status.isOK())
         return status;
 
     const bool initFromDisk = false;
     const bool isReadyIndex = false;
-    _entry = _catalog->_setupInMemoryStructures(
-        opCtx, std::move(descriptor), initFromDisk, isReadyIndex);
+    _indexCatalogEntry =
+        _indexCatalog->createIndexEntry(opCtx, std::move(descriptor), initFromDisk, isReadyIndex);
 
     if (_method == IndexBuildMethod::kHybrid) {
-        _indexBuildInterceptor = stdx::make_unique<IndexBuildInterceptor>(opCtx, _entry);
-        _entry->setIndexBuildInterceptor(_indexBuildInterceptor.get());
-
-        const auto sideWritesIdent = _indexBuildInterceptor->getSideWritesTableIdent();
-        // Only unique indexes have a constraint violations table.
-        const auto constraintsIdent = (_entry->descriptor()->unique())
-            ? boost::optional<std::string>(
-                  _indexBuildInterceptor->getConstraintViolationsTableIdent())
-            : boost::none;
+        _indexBuildInterceptor = std::make_unique<IndexBuildInterceptor>(opCtx, _indexCatalogEntry);
+        _indexCatalogEntry->setIndexBuildInterceptor(_indexBuildInterceptor.get());
 
         if (IndexBuildProtocol::kTwoPhase == protocol) {
-            collection->getCatalogEntry()->setIndexBuildScanning(
-                opCtx, _entry->descriptor()->indexName(), sideWritesIdent, constraintsIdent);
+            const auto sideWritesIdent = _indexBuildInterceptor->getSideWritesTableIdent();
+            // Only unique indexes have a constraint violations table.
+            const auto constraintsIdent = (_indexCatalogEntry->descriptor()->unique())
+                ? boost::optional<std::string>(
+                      _indexBuildInterceptor->getConstraintViolationsTableIdent())
+                : boost::none;
+
+            DurableCatalog::get(opCtx)->setIndexBuildScanning(
+                opCtx,
+                _nss,
+                _indexCatalogEntry->descriptor()->indexName(),
+                sideWritesIdent,
+                constraintsIdent);
         }
     }
 
     if (isBackgroundIndex) {
         opCtx->recoveryUnit()->onCommit(
-            [ entry = _entry, coll = collection ](boost::optional<Timestamp> commitTime) {
+            [entry = _indexCatalogEntry, coll = collection](boost::optional<Timestamp> commitTime) {
                 // This will prevent the unfinished index from being visible on index iterators.
                 if (commitTime) {
                     entry->setMinimumVisibleSnapshot(commitTime.get());
@@ -119,44 +136,39 @@ Status IndexCatalogImpl::IndexBuildBlock::init(OperationContext* opCtx, Collecti
             });
     }
 
-    // Register this index with the CollectionInfoCache to regenerate the cache. This way, updates
+    // Register this index with the CollectionQueryInfo to regenerate the cache. This way, updates
     // occurring while an index is being build in the background will be aware of whether or not
     // they need to modify any indexes.
-    collection->infoCache()->addedIndex(opCtx, _entry->descriptor());
+    CollectionQueryInfo::get(collection).addedIndex(opCtx, _indexCatalogEntry->descriptor());
 
     return Status::OK();
 }
 
-IndexCatalogImpl::IndexBuildBlock::~IndexBuildBlock() {
+IndexBuildBlock::~IndexBuildBlock() {
     // Don't need to call fail() here, as rollback will clean everything up for us.
 }
 
-void IndexCatalogImpl::IndexBuildBlock::fail(OperationContext* opCtx,
-                                             const Collection* collection) {
+void IndexBuildBlock::fail(OperationContext* opCtx, const Collection* collection) {
     // Being in a WUOW means all timestamping responsibility can be pushed up to the caller.
     invariant(opCtx->lockState()->inAWriteUnitOfWork());
-    fassert(17204, collection->ok());  // defensive
 
-    NamespaceString ns(_indexNamespace);
-    invariant(opCtx->lockState()->isDbLockedForMode(ns.db(), MODE_X));
+    invariant(opCtx->lockState()->isCollectionLockedForMode(_nss, MODE_X));
 
-    if (_entry) {
-        invariant(_catalog->_dropIndex(opCtx, _entry).isOK());
+    if (_indexCatalogEntry) {
+        invariant(_indexCatalog->dropIndexEntry(opCtx, _indexCatalogEntry).isOK());
         if (_indexBuildInterceptor) {
-            _entry->setIndexBuildInterceptor(nullptr);
+            _indexCatalogEntry->setIndexBuildInterceptor(nullptr);
         }
     } else {
-        _catalog->_deleteIndexFromDisk(opCtx, _indexName, _indexNamespace);
+        _indexCatalog->deleteIndexFromDisk(opCtx, _indexName);
     }
 }
 
-void IndexCatalogImpl::IndexBuildBlock::success(OperationContext* opCtx, Collection* collection) {
+void IndexBuildBlock::success(OperationContext* opCtx, Collection* collection) {
     // Being in a WUOW means all timestamping responsibility can be pushed up to the caller.
     invariant(opCtx->lockState()->inAWriteUnitOfWork());
 
-    fassert(17207, collection->ok());
-    NamespaceString ns(_indexNamespace);
-    invariant(opCtx->lockState()->isDbLockedForMode(ns.db(), MODE_X));
+    invariant(opCtx->lockState()->isCollectionLockedForMode(_nss, MODE_X));
 
     if (_indexBuildInterceptor) {
         // An index build should never be completed with writes remaining in the interceptor.
@@ -166,28 +178,28 @@ void IndexCatalogImpl::IndexBuildBlock::success(OperationContext* opCtx, Collect
         invariant(_indexBuildInterceptor->areAllConstraintsChecked(opCtx));
     }
 
-    log() << "index build: done building index " << _indexName << " on ns " << _ns;
+    log() << "index build: done building index " << _indexName << " on ns " << _nss;
 
-    collection->indexBuildSuccess(opCtx, _entry);
+    collection->indexBuildSuccess(opCtx, _indexCatalogEntry);
 
-    opCtx->recoveryUnit()->onCommit(
-        [ opCtx, entry = _entry, coll = collection ](boost::optional<Timestamp> commitTime) {
-            // Note: this runs after the WUOW commits but before we release our X lock on the
-            // collection. This means that any snapshot created after this must include the full
-            // index, and no one can try to read this index before we set the visibility.
-            if (!commitTime) {
-                // The end of background index builds on secondaries does not get a commit
-                // timestamp. We use the cluster time since it's guaranteed to be greater than the
-                // time of the index build. It is possible the cluster time could be in the future,
-                // and we will need to do another write to reach the minimum visible snapshot.
-                commitTime = LogicalClock::getClusterTimeForReplicaSet(opCtx).asTimestamp();
-            }
-            entry->setMinimumVisibleSnapshot(commitTime.get());
-            // We must also set the minimum visible snapshot on the collection like during init().
-            // This prevents reads in the past from reading inconsistent metadata. We should be
-            // able to remove this when the catalog is versioned.
-            coll->setMinimumVisibleSnapshot(commitTime.get());
-        });
+    opCtx->recoveryUnit()->onCommit([opCtx, entry = _indexCatalogEntry, coll = collection](
+                                        boost::optional<Timestamp> commitTime) {
+        // Note: this runs after the WUOW commits but before we release our X lock on the
+        // collection. This means that any snapshot created after this must include the full
+        // index, and no one can try to read this index before we set the visibility.
+        if (!commitTime) {
+            // The end of background index builds on secondaries does not get a commit
+            // timestamp. We use the cluster time since it's guaranteed to be greater than the
+            // time of the index build. It is possible the cluster time could be in the future,
+            // and we will need to do another write to reach the minimum visible snapshot.
+            commitTime = LogicalClock::getClusterTimeForReplicaSet(opCtx).asTimestamp();
+        }
+        entry->setMinimumVisibleSnapshot(commitTime.get());
+        // We must also set the minimum visible snapshot on the collection like during init().
+        // This prevents reads in the past from reading inconsistent metadata. We should be
+        // able to remove this when the catalog is versioned.
+        coll->setMinimumVisibleSnapshot(commitTime.get());
+    });
 }
 
 }  // namespace mongo

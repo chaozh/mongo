@@ -29,19 +29,19 @@
 
 #pragma once
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/base/status_with.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/repl/optime_with.h"
 #include "mongo/db/s/config/namespace_serializer.h"
 #include "mongo/executor/task_executor.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/catalog/type_database.h"
 #include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/client/shard.h"
 #include "mongo/s/client/shard_registry.h"
+#include "mongo/s/request_types/rename_collection_gen.h"
 #include "mongo/s/shard_key_pattern.h"
-#include "mongo/stdx/mutex.h"
 
 namespace mongo {
 
@@ -69,13 +69,22 @@ enum ShardDrainingStatus {
  * moved out of ShardingCatalogClient and into this class.
  */
 class ShardingCatalogManager {
-    MONGO_DISALLOW_COPYING(ShardingCatalogManager);
+    ShardingCatalogManager(const ShardingCatalogManager&) = delete;
+    ShardingCatalogManager& operator=(const ShardingCatalogManager&) = delete;
     friend class ConfigSvrShardCollectionCommand;
 
 public:
     ShardingCatalogManager(ServiceContext* serviceContext,
                            std::unique_ptr<executor::TaskExecutor> addShardExecutor);
     ~ShardingCatalogManager();
+
+    /**
+     * Indicates the desired modification to the config.chunks and config.tags collections during
+     * setFeatureCompatibilityVersion.
+     *
+     * TODO SERVER-44034: Remove this enum.
+     */
+    enum class ConfigUpgradeType { kUpgrade, kDowngrade };
 
     /**
      * Instantiates an instance of the sharding catalog manager and installs it on the specified
@@ -188,6 +197,12 @@ public:
      * Updates metadata in config.chunks collection to show the given chunk in its new shard.
      * If 'validAfter' is not set, this means the commit request came from an older server version,
      * which is not history-aware.
+     *
+     * Returns a BSON object with the newly produced chunk versions after the migration:
+     *  - migratedChunkVersion - the version of the chunk, which was migrated
+     *  - controlChunkVersion (optional) - the version of the "control" chunk, which was changed in
+     *      order to reflect the change on the donor. This value will be missing if the last chunk
+     *      on the donor shard was migrated out.
      */
     StatusWith<BSONObj> commitChunkMigration(OperationContext* opCtx,
                                              const NamespaceString& nss,
@@ -196,6 +211,14 @@ public:
                                              const ShardId& fromShard,
                                              const ShardId& toShard,
                                              const boost::optional<Timestamp>& validAfter);
+
+    /**
+     * Removes the jumbo flag from the specified chunk.
+     */
+    void clearJumboFlag(OperationContext* opCtx,
+                        const NamespaceString& nss,
+                        const OID& collectionEpoch,
+                        const ChunkRange& chunk);
 
     //
     // Database Operations
@@ -248,12 +271,40 @@ public:
     /**
      * Drops the specified collection from the collection metadata store.
      *
-     * Returns Status::OK if successful or any error code indicating the failure. These are
-     * some of the known failures:
-     *  - NamespaceNotFound - collection does not exist
+     * Throws a DBException for any failures. These are some of the known failures:
+     *  - NamespaceNotFound - Collection does not exist
      */
-    Status dropCollection(OperationContext* opCtx, const NamespaceString& nss);
+    void dropCollection(OperationContext* opCtx, const NamespaceString& nss);
 
+    /**
+     * Ensures that a namespace that has received a dropCollection, but no longer has an entry in
+     * config.collections, has cleared all relevant metadata entries for the corresponding
+     * collection. As part of this, sends dropCollection, setShardVersion, and unsetSharding to all
+     * shards -- in case shards didn't receive these commands as part of the original
+     * dropCollection.
+     *
+     * This function does not guarantee that all shards will eventually receive setShardVersion,
+     * unless the client infinitely retries until hearing back success. This function does, however,
+     * increase the likelihood of shards having received setShardVersion.
+     */
+
+    void ensureDropCollectionCompleted(OperationContext* opCtx, const NamespaceString& nss);
+
+    /**
+     * Renames collection with namespace 'nssSource' to namespace 'nssTarget'.
+     *
+     * request - the renameCollection request parsed into an idlType. Contains the fields specified
+     * in the docs that renameCollection requires: {renameCollection, to, dropTarget, stayTemp}.
+     * sourceUuid - the collection's uuid.
+     * passthroughFields - the requestBody in the opMsg, used to get the passthrough fields of the
+     * request.
+     *
+     * Throws exceptions on errors.
+     */
+    void renameCollection(OperationContext* opCtx,
+                          const ConfigsvrRenameCollection& request,
+                          const UUID& sourceUuid,
+                          const BSONObj& passthroughFields);
 
     /**
      * Shards collection with namespace 'nss' and implicitly assumes that the database is enabled
@@ -298,6 +349,16 @@ public:
                           const CollectionOptions& options);
 
     /**
+     * Refines the shard key of an existing collection with namespace 'nss'. Here, 'shardKey'
+     * denotes the new shard key, which must contain the old shard key as a prefix.
+     *
+     * Throws exception on errors.
+     */
+    void refineCollectionShardKey(OperationContext* opCtx,
+                                  const NamespaceString& nss,
+                                  const ShardKeyPattern& newShardKey);
+
+    /**
      * Creates a ScopedLock on the collection name in _namespaceSerializer. This is to prevent
      * timeouts waiting on the dist lock if multiple threads attempt to create or drop the same
      * collection.
@@ -337,7 +398,7 @@ public:
      * Because of the asynchronous nature of the draining mechanism, this method returns
      * the current draining status. See ShardDrainingStatus enum definition for more details.
      */
-    StatusWith<ShardDrainingStatus> removeShard(OperationContext* opCtx, const ShardId& shardId);
+    ShardDrainingStatus removeShard(OperationContext* opCtx, const ShardId& shardId);
 
     //
     // Cluster Upgrade Operations
@@ -362,6 +423,14 @@ public:
      * service context, so that 'create' can be called again.
      */
     static void clearForTests(ServiceContext* serviceContext);
+
+    /**
+     * Changes the _id format of all documents in config.chunks and config.tags to use either the
+     * format introduced in 4.4 or the format expected by a 4.2 binary.
+     *
+     * TODO SERVER-44034: Remove this method.
+     */
+    void upgradeOrDowngradeChunksAndTags(OperationContext* opCtx, ConfigUpgradeType upgradeType);
 
     Lock::ExclusiveLock lockZoneMutex(OperationContext* opCtx);
 
@@ -488,7 +557,7 @@ private:
     // (S) Self-synchronizing; access in any way from any context.
     //
 
-    stdx::mutex _mutex;
+    Mutex _mutex = MONGO_MAKE_LATCH("ShardingCatalogManager::_mutex");
 
     // True if shutDown() has been called. False, otherwise.
     bool _inShutdown{false};  // (M)

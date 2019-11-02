@@ -27,8 +27,6 @@
 #
 """Provide code generation information for structs and commands in a polymorphic way."""
 
-from __future__ import absolute_import, print_function, unicode_literals
-
 from abc import ABCMeta, abstractmethod
 from typing import Optional, List
 
@@ -46,7 +44,7 @@ def _is_required_constructor_arg(field):
 
 
 def _get_arg_for_field(field):
-    # type: (ast.Field) -> unicode
+    # type: (ast.Field) -> str
     """Generate a moveable parameter."""
     cpp_type_info = cpp_types.get_cpp_type(field)
     # Use the storage type for the constructor argument since the generated code will use std::move.
@@ -56,7 +54,7 @@ def _get_arg_for_field(field):
 
 
 def _get_required_parameters(struct):
-    # type: (ast.Struct) -> List[unicode]
+    # type: (ast.Struct) -> List[str]
     """Get a list of arguments for required parameters."""
     return [
         _get_arg_for_field(field) for field in struct.fields if _is_required_constructor_arg(field)
@@ -67,7 +65,7 @@ class ArgumentInfo(object):
     """Class that encapsulates information about an argument to a method."""
 
     def __init__(self, arg):
-        # type: (unicode) -> None
+        # type: (str) -> None
         """Create a instance of the ArgumentInfo class by parsing the argument string."""
         parts = arg.split(' ')
         self.type = ' '.join(parts[0:-1])
@@ -84,7 +82,7 @@ class MethodInfo(object):
 
     def __init__(self, class_name, method_name, args, return_type=None, static=False, const=False,
                  explicit=False):
-        # type: (unicode, unicode, List[unicode], unicode, bool, bool, bool) -> None
+        # type: (str, str, List[str], str, bool, bool, bool) -> None
         # pylint: disable=too-many-arguments
         """Create a MethodInfo instance."""
         self.class_name = class_name
@@ -96,7 +94,7 @@ class MethodInfo(object):
         self.explicit = explicit
 
     def get_declaration(self):
-        # type: () -> unicode
+        # type: () -> str
         """Get a declaration for a method."""
         pre_modifiers = ''
         post_modifiers = ''
@@ -120,7 +118,7 @@ class MethodInfo(object):
             args=', '.join([str(arg) for arg in self.args]), post_modifiers=post_modifiers)
 
     def get_definition(self):
-        # type: () -> unicode
+        # type: () -> str
         """Get a definition for a method."""
         pre_modifiers = ''
         post_modifiers = ''
@@ -139,7 +137,7 @@ class MethodInfo(object):
                 [str(arg) for arg in self.args]), post_modifiers=post_modifiers)
 
     def get_call(self, obj):
-        # type: (Optional[unicode]) -> unicode
+        # type: (Optional[str]) -> str
         """Generate a simply call to the method using the defined args list."""
 
         args = ', '.join([arg.name for arg in self.args])
@@ -152,10 +150,8 @@ class MethodInfo(object):
                                     args=args)
 
 
-class StructTypeInfoBase(object):
+class StructTypeInfoBase(object, metaclass=ABCMeta):
     """Base class for struct and command code generation."""
-
-    __metaclass__ = ABCMeta
 
     @abstractmethod
     def get_constructor_method(self):
@@ -234,7 +230,7 @@ class StructTypeInfoBase(object):
 
     @abstractmethod
     def gen_namespace_check(self, indented_writer, db_name, element):
-        # type: (writer.IndentedTextWriter, unicode, unicode) -> None
+        # type: (writer.IndentedTextWriter, str, str) -> None
         """Generate the namespace check predicate for a command."""
         pass
 
@@ -306,7 +302,7 @@ class _StructTypeInfo(StructTypeInfoBase):
         pass
 
     def gen_namespace_check(self, indented_writer, db_name, element):
-        # type: (writer.IndentedTextWriter, unicode, unicode) -> None
+        # type: (writer.IndentedTextWriter, str, str) -> None
         pass
 
 
@@ -366,15 +362,15 @@ class _IgnoredCommandTypeInfo(_CommandBaseTypeInfo):
 
     def gen_serializer(self, indented_writer):
         # type: (writer.IndentedTextWriter) -> None
-        indented_writer.write_line('builder->append("%s", 1);' % (self._command.name))
+        indented_writer.write_line('builder->append("%s"_sd, 1);' % (self._command.name))
 
     def gen_namespace_check(self, indented_writer, db_name, element):
-        # type: (writer.IndentedTextWriter, unicode, unicode) -> None
+        # type: (writer.IndentedTextWriter, str, str) -> None
         pass
 
 
 def _get_command_type_parameter(command):
-    # type: (ast.Command) -> unicode
+    # type: (ast.Command) -> str
     """Get the parameter for the command type."""
     cpp_type_info = cpp_types.get_cpp_type(command.command_field)
     # Use the storage type for the constructor argument since the generated code will use std::move.
@@ -440,7 +436,7 @@ class _CommandFromType(_CommandBaseTypeInfo):
         raise NotImplementedError
 
     def gen_namespace_check(self, indented_writer, db_name, element):
-        # type: (writer.IndentedTextWriter, unicode, unicode) -> None
+        # type: (writer.IndentedTextWriter, str, str) -> None
         # TODO: should the name of the first element be validated??
         raise NotImplementedError
 
@@ -496,15 +492,84 @@ class _CommandWithNamespaceTypeInfo(_CommandBaseTypeInfo):
     def gen_serializer(self, indented_writer):
         # type: (writer.IndentedTextWriter) -> None
         indented_writer.write_line('invariant(!_nss.isEmpty());')
-        indented_writer.write_line('builder->append("%s", _nss.coll());' % (self._command.name))
+        indented_writer.write_line('builder->append("%s"_sd, _nss.coll());' % (self._command.name))
         indented_writer.write_empty_line()
 
     def gen_namespace_check(self, indented_writer, db_name, element):
-        # type: (writer.IndentedTextWriter, unicode, unicode) -> None
+        # type: (writer.IndentedTextWriter, str, str) -> None
         # TODO: should the name of the first element be validated??
         indented_writer.write_line('invariant(_nss.isEmpty());')
-        indented_writer.write_line('_nss = ctxt.parseNSCollectionRequired(%s, %s);' % (db_name,
-                                                                                       element))
+        indented_writer.write_line(
+            '_nss = ctxt.parseNSCollectionRequired(%s, %s);' % (db_name, element))
+
+
+class _CommandWithUUIDNamespaceTypeInfo(_CommandBaseTypeInfo):
+    """Class for command with namespace or UUID code generation."""
+
+    def __init__(self, command):
+        # type: (ast.Command) -> None
+        """Create a _CommandWithUUIDNamespaceTypeInfo instance."""
+        self._command = command
+
+        super(_CommandWithUUIDNamespaceTypeInfo, self).__init__(command)
+
+    def get_constructor_method(self):
+        # type: () -> MethodInfo
+        class_name = common.title_case(self._struct.cpp_name)
+        return MethodInfo(class_name, class_name, ['const NamespaceStringOrUUID nssOrUUID'],
+                          explicit=True)
+
+    def get_required_constructor_method(self):
+        # type: () -> MethodInfo
+        class_name = common.title_case(self._struct.cpp_name)
+        return MethodInfo(
+            class_name, class_name,
+            ['const NamespaceStringOrUUID nssOrUUID'] + _get_required_parameters(self._struct))
+
+    def get_serializer_method(self):
+        # type: () -> MethodInfo
+        return MethodInfo(
+            common.title_case(self._struct.cpp_name), 'serialize',
+            ['const BSONObj& commandPassthroughFields', 'BSONObjBuilder* builder'], 'void',
+            const=True)
+
+    def get_to_bson_method(self):
+        # type: () -> MethodInfo
+        return MethodInfo(
+            common.title_case(self._struct.cpp_name), 'toBSON',
+            ['const BSONObj& commandPassthroughFields'], 'BSONObj', const=True)
+
+    def get_deserializer_method(self):
+        # type: () -> MethodInfo
+        return MethodInfo(
+            common.title_case(self._struct.cpp_name), 'parseProtected',
+            ['const IDLParserErrorContext& ctxt', 'const BSONObj& bsonObject'], 'void')
+
+    def gen_getter_method(self, indented_writer):
+        # type: (writer.IndentedTextWriter) -> None
+        indented_writer.write_line(
+            'const NamespaceStringOrUUID& getNamespaceOrUUID() const { return _nssOrUUID; }')
+
+    def gen_member(self, indented_writer):
+        # type: (writer.IndentedTextWriter) -> None
+        indented_writer.write_line('NamespaceStringOrUUID _nssOrUUID;')
+
+    def gen_serializer(self, indented_writer):
+        # type: (writer.IndentedTextWriter) -> None
+        indented_writer.write_line('invariant(_nssOrUUID.nss() || _nssOrUUID.uuid());')
+        # Prefer the uuid over the nss for serialization
+        with writer.IndentedScopedBlock(indented_writer, "if( _nssOrUUID.uuid() ) {", "}"):
+            indented_writer.write_line(
+                '_nssOrUUID.uuid().get().appendToBuilder(builder, "%s"_sd);' % (self._command.name))
+        with writer.IndentedScopedBlock(indented_writer, "else {", "}"):
+            indented_writer.write_line(
+                'builder->append("%s"_sd, _nssOrUUID.nss().get().coll());' % (self._command.name))
+        indented_writer.write_empty_line()
+
+    def gen_namespace_check(self, indented_writer, db_name, element):
+        # type: (writer.IndentedTextWriter, str, str) -> None
+        indented_writer.write_line('invariant(_nssOrUUID.nss() || _nssOrUUID.uuid());')
+        indented_writer.write_line('_nssOrUUID = ctxt.parseNsOrUUID(%s, %s);' % (db_name, element))
 
 
 def get_struct_info(struct):
@@ -516,6 +581,8 @@ def get_struct_info(struct):
             return _IgnoredCommandTypeInfo(struct)
         elif struct.namespace == common.COMMAND_NAMESPACE_CONCATENATE_WITH_DB:
             return _CommandWithNamespaceTypeInfo(struct)
+        elif struct.namespace == common.COMMAND_NAMESPACE_CONCATENATE_WITH_DB_OR_UUID:
+            return _CommandWithUUIDNamespaceTypeInfo(struct)
         return _CommandFromType(struct)
 
     return _StructTypeInfo(struct)

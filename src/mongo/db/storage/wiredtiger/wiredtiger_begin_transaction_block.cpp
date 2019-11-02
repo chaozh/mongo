@@ -32,19 +32,45 @@
 #include "mongo/platform/basic.h"
 
 #include <cstdio>
+#include <fmt/format.h>
 
 #include "mongo/db/storage/wiredtiger/wiredtiger_begin_transaction_block.h"
+
 #include "mongo/db/storage/wiredtiger/wiredtiger_util.h"
 #include "mongo/util/errno_util.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
+using namespace fmt::literals;
 
-WiredTigerBeginTxnBlock::WiredTigerBeginTxnBlock(WT_SESSION* session, IgnorePrepared ignorePrepare)
+WiredTigerBeginTxnBlock::WiredTigerBeginTxnBlock(
+    WT_SESSION* session,
+    PrepareConflictBehavior prepareConflictBehavior,
+    RoundUpPreparedTimestamps roundUpPreparedTimestamps,
+    RoundUpReadTimestamp roundUpReadTimestamp)
     : _session(session) {
     invariant(!_rollback);
-    invariantWTOK(_session->begin_transaction(
-        _session, (ignorePrepare == IgnorePrepared::kIgnore) ? "ignore_prepare=true" : nullptr));
+
+    str::stream builder;
+    if (prepareConflictBehavior == PrepareConflictBehavior::kIgnoreConflicts) {
+        builder << "ignore_prepare=true,";
+    } else if (prepareConflictBehavior == PrepareConflictBehavior::kIgnoreConflictsAllowWrites) {
+        builder << "ignore_prepare=force,";
+    }
+    if (roundUpPreparedTimestamps == RoundUpPreparedTimestamps::kRound ||
+        roundUpReadTimestamp == RoundUpReadTimestamp::kRound) {
+        builder << "roundup_timestamps=(";
+        if (roundUpPreparedTimestamps == RoundUpPreparedTimestamps::kRound) {
+            builder << "prepared=true,";
+        }
+        if (roundUpReadTimestamp == RoundUpReadTimestamp::kRound) {
+            builder << "read=true";
+        }
+        builder << "),";
+    }
+
+    const std::string beginTxnConfigString = builder;
+    invariantWTOK(_session->begin_transaction(_session, beginTxnConfigString.c_str()));
     _rollback = true;
 }
 
@@ -61,24 +87,11 @@ WiredTigerBeginTxnBlock::~WiredTigerBeginTxnBlock() {
     }
 }
 
-Status WiredTigerBeginTxnBlock::setTimestamp(Timestamp readTimestamp, RoundToOldest roundToOldest) {
+Status WiredTigerBeginTxnBlock::setReadSnapshot(Timestamp readTimestamp) {
     invariant(_rollback);
-    char readTSConfigString[15 /* read_timestamp= */ + 16 /* 16 hexadecimal digits */ +
-                            17 /* ,round_to_oldest= */ + 5 /* false */ + 1 /* trailing null */];
-    auto size = std::snprintf(readTSConfigString,
-                              sizeof(readTSConfigString),
-                              "read_timestamp=%llx,round_to_oldest=%s",
-                              readTimestamp.asULL(),
-                              (roundToOldest == RoundToOldest::kRound) ? "true" : "false");
-    if (size < 0) {
-        int e = errno;
-        error() << "error snprintf " << errnoWithDescription(e);
-        fassertFailedNoTrace(40664);
-    }
-    invariant(static_cast<std::size_t>(size) < sizeof(readTSConfigString));
+    std::string readTSConfigString = "read_timestamp={:x}"_format(readTimestamp.asULL());
 
-    auto status = wtRCToStatus(_session->timestamp_transaction(_session, readTSConfigString));
-    return status;
+    return wtRCToStatus(_session->timestamp_transaction(_session, readTSConfigString.c_str()));
 }
 
 void WiredTigerBeginTxnBlock::done() {

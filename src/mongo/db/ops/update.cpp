@@ -41,6 +41,7 @@
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/exec/update_stage.h"
+#include "mongo/db/matcher/extensions_callback_real.h"
 #include "mongo/db/op_observer.h"
 #include "mongo/db/query/explain.h"
 #include "mongo/db/query/get_executor.h"
@@ -61,7 +62,7 @@ UpdateResult update(OperationContext* opCtx, Database* db, const UpdateRequest& 
     invariant(!request.isExplain());
 
     const NamespaceString& nsString = request.getNamespaceString();
-    Collection* collection = db->getCollection(opCtx, nsString);
+    Collection* collection = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(nsString);
 
     // The update stage does not create its own collection.  As such, if the update is
     // an upsert, create the collection that the update stage inserts into beforehand.
@@ -81,18 +82,18 @@ UpdateResult update(OperationContext* opCtx, Database* db, const UpdateRequest& 
             if (userInitiatedWritesAndNotPrimary) {
                 uassertStatusOK(Status(ErrorCodes::PrimarySteppedDown,
                                        str::stream() << "Not primary while creating collection "
-                                                     << nsString.ns()
-                                                     << " during upsert"));
+                                                     << nsString << " during upsert"));
             }
             WriteUnitOfWork wuow(opCtx);
-            collection = db->createCollection(opCtx, nsString.ns(), CollectionOptions());
+            collection = db->createCollection(opCtx, nsString, CollectionOptions());
             invariant(collection);
             wuow.commit();
         });
     }
 
     // Parse the update, get an executor for it, run the executor, get stats out.
-    ParsedUpdate parsedUpdate(opCtx, &request);
+    const ExtensionsCallbackReal extensionsCallback(opCtx, &request.getNamespaceString());
+    ParsedUpdate parsedUpdate(opCtx, &request, extensionsCallback);
     uassertStatusOK(parsedUpdate.parseRequest());
 
     OpDebug* const nullOpDebug = nullptr;

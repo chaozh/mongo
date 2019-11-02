@@ -41,11 +41,16 @@ namespace mongo {
  */
 class DocumentSourceProject final {
 public:
+    static constexpr StringData kStageName = "$project"_sd;
+    static constexpr StringData kAliasNameUnset = "$unset"_sd;
+
     /**
      * Convenience method to create a $project stage from 'projectSpec'.
      */
     static boost::intrusive_ptr<DocumentSource> create(
-        BSONObj projectSpec, const boost::intrusive_ptr<ExpressionContext>& expCtx);
+        BSONObj projectSpec,
+        const boost::intrusive_ptr<ExpressionContext>& expCtx,
+        StringData specifiedName);
 
     /**
      * Parses a $project stage from the user-supplied BSON.

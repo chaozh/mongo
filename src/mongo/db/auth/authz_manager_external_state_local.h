@@ -29,16 +29,15 @@
 
 #pragma once
 
+#include <functional>
 #include <string>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/base/status.h"
 #include "mongo/db/auth/authz_manager_external_state.h"
 #include "mongo/db/auth/role_graph.h"
 #include "mongo/db/auth/role_name.h"
 #include "mongo/db/auth/user_name.h"
-#include "mongo/stdx/functional.h"
-#include "mongo/stdx/mutex.h"
+#include "mongo/platform/mutex.h"
 
 namespace mongo {
 
@@ -51,7 +50,8 @@ class Document;
  * and user information are stored locally.
  */
 class AuthzManagerExternalStateLocal : public AuthzManagerExternalState {
-    MONGO_DISALLOW_COPYING(AuthzManagerExternalStateLocal);
+    AuthzManagerExternalStateLocal(const AuthzManagerExternalStateLocal&) = delete;
+    AuthzManagerExternalStateLocal& operator=(const AuthzManagerExternalStateLocal&) = delete;
 
 public:
     virtual ~AuthzManagerExternalStateLocal() = default;
@@ -101,13 +101,14 @@ public:
                          const NamespaceString& collectionName,
                          const BSONObj& query,
                          const BSONObj& projection,
-                         const stdx::function<void(const BSONObj&)>& resultProcessor) = 0;
+                         const std::function<void(const BSONObj&)>& resultProcessor) = 0;
 
-    virtual void logOp(OperationContext* opCtx,
-                       const char* op,
-                       const NamespaceString& ns,
-                       const BSONObj& o,
-                       const BSONObj* o2);
+    void logOp(OperationContext* opCtx,
+               AuthorizationManagerImpl* authManager,
+               const char* op,
+               const NamespaceString& ns,
+               const BSONObj& o,
+               const BSONObj* o2) final;
 
     /**
      * Takes a user document, and processes it with the RoleGraph, in order to recursively
@@ -160,7 +161,7 @@ private:
     /**
      * Guards _roleGraphState and _roleGraph.
      */
-    stdx::mutex _roleGraphMutex;
+    Mutex _roleGraphMutex = MONGO_MAKE_LATCH("AuthzManagerExternalStateLocal::_roleGraphMutex");
 };
 
 }  // namespace mongo

@@ -50,28 +50,26 @@ namespace {
 const HashSeed kHashSeed = 0;
 const int kHashVersion = 0;
 
-std::string dumpKeyset(const BSONObjSet& objs) {
+std::string dumpKeyset(const KeyStringSet& keyStrings) {
     std::stringstream ss;
     ss << "[ ";
-    for (BSONObjSet::iterator i = objs.begin(); i != objs.end(); ++i) {
-        ss << i->toString() << " ";
+    for (auto& keyString : keyStrings) {
+        auto key = KeyString::toBson(keyString, Ordering::make(BSONObj()));
+        ss << key.toString() << " ";
     }
     ss << "]";
 
     return ss.str();
 }
 
-bool assertKeysetsEqual(const BSONObjSet& expectedKeys, const BSONObjSet& actualKeys) {
+bool assertKeysetsEqual(const KeyStringSet& expectedKeys, const KeyStringSet& actualKeys) {
     if (expectedKeys.size() != actualKeys.size()) {
         log() << "Expected: " << dumpKeyset(expectedKeys) << ", "
               << "Actual: " << dumpKeyset(actualKeys);
         return false;
     }
 
-    if (!std::equal(expectedKeys.begin(),
-                    expectedKeys.end(),
-                    actualKeys.begin(),
-                    SimpleBSONObjComparator::kInstance.makeEqualTo())) {
+    if (!std::equal(expectedKeys.begin(), expectedKeys.end(), actualKeys.begin())) {
         log() << "Expected: " << dumpKeyset(expectedKeys) << ", "
               << "Actual: " << dumpKeyset(actualKeys);
         return false;
@@ -80,19 +78,30 @@ bool assertKeysetsEqual(const BSONObjSet& expectedKeys, const BSONObjSet& actual
     return true;
 }
 
-BSONObj makeHashKey(BSONElement elt) {
-    return BSON("" << BSONElementHasher::hash64(elt, kHashSeed));
+KeyString::Value makeHashKey(BSONElement elt) {
+    KeyString::HeapBuilder keyString(KeyString::Version::kLatestVersion,
+                                     BSON("" << BSONElementHasher::hash64(elt, kHashSeed)),
+                                     Ordering::make(BSONObj()));
+    return keyString.release();
 }
 
 TEST(HashKeyGeneratorTest, CollationAppliedBeforeHashing) {
     BSONObj obj = fromjson("{a: 'string'}");
-    BSONObjSet actualKeys = SimpleBSONObjComparator::kInstance.makeBSONObjSet();
+    KeyStringSet actualKeys;
     CollatorInterfaceMock collator(CollatorInterfaceMock::MockType::kReverseString);
-    ExpressionKeysPrivate::getHashKeys(
-        obj, "a", kHashSeed, kHashVersion, false, &collator, &actualKeys);
+    BSONObj indexSpec = fromjson("{a: 'hashed'}");
+    ExpressionKeysPrivate::getHashKeys(obj,
+                                       indexSpec,
+                                       kHashSeed,
+                                       kHashVersion,
+                                       false,
+                                       &collator,
+                                       &actualKeys,
+                                       KeyString::Version::kLatestVersion,
+                                       Ordering::make(BSONObj()));
 
     BSONObj backwardsObj = fromjson("{a: 'gnirts'}");
-    BSONObjSet expectedKeys = SimpleBSONObjComparator::kInstance.makeBSONObjSet();
+    KeyStringSet expectedKeys;
     expectedKeys.insert(makeHashKey(backwardsObj["a"]));
 
     ASSERT(assertKeysetsEqual(expectedKeys, actualKeys));
@@ -100,12 +109,21 @@ TEST(HashKeyGeneratorTest, CollationAppliedBeforeHashing) {
 
 TEST(HashKeyGeneratorTest, CollationDoesNotAffectNonStringFields) {
     BSONObj obj = fromjson("{a: 5}");
-    BSONObjSet actualKeys = SimpleBSONObjComparator::kInstance.makeBSONObjSet();
+    KeyStringSet actualKeys;
     CollatorInterfaceMock collator(CollatorInterfaceMock::MockType::kReverseString);
-    ExpressionKeysPrivate::getHashKeys(
-        obj, "a", kHashSeed, kHashVersion, false, &collator, &actualKeys);
 
-    BSONObjSet expectedKeys = SimpleBSONObjComparator::kInstance.makeBSONObjSet();
+    BSONObj indexSpec = fromjson("{a: 'hashed'}");
+    ExpressionKeysPrivate::getHashKeys(obj,
+                                       indexSpec,
+                                       kHashSeed,
+                                       kHashVersion,
+                                       false,
+                                       &collator,
+                                       &actualKeys,
+                                       KeyString::Version::kLatestVersion,
+                                       Ordering::make(BSONObj()));
+
+    KeyStringSet expectedKeys;
     expectedKeys.insert(makeHashKey(obj["a"]));
 
     ASSERT(assertKeysetsEqual(expectedKeys, actualKeys));
@@ -114,26 +132,137 @@ TEST(HashKeyGeneratorTest, CollationDoesNotAffectNonStringFields) {
 TEST(HashKeyGeneratorTest, CollatorAppliedBeforeHashingNestedObject) {
     BSONObj obj = fromjson("{a: {b: 'string'}}");
     BSONObj backwardsObj = fromjson("{a: {b: 'gnirts'}}");
-    BSONObjSet actualKeys = SimpleBSONObjComparator::kInstance.makeBSONObjSet();
+    KeyStringSet actualKeys;
     CollatorInterfaceMock collator(CollatorInterfaceMock::MockType::kReverseString);
-    ExpressionKeysPrivate::getHashKeys(
-        obj, "a", kHashSeed, kHashVersion, false, &collator, &actualKeys);
 
-    BSONObjSet expectedKeys = SimpleBSONObjComparator::kInstance.makeBSONObjSet();
+    BSONObj indexSpec = fromjson("{a: 'hashed'}");
+    ExpressionKeysPrivate::getHashKeys(obj,
+                                       indexSpec,
+                                       kHashSeed,
+                                       kHashVersion,
+                                       false,
+                                       &collator,
+                                       &actualKeys,
+                                       KeyString::Version::kLatestVersion,
+                                       Ordering::make(BSONObj()));
+
+    KeyStringSet expectedKeys;
     expectedKeys.insert(makeHashKey(backwardsObj["a"]));
 
     ASSERT(assertKeysetsEqual(expectedKeys, actualKeys));
 }
 
+TEST(HashKeyGeneratorTest, CollationAppliedforAllIndexFields) {
+    BSONObj obj = fromjson("{a: {b: 'abc', c: 'def'}}");
+    BSONObj backwardsObj = fromjson("{a: {b: 'cba', c: 'fed'}}");
+    KeyStringSet actualKeys;
+    CollatorInterfaceMock collator(CollatorInterfaceMock::MockType::kReverseString);
+
+    BSONObj indexSpec = fromjson("{'a.c': 1, 'a': 'hashed'}");
+    ExpressionKeysPrivate::getHashKeys(obj,
+                                       indexSpec,
+                                       kHashSeed,
+                                       kHashVersion,
+                                       true,
+                                       &collator,
+                                       &actualKeys,
+                                       KeyString::Version::kLatestVersion,
+                                       Ordering::make(BSONObj()));
+
+    KeyStringSet expectedKeys;
+    KeyString::HeapBuilder keyString(KeyString::Version::kLatestVersion, Ordering::make(BSONObj()));
+    keyString.appendBSONElement(backwardsObj["a"]["c"]);
+    keyString.appendNumberLong(BSONElementHasher::hash64(backwardsObj["a"], kHashSeed));
+    expectedKeys.insert(keyString.release());
+    ASSERT(assertKeysetsEqual(expectedKeys, actualKeys));
+}
+
 TEST(HashKeyGeneratorTest, NoCollation) {
     BSONObj obj = fromjson("{a: 'string'}");
-    BSONObjSet actualKeys = SimpleBSONObjComparator::kInstance.makeBSONObjSet();
-    ExpressionKeysPrivate::getHashKeys(
-        obj, "a", kHashSeed, kHashVersion, false, nullptr, &actualKeys);
+    KeyStringSet actualKeys;
+    BSONObj indexSpec = fromjson("{a: 'hashed'}");
+    ExpressionKeysPrivate::getHashKeys(obj,
+                                       indexSpec,
+                                       kHashSeed,
+                                       kHashVersion,
+                                       false,
+                                       nullptr,
+                                       &actualKeys,
+                                       KeyString::Version::kLatestVersion,
+                                       Ordering::make(BSONObj()));
 
-    BSONObjSet expectedKeys = SimpleBSONObjComparator::kInstance.makeBSONObjSet();
+    KeyStringSet expectedKeys;
     expectedKeys.insert(makeHashKey(obj["a"]));
 
+    ASSERT(assertKeysetsEqual(expectedKeys, actualKeys));
+}
+
+TEST(HashKeyGeneratorTest, CompoundIndexEmptyObject) {
+    BSONObj obj = fromjson("{}");
+    KeyStringSet actualKeys;
+    BSONObj indexSpec = fromjson("{a: 'hashed', b: 1, c: 1}");
+    ExpressionKeysPrivate::getHashKeys(obj,
+                                       indexSpec,
+                                       kHashSeed,
+                                       kHashVersion,
+                                       false,
+                                       nullptr,
+                                       &actualKeys,
+                                       KeyString::Version::kLatestVersion,
+                                       Ordering::make(BSONObj()));
+
+    // Verify that we inserted null indexes for empty input object.
+    KeyStringSet expectedKeys;
+    KeyString::HeapBuilder keyString(KeyString::Version::kLatestVersion, Ordering::make(BSONObj()));
+    auto nullBSON = BSON("" << BSONNULL);
+    auto nullElement = nullBSON.firstElement();
+    keyString.appendNumberLong(BSONElementHasher::hash64(nullElement, kHashSeed));
+    keyString.appendBSONElement(nullElement);
+    keyString.appendBSONElement(nullElement);
+    expectedKeys.insert(keyString.release());
+    ASSERT(assertKeysetsEqual(expectedKeys, actualKeys));
+}
+
+TEST(HashKeyGeneratorTest, SparseIndex) {
+    BSONObj obj = fromjson("{k: 1}");
+    KeyStringSet actualKeys;
+    BSONObj indexSpec = fromjson("{a: 'hashed', b: 1, c: 1}");
+    ExpressionKeysPrivate::getHashKeys(obj,
+                                       indexSpec,
+                                       kHashSeed,
+                                       kHashVersion,
+                                       true,  // isSparse
+                                       nullptr,
+                                       &actualKeys,
+                                       KeyString::Version::kLatestVersion,
+                                       Ordering::make(BSONObj()));
+    // Verify that no index entries were added to the sparse index.
+    ASSERT(assertKeysetsEqual(KeyStringSet(), actualKeys));
+}
+
+TEST(HashKeyGeneratorTest, SparseIndexWithAFieldPresent) {
+    BSONObj obj = fromjson("{a: 2}");
+    KeyStringSet actualKeys;
+    BSONObj indexSpec = fromjson("{a: 'hashed', b: 1, c: 1}");
+    ExpressionKeysPrivate::getHashKeys(obj,
+                                       indexSpec,
+                                       kHashSeed,
+                                       kHashVersion,
+                                       true,  // isSparse
+                                       nullptr,
+                                       &actualKeys,
+                                       KeyString::Version::kLatestVersion,
+                                       Ordering::make(BSONObj()));
+
+    // Verify that we inserted null entries for the misssing fields.
+    KeyStringSet expectedKeys;
+    KeyString::HeapBuilder keyString(KeyString::Version::kLatestVersion, Ordering::make(BSONObj()));
+    auto nullBSON = BSON("" << BSONNULL);
+    auto nullElement = nullBSON.firstElement();
+    keyString.appendNumberLong(BSONElementHasher::hash64(obj["a"], kHashSeed));
+    keyString.appendBSONElement(nullElement);
+    keyString.appendBSONElement(nullElement);
+    expectedKeys.insert(keyString.release());
     ASSERT(assertKeysetsEqual(expectedKeys, actualKeys));
 }
 

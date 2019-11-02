@@ -37,6 +37,17 @@ namespace executor {
 TaskExecutor::TaskExecutor() = default;
 TaskExecutor::~TaskExecutor() = default;
 
+void TaskExecutor::schedule(OutOfLineExecutor::Task func) {
+    auto cb = CallbackFn([func = std::move(func)](const CallbackArgs& args) { func(args.status); });
+    auto statusWithCallback = scheduleWork(std::move(cb));
+    if (!statusWithCallback.isOK()) {
+        // The callback was not scheduled or moved from, it is still valid. Run it inline to inform
+        // it of the error. Construct a CallbackArgs for it, only CallbackArgs::status matters here.
+        CallbackArgs args(this, {}, statusWithCallback.getStatus(), nullptr);
+        cb(args);
+    }
+}
+
 TaskExecutor::CallbackState::CallbackState() = default;
 TaskExecutor::CallbackState::~CallbackState() = default;
 
@@ -68,6 +79,20 @@ TaskExecutor::RemoteCommandCallbackArgs::RemoteCommandCallbackArgs(
     const ResponseStatus& theResponse)
     : executor(theExecutor), myHandle(theHandle), request(theRequest), response(theResponse) {}
 
+TaskExecutor::RemoteCommandCallbackArgs::RemoteCommandCallbackArgs(
+    const RemoteCommandOnAnyCallbackArgs& other, size_t idx)
+    : executor(other.executor),
+      myHandle(other.myHandle),
+      request(other.request, idx),
+      response(other.response) {}
+
+TaskExecutor::RemoteCommandOnAnyCallbackArgs::RemoteCommandOnAnyCallbackArgs(
+    TaskExecutor* theExecutor,
+    const CallbackHandle& theHandle,
+    const RemoteCommandRequestOnAny& theRequest,
+    const ResponseOnAnyStatus& theResponse)
+    : executor(theExecutor), myHandle(theHandle), request(theRequest), response(theResponse) {}
+
 TaskExecutor::CallbackState* TaskExecutor::getCallbackFromHandle(const CallbackHandle& cbHandle) {
     return cbHandle.getCallback();
 }
@@ -83,6 +108,16 @@ void TaskExecutor::setEventForHandle(EventHandle* eventHandle, std::shared_ptr<E
 void TaskExecutor::setCallbackForHandle(CallbackHandle* cbHandle,
                                         std::shared_ptr<CallbackState> callback) {
     cbHandle->setCallback(std::move(callback));
+}
+
+
+StatusWith<TaskExecutor::CallbackHandle> TaskExecutor::scheduleRemoteCommand(
+    const RemoteCommandRequest& request,
+    const RemoteCommandCallbackFn& cb,
+    const BatonHandle& baton) {
+    return scheduleRemoteCommandOnAny(request, [cb](const RemoteCommandOnAnyCallbackArgs& args) {
+        cb({args, 0});
+    });
 }
 
 }  // namespace executor

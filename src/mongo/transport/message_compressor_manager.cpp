@@ -53,30 +53,22 @@ struct CompressionHeader {
     uint8_t compressorId;
 
     void serialize(DataRangeCursor* cursor) {
-        uassertStatusOK(cursor->writeAndAdvance<LittleEndian<int32_t>>(originalOpCode));
-        uassertStatusOK(cursor->writeAndAdvance<LittleEndian<int32_t>>(uncompressedSize));
-        uassertStatusOK(cursor->writeAndAdvance<LittleEndian<uint8_t>>(compressorId));
+        cursor->writeAndAdvance<LittleEndian<int32_t>>(originalOpCode);
+        cursor->writeAndAdvance<LittleEndian<int32_t>>(uncompressedSize);
+        cursor->writeAndAdvance<LittleEndian<uint8_t>>(compressorId);
     }
 
     CompressionHeader(int32_t _opcode, int32_t _size, uint8_t _id)
         : originalOpCode{_opcode}, uncompressedSize{_size}, compressorId{_id} {}
 
     CompressionHeader(ConstDataRangeCursor* cursor) {
-        originalOpCode = _readWithChecking<LittleEndian<std::int32_t>>(cursor);
-        uncompressedSize = _readWithChecking<LittleEndian<std::int32_t>>(cursor);
-        compressorId = _readWithChecking<LittleEndian<uint8_t>>(cursor);
+        originalOpCode = cursor->readAndAdvance<LittleEndian<std::int32_t>>();
+        uncompressedSize = cursor->readAndAdvance<LittleEndian<std::int32_t>>();
+        compressorId = cursor->readAndAdvance<LittleEndian<uint8_t>>();
     }
 
     static size_t size() {
         return sizeof(originalOpCode) + sizeof(uncompressedSize) + sizeof(compressorId);
-    }
-
-private:
-    template <typename T>
-    T _readWithChecking(ConstDataRangeCursor* cursor) {
-        auto sw = cursor->readAndAdvance<T>();
-        uassertStatusOK(sw.getStatus());
-        return sw.getValue();
     }
 };
 
@@ -162,7 +154,14 @@ StatusWith<Message> MessageCompressorManager::decompressMessage(const Message& m
 
     LOG(3) << "Decompressing message with " << compressor->getName();
 
-    size_t bufferSize = compressionHeader.uncompressedSize + MsgData::MsgDataHeaderSize;
+    if (compressionHeader.uncompressedSize < 0) {
+        return {ErrorCodes::BadValue, "Decompressed message would be negative in size"};
+    }
+
+    // Explicitly promote `uncompressedSize` to a 64-bit integer before addition in order to
+    // avoid potential overflow.
+    size_t bufferSize =
+        static_cast<size_t>(compressionHeader.uncompressedSize) + MsgData::MsgDataHeaderSize;
     if (bufferSize > MaxMessageSizeBytes) {
         return {ErrorCodes::BadValue,
                 "Decompressed message would be larger than maximum message size"};

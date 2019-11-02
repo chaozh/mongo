@@ -37,7 +37,7 @@
 #include "mongo/rpc/metadata.h"
 #include "mongo/rpc/metadata/oplog_query_metadata.h"
 #include "mongo/rpc/metadata/repl_set_metadata.h"
-#include "mongo/stdx/memory.h"
+#include "mongo/unittest/death_test.h"
 #include "mongo/unittest/ensure_fcv.h"
 #include "mongo/unittest/task_executor_proxy.h"
 #include "mongo/unittest/unittest.h"
@@ -93,6 +93,7 @@ protected:
 
     OpTime remoteNewerOpTime;
     OpTime staleOpTime;
+    Date_t staleWallTime;
     int rbid;
 
     std::unique_ptr<DataReplicatorExternalStateMock> dataReplicatorExternalState;
@@ -109,9 +110,10 @@ void OplogFetcherTest::setUp() {
 
     remoteNewerOpTime = {{124, 1}, 2};
     staleOpTime = {{1, 1}, 0};
+    staleWallTime = Date_t() + Seconds(staleOpTime.getSecs());
     rbid = 2;
 
-    dataReplicatorExternalState = stdx::make_unique<DataReplicatorExternalStateMock>();
+    dataReplicatorExternalState = std::make_unique<DataReplicatorExternalStateMock>();
     dataReplicatorExternalState->currentTerm = lastFetched.getTerm();
     dataReplicatorExternalState->lastCommittedOpTime = {{9999, 0}, lastFetched.getTerm()};
 
@@ -129,7 +131,7 @@ BSONObj OplogFetcherTest::makeOplogQueryMetadataObject(OpTime lastAppliedOpTime,
                                                        int primaryIndex,
                                                        int syncSourceIndex) {
     rpc::OplogQueryMetadata oqMetadata(
-        staleOpTime, lastAppliedOpTime, rbid, primaryIndex, syncSourceIndex);
+        {staleOpTime, staleWallTime}, lastAppliedOpTime, rbid, primaryIndex, syncSourceIndex);
     BSONObjBuilder bob;
     ASSERT_OK(oqMetadata.writeToMetadata(&bob));
     return bob.obj();
@@ -161,7 +163,7 @@ ReplSetConfig _createConfig() {
 
 std::unique_ptr<ShutdownState> OplogFetcherTest::processSingleBatch(RemoteCommandResponse response,
                                                                     bool requireFresherSyncSource) {
-    auto shutdownState = stdx::make_unique<ShutdownState>();
+    auto shutdownState = std::make_unique<ShutdownState>();
 
     OplogFetcher oplogFetcher(&getExecutor(),
                               lastFetched,
@@ -173,7 +175,7 @@ std::unique_ptr<ShutdownState> OplogFetcherTest::processSingleBatch(RemoteComman
                               requireFresherSyncSource,
                               dataReplicatorExternalState.get(),
                               enqueueDocumentsFn,
-                              stdx::ref(*shutdownState),
+                              std::ref(*shutdownState),
                               defaultBatchSize);
 
     ASSERT_FALSE(oplogFetcher.isActive());
@@ -205,18 +207,18 @@ void _checkDefaultCommandObjectFields(BSONObj cmdObj) {
 }
 
 std::unique_ptr<OplogFetcher> OplogFetcherTest::makeOplogFetcher(ReplSetConfig config) {
-    return stdx::make_unique<OplogFetcher>(&getExecutor(),
-                                           lastFetched,
-                                           source,
-                                           nss,
-                                           config,
-                                           0,
-                                           -1,
-                                           true,
-                                           dataReplicatorExternalState.get(),
-                                           enqueueDocumentsFn,
-                                           [](Status) {},
-                                           defaultBatchSize);
+    return std::make_unique<OplogFetcher>(&getExecutor(),
+                                          lastFetched,
+                                          source,
+                                          nss,
+                                          config,
+                                          0,
+                                          -1,
+                                          true,
+                                          dataReplicatorExternalState.get(),
+                                          enqueueDocumentsFn,
+                                          [](Status) {},
+                                          defaultBatchSize);
 }
 
 BSONObj concatenate(BSONObj a, const BSONObj& b) {
@@ -280,27 +282,23 @@ TEST_F(OplogFetcherTest, InvalidOplogQueryMetadataInResponseStopsTheOplogFetcher
     ASSERT_EQUALS(ErrorCodes::NoSuchKey, shutdownState->getStatus());
 }
 
-TEST_F(OplogFetcherTest,
-       ValidMetadataInResponseWithoutOplogMetadataShouldBeForwardedToProcessMetadataFn) {
-    rpc::ReplSetMetadata metadata(1, lastFetched, lastFetched, 1, OID::gen(), 2, 2);
+DEATH_TEST_F(OplogFetcherTest,
+             ValidMetadataInResponseWithoutOplogMetadataInvariants,
+             "Invariant failure oqMetadata") {
+    rpc::ReplSetMetadata metadata(
+        1, {lastFetched, lastFetchedWall}, lastFetched, 1, OID::gen(), 2, 2);
     BSONObjBuilder bob;
     ASSERT_OK(metadata.writeToMetadata(&bob));
     auto metadataObj = bob.obj();
 
-    ASSERT_OK(
-        processSingleBatch(
-            {concatenate(makeCursorResponse(0, {makeNoopOplogEntry(lastFetched)}), metadataObj),
-             Milliseconds(0)})
-            ->getStatus());
-    ASSERT_TRUE(dataReplicatorExternalState->metadataWasProcessed);
-    ASSERT_EQUALS(metadata.getPrimaryIndex(),
-                  dataReplicatorExternalState->replMetadataProcessed.getPrimaryIndex());
-    ASSERT_EQUALS(-1, dataReplicatorExternalState->oqMetadataProcessed.getPrimaryIndex());
+    processSingleBatch(
+        {concatenate(makeCursorResponse(0, {makeNoopOplogEntry(lastFetched)}), metadataObj),
+         Milliseconds(0)});
 }
 
 TEST_F(OplogFetcherTest, ValidMetadataWithInResponseShouldBeForwardedToProcessMetadataFn) {
-    rpc::ReplSetMetadata replMetadata(1, OpTime(), OpTime(), 1, OID::gen(), -1, -1);
-    rpc::OplogQueryMetadata oqMetadata(staleOpTime, remoteNewerOpTime, rbid, 2, 2);
+    rpc::ReplSetMetadata replMetadata(1, {OpTime(), Date_t()}, OpTime(), 1, OID::gen(), -1, -1);
+    rpc::OplogQueryMetadata oqMetadata({staleOpTime, staleWallTime}, remoteNewerOpTime, rbid, 2, 2);
     BSONObjBuilder bob;
     ASSERT_OK(replMetadata.writeToMetadata(&bob));
     ASSERT_OK(oqMetadata.writeToMetadata(&bob));
@@ -318,8 +316,9 @@ TEST_F(OplogFetcherTest, ValidMetadataWithInResponseShouldBeForwardedToProcessMe
 }
 
 TEST_F(OplogFetcherTest, MetadataAndBatchAreNotProcessedWhenSyncSourceRollsBack) {
-    rpc::ReplSetMetadata replMetadata(1, OpTime(), OpTime(), 1, OID::gen(), -1, -1);
-    rpc::OplogQueryMetadata oqMetadata(staleOpTime, remoteNewerOpTime, rbid + 1, 2, 2);
+    rpc::ReplSetMetadata replMetadata(1, {OpTime(), Date_t()}, OpTime(), 1, OID::gen(), -1, -1);
+    rpc::OplogQueryMetadata oqMetadata(
+        {staleOpTime, staleWallTime}, remoteNewerOpTime, rbid + 1, 2, 2);
     BSONObjBuilder bob;
     ASSERT_OK(replMetadata.writeToMetadata(&bob));
     ASSERT_OK(oqMetadata.writeToMetadata(&bob));
@@ -336,8 +335,8 @@ TEST_F(OplogFetcherTest, MetadataAndBatchAreNotProcessedWhenSyncSourceRollsBack)
 }
 
 TEST_F(OplogFetcherTest, MetadataAndBatchAreNotProcessedWhenSyncSourceIsBehind) {
-    rpc::ReplSetMetadata replMetadata(1, OpTime(), OpTime(), 1, OID::gen(), -1, -1);
-    rpc::OplogQueryMetadata oqMetadata(staleOpTime, staleOpTime, rbid, 2, 2);
+    rpc::ReplSetMetadata replMetadata(1, {OpTime(), Date_t()}, OpTime(), 1, OID::gen(), -1, -1);
+    rpc::OplogQueryMetadata oqMetadata({staleOpTime, staleWallTime}, staleOpTime, rbid, 2, 2);
     BSONObjBuilder bob;
     ASSERT_OK(replMetadata.writeToMetadata(&bob));
     ASSERT_OK(oqMetadata.writeToMetadata(&bob));
@@ -354,8 +353,8 @@ TEST_F(OplogFetcherTest, MetadataAndBatchAreNotProcessedWhenSyncSourceIsBehind) 
 }
 
 TEST_F(OplogFetcherTest, MetadataAndBatchAreNotProcessedWhenSyncSourceIsNotAhead) {
-    rpc::ReplSetMetadata replMetadata(1, OpTime(), OpTime(), 1, OID::gen(), -1, -1);
-    rpc::OplogQueryMetadata oqMetadata(staleOpTime, lastFetched, rbid, 2, 2);
+    rpc::ReplSetMetadata replMetadata(1, {OpTime(), Date_t()}, OpTime(), 1, OID::gen(), -1, -1);
+    rpc::OplogQueryMetadata oqMetadata({staleOpTime, staleWallTime}, lastFetched, rbid, 2, 2);
     BSONObjBuilder bob;
     ASSERT_OK(replMetadata.writeToMetadata(&bob));
     ASSERT_OK(oqMetadata.writeToMetadata(&bob));
@@ -373,8 +372,8 @@ TEST_F(OplogFetcherTest, MetadataAndBatchAreNotProcessedWhenSyncSourceIsNotAhead
 
 TEST_F(OplogFetcherTest,
        MetadataAndBatchAreNotProcessedWhenSyncSourceIsBehindWithoutRequiringFresherSyncSource) {
-    rpc::ReplSetMetadata replMetadata(1, OpTime(), OpTime(), 1, OID::gen(), -1, -1);
-    rpc::OplogQueryMetadata oqMetadata(staleOpTime, staleOpTime, rbid, 2, 2);
+    rpc::ReplSetMetadata replMetadata(1, {OpTime(), Date_t()}, OpTime(), 1, OID::gen(), -1, -1);
+    rpc::OplogQueryMetadata oqMetadata({staleOpTime, staleWallTime}, staleOpTime, rbid, 2, 2);
     BSONObjBuilder bob;
     ASSERT_OK(replMetadata.writeToMetadata(&bob));
     ASSERT_OK(oqMetadata.writeToMetadata(&bob));
@@ -394,8 +393,8 @@ TEST_F(OplogFetcherTest, MetadataAndBatchAreProcessedWhenSyncSourceIsCurrentButM
     // This tests the case where the sync source metadata is behind us but we get a document which
     // is equal to us.  Since that means the metadata is stale and can be ignored, we should accept
     // this sync source.
-    rpc::ReplSetMetadata replMetadata(1, OpTime(), OpTime(), 1, OID::gen(), -1, -1);
-    rpc::OplogQueryMetadata oqMetadata(staleOpTime, staleOpTime, rbid, 2, 2);
+    rpc::ReplSetMetadata replMetadata(1, {OpTime(), Date_t()}, OpTime(), 1, OID::gen(), -1, -1);
+    rpc::OplogQueryMetadata oqMetadata({staleOpTime, staleWallTime}, staleOpTime, rbid, 2, 2);
     BSONObjBuilder bob;
     ASSERT_OK(replMetadata.writeToMetadata(&bob));
     ASSERT_OK(oqMetadata.writeToMetadata(&bob));
@@ -410,8 +409,8 @@ TEST_F(OplogFetcherTest, MetadataAndBatchAreProcessedWhenSyncSourceIsCurrentButM
 
 TEST_F(OplogFetcherTest,
        MetadataAndBatchAreProcessedWhenSyncSourceIsNotAheadWithoutRequiringFresherSyncSource) {
-    rpc::ReplSetMetadata replMetadata(1, OpTime(), OpTime(), 1, OID::gen(), -1, -1);
-    rpc::OplogQueryMetadata oqMetadata(staleOpTime, lastFetched, rbid, 2, 2);
+    rpc::ReplSetMetadata replMetadata(1, {OpTime(), Date_t()}, OpTime(), 1, OID::gen(), -1, -1);
+    rpc::OplogQueryMetadata oqMetadata({staleOpTime, staleWallTime}, lastFetched, rbid, 2, 2);
     BSONObjBuilder bob;
     ASSERT_OK(replMetadata.writeToMetadata(&bob));
     ASSERT_OK(oqMetadata.writeToMetadata(&bob));
@@ -426,7 +425,8 @@ TEST_F(OplogFetcherTest,
 
 TEST_F(OplogFetcherTest,
        MetadataWithoutOplogQueryMetadataIsNotProcessedOnBatchThatTriggersRollback) {
-    rpc::ReplSetMetadata metadata(1, lastFetched, lastFetched, 1, OID::gen(), 2, 2);
+    rpc::ReplSetMetadata metadata(
+        1, {lastFetched, lastFetchedWall}, lastFetched, 1, OID::gen(), 2, 2);
     BSONObjBuilder bob;
     ASSERT_OK(metadata.writeToMetadata(&bob));
     auto metadataObj = bob.obj();
@@ -440,8 +440,8 @@ TEST_F(OplogFetcherTest,
 }
 
 TEST_F(OplogFetcherTest, MetadataIsNotProcessedOnBatchThatTriggersRollback) {
-    rpc::ReplSetMetadata replMetadata(1, OpTime(), OpTime(), 1, OID::gen(), -1, -1);
-    rpc::OplogQueryMetadata oqMetadata(staleOpTime, remoteNewerOpTime, rbid, 2, 2);
+    rpc::ReplSetMetadata replMetadata(1, {OpTime(), Date_t()}, OpTime(), 1, OID::gen(), -1, -1);
+    rpc::OplogQueryMetadata oqMetadata({staleOpTime, staleWallTime}, remoteNewerOpTime, rbid, 2, 2);
     BSONObjBuilder bob;
     ASSERT_OK(replMetadata.writeToMetadata(&bob));
     ASSERT_OK(oqMetadata.writeToMetadata(&bob));
@@ -547,6 +547,162 @@ TEST_F(OplogFetcherTest, OplogFetcherShouldExcludeFirstDocumentInFirstBatchWhenE
     ASSERT_OK(shutdownState->getStatus());
 }
 
+TEST_F(OplogFetcherTest,
+       OplogFetcherShouldNotDuplicateFirstDocWithEnqueueFirstDocOnErrorAfterFirstDoc) {
+
+    // This function verifies that every oplog entry is only enqueued once.
+    OpTime lastEnqueuedOpTime = OpTime();
+    enqueueDocumentsFn = [&lastEnqueuedOpTime](Fetcher::Documents::const_iterator begin,
+                                               Fetcher::Documents::const_iterator end,
+                                               const OplogFetcher::DocumentsInfo&) -> Status {
+        auto count = 0;
+        auto toEnqueueOpTime = OpTime();
+
+        for (auto i = begin; i != end; ++i) {
+            count++;
+
+            toEnqueueOpTime = OplogEntry(*i).getOpTime();
+            ASSERT_GREATER_THAN(toEnqueueOpTime, lastEnqueuedOpTime);
+            lastEnqueuedOpTime = toEnqueueOpTime;
+        }
+
+        ASSERT_EQ(1, count);
+        return Status::OK();
+    };
+
+    auto shutdownState = std::make_unique<ShutdownState>();
+    OplogFetcher oplogFetcher(&getExecutor(),
+                              lastFetched,
+                              source,
+                              nss,
+                              _createConfig(),
+                              1 /* maxFetcherRestarts */,
+                              rbid,
+                              false /* requireFresherSyncSource */,
+                              dataReplicatorExternalState.get(),
+                              enqueueDocumentsFn,
+                              std::ref(*shutdownState),
+                              defaultBatchSize,
+                              OplogFetcher::StartingPoint::kEnqueueFirstDoc);
+
+    ASSERT_FALSE(oplogFetcher.isActive());
+    ASSERT_OK(oplogFetcher.startup());
+    ASSERT_TRUE(oplogFetcher.isActive());
+
+    auto firstEntry = makeNoopOplogEntry({{Seconds(123), 0}, lastFetched.getTerm()});
+    auto secondEntry = makeNoopOplogEntry({{Seconds(456), 0}, lastFetched.getTerm()});
+    auto metadataObj = makeOplogQueryMetadataObject(remoteNewerOpTime, rbid, 2, 2);
+
+    // Only send over the first entry. Save the second for the getMore request.
+    processNetworkResponse(
+        {concatenate(makeCursorResponse(22L, {firstEntry}), metadataObj), Milliseconds(0)}, true);
+
+    // Simulate an error right before receiving the second entry.
+    auto request = processNetworkResponse(RemoteCommandResponse(ErrorCodes::QueryPlanKilled,
+                                                                "Simulating failure for test.",
+                                                                Milliseconds(0)),
+                                          true);
+    ASSERT_EQUALS(std::string("getMore"), request.cmdObj.firstElementFieldName());
+
+    // Resend all data for the retry. The enqueueDocumentsFn will check to make sure that
+    // the first entry was not enqueued twice.
+    request = processNetworkResponse(
+        {concatenate(makeCursorResponse(0, {firstEntry, secondEntry}), metadataObj),
+         Milliseconds(0)},
+        false);
+
+    ASSERT_EQUALS(std::string("find"), request.cmdObj.firstElementFieldName());
+    ASSERT_EQUALS("oplog.rs", request.cmdObj["find"].String());
+
+    ASSERT(request.cmdObj["filter"].ok());
+    ASSERT(request.cmdObj["filter"]["ts"].ok());
+    ASSERT(request.cmdObj["filter"]["ts"]["$gte"].ok());
+    ASSERT_EQUALS(firstEntry["ts"].timestamp(), request.cmdObj["filter"]["ts"]["$gte"].timestamp());
+
+    oplogFetcher.join();
+    ASSERT_OK(shutdownState->getStatus());
+}
+
+TEST_F(OplogFetcherTest,
+       OplogFetcherShouldNotDuplicateFirstDocWithEnqueueFirstDocOnErrorAfterSecondDoc) {
+
+    // This function verifies that every oplog entry is only enqueued once.
+    OpTime lastEnqueuedOpTime = OpTime();
+    enqueueDocumentsFn = [&lastEnqueuedOpTime](Fetcher::Documents::const_iterator begin,
+                                               Fetcher::Documents::const_iterator end,
+                                               const OplogFetcher::DocumentsInfo&) -> Status {
+        auto count = 0;
+        auto toEnqueueOpTime = OpTime();
+
+        for (auto i = begin; i != end; ++i) {
+            count++;
+
+            toEnqueueOpTime = OplogEntry(*i).getOpTime();
+            ASSERT_GREATER_THAN(toEnqueueOpTime, lastEnqueuedOpTime);
+            lastEnqueuedOpTime = toEnqueueOpTime;
+        }
+
+        ASSERT_NOT_GREATER_THAN(count, 2);
+        return Status::OK();
+    };
+
+    auto shutdownState = std::make_unique<ShutdownState>();
+    OplogFetcher oplogFetcher(&getExecutor(),
+                              lastFetched,
+                              source,
+                              nss,
+                              _createConfig(),
+                              1 /* maxFetcherRestarts */,
+                              rbid,
+                              false /* requireFresherSyncSource */,
+                              dataReplicatorExternalState.get(),
+                              enqueueDocumentsFn,
+                              std::ref(*shutdownState),
+                              defaultBatchSize,
+                              OplogFetcher::StartingPoint::kEnqueueFirstDoc);
+
+    ASSERT_FALSE(oplogFetcher.isActive());
+    ASSERT_OK(oplogFetcher.startup());
+    ASSERT_TRUE(oplogFetcher.isActive());
+
+    auto firstEntry = makeNoopOplogEntry({{Seconds(123), 0}, lastFetched.getTerm()});
+    auto secondEntry = makeNoopOplogEntry({{Seconds(456), 0}, lastFetched.getTerm()});
+    auto thirdEntry = makeNoopOplogEntry({{Seconds(789), 0}, lastFetched.getTerm()});
+    auto metadataObj = makeOplogQueryMetadataObject(remoteNewerOpTime, rbid, 2, 2);
+
+    // Only send over the first two entries. Save the third for the getMore request.
+    processNetworkResponse(
+        {concatenate(makeCursorResponse(22L, {firstEntry, secondEntry}), metadataObj),
+         Milliseconds(0)},
+        true);
+
+    // Simulate an error right before receiving the third entry.
+    auto request = processNetworkResponse(RemoteCommandResponse(ErrorCodes::QueryPlanKilled,
+                                                                "Simulating failure for test.",
+                                                                Milliseconds(0)),
+                                          true);
+    ASSERT_EQUALS(std::string("getMore"), request.cmdObj.firstElementFieldName());
+
+    // Resend all data for the retry. The enqueueDocumentsFn will check to make sure that
+    // the first entry was not enqueued twice.
+    request = processNetworkResponse(
+        {concatenate(makeCursorResponse(0, {secondEntry, thirdEntry}), metadataObj),
+         Milliseconds(0)},
+        false);
+
+    ASSERT_EQUALS(std::string("find"), request.cmdObj.firstElementFieldName());
+    ASSERT_EQUALS("oplog.rs", request.cmdObj["find"].String());
+
+    ASSERT(request.cmdObj["filter"].ok());
+    ASSERT(request.cmdObj["filter"]["ts"].ok());
+    ASSERT(request.cmdObj["filter"]["ts"]["$gte"].ok());
+    ASSERT_EQUALS(secondEntry["ts"].timestamp(),
+                  request.cmdObj["filter"]["ts"]["$gte"].timestamp());
+
+    oplogFetcher.join();
+    ASSERT_OK(shutdownState->getStatus());
+}
+
 TEST_F(OplogFetcherTest, OplogFetcherShouldReportErrorsThrownFromCallback) {
     auto metadataObj = makeOplogQueryMetadataObject(remoteNewerOpTime, rbid, 2, 2);
 
@@ -603,28 +759,16 @@ TEST_F(OplogFetcherTest, FailedSyncSourceCheckWithoutMetadataStopsTheOplogFetche
     ASSERT_FALSE(dataReplicatorExternalState->syncSourceHasSyncSource);
 }
 
-TEST_F(OplogFetcherTest, FailedSyncSourceCheckWithReplSetMetadataStopsTheOplogFetcher) {
-    rpc::ReplSetMetadata metadata(lastFetched.getTerm(),
-                                  {{Seconds(10000), 0}, 1},
-                                  {{Seconds(20000), 0}, 1},
-                                  1,
-                                  OID::gen(),
-                                  2,
-                                  2);
-
-    testSyncSourceChecking(&metadata, nullptr);
-
-    // Sync source optime and "hasSyncSource" can be set if the respone contains metadata.
-    ASSERT_EQUALS(source, dataReplicatorExternalState->lastSyncSourceChecked);
-    ASSERT_EQUALS(metadata.getLastOpVisible(), dataReplicatorExternalState->syncSourceLastOpTime);
-    ASSERT_TRUE(dataReplicatorExternalState->syncSourceHasSyncSource);
-}
-
 TEST_F(OplogFetcherTest, FailedSyncSourceCheckWithBothMetadatasStopsTheOplogFetcher) {
     rpc::ReplSetMetadata replMetadata(
-        lastFetched.getTerm(), OpTime(), OpTime(), 1, OID::gen(), -1, -1);
+        lastFetched.getTerm(), {OpTime(), Date_t()}, OpTime(), 1, OID::gen(), -1, -1);
+    OpTime committedOpTime = {{Seconds(10000), 0}, 1};
     rpc::OplogQueryMetadata oqMetadata(
-        {{Seconds(10000), 0}, 1}, {{Seconds(20000), 0}, 1}, rbid, 2, 2);
+        {committedOpTime, Date_t() + Seconds(committedOpTime.getSecs())},
+        {{Seconds(20000), 0}, 1},
+        rbid,
+        2,
+        2);
 
     testSyncSourceChecking(&replMetadata, &oqMetadata);
 
@@ -635,34 +779,22 @@ TEST_F(OplogFetcherTest, FailedSyncSourceCheckWithBothMetadatasStopsTheOplogFetc
 }
 
 TEST_F(OplogFetcherTest,
-       FailedSyncSourceCheckWithSyncSourceHavingNoSyncSourceInReplSetMetadataStopsTheOplogFetcher) {
-    rpc::ReplSetMetadata metadata(lastFetched.getTerm(),
-                                  {{Seconds(10000), 0}, 1},
-                                  {{Seconds(20000), 0}, 1},
-                                  1,
-                                  OID::gen(),
-                                  2,
-                                  -1);
-
-    testSyncSourceChecking(&metadata, nullptr);
-
-    // Sync source "hasSyncSource" is derived from metadata.
-    ASSERT_EQUALS(source, dataReplicatorExternalState->lastSyncSourceChecked);
-    ASSERT_EQUALS(metadata.getLastOpVisible(), dataReplicatorExternalState->syncSourceLastOpTime);
-    ASSERT_FALSE(dataReplicatorExternalState->syncSourceHasSyncSource);
-}
-
-TEST_F(OplogFetcherTest,
        FailedSyncSourceCheckWithSyncSourceHavingNoSyncSourceStopsTheOplogFetcher) {
-    rpc::ReplSetMetadata replMetadata(lastFetched.getTerm(),
-                                      {{Seconds(10000), 0}, 1},
-                                      {{Seconds(20000), 0}, 1},
-                                      1,
-                                      OID::gen(),
-                                      2,
-                                      2);
+    OpTime committedOpTime = {{Seconds(10000), 0}, 1};
+    rpc::ReplSetMetadata replMetadata(
+        lastFetched.getTerm(),
+        {committedOpTime, Date_t() + Seconds(committedOpTime.getSecs())},
+        {{Seconds(20000), 0}, 1},
+        1,
+        OID::gen(),
+        2,
+        2);
     rpc::OplogQueryMetadata oqMetadata(
-        {{Seconds(10000), 0}, 1}, {{Seconds(20000), 0}, 1}, rbid, 2, -1);
+        {committedOpTime, Date_t() + Seconds(committedOpTime.getSecs())},
+        {{Seconds(20000), 0}, 1},
+        rbid,
+        2,
+        -1);
 
     testSyncSourceChecking(&replMetadata, &oqMetadata);
 
@@ -685,7 +817,7 @@ RemoteCommandRequest OplogFetcherTest::testTwoBatchHandling() {
                               true,
                               dataReplicatorExternalState.get(),
                               enqueueDocumentsFn,
-                              stdx::ref(shutdownState),
+                              std::ref(shutdownState),
                               defaultBatchSize);
     ASSERT_EQUALS(OplogFetcher::State::kPreStart, oplogFetcher.getState_forTest());
 
@@ -789,8 +921,9 @@ TEST_F(OplogFetcherTest, ValidateDocumentsReturnsOutOfOrderIfTimestampInThirdEnt
                       .getStatus());
 }
 
-TEST_F(OplogFetcherTest,
-       ValidateDocumentsExcludesFirstDocumentInApplyCountAndBytesIfProcessingFirstBatch) {
+TEST_F(
+    OplogFetcherTest,
+    ValidateDocumentsExcludesFirstDocumentInApplyCountAndBytesIfProcessingFirstBatchAndSkipFirstDoc) {
     auto firstEntry = makeNoopOplogEntry(Seconds(123));
     auto secondEntry = makeNoopOplogEntry(Seconds(456));
     auto thirdEntry = makeNoopOplogEntry(Seconds(789));
@@ -798,11 +931,37 @@ TEST_F(OplogFetcherTest,
     auto info = unittest::assertGet(OplogFetcher::validateDocuments(
         {firstEntry, secondEntry, thirdEntry},
         true,
-        unittest::assertGet(OpTime::parseFromOplogEntry(firstEntry)).getTimestamp()));
+        unittest::assertGet(OpTime::parseFromOplogEntry(firstEntry)).getTimestamp(),
+        mongo::repl::OplogFetcher::StartingPoint::kSkipFirstDoc));
 
     ASSERT_EQUALS(3U, info.networkDocumentCount);
+    ASSERT_EQUALS(2U, info.toApplyDocumentCount);
     ASSERT_EQUALS(size_t(firstEntry.objsize() + secondEntry.objsize() + thirdEntry.objsize()),
                   info.networkDocumentBytes);
+    ASSERT_EQUALS(size_t(secondEntry.objsize() + thirdEntry.objsize()), info.toApplyDocumentBytes);
+
+    ASSERT_EQUALS(unittest::assertGet(OpTime::parseFromOplogEntry(thirdEntry)), info.lastDocument);
+}
+
+TEST_F(
+    OplogFetcherTest,
+    ValidateDocumentsIncludesFirstDocumentInApplyCountAndBytesIfProcessingFirstBatchAndEnqueueFirstDoc) {
+    auto firstEntry = makeNoopOplogEntry(Seconds(123));
+    auto secondEntry = makeNoopOplogEntry(Seconds(456));
+    auto thirdEntry = makeNoopOplogEntry(Seconds(789));
+
+    auto info = unittest::assertGet(OplogFetcher::validateDocuments(
+        {firstEntry, secondEntry, thirdEntry},
+        true,
+        unittest::assertGet(OpTime::parseFromOplogEntry(firstEntry)).getTimestamp(),
+        mongo::repl::OplogFetcher::StartingPoint::kEnqueueFirstDoc));
+
+    ASSERT_EQUALS(3U, info.networkDocumentCount);
+    ASSERT_EQUALS(3U, info.toApplyDocumentCount);
+    ASSERT_EQUALS(size_t(firstEntry.objsize() + secondEntry.objsize() + thirdEntry.objsize()),
+                  info.networkDocumentBytes);
+    ASSERT_EQUALS(size_t(firstEntry.objsize() + secondEntry.objsize() + thirdEntry.objsize()),
+                  info.toApplyDocumentBytes);
 
     ASSERT_EQUALS(unittest::assertGet(OpTime::parseFromOplogEntry(thirdEntry)), info.lastDocument);
 }

@@ -4,8 +4,6 @@ Defines filtering rules for what tests to include in a suite depending
 on whether they apply to C++ unit tests, dbtests, or JS tests.
 """
 
-from __future__ import absolute_import
-
 import collections
 import errno
 import fnmatch
@@ -71,7 +69,7 @@ class TestFileExplorer(object):
             A list of paths as a list(str).
         """
         tests = []
-        with open(root_file_path, "rb") as filep:
+        with open(root_file_path, "r") as filep:
             for test_path in filep:
                 test_path = test_path.strip()
                 tests.append(test_path)
@@ -92,11 +90,12 @@ class TestFileExplorer(object):
 
     def list_dbtests(self, dbtest_binary):
         """List the available dbtests suites."""
-        returncode, stdout = self._run_program(dbtest_binary, ["--list"])
+        returncode, stdout, stderr = self._run_program(dbtest_binary, ["--list"])
 
         if returncode != 0:
-            raise errors.ResmokeError("Getting list of dbtest suites failed")
-
+            raise errors.ResmokeError("Getting list of dbtest suites failed"
+                                      ", dbtest_binary=`{}`: stdout=`{}`, stderr=`{}`".format(
+                                          dbtest_binary, stdout, stderr))
         return stdout.splitlines()
 
     @staticmethod
@@ -111,10 +110,9 @@ class TestFileExplorer(object):
         """
         command = [binary]
         command.extend(args)
-        program = subprocess.Popen(command, stdout=subprocess.PIPE)
-        stdout = program.communicate()[0]
-
-        return program.returncode, stdout
+        program = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        stdout, stderr = program.communicate()
+        return program.returncode, stdout.decode("utf-8"), stderr.decode("utf-8")
 
     @staticmethod
     def parse_tag_file(test_kind):
@@ -313,7 +311,7 @@ def make_expression(conf):
     elif isinstance(conf, dict):
         if len(conf) != 1:
             raise ValueError("Tag matching expressions should only contain one key")
-        key = conf.keys()[0]
+        key = list(conf.keys())[0]
         value = conf[key]
         if key == "$allOf":
             return _AllOfExpression(_make_expression_list(value))
@@ -708,6 +706,7 @@ _SELECTOR_REGISTRY = {
     "sleep_test": (_SleepTestCaseSelectorConfig, _SleepTestCaseSelector),
     "genny_test": (_FileBasedSelectorConfig, _Selector),
     "gennylib_test": (_GennylibTestCaseSelectorConfig, _GennylibTestCaseSelector),
+    "cpp_libfuzzer_test": (_CppTestSelectorConfig, _CppTestSelector),
 }
 
 

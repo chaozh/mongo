@@ -43,7 +43,7 @@ public:
 
     std::unique_ptr<MatchExpression> shallowClone() const final {
         std::unique_ptr<InternalSchemaFmodMatchExpression> m =
-            stdx::make_unique<InternalSchemaFmodMatchExpression>(path(), _divisor, _remainder);
+            std::make_unique<InternalSchemaFmodMatchExpression>(path(), _divisor, _remainder);
         if (getTag()) {
             m->setTag(getTag()->clone());
         }
@@ -52,7 +52,7 @@ public:
 
     bool matchesSingleElement(const BSONElement& e, MatchDetails* details = nullptr) const final;
 
-    void debugString(StringBuilder& debug, int level) const final;
+    void debugString(StringBuilder& debug, int indentationLevel) const final;
 
     BSONObj getSerializedRightHandSide() const final;
 

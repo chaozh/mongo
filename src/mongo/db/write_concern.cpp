@@ -38,6 +38,7 @@
 #include "mongo/db/client.h"
 #include "mongo/db/commands/server_status_metric.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/read_write_concern_defaults.h"
 #include "mongo/db/repl/optime.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/server_options.h"
@@ -46,13 +47,14 @@
 #include "mongo/db/storage/storage_engine.h"
 #include "mongo/db/write_concern_options.h"
 #include "mongo/rpc/protocol.h"
-#include "mongo/util/fail_point_service.h"
+#include "mongo/util/fail_point.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
 
-using std::string;
 using repl::OpTime;
+using repl::OpTimeAndWallTime;
+using std::string;
 
 static TimerStats gleWtimeStats;
 static ServerStatusMetricField<TimerStats> displayGleLatency("getLastError.wtime", &gleWtimeStats);
@@ -71,13 +73,36 @@ StatusWith<WriteConcernOptions> extractWriteConcern(OperationContext* opCtx,
                                                     const BSONObj& cmdObj) {
     // The default write concern if empty is {w:1}. Specifying {w:0} is/was allowed, but is
     // interpreted identically to {w:1}.
-    auto wcResult = WriteConcernOptions::extractWCFromCommand(
-        cmdObj, repl::ReplicationCoordinator::get(opCtx)->getGetLastErrorDefault());
+    auto wcResult = WriteConcernOptions::extractWCFromCommand(cmdObj);
     if (!wcResult.isOK()) {
         return wcResult.getStatus();
     }
 
     WriteConcernOptions writeConcern = wcResult.getValue();
+
+    // If no write concern is specified in the command (so usedDefault is true), then use the
+    // cluster-wide default WC (if there is one), or else the default WC from the ReplSetConfig
+    // (which takes the ReplicationCoordinator mutex).
+    if (writeConcern.usedDefault) {
+        writeConcern = ([&]() {
+            // WriteConcern defaults can only be applied on regular replica set members.  Operations
+            // received by shard and config servers should always have WC explicitly specified.
+            if (serverGlobalParams.clusterRole != ClusterRole::ShardServer &&
+                serverGlobalParams.clusterRole != ClusterRole::ConfigServer &&
+                !opCtx->getClient()->isInDirectClient()) {
+                auto wcDefault = ReadWriteConcernDefaults::get(opCtx->getServiceContext())
+                                     .getDefaultWriteConcern();
+                if (wcDefault) {
+                    return *wcDefault;
+                }
+            }
+            return repl::ReplicationCoordinator::get(opCtx)->getGetLastErrorDefault();
+        })();
+        if (writeConcern.wNumNodes == 0 && writeConcern.wMode.empty()) {
+            writeConcern.wNumNodes = 1;
+        }
+        writeConcern.usedDefaultW = true;
+    }
 
     if (writeConcern.usedDefault && serverGlobalParams.clusterRole == ClusterRole::ConfigServer &&
         !opCtx->getClient()->isInDirectClient() &&
@@ -170,7 +195,7 @@ Status waitForWriteConcern(OperationContext* opCtx,
 
     if (!opCtx->getClient()->isInDirectClient()) {
         // Respecting this failpoint for internal clients prevents stepup from working properly.
-        MONGO_FAIL_POINT_PAUSE_WHILE_SET(hangBeforeWaitingForWriteConcern);
+        hangBeforeWaitingForWriteConcern.pauseWhileSet();
     }
 
     // Next handle blocking on disk
@@ -190,7 +215,7 @@ Status waitForWriteConcern(OperationContext* opCtx,
                 result->fsyncFiles = storageEngine->flushAllFiles(opCtx, true);
             } else {
                 // We only need to commit the journal if we're durable
-                opCtx->recoveryUnit()->waitUntilDurable();
+                opCtx->recoveryUnit()->waitUntilDurable(opCtx);
             }
             break;
         }
@@ -198,11 +223,11 @@ Status waitForWriteConcern(OperationContext* opCtx,
             if (replCoord->getReplicationMode() != repl::ReplicationCoordinator::Mode::modeNone) {
                 // Wait for ops to become durable then update replication system's
                 // knowledge of this.
-                OpTime appliedOpTime = replCoord->getMyLastAppliedOpTime();
-                opCtx->recoveryUnit()->waitUntilDurable();
-                replCoord->setMyLastDurableOpTimeForward(appliedOpTime);
+                auto appliedOpTimeAndWallTime = replCoord->getMyLastAppliedOpTimeAndWallTime();
+                opCtx->recoveryUnit()->waitUntilDurable(opCtx);
+                replCoord->setMyLastDurableOpTimeAndWallTimeForward(appliedOpTimeAndWallTime);
             } else {
-                opCtx->recoveryUnit()->waitUntilDurable();
+                opCtx->recoveryUnit()->waitUntilDurable(opCtx);
             }
             break;
     }
@@ -217,8 +242,7 @@ Status waitForWriteConcern(OperationContext* opCtx,
     }
 
     // needed to avoid incrementing gleWtimeStats SERVER-9005
-    if (writeConcernWithPopulatedSyncMode.wNumNodes <= 1 &&
-        writeConcernWithPopulatedSyncMode.wMode.empty()) {
+    if (!writeConcernWithPopulatedSyncMode.needToWaitForOtherNodes()) {
         // no desired replication check
         return Status::OK();
     }
@@ -232,10 +256,6 @@ Status waitForWriteConcern(OperationContext* opCtx,
         result->wTimedOut = true;
     }
 
-    // Add stats
-    result->writtenTo = replCoord->getHostsWrittenTo(replOpTime,
-                                                     writeConcernWithPopulatedSyncMode.syncMode ==
-                                                         WriteConcernOptions::SyncMode::JOURNAL);
     gleWtimeStats.recordMillis(durationCount<Milliseconds>(replStatus.duration));
     result->wTime = durationCount<Milliseconds>(replStatus.duration);
 

@@ -30,6 +30,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 
 #include "mongo/base/string_data.h"
 #include "mongo/client/connection_string.h"
@@ -43,17 +44,16 @@
 #include "mongo/db/write_concern_options.h"
 #include "mongo/logger/log_severity.h"
 #include "mongo/platform/atomic_word.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/rpc/message.h"
 #include "mongo/rpc/metadata.h"
 #include "mongo/rpc/op_msg.h"
 #include "mongo/rpc/protocol.h"
 #include "mongo/rpc/unique_message.h"
-#include "mongo/stdx/functional.h"
-#include "mongo/stdx/mutex.h"
 #include "mongo/transport/message_compressor_manager.h"
 #include "mongo/transport/session.h"
 #include "mongo/transport/transport_layer.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -83,7 +83,7 @@ public:
      * status.
      */
     using HandshakeValidationHook =
-        stdx::function<Status(const executor::RemoteCommandResponse& isMasterReply)>;
+        std::function<Status(const executor::RemoteCommandResponse& isMasterReply)>;
 
     /**
        @param _autoReconnect if true, automatically reconnect on a connection failure
@@ -154,7 +154,7 @@ public:
                                           Query query = Query(),
                                           int nToReturn = 0,
                                           int nToSkip = 0,
-                                          const BSONObj* fieldsToReturn = 0,
+                                          const BSONObj* fieldsToReturn = nullptr,
                                           int queryOptions = 0,
                                           int batchSize = 0) override {
         checkConnection();
@@ -162,7 +162,7 @@ public:
             nsOrUuid, query, nToReturn, nToSkip, fieldsToReturn, queryOptions, batchSize);
     }
 
-    unsigned long long query(stdx::function<void(DBClientCursorBatchIterator&)> f,
+    unsigned long long query(std::function<void(DBClientCursorBatchIterator&)> f,
                              const NamespaceStringOrUUID& nsOrUuid,
                              Query query,
                              const BSONObj* fieldsToReturn,
@@ -227,12 +227,12 @@ public:
         return _serverAddress;
     }
 
-    void say(Message& toSend, bool isRetry = false, std::string* actualServer = 0) override;
+    void say(Message& toSend, bool isRetry = false, std::string* actualServer = nullptr) override;
     bool recv(Message& m, int lastRequestId) override;
     void checkResponse(const std::vector<BSONObj>& batch,
                        bool networkError,
-                       bool* retry = NULL,
-                       std::string* host = NULL) override;
+                       bool* retry = nullptr,
+                       std::string* host = nullptr) override;
     bool call(Message& toSend,
               Message& response,
               bool assertOk,
@@ -293,7 +293,7 @@ protected:
     // rebind the handle from the owning thread. The thread that owns this DBClientConnection is
     // allowed to use the _session without locking the mutex. This mutex also guards writes to
     // _stayFailed, although reads are allowed outside the mutex.
-    stdx::mutex _sessionMutex;
+    Mutex _sessionMutex = MONGO_MAKE_LATCH("DBClientConnection::_sessionMutex");
     transport::SessionHandle _session;
     boost::optional<Milliseconds> _socketTimeout;
     transport::Session::TagMask _tagMask = transport::Session::kEmptyTagMask;

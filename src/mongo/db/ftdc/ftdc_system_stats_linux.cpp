@@ -31,6 +31,7 @@
 
 #include "mongo/db/ftdc/ftdc_system_stats.h"
 
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -39,7 +40,6 @@
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/ftdc/collector.h"
 #include "mongo/db/ftdc/controller.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/util/processinfo.h"
 #include "mongo/util/procparser.h"
 
@@ -68,7 +68,10 @@ static const std::vector<StringData> kMemKeys{
 };
 
 static const std::vector<StringData> kNetstatKeys{
-    "Tcp:"_sd, "Ip:"_sd, "TcpExt:"_sd, "IpExt:"_sd,
+    "Tcp:"_sd,
+    "Ip:"_sd,
+    "TcpExt:"_sd,
+    "IpExt:"_sd,
 };
 
 /**
@@ -88,7 +91,7 @@ public:
 
             // Include the number of cpus to simplify client calculations
             ProcessInfo p;
-            subObjBuilder.append("num_cpus", p.getNumCores());
+            subObjBuilder.append("num_cpus", static_cast<int>(p.getNumCores()));
 
             processStatusErrors(
                 procparser::parseProcStatFile("/proc/stat"_sd, kCpuKeys, &subObjBuilder),
@@ -137,7 +140,7 @@ private:
 }  // namespace
 
 void installSystemMetricsCollector(FTDCController* controller) {
-    controller->addPeriodicCollector(stdx::make_unique<LinuxSystemMetricsCollector>());
+    controller->addPeriodicCollector(std::make_unique<LinuxSystemMetricsCollector>());
 }
 
 }  // namespace mongo

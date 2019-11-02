@@ -49,7 +49,7 @@ public:
     OpTimeWithTerm getCurrentTermAndLastCommittedOpTime() override;
 
     void processMetadata(const rpc::ReplSetMetadata& metadata,
-                         boost::optional<rpc::OplogQueryMetadata> oqMetadata) override;
+                         rpc::OplogQueryMetadata oqMetadata) override;
 
     bool shouldStopFetching(const HostAndPort& source,
                             const rpc::ReplSetMetadata& replMetadata,
@@ -87,10 +87,10 @@ public:
     // Returned by shouldStopFetching.
     bool shouldStopFetchingResult = false;
 
-    // Override to change multiApply behavior.
-    using MultiApplyFn = stdx::function<StatusWith<OpTime>(
+    // Override to change applyOplogBatch behavior.
+    using ApplyOplogBatchFn = std::function<StatusWith<OpTime>(
         OperationContext*, MultiApplier::Operations, OplogApplier::Observer*)>;
-    MultiApplyFn multiApplyFn;
+    ApplyOplogBatchFn applyOplogBatchFn;
 
     StatusWith<ReplSetConfig> replSetConfigResult = ReplSetConfig();
 };

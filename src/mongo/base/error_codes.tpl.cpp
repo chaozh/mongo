@@ -33,7 +33,7 @@
 
 #include "mongo/base/static_assert.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 //#set $codes_with_extra = [ec for ec in $codes if ec.extra]
 
@@ -58,7 +58,7 @@ std::string ErrorCodes::errorString(Error err) {
             return "$ec.name";
         //#end for
         default:
-            return mongoutils::str::stream() << "Location" << int(err);
+            return str::stream() << "Location" << int(err);
     }
 }
 
@@ -75,7 +75,8 @@ std::ostream& operator<<(std::ostream& stream, ErrorCodes::Error code) {
 }
 
 //#for $cat in $categories
-bool ErrorCodes::is${cat.name}(Error err) {
+template <>
+bool ErrorCodes::isA<ErrorCategory::$cat.name>(Error err) {
     switch (err) {
         //#for $code in $cat.codes
         case $code:
@@ -85,8 +86,8 @@ bool ErrorCodes::is${cat.name}(Error err) {
             return false;
     }
 }
-//#end for
 
+//#end for
 bool ErrorCodes::shouldHaveExtraInfo(Error code) {
     switch (code) {
         //#for $ec in $codes_with_extra

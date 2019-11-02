@@ -29,20 +29,21 @@
 
 #pragma once
 
+#include <functional>
 #include <list>
 #include <vector>
 
 #include <boost/intrusive_ptr.hpp>
 
+#include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/exec/plan_stats.h"
 #include "mongo/db/matcher/expression_parser.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/pipeline/dependencies.h"
-#include "mongo/db/pipeline/value.h"
 #include "mongo/db/query/explain_options.h"
 #include "mongo/db/query/query_knobs_gen.h"
 #include "mongo/executor/task_executor.h"
 #include "mongo/s/query/async_results_merger_params_gen.h"
-#include "mongo/stdx/functional.h"
 #include "mongo/util/intrusive_counter.h"
 #include "mongo/util/timer.h"
 
@@ -129,22 +130,9 @@ public:
         SourceContainer sources, const boost::intrusive_ptr<ExpressionContext>& expCtx);
 
     /**
-     * Returns true if the provided aggregation command has a $out stage.
+     * Returns true if the provided aggregation command has an $out or $merge stage.
      */
-    static bool aggSupportsWriteConcern(const BSONObj& cmd);
-
-    /**
-     * Given 'pathsOfInterest' which describes a set of paths which the caller is interested in,
-     * returns boost::none if any of those paths are modified by the section of a pipeline
-     * described by 'rstart' and 'rend', or a mapping from their name at the end of the pipeline to
-     * their name at the beginning of the pipeline if they are preserved but possibly renamed by
-     * this pipeline. Note that the analysis proceeds backwards, so the iterators must be reverse
-     * iterators.
-     */
-    static boost::optional<StringMap<std::string>> renamedPaths(
-        SourceContainer::const_reverse_iterator rstart,
-        SourceContainer::const_reverse_iterator rend,
-        std::set<std::string> pathsOfInterest);
+    static bool aggHasWriteStage(const BSONObj& cmd);
 
     const boost::intrusive_ptr<ExpressionContext>& getContext() const {
         return pCtx;
@@ -263,18 +251,13 @@ public:
      * Returns the dependencies needed by this pipeline. 'metadataAvailable' should reflect what
      * metadata is present on documents that are input to the front of the pipeline.
      */
-    DepsTracker getDependencies(DepsTracker::MetadataAvailable metadataAvailable) const;
-
-    /**
-     * Given 'pathsOfInterest' which describes a set of paths which the caller is interested in,
-     * returns boost::none if any of those paths are modified by this pipeline, or a mapping from
-     * their name at the end of the pipeline to their name at the beginning of the pipeline if they
-     * are preserved but possibly renamed by this pipeline.
-     */
-    boost::optional<StringMap<std::string>> renamedPaths(
-        std::set<std::string> pathsOfInterest) const;
+    DepsTracker getDependencies(QueryMetadataBitSet metadataAvailable) const;
 
     const SourceContainer& getSources() const {
+        return _sources;
+    }
+
+    SourceContainer& getSources() {
         return _sources;
     }
 
@@ -311,7 +294,7 @@ public:
      * stage. Returns nullptr if there is no first stage which meets these criteria.
      */
     boost::intrusive_ptr<DocumentSource> popFrontWithNameAndCriteria(
-        StringData targetStageName, stdx::function<bool(const DocumentSource* const)> predicate);
+        StringData targetStageName, std::function<bool(const DocumentSource* const)> predicate);
 
     /**
      * PipelineD is a "sister" class that has additional functionality for the Pipeline. It exists

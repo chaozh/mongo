@@ -31,7 +31,7 @@
 
 #include "mongo/s/chunk_version.h"
 
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -129,6 +129,10 @@ BSONObj ChunkVersion::toBSON() const {
     b.appendTimestamp(_combined);
     b.append(_epoch);
     return b.arr();
+}
+
+void ChunkVersion::legacyToBSON(StringData field, BSONObjBuilder* out) const {
+    out->appendTimestamp(field, this->toLong());
 }
 
 std::string ChunkVersion::toString() const {

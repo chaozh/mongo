@@ -41,7 +41,7 @@
 #include "mongo/db/operation_context.h"
 #include "mongo/db/service_context.h"
 #include "mongo/scripting/dbdirectclient_factory.h"
-#include "mongo/util/fail_point_service.h"
+#include "mongo/util/fail_point.h"
 #include "mongo/util/file.h"
 #include "mongo/util/log.h"
 #include "mongo/util/text.h"
@@ -68,7 +68,8 @@ static std::unique_ptr<ScriptEngine> globalScriptEngine;
 
 }  // namespace
 
-ScriptEngine::ScriptEngine() : _scopeInitCallback() {}
+ScriptEngine::ScriptEngine(bool disableLoadStored)
+    : _disableLoadStored(disableLoadStored), _scopeInitCallback() {}
 
 ScriptEngine::~ScriptEngine() {}
 
@@ -199,7 +200,7 @@ public:
 };
 
 void Scope::storedFuncMod(OperationContext* opCtx) {
-    opCtx->recoveryUnit()->registerChange(new StoredFuncModLogOpHandler());
+    opCtx->recoveryUnit()->registerChange(std::make_unique<StoredFuncModLogOpHandler>());
 }
 
 void Scope::validateObjectIdString(const string& str) {
@@ -209,6 +210,8 @@ void Scope::validateObjectIdString(const string& str) {
 }
 
 void Scope::loadStored(OperationContext* opCtx, bool ignoreNotConnected) {
+    if (!getGlobalScriptEngine()->_disableLoadStored)
+        return;
     if (_localDBName.size() == 0) {
         if (ignoreNotConnected)
             return;
@@ -225,7 +228,7 @@ void Scope::loadStored(OperationContext* opCtx, bool ignoreNotConnected) {
     auto directDBClient = DBDirectClientFactory::get(opCtx).create(opCtx);
 
     unique_ptr<DBClientCursor> c =
-        directDBClient->query(coll, Query(), 0, 0, NULL, QueryOption_SlaveOk, 0);
+        directDBClient->query(coll, Query(), 0, 0, nullptr, QueryOption_SlaveOk, 0);
     massert(16669, "unable to get db client cursor from query", c.get());
 
     set<string> thisTime;
@@ -237,12 +240,12 @@ void Scope::loadStored(OperationContext* opCtx, bool ignoreNotConnected) {
         uassert(10209, str::stream() << "name has to be a string: " << n, n.type() == String);
         uassert(10210, "value has to be set", v.type() != EOO);
 
-        if (MONGO_FAIL_POINT(mr_killop_test_fp)) {
+        if (MONGO_unlikely(mr_killop_test_fp.shouldFail())) {
 
             /* This thread sleep makes the interrupts in the test come in at a time
-            *  where the js misses the interrupt and throw an exception instead of
-            *  being interrupted
-            */
+             *  where the js misses the interrupt and throw an exception instead of
+             *  being interrupted
+             */
             stdx::this_thread::sleep_for(stdx::chrono::seconds(1));
         }
 
@@ -301,7 +304,6 @@ extern const JSFile db;
 extern const JSFile explain_query;
 extern const JSFile explainable;
 extern const JSFile mongo;
-extern const JSFile mr;
 extern const JSFile session;
 extern const JSFile query;
 extern const JSFile utils;
@@ -309,7 +311,7 @@ extern const JSFile utils_sh;
 extern const JSFile utils_auth;
 extern const JSFile bulk_api;
 extern const JSFile error_codes;
-}
+}  // namespace JSFiles
 
 void Scope::execCoreFiles() {
     execSetup(JSFiles::utils);
@@ -317,7 +319,6 @@ void Scope::execCoreFiles() {
     execSetup(JSFiles::utils_auth);
     execSetup(JSFiles::db);
     execSetup(JSFiles::mongo);
-    execSetup(JSFiles::mr);
     execSetup(JSFiles::session);
     execSetup(JSFiles::query);
     execSetup(JSFiles::bulk_api);
@@ -332,7 +333,7 @@ namespace {
 class ScopeCache {
 public:
     void release(const string& poolName, const std::shared_ptr<Scope>& scope) {
-        stdx::lock_guard<stdx::mutex> lk(_mutex);
+        stdx::lock_guard<Latch> lk(_mutex);
 
         if (scope->hasOutOfMemoryException()) {
             // make some room
@@ -358,7 +359,7 @@ public:
     }
 
     std::shared_ptr<Scope> tryAcquire(OperationContext* opCtx, const string& poolName) {
-        stdx::lock_guard<stdx::mutex> lk(_mutex);
+        stdx::lock_guard<Latch> lk(_mutex);
 
         for (Pools::iterator it = _pools.begin(); it != _pools.end(); ++it) {
             if (it->poolName == poolName) {
@@ -374,7 +375,7 @@ public:
     }
 
     void clear() {
-        stdx::lock_guard<stdx::mutex> lk(_mutex);
+        stdx::lock_guard<Latch> lk(_mutex);
 
         _pools.clear();
     }
@@ -391,7 +392,7 @@ private:
 
     typedef std::deque<ScopeAndPool> Pools;  // More-recently used Scopes are kept at the front.
     Pools _pools;                            // protected by _mutex
-    stdx::mutex _mutex;
+    Mutex _mutex = MONGO_MAKE_LATCH("ScopeCache::_mutex");
 };
 
 ScopeCache scopeCache;
@@ -423,7 +424,7 @@ public:
     void init(const BSONObj* data) {
         _real->init(data);
     }
-    void setLocalDB(const string& dbName) {
+    void setLocalDB(StringData dbName) {
         _real->setLocalDB(dbName);
     }
     void loadStored(OperationContext* opCtx, bool ignoreNotConnected = false) {
@@ -560,7 +561,7 @@ unique_ptr<Scope> ScriptEngine::getPooledScope(OperationContext* opCtx,
     return p;
 }
 
-void (*ScriptEngine::_connectCallback)(DBClientBase&) = 0;
+void (*ScriptEngine::_connectCallback)(DBClientBase&) = nullptr;
 
 ScriptEngine* getGlobalScriptEngine() {
     if (hasGlobalServiceContext())

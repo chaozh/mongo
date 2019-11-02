@@ -29,12 +29,13 @@
 
 #include "mongo/db/exec/merge_sort.h"
 
+#include <memory>
+
 #include "mongo/db/exec/scoped_timer.h"
 #include "mongo/db/exec/working_set.h"
 #include "mongo/db/exec/working_set_common.h"
 #include "mongo/db/query/collation/collator_interface.h"
-#include "mongo/stdx/memory.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -42,7 +43,6 @@ using std::list;
 using std::string;
 using std::unique_ptr;
 using std::vector;
-using stdx::make_unique;
 
 // static
 const char* MergeSortStage::kStageType = "SORT_MERGE";
@@ -57,11 +57,11 @@ MergeSortStage::MergeSortStage(OperationContext* opCtx,
       _dedup(params.dedup),
       _merging(StageWithValueComparison(ws, params.pattern, params.collator)) {}
 
-void MergeSortStage::addChild(PlanStage* child) {
-    _children.emplace_back(child);
+void MergeSortStage::addChild(std::unique_ptr<PlanStage> child) {
+    _children.emplace_back(std::move(child));
 
     // We have to call work(...) on every child before we can pick a min.
-    _noResultToMerge.push(child);
+    _noResultToMerge.push(_children.back().get());
 }
 
 bool MergeSortStage::isEOF() {
@@ -204,8 +204,9 @@ unique_ptr<PlanStageStats> MergeSortStage::getStats() {
 
     _specificStats.sortPattern = _pattern;
 
-    unique_ptr<PlanStageStats> ret = make_unique<PlanStageStats>(_commonStats, STAGE_SORT_MERGE);
-    ret->specific = make_unique<MergeSortStats>(_specificStats);
+    unique_ptr<PlanStageStats> ret =
+        std::make_unique<PlanStageStats>(_commonStats, STAGE_SORT_MERGE);
+    ret->specific = std::make_unique<MergeSortStats>(_specificStats);
     for (size_t i = 0; i < _children.size(); ++i) {
         ret->children.emplace_back(_children[i]->getStats());
     }

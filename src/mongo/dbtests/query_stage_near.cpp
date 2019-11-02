@@ -45,7 +45,6 @@
 #include "mongo/db/exec/queued_data_stage.h"
 #include "mongo/db/exec/working_set_common.h"
 #include "mongo/dbtests/dbtests.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/unittest/unittest.h"
 
 namespace {
@@ -54,7 +53,6 @@ using namespace mongo;
 using std::shared_ptr;
 using std::unique_ptr;
 using std::vector;
-using stdx::make_unique;
 
 const std::string kTestNamespace = "test.coll";
 const BSONObj kTestKeyPattern = BSON("testIndex" << 1);
@@ -105,26 +103,26 @@ public:
           _pos(0) {}
 
     void addInterval(vector<BSONObj> data, double min, double max) {
-        _intervals.push_back(stdx::make_unique<MockInterval>(data, min, max));
+        _intervals.push_back(std::make_unique<MockInterval>(data, min, max));
     }
 
     virtual StatusWith<CoveredInterval*> nextInterval(OperationContext* opCtx,
                                                       WorkingSet* workingSet,
                                                       const Collection* collection) {
         if (_pos == static_cast<int>(_intervals.size()))
-            return StatusWith<CoveredInterval*>(NULL);
+            return StatusWith<CoveredInterval*>(nullptr);
 
         const MockInterval& interval = *_intervals[_pos++];
 
         bool lastInterval = _pos == static_cast<int>(_intervals.size());
 
-        auto queuedStage = make_unique<QueuedDataStage>(opCtx, workingSet);
+        auto queuedStage = std::make_unique<QueuedDataStage>(opCtx, workingSet);
 
         for (unsigned int i = 0; i < interval.data.size(); i++) {
             // Add all documents from the lastInterval into the QueuedDataStage.
             const WorkingSetID id = workingSet->allocate();
             WorkingSetMember* member = workingSet->get(id);
-            member->obj = Snapshotted<BSONObj>(SnapshotId(), interval.data[i]);
+            member->doc = {SnapshotId(), Document{interval.data[i]}};
             workingSet->transitionToOwnedObj(id);
             queuedStage->pushBack(id);
         }
@@ -136,7 +134,7 @@ public:
 
     StatusWith<double> computeDistance(WorkingSetMember* member) final {
         ASSERT(member->hasObj());
-        return StatusWith<double>(member->obj.value()["distance"].numberDouble());
+        return StatusWith<double>(member->doc.value()["distance"].getDouble());
     }
 
     virtual StageState initialize(OperationContext* opCtx,
@@ -158,7 +156,7 @@ static vector<BSONObj> advanceStage(PlanStage* stage, WorkingSet* workingSet) {
 
     while (PlanStage::NEED_TIME == state) {
         while (PlanStage::ADVANCED == (state = stage->work(&nextMemberID))) {
-            results.push_back(workingSet->get(nextMemberID)->obj.value());
+            results.push_back(workingSet->get(nextMemberID)->doc.value().toBson());
         }
     }
 
@@ -236,4 +234,4 @@ TEST_F(QueryStageNearTest, EmptyResults) {
     ASSERT_EQUALS(results.size(), 3u);
     assertAscendingAndValid(results);
 }
-}
+}  // namespace

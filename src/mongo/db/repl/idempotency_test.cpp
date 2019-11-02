@@ -58,9 +58,9 @@ protected:
 
     BSONObj getDoc();
 
-    std::string getStateString(const CollectionState& state1,
-                               const CollectionState& state2,
-                               const std::vector<OplogEntry>& ops) override;
+    std::string getStatesString(const std::vector<CollectionState>& state1,
+                                const std::vector<CollectionState>& state2,
+                                const std::vector<OplogEntry>& ops) override;
 
     Status resetState() override;
 
@@ -111,15 +111,15 @@ std::vector<OplogEntry> RandomizedIdempotencyTest::createUpdateSequence(
     return updateSequence;
 }
 
-std::string RandomizedIdempotencyTest::getStateString(const CollectionState& state1,
-                                                      const CollectionState& state2,
-                                                      const std::vector<OplogEntry>& ops) {
-    unittest::log() << IdempotencyTest::getStateString(state1, state2, ops);
+std::string RandomizedIdempotencyTest::getStatesString(const std::vector<CollectionState>& state1,
+                                                       const std::vector<CollectionState>& state2,
+                                                       const std::vector<OplogEntry>& ops) {
+    unittest::log() << IdempotencyTest::getStatesString(state1, state2, ops);
     StringBuilder sb;
     sb << "Ran update ops: ";
     sb << "[ ";
     bool firstIter = true;
-    for (auto op : ops) {
+    for (const auto& op : ops) {
         if (!firstIter) {
             sb << ", ";
         } else {
@@ -132,7 +132,7 @@ std::string RandomizedIdempotencyTest::getStateString(const CollectionState& sta
     ASSERT_OK(resetState());
 
     sb << "Start: " << getDoc() << "\n";
-    for (auto op : ops) {
+    for (const auto& op : ops) {
         ASSERT_OK(runOpInitialSync(op));
         sb << "Apply: " << op.getObject() << "\n  ==> " << getDoc() << "\n";
     }
@@ -165,7 +165,7 @@ void RandomizedIdempotencyTest::runIdempotencyTestCase() {
     const double kDocProbability = 0.375;
     const double kArrProbability = 0.0;
 
-    this->seed = SecureRandom::create()->nextInt64();
+    this->seed = SecureRandom().nextInt64();
     PseudoRandom seedGenerator(this->seed);
     RandomizedScalarGenerator scalarGenerator{PseudoRandom(seedGenerator.nextInt64())};
     UpdateSequenceGenerator updateGenerator(
@@ -184,8 +184,8 @@ void RandomizedIdempotencyTest::runIdempotencyTestCase() {
 
     for (auto doc : enumerator) {
         BSONObj docWithId = (BSONObjBuilder(doc) << "_id" << kDocId).obj();
-        this->initOps = std::vector<OplogEntry>{createCollection(), insert(docWithId)};
         for (size_t i = 0; i < kNumUpdateSequencesPerDoc; i++) {
+            this->initOps = std::vector<OplogEntry>{createCollection(), insert(docWithId)};
             std::vector<OplogEntry> updateSequence =
                 createUpdateSequence(updateGenerator, kUpdateSequenceLength);
             testOpsAreIdempotent(updateSequence, SequenceType::kAnyPrefixOrSuffix);
@@ -195,6 +195,21 @@ void RandomizedIdempotencyTest::runIdempotencyTestCase() {
 
 TEST_F(RandomizedIdempotencyTest, CheckUpdateSequencesAreIdempotent) {
     runIdempotencyTestCase();
+}
+
+TEST_F(IdempotencyTest, UpdateTwoFields) {
+    ASSERT_OK(
+        ReplicationCoordinator::get(_opCtx.get())->setFollowerMode(MemberState::RS_RECOVERING));
+
+    ASSERT_OK(runOpInitialSync(createCollection(kUuid)));
+    ASSERT_OK(runOpInitialSync(insert(fromjson("{_id: 1, y: [0]}"))));
+
+    auto updateOp1 = update(1, fromjson("{$set: {x: 1}}"));
+    auto updateOp2 = update(1, fromjson("{$set: {x: 2, 'y.0': 2}}"));
+    auto updateOp3 = update(1, fromjson("{$set: {y: 3}}"));
+
+    auto ops = {updateOp1, updateOp2, updateOp3};
+    testOpsAreIdempotent(ops);
 }
 
 }  // namespace

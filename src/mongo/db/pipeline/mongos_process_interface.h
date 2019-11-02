@@ -29,6 +29,7 @@
 
 #pragma once
 
+#include "mongo/db/exec/shard_filterer.h"
 #include "mongo/db/pipeline/mongo_process_common.h"
 #include "mongo/db/pipeline/pipeline.h"
 #include "mongo/s/async_requests_sender.h"
@@ -42,36 +43,8 @@ namespace mongo {
  * Class to provide access to mongos-specific implementations of methods required by some
  * document sources.
  */
-class MongoSInterface final : public MongoProcessCommon {
+class MongoSInterface : public MongoProcessCommon {
 public:
-    static BSONObj createPassthroughCommandForShard(OperationContext* opCtx,
-                                                    const AggregationRequest& request,
-                                                    const boost::optional<ShardId>& shardId,
-                                                    Pipeline* pipeline,
-                                                    BSONObj collationObj);
-
-    /**
-     * Appends information to the command sent to the shards which should be appended both if this
-     * is a passthrough sent to a single shard and if this is a split pipeline.
-     */
-    static BSONObj genericTransformForShards(MutableDocument&& cmdForShards,
-                                             OperationContext* opCtx,
-                                             const boost::optional<ShardId>& shardId,
-                                             const AggregationRequest& request,
-                                             BSONObj collationObj);
-
-    static BSONObj createCommandForTargetedShards(
-        OperationContext* opCtx,
-        const AggregationRequest& request,
-        const LiteParsedPipeline& litePipe,
-        const cluster_aggregation_planner::SplitPipeline& splitPipeline,
-        const BSONObj collationObj,
-        const boost::optional<cluster_aggregation_planner::ShardedExchangePolicy> exchangeSpec,
-        bool needsMerge);
-
-    static StatusWith<CachedCollectionRoutingInfo> getExecutionNsRoutingInfo(
-        OperationContext* opCtx, const NamespaceString& execNss);
-
     MongoSInterface() = default;
 
     virtual ~MongoSInterface() = default;
@@ -89,28 +62,32 @@ public:
     std::vector<GenericCursor> getIdleCursors(const boost::intrusive_ptr<ExpressionContext>& expCtx,
                                               CurrentOpUserMode userMode) const final;
 
+    std::unique_ptr<TransactionHistoryIteratorBase> createTransactionHistoryIterator(
+        repl::OpTime time) const override {
+        MONGO_UNREACHABLE;
+    }
+
     DBClientBase* directClient() final {
         MONGO_UNREACHABLE;
     }
 
     bool isSharded(OperationContext* opCtx, const NamespaceString& nss) final;
 
-    void insert(const boost::intrusive_ptr<ExpressionContext>& expCtx,
-                const NamespaceString& ns,
-                std::vector<BSONObj>&& objs,
-                const WriteConcernOptions& wc,
-                boost::optional<OID>) final {
+    Status insert(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                  const NamespaceString& ns,
+                  std::vector<BSONObj>&& objs,
+                  const WriteConcernOptions& wc,
+                  boost::optional<OID>) final {
         MONGO_UNREACHABLE;
     }
 
-    void update(const boost::intrusive_ptr<ExpressionContext>& expCtx,
-                const NamespaceString& ns,
-                std::vector<BSONObj>&& queries,
-                std::vector<BSONObj>&& updates,
-                const WriteConcernOptions& wc,
-                bool upsert,
-                bool multi,
-                boost::optional<OID>) final {
+    StatusWith<UpdateResult> update(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                                    const NamespaceString& ns,
+                                    BatchedObjects&& batch,
+                                    const WriteConcernOptions& wc,
+                                    bool upsert,
+                                    bool multi,
+                                    boost::optional<OID>) final {
         MONGO_UNREACHABLE;
     }
 
@@ -139,6 +116,12 @@ public:
         MONGO_UNREACHABLE;
     }
 
+    Status appendQueryExecStats(OperationContext* opCtx,
+                                const NamespaceString& nss,
+                                BSONObjBuilder* builder) const final {
+        MONGO_UNREACHABLE;
+    }
+
     BSONObj getCollectionOptions(const NamespaceString& nss) final {
         MONGO_UNREACHABLE;
     }
@@ -153,6 +136,17 @@ public:
 
     std::unique_ptr<Pipeline, PipelineDeleter> attachCursorSourceToPipeline(
         const boost::intrusive_ptr<ExpressionContext>& expCtx, Pipeline* pipeline) final;
+
+    std::unique_ptr<Pipeline, PipelineDeleter> attachCursorSourceToPipelineForLocalRead(
+        const boost::intrusive_ptr<ExpressionContext>& expCtx, Pipeline* pipeline) final {
+        // It is not meaningful to perform a "local read" on mongos.
+        MONGO_UNREACHABLE;
+    }
+
+    std::unique_ptr<ShardFilterer> getShardFilterer(
+        const boost::intrusive_ptr<ExpressionContext>& expCtx) const override {
+        return nullptr;
+    }
 
     std::string getShardName(OperationContext* opCtx) const final {
         MONGO_UNREACHABLE;
@@ -197,9 +191,9 @@ public:
         MONGO_UNREACHABLE;
     }
 
-    bool uniqueKeyIsSupportedByIndex(const boost::intrusive_ptr<ExpressionContext>&,
-                                     const NamespaceString&,
-                                     const std::set<FieldPath>& uniqueKeyPaths) const final;
+    bool fieldsHaveSupportingUniqueIndex(const boost::intrusive_ptr<ExpressionContext>&,
+                                         const NamespaceString&,
+                                         const std::set<FieldPath>& fieldPaths) const;
 
     void checkRoutingInfoEpochOrThrow(const boost::intrusive_ptr<ExpressionContext>&,
                                       const NamespaceString&,
@@ -211,17 +205,25 @@ public:
         return nullptr;
     }
 
+    std::pair<std::set<FieldPath>, boost::optional<ChunkVersion>>
+    ensureFieldsUniqueOrResolveDocumentKey(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                                           boost::optional<std::vector<std::string>> fields,
+                                           boost::optional<ChunkVersion> targetCollectionVersion,
+                                           const NamespaceString& outputNs) const override;
+
 protected:
     BSONObj _reportCurrentOpForClient(OperationContext* opCtx,
                                       Client* client,
-                                      CurrentOpTruncateMode truncateOps) const final;
+                                      CurrentOpTruncateMode truncateOps,
+                                      CurrentOpBacktraceMode backtraceMode) const final;
 
     void _reportCurrentOpsForIdleSessions(OperationContext* opCtx,
                                           CurrentOpUserMode userMode,
-                                          std::vector<BSONObj>* ops) const final {
-        // This implementation is a no-op, since mongoS does not maintain a SessionCatalog or
-        // hold stashed locks for idle sessions.
-    }
+                                          std::vector<BSONObj>* ops) const final;
+
+    void _reportCurrentOpsForTransactionCoordinators(OperationContext* opCtx,
+                                                     bool includeIdle,
+                                                     std::vector<BSONObj>* ops) const final;
 };
 
 }  // namespace mongo

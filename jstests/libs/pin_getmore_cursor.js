@@ -21,7 +21,7 @@ function withPinnedCursor(
     coll.drop();
     db.active_cursor_sentinel.drop();
     for (let i = 0; i < 100; ++i) {
-        assert.writeOK(coll.insert({value: i}));
+        assert.commandWorked(coll.insert({value: i}));
     }
     let cleanup = null;
     try {
@@ -59,8 +59,9 @@ function withPinnedCursor(
         // Eventually the cursor should be cleaned up.
         assert.commandWorked(db.adminCommand({configureFailPoint: failPointName, mode: "off"}));
 
+        assert.soon(() => db.active_cursor_sentinel.find().itcount() > 0);
+
         if (assertEndCounts) {
-            assert.soon(() => db.active_cursor_sentinel.find().itcount() > 0);
             assert.eq(db.serverStatus().metrics.cursor.open.pinned, 0);
         }
 

@@ -60,8 +60,6 @@ namespace {
 const char kRecoveryDocumentId[] = "minOpTimeRecovery";
 const char kMinOpTime[] = "minOpTime";
 const char kMinOpTimeUpdaters[] = "minOpTimeUpdaters";
-const char kConfigsvrConnString[] = "configsvrConnectionString";  // TODO SERVER-34166: Remove.
-const char kShardName[] = "shardName";                            // TODO SERVER-34166: Remove.
 
 const WriteConcernOptions kMajorityWriteConcern(WriteConcernOptions::kMajority,
                                                 WriteConcernOptions::SyncMode::UNSET,
@@ -92,16 +90,11 @@ public:
         return recDoc;
     }
 
-    static BSONObj createChangeObj(ConnectionString configsvr,
-                                   std::string shardName,
-                                   repl::OpTime minOpTime,
-                                   ChangeType change) {
+    static BSONObj createChangeObj(repl::OpTime minOpTime, ChangeType change) {
         BSONObjBuilder cmdBuilder;
 
         {
             BSONObjBuilder setBuilder(cmdBuilder.subobjStart("$set"));
-            setBuilder.append(kConfigsvrConnString, configsvr.toString());
-            setBuilder.append(kShardName, shardName);
             minOpTime.append(&setBuilder, kMinOpTime);
         }
 
@@ -155,22 +148,14 @@ Status modifyRecoveryDocument(OperationContext* opCtx,
         autoGetOrCreateDb.emplace(
             opCtx, NamespaceString::kServerConfigurationNamespace.db(), MODE_X);
 
-        // The config server connection string and shard name are no longer parsed in 4.0, but 3.6
-        // nodes still expect to find them, so we must include them until after 4.0 ships.
-        //
-        // TODO SERVER-34166: Stop writing config server connection string and shard name.
         auto const grid = Grid::get(opCtx);
-        BSONObj updateObj = RecoveryDocument::createChangeObj(
-            grid->shardRegistry()->getConfigServerConnectionString(),
-            ShardingState::get(opCtx)->shardId().toString(),
-            grid->configOpTime(),
-            change);
+        BSONObj updateObj = RecoveryDocument::createChangeObj(grid->configOpTime(), change);
 
         LOG(1) << "Changing sharding recovery document " << redact(updateObj);
 
         UpdateRequest updateReq(NamespaceString::kServerConfigurationNamespace);
         updateReq.setQuery(RecoveryDocument::getQuery());
-        updateReq.setUpdates(updateObj);
+        updateReq.setUpdateModification(updateObj);
         updateReq.setUpsert();
 
         UpdateResult result = update(opCtx, autoGetOrCreateDb->getDb(), updateReq);
@@ -242,7 +227,13 @@ Status ShardingStateRecovery::recover(OperationContext* opCtx) {
 
     if (!recoveryDoc.getMinOpTimeUpdaters()) {
         // Treat the minOpTime as up-to-date
-        grid->advanceConfigOpTime(recoveryDoc.getMinOpTime());
+        const auto prevOpTime = grid->advanceConfigOpTime(
+            opCtx, recoveryDoc.getMinOpTime(), "sharding state recovery document");
+        if (prevOpTime) {
+            log()
+                << "No in flight metadata change operations, so config server optime updated from "
+                << *prevOpTime << " to " << recoveryDoc.getMinOpTime();
+        }
         return Status::OK();
     }
 

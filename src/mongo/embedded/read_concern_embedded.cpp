@@ -33,6 +33,12 @@
 
 namespace mongo {
 
+MONGO_REGISTER_SHIM(setPrepareConflictBehaviorForReadConcern)
+(OperationContext* opCtx,
+ const repl::ReadConcernArgs& readConcernArgs,
+ PrepareConflictBehavior requestedPrepareConflictBehavior)
+    ->void {}
+
 MONGO_REGISTER_SHIM(waitForReadConcern)
 (OperationContext* opCtx, const repl::ReadConcernArgs& readConcernArgs, bool allowAfterClusterTime)
     ->Status {

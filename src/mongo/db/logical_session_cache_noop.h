@@ -33,29 +33,14 @@
 
 namespace mongo {
 
-class Client;
-class OperationContext;
-class ServiceContext;
-
 /**
  * A noop logical session cache for use in tests
  */
 class LogicalSessionCacheNoop : public LogicalSessionCache {
 public:
-    Status promote(LogicalSessionId lsid) override {
-        return Status::OK();
-    }
+    void joinOnShutDown() override {}
 
-    Status startSession(OperationContext* opCtx, LogicalSessionRecord record) override {
-        return Status::OK();
-    }
-
-    Status refreshSessions(OperationContext* opCtx,
-                           const RefreshSessionsCmdFromClient& cmd) override {
-        return Status::OK();
-    }
-    Status refreshSessions(OperationContext* opCtx,
-                           const RefreshSessionsCmdFromClusterMember& cmd) override {
+    Status startSession(OperationContext* opCtx, const LogicalSessionRecord& record) override {
         return Status::OK();
     }
 
@@ -63,17 +48,11 @@ public:
         return Status::OK();
     }
 
-    Status refreshNow(Client* client) override {
+    Status refreshNow(OperationContext* opCtx) override {
         return Status::OK();
     }
 
-    Status reapNow(Client* client) override {
-        return Status::OK();
-    }
-
-    Date_t now() override {
-        return Date_t::now();
-    }
+    void reapNow(OperationContext* opCtx) override {}
 
     size_t size() override {
         return 0;

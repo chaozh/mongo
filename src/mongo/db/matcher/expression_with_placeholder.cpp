@@ -65,11 +65,9 @@ StatusWith<boost::optional<StringData>> parseTopLevelFieldName(MatchExpression* 
 
             if (statusWithId.getValue() && placeholder != statusWithId.getValue()) {
                 return Status(ErrorCodes::FailedToParse,
-                              str::stream() << "Expected a single top-level field name, found '"
-                                            << *placeholder
-                                            << "' and '"
-                                            << *statusWithId.getValue()
-                                            << "'");
+                              str::stream()
+                                  << "Expected a single top-level field name, found '"
+                                  << *placeholder << "' and '" << *statusWithId.getValue() << "'");
             }
         }
         return placeholder;
@@ -105,13 +103,12 @@ StatusWith<std::unique_ptr<ExpressionWithPlaceholder>> ExpressionWithPlaceholder
             return Status(ErrorCodes::BadValue,
                           str::stream() << "The top-level field name must be an alphanumeric "
                                            "string beginning with a lowercase letter, found '"
-                                        << *placeholder
-                                        << "'");
+                                        << *placeholder << "'");
         }
     }
 
     auto exprWithPlaceholder =
-        stdx::make_unique<ExpressionWithPlaceholder>(std::move(placeholder), std::move(filter));
+        std::make_unique<ExpressionWithPlaceholder>(std::move(placeholder), std::move(filter));
     return {std::move(exprWithPlaceholder)};
 }
 

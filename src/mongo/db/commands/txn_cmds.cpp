@@ -39,6 +39,8 @@
 #include "mongo/db/op_observer.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/repl_client_info.h"
+#include "mongo/db/s/sharding_state.h"
+#include "mongo/db/s/transaction_coordinator_service.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/transaction_participant.h"
 #include "mongo/util/log.h"
@@ -50,6 +52,9 @@ MONGO_FAIL_POINT_DEFINE(participantReturnNetworkErrorForAbortAfterExecutingAbort
 MONGO_FAIL_POINT_DEFINE(participantReturnNetworkErrorForCommitAfterExecutingCommitLogic);
 MONGO_FAIL_POINT_DEFINE(hangBeforeCommitingTxn);
 MONGO_FAIL_POINT_DEFINE(hangBeforeAbortingTxn);
+// TODO SERVER-39704: Remove this fail point once the router can safely retry within a transaction
+// on stale version and snapshot errors.
+MONGO_FAIL_POINT_DEFINE(dontRemoveTxnCoordinatorOnAbort);
 
 class CmdCommitTxn : public BasicCommand {
 public:
@@ -99,7 +104,8 @@ public:
             // commit oplog entry.
             auto& replClient = repl::ReplClientInfo::forClient(opCtx->getClient());
             replClient.setLastOpToSystemLastOpTime(opCtx);
-            if (MONGO_FAIL_POINT(participantReturnNetworkErrorForCommitAfterExecutingCommitLogic)) {
+            if (MONGO_unlikely(
+                    participantReturnNetworkErrorForCommitAfterExecutingCommitLogic.shouldFail())) {
                 uasserted(ErrorCodes::HostUnreachable,
                           "returning network error because failpoint is on");
             }
@@ -109,7 +115,7 @@ public:
 
         uassert(ErrorCodes::NoSuchTransaction,
                 "Transaction isn't in progress",
-                txnParticipant.inMultiDocumentTransaction());
+                txnParticipant.transactionIsOpen());
 
         CurOpFailpointHelpers::waitWhileFailPointEnabled(
             &hangBeforeCommitingTxn, opCtx, "hangBeforeCommitingTxn");
@@ -119,10 +125,18 @@ public:
             // commitPreparedTransaction will throw if the transaction is not prepared.
             txnParticipant.commitPreparedTransaction(opCtx, optionalCommitTimestamp.get(), {});
         } else {
+            if (ShardingState::get(opCtx)->canAcceptShardedCommands().isOK() ||
+                serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
+                TransactionCoordinatorService::get(opCtx)->cancelIfCommitNotYetStarted(
+                    opCtx, *opCtx->getLogicalSessionId(), *opCtx->getTxnNumber());
+            }
+
             // commitUnpreparedTransaction will throw if the transaction is prepared.
             txnParticipant.commitUnpreparedTransaction(opCtx);
         }
-        if (MONGO_FAIL_POINT(participantReturnNetworkErrorForCommitAfterExecutingCommitLogic)) {
+
+        if (MONGO_unlikely(
+                participantReturnNetworkErrorForCommitAfterExecutingCommitLogic.shouldFail())) {
             uasserted(ErrorCodes::HostUnreachable,
                       "returning network error because failpoint is on");
         }
@@ -172,14 +186,22 @@ public:
 
         uassert(ErrorCodes::NoSuchTransaction,
                 "Transaction isn't in progress",
-                txnParticipant.inMultiDocumentTransaction());
+                txnParticipant.transactionIsOpen());
 
         CurOpFailpointHelpers::waitWhileFailPointEnabled(
             &hangBeforeAbortingTxn, opCtx, "hangBeforeAbortingTxn");
 
-        txnParticipant.abortActiveTransaction(opCtx);
+        if (!MONGO_unlikely(dontRemoveTxnCoordinatorOnAbort.shouldFail()) &&
+            (ShardingState::get(opCtx)->canAcceptShardedCommands().isOK() ||
+             serverGlobalParams.clusterRole == ClusterRole::ConfigServer)) {
+            TransactionCoordinatorService::get(opCtx)->cancelIfCommitNotYetStarted(
+                opCtx, *opCtx->getLogicalSessionId(), *opCtx->getTxnNumber());
+        }
 
-        if (MONGO_FAIL_POINT(participantReturnNetworkErrorForAbortAfterExecutingAbortLogic)) {
+        txnParticipant.abortTransaction(opCtx);
+
+        if (MONGO_unlikely(
+                participantReturnNetworkErrorForAbortAfterExecutingAbortLogic.shouldFail())) {
             uasserted(ErrorCodes::HostUnreachable,
                       "returning network error because failpoint is on");
         }

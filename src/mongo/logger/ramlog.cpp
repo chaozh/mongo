@@ -35,7 +35,7 @@
 #include "mongo/base/status.h"
 #include "mongo/logger/message_event_utf8_encoder.h"
 #include "mongo/util/map_util.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -43,8 +43,8 @@ using std::string;
 
 namespace {
 typedef std::map<string, RamLog*> RM;
-stdx::mutex* _namedLock = NULL;
-RM* _named = NULL;
+stdx::mutex* _namedLock = nullptr;
+RM* _named = nullptr;
 
 }  // namespace
 
@@ -58,7 +58,7 @@ RamLog::~RamLog() {}
 
 void RamLog::write(const std::string& str) {
     stdx::lock_guard<stdx::mutex> lk(_mutex);
-    _lastWrite = time(0);
+    _lastWrite = time(nullptr);
     _totalLinesWritten++;
 
     char* p = lines[(h + n) % N];
@@ -136,7 +136,7 @@ string RamLog::clean(const std::vector<const char*>& v, int i, string line) {
 string RamLog::linkify(const char* s) {
     const char* p = s;
     const char* h = strstr(p, "http://");
-    if (h == 0)
+    if (h == nullptr)
         return s;
 
     const char* sp = h + 7;
@@ -170,7 +170,7 @@ Status RamLogAppender::append(const logger::MessageEventEphemeral& event) {
 RamLog* RamLog::get(const std::string& name) {
     if (!_namedLock) {
         // Guaranteed to happen before multi-threaded operation.
-        _namedLock = new stdx::mutex();
+        _namedLock = new stdx::mutex();  // NOLINT
     }
 
     stdx::lock_guard<stdx::mutex> lk(*_namedLock);
@@ -179,7 +179,7 @@ RamLog* RamLog::get(const std::string& name) {
         _named = new RM();
     }
 
-    RamLog* result = mapFindWithDefault(*_named, name, static_cast<RamLog*>(NULL));
+    RamLog* result = mapFindWithDefault(*_named, name, static_cast<RamLog*>(nullptr));
     if (!result) {
         result = new RamLog(name);
         (*_named)[name] = result;
@@ -189,9 +189,9 @@ RamLog* RamLog::get(const std::string& name) {
 
 RamLog* RamLog::getIfExists(const std::string& name) {
     if (!_named)
-        return NULL;
+        return nullptr;
     stdx::lock_guard<stdx::mutex> lk(*_namedLock);
-    return mapFindWithDefault(*_named, name, static_cast<RamLog*>(NULL));
+    return mapFindWithDefault(*_named, name, static_cast<RamLog*>(nullptr));
 }
 
 void RamLog::getNames(std::vector<string>& names) {
@@ -215,10 +215,10 @@ MONGO_INITIALIZER(RamLogCatalog)(InitializerContext*) {
             return Status(ErrorCodes::InternalError,
                           "Inconsistent intiailization of RamLogCatalog.");
         }
-        _namedLock = new stdx::mutex();
+        _namedLock = new stdx::mutex();  // NOLINT
         _named = new RM();
     }
 
     return Status::OK();
 }
-}
+}  // namespace mongo

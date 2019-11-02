@@ -36,8 +36,8 @@
 #include "mongo/base/init.h"
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
 #include "mongo/util/scopeguard.h"
+#include "mongo/util/str.h"
 #include "mongo/util/text.h"
 
 namespace mongo {
@@ -244,7 +244,7 @@ StatusWith<PerfCounterCollector::CounterInfo> PerfCounterCollector::addCounter(S
         return {ErrorCodes::WindowsPdhError, formatFunctionCallError("PdhGetCounterInfoW", status)};
     }
 
-    auto buf = stdx::make_unique<char[]>(bufferSize);
+    auto buf = std::make_unique<char[]>(bufferSize);
     auto counterInfo = reinterpret_cast<PPDH_COUNTER_INFO>(buf.get());
 
     status = PdhGetCounterInfoW(counter, false, &bufferSize, counterInfo);
@@ -296,12 +296,10 @@ StatusWith<std::vector<PerfCounterCollector::CounterInfo>> PerfCounterCollector:
     if (status != PDH_MORE_DATA) {
         return {ErrorCodes::WindowsPdhError,
                 str::stream() << formatFunctionCallError("PdhExpandCounterPathW", status)
-                              << " for counter '"
-                              << path
-                              << "'"};
+                              << " for counter '" << path << "'"};
     }
 
-    auto buf = stdx::make_unique<wchar_t[]>(pathListLength);
+    auto buf = std::make_unique<wchar_t[]>(pathListLength);
 
     status = PdhExpandCounterPathW(pathWide.c_str(), buf.get(), &pathListLength);
 

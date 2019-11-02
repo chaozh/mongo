@@ -25,9 +25,6 @@ env.Library(
     ],
 )
 
-env.CppUnitTest('collection_options_test', ['collection_options_test.cpp'],
-                LIBDEPS=['collection_options'])
-
 env.Library(
     target = 'catalog_test_fixture',
     source =[
@@ -41,15 +38,6 @@ env.Library(
         '$BUILD_DIR/mongo/db/repl/replmocks',
         '$BUILD_DIR/mongo/db/repl/storage_interface_impl',
         '$BUILD_DIR/mongo/db/service_context_d_test_fixture',
-    ],
-)
-
-env.CppUnitTest(
-    target = 'collection_test',
-    source = 'collection_test.cpp',
-    LIBDEPS=[
-        'catalog_test_fixture',
-        '$BUILD_DIR/mongo/db/db_raii',
     ],
 )
 
@@ -73,14 +61,6 @@ env.Library(
     ],
 )
 
-env.CppUnitTest(
-    target='commit_quorum_options_test',
-    source='commit_quorum_options_test.cpp',
-    LIBDEPS=[
-        'commit_quorum_options',
-    ],
-)
-
 env.Library(
     target='commit_quorum_idl',
     source=[
@@ -94,6 +74,16 @@ env.Library(
 )
 
 env.Library(
+    target='max_validate_mb_per_sec_idl',
+    source=[
+        env.Idlc('max_validate_mb_per_sec.idl')[0],
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/idl/server_parameter',
+    ],
+)
+
+env.Library(
     target='index_build_entry_idl',
     source=[
         env.Idlc('index_build_entry.idl')[0],
@@ -101,17 +91,6 @@ env.Library(
     LIBDEPS=[
         'commit_quorum_idl',
         '$BUILD_DIR/mongo/util/net/network',
-    ],
-)
-
-env.CppUnitTest(
-    target='index_build_entry_test',
-    source=[
-        'index_build_entry_test.cpp',
-    ],
-    LIBDEPS=[
-        'index_build_entry_idl',
-        '$BUILD_DIR/mongo/unittest/unittest',
     ],
 )
 
@@ -144,17 +123,6 @@ env.Library(
     ]
 )
 
-env.CppUnitTest(
-    target='index_builds_manager_test',
-    source=[
-        'index_builds_manager_test.cpp',
-    ],
-    LIBDEPS=[
-        'catalog_test_fixture',
-        'index_builds_manager',
-    ]
-)
-
 env.Library(
     target='index_key_validate',
     source=[
@@ -169,20 +137,6 @@ env.Library(
         '$BUILD_DIR/mongo/db/matcher/expressions',
         '$BUILD_DIR/mongo/db/query/collation/collator_factory_interface',
         '$BUILD_DIR/mongo/util/fail_point',
-    ],
-)
-
-env.CppUnitTest(
-    target='index_key_validate_test',
-    source=[
-        'index_key_validate_test.cpp',
-        'index_spec_validate_test.cpp',
-    ],
-    LIBDEPS=[
-        '$BUILD_DIR/mongo/db/commands/test_commands_enabled',
-        '$BUILD_DIR/mongo/db/matcher/expressions',
-        '$BUILD_DIR/mongo/db/query/query_test_service_context',
-        'index_key_validate',
     ],
 )
 
@@ -224,32 +178,31 @@ env.Library(
 )
 
 env.Library(
+    target='index_build_block',
+    source=[
+        "index_build_block.cpp",
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/db/catalog/collection_query_info',
+        '$BUILD_DIR/mongo/db/index/index_descriptor',
+        '$BUILD_DIR/mongo/db/index_names',
+        '$BUILD_DIR/mongo/db/ttl_collection_cache',
+    ],
+    LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/db/index/index_build_interceptor',
+        '$BUILD_DIR/mongo/db/logical_clock',
+        '$BUILD_DIR/mongo/db/repl/repl_coordinator_interface',
+    ]
+)
+
+env.Library(
     target='collection',
     source=[
         "collection.cpp",
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
-    ],
-)
-
-env.CppUnitTest(
-    target='database_test',
-    source=[
-        'database_test.cpp',
-    ],
-    LIBDEPS=[
-        'multi_index_block',
-        '$BUILD_DIR/mongo/db/auth/authmocks',
-        '$BUILD_DIR/mongo/db/concurrency/lock_manager',
-        '$BUILD_DIR/mongo/db/db_raii',
-        '$BUILD_DIR/mongo/db/namespace_string',
-        '$BUILD_DIR/mongo/db/repl/drop_pending_collection_reaper',
-        '$BUILD_DIR/mongo/db/repl/optime',
-        '$BUILD_DIR/mongo/db/repl/repl_coordinator_interface',
-        '$BUILD_DIR/mongo/db/repl/replmocks',
-        '$BUILD_DIR/mongo/db/s/op_observer_sharding_impl',
-        '$BUILD_DIR/mongo/db/service_context_d_test_fixture',
     ],
 )
 
@@ -273,7 +226,9 @@ env.Library(
     ],
     LIBDEPS=[
         'collection',
+        'index_build_block',
         'index_timestamp_helper',
+        'index_build_block',
         '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/db/audit',
         '$BUILD_DIR/mongo/db/background',
@@ -292,30 +247,13 @@ env.Library(
     ]
 )
 
-env.CppUnitTest(
-    target='multi_index_block_test',
-    source=[
-        'multi_index_block_test.cpp'
-    ],
-    LIBDEPS=[
-        'collection',
-        'multi_index_block',
-        '$BUILD_DIR/mongo/db/namespace_string',
-        '$BUILD_DIR/mongo/db/repl/replmocks',
-        '$BUILD_DIR/mongo/db/service_context_test_fixture',
-    ],
-)
-
 env.Library(
-    target='uuid_catalog',
+    target='collection_catalog',
     source=[
-        'namespace_uuid_cache.cpp',
-        env.Idlc('namespace_uuid_cache.idl')[0],
-        'uuid_catalog.cpp',
+        'collection_catalog.cpp',
     ],
     LIBDEPS=[
         'collection',
-        'database_holder',
         '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/db/namespace_string',
         '$BUILD_DIR/mongo/db/service_context',
@@ -325,26 +263,15 @@ env.Library(
     ]
 )
 
-env.CppUnitTest(
-    target='namespace_uuid_cache_test',
+env.Library(
+    target='collection_catalog_helper',
     source=[
-        'namespace_uuid_cache_test.cpp'
+        'collection_catalog_helper.cpp',
     ],
-    LIBDEPS=[
-        'uuid_catalog',
-    ],
-)
-
-env.CppUnitTest(
-    target='uuid_catalog_test',
-    source=[
-        'uuid_catalog_test.cpp',
-    ],
-    LIBDEPS=[
-        'uuid_catalog',
+    LIBDEPS_PRIVATE=[
+        'collection_catalog',
         '$BUILD_DIR/mongo/db/concurrency/lock_manager',
-        '$BUILD_DIR/mongo/db/service_context',
-    ],
+    ]
 )
 
 env.Library(
@@ -354,36 +281,39 @@ env.Library(
     ],
     LIBDEPS_PRIVATE=[
         'collection',
-        'uuid_catalog',
+        'collection_catalog',
+        'database_holder',
+        '$BUILD_DIR/mongo/db/index_builds_coordinator_interface',
         '$BUILD_DIR/mongo/db/repair_database',
         '$BUILD_DIR/mongo/db/service_context',
     ],
 )
 
-env.CppUnitTest(
-    target='catalog_control_test',
+env.Library(
+    target="validate_state",
     source=[
-        'catalog_control_test.cpp'
+        "validate_state.cpp"
     ],
-    LIBDEPS=[
-        'catalog_control',
-        'database_holder',
-        '$BUILD_DIR/mongo/db/service_context',
-    ],
+    LIBDEPS_PRIVATE=[
+        "collection_catalog",
+        "database_holder",
+        "throttle_cursor",
+        "$BUILD_DIR/mongo/base",
+        "$BUILD_DIR/mongo/db/catalog_raii",
+        "$BUILD_DIR/mongo/db/views/views",
+        "$BUILD_DIR/mongo/util/fail_point",
+    ]
 )
 
 env.Library(
     target='catalog_impl',
     source=[
         "collection_impl.cpp",
-        "collection_info_cache_impl.cpp",
         "database_holder_impl.cpp",
         "database_impl.cpp",
-        "index_build_block.cpp",
         "index_catalog_entry_impl.cpp",
         "index_catalog_impl.cpp",
         "index_consistency.cpp",
-        "private/record_store_validate_adaptor.cpp",
     ],
     LIBDEPS=[
         'collection',
@@ -400,6 +330,7 @@ env.Library(
         '$BUILD_DIR/mongo/db/curop',
         '$BUILD_DIR/mongo/db/db_raii',
         '$BUILD_DIR/mongo/db/index/index_access_method',
+        '$BUILD_DIR/mongo/db/index/index_access_method_factory',
         '$BUILD_DIR/mongo/db/index_d',
         '$BUILD_DIR/mongo/db/op_observer',
         '$BUILD_DIR/mongo/db/repl/drop_pending_collection_reaper',
@@ -407,16 +338,49 @@ env.Library(
         '$BUILD_DIR/mongo/db/server_options_core',
         '$BUILD_DIR/mongo/db/service_context',
         '$BUILD_DIR/mongo/db/storage/key_string',
+        '$BUILD_DIR/mongo/db/storage/durable_catalog_impl',
+        '$BUILD_DIR/mongo/db/storage/storage_engine_impl',
         '$BUILD_DIR/mongo/db/system_index',
-        '$BUILD_DIR/mongo/db/ttl_collection_cache',
         '$BUILD_DIR/mongo/db/views/views_mongod',
     ],
     LIBDEPS_PRIVATE=[
+        'index_build_block',
+        'throttle_cursor',
+        'validate_state',
+        '$BUILD_DIR/mongo/db/catalog/collection_catalog_helper',
         '$BUILD_DIR/mongo/db/commands/server_status_core',
         '$BUILD_DIR/mongo/db/index/index_build_interceptor',
         '$BUILD_DIR/mongo/db/logical_clock',
         '$BUILD_DIR/mongo/db/repl/repl_settings',
         '$BUILD_DIR/mongo/db/storage/storage_engine_common',
+        '$BUILD_DIR/mongo/db/transaction',
+    ],
+)
+
+env.Library(
+    target='collection_validation',
+    source=[
+        'collection_validation.cpp',
+        'validate_adaptor.cpp',
+    ],
+    LIBDEPS=[
+        'catalog_impl',
+    ],
+    LIBDEPS_PRIVATE=[
+        'throttle_cursor',
+        'validate_state',
+    ]
+)
+
+env.Library(
+    target='throttle_cursor',
+    source=[
+        'throttle_cursor.cpp',
+    ],
+    LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/db/curop',
+        '$BUILD_DIR/mongo/util/fail_point',
+        'max_validate_mb_per_sec_idl',
     ],
 )
 
@@ -436,6 +400,7 @@ env.Library(
         '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/db/background',
         '$BUILD_DIR/mongo/db/db_raii',
+        '$BUILD_DIR/mongo/db/index_builds_coordinator_interface',
         '$BUILD_DIR/mongo/db/query_exec',
         '$BUILD_DIR/mongo/db/server_options_core',
         '$BUILD_DIR/mongo/db/views/views',
@@ -446,79 +411,92 @@ env.Library(
         'index_key_validate',
         'multi_index_block',
     ],
+    LIBDEPS_PRIVATE=[
+        'database_holder',
+    ],
+)
+
+env.Library(
+    target="collection_query_info",
+    source=[
+        "$BUILD_DIR/mongo/db/query/collection_query_info.cpp",
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/db/collection_index_usage_tracker',
+        '$BUILD_DIR/mongo/db/concurrency/lock_manager',
+        '$BUILD_DIR/mongo/db/curop',
+        '$BUILD_DIR/mongo/db/query/query_planner',
+        '$BUILD_DIR/mongo/db/update_index_data',
+        '$BUILD_DIR/mongo/db/service_context',
+    ],
 )
 
 env.CppUnitTest(
-    target='capped_utils_test',
+    target='db_catalog_test',
     source=[
         'capped_utils_test.cpp',
-    ],
-    LIBDEPS=[
-        'catalog_helpers',
-        '$BUILD_DIR/mongo/db/auth/authmocks',
-        '$BUILD_DIR/mongo/db/db_raii',
-        '$BUILD_DIR/mongo/db/namespace_string',
-        '$BUILD_DIR/mongo/db/repl/repl_coordinator_interface',
-        '$BUILD_DIR/mongo/db/repl/replmocks',
-        '$BUILD_DIR/mongo/db/repl/storage_interface_impl',
-        '$BUILD_DIR/mongo/db/service_context_d_test_fixture',
-    ],
-)
-
-env.CppUnitTest(
-    target='create_collection_test',
-    source=[
+        'catalog_control_test.cpp',
+        'collection_catalog_test.cpp',
+        'collection_options_test.cpp',
+        'collection_test.cpp',
+        'collection_validation_test.cpp',
+        'commit_quorum_options_test.cpp',
         'create_collection_test.cpp',
+        'database_test.cpp',
+        'drop_database_test.cpp',
+        'index_build_entry_test.cpp',
+        'index_builds_manager_test.cpp',
+        'index_key_validate_test.cpp',
+        'index_spec_validate_test.cpp',
+        'multi_index_block_test.cpp',
+        'rename_collection_test.cpp',
+        'throttle_cursor_test.cpp',
+        'validate_state_test.cpp',
     ],
     LIBDEPS=[
-        'catalog_helpers',
-        'uuid_catalog',
         '$BUILD_DIR/mongo/db/auth/authmocks',
+        '$BUILD_DIR/mongo/db/commands/test_commands_enabled',
+        '$BUILD_DIR/mongo/db/concurrency/lock_manager',
         '$BUILD_DIR/mongo/db/db_raii',
+        '$BUILD_DIR/mongo/db/index_builds_coordinator_mongod',
+        '$BUILD_DIR/mongo/db/matcher/expressions',
         '$BUILD_DIR/mongo/db/namespace_string',
+        '$BUILD_DIR/mongo/db/op_observer',
+        '$BUILD_DIR/mongo/db/query/datetime/date_time_support',
+        '$BUILD_DIR/mongo/db/query/query_test_service_context',
+        '$BUILD_DIR/mongo/db/repl/drop_pending_collection_reaper',
+        '$BUILD_DIR/mongo/db/repl/oplog',
+        '$BUILD_DIR/mongo/db/repl/optime',
         '$BUILD_DIR/mongo/db/repl/repl_coordinator_interface',
         '$BUILD_DIR/mongo/db/repl/replmocks',
         '$BUILD_DIR/mongo/db/repl/storage_interface_impl',
+        '$BUILD_DIR/mongo/db/s/op_observer_sharding_impl',
+        '$BUILD_DIR/mongo/db/service_context',
         '$BUILD_DIR/mongo/db/service_context_d_test_fixture',
-    ],
-)
-
-env.CppUnitTest(
-    target='rename_collection_test',
-    source=[
-        'rename_collection_test.cpp',
-    ],
-    LIBDEPS=[
+        '$BUILD_DIR/mongo/db/service_context_test_fixture',
+        '$BUILD_DIR/mongo/db/storage/kv/kv_prefix',
+        '$BUILD_DIR/mongo/db/storage/wiredtiger/storage_wiredtiger',
+        '$BUILD_DIR/mongo/unittest/unittest',
+        '$BUILD_DIR/mongo/util/clock_source_mock',
+        '$BUILD_DIR/mongo/util/fail_point',
+        'catalog_control',
         'catalog_helpers',
-        '$BUILD_DIR/mongo/db/auth/authmocks',
-        '$BUILD_DIR/mongo/db/db_raii',
-        '$BUILD_DIR/mongo/db/namespace_string',
-        '$BUILD_DIR/mongo/db/op_observer',
-        '$BUILD_DIR/mongo/db/repl/drop_pending_collection_reaper',
-        '$BUILD_DIR/mongo/db/repl/oplog',
-        '$BUILD_DIR/mongo/db/repl/optime',
-        '$BUILD_DIR/mongo/db/repl/repl_coordinator_interface',
-        '$BUILD_DIR/mongo/db/repl/replmocks',
-        '$BUILD_DIR/mongo/db/service_context_d_test_fixture',
-    ],
-)
-
-env.CppUnitTest(
-    target='drop_database_test',
-    source=[
-        'drop_database_test.cpp',
-    ],
-    LIBDEPS=[
-        'catalog_helpers',
-        '$BUILD_DIR/mongo/db/auth/authmocks',
-        '$BUILD_DIR/mongo/db/db_raii',
-        '$BUILD_DIR/mongo/db/namespace_string',
-        '$BUILD_DIR/mongo/db/op_observer',
-        '$BUILD_DIR/mongo/db/repl/drop_pending_collection_reaper',
-        '$BUILD_DIR/mongo/db/repl/oplog',
-        '$BUILD_DIR/mongo/db/repl/optime',
-        '$BUILD_DIR/mongo/db/repl/repl_coordinator_interface',
-        '$BUILD_DIR/mongo/db/repl/replmocks',
-        '$BUILD_DIR/mongo/db/service_context_d_test_fixture',
+        'catalog_test_fixture',
+        'collection',
+        'collection_catalog',
+        'collection_catalog_helper',
+        'collection_options',
+        'collection_validation',
+        'commit_quorum_options',
+        'database_holder',
+        'index_build_block',
+        'index_build_entry_idl',
+        'index_builds_manager',
+        'index_key_validate',
+        'max_validate_mb_per_sec_idl',
+        'multi_index_block',
+        'throttle_cursor',
+        'validate_state',
     ],
 )

@@ -31,6 +31,8 @@
 
 #include "mongo/platform/basic.h"
 
+#include <memory>
+
 #include "mongo/base/checked_cast.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
@@ -38,7 +40,6 @@
 #include "mongo/db/dbmessage.h"
 #include "mongo/db/service_context.h"
 #include "mongo/rpc/op_msg.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/transport/mock_session.h"
 #include "mongo/transport/service_entry_point.h"
 #include "mongo/transport/service_executor.h"
@@ -88,7 +89,18 @@ public:
         if (_uassertInHandler)
             uassert(40469, "Synthetic uassert failure", false);
 
-        return DbResponse{res};
+        DbResponse dbResponse;
+        if (OpMsg::isFlagSet(request, OpMsg::kExhaustSupported)) {
+            auto reply = OpMsg::parse(res);
+            auto cursorObj = reply.body.getObjectField("cursor");
+            if (reply.body["ok"].trueValue() && !cursorObj.isEmpty()) {
+                dbResponse.exhaustCursorId = cursorObj.getField("id").numberLong();
+                dbResponse.exhaustNS = cursorObj.getField("ns").String();
+            }
+        }
+        dbResponse.response = res;
+
+        return dbResponse;
     }
 
     void endAllSessions(transport::Session::TagMask tags) override {}
@@ -210,7 +222,7 @@ public:
         return _ranSource;
     }
 
-    void setWaitHook(stdx::function<void()> hook) {
+    void setWaitHook(std::function<void()> hook) {
         _waitHook = std::move(hook);
     }
 
@@ -225,7 +237,7 @@ private:
     FailureMode _nextShouldFail = Nothing;
     Message _lastSunk;
     ServiceStateMachine* _ssm;
-    stdx::function<void()> _waitHook;
+    std::function<void()> _waitHook;
 
     // A custom message for this TransportLayer to source.
     Message _sourceMessage;
@@ -235,7 +247,7 @@ class MockServiceExecutor : public ServiceExecutor {
 public:
     explicit MockServiceExecutor(ServiceContext* ctx) {}
 
-    using ScheduleHook = stdx::function<bool(Task)>;
+    using ScheduleHook = std::function<bool(Task)>;
 
     Status start() override {
         return Status::OK();
@@ -247,8 +259,9 @@ public:
         if (!_scheduleHook) {
             return Status::OK();
         } else {
-            return _scheduleHook(std::move(task)) ? Status::OK() : Status{ErrorCodes::InternalError,
-                                                                          "Hook returned error!"};
+            return _scheduleHook(std::move(task))
+                ? Status::OK()
+                : Status{ErrorCodes::InternalError, "Hook returned error!"};
         }
     }
 
@@ -269,19 +282,19 @@ private:
 class SimpleEvent {
 public:
     void signal() {
-        stdx::unique_lock<stdx::mutex> lk(_mutex);
+        stdx::unique_lock<Latch> lk(_mutex);
         _signaled = true;
         _cond.notify_one();
     }
 
     void wait() {
-        stdx::unique_lock<stdx::mutex> lk(_mutex);
+        stdx::unique_lock<Latch> lk(_mutex);
         _cond.wait(lk, [this] { return _signaled; });
         _signaled = false;
     }
 
 private:
-    stdx::mutex _mutex;
+    Mutex _mutex = MONGO_MAKE_LATCH("SimpleEvent::_mutex");
     stdx::condition_variable _cond;
     bool _signaled = false;
 };
@@ -296,18 +309,18 @@ protected:
         auto sc = scOwned.get();
         setGlobalServiceContext(std::move(scOwned));
 
-        sc->setTickSource(stdx::make_unique<TickSourceMock<>>());
-        sc->setFastClockSource(stdx::make_unique<ClockSourceMock>());
+        sc->setTickSource(std::make_unique<TickSourceMock<>>());
+        sc->setFastClockSource(std::make_unique<ClockSourceMock>());
 
-        auto sep = stdx::make_unique<MockSEP>();
+        auto sep = std::make_unique<MockSEP>();
         _sep = sep.get();
         sc->setServiceEntryPoint(std::move(sep));
 
-        auto se = stdx::make_unique<MockServiceExecutor>(sc);
+        auto se = std::make_unique<MockServiceExecutor>(sc);
         _sexec = se.get();
         sc->setServiceExecutor(std::move(se));
 
-        auto tl = stdx::make_unique<MockTL>();
+        auto tl = std::make_unique<MockTL>();
         _tl = tl.get();
         sc->setTransportLayer(std::move(tl));
         _tl->start().transitional_ignore();
@@ -485,10 +498,10 @@ TEST_F(ServiceStateMachineFixture, TestGetMoreWithExhaustAndEmptyResponseNamespa
     Message getMoreWithExhaust = getMoreRequestWithExhaust(nss, cursorId, initRequestId);
 
     // Construct a 'getMore' response with an empty namespace.
-    BSONObj getMoreTerminalResBody = BSON("ok" << 1 << "cursor" << BSON("id" << 42 << "ns"
-                                                                             << ""
-                                                                             << "nextBatch"
-                                                                             << BSONArray()));
+    BSONObj getMoreTerminalResBody = BSON("ok" << 1 << "cursor"
+                                               << BSON("id" << 42 << "ns"
+                                                            << ""
+                                                            << "nextBatch" << BSONArray()));
     Message getMoreTerminalRes = buildOpMsg(getMoreTerminalResBody);
 
     // Let the 'getMore' request be sourced from the network, processed in the database, and
@@ -782,7 +795,7 @@ TEST_F(ServiceStateMachineFixture, TerminateWorksForAllStatesWithScheduleFailure
 
         waitFor = testState;
         // This is a dummy thread that just advances the SSM while we track its state/kill it
-        stdx::thread runner([ ssm = _ssm, &scheduleFailed ] {
+        stdx::thread runner([ssm = _ssm, &scheduleFailed] {
             while (ssm->state() != State::Ended && !scheduleFailed) {
                 ssm->runNext();
             }

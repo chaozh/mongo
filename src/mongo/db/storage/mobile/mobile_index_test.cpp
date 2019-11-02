@@ -29,6 +29,7 @@
 
 #include <boost/filesystem.hpp>
 #include <boost/system/error_code.hpp>
+#include <memory>
 
 #include "mongo/base/init.h"
 #include "mongo/db/operation_context_noop.h"
@@ -37,7 +38,6 @@
 #include "mongo/db/storage/mobile/mobile_session_pool.h"
 #include "mongo/db/storage/sorted_data_interface_test_harness.h"
 #include "mongo/platform/basic.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/unittest/temp_dir.h"
 #include "mongo/unittest/unittest.h"
 
@@ -54,6 +54,10 @@ public:
         _sessionPool.reset(new MobileSessionPool(_fullPath));
     }
 
+    std::unique_ptr<SortedDataInterface> newIdIndexSortedDataInterface() final {
+        return newSortedDataInterface(true /* unique */, false /* partial */);
+    }
+
     std::unique_ptr<SortedDataInterface> newSortedDataInterface(bool isUnique, bool isPartial) {
         std::string ident("index_" + std::to_string(inc++));
         OperationContextNoop opCtx(newRecoveryUnit().release());
@@ -61,14 +65,14 @@ public:
         fassert(37052, status);
 
         if (isUnique) {
-            return stdx::make_unique<MobileIndexUnique>(
+            return std::make_unique<MobileIndexUnique>(
                 _ordering, ident, "test.mobile", "indexName");
         }
-        return stdx::make_unique<MobileIndexStandard>(_ordering, ident, "test.mobile", "indexName");
+        return std::make_unique<MobileIndexStandard>(_ordering, ident, "test.mobile", "indexName");
     }
 
     std::unique_ptr<RecoveryUnit> newRecoveryUnit() {
-        return stdx::make_unique<MobileRecoveryUnit>(_sessionPool.get());
+        return std::make_unique<MobileRecoveryUnit>(_sessionPool.get());
     }
 
 private:
@@ -78,12 +82,12 @@ private:
     const Ordering _ordering;
 };
 
-std::unique_ptr<HarnessHelper> makeHarnessHelper() {
-    return stdx::make_unique<MobileIndexTestHarnessHelper>();
+std::unique_ptr<SortedDataInterfaceHarnessHelper> makeMobileIndexHarnessHelper() {
+    return std::make_unique<MobileIndexTestHarnessHelper>();
 }
 
-MONGO_INITIALIZER(RegisterHarnessFactory)(InitializerContext* const) {
-    mongo::registerHarnessHelperFactory(makeHarnessHelper);
+MONGO_INITIALIZER(RegisterSortedDataInterfaceHarnessFactory)(InitializerContext* const) {
+    mongo::registerSortedDataInterfaceHarnessHelperFactory(makeMobileIndexHarnessHelper);
     return Status::OK();
 }
 }  // namespace mongo

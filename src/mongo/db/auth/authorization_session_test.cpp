@@ -29,6 +29,8 @@
 
 #include "mongo/platform/basic.h"
 
+#include <memory>
+
 /**
  * Unit tests of the AuthorizationSession type.
  */
@@ -49,7 +51,6 @@
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/service_context.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/transport/session.h"
 #include "mongo/transport/transport_layer_mock.h"
 #include "mongo/unittest/unittest.h"
@@ -102,9 +103,9 @@ public:
         session = transportLayer.createSession();
         client = serviceContext->makeClient("testClient", session);
         RestrictionEnvironment::set(
-            session, stdx::make_unique<RestrictionEnvironment>(SockAddr(), SockAddr()));
+            session, std::make_unique<RestrictionEnvironment>(SockAddr(), SockAddr()));
         _opCtx = client->makeOperationContext();
-        auto localManagerState = stdx::make_unique<FailureCapableAuthzManagerExternalStateMock>();
+        auto localManagerState = std::make_unique<FailureCapableAuthzManagerExternalStateMock>();
         managerState = localManagerState.get();
         managerState->setAuthzVersion(AuthorizationManager::schemaVersion26Final);
         auto uniqueAuthzManager = std::make_unique<AuthorizationManagerImpl>(
@@ -178,9 +179,7 @@ TEST_F(AuthorizationSessionTest, AddUserAndCheckAuthorization) {
                                                          << "spencer"
                                                          << "db"
                                                          << "test"
-                                                         << "credentials"
-                                                         << credentials
-                                                         << "roles"
+                                                         << "credentials" << credentials << "roles"
                                                          << BSON_ARRAY(BSON("role"
                                                                             << "readWrite"
                                                                             << "db"
@@ -206,9 +205,7 @@ TEST_F(AuthorizationSessionTest, AddUserAndCheckAuthorization) {
                                                    << "admin"
                                                    << "db"
                                                    << "admin"
-                                                   << "credentials"
-                                                   << credentials
-                                                   << "roles"
+                                                   << "credentials" << credentials << "roles"
                                                    << BSON_ARRAY(BSON("role"
                                                                       << "readWriteAnyDatabase"
                                                                       << "db"
@@ -252,9 +249,7 @@ TEST_F(AuthorizationSessionTest, DuplicateRolesOK) {
                                                          << "spencer"
                                                          << "db"
                                                          << "test"
-                                                         << "credentials"
-                                                         << credentials
-                                                         << "roles"
+                                                         << "credentials" << credentials << "roles"
                                                          << BSON_ARRAY(BSON("role"
                                                                             << "readWrite"
                                                                             << "db"
@@ -284,9 +279,7 @@ TEST_F(AuthorizationSessionTest, SystemCollectionsAccessControl) {
                                                          << "rw"
                                                          << "db"
                                                          << "test"
-                                                         << "credentials"
-                                                         << credentials
-                                                         << "roles"
+                                                         << "credentials" << credentials << "roles"
                                                          << BSON_ARRAY(BSON("role"
                                                                             << "readWrite"
                                                                             << "db"
@@ -301,9 +294,7 @@ TEST_F(AuthorizationSessionTest, SystemCollectionsAccessControl) {
                                                          << "useradmin"
                                                          << "db"
                                                          << "test"
-                                                         << "credentials"
-                                                         << credentials
-                                                         << "roles"
+                                                         << "credentials" << credentials << "roles"
                                                          << BSON_ARRAY(BSON("role"
                                                                             << "userAdmin"
                                                                             << "db"
@@ -315,9 +306,7 @@ TEST_F(AuthorizationSessionTest, SystemCollectionsAccessControl) {
                                                    << "rwany"
                                                    << "db"
                                                    << "test"
-                                                   << "credentials"
-                                                   << credentials
-                                                   << "roles"
+                                                   << "credentials" << credentials << "roles"
                                                    << BSON_ARRAY(BSON("role"
                                                                       << "readWriteAnyDatabase"
                                                                       << "db"
@@ -333,9 +322,7 @@ TEST_F(AuthorizationSessionTest, SystemCollectionsAccessControl) {
                                                    << "useradminany"
                                                    << "db"
                                                    << "test"
-                                                   << "credentials"
-                                                   << credentials
-                                                   << "roles"
+                                                   << "credentials" << credentials << "roles"
                                                    << BSON_ARRAY(BSON("role"
                                                                       << "userAdminAnyDatabase"
                                                                       << "db"
@@ -412,9 +399,7 @@ TEST_F(AuthorizationSessionTest, InvalidateUser) {
                                                          << "spencer"
                                                          << "db"
                                                          << "test"
-                                                         << "credentials"
-                                                         << credentials
-                                                         << "roles"
+                                                         << "credentials" << credentials << "roles"
                                                          << BSON_ARRAY(BSON("role"
                                                                             << "readWrite"
                                                                             << "db"
@@ -444,9 +429,7 @@ TEST_F(AuthorizationSessionTest, InvalidateUser) {
                                                          << "spencer"
                                                          << "db"
                                                          << "test"
-                                                         << "credentials"
-                                                         << credentials
-                                                         << "roles"
+                                                         << "credentials" << credentials << "roles"
                                                          << BSON_ARRAY(BSON("role"
                                                                             << "read"
                                                                             << "db"
@@ -489,9 +472,7 @@ TEST_F(AuthorizationSessionTest, UseOldUserInfoInFaceOfConnectivityProblems) {
                                                          << "spencer"
                                                          << "db"
                                                          << "test"
-                                                         << "credentials"
-                                                         << credentials
-                                                         << "roles"
+                                                         << "credentials" << credentials << "roles"
                                                          << BSON_ARRAY(BSON("role"
                                                                             << "readWrite"
                                                                             << "db"
@@ -522,9 +503,7 @@ TEST_F(AuthorizationSessionTest, UseOldUserInfoInFaceOfConnectivityProblems) {
                                                          << "spencer"
                                                          << "db"
                                                          << "test"
-                                                         << "credentials"
-                                                         << credentials
-                                                         << "roles"
+                                                         << "credentials" << credentials << "roles"
                                                          << BSON_ARRAY(BSON("role"
                                                                             << "read"
                                                                             << "db"
@@ -558,9 +537,7 @@ TEST_F(AuthorizationSessionTest, AcquireUserObtainsAndValidatesAuthenticationRes
              << "spencer"
              << "db"
              << "test"
-             << "credentials"
-             << credentials
-             << "roles"
+             << "credentials" << credentials << "roles"
              << BSON_ARRAY(BSON("role"
                                 << "readWrite"
                                 << "db"
@@ -568,8 +545,7 @@ TEST_F(AuthorizationSessionTest, AcquireUserObtainsAndValidatesAuthenticationRes
              << "authenticationRestrictions"
              << BSON_ARRAY(BSON("clientSource" << BSON_ARRAY("192.168.0.0/24"
                                                              << "192.168.2.10")
-                                               << "serverAddress"
-                                               << BSON_ARRAY("192.168.0.2"))
+                                               << "serverAddress" << BSON_ARRAY("192.168.0.2"))
                            << BSON("clientSource" << BSON_ARRAY("2001:DB8::1") << "serverAddress"
                                                   << BSON_ARRAY("2001:DB8::2"))
                            << BSON("clientSource" << BSON_ARRAY("127.0.0.1"
@@ -583,16 +559,16 @@ TEST_F(AuthorizationSessionTest, AcquireUserObtainsAndValidatesAuthenticationRes
     auto assertWorks = [this](StringData clientSource, StringData serverAddress) {
         RestrictionEnvironment::set(
             session,
-            stdx::make_unique<RestrictionEnvironment>(SockAddr(clientSource, 5555, AF_UNSPEC),
-                                                      SockAddr(serverAddress, 27017, AF_UNSPEC)));
+            std::make_unique<RestrictionEnvironment>(SockAddr(clientSource, 5555, AF_UNSPEC),
+                                                     SockAddr(serverAddress, 27017, AF_UNSPEC)));
         ASSERT_OK(authzSession->addAndAuthorizeUser(_opCtx.get(), UserName("spencer", "test")));
     };
 
     auto assertFails = [this](StringData clientSource, StringData serverAddress) {
         RestrictionEnvironment::set(
             session,
-            stdx::make_unique<RestrictionEnvironment>(SockAddr(clientSource, 5555, AF_UNSPEC),
-                                                      SockAddr(serverAddress, 27017, AF_UNSPEC)));
+            std::make_unique<RestrictionEnvironment>(SockAddr(clientSource, 5555, AF_UNSPEC),
+                                                     SockAddr(serverAddress, 27017, AF_UNSPEC)));
         ASSERT_NOT_OK(authzSession->addAndAuthorizeUser(_opCtx.get(), UserName("spencer", "test")));
     };
 
@@ -911,11 +887,9 @@ TEST_F(AuthorizationSessionTest, CanAggregateOutWithInsertAndRemoveOnTargetNames
         uassertStatusOK(authzSession->getPrivilegesForAggregate(testFooNss, cmdObj, false));
     ASSERT_TRUE(authzSession->isAuthorizedForPrivileges(privileges));
 
-    BSONObj cmdObjNoBypassDocumentValidation = BSON(
-        "aggregate" << testFooNss.coll() << "pipeline" << pipeline << "bypassDocumentValidation"
-                    << false
-                    << "cursor"
-                    << BSONObj());
+    BSONObj cmdObjNoBypassDocumentValidation =
+        BSON("aggregate" << testFooNss.coll() << "pipeline" << pipeline
+                         << "bypassDocumentValidation" << false << "cursor" << BSONObj());
     privileges = uassertStatusOK(authzSession->getPrivilegesForAggregate(
         testFooNss, cmdObjNoBypassDocumentValidation, false));
     ASSERT_TRUE(authzSession->isAuthorizedForPrivileges(privileges));
@@ -928,10 +902,8 @@ TEST_F(AuthorizationSessionTest,
          Privilege(testBarCollResource, {ActionType::insert, ActionType::remove})});
 
     BSONArray pipeline = BSON_ARRAY(BSON("$out" << testBarNss.coll()));
-    BSONObj cmdObj =
-        BSON("aggregate" << testFooNss.coll() << "pipeline" << pipeline << "cursor" << BSONObj()
-                         << "bypassDocumentValidation"
-                         << true);
+    BSONObj cmdObj = BSON("aggregate" << testFooNss.coll() << "pipeline" << pipeline << "cursor"
+                                      << BSONObj() << "bypassDocumentValidation" << true);
     PrivilegeVector privileges =
         uassertStatusOK(authzSession->getPrivilegesForAggregate(testFooNss, cmdObj, false));
     ASSERT_FALSE(authzSession->isAuthorizedForPrivileges(privileges));
@@ -946,10 +918,8 @@ TEST_F(AuthorizationSessionTest,
              {ActionType::insert, ActionType::remove, ActionType::bypassDocumentValidation})});
 
     BSONArray pipeline = BSON_ARRAY(BSON("$out" << testBarNss.coll()));
-    BSONObj cmdObj =
-        BSON("aggregate" << testFooNss.coll() << "pipeline" << pipeline << "cursor" << BSONObj()
-                         << "bypassDocumentValidation"
-                         << true);
+    BSONObj cmdObj = BSON("aggregate" << testFooNss.coll() << "pipeline" << pipeline << "cursor"
+                                      << BSONObj() << "bypassDocumentValidation" << true);
     PrivilegeVector privileges =
         uassertStatusOK(authzSession->getPrivilegesForAggregate(testFooNss, cmdObj, true));
     ASSERT_TRUE(authzSession->isAuthorizedForPrivileges(privileges));
@@ -1013,7 +983,7 @@ TEST_F(AuthorizationSessionTest, CheckAuthForAggregateWithDeeplyNestedLookup) {
 
     // Recursively adds nested $lookup stages to 'pipelineBob', building a pipeline with
     // 'levelsToGo' deep $lookup stages.
-    stdx::function<void(BSONArrayBuilder*, int)> addNestedPipeline;
+    std::function<void(BSONArrayBuilder*, int)> addNestedPipeline;
     addNestedPipeline = [&addNestedPipeline](BSONArrayBuilder* pipelineBob, int levelsToGo) {
         if (levelsToGo == 0) {
             return;
@@ -1144,9 +1114,7 @@ TEST_F(AuthorizationSessionTest, AuthorizedSessionIsNotCoauthorizedWithEmptyUser
                                                          << "spencer"
                                                          << "db"
                                                          << "test"
-                                                         << "credentials"
-                                                         << credentials
-                                                         << "roles"
+                                                         << "credentials" << credentials << "roles"
                                                          << BSONArray()),
                                                     BSONObj()));
     ASSERT_OK(authzSession->addAndAuthorizeUser(_opCtx.get(), UserName("spencer", "test")));
@@ -1163,9 +1131,7 @@ TEST_F(AuthorizationSessionTest,
                                                          << "spencer"
                                                          << "db"
                                                          << "test"
-                                                         << "credentials"
-                                                         << credentials
-                                                         << "roles"
+                                                         << "credentials" << credentials << "roles"
                                                          << BSONArray()),
                                                     BSONObj()));
     ASSERT_OK(authzSession->addAndAuthorizeUser(_opCtx.get(), UserName("spencer", "test")));
@@ -1180,9 +1146,7 @@ TEST_F(AuthorizationSessionTest, AuthorizedSessionIsCoauthorizedWithIntersecting
                                                          << "spencer"
                                                          << "db"
                                                          << "test"
-                                                         << "credentials"
-                                                         << credentials
-                                                         << "roles"
+                                                         << "credentials" << credentials << "roles"
                                                          << BSONArray()),
                                                     BSONObj()));
     ASSERT_OK(managerState->insertPrivilegeDocument(_opCtx.get(),
@@ -1190,9 +1154,7 @@ TEST_F(AuthorizationSessionTest, AuthorizedSessionIsCoauthorizedWithIntersecting
                                                          << "admin"
                                                          << "db"
                                                          << "test"
-                                                         << "credentials"
-                                                         << credentials
-                                                         << "roles"
+                                                         << "credentials" << credentials << "roles"
                                                          << BSONArray()),
                                                     BSONObj()));
     ASSERT_OK(authzSession->addAndAuthorizeUser(_opCtx.get(), UserName("spencer", "test")));
@@ -1210,9 +1172,7 @@ TEST_F(AuthorizationSessionTest, AuthorizedSessionIsNotCoauthorizedWithNoninters
                                                          << "spencer"
                                                          << "db"
                                                          << "test"
-                                                         << "credentials"
-                                                         << credentials
-                                                         << "roles"
+                                                         << "credentials" << credentials << "roles"
                                                          << BSONArray()),
                                                     BSONObj()));
     ASSERT_OK(managerState->insertPrivilegeDocument(_opCtx.get(),
@@ -1220,9 +1180,7 @@ TEST_F(AuthorizationSessionTest, AuthorizedSessionIsNotCoauthorizedWithNoninters
                                                          << "admin"
                                                          << "db"
                                                          << "test"
-                                                         << "credentials"
-                                                         << credentials
-                                                         << "roles"
+                                                         << "credentials" << credentials << "roles"
                                                          << BSONArray()),
                                                     BSONObj()));
     ASSERT_OK(authzSession->addAndAuthorizeUser(_opCtx.get(), UserName("spencer", "test")));
@@ -1241,9 +1199,7 @@ TEST_F(AuthorizationSessionTest,
                                                          << "spencer"
                                                          << "db"
                                                          << "test"
-                                                         << "credentials"
-                                                         << credentials
-                                                         << "roles"
+                                                         << "credentials" << credentials << "roles"
                                                          << BSONArray()),
                                                     BSONObj()));
     ASSERT_OK(managerState->insertPrivilegeDocument(_opCtx.get(),
@@ -1251,9 +1207,7 @@ TEST_F(AuthorizationSessionTest,
                                                          << "admin"
                                                          << "db"
                                                          << "test"
-                                                         << "credentials"
-                                                         << credentials
-                                                         << "roles"
+                                                         << "credentials" << credentials << "roles"
                                                          << BSONArray()),
                                                     BSONObj()));
     ASSERT_OK(authzSession->addAndAuthorizeUser(_opCtx.get(), UserName("spencer", "test")));

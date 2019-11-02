@@ -29,14 +29,13 @@
 
 #pragma once
 
-#include <boost/container/flat_set.hpp>
+#include <memory>
 #include <pcrecpp.h>
 #include <utility>
 #include <vector>
 
 #include "mongo/db/matcher/expression.h"
 #include "mongo/db/matcher/expression_with_placeholder.h"
-#include "mongo/stdx/memory.h"
 
 namespace mongo {
 
@@ -95,7 +94,7 @@ public:
      */
     struct Pattern {
         explicit Pattern(StringData pattern)
-            : rawRegex(pattern), regex(stdx::make_unique<pcrecpp::RE>(pattern.toString())) {}
+            : rawRegex(pattern), regex(std::make_unique<pcrecpp::RE>(pattern.toString())) {}
 
         StringData rawRegex;
         std::unique_ptr<pcrecpp::RE> regex;
@@ -110,12 +109,12 @@ public:
     static constexpr StringData kName = "$_internalSchemaAllowedProperties"_sd;
 
     explicit InternalSchemaAllowedPropertiesMatchExpression(
-        boost::container::flat_set<StringData> properties,
+        StringDataSet properties,
         StringData namePlaceholder,
         std::vector<PatternSchema> patternProperties,
         std::unique_ptr<ExpressionWithPlaceholder> otherwise);
 
-    void debugString(StringBuilder& debug, int level) const final;
+    void debugString(StringBuilder& debug, int indentationLevel) const final;
 
     bool equivalent(const MatchExpression* expr) const final;
 
@@ -171,7 +170,7 @@ private:
 
     // The names of the properties are owned by the BSONObj used to create this match expression.
     // Since that BSONObj must outlive this object, we can safely store StringData.
-    boost::container::flat_set<StringData> _properties;
+    StringDataSet _properties;
 
     // The placeholder used in both '_patternProperties' and '_otherwise'.
     StringData _namePlaceholder;

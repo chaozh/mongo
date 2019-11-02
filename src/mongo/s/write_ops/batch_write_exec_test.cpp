@@ -53,6 +53,97 @@ const HostAndPort kTestConfigShardHost = HostAndPort("FakeConfigHost", 12345);
 const std::string shardName = "FakeShard";
 const int kMaxRoundsWithoutProgress = 5;
 
+BSONObj expectInsertsReturnStaleVersionErrorsBase(const NamespaceString& nss,
+                                                  const std::vector<BSONObj>& expected,
+                                                  const executor::RemoteCommandRequest& request) {
+    ASSERT_EQUALS(nss.db(), request.dbname);
+
+    const auto opMsgRequest(OpMsgRequest::fromDBAndBody(request.dbname, request.cmdObj));
+    const auto actualBatchedInsert(BatchedCommandRequest::parseInsert(opMsgRequest));
+    ASSERT_EQUALS(nss.toString(), actualBatchedInsert.getNS().ns());
+
+    const auto& inserted = actualBatchedInsert.getInsertRequest().getDocuments();
+    ASSERT_EQUALS(expected.size(), inserted.size());
+
+    auto itInserted = inserted.begin();
+    auto itExpected = expected.begin();
+
+    for (; itInserted != inserted.end(); itInserted++, itExpected++) {
+        ASSERT_BSONOBJ_EQ(*itExpected, *itInserted);
+    }
+
+    BatchedCommandResponse staleResponse;
+    staleResponse.setStatus(Status::OK());
+    staleResponse.setN(0);
+
+    auto epoch = OID::gen();
+
+    // Report a stale version error for each write in the batch.
+    int i = 0;
+    for (itInserted = inserted.begin(); itInserted != inserted.end(); ++itInserted) {
+        WriteErrorDetail* error = new WriteErrorDetail;
+        error->setStatus({ErrorCodes::StaleShardVersion, "mock stale error"});
+        error->setErrInfo([&] {
+            StaleConfigInfo sci(nss, ChunkVersion(1, 0, epoch), ChunkVersion(2, 0, epoch));
+            BSONObjBuilder builder;
+            sci.serialize(&builder);
+            return builder.obj();
+        }());
+        error->setIndex(i);
+
+        staleResponse.addToErrDetails(error);
+        ++i;
+    }
+
+    return staleResponse.toBSON();
+}
+
+BSONObj expectInsertsReturnStaleDbVersionErrorsBase(const NamespaceString& nss,
+                                                    const std::vector<BSONObj>& expected,
+                                                    const executor::RemoteCommandRequest& request) {
+    ASSERT_EQUALS(nss.db(), request.dbname);
+
+    const auto opMsgRequest(OpMsgRequest::fromDBAndBody(request.dbname, request.cmdObj));
+    const auto actualBatchedInsert(BatchedCommandRequest::parseInsert(opMsgRequest));
+    ASSERT_EQUALS(nss.toString(), actualBatchedInsert.getNS().ns());
+
+    const auto& inserted = actualBatchedInsert.getInsertRequest().getDocuments();
+    ASSERT_EQUALS(expected.size(), inserted.size());
+
+    auto itInserted = inserted.begin();
+    auto itExpected = expected.begin();
+
+    for (; itInserted != inserted.end(); itInserted++, itExpected++) {
+        ASSERT_BSONOBJ_EQ(*itExpected, *itInserted);
+    }
+
+    BSONObjBuilder staleResponse;
+    staleResponse.append("ok", 1);
+    staleResponse.append("n", 0);
+
+    // Report a stale db version error for each write in the batch.
+    int i = 0;
+    std::vector<BSONObj> errors;
+    for (itInserted = inserted.begin(); itInserted != inserted.end(); ++itInserted) {
+        BSONObjBuilder errorBuilder;
+        errorBuilder.append("index", i);
+        errorBuilder.append("code", int(ErrorCodes::StaleDbVersion));
+
+        auto dbVersion = databaseVersion::makeNew();
+        errorBuilder.append("db", nss.db());
+        errorBuilder.append("vReceived", dbVersion.toBSON());
+        errorBuilder.append("vWanted", databaseVersion::makeIncremented(dbVersion).toBSON());
+
+        errorBuilder.append("errmsg", "mock stale db version");
+
+        errors.push_back(errorBuilder.obj());
+        ++i;
+    }
+    staleResponse.append("writeErrors", errors);
+
+    return staleResponse.obj();
+}
+
 /**
  * Mimics a single shard backend for a particular collection which can be initialized with a
  * set of write command results to return.
@@ -71,7 +162,7 @@ public:
 
         // Add a RemoteCommandTargeter for the data shard.
         std::unique_ptr<RemoteCommandTargeterMock> targeter(
-            stdx::make_unique<RemoteCommandTargeterMock>());
+            std::make_unique<RemoteCommandTargeterMock>());
         targeter->setConnectionStringReturnValue(ConnectionString(kTestShardHost));
         targeter->setFindHostReturnValue(kTestShardHost);
         targeterFactory()->addTargeterToReturn(ConnectionString(kTestShardHost),
@@ -123,48 +214,15 @@ public:
         });
     }
 
-    void expectInsertsReturnStaleVersionErrors(const std::vector<BSONObj>& expected) {
+    virtual void expectInsertsReturnStaleVersionErrors(const std::vector<BSONObj>& expected) {
         onCommandForPoolExecutor([&](const executor::RemoteCommandRequest& request) {
-            ASSERT_EQUALS(nss.db(), request.dbname);
+            return expectInsertsReturnStaleVersionErrorsBase(nss, expected, request);
+        });
+    }
 
-            const auto opMsgRequest(OpMsgRequest::fromDBAndBody(request.dbname, request.cmdObj));
-            const auto actualBatchedInsert(BatchedCommandRequest::parseInsert(opMsgRequest));
-            ASSERT_EQUALS(nss.toString(), actualBatchedInsert.getNS().ns());
-
-            const auto& inserted = actualBatchedInsert.getInsertRequest().getDocuments();
-            ASSERT_EQUALS(expected.size(), inserted.size());
-
-            auto itInserted = inserted.begin();
-            auto itExpected = expected.begin();
-
-            for (; itInserted != inserted.end(); itInserted++, itExpected++) {
-                ASSERT_BSONOBJ_EQ(*itExpected, *itInserted);
-            }
-
-            BatchedCommandResponse staleResponse;
-            staleResponse.setStatus(Status::OK());
-            staleResponse.setN(0);
-
-            auto epoch = OID::gen();
-
-            // Report a stale version error for each write in the batch.
-            int i = 0;
-            for (itInserted = inserted.begin(); itInserted != inserted.end(); ++itInserted) {
-                WriteErrorDetail* error = new WriteErrorDetail;
-                error->setStatus({ErrorCodes::StaleShardVersion, "mock stale error"});
-                error->setErrInfo([&] {
-                    StaleConfigInfo sci(nss, ChunkVersion(1, 0, epoch), ChunkVersion(2, 0, epoch));
-                    BSONObjBuilder builder;
-                    sci.serialize(&builder);
-                    return builder.obj();
-                }());
-                error->setIndex(i);
-
-                staleResponse.addToErrDetails(error);
-                ++i;
-            }
-
-            return staleResponse.toBSON();
+    virtual void expectInsertsReturnStaleDbVersionErrors(const std::vector<BSONObj>& expected) {
+        onCommandForPoolExecutor([&](const executor::RemoteCommandRequest& request) {
+            return expectInsertsReturnStaleDbVersionErrorsBase(nss, expected, request);
         });
     }
 
@@ -233,7 +291,7 @@ TEST_F(BatchWriteExecTest, SingleOp) {
 
     expectInsertsReturnSuccess(std::vector<BSONObj>{BSON("x" << 1)});
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(BatchWriteExecTest, MultiOpLarge) {
@@ -271,7 +329,7 @@ TEST_F(BatchWriteExecTest, MultiOpLarge) {
     expectInsertsReturnSuccess(docsToInsert.begin(), docsToInsert.begin() + 66576);
     expectInsertsReturnSuccess(docsToInsert.begin() + 66576, docsToInsert.end());
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(BatchWriteExecTest, SingleOpError) {
@@ -306,14 +364,14 @@ TEST_F(BatchWriteExecTest, SingleOpError) {
 
     expectInsertsReturnError({BSON("x" << 1)}, errResponse);
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 //
 // Test retryable errors
 //
 
-TEST_F(BatchWriteExecTest, StaleOp) {
+TEST_F(BatchWriteExecTest, StaleShardOp) {
     BatchedCommandRequest request([&] {
         write_ops::Insert insertOp(nss);
         insertOp.setWriteCommandBase([] {
@@ -333,7 +391,7 @@ TEST_F(BatchWriteExecTest, StaleOp) {
         BatchWriteExec::executeBatch(operationContext(), nsTargeter, request, &response, &stats);
         ASSERT(response.getOk());
 
-        ASSERT_EQUALS(1, stats.numStaleBatches);
+        ASSERT_EQUALS(1, stats.numStaleShardBatches);
     });
 
     const std::vector<BSONObj> expected{BSON("x" << 1)};
@@ -341,10 +399,10 @@ TEST_F(BatchWriteExecTest, StaleOp) {
     expectInsertsReturnStaleVersionErrors(expected);
     expectInsertsReturnSuccess(expected);
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
-TEST_F(BatchWriteExecTest, MultiStaleOp) {
+TEST_F(BatchWriteExecTest, MultiStaleShardOp) {
     BatchedCommandRequest request([&] {
         write_ops::Insert insertOp(nss);
         insertOp.setWriteCommandBase([] {
@@ -363,7 +421,7 @@ TEST_F(BatchWriteExecTest, MultiStaleOp) {
         BatchWriteExec::executeBatch(operationContext(), nsTargeter, request, &response, &stats);
         ASSERT(response.getOk());
 
-        ASSERT_EQUALS(3, stats.numStaleBatches);
+        ASSERT_EQUALS(3, stats.numStaleShardBatches);
     });
 
     const std::vector<BSONObj> expected{BSON("x" << 1)};
@@ -375,10 +433,10 @@ TEST_F(BatchWriteExecTest, MultiStaleOp) {
 
     expectInsertsReturnSuccess(expected);
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
-TEST_F(BatchWriteExecTest, TooManyStaleOp) {
+TEST_F(BatchWriteExecTest, TooManyStaleShardOp) {
     // Retry op in exec too many times (without refresh) b/c of stale config (the mock nsTargeter
     // doesn't report progress on refresh). We should report a no progress error for everything in
     // the batch.
@@ -404,7 +462,7 @@ TEST_F(BatchWriteExecTest, TooManyStaleOp) {
         ASSERT_EQUALS(response.getErrDetailsAt(0)->toStatus().code(), ErrorCodes::NoProgressMade);
         ASSERT_EQUALS(response.getErrDetailsAt(1)->toStatus().code(), ErrorCodes::NoProgressMade);
 
-        ASSERT_EQUALS(stats.numStaleBatches, (1 + kMaxRoundsWithoutProgress));
+        ASSERT_EQUALS(stats.numStaleShardBatches, (1 + kMaxRoundsWithoutProgress));
     });
 
     // Return multiple StaleShardVersion errors
@@ -412,7 +470,109 @@ TEST_F(BatchWriteExecTest, TooManyStaleOp) {
         expectInsertsReturnStaleVersionErrors({BSON("x" << 1), BSON("x" << 2)});
     }
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
+}
+
+TEST_F(BatchWriteExecTest, StaleDbOp) {
+    BatchedCommandRequest request([&] {
+        write_ops::Insert insertOp(nss);
+        insertOp.setWriteCommandBase([] {
+            write_ops::WriteCommandBase writeCommandBase;
+            writeCommandBase.setOrdered(false);
+            return writeCommandBase;
+        }());
+        insertOp.setDocuments({BSON("x" << 1)});
+        return insertOp;
+    }());
+    request.setWriteConcern(BSONObj());
+
+    // Execute request
+    auto future = launchAsync([&] {
+        BatchedCommandResponse response;
+        BatchWriteExecStats stats;
+        BatchWriteExec::executeBatch(operationContext(), nsTargeter, request, &response, &stats);
+        ASSERT(response.getOk());
+
+        ASSERT_EQUALS(1, stats.numStaleDbBatches);
+    });
+
+    const std::vector<BSONObj> expected{BSON("x" << 1)};
+
+    expectInsertsReturnStaleDbVersionErrors(expected);
+    expectInsertsReturnSuccess(expected);
+
+    future.default_timed_get();
+}
+
+TEST_F(BatchWriteExecTest, MultiStaleDbOp) {
+    BatchedCommandRequest request([&] {
+        write_ops::Insert insertOp(nss);
+        insertOp.setWriteCommandBase([] {
+            write_ops::WriteCommandBase writeCommandBase;
+            writeCommandBase.setOrdered(false);
+            return writeCommandBase;
+        }());
+        insertOp.setDocuments({BSON("x" << 1)});
+        return insertOp;
+    }());
+    request.setWriteConcern(BSONObj());
+
+    auto future = launchAsync([&] {
+        BatchedCommandResponse response;
+        BatchWriteExecStats stats;
+        BatchWriteExec::executeBatch(operationContext(), nsTargeter, request, &response, &stats);
+        ASSERT(response.getOk());
+
+        ASSERT_EQUALS(3, stats.numStaleDbBatches);
+    });
+
+    const std::vector<BSONObj> expected{BSON("x" << 1)};
+
+    // Return multiple StaleDbVersion errors, but less than the give-up number
+    for (int i = 0; i < 3; i++) {
+        expectInsertsReturnStaleDbVersionErrors(expected);
+    }
+
+    expectInsertsReturnSuccess(expected);
+
+    future.default_timed_get();
+}
+
+TEST_F(BatchWriteExecTest, TooManyStaleDbOp) {
+    // Retry op in exec too many times (without refresh) b/c of stale config (the mock nsTargeter
+    // doesn't report progress on refresh). We should report a no progress error for everything in
+    // the batch.
+    BatchedCommandRequest request([&] {
+        write_ops::Insert insertOp(nss);
+        insertOp.setWriteCommandBase([] {
+            write_ops::WriteCommandBase writeCommandBase;
+            writeCommandBase.setOrdered(false);
+            return writeCommandBase;
+        }());
+        insertOp.setDocuments({BSON("x" << 1), BSON("x" << 2)});
+        return insertOp;
+    }());
+    request.setWriteConcern(BSONObj());
+
+    auto future = launchAsync([&] {
+        BatchedCommandResponse response;
+        BatchWriteExecStats stats;
+        BatchWriteExec::executeBatch(operationContext(), nsTargeter, request, &response, &stats);
+        ASSERT(response.getOk());
+        ASSERT_EQ(0, response.getN());
+        ASSERT(response.isErrDetailsSet());
+        ASSERT_EQUALS(response.getErrDetailsAt(0)->toStatus().code(), ErrorCodes::NoProgressMade);
+        ASSERT_EQUALS(response.getErrDetailsAt(1)->toStatus().code(), ErrorCodes::NoProgressMade);
+
+        ASSERT_EQUALS(stats.numStaleDbBatches, (1 + kMaxRoundsWithoutProgress));
+    });
+
+    // Return multiple StaleDbVersion errors
+    for (int i = 0; i < (1 + kMaxRoundsWithoutProgress); i++) {
+        expectInsertsReturnStaleDbVersionErrors({BSON("x" << 1), BSON("x" << 2)});
+    }
+
+    future.default_timed_get();
 }
 
 TEST_F(BatchWriteExecTest, RetryableWritesLargeBatch) {
@@ -455,7 +615,7 @@ TEST_F(BatchWriteExecTest, RetryableWritesLargeBatch) {
     expectInsertsReturnSuccess(docsToInsert.begin(), docsToInsert.begin() + 63791);
     expectInsertsReturnSuccess(docsToInsert.begin() + 63791, docsToInsert.end());
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(BatchWriteExecTest, RetryableErrorNoTxnNumber) {
@@ -493,7 +653,7 @@ TEST_F(BatchWriteExecTest, RetryableErrorNoTxnNumber) {
 
     expectInsertsReturnError({BSON("x" << 1), BSON("x" << 2)}, retryableErrResponse);
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(BatchWriteExecTest, RetryableErrorTxnNumber) {
@@ -530,7 +690,7 @@ TEST_F(BatchWriteExecTest, RetryableErrorTxnNumber) {
     expectInsertsReturnError({BSON("x" << 1), BSON("x" << 2)}, retryableErrResponse);
     expectInsertsReturnSuccess({BSON("x" << 1), BSON("x" << 2)});
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(BatchWriteExecTest, NonRetryableErrorTxnNumber) {
@@ -571,7 +731,7 @@ TEST_F(BatchWriteExecTest, NonRetryableErrorTxnNumber) {
 
     expectInsertsReturnError({BSON("x" << 1), BSON("x" << 2)}, nonRetryableErrResponse);
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(BatchWriteExecTest, StaleEpochIsNotRetryable) {
@@ -611,7 +771,7 @@ TEST_F(BatchWriteExecTest, StaleEpochIsNotRetryable) {
 
     expectInsertsReturnError({BSON("x" << 1), BSON("x" << 2)}, nonRetryableErrResponse);
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 class BatchWriteExecTransactionTest : public BatchWriteExecTest {
@@ -627,16 +787,16 @@ public:
         repl::ReadConcernArgs::get(operationContext()) =
             repl::ReadConcernArgs(repl::ReadConcernLevel::kSnapshotReadConcern);
 
-        auto logicalClock = stdx::make_unique<LogicalClock>(getServiceContext());
+        auto logicalClock = std::make_unique<LogicalClock>(getServiceContext());
         logicalClock->setClusterTimeFromTrustedSource(kInMemoryLogicalTime);
         LogicalClock::set(getServiceContext(), std::move(logicalClock));
 
         _scopedSession.emplace(operationContext());
 
         auto txnRouter = TransactionRouter::get(operationContext());
-        txnRouter->beginOrContinueTxn(
+        txnRouter.beginOrContinueTxn(
             operationContext(), kTxnNumber, TransactionRouter::TransactionActions::kStart);
-        txnRouter->setDefaultAtClusterTime(operationContext());
+        txnRouter.setDefaultAtClusterTime(operationContext());
     }
 
     void tearDown() override {
@@ -644,6 +804,56 @@ public:
         repl::ReadConcernArgs::get(operationContext()) = repl::ReadConcernArgs();
 
         BatchWriteExecTest::tearDown();
+    }
+
+    void expectInsertsReturnStaleVersionErrors(const std::vector<BSONObj>& expected) override {
+        onCommandForPoolExecutor([&](const executor::RemoteCommandRequest& request) {
+            BSONObjBuilder bob;
+
+            bob.appendElementsUnique(
+                expectInsertsReturnStaleVersionErrorsBase(nss, expected, request));
+
+            // Because this is the transaction-specific fixture, return transaction metadata in the
+            // response.
+            TxnResponseMetadata txnResponseMetadata(false /* readOnly */);
+            txnResponseMetadata.serialize(&bob);
+
+            return bob.obj();
+        });
+    }
+
+    void expectInsertsReturnTransientTxnErrors(const std::vector<BSONObj>& expected) {
+        onCommandForPoolExecutor([&](const executor::RemoteCommandRequest& request) {
+            ASSERT_EQUALS(nss.db(), request.dbname);
+
+            const auto opMsgRequest(OpMsgRequest::fromDBAndBody(request.dbname, request.cmdObj));
+            const auto actualBatchedInsert(BatchedCommandRequest::parseInsert(opMsgRequest));
+            ASSERT_EQUALS(nss.toString(), actualBatchedInsert.getNS().ns());
+
+            const auto& inserted = actualBatchedInsert.getInsertRequest().getDocuments();
+            ASSERT_EQUALS(expected.size(), inserted.size());
+
+            auto itInserted = inserted.begin();
+            auto itExpected = expected.begin();
+
+            for (; itInserted != inserted.end(); itInserted++, itExpected++) {
+                ASSERT_BSONOBJ_EQ(*itExpected, *itInserted);
+            }
+
+            BSONObjBuilder bob;
+
+            bob.append("ok", 0);
+            bob.append("errorLabels", BSON_ARRAY("TransientTransactionError"));
+            bob.append("code", ErrorCodes::WriteConflict);
+            bob.append("codeName", ErrorCodes::errorString(ErrorCodes::WriteConflict));
+
+            // Because this is the transaction-specific fixture, return transaction metadata in the
+            // response.
+            TxnResponseMetadata txnResponseMetadata(false /* readOnly */);
+            txnResponseMetadata.serialize(&bob);
+
+            return bob.obj();
+        });
     }
 
 private:
@@ -666,10 +876,11 @@ TEST_F(BatchWriteExecTransactionTest, ErrorInBatchThrows_CommandError) {
     auto future = launchAsync([&] {
         BatchedCommandResponse response;
         BatchWriteExecStats stats;
-        ASSERT_THROWS_CODE(BatchWriteExec::executeBatch(
-                               operationContext(), nsTargeter, request, &response, &stats),
-                           AssertionException,
-                           ErrorCodes::UnknownError);
+        BatchWriteExec::executeBatch(operationContext(), nsTargeter, request, &response, &stats);
+
+        ASSERT(response.isErrDetailsSet());
+        ASSERT_GT(response.sizeErrDetails(), 0u);
+        ASSERT_EQ(ErrorCodes::UnknownError, response.getErrDetailsAt(0)->toStatus().code());
     });
 
     BatchedCommandResponse failedResponse;
@@ -677,10 +888,10 @@ TEST_F(BatchWriteExecTransactionTest, ErrorInBatchThrows_CommandError) {
 
     expectInsertsReturnError({BSON("x" << 1), BSON("x" << 2)}, failedResponse);
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
-TEST_F(BatchWriteExecTransactionTest, ErrorInBatchThrows_WriteError) {
+TEST_F(BatchWriteExecTransactionTest, ErrorInBatchSets_WriteError) {
     BatchedCommandRequest request([&] {
         write_ops::Insert insertOp(nss);
         insertOp.setWriteCommandBase([] {
@@ -696,19 +907,20 @@ TEST_F(BatchWriteExecTransactionTest, ErrorInBatchThrows_WriteError) {
     auto future = launchAsync([&] {
         BatchedCommandResponse response;
         BatchWriteExecStats stats;
-        ASSERT_THROWS_CODE(BatchWriteExec::executeBatch(
-                               operationContext(), nsTargeter, request, &response, &stats),
-                           AssertionException,
-                           ErrorCodes::StaleShardVersion);
+        BatchWriteExec::executeBatch(operationContext(), nsTargeter, request, &response, &stats);
+
+        ASSERT(response.isErrDetailsSet());
+        ASSERT_GT(response.sizeErrDetails(), 0u);
+        ASSERT_EQ(ErrorCodes::StaleShardVersion, response.getErrDetailsAt(0)->toStatus().code());
     });
 
     // Any write error works, using SSV for convenience.
     expectInsertsReturnStaleVersionErrors({BSON("x" << 1), BSON("x" << 2)});
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
-TEST_F(BatchWriteExecTransactionTest, ErrorInBatchThrows_WriteErrorOrdered) {
+TEST_F(BatchWriteExecTransactionTest, ErrorInBatchSets_WriteErrorOrdered) {
     BatchedCommandRequest request([&] {
         write_ops::Insert insertOp(nss);
         insertOp.setWriteCommandBase([] {
@@ -724,19 +936,20 @@ TEST_F(BatchWriteExecTransactionTest, ErrorInBatchThrows_WriteErrorOrdered) {
     auto future = launchAsync([&] {
         BatchedCommandResponse response;
         BatchWriteExecStats stats;
-        ASSERT_THROWS_CODE(BatchWriteExec::executeBatch(
-                               operationContext(), nsTargeter, request, &response, &stats),
-                           AssertionException,
-                           ErrorCodes::StaleShardVersion);
+        BatchWriteExec::executeBatch(operationContext(), nsTargeter, request, &response, &stats);
+
+        ASSERT(response.isErrDetailsSet());
+        ASSERT_GT(response.sizeErrDetails(), 0u);
+        ASSERT_EQ(ErrorCodes::StaleShardVersion, response.getErrDetailsAt(0)->toStatus().code());
     });
 
     // Any write error works, using SSV for convenience.
     expectInsertsReturnStaleVersionErrors({BSON("x" << 1), BSON("x" << 2)});
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
-TEST_F(BatchWriteExecTransactionTest, ErrorInBatchThrows_WriteConcernError) {
+TEST_F(BatchWriteExecTransactionTest, ErrorInBatchSets_TransientTxnError) {
     BatchedCommandRequest request([&] {
         write_ops::Insert insertOp(nss);
         insertOp.setWriteCommandBase([] {
@@ -755,30 +968,73 @@ TEST_F(BatchWriteExecTransactionTest, ErrorInBatchThrows_WriteConcernError) {
         ASSERT_THROWS_CODE(BatchWriteExec::executeBatch(
                                operationContext(), nsTargeter, request, &response, &stats),
                            AssertionException,
-                           ErrorCodes::NetworkTimeout);
+                           ErrorCodes::WriteConflict);
+    });
+
+    expectInsertsReturnTransientTxnErrors({BSON("x" << 1), BSON("x" << 2)});
+
+    future.default_timed_get();
+}
+
+TEST_F(BatchWriteExecTransactionTest, ErrorInBatchSets_DispatchError) {
+    BatchedCommandRequest request([&] {
+        write_ops::Insert insertOp(nss);
+        insertOp.setWriteCommandBase([] {
+            write_ops::WriteCommandBase writeCommandBase;
+            writeCommandBase.setOrdered(false);
+            return writeCommandBase;
+        }());
+        insertOp.setDocuments({BSON("x" << 1), BSON("x" << 2)});
+        return insertOp;
+    }());
+    request.setWriteConcern(BSONObj());
+
+    auto future = launchAsync([&] {
+        BatchedCommandResponse response;
+        BatchWriteExecStats stats;
+
+        BatchWriteExec::executeBatch(operationContext(), nsTargeter, request, &response, &stats);
+
+        ASSERT(response.isErrDetailsSet());
+        ASSERT_GT(response.sizeErrDetails(), 0u);
+        ASSERT_EQ(ErrorCodes::CallbackCanceled, response.getErrDetailsAt(0)->toStatus().code());
     });
 
     onCommandForPoolExecutor([&](const executor::RemoteCommandRequest& request) {
-        const auto opMsgRequest = OpMsgRequest::fromDBAndBody(request.dbname, request.cmdObj);
-        const auto insertOp = InsertOp::parse(opMsgRequest);
-        ASSERT_EQUALS(nss, insertOp.getNamespace());
-
-        BatchedCommandResponse response;
-        response.setStatus(Status::OK());
-        response.setN(1);
-
-        auto wcError = stdx::make_unique<WriteConcernErrorDetail>();
-        WriteConcernResult wcRes;
-        wcRes.err = "timeout";
-        wcRes.wTimedOut = true;
-        wcError->setStatus({ErrorCodes::NetworkTimeout, "Failed to wait for write concern"});
-        wcError->setErrInfo(BSON("wtimeout" << true));
-        response.setWriteConcernError(wcError.release());
-
-        return response.toBSON();
+        return Status(ErrorCodes::CallbackCanceled, "simulating executor cancel for test");
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
+}
+
+TEST_F(BatchWriteExecTransactionTest, ErrorInBatchSets_TransientDispatchError) {
+    BatchedCommandRequest request([&] {
+        write_ops::Insert insertOp(nss);
+        insertOp.setWriteCommandBase([] {
+            write_ops::WriteCommandBase writeCommandBase;
+            writeCommandBase.setOrdered(false);
+            return writeCommandBase;
+        }());
+        insertOp.setDocuments({BSON("x" << 1), BSON("x" << 2)});
+        return insertOp;
+    }());
+    request.setWriteConcern(BSONObj());
+
+    auto future = launchAsync([&] {
+        BatchedCommandResponse response;
+        BatchWriteExecStats stats;
+
+        ASSERT_THROWS_CODE(BatchWriteExec::executeBatch(
+                               operationContext(), nsTargeter, request, &response, &stats),
+                           AssertionException,
+                           ErrorCodes::InterruptedAtShutdown);
+    });
+
+    onCommandForPoolExecutor([&](const executor::RemoteCommandRequest& request) {
+        return Status(ErrorCodes::InterruptedAtShutdown, "simulating shutdown for test");
+    });
+
+    future.default_timed_get();
 }
 
 }  // namespace

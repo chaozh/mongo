@@ -48,7 +48,7 @@ namespace mongo {
  */
 class JournalListener {
 public:
-    using Token = repl::OpTime;
+    using Token = repl::OpTimeAndWallTime;
     virtual ~JournalListener() = default;
     virtual Token getToken() = 0;
     virtual void onDurable(const Token& token) = 0;
@@ -70,4 +70,4 @@ public:
     // As this has no state, it is de facto const and can be safely shared freely.
     static NoOpJournalListener instance;
 };
-}
+}  // namespace mongo

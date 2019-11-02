@@ -29,13 +29,12 @@
 
 #pragma once
 
+#include <functional>
 #include <list>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/db/service_context.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/stdx/condition_variable.h"
-#include "mongo/stdx/functional.h"
-#include "mongo/stdx/mutex.h"
 #include "mongo/util/concurrency/thread_pool.h"
 #include "mongo/util/functional.h"
 
@@ -47,7 +46,8 @@ class OperationContext;
 namespace repl {
 
 class TaskRunner {
-    MONGO_DISALLOW_COPYING(TaskRunner);
+    TaskRunner(const TaskRunner&) = delete;
+    TaskRunner& operator=(const TaskRunner&) = delete;
 
 public:
     /**
@@ -151,7 +151,7 @@ private:
     ThreadPool* _threadPool;
 
     // Protects member data of this TaskRunner.
-    mutable stdx::mutex _mutex;
+    mutable Mutex _mutex = MONGO_MAKE_LATCH("TaskRunner::_mutex");
 
     stdx::condition_variable _condition;
 

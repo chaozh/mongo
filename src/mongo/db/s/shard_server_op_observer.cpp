@@ -40,6 +40,7 @@
 #include "mongo/db/s/chunk_splitter.h"
 #include "mongo/db/s/database_sharding_state.h"
 #include "mongo/db/s/migration_source_manager.h"
+#include "mongo/db/s/range_deletion_task_gen.h"
 #include "mongo/db/s/shard_identity_rollback_notifier.h"
 #include "mongo/db/s/sharding_initialization_mongod.h"
 #include "mongo/db/s/type_shard_identity.h"
@@ -59,8 +60,9 @@ bool isStandaloneOrPrimary(OperationContext* opCtx) {
     auto replCoord = repl::ReplicationCoordinator::get(opCtx);
     const bool isReplSet =
         replCoord->getReplicationMode() == repl::ReplicationCoordinator::modeReplSet;
-    return !isReplSet || (repl::ReplicationCoordinator::get(opCtx)->getMemberState() ==
-                          repl::MemberState::RS_PRIMARY);
+    return !isReplSet ||
+        (repl::ReplicationCoordinator::get(opCtx)->getMemberState() ==
+         repl::MemberState::RS_PRIMARY);
 }
 
 /**
@@ -133,13 +135,14 @@ void onConfigDeleteInvalidateCachedCollectionMetadataAndNotify(OperationContext*
     // Extract which collection entry is being deleted from the _id field.
     std::string deletedCollection;
     fassert(40479,
-            bsonExtractStringField(query, ShardCollectionType::ns.name(), &deletedCollection));
+            bsonExtractStringField(query, ShardCollectionType::kNssFieldName, &deletedCollection));
     const NamespaceString deletedNss(deletedCollection);
 
     // Need the WUOW to retain the lock for CollectionVersionLogOpHandler::commit().
     AutoGetCollection autoColl(opCtx, deletedNss, MODE_IX);
 
-    opCtx->recoveryUnit()->registerChange(new CollectionVersionLogOpHandler(opCtx, deletedNss));
+    opCtx->recoveryUnit()->registerChange(
+        std::make_unique<CollectionVersionLogOpHandler>(opCtx, deletedNss));
 }
 
 /**
@@ -154,16 +157,7 @@ void incrementChunkOnInsertOrUpdate(OperationContext* opCtx,
                                     long dataWritten,
                                     bool fromMigrate) {
     const auto& shardKeyPattern = chunkManager.getShardKeyPattern();
-
-    // Each inserted/updated document should contain the shard key. The only instance in which a
-    // document could not contain a shard key is if the insert/update is performed through mongod
-    // explicitly, as opposed to first routed through mongos.
     BSONObj shardKey = shardKeyPattern.extractShardKeyFromDoc(document);
-    if (shardKey.woCompare(BSONObj()) == 0) {
-        warning() << "inserting document " << document.toString() << " without shard key pattern "
-                  << shardKeyPattern << " into a sharded collection";
-        return;
-    }
 
     // Use the shard key to locate the chunk into which the document was updated, and increment the
     // number of bytes tracked for the chunk.
@@ -218,7 +212,8 @@ void ShardServerOpObserver::onInserts(OperationContext* opCtx,
                         uassertStatusOK(ShardIdentityType::fromShardIdentityDocument(insertedDoc));
                     uassertStatusOK(shardIdentityDoc.validate());
                     opCtx->recoveryUnit()->registerChange(
-                        new ShardIdentityLogOpHandler(opCtx, std::move(shardIdentityDoc)));
+                        std::make_unique<ShardIdentityLogOpHandler>(opCtx,
+                                                                    std::move(shardIdentityDoc)));
                 }
             }
         }
@@ -263,7 +258,7 @@ void ShardServerOpObserver::onUpdate(OperationContext* opCtx, const OplogUpdateE
             std::string coll;
             fassert(40477,
                     bsonExtractStringField(
-                        args.updateArgs.criteria, ShardCollectionType::ns.name(), &coll));
+                        args.updateArgs.criteria, ShardCollectionType::kNssFieldName, &coll));
             return NamespaceString(coll);
         }());
 
@@ -277,13 +272,13 @@ void ShardServerOpObserver::onUpdate(OperationContext* opCtx, const OplogUpdateE
             // Need the WUOW to retain the lock for CollectionVersionLogOpHandler::commit()
             AutoGetCollection autoColl(opCtx, updatedNss, MODE_IX);
 
-            if (setField.hasField(ShardCollectionType::refreshing.name()) &&
+            if (setField.hasField(ShardCollectionType::kLastRefreshedCollectionVersionFieldName) &&
                 !setField.getBoolField("refreshing")) {
                 opCtx->recoveryUnit()->registerChange(
-                    new CollectionVersionLogOpHandler(opCtx, updatedNss));
+                    std::make_unique<CollectionVersionLogOpHandler>(opCtx, updatedNss));
             }
 
-            if (setField.hasField(ShardCollectionType::enterCriticalSectionCounter.name())) {
+            if (setField.hasField(ShardCollectionType::kEnterCriticalSectionCounterFieldName)) {
                 // Force subsequent uses of the namespace to refresh the filtering metadata so they
                 // can synchronize with any work happening on the primary (e.g., migration critical
                 // section).
@@ -320,11 +315,45 @@ void ShardServerOpObserver::onUpdate(OperationContext* opCtx, const OplogUpdateE
 
             if (setField.hasField(ShardDatabaseType::enterCriticalSectionCounter.name())) {
                 AutoGetDb autoDb(opCtx, db, MODE_X);
-                if (autoDb.getDb()) {
-                    auto& dss = DatabaseShardingState::get(autoDb.getDb());
-                    auto dssLock = DatabaseShardingState::DSSLock::lockExclusive(opCtx, &dss);
-                    dss.setDbVersion(opCtx, boost::none, dssLock);
-                }
+                auto dss = DatabaseShardingState::get(opCtx, db);
+                auto dssLock = DatabaseShardingState::DSSLock::lockExclusive(opCtx, dss);
+                dss->setDbVersion(opCtx, boost::none, dssLock);
+            }
+        }
+    }
+
+    if (args.nss == NamespaceString::kRangeDeletionNamespace) {
+        if (!isStandaloneOrPrimary(opCtx))
+            return;
+
+        BSONElement unsetElement;
+        Status status = bsonExtractTypedField(
+            args.updateArgs.update, StringData("$unset"), Object, &unsetElement);
+
+        if (unsetElement.Obj().hasField("pending")) {
+            auto deletionTask = RangeDeletionTask::parse(
+                IDLParserErrorContext("ShardServerOpObserver"), args.updateArgs.updatedDoc);
+
+            const auto whenToClean = deletionTask.getWhenToClean() == CleanWhenEnum::kNow
+                ? CollectionShardingRuntime::kNow
+                : CollectionShardingRuntime::kDelayed;
+
+            AutoGetCollection autoColl(opCtx, deletionTask.getNss(), MODE_IS);
+
+            if (!autoColl.getCollection() ||
+                autoColl.getCollection()->uuid() !=
+                    UUID::parse(deletionTask.getCollectionUuid().toString())) {
+                LOG(0) << "Collection UUID doesn't match the one marked for deletion: "
+                       << autoColl.getCollection()->uuid()
+                       << " != " << deletionTask.getCollectionUuid();
+            } else {
+                LOG(0) << "Scheduling range " << deletionTask.getRange() << " in namespace "
+                       << deletionTask.getNss() << " for deletion.";
+
+                auto notification = CollectionShardingRuntime::get(opCtx, deletionTask.getNss())
+                                        ->cleanUpRange(*deletionTask.getRange(), whenToClean);
+
+                notification.abandon();
             }
         }
     }
@@ -368,11 +397,9 @@ void ShardServerOpObserver::onDelete(OperationContext* opCtx,
             bsonExtractStringField(documentKey, ShardDatabaseType::name.name(), &deletedDatabase));
 
         AutoGetDb autoDb(opCtx, deletedDatabase, MODE_X);
-        if (autoDb.getDb()) {
-            auto& dss = DatabaseShardingState::get(autoDb.getDb());
-            auto dssLock = DatabaseShardingState::DSSLock::lockExclusive(opCtx, &dss);
-            dss.setDbVersion(opCtx, boost::none, dssLock);
-        }
+        auto dss = DatabaseShardingState::get(opCtx, deletedDatabase);
+        auto dssLock = DatabaseShardingState::DSSLock::lockExclusive(opCtx, dss);
+        dss->setDbVersion(opCtx, boost::none, dssLock);
     }
 
     if (nss == NamespaceString::kServerConfigurationNamespace) {

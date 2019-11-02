@@ -76,7 +76,7 @@ Status WriteOp::targetWrites(OperationContext* opCtx,
     //
     // NOTE: Index inserts are currently specially targeted only at the current collection to avoid
     // creating collections everywhere.
-    const bool inTransaction = TransactionRouter::get(opCtx) != nullptr;
+    const bool inTransaction = bool(TransactionRouter::get(opCtx));
     if (swEndpoints.isOK() && swEndpoints.getValue().size() > 1u && !inTransaction) {
         swEndpoints = targeter.targetAllShards(opCtx);
     }
@@ -114,7 +114,8 @@ size_t WriteOp::getNumTargeted() {
 
 static bool isRetryErrCode(int errCode) {
     return errCode == ErrorCodes::StaleShardVersion ||
-        errCode == ErrorCodes::CannotImplicitlyCreateCollection;
+        errCode == ErrorCodes::CannotImplicitlyCreateCollection ||
+        errCode == ErrorCodes::StaleDbVersion;
 }
 
 static bool errorsAllSame(const vector<ChildWriteOp const*>& errOps) {
@@ -163,17 +164,23 @@ void WriteOp::_updateOpState() {
     std::vector<ChildWriteOp const*> childErrors;
 
     bool isRetryError = true;
+    bool hasPendingChild = false;
     for (const auto& childOp : _childOps) {
-        // Don't do anything till we have all the info
+        // Don't do anything till we have all the info. Unless we're in a transaction because
+        // we abort aggresively whenever we get an error during a transaction.
         if (childOp.state != WriteOpState_Completed && childOp.state != WriteOpState_Error) {
-            return;
+            hasPendingChild = true;
+
+            if (!_inTxn) {
+                return;
+            }
         }
 
         if (childOp.state == WriteOpState_Error) {
             childErrors.push_back(&childOp);
 
             // Any non-retry error aborts all
-            if (!isRetryErrCode(childOp.error->toStatus().code())) {
+            if (_inTxn || !isRetryErrCode(childOp.error->toStatus().code())) {
                 isRetryError = false;
             }
         }
@@ -187,6 +194,10 @@ void WriteOp::_updateOpState() {
         _error.reset(new WriteErrorDetail);
         combineOpErrors(childErrors, _error.get());
         _state = WriteOpState_Error;
+    } else if (hasPendingChild && _inTxn) {
+        // Return early here since this means that there were no errors while in txn
+        // but there are still ops that have not yet finished.
+        return;
     } else {
         _state = WriteOpState_Completed;
     }
@@ -218,7 +229,7 @@ void WriteOp::noteWriteComplete(const TargetedWrite& targetedWrite) {
     const WriteOpRef& ref = targetedWrite.writeOpRef;
     auto& childOp = _childOps[ref.second];
 
-    childOp.pendingWrite = NULL;
+    childOp.pendingWrite = nullptr;
     childOp.endpoint.reset(new ShardEndpoint(targetedWrite.endpoint));
     childOp.state = WriteOpState_Completed;
     _updateOpState();
@@ -228,7 +239,7 @@ void WriteOp::noteWriteError(const TargetedWrite& targetedWrite, const WriteErro
     const WriteOpRef& ref = targetedWrite.writeOpRef;
     auto& childOp = _childOps[ref.second];
 
-    childOp.pendingWrite = NULL;
+    childOp.pendingWrite = nullptr;
     childOp.endpoint.reset(new ShardEndpoint(targetedWrite.endpoint));
     childOp.error.reset(new WriteErrorDetail);
     error.cloneTo(childOp.error.get());

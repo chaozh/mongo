@@ -43,23 +43,24 @@
 #include "mongo/db/storage/wiredtiger/wiredtiger_recovery_unit.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_size_storer.h"
 #include "mongo/platform/atomic_word.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/stdx/condition_variable.h"
-#include "mongo/stdx/mutex.h"
 #include "mongo/stdx/thread.h"
-#include "mongo/util/fail_point_service.h"
+#include "mongo/util/fail_point.h"
 
 /**
  * Either executes the specified operation and returns it's value or randomly throws a write
  * conflict exception if the WTWriteConflictException failpoint is enabled. This is only checked
  * on cursor methods that make modifications.
  */
-#define WT_OP_CHECK(x) (((MONGO_FAIL_POINT(WTWriteConflictException))) ? (WT_ROLLBACK) : (x))
+#define WT_OP_CHECK(x) \
+    (((MONGO_unlikely(WTWriteConflictException.shouldFail()))) ? (WT_ROLLBACK) : (x))
 
 /**
  * Identical to WT_OP_CHECK except this is checked on cursor seeks/advancement.
  */
 #define WT_READ_CHECK(x) \
-    (((MONGO_FAIL_POINT(WTWriteConflictExceptionForReads))) ? (WT_ROLLBACK) : (x))
+    (((MONGO_unlikely(WTWriteConflictExceptionForReads.shouldFail()))) ? (WT_ROLLBACK) : (x))
 
 namespace mongo {
 
@@ -112,9 +113,12 @@ public:
         CappedCallback* cappedCallback;
         WiredTigerSizeStorer* sizeStorer;
         bool isReadOnly;
+        bool tracksSizeAdjustments;
     };
 
     WiredTigerRecordStore(WiredTigerKVEngine* kvEngine, OperationContext* opCtx, Params params);
+
+    virtual void getOplogTruncateStats(BSONObjBuilder& builder) const;
 
     virtual ~WiredTigerRecordStore();
 
@@ -130,7 +134,7 @@ public:
     virtual bool isCapped() const;
 
     virtual int64_t storageSize(OperationContext* opCtx,
-                                BSONObjBuilder* extraInfo = NULL,
+                                BSONObjBuilder* extraInfo = nullptr,
                                 int infoLevel = 0) const;
 
     // CRUD related
@@ -142,12 +146,6 @@ public:
     virtual Status insertRecords(OperationContext* opCtx,
                                  std::vector<Record>* records,
                                  const std::vector<Timestamp>& timestamps);
-
-    virtual Status insertRecordsWithDocWriter(OperationContext* opCtx,
-                                              const DocWriter* const* docs,
-                                              const Timestamp* timestamps,
-                                              size_t nDocs,
-                                              RecordId* idsOut);
 
     virtual Status updateRecord(OperationContext* opCtx,
                                 const RecordId& recordId,
@@ -175,7 +173,7 @@ public:
     virtual bool compactSupported() const {
         return !_isEphemeral;
     }
-    virtual bool compactsInPlace() const {
+    virtual bool supportsOnlineCompaction() const {
         return true;
     }
 
@@ -188,15 +186,12 @@ public:
     }
 
     virtual void validate(OperationContext* opCtx,
-                          ValidateCmdLevel level,
                           ValidateResults* results,
                           BSONObjBuilder* output);
 
     virtual void appendCustomStats(OperationContext* opCtx,
                                    BSONObjBuilder* result,
                                    double scale) const;
-
-    virtual Status touch(OperationContext* opCtx, BSONObjBuilder* output) const;
 
     virtual void cappedTruncateAfter(OperationContext* opCtx, RecordId end, bool inclusive);
 
@@ -217,7 +212,7 @@ public:
     Status updateCappedSize(OperationContext* opCtx, long long cappedSize) final;
 
     void setCappedCallback(CappedCallback* cb) {
-        stdx::lock_guard<stdx::mutex> lk(_cappedCallbackMutex);
+        stdx::lock_guard<Latch> lk(_cappedCallbackMutex);
         _cappedCallback = cb;
     }
 
@@ -236,6 +231,13 @@ public:
         return _tableId;
     }
 
+    /*
+     * Check the size information for this RecordStore. This function opens a cursor on the
+     * RecordStore to determine if it is empty. If it is empty, it will mark the collection as
+     * needing size adjustment as a result of a rollback or storage recovery event.
+     */
+    void checkSize(OperationContext* opCtx);
+
     void setSizeStorer(WiredTigerSizeStorer* ss) {
         _sizeStorer = ss;
     }
@@ -244,7 +246,11 @@ public:
 
     bool inShutdown() const;
 
-    void reclaimOplog(OperationContext* opCtx);
+    bool yieldAndAwaitOplogDeletionRequest(OperationContext* opCtx) override;
+
+    void reclaimOplog(OperationContext* opCtx) override;
+
+    StatusWith<Timestamp> getLatestOplogTimestamp(OperationContext* opCtx) const override;
 
     /**
      * The `recoveryTimestamp` is when replication recovery would need to replay from for
@@ -252,9 +258,6 @@ public:
      * truncate oplog entries in front of this time.
      */
     void reclaimOplog(OperationContext* opCtx, Timestamp recoveryTimestamp);
-
-    // Returns false if the oplog was dropped while waiting for a deletion request.
-    bool yieldAndAwaitOplogDeletionRequest(OperationContext* opCtx);
 
     bool haveCappedWaiters();
 
@@ -285,10 +288,17 @@ private:
                           const Timestamp* timestamps,
                           size_t nRecords);
 
-    RecordId _nextId();
-    void _setId(RecordId id);
+    RecordId _nextId(OperationContext* opCtx);
     bool cappedAndNeedDelete() const;
     RecordData _getData(const WiredTigerCursor& cursor) const;
+
+
+    /**
+     * Initialize the largest known RecordId if it is not already. This is designed to be called
+     * immediately before operations that may need this Recordid. This is to support lazily
+     * initializing the value instead of all at once during startup.
+     */
+    void _initNextIdIfNeeded(OperationContext* opCtx);
 
     /**
      * Position the cursor at the first key. The previously known first key is
@@ -339,6 +349,8 @@ private:
     const bool _isCapped;
     // True if the storage engine is an in-memory storage engine
     const bool _isEphemeral;
+    // True if WiredTiger is logging updates to this table
+    const bool _isLogged;
     // True if the namespace of this record store starts with "local.oplog.", and false otherwise.
     const bool _isOplog;
     int64_t _cappedMaxSize;
@@ -347,22 +359,32 @@ private:
     RecordId _cappedFirstRecord;
     AtomicWord<long long> _cappedSleep;
     AtomicWord<long long> _cappedSleepMS;
+
+    // guards _cappedCallback and _shuttingDown
+    mutable Mutex _cappedCallbackMutex =
+        MONGO_MAKE_LATCH("WiredTigerRecordStore::_cappedCallbackMutex");
     CappedCallback* _cappedCallback;
     bool _shuttingDown;
-    mutable stdx::mutex _cappedCallbackMutex;  // guards _cappedCallback and _shuttingDown
 
     // See comment in ::cappedDeleteAsNeeded
     int _cappedDeleteCheckCount;
     mutable stdx::timed_mutex _cappedDeleterMutex;
 
-    AtomicWord<long long> _nextIdNum;
+    // Protects initialization of the _nextIdNum.
+    mutable Mutex _initNextIdMutex = MONGO_MAKE_LATCH("WiredTigerRecordStore::_initNextIdMutex");
+    AtomicWord<long long> _nextIdNum{0};
 
     WiredTigerSizeStorer* _sizeStorer;  // not owned, can be NULL
     std::shared_ptr<WiredTigerSizeStorer::SizeInfo> _sizeInfo;
+    bool _tracksSizeAdjustments;
     WiredTigerKVEngine* _kvEngine;  // not owned.
 
     // Non-null if this record store is underlying the active oplog.
     std::shared_ptr<OplogStones> _oplogStones;
+
+    AtomicWord<int64_t>
+        _totalTimeTruncating;            // Cumulative amount of time spent truncating the oplog.
+    AtomicWord<int64_t> _truncateCount;  // Cumulative number of truncates of the oplog.
 };
 
 
@@ -456,6 +478,7 @@ protected:
     boost::optional<WiredTigerCursor> _cursor;
     bool _eof = false;
     RecordId _lastReturnedId;  // If null, need to seek to first/last record.
+    bool _hasRestored = true;
 
 private:
     bool isVisible(const RecordId& id);
@@ -520,11 +543,11 @@ private:
 
 
 // WT failpoint to throw write conflict exceptions randomly
-MONGO_FAIL_POINT_DECLARE(WTWriteConflictException);
-MONGO_FAIL_POINT_DECLARE(WTWriteConflictExceptionForReads);
+extern FailPoint WTWriteConflictException;
+extern FailPoint WTWriteConflictExceptionForReads;
 
 // Prevents oplog writes from being considered durable on the primary. Once activated, new writes
 // will not be considered durable until deactivated. It is unspecified whether writes that commit
 // before activation will become visible while active.
-MONGO_FAIL_POINT_DECLARE(WTPausePrimaryOplogDurabilityLoop);
-}
+extern FailPoint WTPausePrimaryOplogDurabilityLoop;
+}  // namespace mongo

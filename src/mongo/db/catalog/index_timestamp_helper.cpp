@@ -102,13 +102,12 @@ void IndexTimestampHelper::setGhostCommitTimestampForWrite(OperationContext* opC
     fassert(51053, status);
 }
 
-/**
- * Returns true if writes to the catalog entry for the input namespace require being
- * timestamped. A ghost write is when the operation is not committed with an oplog entry and
- * implies the caller will look at the logical clock to choose a time to use.
- */
-namespace {
-bool requiresGhostCommitTimestampForCatalogWrite(OperationContext* opCtx, NamespaceString nss) {
+bool IndexTimestampHelper::requiresGhostCommitTimestampForCatalogWrite(OperationContext* opCtx,
+                                                                       NamespaceString nss) {
+    if (opCtx->writesAreReplicated()) {
+        return false;
+    }
+
     if (!nss.isReplicated() || nss.coll().startsWith("tmp.mr.")) {
         return false;
     }
@@ -144,13 +143,12 @@ bool requiresGhostCommitTimestampForCatalogWrite(OperationContext* opCtx, Namesp
 
     return true;
 }
-}  // namespace
 
-void IndexTimestampHelper::setGhostCommitTimestampForCatalogWrite(OperationContext* opCtx,
+bool IndexTimestampHelper::setGhostCommitTimestampForCatalogWrite(OperationContext* opCtx,
                                                                   const NamespaceString& nss) {
     invariant(opCtx->lockState()->inAWriteUnitOfWork());
     if (!requiresGhostCommitTimestampForCatalogWrite(opCtx, nss)) {
-        return;
+        return false;
     }
     auto status = opCtx->recoveryUnit()->setTimestamp(
         LogicalClock::get(opCtx)->getClusterTime().asTimestamp());
@@ -160,5 +158,6 @@ void IndexTimestampHelper::setGhostCommitTimestampForCatalogWrite(OperationConte
         throw WriteConflictException();
     }
     fassert(50701, status);
+    return true;
 }
 }  // namespace mongo

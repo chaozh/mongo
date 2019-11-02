@@ -41,7 +41,8 @@ namespace mongo {
 namespace fts {
 
 class StopWords {
-    MONGO_DISALLOW_COPYING(StopWords);
+    StopWords(const StopWords&) = delete;
+    StopWords& operator=(const StopWords&) = delete;
 
 public:
     StopWords();
@@ -60,5 +61,5 @@ public:
 private:
     StringMap<bool> _words;  // Used as a set. The values have no meaning.
 };
-}
-}
+}  // namespace fts
+}  // namespace mongo

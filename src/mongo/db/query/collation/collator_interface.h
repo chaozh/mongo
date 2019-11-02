@@ -32,7 +32,6 @@
 #include <memory>
 #include <string>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/base/string_data.h"
 #include "mongo/base/string_data_comparator_interface.h"
 #include "mongo/bson/bsonobj_comparator_interface.h"
@@ -49,7 +48,8 @@ namespace mongo {
  * Does not throw exceptions.
  */
 class CollatorInterface : public StringData::ComparatorInterface {
-    MONGO_DISALLOW_COPYING(CollatorInterface);
+    CollatorInterface(const CollatorInterface&) = delete;
+    CollatorInterface& operator=(const CollatorInterface&) = delete;
 
 public:
     /**
@@ -113,6 +113,12 @@ public:
      * comments for details.
      */
     virtual ComparisonKey getComparisonKey(StringData stringData) const = 0;
+
+    /**
+     * Returns the comparison key string for 'stringData', according to this collation. See
+     * ComparisonKey's comments for details.
+     */
+    std::string getComparisonString(StringData stringData) const;
 
     /**
      * Returns whether this collation has the same matching and sorting semantics as 'other'.

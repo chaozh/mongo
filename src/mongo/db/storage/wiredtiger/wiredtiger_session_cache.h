@@ -37,7 +37,7 @@
 #include "mongo/db/storage/journal_listener.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_snapshot_manager.h"
 #include "mongo/platform/atomic_word.h"
-#include "mongo/stdx/mutex.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/util/concurrency/spin_lock.h"
 
 namespace mongo {
@@ -91,25 +91,30 @@ public:
     }
 
     /**
-     * Get a cursor on the table id 'id'. If 'allowOverwrite' is true, insert operations will not
-     * return an error if the record already exists, and update/remove operations will not return
-     * error if the record does not exist.
+     * Gets a cursor on the table id 'id'.
+     *
+     * The config string specifies optional arguments for the cursor. For example, when
+     * the config contains 'read_once=true', this is intended for operations that will be
+     * sequentially scanning large amounts of data. If no cursor is currently available in the
+     * cursor cache, then a new cached cursor will be created with the given config specification.
      *
      * This may return a cursor from the cursor cache and these cursors should *always* be released
      * into the cache by calling releaseCursor().
      */
-    WT_CURSOR* getCursor(const std::string& uri, uint64_t id, bool allowOverwrite);
+    WT_CURSOR* getCachedCursor(const std::string& uri, uint64_t id, const char* config);
+
 
     /**
-     * Get a cursor with the 'read_once=true' configuration. This is intended for operations that
-     * will be sequentially scanning large amounts of data. If 'allowOverwrite' is true, insert
-     * operations will not return an error if the record already exists, and update/remove
-     * operations will not return error if the record does not exist.
+     * Create a new cursor and ignore the cache.
+     *
+     * The config string specifies optional arguments for the cursor. For example, when
+     * the config contains 'read_once=true', this is intended for operations that will be
+     * sequentially scanning large amounts of data.
      *
      * This will never return a cursor from the cursor cache, and these cursors should *never* be
      * released into the cache by calling releaseCursor(). Use closeCursor() instead.
      */
-    WT_CURSOR* getReadOnceCursor(const std::string& uri, bool allowOverwrite);
+    WT_CURSOR* getNewCursor(const std::string& uri, const char* config);
 
     /**
      * Release a cursor into the cursor cache and close old cursors if the number of cursors in the
@@ -149,9 +154,16 @@ public:
     static uint64_t genTableId();
 
     /**
-     * For "metadata:" cursors. Guaranteed never to collide with genTableId() ids.
+     * For special cursors. Guaranteed never to collide with genTableId() ids.
      */
-    static const uint64_t kMetadataTableId = 0;
+    enum TableId {
+        /* For "metadata:" cursors */
+        kMetadataTableId,
+        /* For "metadata:create" cursors */
+        kMetadataCreateTableId,
+        /* The start of non-special table ids for genTableId() */
+        kLastTableId
+    };
 
     void setIdleExpireTime(Date_t idleExpireTime) {
         _idleExpireTime = idleExpireTime;
@@ -163,6 +175,7 @@ public:
 
 private:
     friend class WiredTigerSessionCache;
+    friend class WiredTigerKVEngine;
 
     // The cursor cache is a list of pairs that contain an ID and cursor
     typedef std::list<WiredTigerCachedCursor> CursorCache;
@@ -252,13 +265,19 @@ public:
      */
     void shuttingDown();
 
+    /**
+     * True when in the process of shutting down.
+     */
+    bool isShuttingDown();
+
     bool isEphemeral();
+
     /**
      * Waits until all commits that happened before this call are durable, either by flushing
      * the log or forcing a checkpoint if forceCheckpoint is true or the journal is disabled.
      * Uses a temporary session. Safe to call without any locks, even during shutdown.
      */
-    void waitUntilDurable(bool forceCheckpoint, bool stableCheckpoint);
+    void waitUntilDurable(OperationContext* opCtx, bool forceCheckpoint, bool stableCheckpoint);
 
     /**
      * Waits until a prepared unit of work has ended (either been commited or aborted). This
@@ -317,7 +336,7 @@ private:
     AtomicWord<unsigned> _shuttingDown;
     static const uint32_t kShuttingDownMask = 1 << 31;
 
-    stdx::mutex _cacheLock;
+    Mutex _cacheLock = MONGO_MAKE_LATCH("WiredTigerSessionCache::_cacheLock");
     typedef std::vector<WiredTigerSession*> SessionCache;
     SessionCache _sessions;
 
@@ -329,15 +348,16 @@ private:
 
     // Counter and critical section mutex for waitUntilDurable
     AtomicWord<unsigned> _lastSyncTime;
-    stdx::mutex _lastSyncMutex;
+    Mutex _lastSyncMutex = MONGO_MAKE_LATCH("WiredTigerSessionCache::_lastSyncMutex");
 
     // Mutex and cond var for waiting on prepare commit or abort.
-    stdx::mutex _prepareCommittedOrAbortedMutex;
+    Mutex _prepareCommittedOrAbortedMutex =
+        MONGO_MAKE_LATCH("WiredTigerSessionCache::_prepareCommittedOrAbortedMutex");
     stdx::condition_variable _prepareCommittedOrAbortedCond;
     AtomicWord<std::uint64_t> _prepareCommitOrAbortCounter{0};
 
     // Protects _journalListener.
-    stdx::mutex _journalListenerMutex;
+    Mutex _journalListenerMutex = MONGO_MAKE_LATCH("WiredTigerSessionCache::_journalListenerMutex");
     // Notified when we commit to the journal.
     JournalListener* _journalListener = &NoOpJournalListener::instance;
 
@@ -359,4 +379,4 @@ typedef std::unique_ptr<WiredTigerSession,
     UniqueWiredTigerSession;
 
 extern const std::string kWTRepairMsg;
-}  // namespace
+}  // namespace mongo

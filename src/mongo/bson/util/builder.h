@@ -32,24 +32,24 @@
 #include <cfloat>
 #include <cinttypes>
 #include <cstdint>
+#include <cstdio>
+#include <cstring>
 #include <sstream>
-#include <stdio.h>
-#include <string.h>
 #include <string>
+#include <type_traits>
 
 #include <boost/optional.hpp>
 
 #include "mongo/base/data_type_endian.h"
 #include "mongo/base/data_view.h"
-#include "mongo/base/disallow_copying.h"
 #include "mongo/base/static_assert.h"
 #include "mongo/base/string_data.h"
 #include "mongo/bson/bsontypes.h"
-#include "mongo/bson/inline_decls.h"
 #include "mongo/platform/decimal128.h"
 #include "mongo/stdx/type_traits.h"
 #include "mongo/util/allocator.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/concepts.h"
 #include "mongo/util/itoa.h"
 #include "mongo/util/shared_buffer.h"
 
@@ -76,7 +76,8 @@ template <typename Allocator>
 class StringBuilderImpl;
 
 class SharedBufferAllocator {
-    MONGO_DISALLOW_COPYING(SharedBufferAllocator);
+    SharedBufferAllocator(const SharedBufferAllocator&) = delete;
+    SharedBufferAllocator& operator=(const SharedBufferAllocator&) = delete;
 
 public:
     SharedBufferAllocator() = default;
@@ -111,7 +112,8 @@ private:
 };
 
 class StackAllocator {
-    MONGO_DISALLOW_COPYING(StackAllocator);
+    StackAllocator(const StackAllocator&) = delete;
+    StackAllocator& operator=(const StackAllocator&) = delete;
 
 public:
     StackAllocator() = default;
@@ -153,9 +155,9 @@ private:
 };
 
 template <class BufferAllocator>
-class _BufBuilder {
+class BasicBufBuilder {
 public:
-    _BufBuilder(int initsize = 512) : size(initsize) {
+    BasicBufBuilder(int initsize = 512) : size(initsize) {
         if (size > 0) {
             _buf.malloc(size);
         }
@@ -198,6 +200,7 @@ public:
     }
 
     /* assume ownership of the buffer */
+    REQUIRES_FOR_NON_TEMPLATE(std::is_same_v<BufferAllocator, SharedBufferAllocator>)
     SharedBuffer release() {
         return _buf.release();
     }
@@ -245,10 +248,8 @@ public:
         appendNumImpl(high);
     }
 
-    template <typename Int64_t,
-              typename = stdx::enable_if_t<std::is_same<Int64_t, int64_t>::value &&
-                                           !std::is_same<int64_t, long long>::value>>
-    void appendNum(Int64_t j) {
+    REQUIRES_FOR_NON_TEMPLATE(!std::is_same_v<int64_t, long long>)
+    void appendNum(int64_t j) {
         appendNumImpl(j);
     }
 
@@ -321,8 +322,8 @@ public:
      * Replaces the buffer backing this BufBuilder with the passed in SharedBuffer.
      * Only legal to call when this builder is empty and when the SharedBuffer isn't shared.
      */
+    REQUIRES_FOR_NON_TEMPLATE(std::is_same_v<BufferAllocator, SharedBufferAllocator>)
     void useSharedBuffer(SharedBuffer buf) {
-        MONGO_STATIC_ASSERT(std::is_same<BufferAllocator, SharedBufferAllocator>());
         invariant(l == 0);  // Can only do this while empty.
         invariant(reservedBytes == 0);
         size = buf.capacity();
@@ -339,20 +340,7 @@ private:
         DataView(grow(sizeof(t))).write(tagLittleEndian(t));
     }
     /* "slow" portion of 'grow()'  */
-    void NOINLINE_DECL grow_reallocate(int minSize) {
-        if (minSize > BufferMaxSize) {
-            std::stringstream ss;
-            ss << "BufBuilder attempted to grow() to " << minSize << " bytes, past the 64MB limit.";
-            msgasserted(13548, ss.str().c_str());
-        }
-
-        int a = 64;
-        while (a < minSize)
-            a = a * 2;
-
-        _buf.realloc(a);
-        size = a;
-    }
+    void grow_reallocate(int minSize);
 
     BufferAllocator _buf;
     int l;
@@ -362,8 +350,8 @@ private:
     friend class StringBuilderImpl<BufferAllocator>;
 };
 
-typedef _BufBuilder<SharedBufferAllocator> BufBuilder;
-MONGO_STATIC_ASSERT(std::is_move_constructible<BufBuilder>::value);
+using BufBuilder = BasicBufBuilder<SharedBufferAllocator>;
+MONGO_STATIC_ASSERT(std::is_move_constructible_v<BufBuilder>);
 
 /** The StackBufBuilder builds smaller datasets on the stack instead of using malloc.
       this can be significantly faster for small bufs.  However, you can not release() the
@@ -372,9 +360,9 @@ MONGO_STATIC_ASSERT(std::is_move_constructible<BufBuilder>::value);
       nothing bad would happen.  In fact in some circumstances this might make sense, say,
       embedded in some other object.
 */
-class StackBufBuilder : public _BufBuilder<StackAllocator> {
+class StackBufBuilder : public BasicBufBuilder<StackAllocator> {
 public:
-    StackBufBuilder() : _BufBuilder<StackAllocator>(StackAllocator::SZ) {}
+    StackBufBuilder() : BasicBufBuilder<StackAllocator>(StackAllocator::SZ) {}
     void release() = delete;  // not allowed. not implemented.
 };
 MONGO_STATIC_ASSERT(!std::is_move_constructible<StackBufBuilder>::value);
@@ -470,7 +458,8 @@ public:
         verify(z >= 0);
         verify(z < maxSize);
         _buf.l = prev + z;
-        if (strchr(start, '.') == 0 && strchr(start, 'E') == 0 && strchr(start, 'N') == 0) {
+        if (strchr(start, '.') == nullptr && strchr(start, 'E') == nullptr &&
+            strchr(start, 'N') == nullptr) {
             write(".0", 2);
         }
     }
@@ -506,7 +495,6 @@ public:
     }
 
 private:
-    _BufBuilder<Allocator> _buf;
     template <typename T>
     StringBuilderImpl& appendIntegral(T val, int maxSize) {
         MONGO_STATIC_ASSERT(!std::is_same<T, char>());  // char shouldn't append as number.
@@ -531,8 +519,16 @@ private:
         _buf.l = prev + z;
         return *this;
     }
+
+    BasicBufBuilder<Allocator> _buf;
 };
 
-typedef StringBuilderImpl<SharedBufferAllocator> StringBuilder;
-typedef StringBuilderImpl<StackAllocator> StackStringBuilder;
+using StringBuilder = StringBuilderImpl<SharedBufferAllocator>;
+using StackStringBuilder = StringBuilderImpl<StackAllocator>;
+
+extern template class BasicBufBuilder<SharedBufferAllocator>;
+extern template class BasicBufBuilder<StackAllocator>;
+extern template class StringBuilderImpl<SharedBufferAllocator>;
+extern template class StringBuilderImpl<StackAllocator>;
+
 }  // namespace mongo

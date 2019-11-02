@@ -13,10 +13,8 @@ selector:
   # may insert unexpected operations into the profile collection.
   - jstests/core/profile_list_collections.js
   - jstests/core/profile_list_indexes.js
-  - jstests/core/profile_repair_cursor.js
   - jstests/core/recursion.js
   - jstests/core/system_profile.js
-  - jstests/core/temp_cleanup.js
   # operation_latency_histogram.js and geo_s2cursorlimitskip.js do not expect concurrent reads
   # against their test collections.
   - jstests/core/operation_latency_histogram.js
@@ -38,24 +36,6 @@ selector:
   - jstests/core/txns/transactions_profiling.js
   # The downstream syncing node affects the top output.
   - jstests/core/top.js
-  # TODO (SERVER-36492): Unblacklist when we correctly reconstruct prepared transactions after
-  # initial sync.
-  - jstests/core/txns/abort_prepared_transaction.js
-  - jstests/core/txns/commit_prepared_transaction_errors.js
-  - jstests/core/txns/empty_prepare.js
-  - jstests/core/txns/no_new_transactions_when_prepared_transaction_in_progress.js
-  - jstests/core/txns/no_writes_to_config_transactions_with_prepared_transaction.js
-  - jstests/core/txns/prepare_conflict.js
-  - jstests/core/txns/prepare_prepared_transaction.js
-  - jstests/core/txns/prepared_transactions_do_not_block_non_conflicting_ddl.js
-  - jstests/core/txns/statement_ids_accepted.js
-  # TODO (SERVER-35865): Unblacklist when we also correctly write and apply 'commitTransaction'
-  # oplog entries, besides SERVER-36492.
-  - jstests/core/txns/commit_prepared_transaction.js
-  - jstests/core/txns/disallow_operations_on_prepared_transaction.js
-  - jstests/core/txns/ensure_active_txn_for_prepare_transaction.js
-  - jstests/core/txns/prepare_requires_fcv42.js
-  - jstests/core/txns/timestamped_reads_wait_for_prepare_oplog_visibility.js
 
 run_hook_interval: &run_hook_interval 20
 executor:
@@ -78,5 +58,6 @@ executor:
         enableTestCommands: 1
         collectionClonerBatchSize: 10
         initialSyncOplogFetcherBatchSize: 10
+        logLevel: 2
     num_nodes: 2
     start_initial_sync_node: True

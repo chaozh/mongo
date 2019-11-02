@@ -33,7 +33,7 @@
 
 #include "mongo/db/storage/wiredtiger/wiredtiger_prepare_conflict.h"
 
-#include "mongo/util/fail_point_service.h"
+#include "mongo/util/fail_point.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
@@ -41,9 +41,17 @@ namespace mongo {
 // When set, simulates WT_PREPARE_CONFLICT returned from WiredTiger API calls.
 MONGO_FAIL_POINT_DEFINE(WTPrepareConflictForReads);
 
+MONGO_FAIL_POINT_DEFINE(WTSkipPrepareConflictRetries);
+
+MONGO_FAIL_POINT_DEFINE(WTPrintPrepareConflictLog);
+
 void wiredTigerPrepareConflictLog(int attempts) {
     LOG(1) << "Caught WT_PREPARE_CONFLICT, attempt " << attempts
            << ". Waiting for unit of work to commit or abort.";
+}
+
+void wiredTigerPrepareConflictFailPointLog() {
+    log() << "WTPrintPrepareConflictLog fail point enabled.";
 }
 
 }  // namespace mongo

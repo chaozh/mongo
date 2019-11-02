@@ -29,6 +29,7 @@
 
 #pragma once
 
+#include <functional>
 #include <memory>
 
 #include "mongo/base/status_with.h"
@@ -36,8 +37,7 @@
 #include "mongo/db/keys_collection_cache.h"
 #include "mongo/db/keys_collection_document.h"
 #include "mongo/db/keys_collection_manager_gen.h"
-#include "mongo/stdx/functional.h"
-#include "mongo/stdx/mutex.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/util/concurrency/notification.h"
 #include "mongo/util/duration.h"
@@ -120,7 +120,7 @@ private:
      */
     class PeriodicRunner {
     public:
-        using RefreshFunc = stdx::function<StatusWith<KeysCollectionDocument>(OperationContext*)>;
+        using RefreshFunc = std::function<StatusWith<KeysCollectionDocument>(OperationContext*)>;
 
         /**
          * Preemptively inform the monitoring thread it needs to perform a refresh. Returns an
@@ -169,7 +169,8 @@ private:
                                 std::string threadName,
                                 Milliseconds refreshInterval);
 
-        stdx::mutex _mutex;  // protects all the member variables below.
+        // protects all the member variables below.
+        Mutex _mutex = MONGO_MAKE_LATCH("PeriodicRunner::_mutex");
         std::shared_ptr<Notification<void>> _refreshRequest;
         stdx::condition_variable _refreshNeededCV;
 

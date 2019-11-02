@@ -41,12 +41,13 @@
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/db_raii.h"
+#include "mongo/db/index_builds_coordinator.h"
 #include "mongo/db/op_observer.h"
 #include "mongo/db/repl/timestamp_block.h"
 #include "mongo/db/server_options.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -79,39 +80,26 @@ std::string IndexBuilder::name() const {
     return _name;
 }
 
-Status IndexBuilder::buildInForeground(OperationContext* opCtx, Database* db) const {
-    return _buildAndHandleErrors(opCtx, db, false /*buildInBackground */, nullptr);
-}
+Status IndexBuilder::buildInForeground(OperationContext* opCtx,
+                                       Database* db,
+                                       Collection* coll) const {
+    invariant(opCtx->lockState()->isCollectionLockedForMode(coll->ns(), MODE_X));
 
-Status IndexBuilder::_buildAndHandleErrors(OperationContext* opCtx,
-                                           Database* db,
-                                           bool buildInBackground,
-                                           Lock::DBLock* dbLock) const {
-    invariant(!buildInBackground);
-    invariant(!dbLock);
-
-    const NamespaceString ns(_index["ns"].String());
-
-    Collection* coll = db->getCollection(opCtx, ns);
     // Collections should not be implicitly created by the index builder.
     fassert(40409, coll);
 
     MultiIndexBlock indexer;
 
     // The 'indexer' can throw, so ensure build cleanup occurs.
-    ON_BLOCK_EXIT([&] { indexer.cleanUpAfterBuild(opCtx, coll); });
+    ON_BLOCK_EXIT(
+        [&] { indexer.cleanUpAfterBuild(opCtx, coll, MultiIndexBlock::kNoopOnCleanUpFn); });
 
-    return _build(opCtx, buildInBackground, coll, indexer, dbLock);
+    return _build(opCtx, coll, indexer);
 }
 
 Status IndexBuilder::_build(OperationContext* opCtx,
-                            bool buildInBackground,
                             Collection* coll,
-                            MultiIndexBlock& indexer,
-                            Lock::DBLock* dbLock) const try {
-    invariant(!buildInBackground);
-    invariant(!dbLock);
-
+                            MultiIndexBlock& indexer) const try {
     auto ns = coll->ns();
 
     {
@@ -163,31 +151,65 @@ Status IndexBuilder::_build(OperationContext* opCtx,
     }
 
     {
-        Lock::CollectionLock collLock(opCtx->lockState(), ns.ns(), MODE_IX);
         // WriteConflict exceptions and statuses are not expected to escape this method.
         status = indexer.insertAllDocumentsInCollection(opCtx, coll);
-    }
-    if (!status.isOK()) {
-        return status;
-    }
-
-    status = writeConflictRetry(opCtx, "Commit index build", ns.ns(), [opCtx, coll, &indexer, &ns] {
-        WriteUnitOfWork wunit(opCtx);
-        auto status = indexer.commit(opCtx,
-                                     coll,
-                                     [opCtx, coll, &ns](const BSONObj& indexSpec) {
-                                         opCtx->getServiceContext()->getOpObserver()->onCreateIndex(
-                                             opCtx, ns, *(coll->uuid()), indexSpec, false);
-                                     },
-                                     MultiIndexBlock::kNoopOnCommitFn);
         if (!status.isOK()) {
             return status;
         }
 
-        IndexTimestampHelper::setGhostCommitTimestampForCatalogWrite(opCtx, ns);
-        wunit.commit();
-        return Status::OK();
-    });
+        status = indexer.checkConstraints(opCtx);
+        if (!status.isOK()) {
+            return status;
+        }
+    }
+
+    // Emit startIndexBuild and commitIndexBuild oplog entries if supported by the current
+    // FCV.
+    auto opObserver = opCtx->getServiceContext()->getOpObserver();
+    auto fromMigrate = false;
+    auto buildUUID = serverGlobalParams.featureCompatibility.isVersionInitialized() &&
+            serverGlobalParams.featureCompatibility.getVersion() ==
+                ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo44
+        ? boost::make_optional(UUID::gen())
+        : boost::none;
+
+    if (buildUUID) {
+        opObserver->onStartIndexBuild(
+            opCtx, coll->ns(), coll->uuid(), *buildUUID, {_index}, fromMigrate);
+    }
+
+    status = writeConflictRetry(
+        opCtx,
+        "Commit index build",
+        ns.ns(),
+        [opCtx, coll, buildUUID, fromMigrate, &spec = _index, &indexer, &ns] {
+            WriteUnitOfWork wunit(opCtx);
+
+            auto status = indexer.commit(
+                opCtx,
+                coll,
+                [opCtx, coll, buildUUID, fromMigrate, &ns](const BSONObj& indexSpec) {
+                    // If two phase index builds are enabled, the index build will be coordinated
+                    // using startIndexBuild and commitIndexBuild oplog entries.
+                    if (!IndexBuildsCoordinator::get(opCtx)->supportsTwoPhaseIndexBuild()) {
+                        opCtx->getServiceContext()->getOpObserver()->onCreateIndex(
+                            opCtx, ns, coll->uuid(), indexSpec, fromMigrate);
+                    }
+                },
+                [opCtx, coll, buildUUID, fromMigrate, &spec, &ns] {
+                    if (buildUUID) {
+                        opCtx->getServiceContext()->getOpObserver()->onCommitIndexBuild(
+                            opCtx, coll->ns(), coll->uuid(), *buildUUID, {spec}, fromMigrate);
+                    }
+                });
+            if (!status.isOK()) {
+                return status;
+            }
+
+            IndexTimestampHelper::setGhostCommitTimestampForCatalogWrite(opCtx, ns);
+            wunit.commit();
+            return Status::OK();
+        });
     if (!status.isOK()) {
         return status;
     }

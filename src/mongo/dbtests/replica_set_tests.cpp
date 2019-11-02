@@ -37,7 +37,7 @@
 #include "mongo/db/repl/replication_coordinator_external_state_impl.h"
 #include "mongo/db/repl/replication_process.h"
 #include "mongo/db/repl/replication_recovery.h"
-#include "mongo/db/repl/storage_interface_mock.h"
+#include "mongo/db/repl/storage_interface_impl.h"
 #include "mongo/db/service_context.h"
 #include "mongo/unittest/unittest.h"
 
@@ -52,20 +52,21 @@ class ReplicaSetTest : public mongo::unittest::Test {
 protected:
     void setUp() {
         auto opCtx = makeOpCtx();
-        _storageInterface = stdx::make_unique<repl::StorageInterfaceMock>();
+        _storageInterface = std::make_unique<repl::StorageInterfaceImpl>();
         _dropPendingCollectionReaper =
-            stdx::make_unique<repl::DropPendingCollectionReaper>(_storageInterface.get());
+            std::make_unique<repl::DropPendingCollectionReaper>(_storageInterface.get());
         auto consistencyMarkers =
-            stdx::make_unique<repl::ReplicationConsistencyMarkersImpl>(_storageInterface.get());
-        auto recovery = stdx::make_unique<repl::ReplicationRecoveryImpl>(_storageInterface.get(),
-                                                                         consistencyMarkers.get());
-        _replicationProcess = stdx::make_unique<repl::ReplicationProcess>(
+            std::make_unique<repl::ReplicationConsistencyMarkersImpl>(_storageInterface.get());
+        auto recovery = std::make_unique<repl::ReplicationRecoveryImpl>(_storageInterface.get(),
+                                                                        consistencyMarkers.get());
+        _replicationProcess = std::make_unique<repl::ReplicationProcess>(
             _storageInterface.get(), std::move(consistencyMarkers), std::move(recovery));
-        _replCoordExternalState = stdx::make_unique<repl::ReplicationCoordinatorExternalStateImpl>(
+        _replCoordExternalState = std::make_unique<repl::ReplicationCoordinatorExternalStateImpl>(
             opCtx->getServiceContext(),
             _dropPendingCollectionReaper.get(),
             _storageInterface.get(),
             _replicationProcess.get());
+        ASSERT_OK(_replCoordExternalState->createLocalLastVoteCollection(opCtx.get()));
     }
 
     void tearDown() {
@@ -96,6 +97,8 @@ private:
 
 TEST_F(ReplicaSetTest, ReplCoordExternalStateStoresLastVoteWithNewTerm) {
     auto opCtx = makeOpCtx();
+    // Methods that do writes as part of elections expect Flow Control to be disabled.
+    opCtx->setShouldParticipateInFlowControl(false);
     auto replCoordExternalState = getReplCoordExternalState();
 
     replCoordExternalState->storeLocalLastVoteDocument(opCtx.get(), repl::LastVote{2, 1})
@@ -117,6 +120,8 @@ TEST_F(ReplicaSetTest, ReplCoordExternalStateStoresLastVoteWithNewTerm) {
 
 TEST_F(ReplicaSetTest, ReplCoordExternalStateDoesNotStoreLastVoteWithOldTerm) {
     auto opCtx = makeOpCtx();
+    // Methods that do writes as part of elections expect Flow Control to be disabled.
+    opCtx->setShouldParticipateInFlowControl(false);
     auto replCoordExternalState = getReplCoordExternalState();
 
     replCoordExternalState->storeLocalLastVoteDocument(opCtx.get(), repl::LastVote{2, 1})
@@ -138,6 +143,8 @@ TEST_F(ReplicaSetTest, ReplCoordExternalStateDoesNotStoreLastVoteWithOldTerm) {
 
 TEST_F(ReplicaSetTest, ReplCoordExternalStateDoesNotStoreLastVoteWithEqualTerm) {
     auto opCtx = makeOpCtx();
+    // Methods that do writes as part of elections expect Flow Control to be disabled.
+    opCtx->setShouldParticipateInFlowControl(false);
     auto replCoordExternalState = getReplCoordExternalState();
 
     replCoordExternalState->storeLocalLastVoteDocument(opCtx.get(), repl::LastVote{2, 1})

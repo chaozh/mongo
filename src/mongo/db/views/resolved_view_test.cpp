@@ -35,9 +35,9 @@
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/bson/json.h"
+#include "mongo/db/exec/document_value/document.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/pipeline/aggregation_request.h"
-#include "mongo/db/pipeline/document.h"
 #include "mongo/db/views/resolved_view.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/unittest/unittest.h"
@@ -57,9 +57,8 @@ TEST(ResolvedViewTest, ExpandingAggRequestWithEmptyPipelineOnNoOpViewYieldsEmpty
     AggregationRequest requestOnView{viewNss, emptyPipeline};
 
     auto result = resolvedView.asExpandedViewAggregation(requestOnView);
-    BSONObj expected =
-        BSON("aggregate" << backingNss.coll() << "pipeline" << BSONArray() << "cursor"
-                         << kDefaultCursorOptionDocument);
+    BSONObj expected = BSON("aggregate" << backingNss.coll() << "pipeline" << BSONArray()
+                                        << "cursor" << kDefaultCursorOptionDocument);
     ASSERT_BSONOBJ_EQ(result.serializeToCommandObj().toBson(), expected);
 }
 
@@ -72,8 +71,7 @@ TEST(ResolvedViewTest, ExpandingAggRequestWithNonemptyPipelineAppendsToViewPipel
 
     BSONObj expected = BSON("aggregate" << backingNss.coll() << "pipeline"
                                         << BSON_ARRAY(BSON("skip" << 7) << BSON("limit" << 3))
-                                        << "cursor"
-                                        << kDefaultCursorOptionDocument);
+                                        << "cursor" << kDefaultCursorOptionDocument);
     ASSERT_BSONOBJ_EQ(result.serializeToCommandObj().toBson(), expected);
 }
 
@@ -175,15 +173,6 @@ TEST(ResolvedViewTest, ExpandingAggRequestPreservesDefaultCollationOfView) {
                            << "fr_CA"));
 }
 
-TEST(ResolvedViewTest, ExpandingAggRequestPreservesComment) {
-    const ResolvedView resolvedView{backingNss, emptyPipeline, kSimpleCollation};
-    AggregationRequest aggRequest(viewNss, {});
-    aggRequest.setComment("agg_comment");
-
-    auto result = resolvedView.asExpandedViewAggregation(aggRequest);
-    ASSERT_EQ(result.getComment(), "agg_comment");
-}
-
 TEST(ResolvedViewTest, FromBSONFailsIfMissingResolvedView) {
     BSONObj badCmdResponse = BSON("x" << 1);
     ASSERT_THROWS_CODE(ResolvedView::fromBSON(badCmdResponse), AssertionException, 40248);
@@ -216,9 +205,8 @@ TEST(ResolvedViewTest, FromBSONFailsOnInvalidPipelineType) {
 }
 
 TEST(ResolvedViewTest, FromBSONFailsOnInvalidCollationType) {
-    BSONObj badCmdResponse =
-        BSON("resolvedView" << BSON(
-                 "ns" << backingNss.ns() << "pipeline" << BSONArray() << "collation" << 1));
+    BSONObj badCmdResponse = BSON("resolvedView" << BSON("ns" << backingNss.ns() << "pipeline"
+                                                              << BSONArray() << "collation" << 1));
     ASSERT_THROWS_CODE(ResolvedView::fromBSON(badCmdResponse), AssertionException, 40639);
 }
 
@@ -234,10 +222,10 @@ TEST(ResolvedViewTest, FromBSONSuccessfullyParsesEmptyBSONArrayIntoEmptyVector) 
 }
 
 TEST(ResolvedViewTest, FromBSONSuccessfullyParsesCollation) {
-    BSONObj cmdResponse = BSON(
-        "resolvedView" << BSON("ns" << backingNss.ns() << "pipeline" << BSONArray() << "collation"
-                                    << BSON("locale"
-                                            << "fil")));
+    BSONObj cmdResponse = BSON("resolvedView" << BSON("ns" << backingNss.ns() << "pipeline"
+                                                           << BSONArray() << "collation"
+                                                           << BSON("locale"
+                                                                   << "fil")));
     const ResolvedView result = ResolvedView::fromBSON(cmdResponse);
     ASSERT_EQ(result.getNamespace(), backingNss);
     ASSERT(std::equal(emptyPipeline.begin(),
@@ -257,8 +245,7 @@ TEST(ResolvedViewTest, FromBSONSuccessfullyParsesPopulatedBSONArrayIntoVector) {
     BSONArray pipeline = BSON_ARRAY(matchStage << sortStage << limitStage);
     BSONObj cmdResponse = BSON("resolvedView" << BSON("ns"
                                                       << "testdb.testcoll"
-                                                      << "pipeline"
-                                                      << pipeline));
+                                                      << "pipeline" << pipeline));
 
     const ResolvedView result = ResolvedView::fromBSON(cmdResponse);
     ASSERT_EQ(result.getNamespace(), backingNss);
@@ -274,8 +261,7 @@ TEST(ResolvedViewTest, IsResolvedViewErrorResponseDetectsKickbackErrorCodeSucces
     BSONObj errorResponse =
         BSON("ok" << 0 << "code" << ErrorCodes::CommandOnShardedViewNotSupportedOnMongod << "errmsg"
                   << "This view is sharded and cannot be run on mongod"
-                  << "resolvedView"
-                  << BSON("ns" << backingNss.ns() << "pipeline" << BSONArray()));
+                  << "resolvedView" << BSON("ns" << backingNss.ns() << "pipeline" << BSONArray()));
     auto status = getStatusFromCommandResult(errorResponse);
     ASSERT_EQ(status, ErrorCodes::CommandOnShardedViewNotSupportedOnMongod);
     ASSERT(status.extraInfo<ResolvedView>());

@@ -38,6 +38,7 @@
 #include "mongo/bson/bsonelement_comparator.h"
 #include "mongo/bson/mutable/document.h"
 #include "mongo/bson/mutable/mutable_bson_test_utils.h"
+#include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/field_ref.h"
 #include "mongo/db/json.h"
 #include "mongo/db/pipeline/expression_context_for_test.h"
@@ -50,7 +51,7 @@
     try {                                                                          \
         EXPRESSION;                                                                \
     } catch (const AssertionException& e) {                                        \
-        ::mongoutils::str::stream err;                                             \
+        ::mongo::str::stream err;                                                  \
         err << "Threw an exception incorrectly: " << e.toString();                 \
         ::mongo::unittest::TestAssertionFailure(__FILE__, __LINE__, err).stream(); \
     }
@@ -58,7 +59,7 @@
 namespace mongo {
 namespace {
 
-using mongoutils::str::stream;
+using str::stream;
 using unittest::assertGet;
 
 TEST(Parse, Normal) {
@@ -66,7 +67,7 @@ TEST(Parse, Normal) {
     UpdateDriver driver(expCtx);
     std::map<StringData, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
     ASSERT_DOES_NOT_THROW(driver.parse(fromjson("{$set:{a:1}}"), arrayFilters));
-    ASSERT_FALSE(driver.isDocReplacement());
+    ASSERT_FALSE(driver.type() == UpdateDriver::UpdateType::kReplacement);
 }
 
 TEST(Parse, MultiMods) {
@@ -74,7 +75,7 @@ TEST(Parse, MultiMods) {
     UpdateDriver driver(expCtx);
     std::map<StringData, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
     ASSERT_DOES_NOT_THROW(driver.parse(fromjson("{$set:{a:1, b:1}}"), arrayFilters));
-    ASSERT_FALSE(driver.isDocReplacement());
+    ASSERT_FALSE(driver.type() == UpdateDriver::UpdateType::kReplacement);
 }
 
 TEST(Parse, MixingMods) {
@@ -82,7 +83,7 @@ TEST(Parse, MixingMods) {
     UpdateDriver driver(expCtx);
     std::map<StringData, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
     ASSERT_DOES_NOT_THROW(driver.parse(fromjson("{$set:{a:1}, $unset:{b:1}}"), arrayFilters));
-    ASSERT_FALSE(driver.isDocReplacement());
+    ASSERT_FALSE(driver.type() == UpdateDriver::UpdateType::kReplacement);
 }
 
 TEST(Parse, ObjectReplacment) {
@@ -90,7 +91,30 @@ TEST(Parse, ObjectReplacment) {
     UpdateDriver driver(expCtx);
     std::map<StringData, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
     ASSERT_DOES_NOT_THROW(driver.parse(fromjson("{obj: \"obj replacement\"}"), arrayFilters));
-    ASSERT_TRUE(driver.isDocReplacement());
+    ASSERT_TRUE(driver.type() == UpdateDriver::UpdateType::kReplacement);
+}
+
+TEST(Parse, ParseUpdateWithPipeline) {
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    UpdateDriver driver(expCtx);
+    std::map<StringData, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    auto updateObj = BSON("u" << BSON_ARRAY(BSON("$addFields" << BSON("a" << 1))));
+    ASSERT_DOES_NOT_THROW(driver.parse(updateObj["u"], arrayFilters));
+    ASSERT_TRUE(driver.type() == UpdateDriver::UpdateType::kPipeline);
+}
+
+TEST(Parse, ParseUpdateWithPipelineAndVariables) {
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    UpdateDriver driver(expCtx);
+    std::map<StringData, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    const auto variables = BSON("var1" << 1 << "var2"
+                                       << "foo");
+    auto updateObj = BSON("u" << BSON_ARRAY(BSON("$set" << BSON("a"
+                                                                << "$$var1"
+                                                                << "b"
+                                                                << "$$var2"))));
+    ASSERT_DOES_NOT_THROW(driver.parse(updateObj["u"], arrayFilters, variables));
+    ASSERT_TRUE(driver.type() == UpdateDriver::UpdateType::kPipeline);
 }
 
 TEST(Parse, EmptyMod) {
@@ -111,7 +135,8 @@ TEST(Parse, WrongMod) {
     ASSERT_THROWS_CODE_AND_WHAT(driver.parse(fromjson("{$xyz:{a:1}}"), arrayFilters),
                                 AssertionException,
                                 ErrorCodes::FailedToParse,
-                                "Unknown modifier: $xyz");
+                                "Unknown modifier: $xyz. Expected a valid update modifier or "
+                                "pipeline-style update specified as an array");
 }
 
 TEST(Parse, WrongType) {
@@ -133,7 +158,8 @@ TEST(Parse, ModsWithLaterObjReplacement) {
         driver.parse(fromjson("{$set:{a:1}, obj: \"obj replacement\"}"), arrayFilters),
         AssertionException,
         ErrorCodes::FailedToParse,
-        "Unknown modifier: obj");
+        "Unknown modifier: obj. Expected a valid update modifier or pipeline-style update "
+        "specified as an array");
 }
 
 TEST(Parse, SetOnInsert) {
@@ -141,7 +167,7 @@ TEST(Parse, SetOnInsert) {
     UpdateDriver driver(expCtx);
     std::map<StringData, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
     ASSERT_DOES_NOT_THROW(driver.parse(fromjson("{$setOnInsert:{a:1}}"), arrayFilters));
-    ASSERT_FALSE(driver.isDocReplacement());
+    ASSERT_FALSE(driver.type() == UpdateDriver::UpdateType::kReplacement);
 }
 
 TEST(Collator, SetCollationUpdatesModifierInterfaces) {
@@ -538,6 +564,7 @@ public:
         boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
         UpdateDriver driver(expCtx);
         std::map<StringData, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+
         for (const auto& filter : arrayFilterSpec) {
             auto parsedFilter = assertGet(MatchExpressionParser::parse(filter, expCtx));
             auto expr = assertGet(ExpressionWithPlaceholder::make(std::move(parsedFilter)));

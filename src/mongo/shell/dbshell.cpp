@@ -31,7 +31,12 @@
 
 #include "mongo/platform/basic.h"
 
+#include <boost/core/null_deleter.hpp>
 #include <boost/filesystem/operations.hpp>
+#include <boost/log/attributes/value_extraction.hpp>
+#include <boost/log/core.hpp>
+#include <boost/log/sinks.hpp>
+#include <cctype>
 #include <fstream>
 #include <iostream>
 #include <pcrecpp.h>
@@ -45,11 +50,20 @@
 #include "mongo/client/mongo_uri.h"
 #include "mongo/db/auth/sasl_command_constants.h"
 #include "mongo/db/client.h"
+#include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/log_process_details.h"
 #include "mongo/db/server_options.h"
 #include "mongo/logger/console_appender.h"
 #include "mongo/logger/logger.h"
+#include "mongo/logger/logv2_appender.h"
 #include "mongo/logger/message_event_utf8_encoder.h"
+#include "mongo/logv2/attribute_argument_set.h"
+#include "mongo/logv2/attributes.h"
+#include "mongo/logv2/component_settings_filter.h"
+#include "mongo/logv2/console.h"
+#include "mongo/logv2/log_domain_global.h"
+#include "mongo/logv2/log_manager.h"
+#include "mongo/logv2/text_formatter.h"
 #include "mongo/platform/atomic_word.h"
 #include "mongo/scripting/engine.h"
 #include "mongo/shell/linenoise.h"
@@ -67,8 +81,7 @@
 #include "mongo/util/scopeguard.h"
 #include "mongo/util/signal_handlers.h"
 #include "mongo/util/stacktrace.h"
-#include "mongo/util/startup_test.h"
-#include "mongo/util/stringutils.h"
+#include "mongo/util/str.h"
 #include "mongo/util/text.h"
 #include "mongo/util/version.h"
 
@@ -84,7 +97,6 @@
 using namespace std::literals::string_literals;
 using namespace mongo;
 
-std::string historyFile;
 bool gotInterrupted = false;
 bool inMultiLine = false;
 static AtomicWord<bool> atPrompt(false);  // can eval before getting to prompt
@@ -99,13 +111,105 @@ const std::string kDefaultMongoURL = "mongodb://"s + kDefaultMongoHost + ":"s + 
 // to the latest version because there is no feature gating that currently occurs at the mongo shell
 // level. The server is responsible for rejecting usages of new features if its
 // featureCompatibilityVersion is lower.
-MONGO_INITIALIZER_WITH_PREREQUISITES(SetFeatureCompatibilityVersion42, ("EndStartupOptionSetup"))
+MONGO_INITIALIZER_WITH_PREREQUISITES(SetFeatureCompatibilityVersionLatest,
+                                     ("EndStartupOptionSetup"))
 (InitializerContext* context) {
     mongo::serverGlobalParams.featureCompatibility.setVersion(
-        ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo42);
+        ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo44);
+    return Status::OK();
+}
+
+// Initialize the testCommandsEnabled server parameter to true since the mongo shell does not have
+// any test-only commands that could cause harm to the server, and it may be necessary to enable
+// this to test certain features, for example through benchRun (see SERVER-40419).
+MONGO_INITIALIZER_WITH_PREREQUISITES(EnableShellTestCommands, ("EndStartupOptionSetup"))
+(InitializerContext* context) {
+    setTestCommandsEnabled(true);
     return Status::OK();
 }
 const auto kAuthParam = "authSource"s;
+
+/**
+ * This throws away all log output while inside of a LoggingDisabledScope.
+ */
+class ShellConsoleAppender final : public logger::ConsoleAppender<logger::MessageEventEphemeral> {
+    using Base = logger::ConsoleAppender<logger::MessageEventEphemeral>;
+    friend class ShellBackend;
+
+public:
+    using Base::Base;
+
+    Status append(const Event& event) override {
+        auto lk = stdx::lock_guard(mx);
+        if (!loggingEnabled)
+            return Status::OK();
+        return Base::append(event);
+    }
+
+    struct LoggingDisabledScope {
+        LoggingDisabledScope() {
+            disableLogging();
+        }
+
+        ~LoggingDisabledScope() {
+            enableLogging();
+        }
+    };
+
+private:
+    static void enableLogging() {
+        auto lk = stdx::lock_guard(mx);
+        invariant(!loggingEnabled);
+        loggingEnabled = true;
+    }
+
+    static void disableLogging() {
+        auto lk = stdx::lock_guard(mx);
+        invariant(loggingEnabled);
+        loggingEnabled = false;
+    }
+
+    // This needs to use a mutex rather than an atomic bool because we need to ensure that no more
+    // logging will happen once we return from disable().
+    static inline Mutex mx = MONGO_MAKE_LATCH("ShellConsoleAppender::mx");
+    static inline bool loggingEnabled = true;
+};
+
+/**
+ * Logv2 equivalent of ShellConsoleAppender above. Sharing the lock and LoggingDisabledScope.
+ */
+class ShellBackend final : public boost::log::sinks::text_ostream_backend {
+public:
+    void consume(boost::log::record_view const& rec, string_type const& formatted_message) {
+        auto lk = stdx::lock_guard(ShellConsoleAppender::mx);
+        if (!ShellConsoleAppender::loggingEnabled)
+            return;
+        boost::log::sinks::text_ostream_backend::consume(rec, formatted_message);
+    }
+};
+
+/**
+ * Formatter to provide specialized formatting for logs from javascript engine
+ */
+class ShellFormatter final : private logv2::TextFormatter {
+public:
+    void operator()(boost::log::record_view const& rec, boost::log::formatting_ostream& strm) {
+        using namespace logv2;
+        using boost::log::extract;
+
+        if (extract<LogTag>(attributes::tags(), rec).get().has(LogTag::kJavascript)) {
+            StringData message = extract<StringData>(attributes::message(), rec).get();
+            const auto& attrs = extract<AttributeArgumentSet>(attributes::attributes(), rec).get();
+
+            _buffer.clear();
+            fmt::internal::vformat_to(_buffer, to_string_view(message), attrs._values);
+            strm.write(_buffer.data(), _buffer.size());
+        } else {
+            logv2::TextFormatter::operator()(rec, strm);
+        }
+    }
+};
+
 }  // namespace
 
 namespace mongo {
@@ -120,6 +224,19 @@ enum ShellExitCode : int {
 };
 
 Scope* shellMainScope;
+}  // namespace mongo
+
+bool isSessionTimedOut() {
+    static Date_t previousCommandTime = Date_t::now();
+    if (shellGlobalParams.idleSessionTimeout > Seconds(0)) {
+        const Date_t now = Date_t::now();
+
+        if (now > (previousCommandTime + shellGlobalParams.idleSessionTimeout)) {
+            return true;
+        }
+        previousCommandTime = now;
+    }
+    return false;
 }
 
 void generateCompletions(const std::string& prefix, std::vector<std::string>& all) {
@@ -129,7 +246,7 @@ void generateCompletions(const std::string& prefix, std::vector<std::string>& al
     try {
         BSONObj args = BSON("0" << prefix);
         shellMainScope->invokeSafe(
-            "function callShellAutocomplete(x) {shellAutocomplete(x)}", &args, NULL);
+            "function callShellAutocomplete(x) {shellAutocomplete(x)}", &args, nullptr);
         BSONObjBuilder b;
         shellMainScope->append(b, "", "__autocomplete__");
         BSONObj res = b.obj();
@@ -153,14 +270,7 @@ void completionHook(const char* text, linenoiseCompletions* lc) {
 }
 
 void shellHistoryInit() {
-    std::stringstream ss;
-    const char* h = shell_utils::getUserDir();
-    if (h)
-        ss << h << "/";
-    ss << ".dbshell";
-    historyFile = ss.str();
-
-    Status res = linenoiseHistoryLoad(historyFile.c_str());
+    Status res = linenoiseHistoryLoad(shell_utils::getHistoryFilePath().string().c_str());
     if (!res.isOK()) {
         error() << "Error loading history file: " << res;
     }
@@ -168,7 +278,7 @@ void shellHistoryInit() {
 }
 
 void shellHistoryDone() {
-    Status res = linenoiseHistorySave(historyFile.c_str());
+    Status res = linenoiseHistorySave(shell_utils::getHistoryFilePath().string().c_str());
     if (!res.isOK()) {
         error() << "Error saving history file: " << res;
     }
@@ -194,7 +304,10 @@ void shellHistoryAdd(const char* line) {
     // via runCommand.
     static pcrecpp::RE hiddenCommands(
         "(run|admin)Command\\s*\\(\\s*{\\s*(createUser|updateUser)\\s*:");
-    if (!hiddenHelpers.PartialMatch(line) && !hiddenCommands.PartialMatch(line)) {
+
+    static pcrecpp::RE hiddenFLEConstructor(".*Mongo\\(([\\s\\S]*)secretAccessKey([\\s\\S]*)");
+    if (!hiddenHelpers.PartialMatch(line) && !hiddenCommands.PartialMatch(line) &&
+        !hiddenFLEConstructor.PartialMatch(line)) {
         linenoiseHistoryAdd(line);
     }
 }
@@ -218,6 +331,7 @@ void quitNicely(int sig) {
 
 // the returned string is allocated with strdup() or malloc() and must be freed by calling free()
 char* shellReadline(const char* prompt, int handlesigint = 0) {
+    auto lds = ShellConsoleAppender::LoggingDisabledScope();
     atPrompt.store(true);
 
     char* ret = linenoise(prompt);
@@ -389,165 +503,8 @@ std::string getURIFromArgs(const std::string& arg,
     return parseDbHost("", "127.0.0.1");
 }
 
-static std::string OpSymbols = "~!%^&*-+=|:,<>/?.";
-
-bool isOpSymbol(char c) {
-    for (size_t i = 0; i < OpSymbols.size(); i++)
-        if (OpSymbols[i] == c)
-            return true;
-    return false;
-}
-
-bool isUseCmd(const std::string& code) {
-    std::string cmd = code;
-    if (cmd.find(" ") > 0)
-        cmd = cmd.substr(0, cmd.find(" "));
-    return cmd == "use";
-}
-
-/**
- * Skip over a quoted string, including quotes escaped with backslash
- *
- * @param code      String
- * @param start     Starting position within string, always > 0
- * @param quote     Quote character (single or double quote)
- * @return          Position of ending quote, or code.size() if no quote found
- */
-size_t skipOverString(const std::string& code, size_t start, char quote) {
-    size_t pos = start;
-    while (pos < code.size()) {
-        pos = code.find(quote, pos);
-        if (pos == std::string::npos) {
-            return code.size();
-        }
-        // We want to break if the quote we found is not escaped, but we need to make sure
-        // that the escaping backslash is not itself escaped.  Comparisons of start and pos
-        // are to keep us from reading beyond the beginning of the quoted string.
-        //
-        if (start == pos || code[pos - 1] != '\\' ||  // previous char was backslash
-            start == pos - 1 ||
-            code[pos - 2] == '\\'  // char before backslash was not another
-            ) {
-            break;  // The quote we found was not preceded by an unescaped backslash; it is real
-        }
-        ++pos;  // The quote we found was escaped with backslash, so it doesn't count
-    }
-    return pos;
-}
-
-bool isBalanced(const std::string& code) {
-    if (isUseCmd(code))
-        return true;  // don't balance "use <dbname>" in case dbname contains special chars
-    int curlyBrackets = 0;
-    int squareBrackets = 0;
-    int parens = 0;
-    bool danglingOp = false;
-
-    for (size_t i = 0; i < code.size(); i++) {
-        switch (code[i]) {
-            case '/':
-                if (i + 1 < code.size() && code[i + 1] == '/') {
-                    while (i < code.size() && code[i] != '\n')
-                        i++;
-                }
-                continue;
-            case '{':
-                curlyBrackets++;
-                break;
-            case '}':
-                if (curlyBrackets <= 0)
-                    return true;
-                curlyBrackets--;
-                break;
-            case '[':
-                squareBrackets++;
-                break;
-            case ']':
-                if (squareBrackets <= 0)
-                    return true;
-                squareBrackets--;
-                break;
-            case '(':
-                parens++;
-                break;
-            case ')':
-                if (parens <= 0)
-                    return true;
-                parens--;
-                break;
-            case '"':
-            case '\'':
-                i = skipOverString(code, i + 1, code[i]);
-                if (i >= code.size()) {
-                    return true;  // Do not let unterminated strings enter multi-line mode
-                }
-                break;
-            case '\\':
-                if (i + 1 < code.size() && code[i + 1] == '/')
-                    i++;
-                break;
-            case '+':
-            case '-':
-                if (i + 1 < code.size() && code[i + 1] == code[i]) {
-                    i++;
-                    continue;  // postfix op (++/--) can't be a dangling op
-                }
-                break;
-        }
-        if (i >= code.size()) {
-            danglingOp = false;
-            break;
-        }
-        if (isOpSymbol(code[i]))
-            danglingOp = true;
-        else if (!std::isspace(static_cast<unsigned char>(code[i])))
-            danglingOp = false;
-    }
-
-    return curlyBrackets == 0 && squareBrackets == 0 && parens == 0 && !danglingOp;
-}
-
-struct BalancedTest : public mongo::StartupTest {
-public:
-    void run() {
-        verify(isBalanced("x = 5"));
-        verify(isBalanced("function(){}"));
-        verify(isBalanced("function(){\n}"));
-        verify(!isBalanced("function(){"));
-        verify(isBalanced("x = \"{\";"));
-        verify(isBalanced("// {"));
-        verify(!isBalanced("// \n {"));
-        verify(!isBalanced("\"//\" {"));
-        verify(isBalanced("{x:/x\\//}"));
-        verify(!isBalanced("{ \\/// }"));
-        verify(isBalanced("x = 5 + y "));
-        verify(!isBalanced("x = "));
-        verify(!isBalanced("x = // hello"));
-        verify(!isBalanced("x = 5 +"));
-        verify(isBalanced(" x ++"));
-        verify(isBalanced("-- x"));
-        verify(!isBalanced("a."));
-        verify(!isBalanced("a. "));
-        verify(isBalanced("a.b"));
-
-        // SERVER-5809 and related cases --
-        verify(isBalanced("a = {s:\"\\\"\"}"));            // a = {s:"\""}
-        verify(isBalanced("db.test.save({s:\"\\\"\"})"));  // db.test.save({s:"\""})
-        verify(isBalanced("printjson(\" \\\" \")"));       // printjson(" \" ") -- SERVER-8554
-        verify(isBalanced("var a = \"\\\\\";"));           // var a = "\\";
-        verify(isBalanced("var a = (\"\\\\\") //\""));     // var a = ("\\") //"
-        verify(isBalanced("var a = (\"\\\\\") //\\\""));   // var a = ("\\") //\"
-        verify(isBalanced("var a = (\"\\\\\") //"));       // var a = ("\\") //
-        verify(isBalanced("var a = (\"\\\\\")"));          // var a = ("\\")
-        verify(isBalanced("var a = (\"\\\\\\\"\")"));      // var a = ("\\\"")
-        verify(!isBalanced("var a = (\"\\\\\" //\""));     // var a = ("\\" //"
-        verify(!isBalanced("var a = (\"\\\\\" //"));       // var a = ("\\" //
-        verify(!isBalanced("var a = (\"\\\\\""));          // var a = ("\\"
-    }
-} balanced_test;
-
 std::string finishCode(std::string code) {
-    while (!isBalanced(code)) {
+    while (!shell_utils::isBalanced(code)) {
         inMultiLine = true;
         code += "\n";
         // cancel multiline if two blank lines are entered
@@ -648,7 +605,7 @@ static void edit(const std::string& whatToEdit) {
         GetTempPathA(sizeof tempFolder, tempFolder);
         sb << tempFolder << "mongo_edit" << time(0) + i << ".js";
 #else
-        sb << "/tmp/mongo_edit" << time(0) + i << ".js";
+        sb << "/tmp/mongo_edit" << time(nullptr) + i << ".js";
 #endif
         filename = sb.str();
         if (!::mongo::shell_utils::fileExists(filename))
@@ -684,7 +641,10 @@ static void edit(const std::string& whatToEdit) {
     // Pass file to editor
     StringBuilder sb;
     sb << editor << " " << filename;
-    int ret = ::system(sb.str().c_str());
+    int ret = [&] {
+        auto lds = ShellConsoleAppender::LoggingDisabledScope();
+        return ::system(sb.str().c_str());
+    }();
     if (ret) {
         if (ret == -1) {
             int systemErrno = errno;
@@ -761,6 +721,16 @@ int _main(int argc, char* argv[], char** envp) {
     setupSignalHandlers();
     setupSignals();
 
+    logger::globalLogManager()->getGlobalDomain()->clearAppenders();
+    logger::globalLogManager()->getGlobalDomain()->attachAppender(
+        std::make_unique<ShellConsoleAppender>(
+            std::make_unique<logger::MessageEventDetailsEncoder>()));
+
+    auto& lv2Manager = logv2::LogManager::global();
+    logv2::LogDomainGlobal::ConfigurationOptions lv2Config;
+    lv2Config.makeDisabled();
+    uassertStatusOK(lv2Manager.getGlobalDomainInternal().configure(lv2Config));
+
     mongo::shell_utils::RecordMyLocation(argv[0]);
 
     mongo::runGlobalInitializersOrDie(argc, argv, envp);
@@ -785,12 +755,34 @@ int _main(int argc, char* argv[], char** envp) {
     if (!mongo::serverGlobalParams.quiet.load())
         std::cout << mongoShellVersion(VersionInfoInterface::instance()) << std::endl;
 
-    mongo::StartupTest::runTests();
+    if (!shellGlobalParams.logV2) {
+        logger::globalLogManager()
+            ->getNamedDomain("javascriptOutput")
+            ->attachAppender(std::make_unique<ShellConsoleAppender>(
+                std::make_unique<logger::MessageEventUnadornedEncoder>()));
+    } else {
+        logger::globalLogManager()->getGlobalDomain()->clearAppenders();
+        logger::globalLogManager()->getGlobalDomain()->attachAppender(
+            std::make_unique<logger::LogV2Appender<logger::MessageEventEphemeral>>(
+                &(lv2Manager.getGlobalDomain())));
+        logger::globalLogManager()
+            ->getNamedDomain("javascriptOutput")
+            ->attachAppender(std::make_unique<logger::LogV2Appender<logger::MessageEventEphemeral>>(
+                &lv2Manager.getGlobalDomain(), logv2::LogTag::kJavascript));
 
-    logger::globalLogManager()
-        ->getNamedDomain("javascriptOutput")
-        ->attachAppender(std::make_unique<logger::ConsoleAppender<logger::MessageEventEphemeral>>(
-            std::make_unique<logger::MessageEventUnadornedEncoder>()));
+        auto consoleSink = boost::make_shared<boost::log::sinks::synchronous_sink<ShellBackend>>();
+        consoleSink->set_filter(logv2::ComponentSettingsFilter(lv2Manager.getGlobalDomain(),
+                                                               lv2Manager.getGlobalSettings()));
+        consoleSink->set_formatter(ShellFormatter());
+
+        consoleSink->locked_backend()->add_stream(
+            boost::shared_ptr<std::ostream>(&logv2::Console::out(), boost::null_deleter()));
+
+        consoleSink->locked_backend()->auto_flush();
+
+        boost::log::core::get()->add_sink(std::move(consoleSink));
+    }
+
 
     // Get the URL passed to the shell
     std::string& cmdlineURI = shellGlobalParams.url;
@@ -798,7 +790,7 @@ int _main(int argc, char* argv[], char** envp) {
     // Parse the output of getURIFromArgs which will determine if --host passed in a URI
     MongoURI parsedURI;
     parsedURI = uassertStatusOK(MongoURI::parse(getURIFromArgs(
-        cmdlineURI, escape(shellGlobalParams.dbhost), escape(shellGlobalParams.port))));
+        cmdlineURI, str::escape(shellGlobalParams.dbhost), str::escape(shellGlobalParams.port))));
 
     // TODO: add in all of the relevant shellGlobalParams to parsedURI
     parsedURI.setOptionIfNecessary("compressors"s, shellGlobalParams.networkMessageCompressors);
@@ -809,16 +801,16 @@ int _main(int argc, char* argv[], char** envp) {
 
     if (const auto authMechanisms = parsedURI.getOption("authMechanism")) {
         std::stringstream ss;
-        ss << "DB.prototype._defaultAuthenticationMechanism = \"" << escape(authMechanisms.get())
-           << "\";" << std::endl;
-        mongo::shell_utils::_dbConnect += ss.str();
+        ss << "DB.prototype._defaultAuthenticationMechanism = \""
+           << str::escape(authMechanisms.get()) << "\";" << std::endl;
+        mongo::shell_utils::dbConnect += ss.str();
     }
 
     if (const auto gssapiServiveName = parsedURI.getOption("gssapiServiceName")) {
         std::stringstream ss;
-        ss << "DB.prototype._defaultGssapiServiceName = \"" << escape(gssapiServiveName.get())
+        ss << "DB.prototype._defaultGssapiServiceName = \"" << str::escape(gssapiServiveName.get())
            << "\";" << std::endl;
-        mongo::shell_utils::_dbConnect += ss.str();
+        mongo::shell_utils::dbConnect += ss.str();
     }
 
     if (!shellGlobalParams.nodb) {  // connect to db
@@ -855,7 +847,7 @@ int _main(int argc, char* argv[], char** envp) {
             ss << "db = db.getMongo().startSession().getDatabase(db.getName());" << std::endl;
         }
 
-        mongo::shell_utils::_dbConnect += ss.str();
+        mongo::shell_utils::dbConnect += ss.str();
     }
 
     mongo::ScriptEngine::setConnectCallback(mongo::shell_utils::onConnect);
@@ -880,9 +872,9 @@ int _main(int argc, char* argv[], char** envp) {
     rcGlobalLocation = "/etc/mongorc.js";
 #else
     wchar_t programDataPath[MAX_PATH];
-    if (S_OK == SHGetFolderPathW(NULL, CSIDL_COMMON_APPDATA, NULL, 0, programDataPath)) {
-        rcGlobalLocation = str::stream() << toUtf8String(programDataPath)
-                                         << "\\MongoDB\\mongorc.js";
+    if (S_OK == SHGetFolderPathW(nullptr, CSIDL_COMMON_APPDATA, nullptr, 0, programDataPath)) {
+        rcGlobalLocation = str::stream()
+            << toUtf8String(programDataPath) << "\\MongoDB\\mongorc.js";
     }
 #endif
     if (!rcGlobalLocation.empty() && ::mongo::shell_utils::fileExists(rcGlobalLocation)) {
@@ -934,7 +926,7 @@ int _main(int argc, char* argv[], char** envp) {
                 "function() { return typeof TestData === 'object' && TestData !== null && "
                 "TestData.hasOwnProperty('failIfUnterminatedProcesses') && "
                 "TestData.failIfUnterminatedProcesses; }"_sd;
-            shellMainScope->invokeSafe(code.rawData(), 0, 0);
+            shellMainScope->invokeSafe(code.rawData(), nullptr, nullptr);
             failIfUnterminatedProcesses = shellMainScope->getBoolean("__returnValue");
 
             if (failIfUnterminatedProcesses) {
@@ -958,13 +950,13 @@ int _main(int argc, char* argv[], char** envp) {
         std::string rcLocation;
         if (!shellGlobalParams.norc) {
 #ifndef _WIN32
-            if (getenv("HOME") != NULL)
+            if (getenv("HOME") != nullptr)
                 rcLocation = str::stream() << getenv("HOME") << "/.mongorc.js";
 #else
-            if (getenv("HOMEDRIVE") != NULL && getenv("HOMEPATH") != NULL)
-                rcLocation = str::stream() << toUtf8String(_wgetenv(L"HOMEDRIVE"))
-                                           << toUtf8String(_wgetenv(L"HOMEPATH"))
-                                           << "\\.mongorc.js";
+            if (getenv("HOMEDRIVE") != nullptr && getenv("HOMEPATH") != nullptr)
+                rcLocation = str::stream()
+                    << toUtf8String(_wgetenv(L"HOMEDRIVE")) << toUtf8String(_wgetenv(L"HOMEPATH"))
+                    << "\\.mongorc.js";
 #endif
             if (!rcLocation.empty() && ::mongo::shell_utils::fileExists(rcLocation)) {
                 hasMongoRC = true;
@@ -998,6 +990,12 @@ int _main(int argc, char* argv[], char** envp) {
 
             scope->exec("shellHelper( 'show', 'automationNotices' )",
                         "(automationnotices)",
+                        false,
+                        true,
+                        false);
+
+            scope->exec("shellHelper( 'show', 'nonGenuineMongoDBCheck' )",
+                        "(nonGenuineMongoDBCheck)",
                         false,
                         true,
                         false);
@@ -1045,6 +1043,15 @@ int _main(int argc, char* argv[], char** envp) {
                 free(line);
                 break;
             }
+
+            // Support idle session lifetime limits
+            if (isSessionTimedOut()) {
+                std::cout << "Idle Connection Timeout: Shell session has expired" << std::endl;
+                if (line)
+                    free(line);
+                break;
+            }
+
             if (code == "cls") {
                 free(line);
                 linenoiseClearScreen();

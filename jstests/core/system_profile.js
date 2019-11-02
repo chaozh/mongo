@@ -1,9 +1,11 @@
 // @tags: [
 //   does_not_support_stepdowns,
+//   requires_capped,
+//   requires_collstats,
 //   requires_non_retryable_commands,
 //   requires_non_retryable_writes,
-//   requires_collstats,
-//   requires_capped,
+//   requires_profiling,
+//   uses_map_reduce_with_temp_collections,
 // ]
 
 // Test various user operations against "system.profile" collection.  SERVER-18111.
@@ -43,7 +45,7 @@ assert.commandFailed(testDB.system.profile.runCommand("findAndModify", {query: {
 
 // Using mapReduce to write to "system.profile" should fail.
 assert.commandWorked(testDB.dropDatabase());
-assert.writeOK(testDB.foo.insert({val: 1}));
+assert.commandWorked(testDB.foo.insert({val: 1}));
 assert.commandFailed(testDB.foo.runCommand("mapReduce", {
     map: function() {
         emit(0, this.val);
@@ -56,7 +58,7 @@ assert.commandFailed(testDB.foo.runCommand("mapReduce", {
 
 // Using aggregate to write to "system.profile" should fail.
 assert.commandWorked(testDB.dropDatabase());
-assert.writeOK(testDB.foo.insert({val: 1}));
+assert.commandWorked(testDB.foo.insert({val: 1}));
 assert.commandFailed(testDB.foo.runCommand("aggregate", {pipeline: [{$out: "system.profile"}]}));
 
 // Renaming to/from "system.profile" should fail.

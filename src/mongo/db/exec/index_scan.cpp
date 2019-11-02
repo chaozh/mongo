@@ -33,15 +33,15 @@
 
 #include "mongo/db/exec/index_scan.h"
 
+#include <memory>
+
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/exec/filter.h"
 #include "mongo/db/exec/scoped_timer.h"
-#include "mongo/db/exec/working_set_computed_data.h"
 #include "mongo/db/index/index_access_method.h"
 #include "mongo/db/index_names.h"
 #include "mongo/db/query/index_bounds_builder.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/util/log.h"
 
 namespace {
@@ -64,7 +64,7 @@ IndexScan::IndexScan(OperationContext* opCtx,
                      IndexScanParams params,
                      WorkingSet* workingSet,
                      const MatchExpression* filter)
-    : RequiresIndexStage(kStageType, opCtx, params.indexDescriptor),
+    : RequiresIndexStage(kStageType, opCtx, params.indexDescriptor, workingSet),
       _workingSet(workingSet),
       _keyPattern(params.keyPattern.getOwned()),
       _bounds(std::move(params.bounds)),
@@ -100,7 +100,14 @@ boost::optional<IndexKeyEntry> IndexScan::initIndexScan() {
         _startKey = _bounds.startKey;
         _endKey = _bounds.endKey;
         _indexCursor->setEndPosition(_endKey, _endKeyInclusive);
-        return _indexCursor->seek(_startKey, _startKeyInclusive);
+
+        KeyString::Value keyStringForSeek = IndexEntryComparison::makeKeyStringFromBSONKeyForSeek(
+            _startKey,
+            indexAccessMethod()->getSortedDataInterface()->getKeyStringVersion(),
+            indexAccessMethod()->getSortedDataInterface()->getOrdering(),
+            _forward,
+            _startKeyInclusive);
+        return _indexCursor->seek(keyStringForSeek);
     } else {
         // For single intervals, we can use an optimized scan which checks against the position
         // of an end cursor.  For all other index scans, we fall back on using
@@ -108,14 +115,24 @@ boost::optional<IndexKeyEntry> IndexScan::initIndexScan() {
         if (IndexBoundsBuilder::isSingleInterval(
                 _bounds, &_startKey, &_startKeyInclusive, &_endKey, &_endKeyInclusive)) {
             _indexCursor->setEndPosition(_endKey, _endKeyInclusive);
-            return _indexCursor->seek(_startKey, _startKeyInclusive);
+
+            auto keyStringForSeek = IndexEntryComparison::makeKeyStringFromBSONKeyForSeek(
+                _startKey,
+                indexAccessMethod()->getSortedDataInterface()->getKeyStringVersion(),
+                indexAccessMethod()->getSortedDataInterface()->getOrdering(),
+                _forward,
+                _startKeyInclusive);
+            return _indexCursor->seek(keyStringForSeek);
         } else {
             _checker.reset(new IndexBoundsChecker(&_bounds, _keyPattern, _direction));
 
             if (!_checker->getStartSeekPoint(&_seekPoint))
                 return boost::none;
-
-            return _indexCursor->seek(_seekPoint);
+            return _indexCursor->seek(IndexEntryComparison::makeKeyStringFromSeekPointForSeek(
+                _seekPoint,
+                indexAccessMethod()->getSortedDataInterface()->getKeyStringVersion(),
+                indexAccessMethod()->getSortedDataInterface()->getOrdering(),
+                _forward));
         }
     }
 }
@@ -133,7 +150,11 @@ PlanStage::StageState IndexScan::doWork(WorkingSetID* out) {
                 break;
             case NEED_SEEK:
                 ++_specificStats.seeks;
-                kv = _indexCursor->seek(_seekPoint);
+                kv = _indexCursor->seek(IndexEntryComparison::makeKeyStringFromSeekPointForSeek(
+                    _seekPoint,
+                    indexAccessMethod()->getSortedDataInterface()->getKeyStringVersion(),
+                    indexAccessMethod()->getSortedDataInterface()->getOrdering(),
+                    _forward));
                 break;
             case HIT_END:
                 return PlanStage::IS_EOF;
@@ -212,12 +233,12 @@ PlanStage::StageState IndexScan::doWork(WorkingSetID* out) {
     WorkingSetID id = _workingSet->allocate();
     WorkingSetMember* member = _workingSet->get(id);
     member->recordId = kv->loc;
-    member->keyData.push_back(IndexKeyDatum(_keyPattern, kv->key, indexAccessMethod()));
+    member->keyData.push_back(IndexKeyDatum(
+        _keyPattern, kv->key, workingSetIndexId(), getOpCtx()->recoveryUnit()->getSnapshotId()));
     _workingSet->transitionToRecordIdAndIdx(id);
 
     if (_addKeyMetadata) {
-        member->addComputed(
-            new IndexKeyComputedData(IndexKeyComputedData::rehydrateKey(_keyPattern, kv->key)));
+        member->metadata().setIndexKey(IndexKeyEntry::rehydrateKey(_keyPattern, kv->key));
     }
 
     *out = id;
@@ -260,7 +281,7 @@ std::unique_ptr<PlanStageStats> IndexScan::getStats() {
     // catalog information here.
 
     // Add a BSON representation of the filter to the stats tree, if there is one.
-    if (NULL != _filter) {
+    if (nullptr != _filter) {
         BSONObjBuilder bob;
         _filter->serialize(&bob);
         _commonStats.filter = bob.obj();
@@ -276,8 +297,8 @@ std::unique_ptr<PlanStageStats> IndexScan::getStats() {
     }
 
     std::unique_ptr<PlanStageStats> ret =
-        stdx::make_unique<PlanStageStats>(_commonStats, STAGE_IXSCAN);
-    ret->specific = stdx::make_unique<IndexScanStats>(_specificStats);
+        std::make_unique<PlanStageStats>(_commonStats, STAGE_IXSCAN);
+    ret->specific = std::make_unique<IndexScanStats>(_specificStats);
     return ret;
 }
 

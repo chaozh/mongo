@@ -36,7 +36,7 @@
 #include <fstream>
 
 #include "mongo/base/string_data.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 namespace logger {
@@ -70,7 +70,7 @@ std::wstring utf8ToWide(StringData utf8Str) {
                                         utf8Str.size(),     // Count
                                         tempBuffer.get(),   // UTF-16 output buffer
                                         utf8Str.size()      // Buffer size in wide characters
-                                        );
+    );
     // TODO(schwerin): fassert finalSize > 0?
     return std::wstring(tempBuffer.get(), finalSize);
 }
@@ -84,7 +84,8 @@ std::wstring utf8ToWide(StringData utf8Str) {
  * (2) Opening files with non-ASCII characters in their names.
  */
 class Win32FileStreambuf : public std::streambuf {
-    MONGO_DISALLOW_COPYING(Win32FileStreambuf);
+    Win32FileStreambuf(const Win32FileStreambuf&) = delete;
+    Win32FileStreambuf& operator=(const Win32FileStreambuf&) = delete;
 
 public:
     Win32FileStreambuf();
@@ -106,7 +107,8 @@ private:
  * Minimal implementation of a stream to Win32 files.
  */
 class Win32FileOStream : public std::ostream {
-    MONGO_DISALLOW_COPYING(Win32FileOStream);
+    Win32FileOStream(const Win32FileOStream&) = delete;
+    Win32FileOStream& operator=(const Win32FileOStream&) = delete;
 
 public:
     /**
@@ -136,11 +138,11 @@ bool Win32FileStreambuf::open(StringData fileName, bool append) {
     _fileHandle = CreateFileW(utf8ToWide(fileName).c_str(),         // lpFileName
                               GENERIC_WRITE,                        // dwDesiredAccess
                               FILE_SHARE_DELETE | FILE_SHARE_READ,  // dwShareMode
-                              NULL,                                 // lpSecurityAttributes
+                              nullptr,                              // lpSecurityAttributes
                               OPEN_ALWAYS,                          // dwCreationDisposition
                               FILE_ATTRIBUTE_NORMAL,                // dwFlagsAndAttributes
-                              NULL                                  // hTemplateFile
-                              );
+                              nullptr                               // hTemplateFile
+    );
 
 
     if (INVALID_HANDLE_VALUE == _fileHandle)
@@ -150,11 +152,11 @@ bool Win32FileStreambuf::open(StringData fileName, bool append) {
     zero.QuadPart = 0LL;
 
     if (append) {
-        if (SetFilePointerEx(_fileHandle, zero, NULL, FILE_END)) {
+        if (SetFilePointerEx(_fileHandle, zero, nullptr, FILE_END)) {
             return true;
         }
     } else {
-        if (SetFilePointerEx(_fileHandle, zero, NULL, FILE_BEGIN) && SetEndOfFile(_fileHandle)) {
+        if (SetFilePointerEx(_fileHandle, zero, nullptr, FILE_BEGIN) && SetEndOfFile(_fileHandle)) {
             return true;
         }
     }
@@ -169,7 +171,7 @@ std::streamsize Win32FileStreambuf::xsputn(const char* s, std::streamsize count)
 
     while (count > totalBytesWritten) {
         DWORD bytesWritten;
-        if (!WriteFile(_fileHandle, s, count - totalBytesWritten, &bytesWritten, NULL)) {
+        if (!WriteFile(_fileHandle, s, count - totalBytesWritten, &bytesWritten, nullptr)) {
             break;
         }
 
@@ -209,33 +211,27 @@ Status RotatableFileWriter::Use::rotate(bool renameOnRotate, const std::string& 
         if (renameOnRotate) {
             try {
                 if (boost::filesystem::exists(renameTarget)) {
-                    return Status(
-                        ErrorCodes::FileRenameFailed,
-                        mongoutils::str::stream() << "Renaming file " << _writer->_fileName
-                                                  << " to "
-                                                  << renameTarget
-                                                  << " failed; destination already exists");
+                    return Status(ErrorCodes::FileRenameFailed,
+                                  str::stream()
+                                      << "Renaming file " << _writer->_fileName << " to "
+                                      << renameTarget << " failed; destination already exists");
                 }
             } catch (const std::exception& e) {
-                return Status(
-                    ErrorCodes::FileRenameFailed,
-                    mongoutils::str::stream() << "Renaming file " << _writer->_fileName << " to "
-                                              << renameTarget
-                                              << " failed; Cannot verify whether destination "
-                                                 "already exists: "
-                                              << e.what());
+                return Status(ErrorCodes::FileRenameFailed,
+                              str::stream() << "Renaming file " << _writer->_fileName << " to "
+                                            << renameTarget
+                                            << " failed; Cannot verify whether destination "
+                                               "already exists: "
+                                            << e.what());
             }
 
             boost::system::error_code ec;
             boost::filesystem::rename(_writer->_fileName, renameTarget, ec);
             if (ec) {
                 return Status(ErrorCodes::FileRenameFailed,
-                              mongoutils::str::stream() << "Failed  to rename \""
-                                                        << _writer->_fileName
-                                                        << "\" to \""
-                                                        << renameTarget
-                                                        << "\": "
-                                                        << ec.message());
+                              str::stream()
+                                  << "Failed  to rename \"" << _writer->_fileName << "\" to \""
+                                  << renameTarget << "\": " << ec.message());
                 // TODO(schwerin): Make errnoWithDescription() available in the logger library, and
                 // use it here.
             }
@@ -247,13 +243,11 @@ Status RotatableFileWriter::Use::rotate(bool renameOnRotate, const std::string& 
 Status RotatableFileWriter::Use::status() {
     if (!_writer->_stream) {
         return Status(ErrorCodes::FileNotOpen,
-                      mongoutils::str::stream() << "File \"" << _writer->_fileName
-                                                << "\" not open");
+                      str::stream() << "File \"" << _writer->_fileName << "\" not open");
     }
     if (_writer->_stream->fail()) {
         return Status(ErrorCodes::FileStreamFailed,
-                      mongoutils::str::stream() << "File \"" << _writer->_fileName
-                                                << "\" in failed state");
+                      str::stream() << "File \"" << _writer->_fileName << "\" in failed state");
     }
     return Status::OK();
 }

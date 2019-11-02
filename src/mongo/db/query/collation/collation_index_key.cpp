@@ -31,14 +31,13 @@
 
 #include "mongo/db/query/collation/collation_index_key.h"
 
+#include <memory>
 #include <stack>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/bson/util/builder.h"
 #include "mongo/db/query/collation/collator_interface.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/util/assert_util.h"
 
 namespace mongo {
@@ -49,7 +48,8 @@ namespace {
 // holds necessary information for in-progress translations.  TranslateContexts are held by a
 // TranslateStack, which acts like a heap-allocated call stack.
 class TranslateContext {
-    MONGO_DISALLOW_COPYING(TranslateContext);
+    TranslateContext(const TranslateContext&) = delete;
+    TranslateContext& operator=(const TranslateContext&) = delete;
 
 public:
     TranslateContext(BSONObjIterator&& iter, BufBuilder* buf)
@@ -114,9 +114,7 @@ void translateElement(StringData fieldName,
             uasserted(ErrorCodes::CannotBuildIndexKeys,
                       str::stream()
                           << "Cannot index type Symbol with a collation. Failed to index element: "
-                          << element
-                          << ". Index collation: "
-                          << collator->getSpec().toBSON());
+                          << element << ". Index collation: " << collator->getSpec().toBSON());
         }
         default:
             out->appendAs(element, fieldName);
@@ -144,7 +142,7 @@ void translate(BSONObj obj, const CollatorInterface* collator, BufBuilder* out) 
             element.fieldNameStringData(), element, collator, &ctx.getBuilder(), &ctxStack);
     }
 }
-}
+}  // namespace
 
 void CollationIndexKey::collationAwareIndexKeyAppend(BSONElement elt,
                                                      const CollatorInterface* collator,

@@ -57,10 +57,13 @@ namespace {
  * the session ids match.
  */
 class AutoGetActiveCloner {
-    MONGO_DISALLOW_COPYING(AutoGetActiveCloner);
+    AutoGetActiveCloner(const AutoGetActiveCloner&) = delete;
+    AutoGetActiveCloner& operator=(const AutoGetActiveCloner&) = delete;
 
 public:
-    AutoGetActiveCloner(OperationContext* opCtx, const MigrationSessionId& migrationSessionId) {
+    AutoGetActiveCloner(OperationContext* opCtx,
+                        const MigrationSessionId& migrationSessionId,
+                        const bool holdCollectionLock) {
         const auto nss = ActiveMigrationsRegistry::get(opCtx).getActiveDonateChunkNss();
         uassert(ErrorCodes::NotYetInitialized, "No active migrations were found", nss);
 
@@ -71,18 +74,21 @@ public:
                 str::stream() << "Collection " << nss->ns() << " does not exist",
                 _autoColl->getCollection());
 
-        auto csr = CollectionShardingRuntime::get(opCtx, *nss);
-        _csrLock.emplace(CollectionShardingRuntime::CSRLock::lock(opCtx, csr));
+        {
+            auto csr = CollectionShardingRuntime::get(opCtx, *nss);
+            auto csrLock = CollectionShardingRuntime::CSRLock::lockShared(opCtx, csr);
 
-        if (auto msm = MigrationSourceManager::get(csr, *_csrLock)) {
-            // It is now safe to access the cloner
-            _chunkCloner = dynamic_cast<MigrationChunkClonerSourceLegacy*>(msm->getCloner());
-            invariant(_chunkCloner);
-
-        } else {
-            uasserted(ErrorCodes::IllegalOperation,
-                      str::stream() << "No active migrations were found for collection "
-                                    << nss->ns());
+            if (auto msm = MigrationSourceManager::get(csr, csrLock)) {
+                // It is now safe to access the cloner
+                _chunkCloner =
+                    std::dynamic_pointer_cast<MigrationChunkClonerSourceLegacy,
+                                              MigrationChunkClonerSource>(msm->getCloner());
+                invariant(_chunkCloner);
+            } else {
+                uasserted(ErrorCodes::IllegalOperation,
+                          str::stream()
+                              << "No active migrations were found for collection " << nss->ns());
+            }
         }
 
         // Ensure the session ids are correct
@@ -91,6 +97,10 @@ public:
                               << " does not match active session id "
                               << _chunkCloner->getSessionId().toString(),
                 migrationSessionId.matches(_chunkCloner->getSessionId()));
+
+
+        if (!holdCollectionLock)
+            _autoColl = boost::none;
     }
 
     Database* getDb() const {
@@ -105,19 +115,15 @@ public:
 
     MigrationChunkClonerSourceLegacy* getCloner() const {
         invariant(_chunkCloner);
-        return _chunkCloner;
+        return _chunkCloner.get();
     }
 
 private:
     // Scoped database + collection lock
     boost::optional<AutoGetCollection> _autoColl;
 
-    // The CollectionShardingRuntime::CSRLock corresponding to the collection to which this
-    // migration belongs.
-    boost::optional<CollectionShardingRuntime::CSRLock> _csrLock;
-
     // Contains the active cloner for the namespace
-    MigrationChunkClonerSourceLegacy* _chunkCloner;
+    std::shared_ptr<MigrationChunkClonerSourceLegacy> _chunkCloner;
 };
 
 class InitialCloneCommand : public BasicCommand {
@@ -162,7 +168,7 @@ public:
         int arrSizeAtPrevIteration = -1;
 
         while (!arrBuilder || arrBuilder->arrSize() > arrSizeAtPrevIteration) {
-            AutoGetActiveCloner autoCloner(opCtx, migrationSessionId);
+            AutoGetActiveCloner autoCloner(opCtx, migrationSessionId, true);
 
             if (!arrBuilder) {
                 arrBuilder.emplace(autoCloner.getCloner()->getCloneBatchBufferAllocationSize());
@@ -217,7 +223,7 @@ public:
         const MigrationSessionId migrationSessionId(
             uassertStatusOK(MigrationSessionId::extractFromBSON(cmdObj)));
 
-        AutoGetActiveCloner autoCloner(opCtx, migrationSessionId);
+        AutoGetActiveCloner autoCloner(opCtx, migrationSessionId, true);
 
         uassertStatusOK(autoCloner.getCloner()->nextModsBatch(opCtx, autoCloner.getDb(), &result));
         return true;
@@ -259,25 +265,37 @@ public:
         out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
     }
 
-    bool run(OperationContext* opCtx,
-             const std::string&,
-             const BSONObj& cmdObj,
-             BSONObjBuilder& result) {
-        const MigrationSessionId migrationSessionId(
-            uassertStatusOK(MigrationSessionId::extractFromBSON(cmdObj)));
-
-        BSONArrayBuilder arrBuilder;
-
+    /**
+     * Fetches the next batch of oplog that needs to be transferred and appends it to the given
+     * array builder. If it was not able to fetch anything, it will return a non-null notification
+     * that will get signalled when new batches comes in or when migration is over. If the boolean
+     * value from the notification returns true, then the migration has entered the critical
+     * section or aborted and there's no more new batches to fetch.
+     */
+    std::shared_ptr<Notification<bool>> fetchNextSessionMigrationBatch(
+        OperationContext* opCtx,
+        const MigrationSessionId& migrationSessionId,
+        BSONArrayBuilder* arrBuilder) {
         boost::optional<repl::OpTime> opTime;
+        std::shared_ptr<Notification<bool>> newOplogNotification;
 
-        writeConflictRetry(opCtx,
-                           "Fetching session related oplogs for migration",
-                           NamespaceString::kRsOplogNamespace.ns(),
-                           [&]() {
-                               AutoGetActiveCloner autoCloner(opCtx, migrationSessionId);
-                               opTime = autoCloner.getCloner()->nextSessionMigrationBatch(
-                                   opCtx, &arrBuilder);
-                           });
+        writeConflictRetry(
+            opCtx,
+            "Fetching session related oplogs for migration",
+            NamespaceString::kRsOplogNamespace.ns(),
+            [&]() {
+                AutoGetActiveCloner autoCloner(opCtx, migrationSessionId, false);
+                opTime = autoCloner.getCloner()->nextSessionMigrationBatch(opCtx, arrBuilder);
+
+                if (arrBuilder->arrSize() == 0) {
+                    newOplogNotification =
+                        autoCloner.getCloner()->getNotificationForNextSessionMigrationBatch();
+                }
+            });
+
+        if (newOplogNotification) {
+            return newOplogNotification;
+        }
 
         // If the batch returns something, we wait for write concern to ensure that all the entries
         // in the batch have been majority committed. We then need to check that the rollback id
@@ -290,7 +308,7 @@ public:
             uassertStatusOK(waitForWriteConcern(opCtx, opTime.get(), majorityWC, &wcResult));
 
             auto rollbackIdAtMigrationInit = [&]() {
-                AutoGetActiveCloner autoCloner(opCtx, migrationSessionId);
+                AutoGetActiveCloner autoCloner(opCtx, migrationSessionId, false);
                 return autoCloner.getCloner()->getRollbackIdAtInit();
             }();
 
@@ -299,13 +317,42 @@ public:
             auto rollbackId = repl::ReplicationProcess::get(opCtx)->getRollbackID();
             uassert(50881,
                     str::stream() << "rollback detected, rollbackId was "
-                                  << rollbackIdAtMigrationInit
-                                  << " but is now "
-                                  << rollbackId,
+                                  << rollbackIdAtMigrationInit << " but is now " << rollbackId,
                     rollbackId == rollbackIdAtMigrationInit);
         }
 
+        return nullptr;
+    }
+
+    bool run(OperationContext* opCtx,
+             const std::string&,
+             const BSONObj& cmdObj,
+             BSONObjBuilder& result) {
+        const MigrationSessionId migrationSessionId(
+            uassertStatusOK(MigrationSessionId::extractFromBSON(cmdObj)));
+
+        BSONArrayBuilder arrBuilder;
+        bool hasMigrationCompleted = false;
+
+        do {
+            if (auto newOplogNotification =
+                    fetchNextSessionMigrationBatch(opCtx, migrationSessionId, &arrBuilder)) {
+                hasMigrationCompleted = newOplogNotification->get(opCtx);
+            } else if (arrBuilder.arrSize() == 0) {
+                // If we didn't get a notification and the arrBuilder is empty, that means
+                // that the sessionMigration is not active for this migration (most likely
+                // because it's not a replica set).
+                hasMigrationCompleted = true;
+            }
+        } while (arrBuilder.arrSize() == 0 && !hasMigrationCompleted);
+
         result.appendArray("oplog", arrBuilder.arr());
+
+        // TODO: SERVER-40187 remove after v4.2. This is to indicate the caller that this server
+        // waits for notification on new oplog entries to send over so the caller doesn't need
+        // to throttle.
+        result.append("waitsForNewOplog", true);
+
         return true;
     }
 

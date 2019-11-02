@@ -31,11 +31,11 @@
 
 #include <array>
 #include <cmath>
+#include <memory>
 #include <string>
 #include <utility>
 
 #include "mongo/config.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
@@ -46,74 +46,75 @@ TEST(Decimal128Test, TestDefaultConstructor) {
     ASSERT_TRUE(d.isBinaryEqual(Decimal128(0)));
 }
 
-TEST(Decimal128Test, TestInt32ConstructorZero) {
-    int32_t intZero = 0;
-    Decimal128 d(intZero);
-    Decimal128::Value val = d.getValue();
-    // 0x3040000000000000 0000000000000000 = +0E+0
-    uint64_t highBytes = 0x3040000000000000ull;
-    uint64_t lowBytes = 0x0000000000000000ull;
-    ASSERT_EQUALS(val.high64, highBytes);
-    ASSERT_EQUALS(val.low64, lowBytes);
-}
+template <typename T>
+using Lim = std::numeric_limits<T>;
 
-TEST(Decimal128Test, TestInt32ConstructorMax) {
-    int32_t intMax = std::numeric_limits<int32_t>::max();
-    Decimal128 d(intMax);
-    Decimal128::Value val = d.getValue();
-    // 0x3040000000000000 000000007fffffff = +2147483647E+0
-    uint64_t highBytes = 0x3040000000000000ull;
-    uint64_t lowBytes = 0x000000007fffffffull;
-    ASSERT_EQUALS(val.high64, highBytes);
-    ASSERT_EQUALS(val.low64, lowBytes);
-}
+TEST(Decimal128Test, TestConstructor) {
+    // High bits of a positive Decimal128 with exponent 1.
+    constexpr uint64_t posHigh = 0x3040000000000000;
+    // High bits of a negative Decimal128 with exponent 1.
+    constexpr uint64_t negHigh = 0xb040000000000000;
 
-TEST(Decimal128Test, TestInt32ConstructorMin) {
-    int32_t intMin = std::numeric_limits<int32_t>::lowest();
-    Decimal128 d(intMin);
-    Decimal128::Value val = d.getValue();
-    // 0xb040000000000000 000000007fffffff = -2147483648E+0
-    uint64_t highBytes = 0xb040000000000000ull;
-    uint64_t lowBytes = 0x0000000080000000ull;
-    ASSERT_EQUALS(val.high64, highBytes);
-    ASSERT_EQUALS(val.low64, lowBytes);
-}
+#define TEST_CTOR_COMMON_(N, HIGH64, LOW64)                  \
+    {                                                        \
+        Decimal128 d{N};                                     \
+        auto dv = d.getValue();                              \
+        ASSERT_EQ(dv.high64, static_cast<uint64_t>(HIGH64)); \
+        ASSERT_EQ(dv.low64, static_cast<uint64_t>(LOW64));   \
+    }
 
-TEST(Decimal128Test, TestInt64ConstructorZero) {
-    int64_t longZero = 0;
-    Decimal128 d(longZero);
-    Decimal128::Value val = d.getValue();
-    // 0x3040000000000000 0000000000000000 = +0E+0
-    uint64_t highBytes = 0x3040000000000000ull;
-    uint64_t lowBytes = 0x0000000000000000ull;
-    ASSERT_EQUALS(val.high64, highBytes);
-    ASSERT_EQUALS(val.low64, lowBytes);
-}
+// Veriy that constructor does the same thing whether N is constexpr or not.
+// Undefined behavior in the constructor could cause divergence.
+#define TEST_CTOR(N, HIGH64, LOW64)               \
+    {                                             \
+        constexpr auto cn = N;                    \
+        TEST_CTOR_COMMON_(cn, HIGH64, LOW64)      \
+        std::add_volatile_t<decltype(cn)> vn(cn); \
+        TEST_CTOR_COMMON_(vn, HIGH64, LOW64)      \
+    }
 
-TEST(Decimal128Test, TestInt64ConstructorMax) {
-    int64_t longMax = std::numeric_limits<long long>::max();
-    Decimal128 d(longMax);
-    Decimal128::Value val = d.getValue();
-    // 0x3040000000000000 7fffffffffffffff = +9223372036854775807E+0
-    uint64_t highBytes = 0x3040000000000000ull;
-    uint64_t lowBytes = 0x7fffffffffffffffull;
-    ASSERT_EQUALS(val.high64, highBytes);
-    ASSERT_EQUALS(val.low64, lowBytes);
-}
+    TEST_CTOR(int8_t{0}, posHigh, 0);  // +0E+0
+    TEST_CTOR(Lim<int8_t>::lowest(), negHigh, uint64_t{1} << 7);
+    TEST_CTOR(Lim<int8_t>::max(), posHigh, (uint64_t{1} << 7) - 1);
+    TEST_CTOR(int8_t{5}, posHigh, 0x5);
 
-TEST(Decimal128Test, TestInt64ConstructorMin) {
-    int64_t longMin = std::numeric_limits<long long>::lowest();
-    Decimal128 d(longMin);
-    Decimal128::Value val = d.getValue();
-    // 0xb040000000000000 8000000000000000 = -9223372036854775808E+0
-    uint64_t highBytes = 0xb040000000000000;
-    uint64_t lowBytes = 0x8000000000000000;
-    ASSERT_EQUALS(val.high64, highBytes);
-    ASSERT_EQUALS(val.low64, lowBytes);
+    TEST_CTOR(uint8_t{0}, posHigh, 0);
+    TEST_CTOR(Lim<uint8_t>::max(), posHigh, (uint64_t{1} << 8) - 1);
+    TEST_CTOR(uint8_t{5}, posHigh, 0x5);
+
+    TEST_CTOR(int16_t{0}, posHigh, 0);
+    TEST_CTOR(Lim<int16_t>::lowest(), negHigh, uint64_t{1} << 15);
+    TEST_CTOR(Lim<int16_t>::max(), posHigh, (uint64_t{1} << 15) - 1);
+    TEST_CTOR(int16_t{5}, posHigh, 0x5);
+
+    TEST_CTOR(uint16_t{0}, posHigh, 0);
+    TEST_CTOR(Lim<uint16_t>::max(), posHigh, (uint64_t{1} << 16) - 1);
+    TEST_CTOR(uint16_t{5}, posHigh, 0x5);
+
+    TEST_CTOR(int32_t{0}, posHigh, 0);
+    TEST_CTOR(Lim<int32_t>::lowest(), negHigh, uint64_t{1} << 31);
+    TEST_CTOR(Lim<int32_t>::max(), posHigh, (uint64_t{1} << 31) - 1);
+    TEST_CTOR(int32_t{5}, posHigh, 0x5);
+
+    TEST_CTOR(uint32_t{0}, posHigh, 0);
+    TEST_CTOR(Lim<uint32_t>::max(), posHigh, (uint64_t{1} << 32) - 1);
+    TEST_CTOR(uint32_t{5}, posHigh, 0x5);
+
+    TEST_CTOR(int64_t{0}, posHigh, 0);
+    TEST_CTOR(Lim<int64_t>::lowest(), negHigh, uint64_t{1} << 63);
+    TEST_CTOR(Lim<int64_t>::max(), posHigh, (uint64_t{1} << 63) - 1);
+    TEST_CTOR(int64_t{5}, posHigh, 0x5);
+
+    TEST_CTOR(uint64_t{0}, posHigh, 0);
+    TEST_CTOR(Lim<uint64_t>::max(), posHigh, Lim<uint64_t>::max());
+    TEST_CTOR(uint64_t{5}, posHigh, 0x5);
+
+#undef TEST_CTOR_COMMON_
+#undef TEST_CTOR
 }
 
 TEST(Decimal128Test, TestPartsConstructor) {
-    Decimal128 expected(10);
+    constexpr Decimal128 expected(10);
     Decimal128 val(0LL, Decimal128::kExponentBias, 0LL, 10LL);
     ASSERT_EQUALS(val.getValue().low64, expected.getValue().low64);
     ASSERT_EQUALS(val.getValue().low64, expected.getValue().low64);
@@ -292,23 +293,43 @@ TEST(Decimal128Test, TestStringConstructorNaN) {
     ASSERT_EQUALS(val.low64, lowBytes);
 }
 
+TEST(Decimal128Test, TestLiteral) {
+#define ASSERT_LITERAL128(x) ASSERT_TRUE((x##_dec128).isBinaryEqual(Decimal128(#x)))
+    ASSERT_LITERAL128(5);
+    ASSERT_LITERAL128(-5);
+    ASSERT_LITERAL128(5.5);
+    ASSERT_LITERAL128(-5.5);
+    ASSERT_LITERAL128(5.1);
+    ASSERT_LITERAL128(-5.1);
+    ASSERT_LITERAL128(5.5E10);
+    ASSERT_LITERAL128(5.5E+10);
+    ASSERT_LITERAL128(5.5E-10);
+    ASSERT_LITERAL128(123456789012345678901234567890);  // 30 digits (100 bits)
+    ASSERT_LITERAL128(-123456789012345678901234567890);
+    ASSERT_LITERAL128(+123456789012345678901234567890);
+#undef ASSERT_LITERAL128
+    12345_dec128;
+}
+
 TEST(Decimal128Test, TestNonCanonicalDecimal) {
     // It is possible to encode a significand with more than 34 decimal digits.
     // Conforming implementations should not generate these, but they must be treated as zero
     // when encountered. However, the exponent and sign still matter.
 
     // 0x6c10000000000000 0000000000000000 = non-canonical 0, all ignored bits clear
-    Decimal128 nonCanonical0E0(Decimal128::Value{0, 0x6c10000000000000ull});
+    constexpr Decimal128 nonCanonical0E0(Decimal128::Value{0, 0x6c10000000000000ull});
     std::string zeroE0 = nonCanonical0E0.toString();
     ASSERT_EQUALS(zeroE0, "0");
 
     // 0xec100000deadbeef 0123456789abcdef = non-canonical -0, random stuff in ignored bits
-    Decimal128 nonCanonicalM0E0(Decimal128::Value{0x0123456789abcdefull, 0xec100000deadbeefull});
+    constexpr Decimal128 nonCanonicalM0E0(
+        Decimal128::Value{0x0123456789abcdefull, 0xec100000deadbeefull});
     std::string minusZeroE0 = nonCanonicalM0E0.toString();
     ASSERT_EQUALS(minusZeroE0, "-0");
 
     // 0x6c11fffffffffffff ffffffffffffffff = non-canonical 0.000, all ignored bits set
-    Decimal128 nonCanonical0E3(Decimal128::Value{0xffffffffffffffffull, 0x6c11ffffffffffffull});
+    constexpr Decimal128 nonCanonical0E3(
+        Decimal128::Value{0xffffffffffffffffull, 0x6c11ffffffffffffull});
     std::string zeroE3 = nonCanonical0E3.toString();
     ASSERT_EQUALS(zeroE3, "0E+3");
 
@@ -321,19 +342,19 @@ TEST(Decimal128Test, TestNonCanonicalDecimal) {
     const double minusZeroDouble = nonCanonicalM0E0.toDouble();
     ASSERT_EQUALS(minusZeroDouble, 0.0);
     ASSERT_EQUALS(-1.0, std::copysign(1.0, minusZeroDouble));
-    ASSERT_TRUE(nonCanonical0E3.add(Decimal128(1)).isEqual(Decimal128(1)));
-    ASSERT_TRUE(Decimal128(1).divide(nonCanonicalM0E0).isEqual(Decimal128::kNegativeInfinity));
+    ASSERT_TRUE(nonCanonical0E3.add(1_dec128).isEqual(1_dec128));
+    ASSERT_TRUE((1_dec128).divide(nonCanonicalM0E0).isEqual(Decimal128::kNegativeInfinity));
 }
 
 // Tests for absolute value function
 TEST(Decimal128Test, TestAbsValuePos) {
-    Decimal128 d(25);
+    constexpr Decimal128 d(25);
     Decimal128 dAbs = d.toAbs();
     ASSERT_TRUE(dAbs.isEqual(d));
 }
 
 TEST(Decimal128Test, TestAbsValueNeg) {
-    Decimal128 d(-25);
+    constexpr Decimal128 d(-25);
     Decimal128 dAbs = d.toAbs();
     ASSERT_TRUE(dAbs.isEqual(Decimal128(25)));
 }
@@ -345,7 +366,7 @@ TEST(Decimal128Test, TestDecimal128ToInt32Even) {
     int32_t out[6] = {-3, -2, -2, 2, 2, 3};
     std::unique_ptr<Decimal128> decPtr;
     for (int testNo = 0; testNo < 6; ++testNo) {
-        decPtr = stdx::make_unique<Decimal128>(in[testNo]);
+        decPtr = std::make_unique<Decimal128>(in[testNo]);
         ASSERT_EQUALS(decPtr->toInt(), out[testNo]);
     }
 }
@@ -356,7 +377,7 @@ TEST(Decimal128Test, TestDecimal128ToInt32Neg) {
     int32_t out[6] = {-3, -3, -3, 2, 2, 2};
     std::unique_ptr<Decimal128> decPtr;
     for (int testNo = 0; testNo < 6; ++testNo) {
-        decPtr = stdx::make_unique<Decimal128>(in[testNo]);
+        decPtr = std::make_unique<Decimal128>(in[testNo]);
         ASSERT_EQUALS(decPtr->toInt(roundMode), out[testNo]);
     }
 }
@@ -367,7 +388,7 @@ TEST(Decimal128Test, TestDecimal128ToInt32Pos) {
     int32_t out[6] = {-2, -2, -2, 3, 3, 3};
     std::unique_ptr<Decimal128> decPtr;
     for (int testNo = 0; testNo < 6; ++testNo) {
-        decPtr = stdx::make_unique<Decimal128>(in[testNo]);
+        decPtr = std::make_unique<Decimal128>(in[testNo]);
         ASSERT_EQUALS(decPtr->toInt(roundMode), out[testNo]);
     }
 }
@@ -378,7 +399,7 @@ TEST(Decimal128Test, TestDecimal128ToInt32Zero) {
     int32_t out[6] = {-2, -2, -2, 2, 2, 2};
     std::unique_ptr<Decimal128> decPtr;
     for (int testNo = 0; testNo < 6; ++testNo) {
-        decPtr = stdx::make_unique<Decimal128>(in[testNo]);
+        decPtr = std::make_unique<Decimal128>(in[testNo]);
         ASSERT_EQUALS(decPtr->toInt(roundMode), out[testNo]);
     }
 }
@@ -389,7 +410,7 @@ TEST(Decimal128Test, TestDecimal128ToInt32Away) {
     int32_t out[6] = {-3, -3, -2, 2, 3, 3};
     std::unique_ptr<Decimal128> decPtr;
     for (int testNo = 0; testNo < 6; ++testNo) {
-        decPtr = stdx::make_unique<Decimal128>(in[testNo]);
+        decPtr = std::make_unique<Decimal128>(in[testNo]);
         ASSERT_EQUALS(decPtr->toInt(roundMode), out[testNo]);
     }
 }
@@ -404,40 +425,44 @@ TEST(Decimal128Test, TestDecimal128ToInt64Even) {
     int64_t out[6] = {-4294967297, -4294967296, -4294967296, 4294967296, 4294967296, 4294967297};
     std::unique_ptr<Decimal128> decPtr;
     for (int testNo = 0; testNo < 6; ++testNo) {
-        decPtr = stdx::make_unique<Decimal128>(in[testNo]);
+        decPtr = std::make_unique<Decimal128>(in[testNo]);
         ASSERT_EQUALS(decPtr->toLong(), out[testNo]);
     }
 }
 
 TEST(Decimal128Test, TestDecimal128ToInt64Neg) {
     Decimal128::RoundingMode roundMode = Decimal128::RoundingMode::kRoundTowardNegative;
-    std::string in[6] = {"-4294967296.7",
-                         "-4294967296.5",
-                         "-4294967296.2",
-                         "4294967296.2",
-                         "4294967296.5",
-                         "4294967296.7"};
-    int64_t out[6] = {-4294967297, -4294967297, -4294967297, 4294967296, 4294967296, 4294967296};
-    std::unique_ptr<Decimal128> decPtr;
-    for (int testNo = 0; testNo < 6; ++testNo) {
-        decPtr = stdx::make_unique<Decimal128>(in[testNo]);
-        ASSERT_EQUALS(decPtr->toLong(roundMode), out[testNo]);
+    struct {
+        Decimal128 in;
+        int64_t out;
+    } const specs[] = {
+        {-4294967296.7_dec128, -4294967297},
+        {-4294967296.5_dec128, -4294967297},
+        {-4294967296.2_dec128, -4294967297},
+        {4294967296.2_dec128, 4294967296},
+        {4294967296.5_dec128, 4294967296},
+        {4294967296.7_dec128, 4294967296},
+    };
+    for (const auto& spec : specs) {
+        ASSERT_EQUALS(spec.in.toLong(roundMode), spec.out);
     }
 }
 
 TEST(Decimal128Test, TestDecimal128ToInt64Pos) {
     Decimal128::RoundingMode roundMode = Decimal128::RoundingMode::kRoundTowardPositive;
-    std::string in[6] = {"-4294967296.7",
-                         "-4294967296.5",
-                         "-4294967296.2",
-                         "4294967296.2",
-                         "4294967296.5",
-                         "4294967296.7"};
-    int64_t out[6] = {-4294967296, -4294967296, -4294967296, 4294967297, 4294967297, 4294967297};
-    std::unique_ptr<Decimal128> decPtr;
-    for (int testNo = 0; testNo < 6; ++testNo) {
-        decPtr = stdx::make_unique<Decimal128>(in[testNo]);
-        ASSERT_EQUALS(decPtr->toLong(roundMode), out[testNo]);
+    struct {
+        Decimal128 in;
+        int64_t out;
+    } const specs[] = {
+        {-4294967296.7_dec128, -4294967296},
+        {-4294967296.5_dec128, -4294967296},
+        {-4294967296.2_dec128, -4294967296},
+        {4294967296.2_dec128, 4294967297},
+        {4294967296.5_dec128, 4294967297},
+        {4294967296.7_dec128, 4294967297},
+    };
+    for (const auto& spec : specs) {
+        ASSERT_EQUALS(spec.in.toLong(roundMode), spec.out);
     }
 }
 
@@ -452,7 +477,7 @@ TEST(Decimal128Test, TestDecimal128ToInt64Zero) {
     int64_t out[6] = {-4294967296, -4294967296, -4294967296, 4294967296, 4294967296, 4294967296};
     std::unique_ptr<Decimal128> decPtr;
     for (int testNo = 0; testNo < 6; ++testNo) {
-        decPtr = stdx::make_unique<Decimal128>(in[testNo]);
+        decPtr = std::make_unique<Decimal128>(in[testNo]);
         ASSERT_EQUALS(decPtr->toLong(roundMode), out[testNo]);
     }
 }
@@ -468,7 +493,7 @@ TEST(Decimal128Test, TestDecimal128ToInt64Away) {
     int64_t out[6] = {-4294967297, -4294967297, -4294967296, 4294967296, 4294967297, 4294967297};
     std::unique_ptr<Decimal128> decPtr;
     for (int testNo = 0; testNo < 6; ++testNo) {
-        decPtr = stdx::make_unique<Decimal128>(in[testNo]);
+        decPtr = std::make_unique<Decimal128>(in[testNo]);
         ASSERT_EQUALS(decPtr->toLong(roundMode), out[testNo]);
     }
 }
@@ -478,7 +503,7 @@ TEST(Decimal128Test, TestDecimal128ToInt32ExactEven) {
     int32_t out[6] = {-3, -2, -2, 2, 2, 3};
     std::unique_ptr<Decimal128> decPtr;
     for (int testNo = 0; testNo < 6; ++testNo) {
-        decPtr = stdx::make_unique<Decimal128>(in[testNo]);
+        decPtr = std::make_unique<Decimal128>(in[testNo]);
         ASSERT_EQUALS(decPtr->toIntExact(), out[testNo]);
     }
 }
@@ -489,7 +514,7 @@ TEST(Decimal128Test, TestDecimal128ToInt32ExactNeg) {
     int32_t out[6] = {-3, -3, -3, 2, 2, 2};
     std::unique_ptr<Decimal128> decPtr;
     for (int testNo = 0; testNo < 6; ++testNo) {
-        decPtr = stdx::make_unique<Decimal128>(in[testNo]);
+        decPtr = std::make_unique<Decimal128>(in[testNo]);
         ASSERT_EQUALS(decPtr->toIntExact(roundMode), out[testNo]);
     }
 }
@@ -500,7 +525,7 @@ TEST(Decimal128Test, TestDecimal128ToInt32ExactPos) {
     int32_t out[6] = {-2, -2, -2, 3, 3, 3};
     std::unique_ptr<Decimal128> decPtr;
     for (int testNo = 0; testNo < 6; ++testNo) {
-        decPtr = stdx::make_unique<Decimal128>(in[testNo]);
+        decPtr = std::make_unique<Decimal128>(in[testNo]);
         ASSERT_EQUALS(decPtr->toIntExact(roundMode), out[testNo]);
     }
 }
@@ -511,7 +536,7 @@ TEST(Decimal128Test, TestDecimal128ToInt32ExactZero) {
     int32_t out[6] = {-2, -2, -2, 2, 2, 2};
     std::unique_ptr<Decimal128> decPtr;
     for (int testNo = 0; testNo < 6; ++testNo) {
-        decPtr = stdx::make_unique<Decimal128>(in[testNo]);
+        decPtr = std::make_unique<Decimal128>(in[testNo]);
         ASSERT_EQUALS(decPtr->toIntExact(roundMode), out[testNo]);
     }
 }
@@ -522,7 +547,7 @@ TEST(Decimal128Test, TestDecimal128ToInt32ExactAway) {
     int32_t out[6] = {-3, -3, -2, 2, 3, 3};
     std::unique_ptr<Decimal128> decPtr;
     for (int testNo = 0; testNo < 6; ++testNo) {
-        decPtr = stdx::make_unique<Decimal128>(in[testNo]);
+        decPtr = std::make_unique<Decimal128>(in[testNo]);
         ASSERT_EQUALS(decPtr->toIntExact(roundMode), out[testNo]);
     }
 }
@@ -537,7 +562,7 @@ TEST(Decimal128Test, TestDecimal128ToInt64ExactEven) {
     int64_t out[6] = {-4294967297, -4294967296, -4294967296, 4294967296, 4294967296, 4294967297};
     std::unique_ptr<Decimal128> decPtr;
     for (int testNo = 0; testNo < 6; ++testNo) {
-        decPtr = stdx::make_unique<Decimal128>(in[testNo]);
+        decPtr = std::make_unique<Decimal128>(in[testNo]);
         ASSERT_EQUALS(decPtr->toLongExact(), out[testNo]);
     }
 }
@@ -553,7 +578,7 @@ TEST(Decimal128Test, TestDecimal128ToInt64ExactNeg) {
     int64_t out[6] = {-4294967297, -4294967297, -4294967297, 4294967296, 4294967296, 4294967296};
     std::unique_ptr<Decimal128> decPtr;
     for (int testNo = 0; testNo < 6; ++testNo) {
-        decPtr = stdx::make_unique<Decimal128>(in[testNo]);
+        decPtr = std::make_unique<Decimal128>(in[testNo]);
         ASSERT_EQUALS(decPtr->toLongExact(roundMode), out[testNo]);
     }
 }
@@ -569,7 +594,7 @@ TEST(Decimal128Test, TestDecimal128ToInt64ExactPos) {
     int64_t out[6] = {-4294967296, -4294967296, -4294967296, 4294967297, 4294967297, 4294967297};
     std::unique_ptr<Decimal128> decPtr;
     for (int testNo = 0; testNo < 6; ++testNo) {
-        decPtr = stdx::make_unique<Decimal128>(in[testNo]);
+        decPtr = std::make_unique<Decimal128>(in[testNo]);
         ASSERT_EQUALS(decPtr->toLongExact(roundMode), out[testNo]);
     }
 }
@@ -585,7 +610,7 @@ TEST(Decimal128Test, TestDecimal128ToInt64ExactZero) {
     int64_t out[6] = {-4294967296, -4294967296, -4294967296, 4294967296, 4294967296, 4294967296};
     std::unique_ptr<Decimal128> decPtr;
     for (int testNo = 0; testNo < 6; ++testNo) {
-        decPtr = stdx::make_unique<Decimal128>(in[testNo]);
+        decPtr = std::make_unique<Decimal128>(in[testNo]);
         ASSERT_EQUALS(decPtr->toLongExact(roundMode), out[testNo]);
     }
 }
@@ -601,7 +626,7 @@ TEST(Decimal128Test, TestDecimal128ToInt64ExactAway) {
     int64_t out[6] = {-4294967297, -4294967297, -4294967296, 4294967296, 4294967297, 4294967297};
     std::unique_ptr<Decimal128> decPtr;
     for (int testNo = 0; testNo < 6; ++testNo) {
-        decPtr = stdx::make_unique<Decimal128>(in[testNo]);
+        decPtr = std::make_unique<Decimal128>(in[testNo]);
         ASSERT_EQUALS(decPtr->toLongExact(roundMode), out[testNo]);
     }
 }
@@ -935,42 +960,37 @@ TEST(Decimal128Test, TestDecimal128AddSignaling) {
 TEST(Decimal128Test, TestDecimal128SubtractSignaling) {
     Decimal128 d = Decimal128::kLargestNegative;
     uint32_t sigFlags = Decimal128::SignalingFlag::kNoFlag;
-    Decimal128 res = d.subtract(Decimal128(1), &sigFlags);
+    Decimal128 res = d.subtract(1_dec128, &sigFlags);
     ASSERT_TRUE(res.isEqual(Decimal128::kLargestNegative));
     ASSERT_TRUE(Decimal128::hasFlag(sigFlags, Decimal128::SignalingFlag::kInexact));
 }
 
 TEST(Decimal128Test, TestDecimal128MultiplySignaling) {
-    Decimal128 d("2");
     uint32_t sigFlags = Decimal128::SignalingFlag::kNoFlag;
-    Decimal128 res = d.multiply(Decimal128::kLargestPositive, &sigFlags);
+    Decimal128 res = (2_dec128).multiply(Decimal128::kLargestPositive, &sigFlags);
     ASSERT_TRUE(res.isEqual(Decimal128::kPositiveInfinity));
     ASSERT_TRUE(Decimal128::hasFlag(sigFlags, Decimal128::SignalingFlag::kOverflow));
 }
 
 TEST(Decimal128Test, TestDecimal128DivideSignaling) {
-    Decimal128 d("2");
     uint32_t sigFlags = Decimal128::SignalingFlag::kNoFlag;
-    Decimal128 res = d.divide(Decimal128(0), &sigFlags);
+    Decimal128 res = (2_dec128).divide(0_dec128, &sigFlags);
     ASSERT_TRUE(res.isEqual(Decimal128::kPositiveInfinity));
     ASSERT_TRUE(Decimal128::hasFlag(sigFlags, Decimal128::SignalingFlag::kDivideByZero));
 }
 
 // Test Decimal128 special comparisons
 TEST(Decimal128Test, TestDecimal128IsZero) {
-    Decimal128 d1(0);
-    Decimal128 d2(500);
+    constexpr Decimal128 d1(0);
+    constexpr Decimal128 d2(500);
     ASSERT_TRUE(d1.isZero());
     ASSERT_FALSE(d2.isZero());
 }
 
 TEST(Decimal128Test, TestDecimal128IsNaN) {
-    Decimal128 d1("NaN");
-    Decimal128 d2("10.5");
-    Decimal128 d3("Inf");
-    ASSERT_TRUE(d1.isNaN());
-    ASSERT_FALSE(d2.isNaN());
-    ASSERT_FALSE(d3.isNaN());
+    ASSERT_TRUE("NaN"_dec128.isNaN());
+    ASSERT_FALSE("10.5"_dec128.isNaN());
+    ASSERT_FALSE("Inf"_dec128.isNaN());
 }
 
 TEST(Decimal128Test, TestDecimal128IsInfinite) {
@@ -1396,9 +1416,9 @@ TEST(Decimal128Test, TestDecimal128GetLargestNegativeExponentZero) {
 }
 
 /**
-* Test data was generated using 64 bit versions of these functions, so we must test
-* approximate results.
-*/
+ * Test data was generated using 64 bit versions of these functions, so we must test
+ * approximate results.
+ */
 
 void assertDecimal128ApproxEqual(Decimal128 x, Decimal128 y) {
     ASSERT_TRUE(x.subtract(y).toAbs().isLess(Decimal128("0.00000005")));

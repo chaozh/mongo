@@ -34,6 +34,7 @@
 #include "mongo/bson/bsonobj.h"
 #include "mongo/db/exec/plan_stage.h"
 #include "mongo/db/index/sort_key_generator.h"
+#include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/query/index_bounds.h"
 #include "mongo/db/query/stage_types.h"
 
@@ -45,15 +46,14 @@ class WorkingSetMember;
 
 /**
  * Passes results from the child through after adding the sort key for each result as
- * WorkingSetMember computed data.
+ * WorkingSetMember metadata.
  */
 class SortKeyGeneratorStage final : public PlanStage {
 public:
-    SortKeyGeneratorStage(OperationContext* opCtx,
-                          PlanStage* child,
+    SortKeyGeneratorStage(const boost::intrusive_ptr<ExpressionContext>& pExpCtx,
+                          std::unique_ptr<PlanStage> child,
                           WorkingSet* ws,
-                          const BSONObj& sortSpecObj,
-                          const CollatorInterface* collator);
+                          const BSONObj& sortSpecObj);
 
     bool isEOF() final;
 
@@ -71,16 +71,9 @@ protected:
     StageState doWork(WorkingSetID* out) final;
 
 private:
-    StatusWith<BSONObj> getSortKeyFromIndexKey(const WorkingSetMember& member) const;
-
     WorkingSet* const _ws;
 
-    // The raw sort pattern as expressed by the user.
-    const BSONObj _sortSpec;
-
-    const CollatorInterface* _collator;
-
-    std::unique_ptr<SortKeyGenerator> _sortKeyGen;
+    SortKeyGenerator _sortKeyGen;
 };
 
 }  // namespace mongo

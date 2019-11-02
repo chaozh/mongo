@@ -29,6 +29,8 @@
 
 #pragma once
 
+#include <memory>
+
 #include "mongo/db/index/duplicate_key_tracker.h"
 #include "mongo/db/index/index_access_method.h"
 #include "mongo/db/index/multikey_paths.h"
@@ -44,7 +46,14 @@ class OperationContext;
 
 class IndexBuildInterceptor {
 public:
+    /**
+     * Determines if we will yield locks while draining the side tables.
+     */
+    enum class DrainYieldPolicy { kNoYield, kYield };
+
     enum class Op { kInsert, kDelete };
+
+    static bool typeCanFastpathMultikeyUpdates(IndexType type);
 
     /**
      * Creates a temporary table for writes during an index build. Additionally creates a temporary
@@ -69,9 +78,9 @@ public:
      * On success, `numKeysOut` if non-null will contain the number of keys added or removed.
      */
     Status sideWrite(OperationContext* opCtx,
-                     IndexAccessMethod* indexAccessMethod,
-                     const BSONObj* obj,
-                     const InsertDeleteOptions& options,
+                     const std::vector<KeyString::Value>& keys,
+                     const KeyStringSet& multikeyMetadataKeys,
+                     const MultikeyPaths& multikeyPaths,
                      RecordId loc,
                      Op op,
                      int64_t* const numKeysOut);
@@ -89,6 +98,7 @@ public:
      */
     Status checkDuplicateKeyConstraints(OperationContext* opCtx) const;
 
+
     /**
      * Performs a resumable scan on the side writes table, and either inserts or removes each key
      * from the underlying IndexAccessMethod. This will only insert as many records as are visible
@@ -97,6 +107,8 @@ public:
      * This is resumable, so subsequent calls will start the scan at the record immediately
      * following the last inserted record from a previous call to drainWritesIntoIndex.
      *
+     * TODO (SERVER-40894): Implement draining while reading at a timestamp. The following comment
+     * does not apply.
      * When 'readSource' is not kUnset, perform the drain by reading at the timestamp described by
      * the ReadSource. This will always reset the ReadSource to its original value before returning.
      * The drain otherwise reads at the pre-existing ReadSource on the RecoveryUnit. This may be
@@ -105,7 +117,8 @@ public:
      */
     Status drainWritesIntoIndex(OperationContext* opCtx,
                                 const InsertDeleteOptions& options,
-                                RecoveryUnit::ReadSource readSource);
+                                RecoveryUnit::ReadSource readSource,
+                                DrainYieldPolicy drainYieldPolicy);
 
     /**
      * Returns 'true' if there are no visible records remaining to be applied from the side writes
@@ -119,9 +132,9 @@ public:
     bool areAllConstraintsChecked(OperationContext* opCtx) const;
 
     /**
-      * When an index builder wants to commit, use this to retrieve any recorded multikey paths
-      * that were tracked during the build.
-      */
+     * When an index builder wants to commit, use this to retrieve any recorded multikey paths
+     * that were tracked during the build.
+     */
     boost::optional<MultikeyPaths> getMultikeyPaths() const;
 
     const std::string& getSideWritesTableIdent() const;
@@ -138,10 +151,9 @@ private:
                        int64_t* const keysDeleted);
 
     /**
-     * Yield lock manager locks, but only when holding intent locks. Does nothing otherwise. If this
-     * yields locks, it will also abandon the current storage engine snapshot.
+     * Yield lock manager locks and abandon the current storage engine snapshot.
      */
-    void _tryYield(OperationContext*);
+    void _yield(OperationContext* opCtx);
 
     // The entry for the index that is being built.
     IndexCatalogEntry* _indexCatalogEntry;
@@ -153,9 +165,15 @@ private:
 
     int64_t _numApplied{0};
 
-    AtomicWord<long long> _sideWritesCounter{0};
+    // This allows the counter to be used in a RecoveryUnit rollback handler where the
+    // IndexBuildInterceptor is no longer available (e.g. due to index build cleanup). If there are
+    // additional fields that have to be referenced in commit/rollback handlers, this counter should
+    // be moved to a new IndexBuildsInterceptor::InternalState structure that will be managed as a
+    // shared resource.
+    std::shared_ptr<AtomicWord<long long>> _sideWritesCounter;
 
-    mutable stdx::mutex _multikeyPathMutex;
+    mutable Mutex _multikeyPathMutex =
+        MONGO_MAKE_LATCH("IndexBuildInterceptor::_multikeyPathMutex");
     boost::optional<MultikeyPaths> _multikeyPaths;
 };
 

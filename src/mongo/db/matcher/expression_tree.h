@@ -93,7 +93,7 @@ public:
     }
 
 protected:
-    void _debugList(StringBuilder& debug, int level) const;
+    void _debugList(StringBuilder& debug, int indentationLevel) const;
 
     void _listToBSON(BSONArrayBuilder* out) const;
 
@@ -110,12 +110,12 @@ public:
     AndMatchExpression() : ListOfMatchExpression(AND) {}
     virtual ~AndMatchExpression() {}
 
-    virtual bool matches(const MatchableDocument* doc, MatchDetails* details = 0) const;
+    virtual bool matches(const MatchableDocument* doc, MatchDetails* details = nullptr) const;
 
     bool matchesSingleElement(const BSONElement&, MatchDetails* details = nullptr) const final;
 
     virtual std::unique_ptr<MatchExpression> shallowClone() const {
-        std::unique_ptr<AndMatchExpression> self = stdx::make_unique<AndMatchExpression>();
+        std::unique_ptr<AndMatchExpression> self = std::make_unique<AndMatchExpression>();
         for (size_t i = 0; i < numChildren(); ++i) {
             self->add(getChild(i)->shallowClone().release());
         }
@@ -125,7 +125,7 @@ public:
         return std::move(self);
     }
 
-    virtual void debugString(StringBuilder& debug, int level = 0) const;
+    virtual void debugString(StringBuilder& debug, int indentationLevel = 0) const;
 
     virtual void serialize(BSONObjBuilder* out) const;
 
@@ -139,12 +139,12 @@ public:
     OrMatchExpression() : ListOfMatchExpression(OR) {}
     virtual ~OrMatchExpression() {}
 
-    virtual bool matches(const MatchableDocument* doc, MatchDetails* details = 0) const;
+    virtual bool matches(const MatchableDocument* doc, MatchDetails* details = nullptr) const;
 
     bool matchesSingleElement(const BSONElement&, MatchDetails* details = nullptr) const final;
 
     virtual std::unique_ptr<MatchExpression> shallowClone() const {
-        std::unique_ptr<OrMatchExpression> self = stdx::make_unique<OrMatchExpression>();
+        std::unique_ptr<OrMatchExpression> self = std::make_unique<OrMatchExpression>();
         for (size_t i = 0; i < numChildren(); ++i) {
             self->add(getChild(i)->shallowClone().release());
         }
@@ -154,7 +154,7 @@ public:
         return std::move(self);
     }
 
-    virtual void debugString(StringBuilder& debug, int level = 0) const;
+    virtual void debugString(StringBuilder& debug, int indentationLevel = 0) const;
 
     virtual void serialize(BSONObjBuilder* out) const;
 
@@ -168,12 +168,12 @@ public:
     NorMatchExpression() : ListOfMatchExpression(NOR) {}
     virtual ~NorMatchExpression() {}
 
-    virtual bool matches(const MatchableDocument* doc, MatchDetails* details = 0) const;
+    virtual bool matches(const MatchableDocument* doc, MatchDetails* details = nullptr) const;
 
     bool matchesSingleElement(const BSONElement&, MatchDetails* details = nullptr) const final;
 
     virtual std::unique_ptr<MatchExpression> shallowClone() const {
-        std::unique_ptr<NorMatchExpression> self = stdx::make_unique<NorMatchExpression>();
+        std::unique_ptr<NorMatchExpression> self = std::make_unique<NorMatchExpression>();
         for (size_t i = 0; i < numChildren(); ++i) {
             self->add(getChild(i)->shallowClone().release());
         }
@@ -183,7 +183,7 @@ public:
         return std::move(self);
     }
 
-    virtual void debugString(StringBuilder& debug, int level = 0) const;
+    virtual void debugString(StringBuilder& debug, int indentationLevel = 0) const;
 
     virtual void serialize(BSONObjBuilder* out) const;
 };
@@ -194,22 +194,22 @@ public:
 
     virtual std::unique_ptr<MatchExpression> shallowClone() const {
         std::unique_ptr<NotMatchExpression> self =
-            stdx::make_unique<NotMatchExpression>(_exp->shallowClone().release());
+            std::make_unique<NotMatchExpression>(_exp->shallowClone().release());
         if (getTag()) {
             self->setTag(getTag()->clone());
         }
         return std::move(self);
     }
 
-    virtual bool matches(const MatchableDocument* doc, MatchDetails* details = 0) const {
-        return !_exp->matches(doc, NULL);
+    virtual bool matches(const MatchableDocument* doc, MatchDetails* details = nullptr) const {
+        return !_exp->matches(doc, nullptr);
     }
 
     bool matchesSingleElement(const BSONElement& elt, MatchDetails* details = nullptr) const final {
         return !_exp->matchesSingleElement(elt, details);
     }
 
-    virtual void debugString(StringBuilder& debug, int level = 0) const;
+    virtual void debugString(StringBuilder& debug, int indentationLevel = 0) const;
 
     virtual void serialize(BSONObjBuilder* out) const;
 
@@ -248,4 +248,4 @@ private:
 
     std::unique_ptr<MatchExpression> _exp;
 };
-}
+}  // namespace mongo

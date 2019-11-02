@@ -38,6 +38,12 @@
 
 namespace mongo {
 
+namespace {
+
+const auto kDetached = Status(ErrorCodes::ShutdownInProgress, "Baton detached");
+
+}  // namespace
+
 DefaultBaton::DefaultBaton(OperationContext* opCtx) : _opCtx(opCtx) {}
 
 DefaultBaton::~DefaultBaton() {
@@ -55,13 +61,10 @@ void DefaultBaton::detachImpl() noexcept {
     decltype(_scheduled) scheduled;
 
     {
-        stdx::lock_guard<stdx::mutex> lk(_mutex);
+        stdx::lock_guard<Latch> lk(_mutex);
 
-        {
-            stdx::lock_guard<Client> lk(*_opCtx->getClient());
-            invariant(_opCtx->getBaton().get() == this);
-            _opCtx->setBaton(nullptr);
-        }
+        invariant(_opCtx->getBaton().get() == this);
+        _opCtx->setBaton(nullptr);
 
         _opCtx = nullptr;
         _hasIngressSocket = false;
@@ -71,16 +74,16 @@ void DefaultBaton::detachImpl() noexcept {
     }
 
     for (auto& job : scheduled) {
-        job(nullptr);
+        job(kDetached);
     }
 }
 
-void DefaultBaton::schedule(unique_function<void(OperationContext*)> func) noexcept {
-    stdx::unique_lock<stdx::mutex> lk(_mutex);
+void DefaultBaton::schedule(Task func) noexcept {
+    stdx::unique_lock<Latch> lk(_mutex);
 
     if (!_opCtx) {
         lk.unlock();
-        func(nullptr);
+        func(kDetached);
 
         return;
     }
@@ -94,14 +97,14 @@ void DefaultBaton::schedule(unique_function<void(OperationContext*)> func) noexc
 }
 
 void DefaultBaton::notify() noexcept {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     _notified = true;
     _cv.notify_one();
 }
 
 Waitable::TimeoutState DefaultBaton::run_until(ClockSource* clkSource,
                                                Date_t oldDeadline) noexcept {
-    stdx::unique_lock<stdx::mutex> lk(_mutex);
+    stdx::unique_lock<Latch> lk(_mutex);
 
     // We'll fulfill promises and run jobs on the way out, ensuring we don't hold any locks
     const auto guard = makeGuard([&] {
@@ -111,7 +114,7 @@ Waitable::TimeoutState DefaultBaton::run_until(ClockSource* clkSource,
 
             lk.unlock();
             for (auto& job : toRun) {
-                job(_opCtx);
+                job(Status::OK());
             }
             lk.lock();
         }

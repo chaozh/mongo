@@ -29,9 +29,10 @@
 
 #include "mongo/db/storage/kv/kv_engine_test_harness.h"
 
+#include "mongo/db/catalog/collection_impl.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/operation_context_noop.h"
-#include "mongo/db/storage/kv/kv_catalog.h"
+#include "mongo/db/storage/durable_catalog_test_fixture.h"
 #include "mongo/db/storage/kv/kv_engine.h"
 #include "mongo/db/storage/kv/kv_prefix.h"
 #include "mongo/db/storage/record_store.h"
@@ -45,10 +46,7 @@
 namespace mongo {
 namespace {
 
-using std::unique_ptr;
-using std::string;
-
-stdx::function<std::unique_ptr<KVHarnessHelper>()> basicFactory =
+std::function<std::unique_ptr<KVHarnessHelper>()> basicFactory =
     []() -> std::unique_ptr<KVHarnessHelper> { fassertFailed(40355); };
 
 class MyOperationContext : public OperationContextNoop {
@@ -56,15 +54,15 @@ public:
     MyOperationContext(KVEngine* engine) : OperationContextNoop(engine->newRecoveryUnit()) {}
 };
 
-const std::unique_ptr<ClockSource> clock = stdx::make_unique<ClockSourceMock>();
+const std::unique_ptr<ClockSource> clock = std::make_unique<ClockSourceMock>();
 
 TEST(KVEngineTestHarness, SimpleRS1) {
-    unique_ptr<KVHarnessHelper> helper(KVHarnessHelper::create());
+    std::unique_ptr<KVHarnessHelper> helper(KVHarnessHelper::create());
     KVEngine* engine = helper->getEngine();
     ASSERT(engine);
 
-    string ns = "a.b";
-    unique_ptr<RecordStore> rs;
+    std::string ns = "a.b";
+    std::unique_ptr<RecordStore> rs;
     {
         MyOperationContext opCtx(engine);
         ASSERT_OK(engine->createRecordStore(&opCtx, ns, ns, CollectionOptions()));
@@ -85,7 +83,7 @@ TEST(KVEngineTestHarness, SimpleRS1) {
 
     {
         MyOperationContext opCtx(engine);
-        ASSERT_EQUALS(string("abc"), rs->dataFor(&opCtx, loc).data());
+        ASSERT_EQUALS(std::string("abc"), rs->dataFor(&opCtx, loc).data());
     }
 
     {
@@ -97,16 +95,16 @@ TEST(KVEngineTestHarness, SimpleRS1) {
 }
 
 TEST(KVEngineTestHarness, Restart1) {
-    unique_ptr<KVHarnessHelper> helper(KVHarnessHelper::create());
+    std::unique_ptr<KVHarnessHelper> helper(KVHarnessHelper::create());
     KVEngine* engine = helper->getEngine();
     ASSERT(engine);
 
-    string ns = "a.b";
+    std::string ns = "a.b";
 
     // 'loc' holds location of "abc" and is referenced after restarting engine.
     RecordId loc;
     {
-        unique_ptr<RecordStore> rs;
+        std::unique_ptr<RecordStore> rs;
         {
             MyOperationContext opCtx(engine);
             ASSERT_OK(engine->createRecordStore(&opCtx, ns, ns, CollectionOptions()));
@@ -125,45 +123,69 @@ TEST(KVEngineTestHarness, Restart1) {
 
         {
             MyOperationContext opCtx(engine);
-            ASSERT_EQUALS(string("abc"), rs->dataFor(&opCtx, loc).data());
+            ASSERT_EQUALS(std::string("abc"), rs->dataFor(&opCtx, loc).data());
         }
     }
 
     engine = helper->restartEngine();
 
     {
-        unique_ptr<RecordStore> rs;
+        std::unique_ptr<RecordStore> rs;
         MyOperationContext opCtx(engine);
         rs = engine->getRecordStore(&opCtx, ns, ns, CollectionOptions());
-        ASSERT_EQUALS(string("abc"), rs->dataFor(&opCtx, loc).data());
+        ASSERT_EQUALS(std::string("abc"), rs->dataFor(&opCtx, loc).data());
     }
 }
 
 
 TEST(KVEngineTestHarness, SimpleSorted1) {
-    unique_ptr<KVHarnessHelper> helper(KVHarnessHelper::create());
+    setGlobalServiceContext(ServiceContext::make());
+    std::unique_ptr<KVHarnessHelper> helper(KVHarnessHelper::create());
     KVEngine* engine = helper->getEngine();
     ASSERT(engine);
 
-    string ident = "abc";
-    IndexDescriptor desc(nullptr,
-                         "",
-                         BSON("v" << static_cast<int>(IndexDescriptor::kLatestIndexVersion) << "ns"
-                                  << "mydb.mycoll"
-                                  << "key"
-                                  << BSON("a" << 1)));
-    unique_ptr<SortedDataInterface> sorted;
+    std::string ident = "abc";
+    auto ns = NamespaceString("mydb.mycoll");
+
+    std::unique_ptr<RecordStore> rs;
     {
         MyOperationContext opCtx(engine);
-        ASSERT_OK(engine->createSortedDataInterface(&opCtx, ident, &desc));
-        sorted.reset(engine->getSortedDataInterface(&opCtx, ident, &desc));
+        WriteUnitOfWork uow(&opCtx);
+        ASSERT_OK(engine->createRecordStore(&opCtx, "catalog", "catalog", CollectionOptions()));
+        rs = engine->getRecordStore(&opCtx, "catalog", "catalog", CollectionOptions());
+        uow.commit();
+    }
+
+
+    std::unique_ptr<CollectionImpl> collection;
+    {
+        MyOperationContext opCtx(engine);
+        WriteUnitOfWork uow(&opCtx);
+        collection = std::make_unique<CollectionImpl>(&opCtx, ns, UUID::gen(), std::move(rs));
+        uow.commit();
+    }
+
+    IndexDescriptor desc(collection.get(),
+                         "",
+                         BSON("v" << static_cast<int>(IndexDescriptor::kLatestIndexVersion) << "key"
+                                  << BSON("a" << 1)));
+    std::unique_ptr<SortedDataInterface> sorted;
+    {
+        MyOperationContext opCtx(engine);
+        ASSERT_OK(engine->createSortedDataInterface(&opCtx, CollectionOptions(), ident, &desc));
+        sorted = engine->getSortedDataInterface(&opCtx, ident, &desc);
         ASSERT(sorted);
     }
 
     {
         MyOperationContext opCtx(engine);
         WriteUnitOfWork uow(&opCtx);
-        ASSERT_OK(sorted->insert(&opCtx, BSON("" << 5), RecordId(6, 4), true));
+        const RecordId recordId(6, 4);
+        const KeyString::Value keyString =
+            KeyString::HeapBuilder(
+                sorted->getKeyStringVersion(), BSON("" << 5), sorted->getOrdering(), recordId)
+                .release();
+        ASSERT_OK(sorted->insert(&opCtx, keyString, true));
         uow.commit();
     }
 
@@ -174,12 +196,12 @@ TEST(KVEngineTestHarness, SimpleSorted1) {
 }
 
 TEST(KVEngineTestHarness, TemporaryRecordStoreSimple) {
-    unique_ptr<KVHarnessHelper> helper(KVHarnessHelper::create());
+    std::unique_ptr<KVHarnessHelper> helper(KVHarnessHelper::create());
     KVEngine* engine = helper->getEngine();
     ASSERT(engine);
 
-    string ident = "temptemp";
-    unique_ptr<RecordStore> rs;
+    std::string ident = "temptemp";
+    std::unique_ptr<RecordStore> rs;
     {
         MyOperationContext opCtx(engine);
         rs = engine->makeTemporaryRecordStore(&opCtx, ident);
@@ -198,7 +220,7 @@ TEST(KVEngineTestHarness, TemporaryRecordStoreSimple) {
 
     {
         MyOperationContext opCtx(engine);
-        ASSERT_EQUALS(string("abc"), rs->dataFor(&opCtx, loc).data());
+        ASSERT_EQUALS(std::string("abc"), rs->dataFor(&opCtx, loc).data());
 
         std::vector<std::string> all = engine->getAllIdents(&opCtx);
         ASSERT_EQUALS(1U, all.size());
@@ -210,13 +232,13 @@ TEST(KVEngineTestHarness, TemporaryRecordStoreSimple) {
     }
 }
 
-TEST(KVEngineTestHarness, AllCommittedTimestamp) {
-    unique_ptr<KVHarnessHelper> helper(KVHarnessHelper::create());
+TEST(KVEngineTestHarness, AllDurableTimestamp) {
+    std::unique_ptr<KVHarnessHelper> helper(KVHarnessHelper::create());
     KVEngine* engine = helper->getEngine();
     if (!engine->supportsDocLocking())
         return;
 
-    unique_ptr<RecordStore> rs;
+    std::unique_ptr<RecordStore> rs;
     {
         MyOperationContext opCtx(engine);
         WriteUnitOfWork uow(&opCtx);
@@ -239,17 +261,17 @@ TEST(KVEngineTestHarness, AllCommittedTimestamp) {
         auto t12Doc = BSON("ts" << t12);
         auto t21Doc = BSON("ts" << t21);
 
-        Timestamp allCommitted = engine->getAllCommittedTimestamp();
+        Timestamp allDurable = engine->getAllDurableTimestamp();
         MyOperationContext opCtx1(engine);
         WriteUnitOfWork uow1(&opCtx1);
         ASSERT_EQ(invariant(rs->insertRecord(
                       &opCtx1, t11Doc.objdata(), t11Doc.objsize(), Timestamp::min())),
                   RecordId(1, 1));
 
-        Timestamp lastAllCommitted = allCommitted;
-        allCommitted = engine->getAllCommittedTimestamp();
-        ASSERT_GTE(allCommitted, lastAllCommitted);
-        ASSERT_LT(allCommitted, t11);
+        Timestamp lastAllDurable = allDurable;
+        allDurable = engine->getAllDurableTimestamp();
+        ASSERT_GTE(allDurable, lastAllDurable);
+        ASSERT_LT(allDurable, t11);
 
         MyOperationContext opCtx2(engine);
         WriteUnitOfWork uow2(&opCtx2);
@@ -258,98 +280,106 @@ TEST(KVEngineTestHarness, AllCommittedTimestamp) {
                   RecordId(2, 1));
         uow2.commit();
 
-        lastAllCommitted = allCommitted;
-        allCommitted = engine->getAllCommittedTimestamp();
-        ASSERT_GTE(allCommitted, lastAllCommitted);
-        ASSERT_LT(allCommitted, t11);
+        lastAllDurable = allDurable;
+        allDurable = engine->getAllDurableTimestamp();
+        ASSERT_GTE(allDurable, lastAllDurable);
+        ASSERT_LT(allDurable, t11);
 
         ASSERT_EQ(invariant(rs->insertRecord(
                       &opCtx1, t12Doc.objdata(), t12Doc.objsize(), Timestamp::min())),
                   RecordId(1, 2));
 
-        lastAllCommitted = allCommitted;
-        allCommitted = engine->getAllCommittedTimestamp();
-        ASSERT_GTE(allCommitted, lastAllCommitted);
-        ASSERT_LT(allCommitted, t11);
+        lastAllDurable = allDurable;
+        allDurable = engine->getAllDurableTimestamp();
+        ASSERT_GTE(allDurable, lastAllDurable);
+        ASSERT_LT(allDurable, t11);
 
         uow1.commit();
 
-        lastAllCommitted = allCommitted;
-        allCommitted = engine->getAllCommittedTimestamp();
-        ASSERT_GTE(allCommitted, lastAllCommitted);
-        ASSERT_LTE(allCommitted, t21);
+        lastAllDurable = allDurable;
+        allDurable = engine->getAllDurableTimestamp();
+        ASSERT_GTE(allDurable, lastAllDurable);
+        ASSERT_LTE(allDurable, t21);
     }
 }
 
-TEST(KVCatalogTest, Coll1) {
-    unique_ptr<KVHarnessHelper> helper(KVHarnessHelper::create());
+TEST_F(DurableCatalogImplTest, Coll1) {
+    std::unique_ptr<KVHarnessHelper> helper(KVHarnessHelper::create());
     KVEngine* engine = helper->getEngine();
 
-    unique_ptr<RecordStore> rs;
-    unique_ptr<KVCatalog> catalog;
+    std::unique_ptr<RecordStore> rs;
+    std::unique_ptr<DurableCatalogImpl> catalog;
     {
         MyOperationContext opCtx(engine);
         WriteUnitOfWork uow(&opCtx);
         ASSERT_OK(engine->createRecordStore(&opCtx, "catalog", "catalog", CollectionOptions()));
         rs = engine->getRecordStore(&opCtx, "catalog", "catalog", CollectionOptions());
-        catalog.reset(new KVCatalog(rs.get(), false, false));
+        catalog = std::make_unique<DurableCatalogImpl>(rs.get(), false, false, nullptr);
         uow.commit();
     }
 
     {
         MyOperationContext opCtx(engine);
         WriteUnitOfWork uow(&opCtx);
-        ASSERT_OK(catalog->newCollection(
-            &opCtx, NamespaceString("a.b"), CollectionOptions(), KVPrefix::kNotPrefixed));
-        ASSERT_NOT_EQUALS("a.b", catalog->getCollectionIdent("a.b"));
+        ASSERT_OK(newCollection(&opCtx,
+                                NamespaceString("a.b"),
+                                CollectionOptions(),
+                                KVPrefix::kNotPrefixed,
+                                catalog.get()));
+        ASSERT_NOT_EQUALS("a.b", catalog->getCollectionIdent(NamespaceString("a.b")));
         uow.commit();
     }
 
-    string ident = catalog->getCollectionIdent("a.b");
+    std::string ident = catalog->getCollectionIdent(NamespaceString("a.b"));
     {
         MyOperationContext opCtx(engine);
         WriteUnitOfWork uow(&opCtx);
-        catalog.reset(new KVCatalog(rs.get(), false, false));
+        catalog = std::make_unique<DurableCatalogImpl>(rs.get(), false, false, nullptr);
         catalog->init(&opCtx);
         uow.commit();
     }
-    ASSERT_EQUALS(ident, catalog->getCollectionIdent("a.b"));
+    ASSERT_EQUALS(ident, catalog->getCollectionIdent(NamespaceString("a.b")));
 
     {
         MyOperationContext opCtx(engine);
         WriteUnitOfWork uow(&opCtx);
-        catalog->dropCollection(&opCtx, "a.b").transitional_ignore();
-        catalog
-            ->newCollection(
-                &opCtx, NamespaceString("a.b"), CollectionOptions(), KVPrefix::kNotPrefixed)
+        dropCollection(&opCtx, "a.b", catalog.get()).transitional_ignore();
+        newCollection(&opCtx,
+                      NamespaceString("a.b"),
+                      CollectionOptions(),
+                      KVPrefix::kNotPrefixed,
+                      catalog.get())
             .transitional_ignore();
         uow.commit();
     }
-    ASSERT_NOT_EQUALS(ident, catalog->getCollectionIdent("a.b"));
+    ASSERT_NOT_EQUALS(ident, catalog->getCollectionIdent(NamespaceString("a.b")));
 }
 
-TEST(KVCatalogTest, Idx1) {
-    unique_ptr<KVHarnessHelper> helper(KVHarnessHelper::create());
+TEST_F(DurableCatalogImplTest, Idx1) {
+    std::unique_ptr<KVHarnessHelper> helper(KVHarnessHelper::create());
     KVEngine* engine = helper->getEngine();
 
-    unique_ptr<RecordStore> rs;
-    unique_ptr<KVCatalog> catalog;
+    std::unique_ptr<RecordStore> rs;
+    std::unique_ptr<DurableCatalogImpl> catalog;
     {
         MyOperationContext opCtx(engine);
         WriteUnitOfWork uow(&opCtx);
         ASSERT_OK(engine->createRecordStore(&opCtx, "catalog", "catalog", CollectionOptions()));
         rs = engine->getRecordStore(&opCtx, "catalog", "catalog", CollectionOptions());
-        catalog.reset(new KVCatalog(rs.get(), false, false));
+        catalog = std::make_unique<DurableCatalogImpl>(rs.get(), false, false, nullptr);
         uow.commit();
     }
 
     {
         MyOperationContext opCtx(engine);
         WriteUnitOfWork uow(&opCtx);
-        ASSERT_OK(catalog->newCollection(
-            &opCtx, NamespaceString("a.b"), CollectionOptions(), KVPrefix::kNotPrefixed));
-        ASSERT_NOT_EQUALS("a.b", catalog->getCollectionIdent("a.b"));
-        ASSERT_TRUE(catalog->isUserDataIdent(catalog->getCollectionIdent("a.b")));
+        ASSERT_OK(newCollection(&opCtx,
+                                NamespaceString("a.b"),
+                                CollectionOptions(),
+                                KVPrefix::kNotPrefixed,
+                                catalog.get()));
+        ASSERT_NOT_EQUALS("a.b", catalog->getCollectionIdent(NamespaceString("a.b")));
+        ASSERT_TRUE(catalog->isUserDataIdent(catalog->getCollectionIdent(NamespaceString("a.b"))));
         uow.commit();
     }
 
@@ -364,25 +394,25 @@ TEST(KVCatalogTest, Idx1) {
         imd.spec = BSON("name"
                         << "foo");
         imd.ready = false;
-        imd.head = RecordId();
         imd.multikey = false;
         imd.prefix = KVPrefix::kNotPrefixed;
         imd.isBackgroundSecondaryBuild = false;
         md.indexes.push_back(imd);
-        catalog->putMetaData(&opCtx, "a.b", md);
+        catalog->putMetaData(&opCtx, NamespaceString("a.b"), md);
         uow.commit();
     }
 
-    string idxIndent;
+    std::string idxIndent;
     {
         MyOperationContext opCtx(engine);
-        idxIndent = catalog->getIndexIdent(&opCtx, "a.b", "foo");
+        idxIndent = catalog->getIndexIdent(&opCtx, NamespaceString("a.b"), "foo");
     }
 
     {
         MyOperationContext opCtx(engine);
-        ASSERT_EQUALS(idxIndent, catalog->getIndexIdent(&opCtx, "a.b", "foo"));
-        ASSERT_TRUE(catalog->isUserDataIdent(catalog->getIndexIdent(&opCtx, "a.b", "foo")));
+        ASSERT_EQUALS(idxIndent, catalog->getIndexIdent(&opCtx, NamespaceString("a.b"), "foo"));
+        ASSERT_TRUE(catalog->isUserDataIdent(
+            catalog->getIndexIdent(&opCtx, NamespaceString("a.b"), "foo")));
     }
 
     {
@@ -391,49 +421,51 @@ TEST(KVCatalogTest, Idx1) {
 
         BSONCollectionCatalogEntry::MetaData md;
         md.ns = "a.b";
-        catalog->putMetaData(&opCtx, "a.b", md);  // remove index
+        catalog->putMetaData(&opCtx, NamespaceString("a.b"), md);  // remove index
 
         BSONCollectionCatalogEntry::IndexMetaData imd;
         imd.spec = BSON("name"
                         << "foo");
         imd.ready = false;
-        imd.head = RecordId();
         imd.multikey = false;
         imd.prefix = KVPrefix::kNotPrefixed;
         imd.isBackgroundSecondaryBuild = false;
         md.indexes.push_back(imd);
-        catalog->putMetaData(&opCtx, "a.b", md);
+        catalog->putMetaData(&opCtx, NamespaceString("a.b"), md);
         uow.commit();
     }
 
     {
         MyOperationContext opCtx(engine);
-        ASSERT_NOT_EQUALS(idxIndent, catalog->getIndexIdent(&opCtx, "a.b", "foo"));
+        ASSERT_NOT_EQUALS(idxIndent, catalog->getIndexIdent(&opCtx, NamespaceString("a.b"), "foo"));
     }
 }
 
-TEST(KVCatalogTest, DirectoryPerDb1) {
-    unique_ptr<KVHarnessHelper> helper(KVHarnessHelper::create());
+TEST_F(DurableCatalogImplTest, DirectoryPerDb1) {
+    std::unique_ptr<KVHarnessHelper> helper(KVHarnessHelper::create());
     KVEngine* engine = helper->getEngine();
 
-    unique_ptr<RecordStore> rs;
-    unique_ptr<KVCatalog> catalog;
+    std::unique_ptr<RecordStore> rs;
+    std::unique_ptr<DurableCatalogImpl> catalog;
     {
         MyOperationContext opCtx(engine);
         WriteUnitOfWork uow(&opCtx);
         ASSERT_OK(engine->createRecordStore(&opCtx, "catalog", "catalog", CollectionOptions()));
         rs = engine->getRecordStore(&opCtx, "catalog", "catalog", CollectionOptions());
-        catalog.reset(new KVCatalog(rs.get(), true, false));
+        catalog = std::make_unique<DurableCatalogImpl>(rs.get(), true, false, nullptr);
         uow.commit();
     }
 
     {  // collection
         MyOperationContext opCtx(engine);
         WriteUnitOfWork uow(&opCtx);
-        ASSERT_OK(catalog->newCollection(
-            &opCtx, NamespaceString("a.b"), CollectionOptions(), KVPrefix::kNotPrefixed));
-        ASSERT_STRING_CONTAINS(catalog->getCollectionIdent("a.b"), "a/");
-        ASSERT_TRUE(catalog->isUserDataIdent(catalog->getCollectionIdent("a.b")));
+        ASSERT_OK(newCollection(&opCtx,
+                                NamespaceString("a.b"),
+                                CollectionOptions(),
+                                KVPrefix::kNotPrefixed,
+                                catalog.get()));
+        ASSERT_STRING_CONTAINS(catalog->getCollectionIdent(NamespaceString("a.b")), "a/");
+        ASSERT_TRUE(catalog->isUserDataIdent(catalog->getCollectionIdent(NamespaceString("a.b"))));
         uow.commit();
     }
 
@@ -448,40 +480,43 @@ TEST(KVCatalogTest, DirectoryPerDb1) {
         imd.spec = BSON("name"
                         << "foo");
         imd.ready = false;
-        imd.head = RecordId();
         imd.multikey = false;
         imd.prefix = KVPrefix::kNotPrefixed;
         imd.isBackgroundSecondaryBuild = false;
         md.indexes.push_back(imd);
-        catalog->putMetaData(&opCtx, "a.b", md);
-        ASSERT_STRING_CONTAINS(catalog->getIndexIdent(&opCtx, "a.b", "foo"), "a/");
-        ASSERT_TRUE(catalog->isUserDataIdent(catalog->getIndexIdent(&opCtx, "a.b", "foo")));
+        catalog->putMetaData(&opCtx, NamespaceString("a.b"), md);
+        ASSERT_STRING_CONTAINS(catalog->getIndexIdent(&opCtx, NamespaceString("a.b"), "foo"), "a/");
+        ASSERT_TRUE(catalog->isUserDataIdent(
+            catalog->getIndexIdent(&opCtx, NamespaceString("a.b"), "foo")));
         uow.commit();
     }
 }
 
-TEST(KVCatalogTest, Split1) {
-    unique_ptr<KVHarnessHelper> helper(KVHarnessHelper::create());
+TEST_F(DurableCatalogImplTest, Split1) {
+    std::unique_ptr<KVHarnessHelper> helper(KVHarnessHelper::create());
     KVEngine* engine = helper->getEngine();
 
-    unique_ptr<RecordStore> rs;
-    unique_ptr<KVCatalog> catalog;
+    std::unique_ptr<RecordStore> rs;
+    std::unique_ptr<DurableCatalogImpl> catalog;
     {
         MyOperationContext opCtx(engine);
         WriteUnitOfWork uow(&opCtx);
         ASSERT_OK(engine->createRecordStore(&opCtx, "catalog", "catalog", CollectionOptions()));
         rs = engine->getRecordStore(&opCtx, "catalog", "catalog", CollectionOptions());
-        catalog.reset(new KVCatalog(rs.get(), false, true));
+        catalog = std::make_unique<DurableCatalogImpl>(rs.get(), false, true, nullptr);
         uow.commit();
     }
 
     {
         MyOperationContext opCtx(engine);
         WriteUnitOfWork uow(&opCtx);
-        ASSERT_OK(catalog->newCollection(
-            &opCtx, NamespaceString("a.b"), CollectionOptions(), KVPrefix::kNotPrefixed));
-        ASSERT_STRING_CONTAINS(catalog->getCollectionIdent("a.b"), "collection/");
-        ASSERT_TRUE(catalog->isUserDataIdent(catalog->getCollectionIdent("a.b")));
+        ASSERT_OK(newCollection(&opCtx,
+                                NamespaceString("a.b"),
+                                CollectionOptions(),
+                                KVPrefix::kNotPrefixed,
+                                catalog.get()));
+        ASSERT_STRING_CONTAINS(catalog->getCollectionIdent(NamespaceString("a.b")), "collection/");
+        ASSERT_TRUE(catalog->isUserDataIdent(catalog->getCollectionIdent(NamespaceString("a.b"))));
         uow.commit();
     }
 
@@ -496,40 +531,45 @@ TEST(KVCatalogTest, Split1) {
         imd.spec = BSON("name"
                         << "foo");
         imd.ready = false;
-        imd.head = RecordId();
         imd.multikey = false;
         imd.prefix = KVPrefix::kNotPrefixed;
         imd.isBackgroundSecondaryBuild = false;
         md.indexes.push_back(imd);
-        catalog->putMetaData(&opCtx, "a.b", md);
-        ASSERT_STRING_CONTAINS(catalog->getIndexIdent(&opCtx, "a.b", "foo"), "index/");
-        ASSERT_TRUE(catalog->isUserDataIdent(catalog->getIndexIdent(&opCtx, "a.b", "foo")));
+        catalog->putMetaData(&opCtx, NamespaceString("a.b"), md);
+        ASSERT_STRING_CONTAINS(catalog->getIndexIdent(&opCtx, NamespaceString("a.b"), "foo"),
+                               "index/");
+        ASSERT_TRUE(catalog->isUserDataIdent(
+            catalog->getIndexIdent(&opCtx, NamespaceString("a.b"), "foo")));
         uow.commit();
     }
 }
 
-TEST(KVCatalogTest, DirectoryPerAndSplit1) {
-    unique_ptr<KVHarnessHelper> helper(KVHarnessHelper::create());
+TEST_F(DurableCatalogImplTest, DirectoryPerAndSplit1) {
+    std::unique_ptr<KVHarnessHelper> helper(KVHarnessHelper::create());
     KVEngine* engine = helper->getEngine();
 
-    unique_ptr<RecordStore> rs;
-    unique_ptr<KVCatalog> catalog;
+    std::unique_ptr<RecordStore> rs;
+    std::unique_ptr<DurableCatalogImpl> catalog;
     {
         MyOperationContext opCtx(engine);
         WriteUnitOfWork uow(&opCtx);
         ASSERT_OK(engine->createRecordStore(&opCtx, "catalog", "catalog", CollectionOptions()));
         rs = engine->getRecordStore(&opCtx, "catalog", "catalog", CollectionOptions());
-        catalog.reset(new KVCatalog(rs.get(), true, true));
+        catalog = std::make_unique<DurableCatalogImpl>(rs.get(), true, true, nullptr);
         uow.commit();
     }
 
     {
         MyOperationContext opCtx(engine);
         WriteUnitOfWork uow(&opCtx);
-        ASSERT_OK(catalog->newCollection(
-            &opCtx, NamespaceString("a.b"), CollectionOptions(), KVPrefix::kNotPrefixed));
-        ASSERT_STRING_CONTAINS(catalog->getCollectionIdent("a.b"), "a/collection/");
-        ASSERT_TRUE(catalog->isUserDataIdent(catalog->getCollectionIdent("a.b")));
+        ASSERT_OK(newCollection(&opCtx,
+                                NamespaceString("a.b"),
+                                CollectionOptions(),
+                                KVPrefix::kNotPrefixed,
+                                catalog.get()));
+        ASSERT_STRING_CONTAINS(catalog->getCollectionIdent(NamespaceString("a.b")),
+                               "a/collection/");
+        ASSERT_TRUE(catalog->isUserDataIdent(catalog->getCollectionIdent(NamespaceString("a.b"))));
         uow.commit();
     }
 
@@ -544,46 +584,48 @@ TEST(KVCatalogTest, DirectoryPerAndSplit1) {
         imd.spec = BSON("name"
                         << "foo");
         imd.ready = false;
-        imd.head = RecordId();
         imd.multikey = false;
         imd.prefix = KVPrefix::kNotPrefixed;
         imd.isBackgroundSecondaryBuild = false;
         md.indexes.push_back(imd);
-        catalog->putMetaData(&opCtx, "a.b", md);
-        ASSERT_STRING_CONTAINS(catalog->getIndexIdent(&opCtx, "a.b", "foo"), "a/index/");
-        ASSERT_TRUE(catalog->isUserDataIdent(catalog->getIndexIdent(&opCtx, "a.b", "foo")));
+        catalog->putMetaData(&opCtx, NamespaceString("a.b"), md);
+        ASSERT_STRING_CONTAINS(catalog->getIndexIdent(&opCtx, NamespaceString("a.b"), "foo"),
+                               "a/index/");
+        ASSERT_TRUE(catalog->isUserDataIdent(
+            catalog->getIndexIdent(&opCtx, NamespaceString("a.b"), "foo")));
         uow.commit();
     }
 }
 
-TEST(KVCatalogTest, RestartForPrefixes) {
+TEST_F(DurableCatalogImplTest, RestartForPrefixes) {
     storageGlobalParams.groupCollections = true;
     ON_BLOCK_EXIT([&] { storageGlobalParams.groupCollections = false; });
 
     KVPrefix abCollPrefix = KVPrefix::getNextPrefix(NamespaceString("a.b"));
     KVPrefix fooIndexPrefix = KVPrefix::getNextPrefix(NamespaceString("a.b"));
 
-    unique_ptr<KVHarnessHelper> helper(KVHarnessHelper::create());
+    std::unique_ptr<KVHarnessHelper> helper(KVHarnessHelper::create());
     KVEngine* engine = helper->getEngine();
     {
-        unique_ptr<RecordStore> rs;
-        unique_ptr<KVCatalog> catalog;
+        std::unique_ptr<RecordStore> rs;
+        std::unique_ptr<DurableCatalogImpl> catalog;
         {
             MyOperationContext opCtx(engine);
             WriteUnitOfWork uow(&opCtx);
             ASSERT_OK(engine->createRecordStore(&opCtx, "catalog", "catalog", CollectionOptions()));
             rs = engine->getRecordStore(&opCtx, "catalog", "catalog", CollectionOptions());
-            catalog.reset(new KVCatalog(rs.get(), false, false));
+            catalog = std::make_unique<DurableCatalogImpl>(rs.get(), false, false, nullptr);
             uow.commit();
         }
 
         {
             MyOperationContext opCtx(engine);
             WriteUnitOfWork uow(&opCtx);
-            ASSERT_OK(catalog->newCollection(
-                &opCtx, NamespaceString("a.b"), CollectionOptions(), abCollPrefix));
-            ASSERT_NOT_EQUALS("a.b", catalog->getCollectionIdent("a.b"));
-            ASSERT_TRUE(catalog->isUserDataIdent(catalog->getCollectionIdent("a.b")));
+            ASSERT_OK(newCollection(
+                &opCtx, NamespaceString("a.b"), CollectionOptions(), abCollPrefix, catalog.get()));
+            ASSERT_NOT_EQUALS("a.b", catalog->getCollectionIdent(NamespaceString("a.b")));
+            ASSERT_TRUE(
+                catalog->isUserDataIdent(catalog->getCollectionIdent(NamespaceString("a.b"))));
             uow.commit();
         }
 
@@ -598,13 +640,12 @@ TEST(KVCatalogTest, RestartForPrefixes) {
             imd.spec = BSON("name"
                             << "foo");
             imd.ready = false;
-            imd.head = RecordId();
             imd.multikey = false;
             imd.prefix = fooIndexPrefix;
             imd.isBackgroundSecondaryBuild = false;
             md.indexes.push_back(imd);
             md.prefix = abCollPrefix;
-            catalog->putMetaData(&opCtx, "a.b", md);
+            catalog->putMetaData(&opCtx, NamespaceString("a.b"), md);
             uow.commit();
         }
     }
@@ -613,20 +654,21 @@ TEST(KVCatalogTest, RestartForPrefixes) {
     {
         MyOperationContext opCtx(engine);
         WriteUnitOfWork uow(&opCtx);
-        unique_ptr<RecordStore> rs =
+        std::unique_ptr<RecordStore> rs =
             engine->getRecordStore(&opCtx, "catalog", "catalog", CollectionOptions());
-        unique_ptr<KVCatalog> catalog = stdx::make_unique<KVCatalog>(rs.get(), false, false);
+        auto catalog = std::make_unique<DurableCatalogImpl>(rs.get(), false, false, nullptr);
         catalog->init(&opCtx);
 
-        const BSONCollectionCatalogEntry::MetaData md = catalog->getMetaData(&opCtx, "a.b");
+        const BSONCollectionCatalogEntry::MetaData md =
+            catalog->getMetaData(&opCtx, NamespaceString("a.b"));
         ASSERT_EQ("a.b", md.ns);
         ASSERT_EQ(abCollPrefix, md.prefix);
         ASSERT_EQ(fooIndexPrefix, md.indexes[md.findIndexOffset("foo")].prefix);
     }
 }
 
-TEST(KVCatalogTest, BackupImplemented) {
-    unique_ptr<KVHarnessHelper> helper(KVHarnessHelper::create());
+TEST_F(DurableCatalogImplTest, BackupImplemented) {
+    std::unique_ptr<KVHarnessHelper> helper(KVHarnessHelper::create());
     KVEngine* engine = helper->getEngine();
     ASSERT(engine);
 
@@ -637,25 +679,42 @@ TEST(KVCatalogTest, BackupImplemented) {
     }
 }
 
-DEATH_TEST(KVCatalogTest, TerminateOnNonNumericIndexVersion, "Fatal Assertion 50942") {
-    unique_ptr<KVHarnessHelper> helper(KVHarnessHelper::create());
+DEATH_TEST_F(DurableCatalogImplTest, TerminateOnNonNumericIndexVersion, "Fatal Assertion 50942") {
+    setGlobalServiceContext(ServiceContext::make());
+    std::unique_ptr<KVHarnessHelper> helper(KVHarnessHelper::create());
     KVEngine* engine = helper->getEngine();
     ASSERT(engine);
 
-    string ident = "abc";
-    IndexDescriptor desc(nullptr,
+    std::string ident = "abc";
+    auto ns = NamespaceString("mydb.mycoll");
+
+    std::unique_ptr<RecordStore> rs;
+    {
+        MyOperationContext opCtx(engine);
+        WriteUnitOfWork uow(&opCtx);
+        ASSERT_OK(engine->createRecordStore(&opCtx, "catalog", "catalog", CollectionOptions()));
+        rs = engine->getRecordStore(&opCtx, "catalog", "catalog", CollectionOptions());
+        uow.commit();
+    }
+
+    std::unique_ptr<CollectionImpl> collection;
+    {
+        MyOperationContext opCtx(engine);
+        WriteUnitOfWork uow(&opCtx);
+        collection = std::make_unique<CollectionImpl>(&opCtx, ns, UUID::gen(), std::move(rs));
+        uow.commit();
+    }
+
+    IndexDescriptor desc(collection.get(),
                          "",
                          BSON("v"
                               << "1"
-                              << "ns"
-                              << "mydb.mycoll"
-                              << "key"
-                              << BSON("a" << 1)));
-    unique_ptr<SortedDataInterface> sorted;
+                              << "key" << BSON("a" << 1)));
+    std::unique_ptr<SortedDataInterface> sorted;
     {
         MyOperationContext opCtx(engine);
-        ASSERT_OK(engine->createSortedDataInterface(&opCtx, ident, &desc));
-        sorted.reset(engine->getSortedDataInterface(&opCtx, ident, &desc));
+        ASSERT_OK(engine->createSortedDataInterface(&opCtx, CollectionOptions(), ident, &desc));
+        sorted = engine->getSortedDataInterface(&opCtx, ident, &desc);
         ASSERT(sorted);
     }
 }
@@ -666,7 +725,7 @@ std::unique_ptr<KVHarnessHelper> KVHarnessHelper::create() {
     return basicFactory();
 };
 
-void KVHarnessHelper::registerFactory(stdx::function<std::unique_ptr<KVHarnessHelper>()> factory) {
+void KVHarnessHelper::registerFactory(std::function<std::unique_ptr<KVHarnessHelper>()> factory) {
     basicFactory = std::move(factory);
 };
 

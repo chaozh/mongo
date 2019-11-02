@@ -30,31 +30,32 @@
 #pragma once
 
 #include <boost/optional.hpp>
+#include <functional>
 #include <string>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/executor/task_executor.h"
-#include "mongo/stdx/functional.h"
 #include "mongo/transport/baton.h"
-#include "mongo/util/fail_point_service.h"
+#include "mongo/util/fail_point.h"
 #include "mongo/util/functional.h"
 #include "mongo/util/future.h"
 
 namespace mongo {
 namespace executor {
 
-MONGO_FAIL_POINT_DECLARE(networkInterfaceDiscardCommandsBeforeAcquireConn);
-MONGO_FAIL_POINT_DECLARE(networkInterfaceDiscardCommandsAfterAcquireConn);
+extern FailPoint networkInterfaceDiscardCommandsBeforeAcquireConn;
+extern FailPoint networkInterfaceDiscardCommandsAfterAcquireConn;
 
 /**
  * Interface to networking for use by TaskExecutor implementations.
  */
 class NetworkInterface {
-    MONGO_DISALLOW_COPYING(NetworkInterface);
+    NetworkInterface(const NetworkInterface&) = delete;
+    NetworkInterface& operator=(const NetworkInterface&) = delete;
 
 public:
     using Response = RemoteCommandResponse;
-    using RemoteCommandCompletionFn = unique_function<void(const TaskExecutor::ResponseStatus&)>;
+    using RemoteCommandCompletionFn =
+        unique_function<void(const TaskExecutor::ResponseOnAnyStatus&)>;
 
     virtual ~NetworkInterface();
 
@@ -139,21 +140,25 @@ public:
      * Returns ErrorCodes::ShutdownInProgress if NetworkInterface::shutdown has already started
      * and Status::OK() otherwise. If it returns Status::OK(), then the onFinish argument will be
      * executed by NetworkInterface eventually; otherwise, it will not.
+     *
+     * Note that if you pass a baton to startCommand and that baton refuses work, then your onFinish
+     * function will not run.
      */
     virtual Status startCommand(const TaskExecutor::CallbackHandle& cbHandle,
-                                RemoteCommandRequest& request,
+                                RemoteCommandRequestOnAny& request,
                                 RemoteCommandCompletionFn&& onFinish,
                                 const BatonHandle& baton = nullptr) = 0;
 
-    Future<TaskExecutor::ResponseStatus> startCommand(const TaskExecutor::CallbackHandle& cbHandle,
-                                                      RemoteCommandRequest& request,
-                                                      const BatonHandle& baton = nullptr) {
-        auto pf = makePromiseFuture<TaskExecutor::ResponseStatus>();
+    Future<TaskExecutor::ResponseOnAnyStatus> startCommand(
+        const TaskExecutor::CallbackHandle& cbHandle,
+        RemoteCommandRequestOnAny& request,
+        const BatonHandle& baton = nullptr) {
+        auto pf = makePromiseFuture<TaskExecutor::ResponseOnAnyStatus>();
 
         auto status = startCommand(
             cbHandle,
             request,
-            [p = std::move(pf.promise)](const TaskExecutor::ResponseStatus& rs) mutable {
+            [p = std::move(pf.promise)](const TaskExecutor::ResponseOnAnyStatus& rs) mutable {
                 p.emplaceValue(rs);
             },
             baton);

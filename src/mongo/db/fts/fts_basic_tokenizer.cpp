@@ -31,14 +31,14 @@
 
 #include "mongo/db/fts/fts_basic_tokenizer.h"
 
+#include <memory>
+
 #include "mongo/db/fts/fts_query_impl.h"
 #include "mongo/db/fts/fts_spec.h"
 #include "mongo/db/fts/stemmer.h"
 #include "mongo/db/fts/stop_words.h"
 #include "mongo/db/fts/tokenizer.h"
-#include "mongo/stdx/memory.h"
-#include "mongo/util/mongoutils/str.h"
-#include "mongo/util/stringutils.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 namespace fts {
@@ -51,7 +51,7 @@ BasicFTSTokenizer::BasicFTSTokenizer(const FTSLanguage* language)
 void BasicFTSTokenizer::reset(StringData document, Options options) {
     _options = options;
     _document = document.toString();
-    _tokenizer = stdx::make_unique<Tokenizer>(_language, _document);
+    _tokenizer = std::make_unique<Tokenizer>(_language, _document);
 }
 
 bool BasicFTSTokenizer::moveNext() {
@@ -69,7 +69,7 @@ bool BasicFTSTokenizer::moveNext() {
             continue;
         }
 
-        string word = tolowerString(token.data);
+        string word = str::toLower(token.data);
 
         // Stop words are case-sensitive so we need them to be lower cased to check
         // against the stop word list

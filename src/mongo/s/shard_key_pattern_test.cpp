@@ -42,13 +42,13 @@ namespace {
 using std::string;
 
 TEST(ShardKeyPattern, SingleFieldShardKeyPatternsValidityCheck) {
-    ShardKeyPattern(BSON("a" << 1));
-    ShardKeyPattern(BSON("a" << 1.0f));
-    ShardKeyPattern(BSON("a" << (long long)1L));
-    ShardKeyPattern(BSON("a"
-                         << "hashed"));
+    ShardKeyPattern s1(BSON("a" << 1));
+    ShardKeyPattern s2(BSON("a" << 1.0f));
+    ShardKeyPattern s3(BSON("a" << (long long)1L));
+    ShardKeyPattern s4(BSON("a"
+                            << "hashed"));
 
-    ASSERT_THROWS(ShardKeyPattern({}), DBException);
+    ASSERT_THROWS(ShardKeyPattern(BSONObj()), DBException);
     ASSERT_THROWS(ShardKeyPattern(BSON("a" << -1)), DBException);
     ASSERT_THROWS(ShardKeyPattern(BSON("a" << -1.0)), DBException);
     ASSERT_THROWS(ShardKeyPattern(BSON("a"
@@ -62,9 +62,9 @@ TEST(ShardKeyPattern, SingleFieldShardKeyPatternsValidityCheck) {
 }
 
 TEST(ShardKeyPattern, CompositeShardKeyPatternsValidityCheck) {
-    ShardKeyPattern(BSON("a" << 1 << "b" << 1));
-    ShardKeyPattern(BSON("a" << 1.0f << "b" << 1.0));
-    ShardKeyPattern(BSON("a" << 1 << "b" << 1.0 << "c" << 1.0f));
+    ShardKeyPattern s1(BSON("a" << 1 << "b" << 1));
+    ShardKeyPattern s2(BSON("a" << 1.0f << "b" << 1.0));
+    ShardKeyPattern s3(BSON("a" << 1 << "b" << 1.0 << "c" << 1.0f));
 
     ASSERT_THROWS(ShardKeyPattern(BSON("a" << 1 << "b" << -1)), DBException);
     ASSERT_THROWS(ShardKeyPattern(BSON("a" << 1 << "b"
@@ -75,10 +75,10 @@ TEST(ShardKeyPattern, CompositeShardKeyPatternsValidityCheck) {
 }
 
 TEST(ShardKeyPattern, NestedShardKeyPatternsValidtyCheck) {
-    ShardKeyPattern(BSON("a.b" << 1));
-    ShardKeyPattern(BSON("a.b.c.d" << 1.0));
-    ShardKeyPattern(BSON("a" << 1 << "c.d" << 1.0 << "e.f.g" << 1.0f));
-    ShardKeyPattern(BSON("a" << 1 << "a.b" << 1.0 << "a.b.c" << 1.0f));
+    ShardKeyPattern s1(BSON("a.b" << 1));
+    ShardKeyPattern s2(BSON("a.b.c.d" << 1.0));
+    ShardKeyPattern s3(BSON("a" << 1 << "c.d" << 1.0 << "e.f.g" << 1.0f));
+    ShardKeyPattern s4(BSON("a" << 1 << "a.b" << 1.0 << "a.b.c" << 1.0f));
 
     ASSERT_THROWS(ShardKeyPattern(BSON("a.b" << -1)), DBException);
     ASSERT_THROWS(ShardKeyPattern(BSON("a" << BSON("b" << 1))), DBException);
@@ -140,8 +140,7 @@ TEST(ShardKeyPattern, ExtractDocShardKeySingle) {
                       BSON("a" << regex));
     const BSONObj ref = BSON("$ref"
                              << "coll"
-                             << "$id"
-                             << 1);
+                             << "$id" << 1);
     ASSERT_BSONOBJ_EQ(docKey(pattern, BSON("a" << ref)), BSON("a" << ref));
     ASSERT_BSONOBJ_EQ(docKey(pattern, fromjson("{a:{$dollarPrefixKey:true}}")),
                       fromjson("{a:{$dollarPrefixKey:true}}"));
@@ -149,9 +148,12 @@ TEST(ShardKeyPattern, ExtractDocShardKeySingle) {
     ASSERT_BSONOBJ_EQ(docKey(pattern, fromjson("{a:{$gt:{$dollarPrefixKey:10}}}}")),
                       fromjson("{a:{$gt:{$dollarPrefixKey:10}}}}"));
 
-    ASSERT_BSONOBJ_EQ(docKey(pattern, BSONObj()), BSONObj());
-    ASSERT_BSONOBJ_EQ(docKey(pattern, fromjson("{b:10}")), BSONObj());
-    ASSERT_BSONOBJ_EQ(docKey(pattern, BSON("" << 10)), BSONObj());
+    ASSERT_BSONOBJ_EQ(docKey(pattern, BSONObj()), fromjson("{a: null}"));
+
+    ASSERT_BSONOBJ_EQ(docKey(pattern, fromjson("{b:10}")), fromjson("{a: null}"));
+
+    ASSERT_BSONOBJ_EQ(docKey(pattern, BSON("" << 10)), fromjson("{a: null}"));
+
     ASSERT_BSONOBJ_EQ(docKey(pattern, fromjson("{a:[1,2]}")), BSONObj());
     // BSONObjIterator breaks this for now
     // ASSERT_EQUALS(docKey(pattern, BSON("a" << 10 << "a" << 20)), BSONObj());
@@ -169,8 +171,7 @@ TEST(ShardKeyPattern, ExtractDocShardKeyCompound) {
     ASSERT_BSONOBJ_EQ(docKey(pattern,
                              BSON("c" << 30 << "b"
                                       << "20"
-                                      << "a"
-                                      << 10)),
+                                      << "a" << 10)),
                       fromjson("{a:10, b:'20'}"));
     ASSERT_BSONOBJ_EQ(docKey(pattern, fromjson("{a:10, b:{$dollarPrefixKey:true}}")),
                       fromjson("{a:10, b:{$dollarPrefixKey:true}}"));
@@ -178,11 +179,13 @@ TEST(ShardKeyPattern, ExtractDocShardKeyCompound) {
                       fromjson("{a:10, b:{$gt:20}}"));
 
     ASSERT_BSONOBJ_EQ(docKey(pattern, fromjson("{a:10, b:[1, 2]}")), BSONObj());
-    ASSERT_BSONOBJ_EQ(docKey(pattern, fromjson("{b:20}")), BSONObj());
+
+    ASSERT_BSONOBJ_EQ(docKey(pattern, fromjson("{b:20}")), fromjson("{a:null, b:20}"));
+
     ASSERT_BSONOBJ_EQ(docKey(pattern,
                              BSON("" << 10 << "b"
                                      << "20")),
-                      BSONObj());
+                      fromjson("{a: null, b:'20'}"));
 
     // Ordering
     ASSERT_EQUALS(docKey(pattern, BSON("b" << 20 << "a" << 10)).firstElement().numberInt(), 10);
@@ -199,14 +202,17 @@ TEST(ShardKeyPattern, ExtractDocShardKeyNested) {
                       fromjson("{'a.b':10, c:30}"));
     const BSONObj ref = BSON("$ref"
                              << "coll"
-                             << "$id"
-                             << 1);
+                             << "$id" << 1);
     ASSERT_BSONOBJ_EQ(docKey(pattern, BSON("a" << BSON("b" << ref) << "c" << 30)),
                       BSON("a.b" << ref << "c" << 30));
 
-    ASSERT_BSONOBJ_EQ(docKey(pattern, fromjson("{a:10, c:30}")), BSONObj());
-    ASSERT_BSONOBJ_EQ(docKey(pattern, fromjson("{a:{d:40}, c:30}")), BSONObj());
-    ASSERT_BSONOBJ_EQ(docKey(pattern, fromjson("{a:[{b:10}, {b:20}], c:30}")), BSONObj());
+    ASSERT_BSONOBJ_EQ(docKey(pattern, fromjson("{a:10, c:30}")), fromjson("{'a.b': null, c: 30}"));
+
+    ASSERT_BSONOBJ_EQ(docKey(pattern, fromjson("{a:{d:40}, c:30}")),
+                      fromjson("{'a.b': null, c: 30}"));
+    ASSERT_BSONOBJ_EQ(docKey(pattern, fromjson("{a:[{b:10}, {b:20}], c:30}")),
+                      fromjson("{'a.b': null, c: 30}"));
+
     ASSERT_BSONOBJ_EQ(docKey(pattern, fromjson("{a:{b:[10, 20]}, c:30}")), BSONObj());
 }
 
@@ -218,13 +224,20 @@ TEST(ShardKeyPattern, ExtractDocShardKeyDeepNested) {
     ShardKeyPattern pattern(BSON("a.b.c" << 1));
     ASSERT_BSONOBJ_EQ(docKey(pattern, fromjson("{a:{b:{c:10}}}")), fromjson("{'a.b.c':10}"));
 
-    ASSERT_BSONOBJ_EQ(docKey(pattern, fromjson("{a:[{b:{c:10}}]}")), BSONObj());
-    ASSERT_BSONOBJ_EQ(docKey(pattern, fromjson("{a:{b:[{c:10}]}}")), BSONObj());
+    ASSERT_BSONOBJ_EQ(docKey(pattern, fromjson("{a:[{b:{c:10}}]}")), fromjson("{'a.b.c': null}"));
+
+    ASSERT_BSONOBJ_EQ(docKey(pattern, fromjson("{a:{b:[{c:10}]}}")), fromjson("{'a.b.c': null}"));
+
     ASSERT_BSONOBJ_EQ(docKey(pattern, fromjson("{a:{b:{c:[10, 20]}}}")), BSONObj());
-    ASSERT_BSONOBJ_EQ(docKey(pattern, fromjson("{a:{b:[{c:10}, {c:20}]}}")), BSONObj());
-    ASSERT_BSONOBJ_EQ(docKey(pattern, fromjson("{a:[{b:{c:10}},{b:{c:20}}]}")), BSONObj());
+
+    ASSERT_BSONOBJ_EQ(docKey(pattern, fromjson("{a:{b:[{c:10}, {c:20}]}}")),
+                      fromjson("{'a.b.c': null}"));
+
+    ASSERT_BSONOBJ_EQ(docKey(pattern, fromjson("{a:[{b:{c:10}},{b:{c:20}}]}")),
+                      fromjson("{'a.b.c': null}"));
+
     ASSERT_BSONOBJ_EQ(docKey(pattern, fromjson("{a:[{b:[{c:10},{c:20}]},{b:[{c:30},{c:40}]}]}}")),
-                      BSONObj());
+                      fromjson("{'a.b.c': null}"));
 }
 
 TEST(ShardKeyPattern, ExtractDocShardKeyHashed) {
@@ -237,6 +250,10 @@ TEST(ShardKeyPattern, ExtractDocShardKeyHashed) {
     const long long hashValue =
         BSONElementHasher::hash64(bsonValue.firstElement(), BSONElementHasher::DEFAULT_HASH_SEED);
 
+    const BSONObj nullBsonValue = BSON("" << BSONNULL);
+    const long long nullHashValue = BSONElementHasher::hash64(nullBsonValue.firstElement(),
+                                                              BSONElementHasher::DEFAULT_HASH_SEED);
+
     ShardKeyPattern pattern(BSON("a.b"
                                  << "hashed"));
     ASSERT_BSONOBJ_EQ(docKey(pattern, BSON("a" << BSON("b" << value))), BSON("a.b" << hashValue));
@@ -245,9 +262,13 @@ TEST(ShardKeyPattern, ExtractDocShardKeyHashed) {
     ASSERT_BSONOBJ_EQ(docKey(pattern, BSON("a" << BSON("c" << 30 << "b" << value))),
                       BSON("a.b" << hashValue));
 
-    ASSERT_BSONOBJ_EQ(docKey(pattern, BSON("a" << BSON("c" << value))), BSONObj());
+    ASSERT_BSONOBJ_EQ(docKey(pattern, BSON("a" << BSON("c" << value))),
+                      BSON("a.b" << nullHashValue));
+
     ASSERT_BSONOBJ_EQ(docKey(pattern, BSON("a" << BSON("b" << BSON_ARRAY(value)))), BSONObj());
-    ASSERT_BSONOBJ_EQ(docKey(pattern, BSON("a" << BSON_ARRAY(BSON("b" << value)))), BSONObj());
+
+    ASSERT_BSONOBJ_EQ(docKey(pattern, BSON("a" << BSON_ARRAY(BSON("b" << value)))),
+                      BSON("a.b" << nullHashValue));
 }
 
 static BSONObj queryKey(const ShardKeyPattern& pattern, const BSONObj& query) {
@@ -308,8 +329,7 @@ TEST(ShardKeyPattern, ExtractQueryShardKeyCompound) {
     ASSERT_BSONOBJ_EQ(queryKey(pattern,
                                BSON("c" << 30 << "b"
                                         << "20"
-                                        << "a"
-                                        << 10)),
+                                        << "a" << 10)),
                       fromjson("{a:10, b:'20'}"));
 
     ASSERT_BSONOBJ_EQ(queryKey(pattern, fromjson("{a:10, b:[1, 2]}")), BSONObj());
@@ -485,6 +505,10 @@ TEST(ShardKeyPattern, UniqueIndexCompatibleHashed) {
     ASSERT(indexComp(pattern, BSON("a.b" << -1)));
     ASSERT(indexComp(pattern, BSON("a.b" << 1 << "c" << 1)));
     ASSERT(indexComp(pattern, BSON("a.b" << -1 << "c" << 1)));
+
+    ASSERT(indexComp(pattern,
+                     BSON("a.b"
+                          << "hashed")));
 
     ASSERT(indexComp(pattern, BSON("_id" << 1)));
     ASSERT(indexComp(pattern, BSON("_id" << -1 << "c" << 1)));

@@ -29,10 +29,11 @@
 
 #include "mongo/platform/basic.h"
 
+#include <memory>
+
 #include "mongo/db/service_context_test_fixture.h"
 #include "mongo/db/session_catalog.h"
 #include "mongo/stdx/future.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/unittest/barrier.h"
 #include "mongo/unittest/death_test.h"
 #include "mongo/unittest/unittest.h"
@@ -117,6 +118,71 @@ TEST_F(SessionCatalogTestWithDefaultOpCtx, NestedOperationContextSession) {
     ASSERT(!OperationContextSession::get(_opCtx));
 }
 
+TEST_F(SessionCatalogTest, ScanSession) {
+    // Create three sessions in the catalog.
+    const std::vector<LogicalSessionId> lsids{makeLogicalSessionIdForTest(),
+                                              makeLogicalSessionIdForTest(),
+                                              makeLogicalSessionIdForTest()};
+    for (const auto& lsid : lsids) {
+        stdx::async(stdx::launch::async,
+                    [this, lsid] {
+                        ThreadClient tc(getServiceContext());
+                        auto opCtx = makeOperationContext();
+                        opCtx->setLogicalSessionId(lsid);
+                        OperationContextSession ocs(opCtx.get());
+                    })
+            .get();
+    }
+
+    catalog()->scanSession(lsids[0], [&lsids](const ObservableSession& session) {
+        ASSERT_EQ(lsids[0], session.get()->getSessionId());
+    });
+
+    catalog()->scanSession(lsids[1], [&lsids](const ObservableSession& session) {
+        ASSERT_EQ(lsids[1], session.get()->getSessionId());
+    });
+
+    catalog()->scanSession(lsids[2], [&lsids](const ObservableSession& session) {
+        ASSERT_EQ(lsids[2], session.get()->getSessionId());
+    });
+
+    catalog()->scanSession(makeLogicalSessionIdForTest(), [](const ObservableSession&) {
+        FAIL("The callback was called for non-existent session");
+    });
+}
+
+TEST_F(SessionCatalogTest, ScanSessionMarkForReapWhenSessionIsIdle) {
+    // Create three sessions in the catalog.
+    const std::vector<LogicalSessionId> lsids{makeLogicalSessionIdForTest(),
+                                              makeLogicalSessionIdForTest(),
+                                              makeLogicalSessionIdForTest()};
+    for (const auto& lsid : lsids) {
+        stdx::async(stdx::launch::async,
+                    [this, lsid] {
+                        ThreadClient tc(getServiceContext());
+                        auto opCtx = makeOperationContext();
+                        opCtx->setLogicalSessionId(lsid);
+                        OperationContextSession ocs(opCtx.get());
+                    })
+            .get();
+    }
+
+    catalog()->scanSession(lsids[0],
+                           [&lsids](ObservableSession& session) { session.markForReap(); });
+
+    catalog()->scanSession(lsids[0], [](const ObservableSession&) {
+        FAIL("The callback was called for non-existent session");
+    });
+
+    catalog()->scanSession(lsids[1], [&lsids](const ObservableSession& session) {
+        ASSERT_EQ(lsids[1], session.get()->getSessionId());
+    });
+
+    catalog()->scanSession(lsids[2], [&lsids](const ObservableSession& session) {
+        ASSERT_EQ(lsids[2], session.get()->getSessionId());
+    });
+}
+
 TEST_F(SessionCatalogTestWithDefaultOpCtx, ScanSessions) {
     std::vector<LogicalSessionId> lsidsFound;
     const auto workerFn = [&lsidsFound](const ObservableSession& session) {
@@ -135,12 +201,14 @@ TEST_F(SessionCatalogTestWithDefaultOpCtx, ScanSessions) {
                                               makeLogicalSessionIdForTest(),
                                               makeLogicalSessionIdForTest()};
     for (const auto& lsid : lsids) {
-        stdx::async(stdx::launch::async, [this, lsid] {
-            ThreadClient tc(getServiceContext());
-            auto opCtx = makeOperationContext();
-            opCtx->setLogicalSessionId(lsid);
-            OperationContextSession ocs(opCtx.get());
-        }).get();
+        stdx::async(stdx::launch::async,
+                    [this, lsid] {
+                        ThreadClient tc(getServiceContext());
+                        auto opCtx = makeOperationContext();
+                        opCtx->setLogicalSessionId(lsid);
+                        OperationContextSession ocs(opCtx.get());
+                    })
+            .get();
     }
 
     // Scan over all Sessions.
@@ -155,6 +223,47 @@ TEST_F(SessionCatalogTestWithDefaultOpCtx, ScanSessions) {
     ASSERT_EQ(1U, lsidsFound.size());
     ASSERT_EQ(lsids[2], lsidsFound.front());
     lsidsFound.clear();
+}
+
+TEST_F(SessionCatalogTestWithDefaultOpCtx, ScanSessionsMarkForReap) {
+    // Create three sessions in the catalog.
+    const std::vector<LogicalSessionId> lsids{makeLogicalSessionIdForTest(),
+                                              makeLogicalSessionIdForTest(),
+                                              makeLogicalSessionIdForTest()};
+
+    unittest::Barrier sessionsCheckedOut(2);
+    unittest::Barrier sessionsCheckedIn(2);
+
+    auto f = stdx::async(stdx::launch::async, [&] {
+        ThreadClient tc(getServiceContext());
+        auto opCtx = makeOperationContext();
+        opCtx->setLogicalSessionId(lsids[1]);
+        OperationContextSession ocs(opCtx.get());
+        sessionsCheckedOut.countDownAndWait();
+        sessionsCheckedIn.countDownAndWait();
+    });
+
+    // After this wait, session 1 is checked-out and waiting on the barrier, because of which only
+    // sessions 0 and 2 will be reaped
+    sessionsCheckedOut.countDownAndWait();
+
+    SessionKiller::Matcher matcherAllSessions(
+        KillAllSessionsByPatternSet{makeKillAllSessionsByPattern(_opCtx)});
+
+    catalog()->scanSessions(matcherAllSessions,
+                            [&](ObservableSession& session) { session.markForReap(); });
+
+    catalog()->scanSessions(matcherAllSessions, [&](const ObservableSession& session) {
+        ASSERT_EQ(lsids[1], session.get()->getSessionId());
+    });
+
+    // After this point, session 1 is checked back in
+    sessionsCheckedIn.countDownAndWait();
+    f.get();
+
+    catalog()->scanSessions(matcherAllSessions, [&](const ObservableSession& session) {
+        ASSERT_EQ(lsids[1], session.get()->getSessionId());
+    });
 }
 
 TEST_F(SessionCatalogTest, KillSessionWhenSessionIsNotCheckedOut) {
@@ -491,11 +600,13 @@ TEST_F(SessionCatalogTestWithDefaultOpCtx, ConcurrentCheckOutAndKill) {
 
         // The main thread won't check in the session until it's killed.
         {
-            stdx::mutex m;
+            auto m = MONGO_MAKE_LATCH();
             stdx::condition_variable cond;
-            stdx::unique_lock<stdx::mutex> lock(m);
-            ASSERT_EQ(ErrorCodes::InternalError,
-                      _opCtx->waitForConditionOrInterruptNoAssert(cond, lock));
+            stdx::unique_lock<Latch> lock(m);
+            ASSERT_THROWS_CODE(
+                _opCtx->waitForConditionOrInterrupt(cond, lock, [] { return false; }),
+                DBException,
+                ErrorCodes::InternalError);
         }
     }
     normalCheckOutFinish.get();

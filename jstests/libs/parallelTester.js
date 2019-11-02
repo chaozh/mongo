@@ -42,16 +42,6 @@ if (typeof _threadInject != "undefined") {
     };
     _threadInject(Thread.prototype);
 
-    ScopedThread = function() {
-        var args = Array.prototype.slice.call(arguments);
-        // Always pass TestData as the first argument.
-        args.unshift(TestData);
-        args.unshift(_threadStartWrapper);
-        this.init.apply(this, args);
-    };
-    ScopedThread.prototype = new Thread(function() {});
-    _scopedThreadInject(ScopedThread.prototype);
-
     fork = function() {
         var t = new Thread(function() {});
         Thread.apply(t, arguments);
@@ -135,9 +125,8 @@ if (typeof _threadInject != "undefined") {
         this.params.push(args);
     };
 
-    ParallelTester.prototype.run = function(msg, newScopes) {
-        newScopes = newScopes || false;
-        assert.parallelTests(this.params, msg, newScopes);
+    ParallelTester.prototype.run = function(msg) {
+        assert.parallelTests(this.params, msg);
     };
 
     // creates lists of tests from jstests dir in a format suitable for use by
@@ -166,8 +155,7 @@ if (typeof _threadInject != "undefined") {
             "index_bigkeys_nofail.js",
             "index_bigkeys_validation.js",
 
-            "mr3.js",
-            "evald.js",
+            "mr_fail_invalid_js.js",
             "run_program1.js",
             "notablescan.js",
             "bench_test1.js",
@@ -182,6 +170,7 @@ if (typeof _threadInject != "undefined") {
             // this suite because any test being run at the same time could conceivably spam the
             // logs so much that the line they are looking for has been rotated off the server's
             // in-memory buffer of log messages, which only stores the 1024 most recent operations.
+            "comment_field.js",
             "getlog2.js",
             "logprocessdetails.js",
             "queryoptimizera.js",
@@ -192,6 +181,7 @@ if (typeof _threadInject != "undefined") {
             "geo_update_btree2.js",   // SERVER-11132 test disables table scans
             "update_setOnInsert.js",  // SERVER-9982
             "max_time_ms.js",         // Sensitive to query execution time, by design
+            "autocomplete.js",        // Likewise.
 
             // This overwrites MinKey/MaxKey's singleton which breaks
             // any other test that uses MinKey/MaxKey
@@ -200,6 +190,12 @@ if (typeof _threadInject != "undefined") {
             // Assumes that other tests are not creating cursors.
             "kill_cursors.js",
 
+            // This test takes an IX global lock on an async thread, then runs CRUD ops needing IX
+            // locks. If a concurrent JS test queues a global X lock after the async thread takes
+            // the IX lock, and before the CRUD ops get IX locks, then there's a deadlock: the async
+            // thread will not release the acquired IX lock until the CRUD ops have finished.
+            "background_validation.js",
+
             // Views tests
             "views/invalid_system_views.js",      // Puts invalid view definitions in system.views.
             "views/views_all_commands.js",        // Drops test DB.
@@ -207,11 +203,21 @@ if (typeof _threadInject != "undefined") {
 
             // Destroys and recreates the catalog, which will interfere with other tests.
             "restart_catalog.js",
+
+            // This test works close to the BSON document limit for entries in the durable catalog,
+            // so running it in parallel with other tests will cause failures.
+            "long_collection_names.js",
+
+            // This test causes collMod commands to hang, which interferes with other tests running
+            // collMod.
+            "crud_ops_do_not_throw_locktimeout.js",
         ]);
 
         // The following tests cannot run when shell readMode is legacy.
         if (db.getMongo().readMode() === "legacy") {
             var requires_find_command = [
+                "update_pipeline_shell_helpers.js",
+                "update_with_pipeline.js",
                 "views/views_aggregation.js",
                 "views/views_change.js",
                 "views/views_drop.js",
@@ -273,7 +279,6 @@ if (typeof _threadInject != "undefined") {
             parallelFilesDir + "/profile_mapreduce.js",
             parallelFilesDir + "/profile_no_such_db.js",
             parallelFilesDir + "/profile_query_hash.js",
-            parallelFilesDir + "/profile_repair_cursor.js",
             parallelFilesDir + "/profile_sampling.js",
             parallelFilesDir + "/profile_update.js",
 
@@ -344,9 +349,7 @@ if (typeof _threadInject != "undefined") {
     // by zero or more arguments to that function.  Each function and its arguments will
     // be called in a separate thread.
     // msg: failure message
-    // newScopes: if true, each thread starts in a fresh scope
-    assert.parallelTests = function(params, msg, newScopes) {
-        newScopes = newScopes || false;
+    assert.parallelTests = function(params, msg) {
         function wrapper(fun, argv, globals) {
             if (globals.hasOwnProperty("TestData")) {
                 TestData = globals.TestData;
@@ -368,11 +371,13 @@ if (typeof _threadInject != "undefined") {
         for (var i in params) {
             var param = params[i];
             var test = param.shift();
-            var t;
-            if (newScopes)
-                t = new ScopedThread(wrapper, test, param, {TestData: TestData});
-            else
-                t = new Thread(wrapper, test, param, {TestData: TestData});
+
+            // Make a shallow copy of TestData so we can override the test name to
+            // prevent tests on different threads that to use jsTestName() as the
+            // collection name from colliding.
+            const clonedTestData = Object.assign({}, TestData);
+            clonedTestData.testName = `ParallelTesterThread${i}`;
+            var t = new Thread(wrapper, test, param, {TestData: clonedTestData});
             runners.push(t);
         }
 

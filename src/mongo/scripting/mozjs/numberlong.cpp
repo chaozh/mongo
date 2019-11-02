@@ -40,8 +40,8 @@
 #include "mongo/scripting/mozjs/valuereader.h"
 #include "mongo/scripting/mozjs/valuewriter.h"
 #include "mongo/scripting/mozjs/wrapconstrainedmethod.h"
-#include "mongo/util/mongoutils/str.h"
 #include "mongo/util/represent_as.h"
+#include "mongo/util/str.h"
 #include "mongo/util/text.h"
 
 namespace mongo {
@@ -173,8 +173,8 @@ void NumberLongInfo::construct(JSContext* cx, JS::CallArgs args) {
             // values to fail rather than return 0 (which is the behavior of ToInt64).
             std::string str = ValueWriter(cx, arg).toString();
 
-            // Call parseNumberFromStringWithBase() function to convert string to a number
-            Status status = parseNumberFromStringWithBase(str, 10, &numLong);
+            // Call NumberParser() function to convert string to a number
+            Status status = NumberParser{}.base(10)(str, &numLong);
             uassert(ErrorCodes::BadValue, "could not convert string to long long", status.isOK());
         } else {
             numLong = ValueWriter(cx, arg).toInt64();

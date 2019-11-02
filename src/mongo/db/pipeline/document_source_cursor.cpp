@@ -34,12 +34,13 @@
 #include "mongo/db/pipeline/document_source_cursor.h"
 
 #include "mongo/db/catalog/collection.h"
+#include "mongo/db/exec/document_value/document.h"
 #include "mongo/db/exec/working_set_common.h"
-#include "mongo/db/pipeline/document.h"
+#include "mongo/db/query/collection_query_info.h"
 #include "mongo/db/query/explain.h"
 #include "mongo/db/query/find_common.h"
 #include "mongo/db/storage/storage_options.h"
-#include "mongo/util/fail_point_service.h"
+#include "mongo/util/fail_point.h"
 #include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
 
@@ -52,12 +53,10 @@ using std::shared_ptr;
 using std::string;
 
 const char* DocumentSourceCursor::getSourceName() const {
-    return "$cursor";
+    return kStageName.rawData();
 }
 
-DocumentSource::GetNextResult DocumentSourceCursor::getNext() {
-    pExpCtx->checkForInterrupt();
-
+DocumentSource::GetNextResult DocumentSourceCursor::doGetNext() {
     if (_currentBatch.empty()) {
         loadBatch();
     }
@@ -74,23 +73,19 @@ DocumentSource::GetNextResult DocumentSourceCursor::getNext() {
     return std::move(out);
 }
 
-Document DocumentSourceCursor::transformBSONObjToDocument(const BSONObj& obj) const {
-    return _dependencies ? _dependencies->extractFields(obj) : Document::fromBsonWithMetaData(obj);
-}
-
 void DocumentSourceCursor::loadBatch() {
     if (!_exec || _exec->isDisposed()) {
         // No more documents.
         return;
     }
 
-    while (MONGO_FAIL_POINT(hangBeforeDocumentSourceCursorLoadBatch)) {
+    while (MONGO_unlikely(hangBeforeDocumentSourceCursorLoadBatch.shouldFail())) {
         log() << "Hanging aggregation due to 'hangBeforeDocumentSourceCursorLoadBatch' failpoint";
         sleepmillis(10);
     }
 
     PlanExecutor::ExecState state;
-    BSONObj resultObj;
+    Document resultObj;
     {
         AutoGetCollectionForRead autoColl(pExpCtx->opCtx, _exec->nss());
         uassertStatusOK(repl::ReplicationCoordinator::get(pExpCtx->opCtx)
@@ -106,14 +101,7 @@ void DocumentSourceCursor::loadBatch() {
                 if (_shouldProduceEmptyDocs) {
                     _currentBatch.push_back(Document());
                 } else {
-                    _currentBatch.push_back(transformBSONObjToDocument(resultObj));
-                }
-
-                if (_limit) {
-                    if (++_docsAddedToBatches == _limit->getLimit()) {
-                        break;
-                    }
-                    verify(_docsAddedToBatches < _limit->getLimit());
+                    _currentBatch.push_back(transformDoc(resultObj.getOwned()));
                 }
 
                 memUsageBytes += _currentBatch.back().getApproximateSize();
@@ -171,35 +159,9 @@ void DocumentSourceCursor::_updateOplogTimestamp() {
     _latestOplogTimestamp = _exec->getLatestOplogTimestamp();
 }
 
-Pipeline::SourceContainer::iterator DocumentSourceCursor::doOptimizeAt(
-    Pipeline::SourceContainer::iterator itr, Pipeline::SourceContainer* container) {
-    invariant(*itr == this);
-
-    auto nextLimit = dynamic_cast<DocumentSourceLimit*>((*std::next(itr)).get());
-
-    if (nextLimit) {
-        if (_limit) {
-            // We already have an internal limit, set it to the more restrictive of the two.
-            _limit->setLimit(std::min(_limit->getLimit(), nextLimit->getLimit()));
-        } else {
-            _limit = nextLimit;
-        }
-        container->erase(std::next(itr));
-        return itr;
-    }
-    return std::next(itr);
-}
-
 void DocumentSourceCursor::recordPlanSummaryStats() {
     invariant(_exec);
-    // Aggregation handles in-memory sort outside of the query sub-system. Given that we need to
-    // preserve the existing value of hasSortStage rather than overwrite with the underlying
-    // PlanExecutor's value.
-    auto hasSortStage = _planSummaryStats.hasSortStage;
-
     Explain::getSummaryStats(*_exec, &_planSummaryStats);
-
-    _planSummaryStats.hasSortStage = hasSortStage;
 }
 
 Value DocumentSourceCursor::serialize(boost::optional<ExplainOptions::Verbosity> verbosity) const {
@@ -214,16 +176,6 @@ Value DocumentSourceCursor::serialize(boost::optional<ExplainOptions::Verbosity>
             verbosity == pExpCtx->explain);
 
     MutableDocument out;
-    out["query"] = Value(_query);
-
-    if (!_sort.isEmpty())
-        out["sort"] = Value(_sort);
-
-    if (_limit)
-        out["limit"] = Value(_limit->getLimit());
-
-    if (!_projection.isEmpty())
-        out["fields"] = Value(_projection);
 
     BSONObjBuilder explainStatsBuilder;
 
@@ -231,15 +183,17 @@ Value DocumentSourceCursor::serialize(boost::optional<ExplainOptions::Verbosity>
         auto opCtx = pExpCtx->opCtx;
         auto lockMode = getLockModeForQuery(opCtx, _exec->nss());
         AutoGetDb dbLock(opCtx, _exec->nss().db(), lockMode);
-        Lock::CollectionLock collLock(opCtx->lockState(), _exec->nss().ns(), lockMode);
-        auto collection =
-            dbLock.getDb() ? dbLock.getDb()->getCollection(opCtx, _exec->nss()) : nullptr;
+        Lock::CollectionLock collLock(opCtx, _exec->nss(), lockMode);
+        auto collection = dbLock.getDb()
+            ? CollectionCatalog::get(opCtx).lookupCollectionByNamespace(_exec->nss())
+            : nullptr;
 
         Explain::explainStages(_exec.get(),
                                collection,
                                verbosity.get(),
                                _execStatus,
                                _winningPlanTrialStats.get(),
+                               BSONObj(),
                                &explainStatsBuilder);
     }
 
@@ -300,11 +254,7 @@ DocumentSourceCursor::DocumentSourceCursor(
     std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> exec,
     const intrusive_ptr<ExpressionContext>& pCtx,
     bool trackOplogTimestamp)
-    : DocumentSource(pCtx),
-      _docsAddedToBatches(0),
-      _exec(std::move(exec)),
-      _outputSorts(_exec->getOutputSorts()),
-      _trackOplogTS(trackOplogTimestamp) {
+    : DocumentSource(kStageName, pCtx), _exec(std::move(exec)), _trackOplogTS(trackOplogTimestamp) {
     // Later code in the DocumentSourceCursor lifecycle expects that '_exec' is in a saved state.
     _exec->saveState();
 
@@ -318,7 +268,7 @@ DocumentSourceCursor::DocumentSourceCursor(
     }
 
     if (collection) {
-        collection->infoCache()->notifyOfQuery(pExpCtx->opCtx, _planSummaryStats.indexesUsed);
+        CollectionQueryInfo::get(collection).notifyOfQuery(pExpCtx->opCtx, _planSummaryStats);
     }
 }
 
@@ -331,4 +281,4 @@ intrusive_ptr<DocumentSourceCursor> DocumentSourceCursor::create(
         new DocumentSourceCursor(collection, std::move(exec), pExpCtx, trackOplogTimestamp));
     return source;
 }
-}
+}  // namespace mongo

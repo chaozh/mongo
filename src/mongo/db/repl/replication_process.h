@@ -32,14 +32,13 @@
 
 #include <memory>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/repl/optime.h"
 #include "mongo/db/repl/replication_consistency_markers.h"
 #include "mongo/db/repl/replication_recovery.h"
-#include "mongo/stdx/mutex.h"
+#include "mongo/platform/mutex.h"
 
 namespace mongo {
 
@@ -60,7 +59,8 @@ class StorageInterface;
  * This class DOES NOT hold any information related to the consensus protocol.
  */
 class ReplicationProcess {
-    MONGO_DISALLOW_COPYING(ReplicationProcess);
+    ReplicationProcess(const ReplicationProcess&) = delete;
+    ReplicationProcess& operator=(const ReplicationProcess&) = delete;
 
 public:
     static const int kUninitializedRollbackId = -1;
@@ -103,7 +103,7 @@ private:
     // (M)  Reads and writes guarded by _mutex.
 
     // Guards access to member variables.
-    mutable stdx::mutex _mutex;
+    mutable Mutex _mutex = MONGO_MAKE_LATCH("ReplicationProcess::_mutex");
 
     // Used to access the storage layer.
     StorageInterface* const _storageInterface;  // (R)

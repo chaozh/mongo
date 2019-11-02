@@ -33,12 +33,12 @@
 
 #include <boost/optional.hpp>
 
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/db/pipeline/document.h"
 #include "mongo/db/pipeline/document_source_match.h"
 #include "mongo/db/pipeline/expression.h"
 #include "mongo/db/pipeline/lite_parsed_document_source.h"
-#include "mongo/db/pipeline/value.h"
 
 namespace mongo {
 
@@ -47,23 +47,21 @@ using std::vector;
 
 DocumentSourceRedact::DocumentSourceRedact(const intrusive_ptr<ExpressionContext>& expCtx,
                                            const intrusive_ptr<Expression>& expression)
-    : DocumentSource(expCtx), _expression(expression) {}
+    : DocumentSource(kStageName, expCtx), _expression(expression) {}
 
 REGISTER_DOCUMENT_SOURCE(redact,
                          LiteParsedDocumentSourceDefault::parse,
                          DocumentSourceRedact::createFromBson);
 
 const char* DocumentSourceRedact::getSourceName() const {
-    return "$redact";
+    return kStageName.rawData();
 }
 
 static const Value descendVal = Value("descend"_sd);
 static const Value pruneVal = Value("prune"_sd);
 static const Value keepVal = Value("keep"_sd);
 
-DocumentSource::GetNextResult DocumentSourceRedact::getNext() {
-    pExpCtx->checkForInterrupt();
-
+DocumentSource::GetNextResult DocumentSourceRedact::doGetNext() {
     auto nextInput = pSource->getNext();
     for (; nextInput.isAdvanced(); nextInput = pSource->getNext()) {
         auto& variables = pExpCtx->variables;
@@ -79,6 +77,10 @@ DocumentSource::GetNextResult DocumentSourceRedact::getNext() {
 Pipeline::SourceContainer::iterator DocumentSourceRedact::doOptimizeAt(
     Pipeline::SourceContainer::iterator itr, Pipeline::SourceContainer* container) {
     invariant(*itr == this);
+
+    if (std::next(itr) == container->end()) {
+        return container->end();
+    }
 
     auto nextMatch = dynamic_cast<DocumentSourceMatch*>((*std::next(itr)).get());
 
@@ -131,7 +133,7 @@ Value DocumentSourceRedact::redactValue(const Value& in, const Document& root) {
 
 boost::optional<Document> DocumentSourceRedact::redactObject(const Document& root) {
     auto& variables = pExpCtx->variables;
-    const Value expressionResult = _expression->evaluate(root);
+    const Value expressionResult = _expression->evaluate(root, &variables);
 
     ValueComparator simpleValueCmp;
     if (simpleValueCmp.evaluate(expressionResult == keepVal)) {
@@ -157,8 +159,7 @@ boost::optional<Document> DocumentSourceRedact::redactObject(const Document& roo
         uasserted(17053,
                   str::stream() << "$redact's expression should not return anything "
                                 << "aside from the variables $$KEEP, $$DESCEND, and "
-                                << "$$PRUNE, but returned "
-                                << expressionResult.toString());
+                                << "$$PRUNE, but returned " << expressionResult.toString());
     }
 }
 
@@ -189,7 +190,6 @@ intrusive_ptr<DocumentSource> DocumentSourceRedact::createFromBson(
     variables.setValue(pruneId, pruneVal);
     variables.setValue(keepId, keepVal);
 
-
     return source;
 }
-}
+}  // namespace mongo

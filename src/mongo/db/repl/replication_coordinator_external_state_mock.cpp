@@ -33,12 +33,13 @@
 
 #include "mongo/db/repl/replication_coordinator_external_state_mock.h"
 
+#include <memory>
+
 #include "mongo/base/status_with.h"
 #include "mongo/bson/oid.h"
 #include "mongo/db/client.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/repl/oplog_buffer_blocking_queue.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/util/log.h"
 #include "mongo/util/net/hostandport.h"
 #include "mongo/util/sequence_util.h"
@@ -50,6 +51,7 @@ ReplicationCoordinatorExternalStateMock::ReplicationCoordinatorExternalStateMock
     : _localRsConfigDocument(ErrorCodes::NoMatchingDocument, "No local config document"),
       _localRsLastVoteDocument(ErrorCodes::NoMatchingDocument, "No local lastVote document"),
       _lastOpTime(ErrorCodes::NoMatchingDocument, "No last oplog entry"),
+      _lastWallTime(ErrorCodes::NoMatchingDocument, "No last oplog entry"),
       _canAcquireGlobalSharedLock(true),
       _storeLocalConfigDocumentStatus(Status::OK()),
       _storeLocalLastVoteDocumentStatus(Status::OK()),
@@ -128,6 +130,14 @@ void ReplicationCoordinatorExternalStateMock::setLocalConfigDocument(
     _localRsConfigDocument = localConfigDocument;
 }
 
+Status ReplicationCoordinatorExternalStateMock::createLocalLastVoteCollection(
+    OperationContext* opCtx) {
+    if (!_localRsLastVoteDocument.isOK()) {
+        setLocalLastVoteDocument(LastVote{OpTime::kInitialTerm, -1});
+    }
+    return Status::OK();
+}
+
 StatusWith<LastVote> ReplicationCoordinatorExternalStateMock::loadLocalLastVoteDocument(
     OperationContext* opCtx) {
     return _localRsLastVoteDocument;
@@ -136,7 +146,7 @@ StatusWith<LastVote> ReplicationCoordinatorExternalStateMock::loadLocalLastVoteD
 Status ReplicationCoordinatorExternalStateMock::storeLocalLastVoteDocument(
     OperationContext* opCtx, const LastVote& lastVote) {
     {
-        stdx::unique_lock<stdx::mutex> lock(_shouldHangLastVoteMutex);
+        stdx::unique_lock<Latch> lock(_shouldHangLastVoteMutex);
         while (_storeLocalLastVoteDocumentShouldHang) {
             _shouldHangLastVoteCondVar.wait(lock);
         }
@@ -168,13 +178,24 @@ bool ReplicationCoordinatorExternalStateMock::oplogExists(OperationContext* opCt
     return true;
 }
 
-StatusWith<OpTime> ReplicationCoordinatorExternalStateMock::loadLastOpTime(
+StatusWith<OpTimeAndWallTime> ReplicationCoordinatorExternalStateMock::loadLastOpTimeAndWallTime(
     OperationContext* opCtx) {
-    return _lastOpTime;
+    if (_lastOpTime.getStatus().isOK()) {
+        if (_lastWallTime.getStatus().isOK()) {
+            OpTimeAndWallTime result = {_lastOpTime.getValue(), _lastWallTime.getValue()};
+            return result;
+        } else {
+            return _lastWallTime.getStatus();
+        }
+    } else {
+        return _lastOpTime.getStatus();
+    }
 }
 
-void ReplicationCoordinatorExternalStateMock::setLastOpTime(const StatusWith<OpTime>& lastApplied) {
+void ReplicationCoordinatorExternalStateMock::setLastOpTimeAndWallTime(
+    const StatusWith<OpTime>& lastApplied, Date_t lastAppliedWall) {
     _lastOpTime = lastApplied;
+    _lastWallTime = lastAppliedWall;
 }
 
 void ReplicationCoordinatorExternalStateMock::setStoreLocalConfigDocumentStatus(Status status) {
@@ -190,7 +211,7 @@ void ReplicationCoordinatorExternalStateMock::setStoreLocalLastVoteDocumentStatu
 }
 
 void ReplicationCoordinatorExternalStateMock::setStoreLocalLastVoteDocumentToHang(bool hang) {
-    stdx::unique_lock<stdx::mutex> lock(_shouldHangLastVoteMutex);
+    stdx::unique_lock<Latch> lock(_shouldHangLastVoteMutex);
     _storeLocalLastVoteDocumentShouldHang = hang;
     if (!hang) {
         _shouldHangLastVoteCondVar.notify_all();
@@ -212,6 +233,10 @@ void ReplicationCoordinatorExternalStateMock::signalApplierToChooseNewSyncSource
 void ReplicationCoordinatorExternalStateMock::stopProducer() {}
 
 void ReplicationCoordinatorExternalStateMock::startProducerIfStopped() {}
+
+bool ReplicationCoordinatorExternalStateMock::tooStale() {
+    return false;
+}
 
 void ReplicationCoordinatorExternalStateMock::dropAllSnapshots() {}
 

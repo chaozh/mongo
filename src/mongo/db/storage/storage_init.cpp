@@ -54,21 +54,22 @@ public:
                             const BSONElement& configElement) const override {
         auto svcCtx = opCtx->getClient()->getServiceContext();
         auto engine = svcCtx->getStorageEngine();
+        auto oldestRequiredTimestampForCrashRecovery = engine->getOplogNeededForCrashRecovery();
         auto backupCursorHooks = BackupCursorHooks::get(svcCtx);
 
         return BSON("name" << storageGlobalParams.engine << "supportsCommittedReads"
                            << engine->supportsReadConcernMajority()
-                           << "supportsPendingDrops"
-                           << engine->supportsPendingDrops()
+                           << "oldestRequiredTimestampForCrashRecovery"
+                           << (oldestRequiredTimestampForCrashRecovery
+                                   ? *oldestRequiredTimestampForCrashRecovery
+                                   : Timestamp())
+                           << "supportsPendingDrops" << engine->supportsPendingDrops()
                            << "dropPendingIdents"
                            << static_cast<long long>(engine->getDropPendingIdents().size())
-                           << "supportsSnapshotReadConcern"
-                           << engine->supportsReadConcernSnapshot()
-                           << "readOnly"
-                           << storageGlobalParams.readOnly
-                           << "persistent"
-                           << !engine->isEphemeral()
-                           << "backupCursorOpen"
+                           << "supportsSnapshotReadConcern" << engine->supportsReadConcernSnapshot()
+                           << "supportsCheckpointCursors" << engine->supportsCheckpoints()
+                           << "readOnly" << storageGlobalParams.readOnly << "persistent"
+                           << !engine->isEphemeral() << "backupCursorOpen"
                            << backupCursorHooks->isBackupCursorOpen());
     }
 

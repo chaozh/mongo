@@ -38,6 +38,7 @@
 #include "mongo/db/exec/plan_stats.h"
 #include "mongo/db/exec/working_set.h"
 #include "mongo/db/query/query_solution.h"
+#include "mongo/util/container_size_helper.h"
 
 namespace mongo {
 
@@ -50,13 +51,14 @@ struct PlanRankingDecision;
 class PlanRanker {
 public:
     /**
-     * Returns index in 'candidates' of which plan is best.
-     * Populates 'why' with information relevant to how each plan fared in the ranking process.
-     * Caller owns pointers in 'why'.
-     * 'candidateOrder' holds indices into candidates ordered by score (winner in first element).
+     * Returns a PlanRankingDecision which has the ranking and the information about the ranking
+     * process with status OK if everything worked. 'candidateOrder' within the PlanRankingDecision
+     * holds indices into candidates ordered by score (winner in first element).
+     *
+     * Returns an error if there was an issue with plan ranking (e.g. there was no viable plan).
      */
-    static size_t pickBestPlan(const std::vector<CandidatePlan>& candidates,
-                               PlanRankingDecision* why);
+    static StatusWith<std::unique_ptr<PlanRankingDecision>> pickBestPlan(
+        const std::vector<CandidatePlan>& candidates);
 
     /**
      * Assign the stats tree a 'goodness' score. The higher the score, the better
@@ -102,7 +104,22 @@ struct PlanRankingDecision {
         }
         decision->scores = scores;
         decision->candidateOrder = candidateOrder;
+        decision->failedCandidates = failedCandidates;
         return decision;
+    }
+
+    uint64_t estimateObjectSizeInBytes() const {
+        return  // Add size of each element in 'stats' vector.
+            container_size_helper::estimateObjectSizeInBytes(
+                stats, [](const auto& stat) { return stat->estimateObjectSizeInBytes(); }, true) +
+            // Add size of each element in 'candidateOrder' vector.
+            container_size_helper::estimateObjectSizeInBytes(candidateOrder) +
+            // Add size of each element in 'failedCandidates' vector.
+            container_size_helper::estimateObjectSizeInBytes(failedCandidates) +
+            // Add size of each element in 'scores' vector.
+            container_size_helper::estimateObjectSizeInBytes(scores) +
+            // Add size of the object.
+            sizeof(*this);
     }
 
     // Stats of all plans sorted in descending order by score.
@@ -119,7 +136,14 @@ struct PlanRankingDecision {
     // with corresponding cores[0] and stats[0]. Runner-up would be
     // candidates[candidateOrder[1]] followed by
     // candidates[candidateOrder[2]], ...
+    //
+    // Contains only non-failing plans.
     std::vector<size_t> candidateOrder;
+
+    // Contains the list of original plans that failed.
+    //
+    // Like 'candidateOrder', the contents of this array are indicies into the 'candidates' array.
+    std::vector<size_t> failedCandidates;
 
     // Whether two plans tied for the win.
     //

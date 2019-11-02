@@ -76,15 +76,15 @@ public:
 
     virtual std::unique_ptr<MatchExpression> shallowClone() const {
         std::unique_ptr<ElemMatchObjectMatchExpression> e =
-            stdx::make_unique<ElemMatchObjectMatchExpression>(path(),
-                                                              _sub->shallowClone().release());
+            std::make_unique<ElemMatchObjectMatchExpression>(path(),
+                                                             _sub->shallowClone().release());
         if (getTag()) {
             e->setTag(getTag()->clone());
         }
         return std::move(e);
     }
 
-    virtual void debugString(StringBuilder& debug, int level) const;
+    virtual void debugString(StringBuilder& debug, int indentationLevel) const;
 
     BSONObj getSerializedRightHandSide() const final;
 
@@ -117,8 +117,8 @@ private:
 class ElemMatchValueMatchExpression : public ArrayMatchingMatchExpression {
 public:
     /**
-    * This constructor takes ownership of 'sub.'
-    */
+     * This constructor takes ownership of 'sub.'
+     */
     ElemMatchValueMatchExpression(StringData path, MatchExpression* sub);
     explicit ElemMatchValueMatchExpression(StringData path);
     virtual ~ElemMatchValueMatchExpression();
@@ -129,7 +129,7 @@ public:
 
     virtual std::unique_ptr<MatchExpression> shallowClone() const {
         std::unique_ptr<ElemMatchValueMatchExpression> e =
-            stdx::make_unique<ElemMatchValueMatchExpression>(path());
+            std::make_unique<ElemMatchValueMatchExpression>(path());
         for (size_t i = 0; i < _subs.size(); ++i) {
             e->add(_subs[i]->shallowClone().release());
         }
@@ -139,7 +139,7 @@ public:
         return std::move(e);
     }
 
-    virtual void debugString(StringBuilder& debug, int level) const;
+    virtual void debugString(StringBuilder& debug, int indentationLevel) const;
 
     BSONObj getSerializedRightHandSide() const final;
 
@@ -169,7 +169,7 @@ public:
 
     virtual std::unique_ptr<MatchExpression> shallowClone() const {
         std::unique_ptr<SizeMatchExpression> e =
-            stdx::make_unique<SizeMatchExpression>(path(), _size);
+            std::make_unique<SizeMatchExpression>(path(), _size);
         if (getTag()) {
             e->setTag(getTag()->clone());
         }
@@ -190,7 +190,7 @@ public:
 
     virtual bool matchesArray(const BSONObj& anArray, MatchDetails* details) const;
 
-    virtual void debugString(StringBuilder& debug, int level) const;
+    virtual void debugString(StringBuilder& debug, int indentationLevel) const;
 
     BSONObj getSerializedRightHandSide() const final;
 
@@ -207,4 +207,4 @@ private:
 
     int _size;  // >= 0 real, < 0, nothing will match
 };
-}
+}  // namespace mongo

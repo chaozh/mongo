@@ -29,7 +29,6 @@
 
 #pragma once
 
-#include <boost/algorithm/string.hpp>
 #include <map>
 #include <sstream>
 #include <string>
@@ -40,7 +39,7 @@
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/util/builder.h"
 #include "mongo/client/connection_string.h"
-#include "mongo/stdx/mutex.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/transport/transport_layer.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/net/hostandport.h"
@@ -105,8 +104,7 @@ class MongoURI {
 public:
     class CaseInsensitiveString {
     public:
-        CaseInsensitiveString(std::string str)
-            : _original(std::move(str)), _lowercase(boost::algorithm::to_lower_copy(_original)) {}
+        CaseInsensitiveString(std::string str);
 
         CaseInsensitiveString(StringData sd) : CaseInsensitiveString(std::string(sd)) {}
         CaseInsensitiveString(const char* str) : CaseInsensitiveString(std::string(str)) {}
@@ -191,7 +189,7 @@ public:
         return _database;
     }
 
-    std::string getAuthenticationDatabase() {
+    std::string getAuthenticationDatabase() const {
         auto authDB = _options.find("authSource");
         if (authDB != _options.end()) {
             return authDB->second;
@@ -240,9 +238,14 @@ public:
     // server (say a member of a replica-set), you can pass in its HostAndPort information to
     // get a new URI with the same info, except type() will be MASTER and getServers() will
     // be the single host you pass in.
-    MongoURI cloneURIForServer(HostAndPort hostAndPort) const {
+    MongoURI cloneURIForServer(HostAndPort hostAndPort, StringData applicationName) const {
         auto out = *this;
         out._connectString = ConnectionString(std::move(hostAndPort));
+
+        if (!out.getAppName()) {
+            out._options["appName"] = applicationName.toString();
+        }
+
         return out;
     }
 
@@ -274,7 +277,8 @@ private:
           _sslMode(sslMode),
           _options(std::move(options)) {}
 
-    boost::optional<BSONObj> _makeAuthObjFromOptions(int maxWireVersion) const;
+    boost::optional<BSONObj> _makeAuthObjFromOptions(
+        int maxWireVersion, const std::vector<std::string>& saslMechsForAuth) const;
 
     static MongoURI parseImpl(const std::string& url);
 

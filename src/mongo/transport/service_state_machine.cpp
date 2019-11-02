@@ -33,6 +33,8 @@
 
 #include "mongo/transport/service_state_machine.h"
 
+#include <memory>
+
 #include "mongo/config.h"
 #include "mongo/db/client.h"
 #include "mongo/db/dbmessage.h"
@@ -40,7 +42,6 @@
 #include "mongo/db/traffic_recorder.h"
 #include "mongo/rpc/message.h"
 #include "mongo/rpc/op_msg.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/transport/message_compressor_manager.h"
 #include "mongo/transport/service_entry_point.h"
 #include "mongo/transport/service_executor_task_names.h"
@@ -118,36 +119,29 @@ Message makeExhaustMessage(Message requestMsg, DbResponse* dbresponse) {
         return Message();
     }
 
-    auto reply = OpMsg::parse(dbresponse->response);
-
-    // Check for a non-OK response.
-    auto resOk = reply.body["ok"].number();
-    if (resOk != 1.0) {
-        return Message();
-    }
-
-    // Check the validity of the 'cursor' object in the response.
-    auto cursorObj = reply.body.getObjectField("cursor");
-    if (cursorObj.isEmpty()) {
-        return Message();
-    }
-
     // A returned cursor id of '0' indicates that the cursor is exhausted and so the exhaust stream
     // should be terminated. Also make sure the cursor namespace is valid.
-    auto cursorId = cursorObj.getField("id").numberLong();
-    auto cursorNs = cursorObj.getField("ns").str();
-    if (cursorId == 0 || cursorNs.empty()) {
+    if (dbresponse->exhaustCursorId == 0 || dbresponse->exhaustNS.empty()) {
         return Message();
     }
 
-    // Indicate that the response is part of an exhaust stream.
+    const bool checksumPresent = OpMsg::isFlagSet(requestMsg, OpMsg::kChecksumPresent);
+    OpMsg::removeChecksum(&dbresponse->response);
+    // Indicate that the response is part of an exhaust stream. Re-checksum if needed.
     OpMsg::setFlag(&dbresponse->response, OpMsg::kMoreToCome);
+    if (checksumPresent) {
+        OpMsg::appendChecksum(&dbresponse->response);
+    }
 
     // Return an augmented form of the initial request, which is to be used as the next request to
     // be processed by the database. The id of the response is used as the request id of this
-    // 'synthetic' request.
+    // 'synthetic' request. Re-checksum if needed.
+    OpMsg::removeChecksum(&requestMsg);
     requestMsg.header().setId(dbresponse->response.header().getId());
     requestMsg.header().setResponseToMsgId(dbresponse->response.header().getResponseToMsgId());
+    if (checksumPresent) {
+        OpMsg::appendChecksum(&requestMsg);
+    }
     return requestMsg;
 }
 
@@ -167,7 +161,8 @@ class ServiceStateMachine::ThreadGuard {
 
 public:
     explicit ThreadGuard(ServiceStateMachine* ssm) : _ssm{ssm} {
-        auto owned = _ssm->_owned.compareAndSwap(Ownership::kUnowned, Ownership::kOwned);
+        auto owned = Ownership::kUnowned;
+        _ssm->_owned.compareAndSwap(&owned, Ownership::kOwned);
         if (owned == Ownership::kStatic) {
             dassert(haveClient());
             dassert(Client::getCurrent() == _ssm->_dbClientPtr);
@@ -454,10 +449,20 @@ void ServiceStateMachine::_processMessage(ThreadGuard guard) {
     Message& toSink = dbresponse.response;
     if (!toSink.empty()) {
         invariant(!OpMsg::isFlagSet(_inMessage, OpMsg::kMoreToCome));
+        invariant(!OpMsg::isFlagSet(toSink, OpMsg::kChecksumPresent));
 
         // Update the header for the response message.
         toSink.header().setId(nextMessageId());
         toSink.header().setResponseToMsgId(_inMessage.header().getId());
+        if (OpMsg::isFlagSet(_inMessage, OpMsg::kChecksumPresent)) {
+#ifdef MONGO_CONFIG_SSL
+            if (!SSLPeerInfo::forSession(_session()).isTLS) {
+                OpMsg::appendChecksum(&toSink);
+            }
+#else
+            OpMsg::appendChecksum(&toSink);
+#endif
+        }
 
         // If the incoming message has the exhaust flag set and is a 'getMore' command, then we
         // bypass the normal RPC behavior. We will sink the response to the network, but we also
@@ -550,7 +555,7 @@ void ServiceStateMachine::_scheduleNextWithGuard(ThreadGuard guard,
                                                  transport::ServiceExecutor::ScheduleFlags flags,
                                                  transport::ServiceExecutorTaskName taskName,
                                                  Ownership ownershipModel) {
-    auto func = [ ssm = shared_from_this(), ownershipModel ] {
+    auto func = [ssm = shared_from_this(), ownershipModel] {
         ThreadGuard guard(ssm.get());
         if (ownershipModel == Ownership::kStatic)
             guard.markStaticOwnership();
@@ -594,7 +599,7 @@ void ServiceStateMachine::terminateIfTagsDontMatch(transport::Session::TagMask t
     terminate();
 }
 
-void ServiceStateMachine::setCleanupHook(stdx::function<void()> hook) {
+void ServiceStateMachine::setCleanupHook(std::function<void()> hook) {
     invariant(state() == State::Created);
     _cleanupHook = std::move(hook);
 }

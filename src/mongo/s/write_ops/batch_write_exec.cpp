@@ -36,6 +36,7 @@
 #include "mongo/base/error_codes.h"
 #include "mongo/base/owned_pointer_map.h"
 #include "mongo/base/status.h"
+#include "mongo/base/transaction_error.h"
 #include "mongo/bson/util/builder.h"
 #include "mongo/client/connection_string.h"
 #include "mongo/client/remote_command_targeter.h"
@@ -67,16 +68,38 @@ WriteErrorDetail errorFromStatus(const Status& status) {
     return error;
 }
 
-// Helper to note several stale errors from a response
-void noteStaleResponses(const std::vector<ShardError>& staleErrors, NSTargeter* targeter) {
+// Helper to note several stale shard errors from a response
+void noteStaleShardResponses(const std::vector<ShardError>& staleErrors, NSTargeter* targeter) {
     for (const auto& error : staleErrors) {
         LOG(4) << "Noting stale config response " << error.error.getErrInfo() << " from shard "
                << error.endpoint.shardName;
-        targeter->noteStaleResponse(
+        targeter->noteStaleShardResponse(
             error.endpoint,
             StaleConfigInfo::parseFromCommandError(
                 error.error.isErrInfoSet() ? error.error.getErrInfo() : BSONObj()));
     }
+}
+
+// Helper to note several stale db errors from a response
+void noteStaleDbResponses(const std::vector<ShardError>& staleErrors, NSTargeter* targeter) {
+    for (const auto& error : staleErrors) {
+        LOG(4) << "Noting stale database response " << error.error.toBSON() << " from shard "
+               << error.endpoint.shardName;
+        targeter->noteStaleDbResponse(
+            error.endpoint, StaleDbRoutingVersion::parseFromCommandError(error.error.toBSON()));
+    }
+}
+
+bool hasTransientTransactionError(const BatchedCommandResponse& response) {
+    if (!response.isErrorLabelsSet()) {
+        return false;
+    }
+
+    const auto& errorLabels = response.getErrorLabels();
+    auto iter = std::find_if(errorLabels.begin(), errorLabels.end(), [](const std::string& label) {
+        return label == txn::TransientTxnErrorFieldName;
+    });
+    return iter != errorLabels.end();
 }
 
 // The number of times we'll try to continue a batch op if no progress is being made. This only
@@ -102,8 +125,9 @@ void BatchWriteExec::executeBatch(OperationContext* opCtx,
     int rounds = 0;
     int numCompletedOps = 0;
     int numRoundsWithoutProgress = 0;
+    bool abortBatch = false;
 
-    while (!batchOp.isFinished()) {
+    while (!batchOp.isFinished() && !abortBatch) {
         //
         // Get child batches to send using the targeter
         //
@@ -141,6 +165,18 @@ void BatchWriteExec::executeBatch(OperationContext* opCtx,
             refreshedTargeter = true;
             ++stats->numTargetErrors;
             dassert(childBatches.size() == 0u);
+
+            if (TransactionRouter::get(opCtx)) {
+                batchOp.forgetTargetedBatchesOnTransactionAbortingError();
+
+                // Throw when there is a transient transaction error since this should be a top
+                // level error and not just a write error.
+                if (isTransientTransactionError(targetStatus.code(), false, false)) {
+                    uassertStatusOK(targetStatus);
+                }
+
+                break;
+            }
         }
 
         //
@@ -271,32 +307,53 @@ void BatchWriteExec::executeBatch(OperationContext* opCtx,
                 if (responseStatus.isOK()) {
                     TrackedErrors trackedErrors;
                     trackedErrors.startTracking(ErrorCodes::StaleShardVersion);
+                    trackedErrors.startTracking(ErrorCodes::StaleDbVersion);
                     trackedErrors.startTracking(ErrorCodes::CannotImplicitlyCreateCollection);
 
                     LOG(4) << "Write results received from " << shardHost.toString() << ": "
-                           << redact(batchedCommandResponse.toString());
+                           << redact(batchedCommandResponse.toStatus());
+
+                    // Dispatch was ok, note response
+                    batchOp.noteBatchResponse(*batch, batchedCommandResponse, &trackedErrors);
 
                     // If we are in a transaction, we must fail the whole batch on any error.
                     if (TransactionRouter::get(opCtx)) {
                         // Note: this returns a bad status if any part of the batch failed.
                         auto batchStatus = batchedCommandResponse.toStatus();
-                        if (!batchStatus.isOK()) {
-                            batchOp.forgetTargetedBatchesOnTransactionAbortingError();
-                            uassertStatusOK(batchStatus.withContext(
+                        if (!batchStatus.isOK() &&
+                            batchStatus != ErrorCodes::WouldChangeOwningShard) {
+                            auto newStatus = batchStatus.withContext(
                                 str::stream() << "Encountered error from " << shardHost.toString()
-                                              << " during a transaction"));
+                                              << " during a transaction");
+
+                            batchOp.forgetTargetedBatchesOnTransactionAbortingError();
+
+                            // Throw when there is a transient transaction error since this
+                            // should be a top level error and not just a write error.
+                            if (hasTransientTransactionError(batchedCommandResponse)) {
+                                uassertStatusOK(newStatus);
+                            }
+
+                            abortBatch = true;
+                            break;
                         }
                     }
 
-                    // Dispatch was ok, note response
-                    batchOp.noteBatchResponse(*batch, batchedCommandResponse, &trackedErrors);
-
                     // Note if anything was stale
-                    const auto& staleErrors =
+                    const auto& staleShardErrors =
                         trackedErrors.getErrors(ErrorCodes::StaleShardVersion);
-                    if (!staleErrors.empty()) {
-                        noteStaleResponses(staleErrors, &targeter);
-                        ++stats->numStaleBatches;
+                    const auto& staleDbErrors = trackedErrors.getErrors(ErrorCodes::StaleDbVersion);
+
+                    if (!staleShardErrors.empty()) {
+                        invariant(staleDbErrors.empty());
+                        noteStaleShardResponses(staleShardErrors, &targeter);
+                        ++stats->numStaleShardBatches;
+                    }
+
+                    if (!staleDbErrors.empty()) {
+                        invariant(staleShardErrors.empty());
+                        noteStaleDbResponses(staleDbErrors, &targeter);
+                        ++stats->numStaleDbBatches;
                     }
 
                     const auto& cannotImplicitlyCreateErrors =
@@ -333,12 +390,19 @@ void BatchWriteExec::executeBatch(OperationContext* opCtx,
                     LOG(4) << "Unable to receive write results from " << shardHost
                            << causedBy(redact(status));
 
-                    // If we are in a transaction, we must fail the whole batch on any error.
+                    // If we are in a transaction, we must stop immediately (even for unordered).
                     if (TransactionRouter::get(opCtx)) {
                         batchOp.forgetTargetedBatchesOnTransactionAbortingError();
-                        uassertStatusOK(status.withContext(
-                            str::stream() << "Encountered error from " << shardHost.toString()
-                                          << " during a transaction"));
+                        abortBatch = true;
+
+                        // Throw when there is a transient transaction error since this should be a
+                        // top
+                        // level error and not just a write error.
+                        if (isTransientTransactionError(status.code(), false, false)) {
+                            uassertStatusOK(status);
+                        }
+
+                        break;
                     }
                 }
             }
@@ -384,14 +448,9 @@ void BatchWriteExec::executeBatch(OperationContext* opCtx,
             batchOp.abortBatch(errorFromStatus(
                 {ErrorCodes::NoProgressMade,
                  str::stream() << "no progress was made executing batch write op in "
-                               << clientRequest.getNS().ns()
-                               << " after "
-                               << kMaxRoundsWithoutProgress
-                               << " rounds ("
-                               << numCompletedOps
-                               << " ops completed in "
-                               << rounds
-                               << " rounds total)"}));
+                               << clientRequest.getNS().ns() << " after "
+                               << kMaxRoundsWithoutProgress << " rounds (" << numCompletedOps
+                               << " ops completed in " << rounds << " rounds total)"}));
             break;
         }
     }
@@ -425,4 +484,4 @@ const HostOpTimeMap& BatchWriteExecStats::getWriteOpTimes() const {
     return _writeOpTimes;
 }
 
-}  // namespace
+}  // namespace mongo

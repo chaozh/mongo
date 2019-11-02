@@ -1,5 +1,6 @@
 // SERVER-10927
 // This is to make sure that temp collections get cleaned up on promotion to primary
+// @tags: [requires_replication]
 
 var replTest = new ReplSetTest({name: 'testSet', nodes: 3});
 var nodes = replTest.nodeList();
@@ -26,14 +27,18 @@ var masterDB = master.getDB('test');
 var secondDB = second.getDB('test');
 
 // set up collections
-masterDB.runCommand({create: 'temp1', temp: true});
+assert.commandWorked(masterDB.runCommand(
+    {applyOps: [{op: "c", ns: masterDB.getName() + ".$cmd", o: {create: "temp1", temp: true}}]}));
 masterDB.temp1.ensureIndex({x: 1});
-masterDB.runCommand({create: 'temp2', temp: 1});
+assert.commandWorked(masterDB.runCommand(
+    {applyOps: [{op: "c", ns: masterDB.getName() + ".$cmd", o: {create: "temp2", temp: 1}}]}));
 masterDB.temp2.ensureIndex({x: 1});
-masterDB.runCommand({create: 'keep1', temp: false});
-masterDB.runCommand({create: 'keep2', temp: 0});
+assert.commandWorked(masterDB.runCommand(
+    {applyOps: [{op: "c", ns: masterDB.getName() + ".$cmd", o: {create: "keep1", temp: false}}]}));
+assert.commandWorked(masterDB.runCommand(
+    {applyOps: [{op: "c", ns: masterDB.getName() + ".$cmd", o: {create: "keep2", temp: 0}}]}));
 masterDB.runCommand({create: 'keep3'});
-assert.writeOK(masterDB.keep4.insert({}, {writeConcern: {w: 2}}));
+assert.commandWorked(masterDB.keep4.insert({}, {writeConcern: {w: 2}}));
 
 // make sure they exist on primary and secondary
 function countCollection(mydb, nameFilter) {

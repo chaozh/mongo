@@ -29,9 +29,8 @@
 
 #pragma once
 
-#include "mongo/base/disallow_copying.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/stdx/condition_variable.h"
-#include "mongo/stdx/mutex.h"
 
 namespace mongo {
 namespace unittest {
@@ -42,7 +41,8 @@ namespace unittest {
  * All threads are unblocked when the counter reaches zero and the counter is reset.
  */
 class Barrier {
-    MONGO_DISALLOW_COPYING(Barrier);
+    Barrier(const Barrier&) = delete;
+    Barrier& operator=(const Barrier&) = delete;
 
 public:
     /**
@@ -60,7 +60,7 @@ private:
     size_t _threadCount;
     size_t _threadsWaiting;
     uint64_t _generation;
-    stdx::mutex _mutex;
+    stdx::mutex _mutex;  // NOLINT
     stdx::condition_variable _condition;
 };
 

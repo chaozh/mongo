@@ -30,7 +30,9 @@
 #include "mongo/platform/basic.h"
 
 #include <cmath>
+#include <fmt/format.h>
 #include <limits>
+#include <type_traits>
 
 #include <boost/optional.hpp>
 
@@ -41,6 +43,8 @@
 namespace mongo {
 
 namespace {
+
+using namespace fmt::literals;
 
 // Char values
 const signed char kCharMax = std::numeric_limits<signed char>::max();
@@ -244,6 +248,184 @@ TEST(RepresentAs, UnsignedIntToDouble) {
     // kUInt64Max is too precise for double.
     ASSERT(*(representAs<double>(kUInt32Max)) == kUInt32MaxAsDouble);
     ASSERT(!(representAs<double>(kUInt64Max)));
+}
+
+template <typename Number>
+void decimal128ToNumber() {
+    const auto floor = std::to_string(std::numeric_limits<Number>::lowest());
+    const auto ceiling = std::to_string(std::numeric_limits<Number>::max());
+
+    ASSERT_EQ(*representAs<Number>(Decimal128(floor)), std::numeric_limits<Number>::lowest());
+    ASSERT_EQ(*representAs<Number>(Decimal128(ceiling)), std::numeric_limits<Number>::max());
+
+    ASSERT_EQ(*representAs<Number>(Decimal128::kNormalizedZero), static_cast<Number>(0));
+    ASSERT_EQ(*representAs<Number>(Decimal128("5")), static_cast<Number>(5));
+
+    ASSERT(!representAs<Number>(Decimal128::kLargestPositive));
+    ASSERT(!representAs<Number>(Decimal128::kLargestNegative));
+}
+
+template <typename Float>
+void decimal128ToFloatingPoint() {
+    decimal128ToNumber<Float>();
+    ASSERT_EQ(*representAs<Float>(Decimal128("-5")), -5);
+    ASSERT_EQ(*representAs<Float>(Decimal128("5.5")), 5.5);
+    ASSERT_EQ(*representAs<Float>(Decimal128("-5.5")), -5.5);
+}
+
+TEST(RepresentAs, Decimal128ToFloat) {
+    decimal128ToFloatingPoint<float>();
+}
+
+TEST(RepresentAs, Decimal128ToDouble) {
+    decimal128ToFloatingPoint<double>();
+}
+
+template <typename Integer>
+void decimal128ToInteger() {
+    decimal128ToNumber<Integer>();
+    ASSERT(!representAs<Integer>(Decimal128("5.5")));
+    ASSERT(!representAs<Integer>(Decimal128("-5.5")));
+
+    ASSERT(!representAs<Integer>(Decimal128::kLargestPositive));
+    ASSERT(!representAs<Integer>(Decimal128::kLargestNegative));
+    ASSERT(!representAs<Integer>(Decimal128::kSmallestPositive));
+    ASSERT(!representAs<Integer>(Decimal128::kSmallestNegative));
+
+    if constexpr (std::is_signed<Integer>()) {
+        ASSERT_EQ(*representAs<Integer>(Decimal128("-5")), -5);
+    } else {
+        ASSERT(!representAs<Integer>(Decimal128("-5")));
+    }
+}
+
+TEST(RepresentAs, Decimal128ToInt8) {
+    decimal128ToInteger<int8_t>();
+}
+
+TEST(RepresentAs, Decimal128ToUInt8) {
+    decimal128ToInteger<uint8_t>();
+}
+
+TEST(RepresentAs, Decimal128ToInt16) {
+    decimal128ToInteger<int16_t>();
+}
+
+TEST(RepresentAs, Decimal128ToUInt16) {
+    decimal128ToInteger<uint16_t>();
+}
+
+TEST(RepresentAs, Decimal128ToInt32) {
+    decimal128ToInteger<int32_t>();
+}
+
+TEST(RepresentAs, Decimal128ToUInt32) {
+    decimal128ToInteger<uint32_t>();
+}
+
+TEST(RepresentAs, Decimal128ToInt64) {
+    decimal128ToInteger<int64_t>();
+}
+
+TEST(RepresentAs, Decimal128ToUInt64) {
+    decimal128ToInteger<uint64_t>();
+}
+
+TEST(RepresentAs, Decimal128ToDecimal128) {
+    Decimal128 decimals[] = {Decimal128::kNormalizedZero,
+                             Decimal128::kLargestPositive,
+                             Decimal128::kSmallestPositive,
+                             Decimal128::kLargestNegative,
+                             Decimal128::kSmallestNegative,
+                             Decimal128(5),
+                             Decimal128(5.5),
+                             Decimal128(-5),
+                             Decimal128(-5.5)};
+
+    for (const auto& d : decimals) {
+        ASSERT(representAs<Decimal128>(d)->isEqual(d));
+    }
+}
+
+template <typename Integer>
+void integerToDecimal128() {
+    std::vector<Integer> v{
+        Integer{5}, std::numeric_limits<Integer>::lowest(), std::numeric_limits<Integer>::max()};
+
+    if constexpr (std::is_signed_v<Integer>) {
+        v.emplace_back(-5);
+    }
+
+    for (const Integer n : v) {
+        auto d = representAs<Decimal128>(n);
+        ASSERT(d);
+        if (!d->isEqual(Decimal128(std::to_string(n)))) {
+            FAIL(
+                "Failed expectation, representAs<Decimal128>({}) == Decimal128({}),"
+                " but !Decimal128({}).isEqual(Decimal128(std::to_string({}))"_format(
+                    n, d->toString(), d->toString(), n));
+        }
+    }
+}
+
+TEST(RepresentAs, Int8ToDecimal128) {
+    integerToDecimal128<int8_t>();
+}
+
+TEST(RepresentAs, UInt8ToDecimal128) {
+    integerToDecimal128<uint8_t>();
+}
+
+TEST(RepresentAs, Int16ToDecimal128) {
+    integerToDecimal128<int16_t>();
+}
+
+TEST(RepresentAs, UInt16ToDecimal128) {
+    integerToDecimal128<uint16_t>();
+}
+
+TEST(RepresentAs, Int32ToDecimal128) {
+    integerToDecimal128<int32_t>();
+}
+
+TEST(RepresentAs, UInt32ToDecimal128) {
+    integerToDecimal128<uint32_t>();
+}
+
+TEST(RepresentAs, Int64ToDecimal128) {
+    integerToDecimal128<int64_t>();
+}
+
+TEST(RepresentAs, UInt64ToDecimal128) {
+    integerToDecimal128<uint64_t>();
+}
+
+template <typename Float>
+void floatToDecimal128() {
+    Float x = 5.5;
+    ASSERT(representAs<Decimal128>(x)->isEqual(Decimal128(std::to_string(x))));
+    ASSERT(representAs<Decimal128>(-x)->isEqual(Decimal128(std::to_string(-x))));
+
+    // Assert extreme numbers can be represented as Decimal128, and one basic property of each.
+    using limits = std::numeric_limits<Float>;
+    ASSERT(representAs<Decimal128>(limits::lowest())->isLess(Decimal128(0)));
+    ASSERT(representAs<Decimal128>(limits::min())->isGreater(Decimal128(0)));
+    ASSERT(representAs<Decimal128>(limits::denorm_min())->isGreater(Decimal128(0)));
+    ASSERT(representAs<Decimal128>(limits::max())->isGreater(Decimal128(0)));
+    ASSERT(representAs<Decimal128>(limits::quiet_NaN())->isNaN());
+    ASSERT(representAs<Decimal128>(-limits::quiet_NaN())->isNaN());
+    ASSERT(representAs<Decimal128>(limits::infinity())->isInfinite());
+    ASSERT(representAs<Decimal128>(-limits::infinity())->isInfinite());
+    ASSERT(representAs<Decimal128>(Float{0})->isEqual(Decimal128(0)));
+    ASSERT(representAs<Decimal128>(Float{-0})->isEqual(Decimal128(0)));
+}
+
+TEST(RepresentAs, FloatToDecimal128) {
+    floatToDecimal128<float>();
+}
+
+TEST(RepresentAs, DoubleToDecimal128) {
+    floatToDecimal128<double>();
 }
 
 TEST(RepresentAs, PlatformDependent) {

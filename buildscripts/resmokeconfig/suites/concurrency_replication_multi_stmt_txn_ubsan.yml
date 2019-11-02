@@ -26,7 +26,11 @@ selector:
   # Performs direct writes to system.views
   - jstests/concurrency/fsm_workloads/view_catalog_direct_system_writes.js
 
+  # Extracts error code from write error, which is obscured by runInsideTransaction.
+  - jstests/concurrency/fsm_workloads/access_collection_in_transaction_after_catalog_changes.js
+
   exclude_with_any_tags:
+  - does_not_support_causal_consistency
   - requires_sharding
   # Sharing cursors between state functions will fail in this suite because it will attempt to use
   # the same cursor in multiple transactions.
@@ -34,10 +38,15 @@ selector:
   # These start a transaction in one state function and use it in other state functions. This suite
   # would instead execute each state function as its own transaction.
   - state_functions_share_transaction
+  # Tests which expect commands to fail and catch the error can cause transactions to abort and
+  # retry indefinitely.
+  - catches_command_failures
 
 executor:
   archive:
     hooks:
+      - CheckReplDBHashInBackground
+      - ValidateCollectionsInBackground
       - CheckReplDBHash
       - ValidateCollections
     tests: true
@@ -55,7 +64,8 @@ executor:
   # validating the entire contents of the collection.
   #
   # TODO SERVER-26466: Add CheckReplOplogs hook to the concurrency suite.
-  # TODO SERVER-39321: Re-enable and archive the CheckReplDBHashInBackground hook.
+  - class: CheckReplDBHashInBackground
+  - class: ValidateCollectionsInBackground
   - class: CheckReplDBHash
   - class: ValidateCollections
   - class: CleanEveryN

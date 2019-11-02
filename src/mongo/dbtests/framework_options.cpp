@@ -40,6 +40,7 @@
 #include "mongo/base/status.h"
 #include "mongo/bson/util/builder.h"
 #include "mongo/db/query/find.h"
+#include "mongo/db/storage/flow_control_parameters_gen.h"
 #include "mongo/db/storage/storage_options.h"
 #include "mongo/dbtests/dbtests.h"
 #include "mongo/unittest/unittest.h"
@@ -117,12 +118,18 @@ Status storeTestFrameworkOptions(const moe::Environment& params,
         return Status(ErrorCodes::BadValue, sb.str());
     }
 
-    DEV log() << "DEBUG build" << endl;
+    if (kDebugBuild)
+        log() << "DEBUG build" << endl;
 
     string dbpathString = p.string();
     storageGlobalParams.dbpath = dbpathString.c_str();
 
     storageGlobalParams.engine = params["storage.engine"].as<string>();
+    gFlowControlEnabled.store(params["enableFlowControl"].as<bool>());
+
+    if (gFlowControlEnabled.load()) {
+        log() << "Flow Control enabled" << endl;
+    }
 
     if (storageGlobalParams.engine == "wiredTiger" &&
         params.count("replication.enableMajorityReadConcern")) {
@@ -132,4 +139,4 @@ Status storeTestFrameworkOptions(const moe::Environment& params,
 
     return Status::OK();
 }
-}
+}  // namespace mongo

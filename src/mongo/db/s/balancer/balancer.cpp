@@ -34,6 +34,7 @@
 #include "mongo/db/s/balancer/balancer.h"
 
 #include <algorithm>
+#include <memory>
 #include <string>
 
 #include "mongo/base/status_with.h"
@@ -51,9 +52,9 @@
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/shard_util.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/util/concurrency/idle_thread_block.h"
 #include "mongo/util/exit.h"
+#include "mongo/util/fail_point.h"
 #include "mongo/util/log.h"
 #include "mongo/util/timer.h"
 #include "mongo/util/version.h"
@@ -65,6 +66,8 @@ using std::string;
 using std::vector;
 
 namespace {
+
+MONGO_FAIL_POINT_DEFINE(overrideBalanceRoundInterval);
 
 const Seconds kBalanceRoundDefaultInterval(10);
 
@@ -154,20 +157,20 @@ void warnOnMultiVersion(const vector<ClusterStatistics::ShardStatistics>& cluste
 Balancer::Balancer(ServiceContext* serviceContext)
     : _balancedLastTime(0),
       _random(std::random_device{}()),
-      _clusterStats(stdx::make_unique<ClusterStatisticsImpl>(_random)),
+      _clusterStats(std::make_unique<ClusterStatisticsImpl>(_random)),
       _chunkSelectionPolicy(
-          stdx::make_unique<BalancerChunkSelectionPolicyImpl>(_clusterStats.get(), _random)),
+          std::make_unique<BalancerChunkSelectionPolicyImpl>(_clusterStats.get(), _random)),
       _migrationManager(serviceContext) {}
 
 Balancer::~Balancer() {
     // The balancer thread must have been stopped
-    stdx::lock_guard<stdx::mutex> scopedLock(_mutex);
+    stdx::lock_guard<Latch> scopedLock(_mutex);
     invariant(_state == kStopped);
 }
 
 void Balancer::create(ServiceContext* serviceContext) {
     invariant(!getBalancer(serviceContext));
-    getBalancer(serviceContext) = stdx::make_unique<Balancer>(serviceContext);
+    getBalancer(serviceContext) = std::make_unique<Balancer>(serviceContext);
 }
 
 Balancer* Balancer::get(ServiceContext* serviceContext) {
@@ -179,7 +182,7 @@ Balancer* Balancer::get(OperationContext* operationContext) {
 }
 
 void Balancer::initiateBalancer(OperationContext* opCtx) {
-    stdx::lock_guard<stdx::mutex> scopedLock(_mutex);
+    stdx::lock_guard<Latch> scopedLock(_mutex);
     invariant(_state == kStopped);
     _state = kRunning;
 
@@ -191,7 +194,7 @@ void Balancer::initiateBalancer(OperationContext* opCtx) {
 }
 
 void Balancer::interruptBalancer() {
-    stdx::lock_guard<stdx::mutex> scopedLock(_mutex);
+    stdx::lock_guard<Latch> scopedLock(_mutex);
     if (_state != kRunning)
         return;
 
@@ -201,7 +204,7 @@ void Balancer::interruptBalancer() {
     // context of that thread is still alive, because we hold the balancer mutex.
     if (_threadOperationContext) {
         stdx::lock_guard<Client> scopedClientLock(*_threadOperationContext->getClient());
-        _threadOperationContext->markKilled(ErrorCodes::InterruptedDueToStepDown);
+        _threadOperationContext->markKilled(ErrorCodes::InterruptedDueToReplStateChange);
     }
 
     // Schedule a separate thread to shutdown the migration manager in order to avoid deadlock with
@@ -215,7 +218,7 @@ void Balancer::interruptBalancer() {
 
 void Balancer::waitForBalancerToStop() {
     {
-        stdx::lock_guard<stdx::mutex> scopedLock(_mutex);
+        stdx::lock_guard<Latch> scopedLock(_mutex);
         if (_state == kStopped)
             return;
 
@@ -225,7 +228,7 @@ void Balancer::waitForBalancerToStop() {
 
     _thread.join();
 
-    stdx::lock_guard<stdx::mutex> scopedLock(_mutex);
+    stdx::lock_guard<Latch> scopedLock(_mutex);
     _state = kStopped;
     _thread = {};
 
@@ -233,7 +236,7 @@ void Balancer::waitForBalancerToStop() {
 }
 
 void Balancer::joinCurrentRound(OperationContext* opCtx) {
-    stdx::unique_lock<stdx::mutex> scopedLock(_mutex);
+    stdx::unique_lock<Latch> scopedLock(_mutex);
     const auto numRoundsAtStart = _numBalancerRounds;
     opCtx->waitForConditionOrInterrupt(_condVar, scopedLock, [&] {
         return !_inBalancerRound || _numBalancerRounds != numRoundsAtStart;
@@ -286,7 +289,7 @@ void Balancer::report(OperationContext* opCtx, BSONObjBuilder* builder) {
 
     const auto mode = balancerConfig->getBalancerMode();
 
-    stdx::lock_guard<stdx::mutex> scopedLock(_mutex);
+    stdx::lock_guard<Latch> scopedLock(_mutex);
     builder->append("mode", BalancerSettingsType::kBalancerModes[mode]);
     builder->append("inBalancerRound", _inBalancerRound);
     builder->append("numBalancerRounds", _numBalancerRounds);
@@ -300,7 +303,7 @@ void Balancer::_mainThread() {
     log() << "CSRS balancer is starting";
 
     {
-        stdx::lock_guard<stdx::mutex> scopedLock(_mutex);
+        stdx::lock_guard<Latch> scopedLock(_mutex);
         _threadOperationContext = opCtx.get();
     }
 
@@ -391,9 +394,16 @@ void Balancer::_mainThread() {
                 LOG(1) << "*** End of balancing round";
             }
 
-            _endRound(opCtx.get(),
-                      _balancedLastTime ? kShortBalanceRoundInterval
-                                        : kBalanceRoundDefaultInterval);
+            Milliseconds balancerInterval =
+                _balancedLastTime ? kShortBalanceRoundInterval : kBalanceRoundDefaultInterval;
+
+            overrideBalanceRoundInterval.execute([&](const BSONObj& data) {
+                balancerInterval = Milliseconds(data["intervalMs"].numberInt());
+                log() << "overrideBalanceRoundInterval: using shorter balancing interval: "
+                      << balancerInterval;
+            });
+
+            _endRound(opCtx.get(), balancerInterval);
         } catch (const DBException& e) {
             log() << "caught exception while doing balance: " << e.what();
 
@@ -413,7 +423,7 @@ void Balancer::_mainThread() {
     }
 
     {
-        stdx::lock_guard<stdx::mutex> scopedLock(_mutex);
+        stdx::lock_guard<Latch> scopedLock(_mutex);
         invariant(_state == kStopping);
         invariant(_migrationManagerInterruptThread.joinable());
     }
@@ -422,7 +432,7 @@ void Balancer::_mainThread() {
     _migrationManager.drainActiveMigrations();
 
     {
-        stdx::lock_guard<stdx::mutex> scopedLock(_mutex);
+        stdx::lock_guard<Latch> scopedLock(_mutex);
         _migrationManagerInterruptThread = {};
         _threadOperationContext = nullptr;
     }
@@ -431,19 +441,19 @@ void Balancer::_mainThread() {
 }
 
 bool Balancer::_stopRequested() {
-    stdx::lock_guard<stdx::mutex> scopedLock(_mutex);
+    stdx::lock_guard<Latch> scopedLock(_mutex);
     return (_state != kRunning);
 }
 
 void Balancer::_beginRound(OperationContext* opCtx) {
-    stdx::unique_lock<stdx::mutex> lock(_mutex);
+    stdx::unique_lock<Latch> lock(_mutex);
     _inBalancerRound = true;
     _condVar.notify_all();
 }
 
-void Balancer::_endRound(OperationContext* opCtx, Seconds waitTimeout) {
+void Balancer::_endRound(OperationContext* opCtx, Milliseconds waitTimeout) {
     {
-        stdx::lock_guard<stdx::mutex> lock(_mutex);
+        stdx::lock_guard<Latch> lock(_mutex);
         _inBalancerRound = false;
         _numBalancerRounds++;
         _condVar.notify_all();
@@ -453,8 +463,8 @@ void Balancer::_endRound(OperationContext* opCtx, Seconds waitTimeout) {
     _sleepFor(opCtx, waitTimeout);
 }
 
-void Balancer::_sleepFor(OperationContext* opCtx, Seconds waitTimeout) {
-    stdx::unique_lock<stdx::mutex> lock(_mutex);
+void Balancer::_sleepFor(OperationContext* opCtx, Milliseconds waitTimeout) {
+    stdx::unique_lock<Latch> lock(_mutex);
     _condVar.wait_for(lock, waitTimeout.toSystemDuration(), [&] { return _state != kRunning; });
 }
 
@@ -629,7 +639,25 @@ void Balancer::_splitOrMarkJumbo(OperationContext* opCtx,
             Grid::get(opCtx)->getBalancerConfiguration()->getMaxChunkSizeBytes(),
             boost::none));
 
-        uassert(ErrorCodes::CannotSplit, "No split points found", !splitPoints.empty());
+        if (splitPoints.empty()) {
+            log() << "Marking chunk " << redact(chunk.toString()) << " as jumbo.";
+            chunk.markAsJumbo();
+
+            auto status = Grid::get(opCtx)->catalogClient()->updateConfigDocument(
+                opCtx,
+                ChunkType::ConfigNS,
+                BSON(ChunkType::ns(nss.ns()) << ChunkType::min(chunk.getMin())),
+                BSON("$set" << BSON(ChunkType::jumbo(true))),
+                false,
+                ShardingCatalogClient::kMajorityWriteConcern);
+            if (!status.isOK()) {
+                log() << "Couldn't set jumbo for chunk with namespace " << redact(nss.ns())
+                      << " and min key " << redact(chunk.getMin())
+                      << causedBy(redact(status.getStatus()));
+            }
+
+            return;
+        }
 
         uassertStatusOK(
             shardutil::splitChunkAtMultiplePoints(opCtx,
@@ -640,28 +668,11 @@ void Balancer::_splitOrMarkJumbo(OperationContext* opCtx,
                                                   ChunkRange(chunk.getMin(), chunk.getMax()),
                                                   splitPoints));
     } catch (const DBException&) {
-        log() << "Marking chunk " << redact(chunk.toString()) << " as jumbo.";
-
-        chunk.markAsJumbo();
-
-        const std::string chunkName = ChunkType::genID(nss, chunk.getMin());
-
-        auto status = Grid::get(opCtx)->catalogClient()->updateConfigDocument(
-            opCtx,
-            ChunkType::ConfigNS,
-            BSON(ChunkType::name(chunkName)),
-            BSON("$set" << BSON(ChunkType::jumbo(true))),
-            false,
-            ShardingCatalogClient::kMajorityWriteConcern);
-        if (!status.isOK()) {
-            log() << "Couldn't set jumbo for chunk: " << redact(chunkName)
-                  << causedBy(redact(status.getStatus()));
-        }
     }
 }
 
 void Balancer::notifyPersistedBalancerSettingsChanged() {
-    stdx::unique_lock<stdx::mutex> lock(_mutex);
+    stdx::unique_lock<Latch> lock(_mutex);
     _condVar.notify_all();
 }
 

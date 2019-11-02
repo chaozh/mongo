@@ -53,9 +53,8 @@
 #include "mongo/db/server_options.h"
 #include "mongo/util/base64.h"
 #include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
 #include "mongo/util/sequence_util.h"
-#include "mongo/util/stringutils.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 namespace {
@@ -210,7 +209,8 @@ Status doSaslStep(OperationContext* opCtx,
 
         if (!serverGlobalParams.quiet.load()) {
             log() << "Successfully authenticated as principal " << mechanism.getPrincipalName()
-                  << " on " << mechanism.getAuthenticationDatabase();
+                  << " on " << mechanism.getAuthenticationDatabase() << " from client "
+                  << opCtx->getClient()->session()->remote();
         }
     }
     return Status::OK();
@@ -242,7 +242,12 @@ StatusWith<std::unique_ptr<AuthenticationSession>> doSaslStart(OperationContext*
 
     auto session = std::make_unique<AuthenticationSession>(std::move(swMech.getValue()));
     Status statusStep = doSaslStep(opCtx, session.get(), cmdObj, result);
-    *principalName = session->getMechanism().getPrincipalName().toString();
+
+    if (!statusStep.isOK() || session->getMechanism().isSuccess()) {
+        // Only attempt to populate principal name if we're done (successfully or not).
+        *principalName = session->getMechanism().getPrincipalName().toString();
+    }
+
     if (!statusStep.isOK()) {
         return statusStep;
     }

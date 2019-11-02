@@ -52,27 +52,14 @@ public:
     virtual ~MobileRecoveryUnit();
 
     void beginUnitOfWork(OperationContext* opCtx) override;
-    void commitUnitOfWork() override;
-    void abortUnitOfWork() override;
-
-    bool waitUntilDurable() override {
-        return true;
-    }
-
-    void abandonSnapshot() override;
-
-    void registerChange(Change* change) override;
-
-    SnapshotId getSnapshotId() const override {
-        return SnapshotId();
-    }
+    bool waitUntilDurable(OperationContext* opCtx) override;
 
     MobileSession* getSession(OperationContext* opCtx, bool readOnly = true);
 
     MobileSession* getSessionNoTxn(OperationContext* opCtx);
 
     bool inActiveTxn() const {
-        return _active;
+        return _isActive();
     }
 
     void assertInActiveTxn() const;
@@ -86,6 +73,11 @@ public:
     void setOrderedCommit(bool orderedCommit) override {}
 
 private:
+    void doCommitUnitOfWork() override;
+    void doAbortUnitOfWork() override;
+
+    void doAbandonSnapshot() override;
+
     void _abort();
     void _commit();
 
@@ -94,10 +86,6 @@ private:
     void _txnOpen(OperationContext* opCtx, bool readOnly);
     void _upgradeToWriteSession(OperationContext* opCtx);
 
-    bool _areWriteUnitOfWorksBanned = false;
-    bool _inUnitOfWork;
-    bool _active;
-
     static AtomicWord<long long> _nextID;
     uint64_t _id;
     bool _isReadOnly;
@@ -105,9 +93,6 @@ private:
     std::string _path;
     MobileSessionPool* _sessionPool;
     std::unique_ptr<MobileSession> _session;
-
-    using Changes = std::vector<std::unique_ptr<Change>>;
-    Changes _changes;
 };
 
 }  // namespace mongo

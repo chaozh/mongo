@@ -29,19 +29,17 @@
 
 #pragma once
 
-#include <atomic>
-#include <memory>
+#include <functional>
 #include <memory>
 #include <set>
 #include <string>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/base/string_data.h"
 #include "mongo/client/mongo_uri.h"
+#include "mongo/client/replica_set_change_notifier.h"
 #include "mongo/executor/task_executor.h"
-#include "mongo/platform/atomic_word.h"
-#include "mongo/stdx/functional.h"
 #include "mongo/util/concurrency/with_lock.h"
+#include "mongo/util/duration.h"
 #include "mongo/util/net/hostandport.h"
 #include "mongo/util/time_support.h"
 
@@ -49,6 +47,7 @@ namespace mongo {
 
 class BSONObj;
 class ReplicaSetMonitor;
+class ReplicaSetMonitorTest;
 struct ReadPreferenceSetting;
 typedef std::shared_ptr<ReplicaSetMonitor> ReplicaSetMonitorPtr;
 
@@ -56,28 +55,30 @@ typedef std::shared_ptr<ReplicaSetMonitor> ReplicaSetMonitorPtr;
  * Holds state about a replica set and provides a means to refresh the local view.
  * All methods perform the required synchronization to allow callers from multiple threads.
  */
-class ReplicaSetMonitor : public std::enable_shared_from_this<ReplicaSetMonitor> {
-    MONGO_DISALLOW_COPYING(ReplicaSetMonitor);
+class ReplicaSetMonitor {
+    ReplicaSetMonitor(const ReplicaSetMonitor&) = delete;
+    ReplicaSetMonitor& operator=(const ReplicaSetMonitor&) = delete;
 
 public:
     class Refresher;
 
-    typedef stdx::function<void(const std::string& setName, const std::string& newConnectionString)>
-        ConfigChangeHook;
+    static constexpr auto kExpeditedRefreshPeriod = Milliseconds(500);
+    static constexpr auto kCheckTimeout = Seconds(5);
 
     /**
-     * Initializes local state.
-     *
-     * seeds must not be empty.
+     * Initializes local state from a MongoURI.
      */
-    ReplicaSetMonitor(StringData name, const std::set<HostAndPort>& seeds);
-
     ReplicaSetMonitor(const MongoURI& uri);
 
     /**
      * Schedules the initial refresh task into task executor.
      */
     void init();
+
+    /**
+     * Ends any ongoing refreshes.
+     */
+    void drop();
 
     /**
      * Returns a host matching the given read preference or an error, if no host matches.
@@ -93,8 +94,11 @@ public:
      * Known errors are:
      *  FailedToSatisfyReadPreference, if node cannot be found, which matches the read preference.
      */
-    SharedSemiFuture<HostAndPort> getHostOrRefresh(const ReadPreferenceSetting& readPref,
-                                                   Milliseconds maxWait = kDefaultFindHostTimeout);
+    SemiFuture<HostAndPort> getHostOrRefresh(const ReadPreferenceSetting& readPref,
+                                             Milliseconds maxWait = kDefaultFindHostTimeout);
+
+    SemiFuture<std::vector<HostAndPort>> getHostsOrRefresh(
+        const ReadPreferenceSetting& readPref, Milliseconds maxWait = kDefaultFindHostTimeout);
 
     /**
      * Returns the host we think is the current master or uasserts.
@@ -161,19 +165,15 @@ public:
     bool contains(const HostAndPort& server) const;
 
     /**
-     * Writes information about our cached view of the set to a BSONObjBuilder.
+     * Writes information about our cached view of the set to a BSONObjBuilder. If
+     * forFTDC, trim to minimize its size for full-time diagnostic data capture.
      */
-    void appendInfo(BSONObjBuilder& b) const;
+    void appendInfo(BSONObjBuilder& b, bool forFTDC = false) const;
 
     /**
      * Returns true if the monitor knows a usable primary from it's interal view.
      */
     bool isKnownToHaveGoodPrimary() const;
-
-    /**
-     * Marks the instance as removed to exit refresh sooner.
-     */
-    void markAsRemoved();
 
     /**
      * Creates a new ReplicaSetMonitor, if it doesn't already exist.
@@ -198,27 +198,9 @@ public:
     static void remove(const std::string& name);
 
     /**
-     * Sets the hook to be called whenever the config of any replica set changes.
-     * Currently only 1 globally, so this asserts if one already exists.
-     *
-     * The hook will be called from a fresh thread. It is responsible for initializing any
-     * thread-local state and ensuring that no exceptions escape.
-     *
-     * The hook must not be changed while the program has multiple threads.
+     * Returns the change notifier for the underlying ReplicaMonitorManager
      */
-    static void setAsynchronousConfigChangeHook(ConfigChangeHook hook);
-
-    /**
-     * Sets the hook to be called whenever the config of any replica set changes.
-     * Currently only 1 globally, so this asserts if one already exists.
-     *
-     * The hook will be called inline while refreshing the ReplicaSetMonitor's view of the set
-     * membership.  It is important that the hook not block for long as it will be running under
-     * the ReplicaSetMonitor's mutex.
-     *
-     * The hook must not be changed while the program has multiple threads.
-     */
-    static void setSynchronousConfigChangeHook(ConfigChangeHook hook);
+    static ReplicaSetChangeNotifier& getNotifier();
 
     /**
      * Permanently stops all monitoring on replica sets and clears all cached information
@@ -256,7 +238,7 @@ public:
     /**
      * Allows tests to set initial conditions and introspect the current state.
      */
-    explicit ReplicaSetMonitor(const SetStatePtr& initialState) : _state(initialState) {}
+    explicit ReplicaSetMonitor(const SetStatePtr& initialState);
     ~ReplicaSetMonitor();
 
     /**
@@ -281,20 +263,15 @@ public:
     void runScanForMockReplicaSet();
 
 private:
+    Future<std::vector<HostAndPort>> _getHostsOrRefresh(const ReadPreferenceSetting& readPref,
+                                                        Milliseconds maxWait);
     /**
-     * Schedules a refresh via the task executor. (Task is automatically canceled in the d-tor.)
+     * If no scan is in-progress, this function is responsible for setting up a new scan. Otherwise,
+     * does nothing.
      */
-    void _scheduleRefresh(Date_t when, WithLock);
-
-    /**
-     * This function refreshes the replica set and calls _scheduleRefresh() again.
-     */
-    void _doScheduledRefresh(const executor::TaskExecutor::CallbackHandle& currentHandle);
-
-    executor::TaskExecutor::CallbackHandle _refresherHandle;
+    static void _ensureScanInProgress(const SetStatePtr&);
 
     const SetStatePtr _state;
-    AtomicWord<bool> _isRemovedFromManager{false};
 };
 
 
@@ -302,23 +279,11 @@ private:
  * Refreshes the local view of a replica set.
  *
  * All logic related to choosing the hosts to contact and updating the SetState based on replies
- * lives in this class.
+ * lives in this class. Use of this class should always be guarded by SetState::mutex unless in
+ * single-threaded use by ReplicaSetMonitorTest.
  */
 class ReplicaSetMonitor::Refresher {
 public:
-    /**
-     * If no scan is in-progress, this function is responsible for setting up a new scan. Otherwise,
-     * does nothing.
-     */
-    static void ensureScanInProgress(const SetStatePtr&, WithLock);
-
-    //
-    // Remaining methods are only for testing and internal use.
-    // Callers are responsible for holding SetState::mutex before calling any of these methods, but
-    // not all of them take a WithLock because they predate its introduction, and because they are
-    // mostly called from single-threaded unit tests.
-    //
-
     explicit Refresher(const SetStatePtr& setState);
 
     struct NextStep {
@@ -357,9 +322,8 @@ public:
     /**
      * Starts a new scan over the hosts in set.
      */
-    static ScanStatePtr startNewScan(const SetState* set);
+    void startNewScan();
 
-private:
     /**
      * First, checks that the "reply" is not from a stale primary by comparing the electionId of
      * "reply" to the maxElectionId recorded by the SetState and returns OK status if "reply"
@@ -377,17 +341,11 @@ private:
      * Schedules isMaster requests to all hosts that currently need to be contacted.
      * Does nothing if requests have already been sent to all known hosts.
      */
-    void scheduleNetworkRequests(WithLock);
+    void scheduleNetworkRequests();
 
-    void scheduleIsMaster(const HostAndPort& host, WithLock);
+    void scheduleIsMaster(const HostAndPort& host);
 
-    /**
-     * Adjusts the _scan work queue based on information from this host.
-     * This should only be called with replies from non-masters.
-     * Does not update _set at all.
-     */
-    void receivedIsMasterBeforeFoundMaster(const IsMasterReply& reply);
-
+private:
     // Both pointers are never NULL
     SetStatePtr _set;
     ScanStatePtr _scan;  // May differ from _set->currentScan if a new scan has started.

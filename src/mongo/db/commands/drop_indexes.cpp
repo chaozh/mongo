@@ -36,7 +36,6 @@
 
 #include "mongo/db/background.h"
 #include "mongo/db/catalog/collection.h"
-#include "mongo/db/catalog/collection_catalog_entry.h"
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/drop_indexes.h"
 #include "mongo/db/catalog/index_catalog.h"
@@ -48,11 +47,14 @@
 #include "mongo/db/curop.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/index/index_descriptor.h"
+#include "mongo/db/index_builds_coordinator.h"
 #include "mongo/db/logical_clock.h"
 #include "mongo/db/op_observer.h"
 #include "mongo/db/service_context.h"
+#include "mongo/db/storage/durable_catalog.h"
 #include "mongo/db/views/view_catalog.h"
 #include "mongo/util/log.h"
+#include "mongo/util/quick_exit.h"
 
 namespace mongo {
 
@@ -60,6 +62,8 @@ using std::endl;
 using std::string;
 using std::stringstream;
 using std::vector;
+
+MONGO_FAIL_POINT_DEFINE(reIndexCrashAfterDrop);
 
 /* "dropIndexes" is now the preferred form - "deleteIndexes" deprecated */
 class CmdDropIndexes : public BasicCommand {
@@ -124,23 +128,18 @@ public:
 
         LOG(0) << "CMD: reIndex " << toReIndexNss;
 
-        // This Global write lock is necessary to ensure no other connections establish a snapshot
-        // while the reIndex command is running.  The reIndex command does not write oplog entries
-        // (for the most part) and thus the minimumVisibleSnapshot mechanism doesn't completely
-        // avoid reading at times that may show discrepancies between the in-memory index catalog
-        // and the on-disk index catalog.
-        Lock::GlobalWrite lk(opCtx);
-        AutoGetOrCreateDb autoDb(opCtx, dbname, MODE_X);
-
-        Collection* collection = autoDb.getDb()->getCollection(opCtx, toReIndexNss);
+        AutoGetCollection autoColl(opCtx, toReIndexNss, MODE_X);
+        Collection* collection = autoColl.getCollection();
         if (!collection) {
-            if (ViewCatalog::get(autoDb.getDb())->lookup(opCtx, toReIndexNss.ns()))
+            if (ViewCatalog::get(autoColl.getDb())->lookup(opCtx, toReIndexNss.ns()))
                 uasserted(ErrorCodes::CommandNotSupportedOnView, "can't re-index a view");
             else
                 uasserted(ErrorCodes::NamespaceNotFound, "collection does not exist");
         }
 
         BackgroundOperation::assertNoBgOpInProgForNs(toReIndexNss.ns());
+        IndexBuildsCoordinator::get(opCtx)->assertNoIndexBuildInProgForCollection(
+            collection->uuid());
 
         // This is necessary to set up CurOp and update the Top stats.
         OldClientContext ctx(opCtx, toReIndexNss.ns());
@@ -150,12 +149,18 @@ public:
         vector<BSONObj> all;
         {
             vector<string> indexNames;
-            collection->getCatalogEntry()->getAllIndexes(opCtx, &indexNames);
+            writeConflictRetry(opCtx, "listIndexes", toReIndexNss.ns(), [&] {
+                indexNames.clear();
+                DurableCatalog::get(opCtx)->getAllIndexes(opCtx, collection->ns(), &indexNames);
+            });
+
             all.reserve(indexNames.size());
 
             for (size_t i = 0; i < indexNames.size(); i++) {
                 const string& name = indexNames[i];
-                BSONObj spec = collection->getCatalogEntry()->getIndexSpec(opCtx, name);
+                BSONObj spec = writeConflictRetry(opCtx, "getIndexSpec", toReIndexNss.ns(), [&] {
+                    return DurableCatalog::get(opCtx)->getIndexSpec(opCtx, collection->ns(), name);
+                });
 
                 {
                     BSONObjBuilder bob;
@@ -190,32 +195,47 @@ public:
         result.appendNumber("nIndexesWas", all.size());
 
         std::unique_ptr<MultiIndexBlock> indexer = std::make_unique<MultiIndexBlock>();
+        indexer->setIndexBuildMethod(IndexBuildMethod::kForeground);
         StatusWith<std::vector<BSONObj>> swIndexesToRebuild(ErrorCodes::UnknownError,
                                                             "Uninitialized");
 
         // The 'indexer' can throw, so ensure build cleanup occurs.
-        ON_BLOCK_EXIT([&] { indexer->cleanUpAfterBuild(opCtx, collection); });
+        ON_BLOCK_EXIT([&] {
+            indexer->cleanUpAfterBuild(opCtx, collection, MultiIndexBlock::kNoopOnCleanUpFn);
+        });
 
         {
-            WriteUnitOfWork wunit(opCtx);
-            collection->getIndexCatalog()->dropAllIndexes(opCtx, true);
+            writeConflictRetry(opCtx, "dropAllIndexes", toReIndexNss.ns(), [&] {
+                WriteUnitOfWork wunit(opCtx);
+                collection->getIndexCatalog()->dropAllIndexes(opCtx, true);
 
-            swIndexesToRebuild =
-                indexer->init(opCtx, collection, all, MultiIndexBlock::kNoopOnInitFn);
-            uassertStatusOK(swIndexesToRebuild.getStatus());
-            wunit.commit();
+                swIndexesToRebuild =
+                    indexer->init(opCtx, collection, all, MultiIndexBlock::kNoopOnInitFn);
+                uassertStatusOK(swIndexesToRebuild.getStatus());
+                wunit.commit();
+            });
         }
 
-        auto status = indexer->insertAllDocumentsInCollection(opCtx, collection);
-        uassertStatusOK(status);
+        if (MONGO_unlikely(reIndexCrashAfterDrop.shouldFail())) {
+            log() << "exiting because 'reIndexCrashAfterDrop' fail point was set";
+            quickExit(EXIT_ABRUPT);
+        }
+
+        // The following function performs its own WriteConflict handling, so don't wrap it in a
+        // writeConflictRetry loop.
+        uassertStatusOK(indexer->insertAllDocumentsInCollection(opCtx, collection));
+
+        uassertStatusOK(indexer->checkConstraints(opCtx));
 
         {
-            WriteUnitOfWork wunit(opCtx);
-            uassertStatusOK(indexer->commit(opCtx,
-                                            collection,
-                                            MultiIndexBlock::kNoopOnCreateEachFn,
-                                            MultiIndexBlock::kNoopOnCommitFn));
-            wunit.commit();
+            writeConflictRetry(opCtx, "commitReIndex", toReIndexNss.ns(), [&] {
+                WriteUnitOfWork wunit(opCtx);
+                uassertStatusOK(indexer->commit(opCtx,
+                                                collection,
+                                                MultiIndexBlock::kNoopOnCreateEachFn,
+                                                MultiIndexBlock::kNoopOnCommitFn));
+                wunit.commit();
+            });
         }
 
         // Do not allow majority reads from this collection until all original indexes are visible.
@@ -231,4 +251,4 @@ public:
         return true;
     }
 } cmdReIndex;
-}
+}  // namespace mongo

@@ -8,19 +8,18 @@ load('jstests/concurrency/fsm_libs/extend_workload.js');      // for extendWorkl
 load('jstests/concurrency/fsm_workloads/yield_geo_near.js');  // for $config
 
 var $config = extendWorkload($config, function($config, $super) {
-
     $config.states.remove = function remove(db, collName) {
         var id = Random.randInt(this.nDocs);
         var doc = db[collName].findOne({_id: id});
         if (doc !== null) {
             var res = db[collName].remove({_id: id});
-            assertAlways.writeOK(res);
+            assertAlways.commandWorked(res);
             if (res.nRemoved > 0) {
                 // Re-insert the document with the same '_id', but an incremented
                 // 'timesInserted' to
                 // distinguish it from the deleted document.
                 doc.timesInserted++;
-                assertAlways.writeOK(db[collName].insert(doc));
+                assertAlways.commandWorked(db[collName].insert(doc));
             }
         }
     };
@@ -56,17 +55,22 @@ var $config = extendWorkload($config, function($config, $super) {
         // aggregation may fail if we don't have exactly one 2d index to use.
         assertWhenOwnColl(function verifyResults() {
             const seenObjs = [];
+            const seenObjsOriginals = [];
             while (cursor.hasNext()) {
                 const doc = cursor.next();
 
                 // The pair (_id, timesInserted) is the smallest set of attributes that uniquely
                 // identifies a document.
                 const objToSearch = {_id: doc._id, timesInserted: doc.timesInserted};
-                const found = seenObjs.some(obj => bsonWoCompare(obj, objToSearch) === 0);
-                assertWhenOwnColl(!found,
-                                  `$geoNear returned document ${tojson(doc)} multiple ` +
-                                      `times: ${tojson(seenObjs)}`);
+                for (let i = 0; i < seenObjs.length; ++i) {
+                    assertWhenOwnColl.neq(
+                        bsonWoCompare(seenObjs[i], objToSearch),
+                        0,
+                        () => `$geoNear returned document ${tojson(doc)} multiple ` +
+                            `times: first occurence was ${tojson(seenObjsOriginals[i])}`);
+                }
                 seenObjs.push(objToSearch);
+                seenObjsOriginals.push(doc);
             }
         });
     };

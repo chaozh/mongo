@@ -34,7 +34,6 @@
 #include <string>
 #include <vector>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/db/keys_collection_document.h"
 #include "mongo/db/repl/optime_with.h"
 #include "mongo/db/write_concern_options.h"
@@ -83,7 +82,8 @@ struct ConnectionPoolStats;
  * move to be run on the config server primary.
  */
 class ShardingCatalogClient {
-    MONGO_DISALLOW_COPYING(ShardingCatalogClient);
+    ShardingCatalogClient(const ShardingCatalogClient&) = delete;
+    ShardingCatalogClient& operator=(const ShardingCatalogClient&) = delete;
 
     // Allows ShardingCatalogManager to access _exhaustiveFindOnConfig
     friend class ShardingCatalogManager;
@@ -322,8 +322,21 @@ public:
                                         const WriteConcernOptions& writeConcern) = 0;
 
     /**
-     * Updates a single document in the specified namespace on the config server. The document must
-     * have an _id index. Must only be used for updates to the 'config' database.
+     * Directly inserts documents in the specified namespace on the config server. Inserts said
+     * documents using a retryable write. Underneath, a session is created and destroyed -- this
+     * ad-hoc session creation strategy should never be used outside of specific, non-performant
+     * code paths.
+     *
+     * Must only be used for insertions in the 'config' database.
+     */
+    virtual void insertConfigDocumentsAsRetryableWrite(OperationContext* opCtx,
+                                                       const NamespaceString& nss,
+                                                       std::vector<BSONObj> docs,
+                                                       const WriteConcernOptions& writeConcern) = 0;
+
+    /**
+     * Updates a single document in the specified namespace on the config server. Must only be used
+     * for updates to the 'config' database.
      *
      * This method retries the operation on NotMaster or network errors, so it should only be used
      * with modifications which are idempotent.

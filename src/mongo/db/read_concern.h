@@ -38,17 +38,32 @@ class OperationContext;
 class Status;
 template <typename T>
 class StatusWith;
+enum class PrepareConflictBehavior;
 namespace repl {
 class ReadConcernArgs;
 class SpeculativeMajorityReadInfo;
-}
+}  // namespace repl
 
+/**
+ * Sets the prepare conflict behavior for a command.
+ *
+ * If the prepareConflictBehavior requested is to ignore prepare conflicts, then readConcernArgs
+ * are used to verify if the command is safe to ignore prepare conflicts, and if not, we
+ * enforce prepare conflicts.
+ */
+extern MONGO_DECLARE_SHIM((OperationContext * opCtx,
+                           const repl::ReadConcernArgs& readConcernArgs,
+                           PrepareConflictBehavior prepareConflictBehavior)
+                              ->void) setPrepareConflictBehaviorForReadConcern;
 
 /**
  * Given the specified read concern arguments, performs checks that the read concern can actually be
  * satisfied given the current state of the server and if so calls into the replication subsystem to
  * perform the wait. If allowAfterClusterTime is false returns an error if afterClusterTime is
  * set on the readConcernArgs.
+ *
+ * Note: Callers should use setPrepareConflictBehaviorForReadConcern method to set the desired
+ * prepare conflict behavior for their command.
  */
 extern MONGO_DECLARE_SHIM((OperationContext * opCtx,
                            const repl::ReadConcernArgs& readConcernArgs,

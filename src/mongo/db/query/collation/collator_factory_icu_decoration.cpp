@@ -29,20 +29,19 @@
 
 #include "mongo/platform/basic.h"
 
+#include <memory>
+
 #include "mongo/base/init.h"
 #include "mongo/db/query/collation/collator_factory_icu.h"
 #include "mongo/db/service_context.h"
-#include "mongo/stdx/memory.h"
 
 namespace mongo {
 
 namespace {
 
 ServiceContext::ConstructorActionRegisterer registerIcuCollator{
-    "CreateCollatorFactory",
-    {"LoadICUData"},
-    [](ServiceContext* service) {
-        CollatorFactoryInterface::set(service, stdx::make_unique<CollatorFactoryICU>());
+    "CreateCollatorFactory", {"LoadICUData"}, [](ServiceContext* service) {
+        CollatorFactoryInterface::set(service, std::make_unique<CollatorFactoryICU>());
     }};
 }  // namespace
 

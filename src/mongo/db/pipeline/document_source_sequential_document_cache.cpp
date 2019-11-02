@@ -39,7 +39,7 @@ constexpr StringData DocumentSourceSequentialDocumentCache::kStageName;
 
 DocumentSourceSequentialDocumentCache::DocumentSourceSequentialDocumentCache(
     const boost::intrusive_ptr<ExpressionContext>& expCtx, SequentialDocumentCache* cache)
-    : DocumentSource(expCtx), _cache(cache) {
+    : DocumentSource(kStageName, expCtx), _cache(cache) {
     invariant(_cache);
     invariant(!_cache->isAbandoned());
 
@@ -48,15 +48,21 @@ DocumentSourceSequentialDocumentCache::DocumentSourceSequentialDocumentCache(
     }
 }
 
-DocumentSource::GetNextResult DocumentSourceSequentialDocumentCache::getNext() {
+DocumentSource::GetNextResult DocumentSourceSequentialDocumentCache::doGetNext() {
     // Either we're reading from the cache, or we have an input source to build the cache from.
     invariant(pSource || _cache->isServing());
 
-    pExpCtx->checkForInterrupt();
+    if (_cacheIsEOF) {
+        return GetNextResult::makeEOF();
+    }
 
     if (_cache->isServing()) {
         auto nextDoc = _cache->getNext();
-        return (nextDoc ? std::move(*nextDoc) : GetNextResult::makeEOF());
+        if (nextDoc) {
+            return std::move(*nextDoc);
+        }
+        _cacheIsEOF = true;
+        return GetNextResult::makeEOF();
     }
 
     auto nextResult = pSource->getNext();
@@ -64,6 +70,7 @@ DocumentSource::GetNextResult DocumentSourceSequentialDocumentCache::getNext() {
     if (!_cache->isAbandoned()) {
         if (nextResult.isEOF()) {
             _cache->freeze();
+            _cacheIsEOF = true;
         } else {
             _cache->add(nextResult.getDocument());
         }
@@ -108,7 +115,7 @@ Pipeline::SourceContainer::iterator DocumentSourceSequentialDocumentCache::doOpt
     // elsewhere. So without knowledge of what metadata is in fact available, here
     // we "lie" and say that all metadata is available to avoid tripping any
     // assertions.
-    DepsTracker deps(DepsTracker::kAllMetadataAvailable);
+    DepsTracker deps(DepsTracker::kAllMetadata);
 
     // Iterate through the pipeline stages until we find one which references an external variable.
     for (; prefixSplit != container->end(); ++prefixSplit) {
@@ -144,12 +151,12 @@ Value DocumentSourceSequentialDocumentCache::serialize(
             {kStageName,
              Document{{"maxSizeBytes"_sd, Value(static_cast<long long>(_cache->maxSizeBytes()))},
                       {"status"_sd,
-                       _cache->isBuilding() ? "kBuilding"_sd : _cache->isServing()
-                               ? "kServing"_sd
-                               : "kAbandoned"_sd}}}});
+                       _cache->isBuilding()
+                           ? "kBuilding"_sd
+                           : _cache->isServing() ? "kServing"_sd : "kAbandoned"_sd}}}});
     }
 
     return Value();
 }
 
-}  // namesace mongo
+}  // namespace mongo

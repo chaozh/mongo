@@ -55,7 +55,9 @@ namespace {
 
 namespace wcp = ::mongo::wildcard_planning;
 
-bool isNotEqualsArrayOrNotInArray(const MatchExpression* me) {
+// Can't index negations of {$eq: <Array>} or {$in: [<Array>, ...]}. Note that we could
+// use the index in principle, though we would need to generate special bounds.
+bool isEqualsArrayOrNotInArray(const MatchExpression* me) {
     const auto type = me->matchType();
     if (type == MatchExpression::EQ) {
         return static_cast<const ComparisonMatchExpression*>(me)->getData().type() ==
@@ -319,14 +321,13 @@ std::vector<IndexEntry> QueryPlannerIXSelect::findRelevantIndices(
 }
 
 std::vector<IndexEntry> QueryPlannerIXSelect::expandIndexes(
-    const stdx::unordered_set<std::string>& fields,
-    const std::vector<IndexEntry>& relevantIndices) {
+    const stdx::unordered_set<std::string>& fields, std::vector<IndexEntry> relevantIndices) {
     std::vector<IndexEntry> out;
     for (auto&& entry : relevantIndices) {
         if (entry.type == IndexType::INDEX_WILDCARD) {
             wcp::expandWildcardIndexEntry(entry, fields, &out);
         } else {
-            out.push_back(entry);
+            out.push_back(std::move(entry));
         }
     }
 
@@ -433,16 +434,15 @@ bool QueryPlannerIXSelect::_compatible(const BSONElement& keyPatternElt,
                 return false;
             }
 
-            // Can't index negations of {$eq: <Array>} or {$in: [<Array>, ...]}. Note that we could
-            // use the index in principle, though we would need to generate special bounds.
-            if (isNotEqualsArrayOrNotInArray(child)) {
+            if (isEqualsArrayOrNotInArray(child)) {
                 return false;
             }
 
             // Most of the time we can't use a multikey index for a $ne: null query, however there
             // are a few exceptions around $elemMatch.
-            if (isNotEqualsNull &&
-                !notEqualsNullCanUseIndex(index, keyPatternElt, keyPatternIdx, elemMatchContext)) {
+            const bool canUseIndexForNeNull =
+                notEqualsNullCanUseIndex(index, keyPatternElt, keyPatternIdx, elemMatchContext);
+            if (isNotEqualsNull && !canUseIndexForNeNull) {
                 return false;
             }
 
@@ -450,6 +450,12 @@ bool QueryPlannerIXSelect::_compatible(const BSONElement& keyPatternElt,
             if (MatchExpression::MATCH_IN == childtype) {
                 InMatchExpression* ime = static_cast<InMatchExpression*>(node->getChild(0));
                 if (!ime->getRegexes().empty()) {
+                    return false;
+                }
+
+                // If we can't use the index for $ne to null, then we cannot use it for the
+                // case {$nin: [null, <...>]}.
+                if (!canUseIndexForNeNull && ime->hasNull()) {
                     return false;
                 }
             }
@@ -558,7 +564,7 @@ bool QueryPlannerIXSelect::_compatible(const BSONElement& keyPatternElt,
             const CapWithCRS* cap = gc.getCapGeometryHack();
 
             // 2d indices can answer centerSphere queries.
-            if (NULL == cap) {
+            if (nullptr == cap) {
                 return false;
             }
 
@@ -574,7 +580,7 @@ bool QueryPlannerIXSelect::_compatible(const BSONElement& keyPatternElt,
     } else if (IndexNames::GEO_HAYSTACK == indexedFieldType) {
         return false;
     } else {
-        warning() << "Unknown indexing for node " << node->toString() << " and field "
+        warning() << "Unknown indexing for node " << node->debugString() << " and field "
                   << keyPatternElt.toString();
         verify(0);
     }
@@ -608,6 +614,11 @@ bool QueryPlannerIXSelect::nodeIsSupportedBySparseIndex(const MatchExpression* q
     }
 
     return true;
+}
+
+bool QueryPlannerIXSelect::logicalNodeMayBeSupportedByAnIndex(const MatchExpression* queryExpr) {
+    return !(queryExpr->matchType() == MatchExpression::NOT &&
+             isEqualsArrayOrNotInArray(queryExpr->getChild(0)));
 }
 
 bool QueryPlannerIXSelect::nodeIsSupportedByWildcardIndex(const MatchExpression* queryExpr) {
@@ -662,7 +673,7 @@ void QueryPlannerIXSelect::_rateIndices(MatchExpression* node,
             fullPath = prefix + node->path().toString();
         }
 
-        verify(NULL == node->getTag());
+        verify(nullptr == node->getTag());
         node->setTag(new RelevantTag());
         auto rt = static_cast<RelevantTag*>(node->getTag());
         rt->path = fullPath;
@@ -671,13 +682,14 @@ void QueryPlannerIXSelect::_rateIndices(MatchExpression* node,
             const IndexEntry& index = indices[i];
             std::size_t keyPatternIndex = 0;
             for (auto&& keyPatternElt : index.keyPattern) {
-                if (keyPatternElt.fieldNameStringData() == fullPath && _compatible(keyPatternElt,
-                                                                                   index,
-                                                                                   keyPatternIndex,
-                                                                                   node,
-                                                                                   fullPath,
-                                                                                   collator,
-                                                                                   elemMatchCtx)) {
+                if (keyPatternElt.fieldNameStringData() == fullPath &&
+                    _compatible(keyPatternElt,
+                                index,
+                                keyPatternIndex,
+                                node,
+                                fullPath,
+                                collator,
+                                elemMatchCtx)) {
                     if (keyPatternIndex == 0) {
                         rt->first.push_back(i);
                     } else {
@@ -991,7 +1003,7 @@ static void stripInvalidAssignmentsToTextIndex(MatchExpression* node,
         MatchExpression* child = node->getChild(i);
         RelevantTag* tag = static_cast<RelevantTag*>(child->getTag());
 
-        if (NULL == tag) {
+        if (nullptr == tag) {
             // 'child' could be a logical operator.  Maybe there are some assignments hiding
             // inside.
             stripInvalidAssignmentsToTextIndex(child, idx, prefixPaths);

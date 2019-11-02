@@ -33,6 +33,8 @@
 
 #include "mongo/db/index/index_build_interceptor.h"
 
+#include <vector>
+
 #include "mongo/bson/bsonobj.h"
 #include "mongo/db/catalog/index_timestamp_helper.h"
 #include "mongo/db/catalog_raii.h"
@@ -40,10 +42,11 @@
 #include "mongo/db/curop.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/index/index_access_method.h"
+#include "mongo/db/index/index_build_interceptor_gen.h"
 #include "mongo/db/multi_key_path_tracker.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/service_context.h"
-#include "mongo/util/fail_point_service.h"
+#include "mongo/util/fail_point.h"
 #include "mongo/util/log.h"
 #include "mongo/util/progress_meter.h"
 #include "mongo/util/uuid.h"
@@ -52,13 +55,35 @@ namespace mongo {
 
 MONGO_FAIL_POINT_DEFINE(hangDuringIndexBuildDrainYield);
 
+bool IndexBuildInterceptor::typeCanFastpathMultikeyUpdates(IndexType indexType) {
+    // Ensure no new indexes are added without considering whether they use the multikeyPaths
+    // vector.
+    invariant(indexType == INDEX_BTREE || indexType == INDEX_2D || indexType == INDEX_HAYSTACK ||
+              indexType == INDEX_2DSPHERE || indexType == INDEX_TEXT || indexType == INDEX_HASHED ||
+              indexType == INDEX_WILDCARD);
+    // Only BTREE indexes are guaranteed to use the multikeyPaths vector. Other index types either
+    // do not track path-level multikey information or have "special" handling of multikey
+    // information.
+    return (indexType == INDEX_BTREE);
+}
+
 IndexBuildInterceptor::IndexBuildInterceptor(OperationContext* opCtx, IndexCatalogEntry* entry)
     : _indexCatalogEntry(entry),
       _sideWritesTable(
-          opCtx->getServiceContext()->getStorageEngine()->makeTemporaryRecordStore(opCtx)) {
+          opCtx->getServiceContext()->getStorageEngine()->makeTemporaryRecordStore(opCtx)),
+      _sideWritesCounter(std::make_shared<AtomicWord<long long>>()) {
 
     if (entry->descriptor()->unique()) {
         _duplicateKeyTracker = std::make_unique<DuplicateKeyTracker>(opCtx, entry);
+    }
+    // `mergeMultikeyPaths` is sensitive to the two inputs having the same multikey
+    // "shape". Initialize `_multikeyPaths` with the right shape from the IndexCatalogEntry.
+    auto indexType = entry->descriptor()->getIndexType();
+    if (typeCanFastpathMultikeyUpdates(indexType)) {
+        auto numFields = entry->descriptor()->getNumFields();
+        _multikeyPaths = MultikeyPaths{};
+        auto it = _multikeyPaths->begin();
+        _multikeyPaths->insert(it, numFields, {});
     }
 }
 
@@ -100,24 +125,11 @@ const std::string& IndexBuildInterceptor::getConstraintViolationsTableIdent() co
 
 Status IndexBuildInterceptor::drainWritesIntoIndex(OperationContext* opCtx,
                                                    const InsertDeleteOptions& options,
-                                                   RecoveryUnit::ReadSource readSource) {
+                                                   RecoveryUnit::ReadSource readSource,
+                                                   DrainYieldPolicy drainYieldPolicy) {
     invariant(!opCtx->lockState()->inAWriteUnitOfWork());
-
-    // Callers may request to read at a specific timestamp so that no drained writes are timestamped
-    // earlier than their original write timestamp. Also ensure that leaving this function resets
-    // the ReadSource to its original value.
-    auto resetReadSourceGuard =
-        makeGuard([ opCtx, prevReadSource = opCtx->recoveryUnit()->getTimestampReadSource() ] {
-            opCtx->recoveryUnit()->abandonSnapshot();
-            opCtx->recoveryUnit()->setTimestampReadSource(prevReadSource);
-        });
-
-    if (readSource != RecoveryUnit::ReadSource::kUnset) {
-        opCtx->recoveryUnit()->abandonSnapshot();
-        opCtx->recoveryUnit()->setTimestampReadSource(readSource);
-    } else {
-        resetReadSourceGuard.dismiss();
-    }
+    // Reading at a timestamp during hybrid index builds is not supported.
+    invariant(readSource == RecoveryUnit::ReadSource::kUnset);
 
     // These are used for logging only.
     int64_t totalDeleted = 0;
@@ -136,113 +148,112 @@ Status IndexBuildInterceptor::drainWritesIntoIndex(OperationContext* opCtx,
     }
 
     // Force the progress meter to log at the end of every batch. By default, the progress meter
-    // only logs after a large number of calls to hit(), but since we batch inserts by up to
-    // 1000 records, progress would rarely be displayed.
-    progress->reset(_sideWritesCounter.load() - appliedAtStart /* total */,
+    // only logs after a large number of calls to hit(), but since we use such large batch sizes,
+    // progress would rarely be displayed.
+    progress->reset(_sideWritesCounter->load() - appliedAtStart /* total */,
                     3 /* secondsBetween */,
                     1 /* checkInterval */);
 
-    // Buffer operations into batches to insert per WriteUnitOfWork. Impose an upper limit on the
-    // number of documents and the total size of the batch.
-    const int32_t kBatchMaxSize = 1000;
-    const int64_t kBatchMaxBytes = BSONObjMaxInternalSize;
+    // Apply operations in batches per WriteUnitOfWork. The batch size limit allows the drain to
+    // yield at a frequent interval, releasing locks and storage engine resources.
+    const int32_t kBatchMaxSize = maxIndexBuildDrainBatchSize.load();
 
-    int64_t batchSizeBytes = 0;
+    // The batch byte limit restricts the total size of the write transaction, which relieves
+    // pressure on the storage engine cache. This size maximum is enforced by the IDL. It should
+    // never exceed the size limit of a 32-bit signed integer for overflow reasons.
+    const int32_t kBatchMaxMB = maxIndexBuildDrainMemoryUsageMegabytes.load();
+    const int32_t kMB = 1024 * 1024;
+    invariant(kBatchMaxMB <= std::numeric_limits<int32_t>::max() / kMB);
+    const int32_t kBatchMaxBytes = kBatchMaxMB * kMB;
 
-    std::vector<SideWriteRecord> batch;
-    batch.reserve(kBatchMaxSize);
-
-    // Hold on to documents that would exceed the per-batch memory limit. Always insert this first
-    // into the next batch.
-    boost::optional<SideWriteRecord> stashed;
-
-    auto cursor = _sideWritesTable->rs()->getCursor(opCtx);
-
+    // Indicates that there are no more visible records in the side table.
     bool atEof = false;
-    while (!atEof) {
-        opCtx->checkForInterrupt();
 
-        // Stashed records should be inserted into a batch first.
-        if (stashed) {
-            invariant(batch.empty());
-            batch.push_back(std::move(stashed.get()));
-            stashed.reset();
-        }
+    // In a single WriteUnitOfWork, scan the side table up to the batch or memory limit, apply the
+    // keys to the index, and delete the side table records.
+    auto applySingleBatch = [&] {
+        WriteUnitOfWork wuow(opCtx);
 
-        auto record = cursor->next();
+        int32_t batchSize = 0;
+        int64_t batchSizeBytes = 0;
 
-        if (record) {
-            RecordId currentRecordId = record->id;
-            BSONObj docOut = record->data.toBson().getOwned();
+        auto cursor = _sideWritesTable->rs()->getCursor(opCtx);
 
-            // If the total batch size in bytes would be too large, stash this document and let the
-            // current batch insert.
-            int objSize = docOut.objsize();
-            if (batchSizeBytes + objSize > kBatchMaxBytes) {
-                invariant(!stashed);
+        // We use an ordered container because the order of deletion for the records in the side
+        // table matters.
+        std::vector<RecordId> recordsAddedToIndex;
 
-                // Stash this document to be inserted in the next batch.
-                stashed.emplace(currentRecordId, std::move(docOut));
-            } else {
-                batchSizeBytes += objSize;
-                batch.emplace_back(currentRecordId, std::move(docOut));
+        while (!atEof) {
+            opCtx->checkForInterrupt();
 
-                // Continue if there is more room in the batch.
-                if (batch.size() < kBatchMaxSize) {
-                    continue;
-                }
-            }
-        } else {
-            atEof = true;
-            if (batch.empty())
+            auto record = cursor->next();
+            if (!record) {
+                atEof = true;
                 break;
-        }
-
-        invariant(!batch.empty());
-
-        cursor->save();
-
-        // If we are here, either we have reached the end of the table or the batch is full, so
-        // insert everything in one WriteUnitOfWork, and delete each inserted document from the side
-        // writes table.
-        auto status = writeConflictRetry(opCtx, "index build drain", _indexCatalogEntry->ns(), [&] {
-            WriteUnitOfWork wuow(opCtx);
-            for (auto& operation : batch) {
-                auto status =
-                    _applyWrite(opCtx, operation.second, options, &totalInserted, &totalDeleted);
-                if (!status.isOK()) {
-                    return status;
-                }
-
-                // Delete the document from the table as soon as it has been inserted into the
-                // index. This ensures that no key is ever inserted twice and no keys are skipped.
-                _sideWritesTable->rs()->deleteRecord(opCtx, operation.first);
             }
 
-            // For rollback to work correctly, these writes need to be timestamped. The actual time
-            // is not important, as long as it not older than the most recent visible side write.
-            IndexTimestampHelper::setGhostCommitTimestampForWrite(
-                opCtx, NamespaceString(_indexCatalogEntry->ns()));
+            RecordId currentRecordId = record->id;
+            BSONObj unownedDoc = record->data.toBson();
 
-            wuow.commit();
-            return Status::OK();
-        });
-        if (!status.isOK()) {
-            return status;
+            // Don't apply this record if the total batch size in bytes would be too large.
+            const int objSize = unownedDoc.objsize();
+            if (batchSize > 0 && batchSizeBytes + objSize > kBatchMaxBytes) {
+                break;
+            }
+
+            batchSize += 1;
+            batchSizeBytes += objSize;
+
+            if (auto status =
+                    _applyWrite(opCtx, unownedDoc, options, &totalInserted, &totalDeleted);
+                !status.isOK()) {
+                return status;
+            }
+
+            // Save the record ids of the documents inserted into the index for deletion later.
+            // We can't delete records while holding a positioned cursor.
+            recordsAddedToIndex.push_back(currentRecordId);
+
+            // Don't continue if the batch is full. Allow the transaction to commit.
+            if (batchSize == kBatchMaxSize) {
+                break;
+            }
         }
 
-        progress->hit(batch.size());
+        // Delete documents from the side table as soon as they have been inserted into the index.
+        // This ensures that no key is ever inserted twice and no keys are skipped.
+        for (const auto& recordId : recordsAddedToIndex) {
+            _sideWritesTable->rs()->deleteRecord(opCtx, recordId);
+        }
 
-        // Lock yielding will only happen if we are holding intent locks.
-        _tryYield(opCtx);
-        cursor->restore();
+        if (batchSize == 0) {
+            invariant(atEof);
+            return Status::OK();
+        }
+
+        wuow.commit();
+
+        progress->hit(batchSize);
+        _numApplied += batchSize;
+
+        // Lock yielding will be directed by the yield policy provided.
+        // We will typically yield locks during the draining phase if we are holding intent locks.
+        if (DrainYieldPolicy::kYield == drainYieldPolicy) {
+            _yield(opCtx);
+        }
 
         // Account for more writes coming in during a batch.
-        progress->setTotalWhileRunning(_sideWritesCounter.loadRelaxed() - appliedAtStart);
+        progress->setTotalWhileRunning(_sideWritesCounter->loadRelaxed() - appliedAtStart);
+        return Status::OK();
+    };
 
-        _numApplied += batch.size();
-        batch.clear();
-        batchSizeBytes = 0;
+    // Apply batches of side writes until the last record in the table is seen.
+    while (!atEof) {
+        if (auto status = writeConflictRetry(
+                opCtx, "index build drain", _indexCatalogEntry->ns().ns(), applySingleBatch);
+            !status.isOK()) {
+            return status;
+        }
     }
 
     progress->finished();
@@ -261,18 +272,27 @@ Status IndexBuildInterceptor::_applyWrite(OperationContext* opCtx,
                                           const InsertDeleteOptions& options,
                                           int64_t* const keysInserted,
                                           int64_t* const keysDeleted) {
-    const BSONObj key = operation["key"].Obj();
-    const RecordId opRecordId = RecordId(operation["recordId"].Long());
+    // Deserialize the encoded KeyString::Value.
+    int keyLen;
+    const char* binKey = operation["key"].binData(keyLen);
+    BufReader reader(binKey, keyLen);
+    const KeyString::Value keyString = KeyString::Value::deserialize(
+        reader,
+        _indexCatalogEntry->accessMethod()->getSortedDataInterface()->getKeyStringVersion());
+
     const Op opType =
         (strcmp(operation.getStringField("op"), "i") == 0) ? Op::kInsert : Op::kDelete;
-    const BSONObjSet keySet = SimpleBSONObjComparator::kInstance.makeBSONObjSet({key});
+
+    const KeyStringSet keySet{keyString};
+    const RecordId opRecordId =
+        KeyString::decodeRecordIdAtEnd(keyString.getBuffer(), keyString.getSize());
 
     auto accessMethod = _indexCatalogEntry->accessMethod();
     if (opType == Op::kInsert) {
         InsertResult result;
         auto status = accessMethod->insertKeys(opCtx,
-                                               keySet,
-                                               SimpleBSONObjComparator::kInstance.makeBSONObjSet(),
+                                               {keySet.begin(), keySet.end()},
+                                               {},
                                                MultikeyPaths{},
                                                opRecordId,
                                                options,
@@ -295,10 +315,12 @@ Status IndexBuildInterceptor::_applyWrite(OperationContext* opCtx,
             [keysInserted, numInserted] { *keysInserted -= numInserted; });
     } else {
         invariant(opType == Op::kDelete);
-        DEV invariant(strcmp(operation.getStringField("op"), "d") == 0);
+        if (kDebugBuild)
+            invariant(strcmp(operation.getStringField("op"), "d") == 0);
 
         int64_t numDeleted;
-        Status s = accessMethod->removeKeys(opCtx, keySet, opRecordId, options, &numDeleted);
+        Status s = accessMethod->removeKeys(
+            opCtx, {keySet.begin(), keySet.end()}, opRecordId, options, &numDeleted);
         if (!s.isOK()) {
             return s;
         }
@@ -310,19 +332,7 @@ Status IndexBuildInterceptor::_applyWrite(OperationContext* opCtx,
     return Status::OK();
 }
 
-void IndexBuildInterceptor::_tryYield(OperationContext* opCtx) {
-    // Never yield while holding locks that prevent writes to the collection: only yield while
-    // holding intent locks. This check considers all locks in the hierarchy that would cover this
-    // mode.
-    const NamespaceString nss(_indexCatalogEntry->ns());
-    if (opCtx->lockState()->isCollectionLockedForMode(nss, MODE_S)) {
-        return;
-    }
-    DEV {
-        invariant(!opCtx->lockState()->isCollectionLockedForMode(nss, MODE_X));
-        invariant(!opCtx->lockState()->isDbLockedForMode(nss.db(), MODE_X));
-    }
-
+void IndexBuildInterceptor::_yield(OperationContext* opCtx) {
     // Releasing locks means a new snapshot should be acquired when restored.
     opCtx->recoveryUnit()->abandonSnapshot();
 
@@ -334,107 +344,126 @@ void IndexBuildInterceptor::_tryYield(OperationContext* opCtx) {
     // Track the number of yields in CurOp.
     CurOp::get(opCtx)->yielded();
 
-    MONGO_FAIL_POINT_BLOCK(hangDuringIndexBuildDrainYield, config) {
-        StringData ns{config.getData().getStringField("namespace")};
-        if (ns == _indexCatalogEntry->ns()) {
+    hangDuringIndexBuildDrainYield.executeIf(
+        [&](auto&&) {
             log() << "Hanging index build during drain yield";
-            MONGO_FAIL_POINT_PAUSE_WHILE_SET(hangDuringIndexBuildDrainYield);
-        }
-    }
+            hangDuringIndexBuildDrainYield.pauseWhileSet();
+        },
+        [&](auto&& config) {
+            return config.getStringField("namespace") == _indexCatalogEntry->ns().ns();
+        });
 
     locker->restoreLockState(opCtx, snapshot);
 }
 
 bool IndexBuildInterceptor::areAllWritesApplied(OperationContext* opCtx) const {
     invariant(_sideWritesTable);
-    auto cursor = _sideWritesTable->rs()->getCursor(opCtx, false /* forward */);
+    auto cursor = _sideWritesTable->rs()->getCursor(opCtx);
     auto record = cursor->next();
 
     // The table is empty only when all writes are applied.
-    if (!record)
+    if (!record) {
+        auto writesRecorded = _sideWritesCounter->load();
+        if (writesRecorded != _numApplied) {
+            const std::string message = str::stream()
+                << "The number of side writes recorded does not match the number "
+                   "applied, despite the table appearing empty. Writes recorded: "
+                << writesRecorded << ", applied: " << _numApplied;
+
+            dassert(writesRecorded == _numApplied, message);
+            warning() << message;
+        }
         return true;
+    }
 
     return false;
 }
 
 boost::optional<MultikeyPaths> IndexBuildInterceptor::getMultikeyPaths() const {
-    stdx::unique_lock<stdx::mutex> lk(_multikeyPathMutex);
+    stdx::unique_lock<Latch> lk(_multikeyPathMutex);
     return _multikeyPaths;
 }
 
 Status IndexBuildInterceptor::sideWrite(OperationContext* opCtx,
-                                        IndexAccessMethod* indexAccessMethod,
-                                        const BSONObj* obj,
-                                        const InsertDeleteOptions& options,
+                                        const std::vector<KeyString::Value>& keys,
+                                        const KeyStringSet& multikeyMetadataKeys,
+                                        const MultikeyPaths& multikeyPaths,
                                         RecordId loc,
                                         Op op,
                                         int64_t* const numKeysOut) {
     invariant(opCtx->lockState()->inAWriteUnitOfWork());
-
-    *numKeysOut = 0;
-    BSONObjSet keys = SimpleBSONObjComparator::kInstance.makeBSONObjSet();
-    BSONObjSet multikeyMetadataKeys = SimpleBSONObjComparator::kInstance.makeBSONObjSet();
-    MultikeyPaths multikeyPaths;
-
-    // Override key constraints when generating keys for removal. This is the same behavior as
-    // IndexAccessMethod::remove and only applies to keys that do not apply to a partial filter
-    // expression.
-    const auto getKeysMode = op == Op::kInsert
-        ? options.getKeysMode
-        : IndexAccessMethod::GetKeysMode::kRelaxConstraintsUnfiltered;
-    indexAccessMethod->getKeys(*obj, getKeysMode, &keys, &multikeyMetadataKeys, &multikeyPaths);
-
     // Maintain parity with IndexAccessMethods handling of key counting. Only include
     // `multikeyMetadataKeys` when inserting.
     *numKeysOut = keys.size() + (op == Op::kInsert ? multikeyMetadataKeys.size() : 0);
 
-    if (*numKeysOut == 0) {
-        return Status::OK();
-    }
+    auto indexType = _indexCatalogEntry->descriptor()->getIndexType();
 
-    {
-        stdx::unique_lock<stdx::mutex> lk(_multikeyPathMutex);
+    // No need to take the multikeyPaths mutex if this is a trivial multikey update.
+    bool canBypassMultikeyMutex = typeCanFastpathMultikeyUpdates(indexType) &&
+        MultikeyPathTracker::isMultikeyPathsTrivial(multikeyPaths);
+
+    if (op == Op::kInsert && !canBypassMultikeyMutex) {
+        // SERVER-39705: It's worth noting that a document may not generate any keys, but be
+        // described as being multikey. This step must be done to maintain parity with `validate`s
+        // expectations.
+        stdx::unique_lock<Latch> lk(_multikeyPathMutex);
         if (_multikeyPaths) {
             MultikeyPathTracker::mergeMultikeyPaths(&_multikeyPaths.get(), multikeyPaths);
         } else {
+            // All indexes that support pre-initialization of _multikeyPaths during
+            // IndexBuildInterceptor construction time should have been initialized already.
+            invariant(!typeCanFastpathMultikeyUpdates(indexType));
+
             // `mergeMultikeyPaths` is sensitive to the two inputs having the same multikey
             // "shape". Initialize `_multikeyPaths` with the right shape from the first result.
             _multikeyPaths = multikeyPaths;
         }
     }
 
+    if (*numKeysOut == 0) {
+        return Status::OK();
+    }
+
+    // Reuse the same builder to avoid an allocation per key.
+    BufBuilder builder;
     std::vector<BSONObj> toInsert;
-    for (const auto& key : keys) {
+    for (const auto& keyString : keys) {
         // Documents inserted into this table must be consumed in insert-order.
         // Additionally, these writes should be timestamped with the same timestamps that the
         // other writes making up this operation are given. When index builds can cope with
         // replication rollbacks, side table writes associated with a CUD operation should
         // remain/rollback along with the corresponding oplog entry.
-        toInsert.emplace_back(BSON(
-            "op" << (op == Op::kInsert ? "i" : "d") << "key" << key << "recordId" << loc.repr()));
+
+        // Serialize the KeyString::Value into a binary format for storage. Since the
+        // KeyString::Value also contains TypeBits information, it is not sufficient to just read
+        // from getBuffer().
+        builder.reset();
+        keyString.serialize(builder);
+        BSONBinData binData(builder.buf(), builder.getSize(), BinDataGeneral);
+        toInsert.emplace_back(BSON("op" << (op == Op::kInsert ? "i" : "d") << "key" << binData));
     }
 
     if (op == Op::kInsert) {
         // Wildcard indexes write multikey path information, typically part of the catalog
         // document, to the index itself. Multikey information is never deleted, so we only need
         // to add this data on the insert path.
-        for (const auto& key : multikeyMetadataKeys) {
+        for (const auto& keyString : multikeyMetadataKeys) {
+            builder.reset();
+            keyString.serialize(builder);
+            BSONBinData binData(builder.buf(), builder.getSize(), BinDataGeneral);
             toInsert.emplace_back(BSON("op"
                                        << "i"
-                                       << "key"
-                                       << key
-                                       << "recordId"
-                                       << static_cast<int64_t>(
-                                              RecordId::ReservedId::kWildcardMultikeyMetadataId)));
+                                       << "key" << binData));
         }
     }
 
-    _sideWritesCounter.fetchAndAdd(toInsert.size());
+    _sideWritesCounter->fetchAndAdd(toInsert.size());
     // This insert may roll back, but not necessarily from inserting into this table. If other write
     // operations outside this table and in the same transaction are rolled back, this counter also
     // needs to be rolled back.
-    opCtx->recoveryUnit()->onRollback(
-        [ this, size = toInsert.size() ] { _sideWritesCounter.fetchAndSubtract(size); });
+    opCtx->recoveryUnit()->onRollback([sharedCounter = _sideWritesCounter, size = toInsert.size()] {
+        sharedCounter->fetchAndSubtract(size);
+    });
 
     std::vector<Record> records;
     for (auto& doc : toInsert) {

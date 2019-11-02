@@ -33,7 +33,7 @@
 
 #include "mongo/db/storage/journal_listener.h"
 #include "mongo/db/storage/kv/kv_engine.h"
-#include "mongo/stdx/mutex.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/util/string_map.h"
 
 namespace mongo {
@@ -58,12 +58,12 @@ public:
                                                                   StringData ident) override;
 
     virtual Status createSortedDataInterface(OperationContext* opCtx,
+                                             const CollectionOptions& collOptions,
                                              StringData ident,
                                              const IndexDescriptor* desc);
 
-    virtual SortedDataInterface* getSortedDataInterface(OperationContext* opCtx,
-                                                        StringData ident,
-                                                        const IndexDescriptor* desc);
+    virtual std::unique_ptr<SortedDataInterface> getSortedDataInterface(
+        OperationContext* opCtx, StringData ident, const IndexDescriptor* desc);
 
     virtual Status beginBackup(OperationContext* opCtx) {
         return Status::OK();
@@ -102,17 +102,16 @@ public:
 
     virtual bool hasIdent(OperationContext* opCtx, StringData ident) const {
         return _dataMap.find(ident) != _dataMap.end();
-        ;
     }
 
     std::vector<std::string> getAllIdents(OperationContext* opCtx) const;
 
     void setJournalListener(JournalListener* jl) final {
-        stdx::unique_lock<stdx::mutex> lk(_mutex);
+        stdx::unique_lock<Latch> lk(_mutex);
         _journalListener = jl;
     }
 
-    virtual Timestamp getAllCommittedTimestamp() const override {
+    virtual Timestamp getAllDurableTimestamp() const override {
         MONGO_UNREACHABLE;
     }
 
@@ -120,13 +119,17 @@ public:
         return Timestamp();
     }
 
+    boost::optional<Timestamp> getOplogNeededForCrashRecovery() const final {
+        return boost::none;
+    }
+
 private:
     typedef StringMap<std::shared_ptr<void>> DataMap;
 
-    mutable stdx::mutex _mutex;
+    mutable Mutex _mutex = MONGO_MAKE_LATCH("EphemeralForTestEngine::_mutex");
     DataMap _dataMap;  // All actual data is owned in here
 
     // Notified when we write as everything is considered "journalled" since repl depends on it.
     JournalListener* _journalListener = &NoOpJournalListener::instance;
 };
-}
+}  // namespace mongo

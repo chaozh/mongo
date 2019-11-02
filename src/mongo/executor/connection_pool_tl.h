@@ -48,14 +48,21 @@ public:
 
     TLTypeFactory(transport::ReactorHandle reactor,
                   transport::TransportLayer* tl,
-                  std::unique_ptr<NetworkConnectionHook> onConnectHook)
-        : _reactor(std::move(reactor)), _tl(tl), _onConnectHook(std::move(onConnectHook)) {}
+                  std::unique_ptr<NetworkConnectionHook> onConnectHook,
+                  const ConnectionPool::Options& connPoolOptions)
+        : _executor(std::move(reactor)),
+          _tl(tl),
+          _onConnectHook(std::move(onConnectHook)),
+          _connPoolOptions(connPoolOptions) {}
 
     std::shared_ptr<ConnectionPool::ConnectionInterface> makeConnection(
         const HostAndPort& hostAndPort,
         transport::ConnectSSLMode sslMode,
         size_t generation) override;
     std::shared_ptr<ConnectionPool::TimerInterface> makeTimer() override;
+    const std::shared_ptr<OutOfLineExecutor>& getExecutor() override {
+        return _executor;
+    }
 
     Date_t now() override;
 
@@ -65,11 +72,14 @@ public:
     void release(Type* type);
 
 private:
-    transport::ReactorHandle _reactor;
+    auto reactor();
+
+    std::shared_ptr<OutOfLineExecutor> _executor;  // This is always a transport::Reactor
     transport::TransportLayer* _tl;
     std::unique_ptr<NetworkConnectionHook> _onConnectHook;
+    const ConnectionPool::Options _connPoolOptions;
 
-    mutable stdx::mutex _mutex;
+    mutable Mutex _mutex = MONGO_MAKE_LATCH("TLTypeFactory::_mutex");
     AtomicWord<bool> _inShutdown{false};
     stdx::unordered_set<Type*> _collars;
 };
@@ -77,7 +87,8 @@ private:
 class TLTypeFactory::Type : public std::enable_shared_from_this<TLTypeFactory::Type> {
     friend class TLTypeFactory;
 
-    MONGO_DISALLOW_COPYING(Type);
+    Type(const Type&) = delete;
+    Type& operator=(const Type&) = delete;
 
 public:
     explicit Type(const std::shared_ptr<TLTypeFactory>& factory);
@@ -126,12 +137,14 @@ public:
                  HostAndPort peer,
                  transport::ConnectSSLMode sslMode,
                  size_t generation,
-                 NetworkConnectionHook* onConnectHook)
+                 NetworkConnectionHook* onConnectHook,
+                 bool skipAuth)
         : ConnectionInterface(generation),
           TLTypeFactory::Type(factory),
           _reactor(reactor),
           _serviceContext(serviceContext),
           _timer(factory->makeTimer()),
+          _skipAuth(skipAuth),
           _peer(std::move(peer)),
           _sslMode(sslMode),
           _onConnectHook(onConnectHook) {}
@@ -161,6 +174,7 @@ private:
     transport::ReactorHandle _reactor;
     ServiceContext* const _serviceContext;
     std::shared_ptr<ConnectionPool::TimerInterface> _timer;
+    const bool _skipAuth;
 
     HostAndPort _peer;
     transport::ConnectSSLMode _sslMode;
@@ -168,6 +182,6 @@ private:
     AsyncDBClient::Handle _client;
 };
 
-}  // namespace connection_pool_asio
+}  // namespace connection_pool_tl
 }  // namespace executor
 }  // namespace mongo

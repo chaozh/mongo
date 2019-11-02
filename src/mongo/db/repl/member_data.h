@@ -30,6 +30,7 @@
 #pragma once
 
 #include "mongo/bson/timestamp.h"
+#include "mongo/db/repl/member_id.h"
 #include "mongo/db/repl/member_state.h"
 #include "mongo/db/repl/repl_set_heartbeat_response.h"
 #include "mongo/util/time_support.h"
@@ -108,6 +109,13 @@ public:
         return _lastDurableOpTime;
     }
 
+    Date_t getLastAppliedWallTime() const {
+        return _lastAppliedWallTime;
+    }
+    Date_t getLastDurableWallTime() const {
+        return _lastDurableWallTime;
+    }
+
     // When was the last time this data was updated via any means?
     Date_t getLastUpdate() const {
         return _lastUpdate;
@@ -122,7 +130,7 @@ public:
         return _configIndex;
     }
 
-    int getMemberId() const {
+    MemberId getMemberId() const {
         return _memberId;
     }
 
@@ -165,29 +173,34 @@ public:
     }
 
     /**
-     * Sets the last applied op time (not the heartbeat applied op time) and updates the
-     * lastUpdate time.
+     * Performs setLastAppliedOpTime and also sets the wall clock time corresponding to the last
+     * applied opTime. Should only be used on the current node.
      */
-    void setLastAppliedOpTime(OpTime opTime, Date_t now);
+    void setLastAppliedOpTimeAndWallTime(OpTimeAndWallTime opTime, Date_t now);
 
     /**
-     * Sets the last durable op time (not the heartbeat durable op time)
+     * Performs setLastDurableOpTime and also sets the wall clock time corresponding to the last
+     * durable opTime. Should only be used on the current node.
      */
-    void setLastDurableOpTime(OpTime opTime, Date_t now);
+    void setLastDurableOpTimeAndWallTime(OpTimeAndWallTime opTime, Date_t now);
 
     /**
      * Sets the last applied op time (not the heartbeat applied op time) iff the new optime is
      * later than the current optime, and updates the lastUpdate time.  Returns true if the
      * optime was advanced.
+     * Performs advanceLastAppliedOpTime and also sets the wall clock time corresponding to the last
+     * applied opTime. Should only be used on the current node.
      */
-    bool advanceLastAppliedOpTime(OpTime opTime, Date_t now);
+    bool advanceLastAppliedOpTimeAndWallTime(OpTimeAndWallTime opTime, Date_t now);
 
     /**
      * Sets the last durable op time (not the heartbeat applied op time) iff the new optime is
      * later than the current optime, and updates the lastUpdate time.  Returns true if the
      * optime was advanced.
+     * Performs advanceLastDurableOpTime and also sets the wall clock time corresponding to the last
+     * durable opTime. Should only be used on the current node.
      */
-    bool advanceLastDurableOpTime(OpTime opTime, Date_t now);
+    bool advanceLastDurableOpTimeAndWallTime(OpTimeAndWallTime opTime, Date_t now);
 
     /*
      * Indicates that this data is stale, based on _lastUpdateTime.
@@ -216,11 +229,12 @@ public:
         _hostAndPort = hostAndPort;
     }
 
-    void setMemberId(int memberId) {
+    void setMemberId(MemberId memberId) {
         _memberId = memberId;
     }
 
 private:
+    bool _checkAndSetLastDurableOpTime(OpTime opTime, Date_t now);
     // -1 = not checked yet, 0 = member is down/unreachable, 1 = member is up
     int _health;
 
@@ -253,9 +267,11 @@ private:
 
     // Last known OpTime that the replica has applied and journaled to.
     OpTime _lastDurableOpTime;
+    Date_t _lastDurableWallTime = Date_t();
 
     // Last known OpTime that the replica has applied, whether journaled or unjournaled.
     OpTime _lastAppliedOpTime;
+    Date_t _lastAppliedWallTime = Date_t();
 
     // TODO(russotto): Since memberData is kept in config order, _configIndex
     // and _isSelf may not be necessary.
@@ -267,7 +283,7 @@ private:
 
     // This member's member ID.  memberId and hostAndPort duplicate information in the
     // set's ReplSetConfig.
-    int _memberId = -1;
+    MemberId _memberId;
 
     // Client address of this member.
     HostAndPort _hostAndPort;

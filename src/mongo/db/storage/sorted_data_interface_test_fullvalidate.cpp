@@ -56,7 +56,7 @@ TEST(SortedDataInterface, FullValidate) {
             WriteUnitOfWork uow(opCtx.get());
             BSONObj key = BSON("" << i);
             RecordId loc(42, i * 2);
-            ASSERT_OK(sorted->insert(opCtx.get(), key, loc, true));
+            ASSERT_OK(sorted->insert(opCtx.get(), makeKeyString(sorted.get(), key, loc), true));
             uow.commit();
         }
     }
@@ -69,7 +69,7 @@ TEST(SortedDataInterface, FullValidate) {
     {
         long long numKeysOut;
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
-        sorted->fullValidate(opCtx.get(), &numKeysOut, NULL);
+        sorted->fullValidate(opCtx.get(), &numKeysOut, nullptr);
         // fullValidate() can set numKeysOut as the number of existing keys or -1.
         ASSERT(numKeysOut == nToInsert || numKeysOut == -1);
     }

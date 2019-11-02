@@ -39,13 +39,14 @@
 namespace mongo {
 namespace {
 
-void aggregateResults(const std::vector<AsyncRequestsSender::Response>& responses,
+void aggregateResults(int scale,
+                      const std::vector<AsyncRequestsSender::Response>& responses,
                       BSONObjBuilder& output) {
     long long objects = 0;
     long long unscaledDataSize = 0;
     long long dataSize = 0;
     long long storageSize = 0;
-    long long numExtents = 0;
+    long long totalSize = 0;
     long long indexes = 0;
     long long indexSize = 0;
     long long fileSize = 0;
@@ -58,7 +59,7 @@ void aggregateResults(const std::vector<AsyncRequestsSender::Response>& response
         unscaledDataSize += b["avgObjSize"].numberLong() * b["objects"].numberLong();
         dataSize += b["dataSize"].numberLong();
         storageSize += b["storageSize"].numberLong();
-        numExtents += b["numExtents"].numberLong();
+        totalSize += b["totalSize"].numberLong();
         indexes += b["indexes"].numberLong();
         indexSize += b["indexSize"].numberLong();
         fileSize += b["fileSize"].numberLong();
@@ -72,9 +73,10 @@ void aggregateResults(const std::vector<AsyncRequestsSender::Response>& response
     output.append("avgObjSize", objects == 0 ? 0 : double(unscaledDataSize) / double(objects));
     output.appendNumber("dataSize", dataSize);
     output.appendNumber("storageSize", storageSize);
-    output.appendNumber("numExtents", numExtents);
+    output.appendNumber("totalSize", totalSize);
     output.appendNumber("indexes", indexes);
     output.appendNumber("indexSize", indexSize);
+    output.appendNumber("scaleFactor", scale);
     output.appendNumber("fileSize", fileSize);
 }
 
@@ -107,6 +109,18 @@ public:
                    const BSONObj& cmdObj,
                    std::string& errmsg,
                    BSONObjBuilder& output) override {
+        int scale = 1;
+        if (cmdObj["scale"].isNumber()) {
+            scale = cmdObj["scale"].numberInt();
+            if (scale <= 0) {
+                errmsg = "scale has to be > 0";
+                return false;
+            }
+        } else if (cmdObj["scale"].trueValue()) {
+            errmsg = "scale has to be a number > 0";
+            return false;
+        }
+
         auto shardResponses = scatterGatherUnversionedTargetAllShards(
             opCtx,
             dbName,
@@ -117,7 +131,7 @@ public:
             return false;
         }
 
-        aggregateResults(shardResponses, output);
+        aggregateResults(scale, shardResponses, output);
         return true;
     }
 

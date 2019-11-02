@@ -35,6 +35,7 @@
 
 #include <algorithm>
 #include <math.h>
+#include <memory>
 
 #include "mongo/base/owned_pointer_vector.h"
 #include "mongo/db/catalog/collection.h"
@@ -43,12 +44,12 @@
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/exec/scoped_timer.h"
 #include "mongo/db/exec/working_set_common.h"
+#include "mongo/db/query/collection_query_info.h"
 #include "mongo/db/query/explain.h"
 #include "mongo/db/query/plan_cache.h"
 #include "mongo/db/query/plan_ranker.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -56,7 +57,6 @@ using std::endl;
 using std::list;
 using std::unique_ptr;
 using std::vector;
-using stdx::make_unique;
 
 // static
 const char* MultiPlanStage::kStageType = "MULTI_PLAN";
@@ -75,10 +75,10 @@ MultiPlanStage::MultiPlanStage(OperationContext* opCtx,
       _statusMemberId(WorkingSet::INVALID_ID) {}
 
 void MultiPlanStage::addPlan(std::unique_ptr<QuerySolution> solution,
-                             PlanStage* root,
+                             std::unique_ptr<PlanStage> root,
                              WorkingSet* ws) {
-    _candidates.push_back(CandidatePlan(std::move(solution), root, ws));
-    _children.emplace_back(root);
+    _children.emplace_back(std::move(root));
+    _candidates.push_back(CandidatePlan(std::move(solution), _children.back().get(), ws));
 }
 
 bool MultiPlanStage::isEOF() {
@@ -126,7 +126,10 @@ PlanStage::StageState MultiPlanStage::doWork(WorkingSetID* out) {
         // if the best solution fails. Alternatively we could try to
         // defer cache insertion to be after the first produced result.
 
-        collection()->infoCache()->getPlanCache()->remove(*_query).transitional_ignore();
+        CollectionQueryInfo::get(collection())
+            .getPlanCache()
+            ->remove(*_query)
+            .transitional_ignore();
 
         _bestPlanIdx = _backupPlanIdx;
         _backupPlanIdx = kNoSuchPlan;
@@ -167,7 +170,7 @@ size_t MultiPlanStage::getTrialPeriodWorks(OperationContext* opCtx, const Collec
     // Run each plan some number of times. This number is at least as great as
     // 'internalQueryPlanEvaluationWorks', but may be larger for big collections.
     size_t numWorks = internalQueryPlanEvaluationWorks.load();
-    if (NULL != collection) {
+    if (nullptr != collection) {
         // For large collections, the number of works is set to be this
         // fraction of the collection size.
         double fraction = internalQueryPlanEvaluationCollFraction;
@@ -220,13 +223,23 @@ Status MultiPlanStage::pickBestPlan(PlanYieldPolicy* yieldPolicy) {
 
     // After picking best plan, ranking will own plan stats from
     // candidate solutions (winner and losers).
-    std::unique_ptr<PlanRankingDecision> ranking(new PlanRankingDecision);
-    _bestPlanIdx = PlanRanker::pickBestPlan(_candidates, ranking.get());
+    auto statusWithRanking = PlanRanker::pickBestPlan(_candidates);
+    if (!statusWithRanking.isOK()) {
+        return statusWithRanking.getStatus();
+    }
+
+    auto ranking = std::move(statusWithRanking.getValue());
+    // Since the status was ok there should be a ranking containing at least one successfully ranked
+    // plan.
+    invariant(ranking);
+    _bestPlanIdx = ranking->candidateOrder[0];
+
     verify(_bestPlanIdx >= 0 && _bestPlanIdx < static_cast<int>(_candidates.size()));
 
-    // Copy candidate order. We will need this to sort candidate stats for explain
-    // after transferring ownership of 'ranking' to plan cache.
+    // Copy candidate order and failed candidates. We will need this to sort candidate stats for
+    // explain after transferring ownership of 'ranking' to plan cache.
     std::vector<size_t> candidateOrder = ranking->candidateOrder;
+    std::vector<size_t> failedCandidates = ranking->failedCandidates;
 
     CandidatePlan& bestCandidate = _candidates[_bestPlanIdx];
     const auto& alreadyProduced = bestCandidate.results;
@@ -238,7 +251,7 @@ Status MultiPlanStage::pickBestPlan(PlanYieldPolicy* yieldPolicy) {
     _backupPlanIdx = kNoSuchPlan;
     if (bestSolution->hasBlockingStage && (0 == alreadyProduced.size())) {
         LOG(5) << "Winner has blocking stage, looking for backup plan...";
-        for (size_t ix = 0; ix < _candidates.size(); ++ix) {
+        for (auto&& ix : candidateOrder) {
             if (!_candidates[ix].solution->hasBlockingStage) {
                 LOG(5) << "Candidate " << ix << " is backup child";
                 _backupPlanIdx = ix;
@@ -269,7 +282,7 @@ Status MultiPlanStage::pickBestPlan(PlanYieldPolicy* yieldPolicy) {
             size_t runnerUpIdx = ranking->candidateOrder[1];
 
             LOG(1) << "Winning plan tied with runner-up. Not caching."
-                   << " ns: " << collection()->ns() << " " << redact(_query->toStringShort())
+                   << " query: " << redact(_query->toStringShort())
                    << " winner score: " << ranking->scores[0]
                    << " winner summary: " << Explain::getPlanSummary(_candidates[winnerIdx].root)
                    << " runner-up score: " << ranking->scores[1] << " runner-up summary: "
@@ -283,7 +296,7 @@ Status MultiPlanStage::pickBestPlan(PlanYieldPolicy* yieldPolicy) {
 
             size_t winnerIdx = ranking->candidateOrder[0];
             LOG(1) << "Winning plan had zero results. Not caching."
-                   << " ns: " << collection()->ns() << " " << redact(_query->toStringShort())
+                   << " query: " << redact(_query->toStringShort())
                    << " winner score: " << ranking->scores[0]
                    << " winner summary: " << Explain::getPlanSummary(_candidates[winnerIdx].root);
         }
@@ -297,9 +310,11 @@ Status MultiPlanStage::pickBestPlan(PlanYieldPolicy* yieldPolicy) {
         std::vector<QuerySolution*> solutions;
 
         // Generate solutions and ranking decisions sorted by score.
-        for (size_t orderingIndex = 0; orderingIndex < candidateOrder.size(); ++orderingIndex) {
-            // index into candidates/ranking
-            size_t ix = candidateOrder[orderingIndex];
+        for (auto&& ix : candidateOrder) {
+            solutions.push_back(_candidates[ix].solution.get());
+        }
+        // Insert the failed plans in the back.
+        for (auto&& ix : failedCandidates) {
             solutions.push_back(_candidates[ix].solution.get());
         }
 
@@ -308,7 +323,7 @@ Status MultiPlanStage::pickBestPlan(PlanYieldPolicy* yieldPolicy) {
         // XXX: One known example is 2D queries
         bool validSolutions = true;
         for (size_t ix = 0; ix < solutions.size(); ++ix) {
-            if (NULL == solutions[ix]->cacheData.get()) {
+            if (nullptr == solutions[ix]->cacheData.get()) {
                 LOG(5) << "Not caching query because this solution has no cache data: "
                        << redact(solutions[ix]->toString());
                 validSolutions = false;
@@ -317,9 +332,8 @@ Status MultiPlanStage::pickBestPlan(PlanYieldPolicy* yieldPolicy) {
         }
 
         if (validSolutions) {
-            collection()
-                ->infoCache()
-                ->getPlanCache()
+            CollectionQueryInfo::get(collection())
+                .getPlanCache()
                 ->set(*_query,
                       solutions,
                       std::move(ranking),
@@ -414,15 +428,16 @@ int MultiPlanStage::bestPlanIdx() const {
 
 QuerySolution* MultiPlanStage::bestSolution() {
     if (_bestPlanIdx == kNoSuchPlan)
-        return NULL;
+        return nullptr;
 
     return _candidates[_bestPlanIdx].solution.get();
 }
 
 unique_ptr<PlanStageStats> MultiPlanStage::getStats() {
     _commonStats.isEOF = isEOF();
-    unique_ptr<PlanStageStats> ret = make_unique<PlanStageStats>(_commonStats, STAGE_MULTI_PLAN);
-    ret->specific = make_unique<MultiPlanStats>(_specificStats);
+    unique_ptr<PlanStageStats> ret =
+        std::make_unique<PlanStageStats>(_commonStats, STAGE_MULTI_PLAN);
+    ret->specific = std::make_unique<MultiPlanStats>(_specificStats);
     for (auto&& child : _children) {
         ret->children.emplace_back(child->getStats());
     }

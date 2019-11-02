@@ -38,9 +38,14 @@
 #include <string>
 #include <vector>
 
+#include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/catalog/collection_options.h"
+#include "mongo/db/catalog/index_catalog.h"
+#include "mongo/db/catalog_raii.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/commands/map_reduce_gen.h"
+#include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/json.h"
 #include "mongo/db/op_observer_noop.h"
@@ -74,25 +79,21 @@ void _compareOutputOptionField(const std::string& dbname,
     if (actual == expected)
         return;
     FAIL(str::stream() << "parseOutputOptions(\"" << dbname << ", " << cmdObjStr << "): "
-                       << fieldName
-                       << ": Expected: "
-                       << expected
-                       << ". Actual: "
-                       << actual);
+                       << fieldName << ": Expected: " << expected << ". Actual: " << actual);
 }
 
 /**
- * Returns string representation of mr::Config::OutputType
+ * Returns string representation of OutputType
  */
-std::string _getOutTypeString(mr::Config::OutputType outType) {
+std::string _getOutTypeString(OutputType outType) {
     switch (outType) {
-        case mr::Config::REPLACE:
+        case OutputType::Replace:
             return "REPLACE";
-        case mr::Config::MERGE:
+        case OutputType::Merge:
             return "MERGE";
-        case mr::Config::REDUCE:
+        case OutputType::Reduce:
             return "REDUCE";
-        case mr::Config::INMEMORY:
+        case OutputType::InMemory:
             return "INMEMORY";
     }
     MONGO_UNREACHABLE;
@@ -107,9 +108,10 @@ void _testConfigParseOutputOptions(const std::string& dbname,
                                    const std::string& expectedCollectionName,
                                    const std::string& expectedFinalNamespace,
                                    bool expectedOutNonAtomic,
-                                   mr::Config::OutputType expectedOutType) {
+                                   OutputType expectedOutType) {
     const BSONObj cmdObj = fromjson(cmdObjStr);
-    mr::Config::OutputOptions outputOptions = mr::Config::parseOutputOptions(dbname, cmdObj);
+    map_reduce_common::OutputOptions outputOptions =
+        map_reduce_common::parseOutputOptions(dbname, cmdObj);
     _compareOutputOptionField(dbname, cmdObjStr, "outDb", outputOptions.outDB, expectedOutDb);
     _compareOutputOptionField(
         dbname, cmdObjStr, "collectionName", outputOptions.collectionName, expectedCollectionName);
@@ -128,33 +130,34 @@ void _testConfigParseOutputOptions(const std::string& dbname,
 }
 
 /**
- * Tests for mr::Config::parseOutputOptions.
+ * Tests for map_reduce_common::parseOutputOptions.
  */
 TEST(ConfigOutputOptionsTest, parseOutputOptions) {
     // Missing 'out' field.
-    ASSERT_THROWS(mr::Config::parseOutputOptions("mydb", fromjson("{}")), AssertionException);
+    ASSERT_THROWS(map_reduce_common::parseOutputOptions("mydb", fromjson("{}")),
+                  AssertionException);
     // 'out' must be either string or object.
-    ASSERT_THROWS(mr::Config::parseOutputOptions("mydb", fromjson("{out: 99}")),
+    ASSERT_THROWS(map_reduce_common::parseOutputOptions("mydb", fromjson("{out: 99}")),
                   AssertionException);
     // 'out.nonAtomic' is not supported with normal, replace or inline.
-    ASSERT_THROWS(mr::Config::parseOutputOptions(
+    ASSERT_THROWS(map_reduce_common::parseOutputOptions(
                       "mydb", fromjson("{out: {normal: 'mycoll', nonAtomic: true}}")),
                   AssertionException);
-    ASSERT_THROWS(mr::Config::parseOutputOptions(
+    ASSERT_THROWS(map_reduce_common::parseOutputOptions(
                       "mydb", fromjson("{out: {replace: 'mycoll', nonAtomic: true}}")),
                   AssertionException);
-    ASSERT_THROWS(mr::Config::parseOutputOptions(
+    ASSERT_THROWS(map_reduce_common::parseOutputOptions(
                       "mydb", fromjson("{out: {inline: 'mycoll', nonAtomic: true}}")),
                   AssertionException);
     // Unknown output specifer.
-    ASSERT_THROWS(
-        mr::Config::parseOutputOptions("mydb", fromjson("{out: {no_such_out_type: 'mycoll'}}")),
-        AssertionException);
+    ASSERT_THROWS(map_reduce_common::parseOutputOptions(
+                      "mydb", fromjson("{out: {no_such_out_type: 'mycoll'}}")),
+                  AssertionException);
 
 
     // 'out' is string.
     _testConfigParseOutputOptions(
-        "mydb", "{out: 'mycoll'}", "", "mycoll", "mydb.mycoll", false, mr::Config::REPLACE);
+        "mydb", "{out: 'mycoll'}", "", "mycoll", "mydb.mycoll", false, OutputType::Replace);
     // 'out' is object.
     _testConfigParseOutputOptions("mydb",
                                   "{out: {normal: 'mycoll'}}",
@@ -162,7 +165,7 @@ TEST(ConfigOutputOptionsTest, parseOutputOptions) {
                                   "mycoll",
                                   "mydb.mycoll",
                                   false,
-                                  mr::Config::REPLACE);
+                                  OutputType::Replace);
     // 'out.db' overrides dbname parameter
     _testConfigParseOutputOptions("mydb1",
                                   "{out: {replace: 'mycoll', db: 'mydb2'}}",
@@ -170,7 +173,7 @@ TEST(ConfigOutputOptionsTest, parseOutputOptions) {
                                   "mycoll",
                                   "mydb2.mycoll",
                                   false,
-                                  mr::Config::REPLACE);
+                                  OutputType::Replace);
     // 'out.nonAtomic' is supported with merge and reduce.
     _testConfigParseOutputOptions("mydb",
                                   "{out: {merge: 'mycoll', nonAtomic: true}}",
@@ -178,14 +181,14 @@ TEST(ConfigOutputOptionsTest, parseOutputOptions) {
                                   "mycoll",
                                   "mydb.mycoll",
                                   true,
-                                  mr::Config::MERGE);
+                                  OutputType::Merge);
     _testConfigParseOutputOptions("mydb",
                                   "{out: {reduce: 'mycoll', nonAtomic: true}}",
                                   "",
                                   "mycoll",
                                   "mydb.mycoll",
                                   true,
-                                  mr::Config::REDUCE);
+                                  OutputType::Reduce);
     // inline
     _testConfigParseOutputOptions("mydb1",
                                   "{out: {inline: 'mycoll', db: 'mydb2'}}",
@@ -193,7 +196,7 @@ TEST(ConfigOutputOptionsTest, parseOutputOptions) {
                                   "",
                                   "",
                                   false,
-                                  mr::Config::INMEMORY);
+                                  OutputType::InMemory);
 
     // Order should not matter in fields of 'out' object.
     _testConfigParseOutputOptions("mydb1",
@@ -202,35 +205,35 @@ TEST(ConfigOutputOptionsTest, parseOutputOptions) {
                                   "mycoll",
                                   "mydb2.mycoll",
                                   false,
-                                  mr::Config::REPLACE);
+                                  OutputType::Replace);
     _testConfigParseOutputOptions("mydb1",
                                   "{out: {db: 'mydb2', replace: 'mycoll'}}",
                                   "mydb2",
                                   "mycoll",
                                   "mydb2.mycoll",
                                   false,
-                                  mr::Config::REPLACE);
+                                  OutputType::Replace);
     _testConfigParseOutputOptions("mydb1",
                                   "{out: {nonAtomic: true, merge: 'mycoll'}}",
                                   "",
                                   "mycoll",
                                   "mydb1.mycoll",
                                   true,
-                                  mr::Config::MERGE);
+                                  OutputType::Merge);
     _testConfigParseOutputOptions("mydb1",
                                   "{out: {nonAtomic: true, reduce: 'mycoll'}}",
                                   "",
                                   "mycoll",
                                   "mydb1.mycoll",
                                   true,
-                                  mr::Config::REDUCE);
+                                  OutputType::Reduce);
     _testConfigParseOutputOptions("mydb1",
                                   "{out: {db: 'mydb2', inline: 'mycoll'}}",
                                   "mydb2",
                                   "",
                                   "",
                                   false,
-                                  mr::Config::INMEMORY);
+                                  OutputType::InMemory);
 }
 
 TEST(ConfigTest, ParseCollation) {
@@ -278,6 +281,17 @@ TEST(ConfigTest, CollationNotAnObjectFailsToParse) {
 class MapReduceOpObserver : public OpObserverNoop {
 public:
     /**
+     * This function is called whenever mapReduce copies indexes from an existing output collection
+     * to a temporary collection.
+     */
+    void onStartIndexBuild(OperationContext* opCtx,
+                           const NamespaceString& nss,
+                           CollectionUUID collUUID,
+                           const UUID& indexBuildUUID,
+                           const std::vector<BSONObj>& indexes,
+                           bool fromMigrate) override;
+
+    /**
      * This function is called whenever mapReduce inserts documents into a temporary output
      * collection.
      */
@@ -308,11 +322,27 @@ public:
     // while mapReduce inserts its results into the temporary output collection.
     std::function<void()> onInsertsFn = [] {};
 
+    // Holds indexes copied from existing output collection to the temporary collections.
+    std::vector<BSONObj> indexesCreated;
+
     // Holds namespaces of temporary collections created by mapReduce.
     std::vector<NamespaceString> tempNamespaces;
 
     const repl::OpTime dropOpTime = {Timestamp(Seconds(100), 1U), 1LL};
 };
+
+/**
+ * This function is called whenever mapReduce copies indexes from an existing output collection
+ * to a temporary collection.
+ */
+void MapReduceOpObserver::onStartIndexBuild(OperationContext* opCtx,
+                                            const NamespaceString& nss,
+                                            CollectionUUID collUUID,
+                                            const UUID& indexBuildUUID,
+                                            const std::vector<BSONObj>& indexes,
+                                            bool fromMigrate) {
+    indexesCreated = indexes;
+}
 
 void MapReduceOpObserver::onInserts(OperationContext* opCtx,
                                     const NamespaceString& nss,
@@ -405,7 +435,7 @@ void MapReduceCommandTest::setUp() {
 
     repl::DropPendingCollectionReaper::set(
         service,
-        stdx::make_unique<repl::DropPendingCollectionReaper>(repl::StorageInterface::get(service)));
+        std::make_unique<repl::DropPendingCollectionReaper>(repl::StorageInterface::get(service)));
 
     // Set up an OpObserver to track the temporary collections mapReduce creates.
     auto opObserver = std::make_unique<MapReduceOpObserver>();
@@ -519,6 +549,48 @@ TEST_F(MapReduceCommandTest, PrimaryStepDownPreventsTemporaryCollectionDrops) {
         ASSERT_OK(_storage.getCollectionCount(_opCtx.get(), tempNss).getStatus())
             << "missing mapReduce temporary collection: " << tempNss;
     }
+}
+
+TEST_F(MapReduceCommandTest, ReplacingExistingOutputCollectionPreservesIndexes) {
+    CollectionOptions options;
+    options.uuid = UUID::gen();
+    ASSERT_OK(_storage.createCollection(_opCtx.get(), outputNss, options));
+
+    // Create an index in the existing output collection. This should be present in the recreated
+    // output collection.
+    auto indexSpec = BSON("v" << 2 << "key" << BSON("a" << 1) << "name"
+                              << "a_1");
+    {
+        AutoGetCollection autoColl(_opCtx.get(), outputNss, MODE_IX);
+        auto coll = autoColl.getCollection();
+        ASSERT(coll);
+        auto indexCatalog = coll->getIndexCatalog();
+        writeConflictRetry(
+            _opCtx.get(), "ReplacingExistingOutputCollectionPreservesIndexes", outputNss.ns(), [&] {
+                WriteUnitOfWork wuow(_opCtx.get());
+                ASSERT_OK(indexCatalog->createIndexOnEmptyCollection(_opCtx.get(), indexSpec));
+                wuow.commit();
+            });
+    }
+
+    auto sourceDoc = BSON("_id" << 0);
+    ASSERT_OK(_storage.insertDocument(_opCtx.get(), inputNss, {sourceDoc, Timestamp(0)}, 1LL));
+
+    auto mapCode = "function() { emit(this._id, this._id); }"_sd;
+    auto reduceCode = "function(k, v) { return Array.sum(v); }"_sd;
+    ASSERT_OK(_runCommand(mapCode, reduceCode));
+
+    // MapReduce should filter existing indexes in the temporary collection, such as
+    // the _id index.
+    ASSERT_EQUALS(1U, _opObserver->indexesCreated.size())
+        << BSON("indexesCreated" << _opObserver->indexesCreated);
+    ASSERT_BSONOBJ_EQ(indexSpec, _opObserver->indexesCreated[0]);
+
+    ASSERT_NOT_EQUALS(*options.uuid,
+                      *CollectionCatalog::get(_opCtx.get()).lookupUUIDByNSS(outputNss))
+        << "Output collection " << outputNss << " was not replaced";
+
+    _assertTemporaryCollectionsAreDropped();
 }
 
 }  // namespace

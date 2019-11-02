@@ -34,14 +34,15 @@
 #include "mongo/db/catalog/create_collection.h"
 
 #include "mongo/bson/bsonobj.h"
+#include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/catalog/database_holder.h"
-#include "mongo/db/catalog/uuid_catalog.h"
 #include "mongo/db/command_generic_argument.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/op_observer.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/ops/insert.h"
 #include "mongo/db/repl/replication_coordinator.h"
@@ -50,6 +51,85 @@
 
 namespace mongo {
 namespace {
+
+Status _createView(OperationContext* opCtx,
+                   const NamespaceString& nss,
+                   const CollectionOptions& collectionOptions,
+                   const BSONObj& idIndex) {
+    return writeConflictRetry(opCtx, "create", nss.ns(), [&] {
+        AutoGetOrCreateDb autoDb(opCtx, nss.db(), MODE_IX);
+        Lock::CollectionLock collLock(opCtx, nss, MODE_IX);
+        // Operations all lock system.views in the end to prevent deadlock.
+        Lock::CollectionLock systemViewsLock(
+            opCtx,
+            NamespaceString(nss.db(), NamespaceString::kSystemDotViewsCollectionName),
+            MODE_X);
+
+        Database* db = autoDb.getDb();
+
+        AutoStatsTracker statsTracker(opCtx,
+                                      nss,
+                                      Top::LockType::NotLocked,
+                                      AutoStatsTracker::LogMode::kUpdateTopAndCurop,
+                                      db->getProfilingLevel());
+
+        if (opCtx->writesAreReplicated() &&
+            !repl::ReplicationCoordinator::get(opCtx)->canAcceptWritesFor(opCtx, nss)) {
+            return Status(ErrorCodes::NotMaster,
+                          str::stream() << "Not primary while creating collection " << nss);
+        }
+
+        // Create 'system.views' in a separate WUOW if it does not exist.
+        WriteUnitOfWork wuow(opCtx);
+        Collection* coll = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(
+            NamespaceString(db->getSystemViewsName()));
+        if (!coll) {
+            coll = db->createCollection(opCtx, NamespaceString(db->getSystemViewsName()));
+        }
+        invariant(coll);
+        wuow.commit();
+
+        WriteUnitOfWork wunit(opCtx);
+        Status status = db->userCreateNS(opCtx, nss, collectionOptions, true, idIndex);
+        if (!status.isOK()) {
+            return status;
+        }
+        wunit.commit();
+
+        return Status::OK();
+    });
+}
+
+Status _createCollection(OperationContext* opCtx,
+                         const NamespaceString& nss,
+                         const CollectionOptions& collectionOptions,
+                         const BSONObj& idIndex) {
+    return writeConflictRetry(opCtx, "create", nss.ns(), [&] {
+        AutoGetOrCreateDb autoDb(opCtx, nss.db(), MODE_IX);
+        Lock::CollectionLock collLock(opCtx, nss, MODE_X);
+
+        AutoStatsTracker statsTracker(opCtx,
+                                      nss,
+                                      Top::LockType::NotLocked,
+                                      AutoStatsTracker::LogMode::kUpdateTopAndCurop,
+                                      autoDb.getDb()->getProfilingLevel());
+
+        if (opCtx->writesAreReplicated() &&
+            !repl::ReplicationCoordinator::get(opCtx)->canAcceptWritesFor(opCtx, nss)) {
+            return Status(ErrorCodes::NotMaster,
+                          str::stream() << "Not primary while creating collection " << nss);
+        }
+
+        WriteUnitOfWork wunit(opCtx);
+        Status status = autoDb.getDb()->userCreateNS(opCtx, nss, collectionOptions, true, idIndex);
+        if (!status.isOK()) {
+            return status;
+        }
+        wunit.commit();
+
+        return Status::OK();
+    });
+}
 
 /**
  * Shared part of the implementation of the createCollection versions for replicated and regular
@@ -86,52 +166,24 @@ Status createCollection(OperationContext* opCtx,
     BSONObj options = optionsBuilder.obj();
     uassert(14832,
             "specify size:<n> when capped is true",
-            !options["capped"].trueValue() || options["size"].isNumber() ||
-                options.hasField("$nExtents"));
+            !options["capped"].trueValue() || options["size"].isNumber());
 
     CollectionOptions collectionOptions;
     {
-        Status status = collectionOptions.parse(options, kind);
-        if (!status.isOK()) {
-            return status;
+        StatusWith<CollectionOptions> statusWith = CollectionOptions::parse(options, kind);
+        if (!statusWith.isOK()) {
+            return statusWith.getStatus();
         }
+        collectionOptions = statusWith.getValue();
     }
 
-    return writeConflictRetry(opCtx, "create", nss.ns(), [&] {
-        Lock::DBLock dbXLock(opCtx, nss.db(), MODE_X);
-
-        const bool shardVersionCheck = true;
-        OldClientContext ctx(opCtx, nss.ns(), shardVersionCheck);
-
-        if (opCtx->writesAreReplicated() &&
-            !repl::ReplicationCoordinator::get(opCtx)->canAcceptWritesFor(opCtx, nss)) {
-            return Status(ErrorCodes::NotMaster,
-                          str::stream() << "Not primary while creating collection " << nss);
-        }
-
-        if (collectionOptions.isView()) {
-            // If the `system.views` collection does not exist, create it in a separate
-            // WriteUnitOfWork.
-            WriteUnitOfWork wuow(opCtx);
-            ctx.db()->getOrCreateCollection(opCtx, NamespaceString(ctx.db()->getSystemViewsName()));
-            wuow.commit();
-        }
-
-        WriteUnitOfWork wunit(opCtx);
-
-        // Create collection.
-        const bool createDefaultIndexes = true;
-        Status status =
-            ctx.db()->userCreateNS(opCtx, nss, collectionOptions, createDefaultIndexes, idIndex);
-        if (!status.isOK()) {
-            return status;
-        }
-
-        wunit.commit();
-
-        return Status::OK();
-    });
+    if (collectionOptions.isView()) {
+        return _createView(opCtx, nss, collectionOptions, idIndex);
+    } else {
+        return _createCollection(opCtx, nss, collectionOptions, idIndex);
+    }
 }
+
 }  // namespace
 
 Status createCollection(OperationContext* opCtx,
@@ -147,10 +199,10 @@ Status createCollection(OperationContext* opCtx,
 
 Status createCollectionForApplyOps(OperationContext* opCtx,
                                    const std::string& dbName,
-                                   const BSONElement& ui,
+                                   const OptionalCollectionUUID& ui,
                                    const BSONObj& cmdObj,
                                    const BSONObj& idIndex) {
-    invariant(opCtx->lockState()->isDbLockedForMode(dbName, MODE_X));
+    invariant(opCtx->lockState()->isDbLockedForMode(dbName, MODE_IX));
 
     const NamespaceString newCollName(CommandHelpers::parseNsCollectionRequired(dbName, cmdObj));
     auto newCmd = cmdObj;
@@ -164,36 +216,34 @@ Status createCollectionForApplyOps(OperationContext* opCtx,
     // We need to do the renaming part in a separate transaction, as we cannot transactionally
     // create a database on MMAPv1, which could result in createCollection failing if the database
     // does not yet exist.
-    if (ui.ok()) {
+    if (ui) {
         // Return an optional, indicating whether we need to early return (if the collection already
         // exists, or in case of an error).
         using Result = boost::optional<Status>;
         auto result =
             writeConflictRetry(opCtx, "createCollectionForApplyOps", newCollName.ns(), [&] {
                 WriteUnitOfWork wunit(opCtx);
-                // Options need the field to be named "uuid", so parse/recreate.
-                auto uuid = uassertStatusOK(UUID::parse(ui));
+                auto uuid = ui.get();
                 uassert(ErrorCodes::InvalidUUID,
                         "Invalid UUID in applyOps create command: " + uuid.toString(),
                         uuid.isRFC4122v4());
 
-                auto& catalog = UUIDCatalog::get(opCtx);
+                auto& catalog = CollectionCatalog::get(opCtx);
                 const auto currentName = catalog.lookupNSSByUUID(uuid);
                 auto serviceContext = opCtx->getServiceContext();
                 auto opObserver = serviceContext->getOpObserver();
-                if (currentName == newCollName)
+                if (currentName && *currentName == newCollName)
                     return Result(Status::OK());
 
-                if (currentName.isDropPendingNamespace()) {
+                if (currentName && currentName->isDropPendingNamespace()) {
                     log() << "CMD: create " << newCollName
                           << " - existing collection with conflicting UUID " << uuid
-                          << " is in a drop-pending state: " << currentName;
+                          << " is in a drop-pending state: " << *currentName;
                     return Result(Status(ErrorCodes::NamespaceExists,
-                                         str::stream() << "existing collection "
-                                                       << currentName.toString()
-                                                       << " with conflicting UUID "
-                                                       << uuid.toString()
-                                                       << " is in a drop-pending state."));
+                                         str::stream()
+                                             << "existing collection " << currentName->toString()
+                                             << " with conflicting UUID " << uuid.toString()
+                                             << " is in a drop-pending state."));
                 }
 
                 // In the case of oplog replay, a future command may have created or renamed a
@@ -205,7 +255,11 @@ Status createCollectionForApplyOps(OperationContext* opCtx,
                 // of the initial sync or result in rollback to fassert, requiring a resync of that
                 // node.
                 const bool stayTemp = true;
-                if (auto futureColl = db ? db->getCollection(opCtx, newCollName) : nullptr) {
+                auto futureColl = db
+                    ? CollectionCatalog::get(opCtx).lookupCollectionByNamespace(newCollName)
+                    : nullptr;
+                bool needsRenaming = static_cast<bool>(futureColl);
+                for (int tries = 0; needsRenaming && tries < 10; ++tries) {
                     auto tmpNameResult =
                         db->makeUniqueCollectionNamespace(opCtx, "tmp%%%%%.create");
                     if (!tmpNameResult.isOK()) {
@@ -215,13 +269,19 @@ Status createCollectionForApplyOps(OperationContext* opCtx,
                                              "create command: collection: "
                                           << newCollName));
                     }
+
                     const auto& tmpName = tmpNameResult.getValue();
+                    AutoGetCollection tmpCollLock(opCtx, tmpName, LockMode::MODE_X);
+                    if (tmpCollLock.getCollection()) {
+                        // Conflicting on generating a unique temp collection name. Try again.
+                        continue;
+                    }
+
                     // It is ok to log this because this doesn't happen very frequently.
                     log() << "CMD: create " << newCollName
                           << " - renaming existing collection with conflicting UUID " << uuid
                           << " to temporary collection " << tmpName;
-                    Status status =
-                        db->renameCollection(opCtx, newCollName.ns(), tmpName.ns(), stayTemp);
+                    Status status = db->renameCollection(opCtx, newCollName, tmpName, stayTemp);
                     if (!status.isOK())
                         return Result(status);
                     opObserver->onRenameCollection(opCtx,
@@ -231,20 +291,30 @@ Status createCollectionForApplyOps(OperationContext* opCtx,
                                                    /*dropTargetUUID*/ {},
                                                    /*numRecords*/ 0U,
                                                    stayTemp);
+                    // The existing collection has been successfully moved out of the way.
+                    needsRenaming = false;
+                }
+                if (needsRenaming) {
+                    return Result(Status(ErrorCodes::NamespaceExists,
+                                         str::stream() << "Cannot generate temporary "
+                                                          "collection namespace for applyOps "
+                                                          "create command: collection: "
+                                                       << newCollName));
                 }
 
                 // If the collection with the requested UUID already exists, but with a different
                 // name, just rename it to 'newCollName'.
                 if (catalog.lookupCollectionByUUID(uuid)) {
+                    invariant(currentName);
                     uassert(40655,
                             str::stream() << "Invalid name " << newCollName << " for UUID " << uuid,
-                            currentName.db() == newCollName.db());
+                            currentName->db() == newCollName.db());
                     Status status =
-                        db->renameCollection(opCtx, currentName.ns(), newCollName.ns(), stayTemp);
+                        db->renameCollection(opCtx, *currentName, newCollName, stayTemp);
                     if (!status.isOK())
                         return Result(status);
                     opObserver->onRenameCollection(opCtx,
-                                                   currentName,
+                                                   *currentName,
                                                    newCollName,
                                                    uuid,
                                                    /*dropTargetUUID*/ {},

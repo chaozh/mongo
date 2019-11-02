@@ -45,9 +45,9 @@ var tearDown = function() {
  * @param isMongos {boolean} true if conn is a mongos connection.
  * @param mode {string} a read preference mode like 'secondary'
  * @param tagSets {Array.<Object>} list of tag sets to use
- * @param secExpected {boolean} true if we expect to run any commands on secondary
+ * @param expectedHost {string} which host should this run on: 'primary', 'secondary', or 'any'
  */
-var testReadPreference = function(conn, hostList, isMongos, mode, tagSets, secExpected) {
+var testReadPreference = function(conn, hostList, isMongos, mode, tagSets, expectedHost) {
     var testDB = conn.getDB('test');
     var adminDB = conn.getDB('admin');
     conn.setSlaveOk(false);  // purely rely on readPref
@@ -85,11 +85,11 @@ var testReadPreference = function(conn, hostList, isMongos, mode, tagSets, secEx
             var result = profileDB.system.profile.findOne(query);
 
             if (result != null) {
-                if (secOk && secExpected) {
+                if (secOk && expectedHost == "secondary") {
                     // The command obeys read prefs and we expect to run
                     // commands on secondaries with this mode and tag sets
                     assert(profileDB.adminCommand({isMaster: 1}).secondary);
-                } else {
+                } else if (expectedHost == "primary") {
                     // The command does not obey read prefs, or we expect to run
                     // commands on primary with this mode or tag sets
                     assert(profileDB.adminCommand({isMaster: 1}).ismaster);
@@ -168,7 +168,7 @@ var testReadPreference = function(conn, hostList, isMongos, mode, tagSets, secEx
     // Run a no-op command and wait for it to be applied on secondaries. Due to the asynchronous
     // completion nature of indexes on secondaries, we can guarantee an index build is complete
     // on all secondaries once all secondaries have applied this collMod command.
-    assert.commandWorked(testDB.runCommand({collMod: 'user', usePowerOf2Sizes: true}));
+    assert.commandWorked(testDB.runCommand({collMod: 'user'}));
     assert.commandWorked(testDB.runCommand({getLastError: 1, w: NODE_COUNT}));
 
     // Mongos doesn't implement geoSearch; test it only with ReplicaSetConnection.
@@ -198,10 +198,7 @@ var testReadPreference = function(conn, hostList, isMongos, mode, tagSets, secEx
             aggregate: 1,
             pipeline: [
                 {$currentOp: {}},
-                {
-                  $lookup:
-                      {from: "dummy", localField: "dummy", foreignField: "dummy", as: "dummy"}
-                }
+                {$lookup: {from: "dummy", localField: "dummy", foreignField: "dummy", as: "dummy"}}
             ],
             comment: curOpComment,
             cursor: {}
@@ -251,39 +248,38 @@ var testBadMode = function(conn, hostList, isMongos, mode, tagSets) {
 };
 
 var testAllModes = function(conn, hostList, isMongos) {
-
     // The primary is tagged with { tag: 'one' } and the secondary with
     // { tag: 'two' } so we can test the interaction of modes and tags. Test
     // a bunch of combinations.
     [
         // mode, tagSets, expectedHost
-        ['primary', undefined, false],
-        ['primary', [], false],
+        ['primary', undefined, "primary"],
+        ['primary', [], "primary"],
 
-        ['primaryPreferred', undefined, false],
-        ['primaryPreferred', [{tag: 'one'}], false],
+        ['primaryPreferred', undefined, "any"],
+        ['primaryPreferred', [{tag: 'one'}], "primary"],
         // Correctly uses primary and ignores the tag
-        ['primaryPreferred', [{tag: 'two'}], false],
+        ['primaryPreferred', [{tag: 'two'}], "any"],
 
-        ['secondary', undefined, true],
-        ['secondary', [{tag: 'two'}], true],
-        ['secondary', [{tag: 'doesntexist'}, {}], true],
-        ['secondary', [{tag: 'doesntexist'}, {tag: 'two'}], true],
+        ['secondary', undefined, "secondary"],
+        ['secondary', [{tag: 'two'}], "secondary"],
+        ['secondary', [{tag: 'doesntexist'}, {}], "secondary"],
+        ['secondary', [{tag: 'doesntexist'}, {tag: 'two'}], "secondary"],
 
-        ['secondaryPreferred', undefined, true],
-        ['secondaryPreferred', [{tag: 'one'}], false],
-        ['secondaryPreferred', [{tag: 'two'}], true],
+        ['secondaryPreferred', undefined, "any"],
+        ['secondaryPreferred', [{tag: 'one'}], "primary"],
+        ['secondaryPreferred', [{tag: 'two'}], "any"],
 
         // We don't have a way to alter ping times so we can't predict where an
         // untagged 'nearest' command should go, hence only test with tags.
-        ['nearest', [{tag: 'one'}], false],
-        ['nearest', [{tag: 'two'}], true]
+        ['nearest', [{tag: 'one'}], "any"],
+        ['nearest', [{tag: 'two'}], "any"]
 
     ].forEach(function(args) {
-        var mode = args[0], tagSets = args[1], secExpected = args[2];
+        var mode = args[0], tagSets = args[1], expectedHost = args[2];
 
         setUp();
-        testReadPreference(conn, hostList, isMongos, mode, tagSets, secExpected);
+        testReadPreference(conn, hostList, isMongos, mode, tagSets, expectedHost);
         tearDown();
     });
 
@@ -327,6 +323,8 @@ rsConfig.members.forEach(function(member) {
         member.tags = PRIMARY_TAG;
     } else {
         member.tags = SECONDARY_TAG;
+        member.priority = 0;
+        member.votes = 0;
     }
 });
 

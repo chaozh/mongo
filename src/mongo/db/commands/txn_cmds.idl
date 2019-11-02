@@ -28,7 +28,6 @@
 global:
     cpp_namespace: "mongo"
 
-
 imports:
     - "mongo/idl/basic_types.idl"
     - "mongo/s/sharding_types.idl"
@@ -48,9 +47,10 @@ structs:
     TxnRecoveryToken:
         description: "Contains info for retrying the commit of a sharded transaction"
         fields:
-            shardId:
+            recoveryShardId:
                 description: "The id of the shard that can make progress committing the transaction"
                 type: shard_id
+                optional: true
 
     CommitTransactionOplogObject:
         description: A document representing the 'o' field of a 'commitTransaction' oplog entry.
@@ -64,23 +64,16 @@ structs:
                 description: "Specifies the timestamp at which the multi-document transaction should
                               be committed.  Required for prepared transactions, not permitted for
                               unprepared ones."
-            prepare:
-                type: bool
+            count:
+                type: long
                 optional: true
-                description: "Set to false for a commit for an unprepared transaction.  Implicit
-                              default is true, do not set explicitly to true"
+                description: "The number of in-transaction operations applied in a transaction.
+                              This field is required only for unprepared transactions."
 
     AbortTransactionOplogObject:
         description: A document representing the 'o' field of an 'abortTransaction' oplog entry.
         fields:
             abortTransaction:
-                type: int
-                default: 1
-
-    PrepareTransactionOplogObject:
-        description: A document representing the 'o' field of a 'prepareTransaction' oplog entry.
-        fields:
-            prepareTransaction:
                 type: int
                 default: 1
 
@@ -99,3 +92,7 @@ commands:
                               progress on commit by processing using the info in the recoveryToken."
                 optional: true
                 type: TxnRecoveryToken
+
+    abortTransaction:
+        description: "abortTransaction Command"
+        namespace: ignored

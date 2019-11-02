@@ -82,7 +82,7 @@ public:
         WorkingSetID invalid = WorkingSet::INVALID_ID;
         ASSERT_NOT_EQUALS(invalid, wsid);
 
-        WorkingSetMember* member = ws.get(wsid);
+        auto member = ws.get(wsid);
 
         // Distinct hack execution is always covered.
         // Key value is retrieved from working set key data
@@ -304,9 +304,9 @@ public:
 // XXX: add a test case with bounds where skipping to the next key gets us a result that's not
 // valid w.r.t. our query.
 
-class All : public Suite {
+class All : public OldStyleSuiteSpecification {
 public:
-    All() : Suite("query_stage_distinct") {}
+    All() : OldStyleSuiteSpecification("query_stage_distinct") {}
 
     void setupTests() {
         add<QueryStageDistinctBasic>();
@@ -315,6 +315,6 @@ public:
     }
 };
 
-SuiteInstance<All> queryStageDistinctAll;
+OldStyleSuiteInitializer<All> queryStageDistinctAll;
 
 }  // namespace QueryStageDistinct

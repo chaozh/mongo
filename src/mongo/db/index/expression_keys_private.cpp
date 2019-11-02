@@ -48,7 +48,7 @@
 #include "mongo/db/query/collation/collation_index_key.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 #include "third_party/s2/s2cell.h"
 #include "third_party/s2/s2regioncoverer.h"
 
@@ -57,28 +57,6 @@ namespace {
 using namespace mongo;
 
 namespace dps = ::mongo::dotted_path_support;
-
-//
-// Helper functions for getHaystackKeys
-//
-
-/**
- * Build a new BSONObj with root in it.  If e is non-empty, append that to the key.
- * Insert the BSONObj into keys.
- * Used by getHaystackKeys.
- */
-void addKey(const string& root, const BSONElement& e, BSONObjSet* keys) {
-    BSONObjBuilder buf;
-    buf.append("", root);
-
-    if (e.eoo())
-        buf.appendNull("");
-    else
-        buf.appendAs(e, "");
-
-    keys->insert(buf.obj());
-}
-
 //
 // Helper functions for getS2Keys
 //
@@ -120,6 +98,29 @@ Status S2GetKeysForElement(const BSONElement& element,
     return Status::OK();
 }
 
+/*
+ * We take the cartesian product of all keys when appending.
+ */
+void appendToS2Keys(const std::vector<KeyString::HeapBuilder>& existingKeys,
+                    std::vector<KeyString::HeapBuilder>* out,
+                    KeyString::Version keyStringVersion,
+                    Ordering ordering,
+                    const std::function<void(KeyString::HeapBuilder&)>& fn) {
+    if (existingKeys.empty()) {
+        /*
+         * This is the base case when the keys for the first field are generated.
+         */
+        out->emplace_back(keyStringVersion, ordering);
+        fn(out->back());
+    }
+    for (const auto& ks : existingKeys) {
+        /*
+         * We copy all of the existing keys and perform 'fn' on each copy.
+         */
+        out->emplace_back(ks);
+        fn(out->back());
+    }
+}
 
 /**
  * Fills 'out' with the S2 keys that should be generated for 'elements' in a 2dsphere index.
@@ -130,7 +131,10 @@ Status S2GetKeysForElement(const BSONElement& element,
 bool getS2GeoKeys(const BSONObj& document,
                   const BSONElementSet& elements,
                   const S2IndexingParams& params,
-                  BSONObjSet* out) {
+                  const std::vector<KeyString::HeapBuilder>& keysToAdd,
+                  std::vector<KeyString::HeapBuilder>* out,
+                  KeyString::Version keyStringVersion,
+                  Ordering ordering) {
     bool everGeneratedMultipleCells = false;
     for (BSONElementSet::iterator i = elements.begin(); i != elements.end(); ++i) {
         vector<S2CellId> cells;
@@ -144,16 +148,17 @@ bool getS2GeoKeys(const BSONObj& document,
                 cells.size() > 0);
 
         for (vector<S2CellId>::const_iterator it = cells.begin(); it != cells.end(); ++it) {
-            out->insert(S2CellIdToIndexKey(*it, params.indexVersion));
+            S2CellIdToIndexKeyStringAppend(
+                *it, params.indexVersion, keysToAdd, out, keyStringVersion, ordering);
         }
 
         everGeneratedMultipleCells = everGeneratedMultipleCells || cells.size() > 1;
     }
 
     if (0 == out->size()) {
-        BSONObjBuilder b;
-        b.appendNull("");
-        out->insert(b.obj());
+        appendToS2Keys(keysToAdd, out, keyStringVersion, ordering, [](KeyString::HeapBuilder& ks) {
+            ks.appendNull();
+        });
     }
     return everGeneratedMultipleCells;
 }
@@ -162,19 +167,32 @@ bool getS2GeoKeys(const BSONObj& document,
  * Fills 'out' with the keys that should be generated for an array value 'obj' in a 2dsphere index.
  * A key is generated for each element of the array value 'obj'.
  */
-void getS2LiteralKeysArray(const BSONObj& obj, const CollatorInterface* collator, BSONObjSet* out) {
+void getS2LiteralKeysArray(const BSONObj& obj,
+                           const CollatorInterface* collator,
+                           const std::vector<KeyString::HeapBuilder>& keysToAdd,
+                           std::vector<KeyString::HeapBuilder>* out,
+                           KeyString::Version keyStringVersion,
+                           Ordering ordering) {
     BSONObjIterator objIt(obj);
     if (!objIt.more()) {
         // Empty arrays are indexed as undefined.
-        BSONObjBuilder b;
-        b.appendUndefined("");
-        out->insert(b.obj());
+        appendToS2Keys(keysToAdd, out, keyStringVersion, ordering, [](KeyString::HeapBuilder& ks) {
+            ks.appendUndefined();
+        });
     } else {
         // Non-empty arrays are exploded.
         while (objIt.more()) {
-            BSONObjBuilder b;
-            CollationIndexKey::collationAwareIndexKeyAppend(objIt.next(), collator, &b);
-            out->insert(b.obj());
+            const auto elem = objIt.next();
+            appendToS2Keys(
+                keysToAdd, out, keyStringVersion, ordering, [&](KeyString::HeapBuilder& ks) {
+                    if (collator) {
+                        ks.appendBSONElement(elem, [&](StringData stringData) {
+                            return collator->getComparisonString(stringData);
+                        });
+                    } else {
+                        ks.appendBSONElement(elem);
+                    }
+                });
         }
     }
 }
@@ -187,15 +205,24 @@ void getS2LiteralKeysArray(const BSONObj& obj, const CollatorInterface* collator
  */
 bool getS2OneLiteralKey(const BSONElement& elt,
                         const CollatorInterface* collator,
-                        BSONObjSet* out) {
+                        const std::vector<KeyString::HeapBuilder>& keysToAdd,
+                        std::vector<KeyString::HeapBuilder>* out,
+                        KeyString::Version keyStringVersion,
+                        Ordering ordering) {
     if (Array == elt.type()) {
-        getS2LiteralKeysArray(elt.Obj(), collator, out);
+        getS2LiteralKeysArray(elt.Obj(), collator, keysToAdd, out, keyStringVersion, ordering);
         return true;
     } else {
         // One thing, not an array, index as-is.
-        BSONObjBuilder b;
-        CollationIndexKey::collationAwareIndexKeyAppend(elt, collator, &b);
-        out->insert(b.obj());
+        appendToS2Keys(keysToAdd, out, keyStringVersion, ordering, [&](KeyString::HeapBuilder& ks) {
+            if (collator) {
+                ks.appendBSONElement(elt, [&](StringData stringData) {
+                    return collator->getComparisonString(stringData);
+                });
+            } else {
+                ks.appendBSONElement(elt);
+            }
+        });
     }
     return false;
 }
@@ -209,16 +236,20 @@ bool getS2OneLiteralKey(const BSONElement& elt,
  */
 bool getS2LiteralKeys(const BSONElementSet& elements,
                       const CollatorInterface* collator,
-                      BSONObjSet* out) {
+                      const std::vector<KeyString::HeapBuilder>& keysToAdd,
+                      std::vector<KeyString::HeapBuilder>* out,
+                      KeyString::Version keyStringVersion,
+                      Ordering ordering) {
     bool foundIndexedArrayValue = false;
     if (0 == elements.size()) {
         // Missing fields are indexed as null.
-        BSONObjBuilder b;
-        b.appendNull("");
-        out->insert(b.obj());
+        appendToS2Keys(keysToAdd, out, keyStringVersion, ordering, [](KeyString::HeapBuilder& ks) {
+            ks.appendNull();
+        });
     } else {
         for (BSONElementSet::iterator i = elements.begin(); i != elements.end(); ++i) {
-            const bool thisElemIsArray = getS2OneLiteralKey(*i, collator, out);
+            const bool thisElemIsArray =
+                getS2OneLiteralKey(*i, collator, keysToAdd, out, keyStringVersion, ordering);
             foundIndexedArrayValue = foundIndexedArrayValue || thisElemIsArray;
         }
     }
@@ -236,7 +267,10 @@ using std::vector;
 // static
 void ExpressionKeysPrivate::get2DKeys(const BSONObj& obj,
                                       const TwoDIndexingParams& params,
-                                      BSONObjSet* keys) {
+                                      KeyStringSet* keys,
+                                      KeyString::Version keyStringVersion,
+                                      Ordering ordering,
+                                      boost::optional<RecordId> id) {
     BSONElementMultiSet bSet;
 
     // Get all the nested location fields, but don't return individual elements from
@@ -279,7 +313,7 @@ void ExpressionKeysPrivate::get2DKeys(const BSONObj& obj,
                 BSONElement locElement = oi.next();
 
                 uassert(16804,
-                        mongoutils::str::stream()
+                        str::stream()
                             << "location object expected, location array not in correct format",
                         locElement.isABSONObj());
 
@@ -287,8 +321,6 @@ void ExpressionKeysPrivate::get2DKeys(const BSONObj& obj,
                 if (locObj.isEmpty())
                     continue;
             }
-
-            BSONObjBuilder b(64);
 
             // Stop if we don't need to get anything but location objects
             if (!keys) {
@@ -298,7 +330,8 @@ void ExpressionKeysPrivate::get2DKeys(const BSONObj& obj,
                     continue;
             }
 
-            params.geoHashConverter->hash(locObj, &obj).appendHashMin(&b, "");
+            KeyString::Builder keyString(keyStringVersion, ordering);
+            params.geoHashConverter->hash(locObj, &obj).appendHashMin(&keyString);
 
             // Go through all the other index keys
             for (vector<pair<string, int>>::const_iterator i = params.other.begin();
@@ -309,21 +342,19 @@ void ExpressionKeysPrivate::get2DKeys(const BSONObj& obj,
                 dps::extractAllElementsAlongPath(obj, i->first, eSet);
 
                 if (eSet.size() == 0)
-                    b.appendNull("");
+                    keyString.appendNull();
                 else if (eSet.size() == 1)
-                    b.appendAs(*(eSet.begin()), "");
+                    keyString.appendBSONElement(*(eSet.begin()));
                 else {
                     // If we have more than one key, store as an array of the objects
-                    BSONArrayBuilder aBuilder;
-
-                    for (BSONElementSet::iterator ei = eSet.begin(); ei != eSet.end(); ++ei) {
-                        aBuilder.append(*ei);
-                    }
-
-                    b.append("", aBuilder.arr());
+                    keyString.appendSetAsArray(eSet);
                 }
             }
-            keys->insert(b.obj());
+
+            if (id) {
+                keyString.appendRecordId(*id);
+            }
+            keys->insert(keyString.getValueCopy());
             if (singleElement)
                 break;
         }
@@ -333,41 +364,67 @@ void ExpressionKeysPrivate::get2DKeys(const BSONObj& obj,
 // static
 void ExpressionKeysPrivate::getFTSKeys(const BSONObj& obj,
                                        const fts::FTSSpec& ftsSpec,
-                                       BSONObjSet* keys) {
-    fts::FTSIndexFormat::getKeys(ftsSpec, obj, keys);
+                                       KeyStringSet* keys,
+                                       KeyString::Version keyStringVersion,
+                                       Ordering ordering,
+                                       boost::optional<RecordId> id) {
+    fts::FTSIndexFormat::getKeys(ftsSpec, obj, keys, keyStringVersion, ordering, id);
 }
 
 // static
 void ExpressionKeysPrivate::getHashKeys(const BSONObj& obj,
-                                        const string& hashedField,
+                                        const BSONObj& keyPattern,
                                         HashSeed seed,
                                         int hashVersion,
                                         bool isSparse,
                                         const CollatorInterface* collator,
-                                        BSONObjSet* keys) {
-    const char* cstr = hashedField.c_str();
-    BSONElement fieldVal = dps::extractElementAtPath(obj, cstr);
+                                        KeyStringSet* keys,
+                                        KeyString::Version keyStringVersion,
+                                        Ordering ordering,
+                                        boost::optional<RecordId> id) {
+    static const BSONObj nullObj = BSON("" << BSONNULL);
+    auto hasFieldValue = false;
+    KeyString::HeapBuilder keyString(keyStringVersion, ordering);
+    for (auto&& indexEntry : keyPattern) {
+        auto indexPath = indexEntry.fieldNameStringData();
+        auto* cstr = indexPath.rawData();
+        auto fieldVal = dps::extractElementAtPathOrArrayAlongPath(obj, cstr);
 
-    // Convert strings to comparison keys.
-    BSONObj fieldValObj;
-    if (!fieldVal.eoo()) {
-        BSONObjBuilder bob;
-        CollationIndexKey::collationAwareIndexKeyAppend(fieldVal, collator, &bob);
-        fieldValObj = bob.obj();
-        fieldVal = fieldValObj.firstElement();
+        // If we hit an array while traversing the path, 'cstr' will point to the path component
+        // immediately following the array, or the null termination byte if the final field in the
+        // path was an array.
+        uassert(16766,
+                str::stream() << "Error: hashed indexes do not currently support array values. "
+                                 "Found array at path: "
+                              << indexPath.substr(0,
+                                                  indexPath.size() - StringData(cstr).size() -
+                                                      !StringData(cstr).empty()),
+                fieldVal.type() != BSONType::Array);
+
+        BSONObj fieldValObj;
+        if (fieldVal.eoo()) {
+            fieldVal = nullObj.firstElement();
+        } else {
+            BSONObjBuilder bob;
+            CollationIndexKey::collationAwareIndexKeyAppend(fieldVal, collator, &bob);
+            fieldValObj = bob.obj();
+            fieldVal = fieldValObj.firstElement();
+            hasFieldValue = true;
+        }
+
+        if (indexEntry.isNumber()) {
+            keyString.appendBSONElement(fieldVal);
+        } else {
+            keyString.appendNumberLong(makeSingleHashKey(fieldVal, seed, hashVersion));
+        }
     }
-
-    uassert(16766,
-            "Error: hashed indexes do not currently support array values",
-            fieldVal.type() != Array);
-
-    if (!fieldVal.eoo()) {
-        BSONObj key = BSON("" << makeSingleHashKey(fieldVal, seed, hashVersion));
-        keys->insert(key);
-    } else if (!isSparse) {
-        BSONObj nullObj = BSON("" << BSONNULL);
-        keys->insert(BSON("" << makeSingleHashKey(nullObj.firstElement(), seed, hashVersion)));
+    if (isSparse && !hasFieldValue) {
+        return;
     }
+    if (id) {
+        keyString.appendRecordId(*id);
+    }
+    keys->insert(keyString.release());
 }
 
 // static
@@ -381,7 +438,10 @@ void ExpressionKeysPrivate::getHaystackKeys(const BSONObj& obj,
                                             const std::string& geoField,
                                             const std::vector<std::string>& otherFields,
                                             double bucketSize,
-                                            BSONObjSet* keys) {
+                                            KeyStringSet* keys,
+                                            KeyString::Version keyStringVersion,
+                                            Ordering ordering,
+                                            boost::optional<RecordId> id) {
     BSONElement loc = dps::extractElementAtPath(obj, geoField);
 
     if (loc.eoo()) {
@@ -403,7 +463,7 @@ void ExpressionKeysPrivate::getHaystackKeys(const BSONObj& obj,
                                   hashHaystackElement(y, bucketSize));
     }
 
-    verify(otherFields.size() == 1);
+    invariant(otherFields.size() == 1);
 
     BSONElementSet all;
 
@@ -414,14 +474,26 @@ void ExpressionKeysPrivate::getHaystackKeys(const BSONObj& obj,
         // We're indexing a document that doesn't have the secondary non-geo field present.
         // XXX: do we want to add this even if all.size() > 0?  result:empty search terms
         // match everything instead of only things w/empty search terms)
-        addKey(root, BSONElement(), keys);
+        KeyString::HeapBuilder keyString(keyStringVersion, ordering);
+        keyString.appendString(root);
+        keyString.appendNull();
+        if (id) {
+            keyString.appendRecordId(*id);
+        }
+        keys->insert(keyString.release());
     } else {
         // Ex:If our secondary field is type: "foo" or type: {a:"foo", b:"bar"},
         // all.size()==1.  We can query on the complete field.
         // Ex: If our secondary field is type: ["A", "B"] all.size()==2 and all has values
         // "A" and "B".  The query looks for any of the fields in the array.
-        for (BSONElementSet::iterator i = all.begin(); i != all.end(); ++i) {
-            addKey(root, *i, keys);
+        for (const auto& elem : all) {
+            KeyString::HeapBuilder keyString(keyStringVersion, ordering);
+            keyString.appendString(root);
+            keyString.appendBSONElement(elem);
+            if (id) {
+                keyString.appendRecordId(*id);
+            }
+            keys->insert(keyString.release());
         }
     }
 }
@@ -437,7 +509,7 @@ int ExpressionKeysPrivate::hashHaystackElement(const BSONElement& e, double buck
 
 // static
 std::string ExpressionKeysPrivate::makeHaystackString(int hashedX, int hashedY) {
-    mongoutils::str::stream ss;
+    str::stream ss;
     ss << hashedX << "_" << hashedY;
     return ss;
 }
@@ -445,9 +517,12 @@ std::string ExpressionKeysPrivate::makeHaystackString(int hashedX, int hashedY) 
 void ExpressionKeysPrivate::getS2Keys(const BSONObj& obj,
                                       const BSONObj& keyPattern,
                                       const S2IndexingParams& params,
-                                      BSONObjSet* keys,
-                                      MultikeyPaths* multikeyPaths) {
-    BSONObjSet keysToAdd = SimpleBSONObjComparator::kInstance.makeBSONObjSet();
+                                      KeyStringSet* keys,
+                                      MultikeyPaths* multikeyPaths,
+                                      KeyString::Version keyStringVersion,
+                                      Ordering ordering,
+                                      boost::optional<RecordId> id) {
+    std::vector<KeyString::HeapBuilder> keysToAdd;
 
     // Does one of our documents have a geo field?
     bool haveGeoField = false;
@@ -477,7 +552,7 @@ void ExpressionKeysPrivate::getS2Keys(const BSONObj& obj,
         //   (b) the last component of the indexed path ever refers to GeoJSON data that requires
         //       multiple cells for its covering.
         bool lastPathComponentCausesIndexToBeMultikey;
-        BSONObjSet keysForThisField = SimpleBSONObjComparator::kInstance.makeBSONObjSet();
+        std::vector<KeyString::HeapBuilder> updatedKeysToAdd;
         if (IndexNames::GEO_2DSPHERE == keyElem.valuestr()) {
             if (params.indexVersion >= S2_INDEX_VERSION_2) {
                 // For >= V2,
@@ -507,16 +582,25 @@ void ExpressionKeysPrivate::getS2Keys(const BSONObj& obj,
                 }
             }
 
-            lastPathComponentCausesIndexToBeMultikey =
-                getS2GeoKeys(obj, fieldElements, params, &keysForThisField);
+            lastPathComponentCausesIndexToBeMultikey = getS2GeoKeys(obj,
+                                                                    fieldElements,
+                                                                    params,
+                                                                    keysToAdd,
+                                                                    &updatedKeysToAdd,
+                                                                    keyStringVersion,
+                                                                    ordering);
         } else {
-            lastPathComponentCausesIndexToBeMultikey =
-                getS2LiteralKeys(fieldElements, params.collator, &keysForThisField);
+            lastPathComponentCausesIndexToBeMultikey = getS2LiteralKeys(fieldElements,
+                                                                        params.collator,
+                                                                        keysToAdd,
+                                                                        &updatedKeysToAdd,
+                                                                        keyStringVersion,
+                                                                        ordering);
         }
 
         // We expect there to be the missing field element present in the keys if data is
         // missing.  So, this should be non-empty.
-        verify(!keysForThisField.empty());
+        invariant(!updatedKeysToAdd.empty());
 
         if (multikeyPaths && lastPathComponentCausesIndexToBeMultikey) {
             const size_t pathLengthOfThisField = FieldRef{keyElem.fieldNameStringData()}.numParts();
@@ -524,26 +608,6 @@ void ExpressionKeysPrivate::getS2Keys(const BSONObj& obj,
             (*multikeyPaths)[posInIdx].insert(pathLengthOfThisField - 1);
         }
 
-        // We take the Cartesian product of all of the keys.  This requires that we have
-        // some keys to take the Cartesian product with.  If keysToAdd.empty(), we
-        // initialize it.
-        if (keysToAdd.empty()) {
-            keysToAdd = std::move(keysForThisField);
-            ++posInIdx;
-            continue;
-        }
-
-        BSONObjSet updatedKeysToAdd = SimpleBSONObjComparator::kInstance.makeBSONObjSet();
-        for (BSONObjSet::const_iterator it = keysToAdd.begin(); it != keysToAdd.end(); ++it) {
-            for (BSONObjSet::const_iterator newIt = keysForThisField.begin();
-                 newIt != keysForThisField.end();
-                 ++newIt) {
-                BSONObjBuilder b;
-                b.appendElements(*it);
-                b.append(newIt->firstElement());
-                updatedKeysToAdd.insert(b.obj());
-            }
-        }
         keysToAdd = std::move(updatedKeysToAdd);
         ++posInIdx;
     }
@@ -560,7 +624,13 @@ void ExpressionKeysPrivate::getS2Keys(const BSONObj& obj,
                   << " num keys: " << keysToAdd.size() << " obj inserted: " << redact(obj);
     }
 
-    *keys = std::move(keysToAdd);
+    invariant(keys->empty());
+    for (auto& ks : keysToAdd) {
+        if (id) {
+            ks.appendRecordId(*id);
+        }
+        keys->insert(ks.release());
+    }
 }
 
 }  // namespace mongo

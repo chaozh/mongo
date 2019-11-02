@@ -61,7 +61,7 @@ LogSeverity LogComponentSettings::getMinimumLogSeverity(LogComponent component) 
 
 void LogComponentSettings::setMinimumLoggedSeverity(LogComponent component, LogSeverity severity) {
     dassert(int(component) >= 0 && int(component) < LogComponent::kNumLogComponents);
-    stdx::lock_guard<stdx::mutex> lk(_mtx);
+    stdx::lock_guard<Latch> lk(_mtx);
     _setMinimumLoggedSeverityInLock(component, severity);
 }
 
@@ -99,7 +99,7 @@ void LogComponentSettings::_setMinimumLoggedSeverityInLock(LogComponent componen
 void LogComponentSettings::clearMinimumLoggedSeverity(LogComponent component) {
     dassert(int(component) >= 0 && int(component) < LogComponent::kNumLogComponents);
 
-    stdx::lock_guard<stdx::mutex> lk(_mtx);
+    stdx::lock_guard<Latch> lk(_mtx);
 
     // LogComponent::kDefault must always be configured.
     if (component == LogComponent::kDefault) {
@@ -117,5 +117,5 @@ bool LogComponentSettings::shouldLog(LogComponent component, LogSeverity severit
     return severity >= LogSeverity::cast(_minimumLoggedSeverity[component].loadRelaxed());
 }
 
-}  // logger
-}  // mongo
+}  // namespace logger
+}  // namespace mongo

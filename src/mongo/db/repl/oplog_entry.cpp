@@ -35,6 +35,7 @@
 
 #include "mongo/db/namespace_string.h"
 #include "mongo/util/log.h"
+#include "mongo/util/time_support.h"
 
 namespace mongo {
 namespace repl {
@@ -80,8 +81,7 @@ OplogEntry::CommandType parseCommandType(const BSONObj& objectField) {
     } else {
         uasserted(ErrorCodes::BadValue,
                   str::stream() << "Unknown oplog entry command type: " << commandString
-                                << " Object field: "
-                                << redact(objectField));
+                                << " Object field: " << redact(objectField));
     }
     MONGO_UNREACHABLE;
 }
@@ -100,7 +100,7 @@ BSONObj makeOplogEntryDoc(OpTime opTime,
                           const boost::optional<BSONObj>& o2Field,
                           const OperationSessionInfo& sessionInfo,
                           const boost::optional<bool>& isUpsert,
-                          const boost::optional<mongo::Date_t>& wallClockTime,
+                          const mongo::Date_t& wallClockTime,
                           const boost::optional<StmtId>& statementId,
                           const boost::optional<OpTime>& prevWriteOpTimeInTransaction,
                           const boost::optional<OpTime>& preImageOpTime,
@@ -112,6 +112,7 @@ BSONObj makeOplogEntryDoc(OpTime opTime,
     builder.append(OplogEntryBase::kVersionFieldName, version);
     builder.append(OplogEntryBase::kOpTypeFieldName, OpType_serializer(opType));
     builder.append(OplogEntryBase::kNssFieldName, nss.toString());
+    builder.append(OplogEntryBase::kWallClockTimeFieldName, wallClockTime);
     if (hash) {
         builder.append(OplogEntryBase::kHashFieldName, hash.get());
     }
@@ -128,9 +129,6 @@ BSONObj makeOplogEntryDoc(OpTime opTime,
     if (isUpsert) {
         invariant(o2Field);
         builder.append(OplogEntryBase::kUpsertFieldName, isUpsert.get());
-    }
-    if (wallClockTime) {
-        builder.append(OplogEntryBase::kWallClockTimeFieldName, wallClockTime.get());
     }
     if (statementId) {
         builder.append(OplogEntryBase::kStatementIdFieldName, statementId.get());
@@ -152,12 +150,12 @@ BSONObj makeOplogEntryDoc(OpTime opTime,
 
 }  // namespace
 
-const int OplogEntry::kOplogVersion = 2;
+const int MutableOplogEntry::kOplogVersion = 2;
 
 // Static
-ReplOperation OplogEntry::makeInsertOperation(const NamespaceString& nss,
-                                              boost::optional<UUID> uuid,
-                                              const BSONObj& docToInsert) {
+ReplOperation MutableOplogEntry::makeInsertOperation(const NamespaceString& nss,
+                                                     boost::optional<UUID> uuid,
+                                                     const BSONObj& docToInsert) {
     ReplOperation op;
     op.setOpType(OpTypeEnum::kInsert);
     op.setNss(nss);
@@ -166,10 +164,10 @@ ReplOperation OplogEntry::makeInsertOperation(const NamespaceString& nss,
     return op;
 }
 
-ReplOperation OplogEntry::makeUpdateOperation(const NamespaceString nss,
-                                              boost::optional<UUID> uuid,
-                                              const BSONObj& update,
-                                              const BSONObj& criteria) {
+ReplOperation MutableOplogEntry::makeUpdateOperation(const NamespaceString nss,
+                                                     boost::optional<UUID> uuid,
+                                                     const BSONObj& update,
+                                                     const BSONObj& criteria) {
     ReplOperation op;
     op.setOpType(OpTypeEnum::kUpdate);
     op.setNss(nss);
@@ -179,9 +177,9 @@ ReplOperation OplogEntry::makeUpdateOperation(const NamespaceString nss,
     return op;
 }
 
-ReplOperation OplogEntry::makeDeleteOperation(const NamespaceString& nss,
-                                              boost::optional<UUID> uuid,
-                                              const BSONObj& docToDelete) {
+ReplOperation MutableOplogEntry::makeDeleteOperation(const NamespaceString& nss,
+                                                     boost::optional<UUID> uuid,
+                                                     const BSONObj& docToDelete) {
     ReplOperation op;
     op.setOpType(OpTypeEnum::kDelete);
     op.setNss(nss);
@@ -190,7 +188,32 @@ ReplOperation OplogEntry::makeDeleteOperation(const NamespaceString& nss,
     return op;
 }
 
-size_t OplogEntry::getReplOperationSize(const ReplOperation& op) {
+StatusWith<MutableOplogEntry> MutableOplogEntry::parse(const BSONObj& object) {
+    try {
+        MutableOplogEntry oplogEntry;
+        oplogEntry.parseProtected(IDLParserErrorContext("OplogEntryBase"), object);
+        return oplogEntry;
+    } catch (...) {
+        return exceptionToStatus();
+    }
+    MONGO_UNREACHABLE;
+}
+
+void MutableOplogEntry::setOpTime(const OpTime& opTime) & {
+    setTimestamp(opTime.getTimestamp());
+    if (opTime.getTerm() != OpTime::kUninitializedTerm)
+        setTerm(opTime.getTerm());
+}
+
+OpTime MutableOplogEntry::getOpTime() const {
+    long long term = OpTime::kUninitializedTerm;
+    if (getTerm()) {
+        term = getTerm().get();
+    }
+    return OpTime(getTimestamp(), term);
+}
+
+size_t OplogEntry::getDurableReplOperationSize(const DurableReplOperation& op) {
     return sizeof(op) + op.getNss().size() + op.getObject().objsize() +
         (op.getObject2() ? op.getObject2()->objsize() : 0);
 }
@@ -204,10 +227,10 @@ StatusWith<OplogEntry> OplogEntry::parse(const BSONObj& object) {
     MONGO_UNREACHABLE;
 }
 
-OplogEntry::OplogEntry(BSONObj rawInput) : raw(std::move(rawInput)) {
-    raw = raw.getOwned();
+OplogEntry::OplogEntry(BSONObj rawInput) : _raw(std::move(rawInput)) {
+    _raw = _raw.getOwned();
 
-    parseProtected(IDLParserErrorContext("OplogEntryBase"), raw);
+    parseProtected(IDLParserErrorContext("OplogEntryBase"), _raw);
 
     // Parse command type from 'o' and 'o2' fields.
     if (isCommand()) {
@@ -226,7 +249,7 @@ OplogEntry::OplogEntry(OpTime opTime,
                        const boost::optional<BSONObj>& o2Field,
                        const OperationSessionInfo& sessionInfo,
                        const boost::optional<bool>& isUpsert,
-                       const boost::optional<mongo::Date_t>& wallClockTime,
+                       const mongo::Date_t& wallClockTime,
                        const boost::optional<StmtId>& statementId,
                        const boost::optional<OpTime>& prevWriteOpTimeInTransaction,
                        const boost::optional<OpTime>& preImageOpTime,
@@ -271,14 +294,16 @@ bool OplogEntry::isCrudOpType() const {
 }
 
 bool OplogEntry::shouldPrepare() const {
-    return getPrepare() && *getPrepare();
+    return getCommandType() == CommandType::kApplyOps &&
+        getObject()[ApplyOpsCommandInfoBase::kPrepareFieldName].booleanSafe();
 }
 
 BSONElement OplogEntry::getIdElement() const {
     invariant(isCrudOpType());
     if (getOpType() == OpTypeEnum::kUpdate) {
-        // We cannot use getOperationToApply() here because the BSONObj will go out out of scope
-        // after we return the BSONElement.
+        // We cannot use getObjectContainingDocumentKey() here because the BSONObj will go out
+        // of scope after we return the BSONElement.
+        fassert(31080, getObject2() != boost::none);
         return getObject2()->getField("_id");
     } else {
         return getObject()["_id"];
@@ -286,15 +311,17 @@ BSONElement OplogEntry::getIdElement() const {
 }
 
 BSONObj OplogEntry::getOperationToApply() const {
-    if (getOpType() != OpTypeEnum::kUpdate) {
+    return getObject();
+}
+
+BSONObj OplogEntry::getObjectContainingDocumentKey() const {
+    invariant(isCrudOpType());
+    if (getOpType() == OpTypeEnum::kUpdate) {
+        fassert(31081, getObject2() != boost::none);
+        return *getObject2();
+    } else {
         return getObject();
     }
-
-    if (auto optionalObj = getObject2()) {
-        return *optionalObj;
-    }
-
-    return {};
 }
 
 OplogEntry::CommandType OplogEntry::getCommandType() const {
@@ -302,19 +329,11 @@ OplogEntry::CommandType OplogEntry::getCommandType() const {
 }
 
 int OplogEntry::getRawObjSizeBytes() const {
-    return raw.objsize();
-}
-
-OpTime OplogEntry::getOpTime() const {
-    long long term = OpTime::kUninitializedTerm;
-    if (getTerm()) {
-        term = getTerm().get();
-    }
-    return OpTime(getTimestamp(), term);
+    return _raw.objsize();
 }
 
 std::string OplogEntry::toString() const {
-    return raw.toString();
+    return _raw.toString();
 }
 
 std::ostream& operator<<(std::ostream& s, const OplogEntry& o) {

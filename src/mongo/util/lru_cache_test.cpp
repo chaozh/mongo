@@ -141,7 +141,7 @@ void assertNotInCache(const LRUCache<K, V>& cache, const K& key) {
 }
 
 const std::array<int, 7> kTestSizes{1, 2, 3, 4, 5, 10, 1000};
-using SizedTest = stdx::function<void(int)>;
+using SizedTest = std::function<void(int)>;
 void runWithDifferentSizes(SizedTest test) {
     for (auto size : kTestSizes) {
         mongo::unittest::log() << "\t\tTesting cache size of " << size;
@@ -277,7 +277,6 @@ TEST(LRUCacheTest, SizeOneCache) {
 // Test cache eviction when the cache is full and new elements are added.
 TEST(LRUCacheTest, EvictionTest) {
     runWithDifferentSizes([](int maxSize) {
-
         // Test eviction for any permutation of the original cache
         for (int i = 0; i < maxSize; i++) {
             LRUCache<int, int> cache(maxSize);
@@ -309,7 +308,6 @@ TEST(LRUCacheTest, EvictionTest) {
 // from any original position in the cache.
 TEST(LRUCacheTest, PromoteTest) {
     runWithDifferentSizes([](int maxSize) {
-
         // Test promotion for any position in the original cache
         // i <= maxSize here, so we test promotion of cache.end(),
         // and of a non-existent key.
@@ -354,7 +352,6 @@ TEST(LRUCacheTest, PromoteTest) {
 // the existing entry and gets promoted properly
 TEST(LRUCacheTest, ReplaceKeyTest) {
     runWithDifferentSizes([](int maxSize) {
-
         // Test replacement for any position in the original cache
         for (int i = 0; i < maxSize; i++) {
             LRUCache<int, int> cache(maxSize);
@@ -378,7 +375,6 @@ TEST(LRUCacheTest, ReplaceKeyTest) {
 // the existing entry and gets promoted properly
 TEST(LRUCacheTest, EraseByKey) {
     runWithDifferentSizes([](int maxSize) {
-
         // Test replacement for any position in the original cache
         // i <= maxSize so we erase a non-existent element
         for (int i = 0; i <= maxSize; i++) {
@@ -416,7 +412,6 @@ TEST(LRUCacheTest, EraseByKey) {
 // Test removal of elements by iterator from the cache
 TEST(LRUCacheTest, EraseByIterator) {
     runWithDifferentSizes([](int maxSize) {
-
         // Test replacement for any position in the original cache
         for (int i = 0; i < maxSize; i++) {
             LRUCache<int, int> cache(maxSize);

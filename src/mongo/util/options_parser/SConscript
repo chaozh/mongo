@@ -24,6 +24,7 @@ optsEnv.Library(
         '$BUILD_DIR/third_party/shim_yaml',
     ],
     LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/crypto/sha_block_${MONGO_CRYPTO}',
         '$BUILD_DIR/mongo/util/net/http_client',
         '$BUILD_DIR/mongo/util/net/network',
         '$BUILD_DIR/third_party/shim_boost',
@@ -37,10 +38,14 @@ optsEnv.Library(
 env.Library('options_parser_init', ['options_parser_init.cpp'],
                                     LIBDEPS=['options_parser'])
 
-env.CppUnitTest('options_parser_test',
-                'options_parser_test.cpp',
-                LIBDEPS=['options_parser', '$BUILD_DIR/mongo/unittest/unittest'])
-
-env.CppUnitTest('environment_test',
-                'environment_test.cpp',
-                LIBDEPS=['options_parser', '$BUILD_DIR/mongo/unittest/unittest'])
+env.CppUnitTest(
+    target='options_parser_test',
+    source=[
+        'environment_test.cpp',
+        'options_parser_test.cpp',
+    ],
+    LIBDEPS=[
+        'options_parser',
+        '$BUILD_DIR/mongo/unittest/unittest',
+    ],
+)

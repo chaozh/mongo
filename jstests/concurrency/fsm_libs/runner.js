@@ -8,15 +8,14 @@ load('jstests/concurrency/fsm_utils/name_utils.js');  // for uniqueCollName and 
 load('jstests/concurrency/fsm_utils/setup_teardown_functions.js');
 
 var runner = (function() {
-
     function validateExecutionMode(mode) {
         var allowedKeys = ['composed', 'parallel', 'serial'];
 
         Object.keys(mode).forEach(function(option) {
             assert.contains(option,
                             allowedKeys,
-                            'invalid option: ' + tojson(option) + '; valid options are: ' +
-                                tojson(allowedKeys));
+                            'invalid option: ' + tojson(option) +
+                                '; valid options are: ' + tojson(allowedKeys));
         });
 
         mode.composed = mode.composed || false;
@@ -45,8 +44,7 @@ var runner = (function() {
             'dbNamePrefix',
             'iterationMultiplier',
             'sessionOptions',
-            'stepdownPermittedFile',
-            'steppingDownFile',
+            'stepdownFiles',
             'threadMultiplier'
         ];
 
@@ -62,8 +60,8 @@ var runner = (function() {
         Object.keys(options).forEach(function(option) {
             assert.contains(option,
                             allowedKeys,
-                            'invalid option: ' + tojson(option) + '; valid options are: ' +
-                                tojson(allowedKeys));
+                            'invalid option: ' + tojson(option) +
+                                '; valid options are: ' + tojson(allowedKeys));
         });
 
         if (typeof options.subsetSize !== 'undefined') {
@@ -101,16 +99,18 @@ var runner = (function() {
                    1,
                    'expected iterationMultiplier to be greater than or equal to 1');
 
-        if (typeof options.stepdownPermittedFile !== 'undefined') {
+        if (typeof options.stepdownFiles !== 'undefined') {
             assert.eq('string',
-                      typeof options.stepdownPermittedFile,
-                      'expected stepdownPermittedFile to be a string');
-        }
+                      typeof options.stepdownFiles.permitted,
+                      'expected stepdownFiles.permitted to be a string');
 
-        if (typeof options.steppingDownFile !== 'undefined') {
             assert.eq('string',
-                      typeof options.steppingDownFile,
-                      'expected steppingDownFile to be a string');
+                      typeof options.stepdownFiles.idleRequest,
+                      'expected stepdownFiles.idleRequest to be a string');
+
+            assert.eq('string',
+                      typeof options.stepdownFiles.idleAck,
+                      'expected stepdownFiles.idleAck to be a string');
         }
 
         options.threadMultiplier = options.threadMultiplier || 1;
@@ -129,8 +129,8 @@ var runner = (function() {
         Object.keys(options).forEach(function(option) {
             assert.contains(option,
                             allowedKeys,
-                            'invalid option: ' + tojson(option) + '; valid options are: ' +
-                                tojson(allowedKeys));
+                            'invalid option: ' + tojson(option) +
+                                '; valid options are: ' + tojson(allowedKeys));
         });
 
         if (typeof options.dropDatabaseBlacklist !== 'undefined') {
@@ -336,8 +336,8 @@ var runner = (function() {
 
             // Special case message when threads all have the same trace
             if (numUniqueTraces === 1) {
-                return pluralize('thread', stackTraces.length) + ' threw\n\n' +
-                    indent(uniqueTraces[0].value, 8);
+                return pluralize('thread', stackTraces.length) + ' with tids ' +
+                    JSON.stringify(stackTids) + ' threw\n\n' + indent(uniqueTraces[0].value, 8);
             }
 
             var summary = pluralize('exception', stackTraces.length) + ' were thrown, ' +
@@ -390,7 +390,7 @@ var runner = (function() {
     function setIterations(config) {
         // This property must be enumerable because of SERVER-21338, which prevents
         // objects with non-enumerable properties from being serialized properly in
-        // ScopedThreads.
+        // Threads.
         Object.defineProperty(
             config.data, 'iterations', {enumerable: true, value: config.iterations});
     }
@@ -398,7 +398,7 @@ var runner = (function() {
     function setThreadCount(config) {
         // This property must be enumerable because of SERVER-21338, which prevents
         // objects with non-enumerable properties from being serialized properly in
-        // ScopedThreads.
+        // Threads.
         Object.defineProperty(
             config.data, 'threadCount', {enumerable: true, value: config.threadCount});
     }
@@ -552,9 +552,9 @@ var runner = (function() {
                 const session = cluster.getDB('test').getSession();
 
                 // JavaScript objects backed by C++ objects (e.g. BSON values from a command
-                // response) do not serialize correctly when passed through the ScopedThread
+                // response) do not serialize correctly when passed through the Thread
                 // constructor. To work around this behavior, we instead pass a stringified form of
-                // the JavaScript object through the ScopedThread constructor and use eval() to
+                // the JavaScript object through the Thread constructor and use eval() to
                 // rehydrate it.
                 executionOptions.sessionOptions.initialClusterTime =
                     tojson(session.getClusterTime());
@@ -751,7 +751,6 @@ var runner = (function() {
             loadWorkloadContext,
         }
     };
-
 })();
 
 var runWorkloadsSerially = runner.serial;

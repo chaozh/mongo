@@ -35,13 +35,16 @@
 #include <string>
 #include <vector>
 
+#include "mongo/base/string_data.h"
 #include "mongo/bson/bsonobj.h"
+#include "mongo/db/exec/document_value/document_comparator.h"
+#include "mongo/db/exec/document_value/value_comparator.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/pipeline/aggregation_request.h"
-#include "mongo/db/pipeline/document_comparator.h"
+#include "mongo/db/pipeline/javascript_execution.h"
 #include "mongo/db/pipeline/mongo_process_interface.h"
-#include "mongo/db/pipeline/value_comparator.h"
+#include "mongo/db/pipeline/runtime_constants_gen.h"
 #include "mongo/db/pipeline/variables.h"
 #include "mongo/db/query/collation/collator_interface.h"
 #include "mongo/db/query/datetime/date_time_support.h"
@@ -91,7 +94,6 @@ public:
 
         boost::intrusive_ptr<ExpressionContext> _expCtx;
 
-        BSONObj _originalCollation;
         std::unique_ptr<CollatorInterface> _originalCollatorOwned;
         const CollatorInterface* _originalCollatorUnowned{nullptr};
     };
@@ -108,10 +110,32 @@ public:
                       boost::optional<UUID> collUUID);
 
     /**
-     * Constructs an ExpressionContext to be used for MatchExpression parsing outside of the context
-     * of aggregation.
+     * Constructs an ExpressionContext to be used for Pipeline parsing and evaluation. This version
+     * requires finer-grained parameters but does not require an AggregationRequest.
+     * 'resolvedNamespaces' maps collection names (not full namespaces) to ResolvedNamespaces.
      */
-    ExpressionContext(OperationContext* opCtx, const CollatorInterface* collator);
+    ExpressionContext(OperationContext* opCtx,
+                      const boost::optional<ExplainOptions::Verbosity>& explain,
+                      bool fromMongos,
+                      bool needsmerge,
+                      bool allowDiskUse,
+                      bool bypassDocumentValidation,
+                      const NamespaceString& ns,
+                      const boost::optional<RuntimeConstants>& runtimeConstants,
+                      std::unique_ptr<CollatorInterface> collator,
+                      const std::shared_ptr<MongoProcessInterface>& mongoProcessInterface,
+                      StringMap<ExpressionContext::ResolvedNamespace> resolvedNamespaces,
+                      boost::optional<UUID> collUUID);
+
+    /**
+     * Constructs an ExpressionContext suitable for use outside of the aggregation system, including
+     * for MatchExpression parsing and executing pipeline-style operations in the Update system.
+     *
+     * If 'collator' is null, the simple collator will be used.
+     */
+    ExpressionContext(OperationContext* opCtx,
+                      const CollatorInterface* collator,
+                      const boost::optional<RuntimeConstants>& runtimeConstants = boost::none);
 
     /**
      * Used by a pipeline to check for interrupts so that killOp() works. Throws a UserAssertion if
@@ -141,7 +165,20 @@ public:
     }
 
     const CollatorInterface* getCollator() const {
-        return _collator;
+        return _unownedCollator;
+    }
+
+    /**
+     * Returns the BSON spec for the ExpressionContext's collator, or the simple collator spec if
+     * the collator is null.
+     *
+     * The ExpressionContext is always set up with the fully-resolved collation. So even though
+     * SERVER-24433 describes an ambiguity between a null collator, here we can say confidently that
+     * null must mean simple since we have already handled "absence of a collator" before creating
+     * the ExpressionContext.
+     */
+    BSONObj getCollatorBSON() const {
+        return _unownedCollator ? _unownedCollator->getSpec().toBSON() : CollationSpec::kSimpleSpec;
     }
 
     void setCollator(const CollatorInterface* collator);
@@ -163,12 +200,12 @@ public:
 
     /**
      * Returns an ExpressionContext that is identical to 'this' that can be used to execute a
-     * separate aggregation pipeline on 'ns' with the optional 'uuid'.
+     * separate aggregation pipeline on 'ns' with the optional 'uuid' and an updated collator.
      */
     boost::intrusive_ptr<ExpressionContext> copyWith(
         NamespaceString ns,
         boost::optional<UUID> uuid = boost::none,
-        boost::optional<std::unique_ptr<CollatorInterface>> collator = boost::none) const;
+        boost::optional<std::unique_ptr<CollatorInterface>> updatedCollator = boost::none) const;
 
     /**
      * Returns the ResolvedNamespace corresponding to 'nss'. It is an error to call this method on a
@@ -188,23 +225,31 @@ public:
         return tailableMode == TailableModeEnum::kTailableAndAwaitData;
     }
 
+    void setResolvedNamespaces(StringMap<ResolvedNamespace> resolvedNamespaces) {
+        _resolvedNamespaces = std::move(resolvedNamespaces);
+    }
+
+    auto getRuntimeConstants() const {
+        return variables.getRuntimeConstants();
+    }
+
     /**
-     * Sets the resolved definition for an involved namespace.
+     * Retrieves the Javascript Scope for the current thread or creates a new one if it has not been
+     * created yet. Initializes the Scope with the 'jsScope' variables from the runtimeConstants.
+     *
+     * Returns a JsExec and a boolean indicating whether the Scope was created as part of this call.
      */
-    void setResolvedNamespace_forTest(const NamespaceString& nss,
-                                      ResolvedNamespace resolvedNamespace) {
-        _resolvedNamespaces[nss.coll()] = std::move(resolvedNamespace);
+    auto getJsExecWithScope() const {
+        RuntimeConstants runtimeConstants = getRuntimeConstants();
+        const boost::optional<mongo::BSONObj>& scope = runtimeConstants.getJsScope();
+        return JsExecution::get(opCtx, scope.get_value_or(BSONObj()), ns.db());
     }
 
     // The explain verbosity requested by the user, or boost::none if no explain was requested.
     boost::optional<ExplainOptions::Verbosity> explain;
 
-    // The comment provided by the user, or the empty string if no comment was provided.
-    std::string comment;
-
     bool fromMongos = false;
     bool needsMerge = false;
-    bool mergeByPBRT = false;
     bool inMongos = false;
     bool allowDiskUse = false;
     bool bypassDocumentValidation = false;
@@ -227,10 +272,6 @@ public:
 
     const TimeZoneDatabase* timeZoneDatabase;
 
-    // Collation requested by the user for this pipeline. Empty if the user did not request a
-    // collation.
-    BSONObj collation;
-
     Variables variables;
     VariablesParseState variablesParseState;
 
@@ -246,15 +287,22 @@ public:
     boost::optional<ServerGlobalParams::FeatureCompatibility::Version>
         maxFeatureCompatibilityVersion;
 
+    // True if this ExpressionContext is associated with a Change Stream that should serialize its
+    // "$sortKey" using the 4.2 format.
+    bool use42ChangeStreamSortKeys = false;
+
+    // True if this ExpressionContext is used to parse a view definition pipeline.
+    bool isParsingViewDefinition = false;
+
+    // True if this ExpressionContext is used to parse a collection validator expression.
+    bool isParsingCollectionValidator = false;
+
 protected:
     static const int kInterruptCheckPeriod = 128;
 
-    ExpressionContext(NamespaceString nss,
-                      std::shared_ptr<MongoProcessInterface>,
-                      const TimeZoneDatabase* tzDb);
-
     /**
-     * Sets '_ownedCollator' and resets '_collator', 'documentComparator' and 'valueComparator'.
+     * Sets '_ownedCollator' and resets '_unownedCollator', 'documentComparator' and
+     * 'valueComparator'.
      *
      * Use with caution - '_ownedCollator' is used in the context of a Pipeline, and it is illegal
      * to change the collation once a Pipeline has been parsed with this ExpressionContext.
@@ -272,7 +320,7 @@ protected:
 
     // Collator used for comparisons. If '_ownedCollator' is non-null, then this must point to the
     // same collator object.
-    const CollatorInterface* _collator = nullptr;
+    const CollatorInterface* _unownedCollator = nullptr;
 
     // Used for all comparisons of Document/Value during execution of the aggregation operation.
     // Must not be changed after parsing a Pipeline with this ExpressionContext.

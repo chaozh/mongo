@@ -31,6 +31,7 @@
 
 #include "mongo/platform/basic.h"
 
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -45,6 +46,7 @@
 #include "mongo/db/jsobj.h"
 #include "mongo/db/matcher/extensions_callback_real.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/query/collection_query_info.h"
 #include "mongo/db/query/cursor_response.h"
 #include "mongo/db/query/explain.h"
 #include "mongo/db/query/find_common.h"
@@ -53,8 +55,8 @@
 #include "mongo/db/query/plan_summary_stats.h"
 #include "mongo/db/query/query_planner_common.h"
 #include "mongo/db/query/view_response_formatter.h"
+#include "mongo/db/s/collection_sharding_state.h"
 #include "mongo/db/views/resolved_view.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
@@ -78,10 +80,15 @@ public:
         return false;
     }
 
-    bool supportsReadConcern(const std::string& dbName,
-                             const BSONObj& cmdObj,
-                             repl::ReadConcernLevel level) const override {
+    bool canIgnorePrepareConflicts() const override {
         return true;
+    }
+
+    ReadConcernSupportResult supportsReadConcern(const std::string& dbName,
+                                                 const BSONObj& cmdObj,
+                                                 repl::ReadConcernLevel level) const override {
+        return {ReadConcernSupportResult::ReadConcern::kSupported,
+                ReadConcernSupportResult::DefaultReadConcern::kPermitted};
     }
 
     ReadWriteType getReadWriteType() const override {
@@ -103,8 +110,8 @@ public:
 
         const auto hasTerm = false;
         return authSession->checkAuthForFind(
-            AutoGetCollection::resolveNamespaceStringOrUUID(
-                opCtx, CommandHelpers::parseNsOrUUID(dbname, cmdObj)),
+            CollectionCatalog::get(opCtx).resolveNamespaceStringOrUUID(
+                CommandHelpers::parseNsOrUUID(dbname, cmdObj)),
             hasTerm);
     }
 
@@ -123,8 +130,10 @@ public:
         const auto nss = ctx->getNss();
 
         const ExtensionsCallbackReal extensionsCallback(opCtx, &nss);
-        auto parsedDistinct =
-            uassertStatusOK(ParsedDistinct::parse(opCtx, nss, cmdObj, extensionsCallback, true));
+        auto defaultCollator =
+            ctx->getCollection() ? ctx->getCollection()->getDefaultCollator() : nullptr;
+        auto parsedDistinct = uassertStatusOK(
+            ParsedDistinct::parse(opCtx, nss, cmdObj, extensionsCallback, true, defaultCollator));
 
         if (ctx->getView()) {
             // Relinquish locks. The aggregation command will re-acquire them.
@@ -157,7 +166,7 @@ public:
             getExecutorDistinct(opCtx, collection, QueryPlannerParams::DEFAULT, &parsedDistinct));
 
         auto bodyBuilder = result->getBodyBuilder();
-        Explain::explainStages(executor.get(), collection, verbosity, &bodyBuilder);
+        Explain::explainStages(executor.get(), collection, verbosity, BSONObj(), &bodyBuilder);
         return Status::OK();
     }
 
@@ -174,9 +183,20 @@ public:
                     AutoGetCollection::ViewMode::kViewsPermitted);
         const auto& nss = ctx->getNss();
 
+        // Distinct doesn't filter orphan documents so it is not allowed to run on sharded
+        // collections in multi-document transactions.
+        uassert(ErrorCodes::OperationNotSupportedInTransaction,
+                "Cannot run 'distinct' on a sharded collection in a multi-document transaction. "
+                "Please see http://dochub.mongodb.org/core/transaction-distinct for a recommended "
+                "alternative.",
+                !opCtx->inMultiDocumentTransaction() ||
+                    !CollectionShardingState::get(opCtx, nss)->getCurrentMetadata()->isSharded());
+
         const ExtensionsCallbackReal extensionsCallback(opCtx, &nss);
-        auto parsedDistinct =
-            uassertStatusOK(ParsedDistinct::parse(opCtx, nss, cmdObj, extensionsCallback, false));
+        auto defaultCollation =
+            ctx->getCollection() ? ctx->getCollection()->getDefaultCollator() : nullptr;
+        auto parsedDistinct = uassertStatusOK(
+            ParsedDistinct::parse(opCtx, nss, cmdObj, extensionsCallback, false, defaultCollation));
 
         // Check whether we are allowed to read from this node after acquiring our locks.
         auto replCoord = repl::ReplicationCoordinator::get(opCtx);
@@ -210,16 +230,14 @@ public:
 
         const auto key = cmdObj[ParsedDistinct::kKeyField].valuestrsafe();
 
-        int bufSize = BSONObjMaxUserSize - 4096;
-        BufBuilder bb(bufSize);
-        char* start = bb.buf();
-
-        BSONArrayBuilder arr(bb);
+        std::vector<BSONObj> distinctValueHolder;
         BSONElementSet values(executor.getValue()->getCanonicalQuery()->getCollator());
 
+        const int kMaxResponseSize = BSONObjMaxUserSize - 4096;
+        size_t listApproxBytes = 0;
         BSONObj obj;
         PlanExecutor::ExecState state;
-        while (PlanExecutor::ADVANCED == (state = executor.getValue()->getNext(&obj, NULL))) {
+        while (PlanExecutor::ADVANCED == (state = executor.getValue()->getNext(&obj, nullptr))) {
             // Distinct expands arrays.
             //
             // If our query is covered, each value of the key should be in the index key and
@@ -233,26 +251,30 @@ public:
                 if (values.count(elt)) {
                     continue;
                 }
-                int currentBufPos = bb.len();
 
-                uassert(17217,
-                        "distinct too big, 16mb cap",
-                        (currentBufPos + elt.size() + 1024) < bufSize);
+                // This is an approximate size check which safeguards against use of unbounded
+                // memory by the distinct command. We perform a more precise check at the end of
+                // this method to confirm that the response size is less than 16MB.
+                listApproxBytes += elt.size();
+                uassert(17217, "distinct too big, 16mb cap", listApproxBytes < kMaxResponseSize);
 
-                arr.append(elt);
-                BSONElement x(start + currentBufPos);
-                values.insert(x);
+                auto distinctObj = elt.wrap();
+                values.insert(distinctObj.firstElement());
+                distinctValueHolder.push_back(std::move(distinctObj));
             }
         }
 
         // Return an error if execution fails for any reason.
         if (PlanExecutor::FAILURE == state) {
-            log() << "Plan executor error during distinct command: "
-                  << redact(PlanExecutor::statestr(state))
-                  << ", stats: " << redact(Explain::getWinningPlanStats(executor.getValue().get()));
+            // We should always have a valid status member object at this point.
+            auto status = WorkingSetCommon::getMemberObjectStatus(obj);
+            invariant(!status.isOK());
+            warning() << "Plan executor error during distinct command: "
+                      << redact(PlanExecutor::statestr(state)) << ", status: " << status
+                      << ", stats: "
+                      << redact(Explain::getWinningPlanStats(executor.getValue().get()));
 
-            uassertStatusOK(WorkingSetCommon::getMemberObjectStatus(obj).withContext(
-                "Executor error during distinct command"));
+            uassertStatusOK(status.withContext("Executor error during distinct command"));
         }
 
 
@@ -262,7 +284,7 @@ public:
         PlanSummaryStats stats;
         Explain::getSummaryStats(*executor.getValue(), &stats);
         if (collection) {
-            collection->infoCache()->notifyOfQuery(opCtx, stats.indexesUsed);
+            CollectionQueryInfo::get(collection).notifyOfQuery(opCtx, stats);
         }
         curOp->debug().setPlanSummaryMetrics(stats);
 
@@ -272,10 +294,13 @@ public:
             curOp->debug().execStats = execStatsBob.obj();
         }
 
-        verify(start == bb.buf());
+        BSONArrayBuilder valueListBuilder(result.subarrayStart("values"));
+        for (const auto& value : values) {
+            valueListBuilder.append(value);
+        }
+        valueListBuilder.doneFast();
 
-        result.appendArray("values", arr.done());
-
+        uassert(31299, "distinct too big, 16mb cap", result.len() < kMaxResponseSize);
         return true;
     }
 

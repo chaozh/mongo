@@ -29,33 +29,29 @@
 
 #pragma once
 
+#include <functional>
 #include <vector>
 
 #include "mongo/db/record_id.h"
 #include "mongo/db/storage/biggie/biggie_kv_engine.h"
 #include "mongo/db/storage/biggie/store.h"
 #include "mongo/db/storage/recovery_unit.h"
-#include "mongo/stdx/functional.h"
 
 namespace mongo {
 namespace biggie {
 
 class RecoveryUnit : public ::mongo::RecoveryUnit {
 public:
-    RecoveryUnit(KVEngine* parentKVEngine, stdx::function<void()> cb = nullptr);
+    RecoveryUnit(KVEngine* parentKVEngine, std::function<void()> cb = nullptr);
     ~RecoveryUnit();
 
     void beginUnitOfWork(OperationContext* opCtx) override final;
-    void commitUnitOfWork() override final;
-    void abortUnitOfWork() override final;
 
-    virtual bool waitUntilDurable() override;
+    bool inActiveTxn() const {
+        return _inUnitOfWork();
+    }
 
-    virtual void abandonSnapshot() override;
-
-    virtual void registerChange(Change* change) override;
-
-    virtual SnapshotId getSnapshotId() const override;
+    virtual bool waitUntilDurable(OperationContext* opCtx) override;
 
     virtual void setOrderedCommit(bool orderedCommit) override;
 
@@ -78,9 +74,15 @@ public:
     static RecoveryUnit* get(OperationContext* opCtx);
 
 private:
+    void doCommitUnitOfWork() override final;
+
+    void doAbortUnitOfWork() override final;
+
+    void doAbandonSnapshot() override final;
+
     void _abort();
 
-    stdx::function<void()> _waitUntilDurableCallback;
+    std::function<void()> _waitUntilDurableCallback;
     // Official master is kept by KVEngine
     KVEngine* _KVEngine;
     StringStore _mergeBase;
@@ -88,10 +90,6 @@ private:
 
     bool _forked = false;
     bool _dirty = false;  // Whether or not we have written to this _workingCopy.
-    bool _inUnitOfWork = false;
-
-    typedef std::vector<std::unique_ptr<Change>> Changes;
-    Changes _changes;
 };
 
 }  // namespace biggie

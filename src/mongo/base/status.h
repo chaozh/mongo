@@ -37,13 +37,11 @@
 #include "mongo/platform/atomic_word.h"
 #include "mongo/platform/compiler.h"
 
-namespace mongoutils {
+namespace mongo {
+
 namespace str {
 class stream;
 }  // namespace str
-}  // namespace mongoutils
-
-namespace mongo {
 
 // Including builder.h here would cause a cycle.
 template <typename Allocator>
@@ -80,8 +78,7 @@ public:
     MONGO_COMPILER_COLD_FUNCTION Status(ErrorCodes::Error code, const std::string& reason);
     MONGO_COMPILER_COLD_FUNCTION Status(ErrorCodes::Error code, const char* reason);
     MONGO_COMPILER_COLD_FUNCTION Status(ErrorCodes::Error code, StringData reason);
-    MONGO_COMPILER_COLD_FUNCTION Status(ErrorCodes::Error code,
-                                        const mongoutils::str::stream& reason);
+    MONGO_COMPILER_COLD_FUNCTION Status(ErrorCodes::Error code, const str::stream& reason);
     MONGO_COMPILER_COLD_FUNCTION Status(ErrorCodes::Error code,
                                         StringData message,
                                         const BSONObj& extraInfoHolder);
@@ -197,11 +194,17 @@ public:
     std::string toString() const;
 
     /**
+     * May only be called if the status is *not OK*. Serializes the code, code name and reason in
+     * the canonical code/codeName/errmsg format used in the server command responses.
+     */
+    void serializeErrorToBSON(BSONObjBuilder* builder) const;
+
+    /**
      * Returns true if this Status's code is a member of the given category.
      */
     template <ErrorCategory category>
     bool isA() const {
-        return ErrorCodes::isA<category>(code());
+        return ErrorCodes::isA<category>(*this);
     }
 
     /**
@@ -269,6 +272,70 @@ std::ostream& operator<<(std::ostream& os, const Status& status);
 template <typename Allocator>
 StringBuilderImpl<Allocator>& operator<<(StringBuilderImpl<Allocator>& os, const Status& status);
 
-}  // namespace mongo
+inline Status Status::OK() {
+    return Status();
+}
 
-#include "mongo/base/status-inl.h"
+inline Status::Status(const Status& other) : _error(other._error) {
+    ref(_error);
+}
+
+inline Status& Status::operator=(const Status& other) {
+    ref(other._error);
+    unref(_error);
+    _error = other._error;
+    return *this;
+}
+
+inline Status::Status(Status&& other) noexcept : _error(other._error) {
+    other._error = nullptr;
+}
+
+inline Status& Status::operator=(Status&& other) noexcept {
+    unref(_error);
+    _error = other._error;
+    other._error = nullptr;
+    return *this;
+}
+
+inline Status::~Status() {
+    unref(_error);
+}
+
+inline bool Status::isOK() const {
+    return !_error;
+}
+
+inline ErrorCodes::Error Status::code() const {
+    return _error ? _error->code : ErrorCodes::OK;
+}
+
+inline std::string Status::codeString() const {
+    return ErrorCodes::errorString(code());
+}
+
+inline unsigned Status::refCount() const {
+    return _error ? _error->refs.load() : 0;
+}
+
+inline Status::Status() : _error(nullptr) {}
+
+inline void Status::ref(ErrorInfo* error) {
+    if (error)
+        error->refs.fetchAndAdd(1);
+}
+
+inline void Status::unref(ErrorInfo* error) {
+    if (error && (error->refs.subtractAndFetch(1) == 0))
+        delete error;
+}
+
+inline bool operator==(const ErrorCodes::Error lhs, const Status& rhs) {
+    return rhs == lhs;
+}
+
+inline bool operator!=(const ErrorCodes::Error lhs, const Status& rhs) {
+    return rhs != lhs;
+}
+
+}  // namespace mongo

@@ -34,329 +34,517 @@
 #include "mongo/db/s/transaction_coordinator.h"
 
 #include "mongo/db/logical_clock.h"
-#include "mongo/db/s/transaction_coordinator_document_gen.h"
-#include "mongo/db/s/transaction_coordinator_futures_util.h"
-#include "mongo/util/fail_point_service.h"
+#include "mongo/db/s/transaction_coordinator_metrics_observer.h"
+#include "mongo/db/s/wait_for_majority_service.h"
+#include "mongo/db/server_options.h"
+#include "mongo/s/grid.h"
+#include "mongo/util/fail_point.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
 namespace {
 
-using CoordinatorCommitDecision = TransactionCoordinator::CoordinatorCommitDecision;
+using CommitDecision = txn::CommitDecision;
+using CoordinatorCommitDecision = txn::CoordinatorCommitDecision;
+using PrepareVoteConsensus = txn::PrepareVoteConsensus;
+using TransactionCoordinatorDocument = txn::TransactionCoordinatorDocument;
 
-CoordinatorCommitDecision makeDecisionFromPrepareVoteConsensus(
-    ServiceContext* service,
-    const txn::PrepareVoteConsensus& result,
-    const LogicalSessionId& lsid,
-    TxnNumber txnNumber) {
-    invariant(result.decision);
-    CoordinatorCommitDecision decision{*result.decision, boost::none};
+MONGO_FAIL_POINT_DEFINE(hangBeforeWaitingForParticipantListWriteConcern);
+MONGO_FAIL_POINT_DEFINE(hangBeforeWaitingForDecisionWriteConcern);
 
-    if (result.decision == txn::CommitDecision::kCommit) {
-        invariant(result.maxPrepareTimestamp);
+ExecutorFuture<void> waitForMajorityWithHangFailpoint(ServiceContext* service,
+                                                      FailPoint& failpoint,
+                                                      const std::string& failPointName,
+                                                      repl::OpTime opTime) {
+    auto executor = Grid::get(service)->getExecutorPool()->getFixedExecutor();
+    auto waitForWC = [service, executor](repl::OpTime opTime) {
+        return WaitForMajorityService::get(service).waitUntilMajority(opTime).thenRunOn(executor);
+    };
 
-        decision.commitTimestamp = Timestamp(result.maxPrepareTimestamp->getSecs(),
-                                             result.maxPrepareTimestamp->getInc() + 1);
+    if (auto sfp = failpoint.scoped(); MONGO_unlikely(sfp.isActive())) {
+        const BSONObj& data = sfp.getData();
+        LOG(0) << "Hit " << failPointName << " failpoint";
 
-        LOG(3) << "Advancing cluster time to commit Timestamp " << decision.commitTimestamp.get()
-               << " of transaction " << txnNumber << " on session " << lsid.toBSON();
+        // Run the hang failpoint asynchronously on a different thread to avoid self deadlocks.
+        return ExecutorFuture<void>(executor).then(
+            [service, &failpoint, failPointName, data, waitForWC, opTime] {
+                if (!data["useUninterruptibleSleep"].eoo()) {
+                    failpoint.pauseWhileSet();
+                } else {
+                    ThreadClient tc(failPointName, service);
+                    auto opCtx = tc->makeOperationContext();
+                    failpoint.pauseWhileSet(opCtx.get());
+                }
 
-        uassertStatusOK(LogicalClock::get(service)->advanceClusterTime(
-            LogicalTime(result.maxPrepareTimestamp.get())));
+                return waitForWC(std::move(opTime));
+            });
     }
 
-    return decision;
+    return waitForWC(std::move(opTime));
 }
 
 }  // namespace
 
-TransactionCoordinator::TransactionCoordinator(ServiceContext* serviceContext,
+TransactionCoordinator::TransactionCoordinator(OperationContext* operationContext,
                                                const LogicalSessionId& lsid,
                                                TxnNumber txnNumber,
                                                std::unique_ptr<txn::AsyncWorkScheduler> scheduler,
-                                               boost::optional<Date_t> coordinateCommitDeadline)
-    : _serviceContext(serviceContext),
+                                               Date_t deadline)
+    : _serviceContext(operationContext->getServiceContext()),
       _lsid(lsid),
       _txnNumber(txnNumber),
       _scheduler(std::move(scheduler)),
-      _driver(serviceContext) {
-    if (coordinateCommitDeadline) {
-        _deadlineScheduler = _scheduler->makeChildScheduler();
-        _deadlineScheduler
-            ->scheduleWorkAt(*coordinateCommitDeadline,
-                             [this](OperationContext* opCtx) { cancelIfCommitNotYetStarted(); })
-            .getAsync([](const Status&) {});
-    }
+      _sendPrepareScheduler(_scheduler->makeChildScheduler()),
+      _transactionCoordinatorMetricsObserver(
+          std::make_unique<TransactionCoordinatorMetricsObserver>()),
+      _deadline(deadline) {
+
+    auto kickOffCommitPF = makePromiseFuture<void>();
+    _kickOffCommitPromise = std::move(kickOffCommitPF.promise);
+
+    // Task, which will fire when the transaction's total deadline has been reached. If the 2PC
+    // sequence has not yet started, it will be abandoned altogether.
+    auto deadlineFuture =
+        _scheduler
+            ->scheduleWorkAt(deadline,
+                             [this](OperationContext*) {
+                                 cancelIfCommitNotYetStarted();
+
+                                 // See the comments for sendPrepare about the purpose of this
+                                 // cancellation code
+                                 _sendPrepareScheduler->shutdown(
+                                     {ErrorCodes::TransactionCoordinatorReachedAbortDecision,
+                                      "Transaction exceeded deadline"});
+                             })
+            .tapError([this](Status s) {
+                if (_reserveKickOffCommitPromise()) {
+                    _kickOffCommitPromise.setError(std::move(s));
+                }
+            });
+
+    // TODO: The duration will be meaningless after failover.
+    _updateAssociatedClient(operationContext->getClient());
+    _transactionCoordinatorMetricsObserver->onCreate(
+        ServerTransactionCoordinatorsMetrics::get(_serviceContext),
+        _serviceContext->getTickSource(),
+        _serviceContext->getPreciseClockSource()->now());
+
+    // Two-phase commit phases chain. Once this chain executes, the 2PC sequence has completed
+    // either with success or error and the scheduled deadline task above has been joined.
+    std::move(kickOffCommitPF.future)
+        .then([this] {
+            // Persist the participants, unless they have been made durable already (which would
+            // only be the case if this coordinator was created as part of step-up recovery).
+            //  Input: _participants
+            //         _participantsDurable (optional)
+            //  Output: _participantsDurable = true
+            {
+                stdx::lock_guard<Latch> lg(_mutex);
+                invariant(_participants);
+
+                _step = Step::kWritingParticipantList;
+
+                _transactionCoordinatorMetricsObserver->onStartWritingParticipantList(
+                    ServerTransactionCoordinatorsMetrics::get(_serviceContext),
+                    _serviceContext->getTickSource(),
+                    _serviceContext->getPreciseClockSource()->now());
+
+                if (_participantsDurable)
+                    return Future<repl::OpTime>::makeReady(repl::OpTime());
+            }
+
+            return txn::persistParticipantsList(
+                *_sendPrepareScheduler, _lsid, _txnNumber, *_participants);
+        })
+        .then([this](repl::OpTime opTime) {
+            return waitForMajorityWithHangFailpoint(
+                _serviceContext,
+                hangBeforeWaitingForParticipantListWriteConcern,
+                "hangBeforeWaitingForParticipantListWriteConcern",
+                std::move(opTime));
+        })
+        .thenRunOn(Grid::get(_serviceContext)->getExecutorPool()->getFixedExecutor())
+        .then([this] {
+            {
+                stdx::lock_guard<Latch> lg(_mutex);
+                _participantsDurable = true;
+            }
+
+            // Send prepare to the participants, unless this has already been done (which would only
+            // be the case if this coordinator was created as part of step-up recovery and the
+            // recovery document contained a decision).
+            //  Input: _participants, _participantsDurable
+            //         _decision (optional)
+            //  Output: _decision is set
+            {
+                stdx::lock_guard<Latch> lg(_mutex);
+                invariant(_participantsDurable);
+
+                _step = Step::kWaitingForVotes;
+
+                _transactionCoordinatorMetricsObserver->onStartWaitingForVotes(
+                    ServerTransactionCoordinatorsMetrics::get(_serviceContext),
+                    _serviceContext->getTickSource(),
+                    _serviceContext->getPreciseClockSource()->now());
+
+                if (_decision)
+                    return Future<void>::makeReady();
+            }
+
+            return txn::sendPrepare(
+                       _serviceContext, *_sendPrepareScheduler, _lsid, _txnNumber, *_participants)
+                .then([this](PrepareVoteConsensus consensus) mutable {
+                    {
+                        stdx::lock_guard<Latch> lg(_mutex);
+                        _decision = consensus.decision();
+                    }
+
+                    if (_decision->getDecision() == CommitDecision::kCommit) {
+                        LOG(3) << txn::txnIdToString(_lsid, _txnNumber)
+                               << " Advancing cluster time to the commit timestamp "
+                               << *_decision->getCommitTimestamp();
+
+                        uassertStatusOK(LogicalClock::get(_serviceContext)
+                                            ->advanceClusterTime(
+                                                LogicalTime(*_decision->getCommitTimestamp())));
+                    }
+                });
+        })
+        .then([this] {
+            // Persist the commit decision, unless this has already been done (which would only be
+            // the case if this coordinator was created as part of step-up recovery and the recovery
+            // document contained a decision).
+            //  Input: _decision
+            //         _decisionDurable (optional)
+            //  Output: _decisionDurable = true
+            {
+                stdx::lock_guard<Latch> lg(_mutex);
+                invariant(_decision);
+
+                _step = Step::kWritingDecision;
+
+                _transactionCoordinatorMetricsObserver->onStartWritingDecision(
+                    ServerTransactionCoordinatorsMetrics::get(_serviceContext),
+                    _serviceContext->getTickSource(),
+                    _serviceContext->getPreciseClockSource()->now());
+
+                if (_decisionDurable)
+                    return Future<repl::OpTime>::makeReady(repl::OpTime());
+            }
+
+            return txn::persistDecision(*_scheduler, _lsid, _txnNumber, *_participants, *_decision);
+        })
+        .then([this](repl::OpTime opTime) {
+            return waitForMajorityWithHangFailpoint(_serviceContext,
+                                                    hangBeforeWaitingForDecisionWriteConcern,
+                                                    "hangBeforeWaitingForDecisionWriteConcern",
+                                                    std::move(opTime));
+        })
+        .then([this] {
+            {
+                stdx::lock_guard<Latch> lg(_mutex);
+                _decisionDurable = true;
+            }
+
+            // Send the commit/abort decision to the participants.
+            //  Input: _decisionDurable
+            //  Output: (none)
+            {
+                stdx::lock_guard<Latch> lg(_mutex);
+                invariant(_decisionDurable);
+
+                _step = Step::kWaitingForDecisionAcks;
+
+                _transactionCoordinatorMetricsObserver->onStartWaitingForDecisionAcks(
+                    ServerTransactionCoordinatorsMetrics::get(_serviceContext),
+                    _serviceContext->getTickSource(),
+                    _serviceContext->getPreciseClockSource()->now());
+            }
+
+            switch (_decision->getDecision()) {
+                case CommitDecision::kCommit: {
+                    _decisionPromise.emplaceValue(CommitDecision::kCommit);
+
+                    return txn::sendCommit(_serviceContext,
+                                           *_scheduler,
+                                           _lsid,
+                                           _txnNumber,
+                                           *_participants,
+                                           *_decision->getCommitTimestamp());
+                }
+                case CommitDecision::kAbort: {
+                    const auto& abortStatus = *_decision->getAbortStatus();
+
+                    if (abortStatus == ErrorCodes::ReadConcernMajorityNotEnabled)
+                        _decisionPromise.setError(abortStatus);
+                    else
+                        _decisionPromise.emplaceValue(CommitDecision::kAbort);
+
+                    return txn::sendAbort(
+                        _serviceContext, *_scheduler, _lsid, _txnNumber, *_participants);
+                }
+                default:
+                    MONGO_UNREACHABLE;
+            };
+        })
+        .then([this] {
+            // Do a best-effort attempt (i.e., writeConcern w:1) to delete the coordinator's durable
+            // state.
+            {
+                stdx::lock_guard<Latch> lg(_mutex);
+
+                _step = Step::kDeletingCoordinatorDoc;
+
+                _transactionCoordinatorMetricsObserver->onStartDeletingCoordinatorDoc(
+                    ServerTransactionCoordinatorsMetrics::get(_serviceContext),
+                    _serviceContext->getTickSource(),
+                    _serviceContext->getPreciseClockSource()->now());
+            }
+
+            return txn::deleteCoordinatorDoc(*_scheduler, _lsid, _txnNumber);
+        })
+        .onCompletion([this, deadlineFuture = std::move(deadlineFuture)](Status s) mutable {
+            // Interrupt this coordinator's scheduler hierarchy and join the deadline task's future
+            // in order to guarantee that there are no more threads running within the coordinator.
+            _scheduler->shutdown(
+                {ErrorCodes::TransactionCoordinatorDeadlineTaskCanceled, "Coordinator completed"});
+
+            return std::move(deadlineFuture).onCompletion([this, s = std::move(s)](Status) {
+                // Notify all the listeners which are interested in the coordinator's lifecycle.
+                // After this call, the coordinator object could potentially get destroyed by its
+                // lifetime controller, so there shouldn't be any accesses to `this` after this
+                // call.
+                _done(s);
+            });
+        });
 }
 
 TransactionCoordinator::~TransactionCoordinator() {
-    _cancelTimeoutWaitForCommitTask();
-
-    if (_deadlineScheduler)
-        _deadlineScheduler.reset();
-
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
-    invariant(_state == TransactionCoordinator::CoordinatorState::kDone);
-
-    // Make sure no callers of functions on the coordinator are waiting for a decision to be
-    // signaled or the commit process to complete.
-    invariant(_completionPromises.empty());
+    invariant(_completionPromise.getFuture().isReady());
 }
 
-void TransactionCoordinator::runCommit(std::vector<ShardId> participantShards) {
-    {
-        stdx::lock_guard<stdx::mutex> lg(_mutex);
-        if (_state != CoordinatorState::kInit)
-            return;
-        _state = CoordinatorState::kPreparing;
-    }
-
-    _cancelTimeoutWaitForCommitTask();
-
-    _driver.persistParticipantList(_lsid, _txnNumber, participantShards)
-        .then([this, participantShards]() { return _runPhaseOne(participantShards); })
-        .then([this, participantShards](CoordinatorCommitDecision decision) {
-            return _runPhaseTwo(participantShards, decision);
-        })
-        .getAsync([this](Status s) { _handleCompletionStatus(s); });
+void TransactionCoordinator::runCommit(OperationContext* opCtx, std::vector<ShardId> participants) {
+    if (!_reserveKickOffCommitPromise())
+        return;
+    invariant(opCtx != nullptr && opCtx->getClient() != nullptr);
+    _updateAssociatedClient(opCtx->getClient());
+    _participants = std::move(participants);
+    _kickOffCommitPromise.emplaceValue();
 }
 
 void TransactionCoordinator::continueCommit(const TransactionCoordinatorDocument& doc) {
-    {
-        stdx::lock_guard<stdx::mutex> lg(_mutex);
-        invariant(_state == CoordinatorState::kInit);
-        invariant(!_deadlineScheduler);
-        _state = CoordinatorState::kPreparing;
+    if (!_reserveKickOffCommitPromise())
+        return;
+
+    _transactionCoordinatorMetricsObserver->onRecoveryFromFailover();
+
+    _participants = std::move(doc.getParticipants());
+    if (doc.getDecision()) {
+        _participantsDurable = true;
+        _decision = std::move(doc.getDecision());
     }
 
-    const auto& participantShards = doc.getParticipants();
-
-    // Helper lambda to get the decision either from the document passed in or from the participants
-    // (by performing 'phase one' of two-phase commit).
-    auto getDecision = [&]() -> Future<CoordinatorCommitDecision> {
-        auto decision = doc.getDecision();
-        if (!decision) {
-            return _runPhaseOne(participantShards);
-        } else {
-            return (decision->decision == txn::CommitDecision::kCommit)
-                ? CoordinatorCommitDecision{txn::CommitDecision::kCommit, decision->commitTimestamp}
-                : CoordinatorCommitDecision{txn::CommitDecision::kAbort, boost::none};
-        }
-    };
-
-    getDecision()
-        .then([this, participantShards](CoordinatorCommitDecision decision) {
-            return _runPhaseTwo(participantShards, decision);
-        })
-        .getAsync([this](Status s) { _handleCompletionStatus(s); });
+    _kickOffCommitPromise.emplaceValue();
 }
 
-Future<void> TransactionCoordinator::onCompletion() {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
-    if (_state == CoordinatorState::kDone) {
-        return Future<void>::makeReady();
-    }
-
-    auto completionPromiseFuture = makePromiseFuture<void>();
-    _completionPromises.push_back(std::move(completionPromiseFuture.promise));
-
-    return std::move(completionPromiseFuture.future)
-        .onError<ErrorCodes::TransactionCoordinatorSteppingDown>(
-            [](const Status& s) { uasserted(ErrorCodes::InterruptedDueToStepDown, s.reason()); });
-}
-
-SharedSemiFuture<txn::CommitDecision> TransactionCoordinator::getDecision() {
-    stdx::lock_guard<stdx::mutex> lg(_mutex);
+SharedSemiFuture<CommitDecision> TransactionCoordinator::getDecision() const {
     return _decisionPromise.getFuture();
 }
 
+SharedSemiFuture<txn::CommitDecision> TransactionCoordinator::onCompletion() {
+    return _completionPromise.getFuture();
+}
+
 void TransactionCoordinator::cancelIfCommitNotYetStarted() {
-    _cancelTimeoutWaitForCommitTask();
+    if (!_reserveKickOffCommitPromise())
+        return;
 
-    stdx::unique_lock<stdx::mutex> lk(_mutex);
-    if (_state == CoordinatorState::kInit) {
-        invariant(!_decisionPromise.getFuture().isReady());
-        _decisionPromise.emplaceValue(txn::CommitDecision::kCanceled);
-        _transitionToDone(std::move(lk));
+    _kickOffCommitPromise.setError({ErrorCodes::NoSuchTransaction,
+                                    "Transaction exceeded deadline or newer transaction started"});
+}
+
+bool TransactionCoordinator::_reserveKickOffCommitPromise() {
+    stdx::lock_guard<Latch> lg(_mutex);
+    if (_kickOffCommitPromiseSet)
+        return false;
+
+    _kickOffCommitPromiseSet = true;
+    return true;
+}
+
+void TransactionCoordinator::_done(Status status) {
+    // TransactionCoordinatorSteppingDown indicates the *sending* node (that is, *this* node) is
+    // stepping down. Active coordinator tasks are interrupted with this code instead of
+    // InterruptedDueToReplStateChange, because InterruptedDueToReplStateChange indicates the
+    // *receiving* node was stepping down.
+    if (status == ErrorCodes::TransactionCoordinatorSteppingDown)
+        status = Status(ErrorCodes::InterruptedDueToReplStateChange,
+                        str::stream() << "Coordinator " << _lsid.getId() << ':' << _txnNumber
+                                      << " stopped due to: " << status.reason());
+
+    LOG(3) << txn::txnIdToString(_lsid, _txnNumber) << " Two-phase commit completed with "
+           << redact(status);
+
+    stdx::unique_lock<Latch> ul(_mutex);
+
+    const auto tickSource = _serviceContext->getTickSource();
+
+    _transactionCoordinatorMetricsObserver->onEnd(
+        ServerTransactionCoordinatorsMetrics::get(_serviceContext),
+        tickSource,
+        _serviceContext->getPreciseClockSource()->now(),
+        _step,
+        _decisionDurable ? _decision : boost::none);
+
+    if (status.isOK() &&
+        (shouldLog(logger::LogComponent::kTransaction, logger::LogSeverity::Debug(1)) ||
+         _transactionCoordinatorMetricsObserver->getSingleTransactionCoordinatorStats()
+                 .getTwoPhaseCommitDuration(tickSource, tickSource->getTicks()) >
+             Milliseconds(serverGlobalParams.slowMS))) {
+        _logSlowTwoPhaseCommit(*_decision);
     }
-}
 
-void TransactionCoordinator::_cancelTimeoutWaitForCommitTask() {
-    if (_deadlineScheduler) {
-        _deadlineScheduler->shutdown(
-            {ErrorCodes::CallbackCanceled, "Interrupting the commit received deadline task"});
+    ul.unlock();
+    if (!_decisionDurable) {
+        _decisionPromise.setError(status);
     }
+    _completionPromise.setFrom(_decisionPromise.getFuture().getNoThrow());
 }
 
-Future<CoordinatorCommitDecision> TransactionCoordinator::_runPhaseOne(
-    const std::vector<ShardId>& participantShards) {
-    return _driver.sendPrepare(participantShards, _lsid, _txnNumber)
-        .then([this, participantShards](txn::PrepareVoteConsensus result) {
-            invariant(_state == CoordinatorState::kPreparing);
-
-            auto decision =
-                makeDecisionFromPrepareVoteConsensus(_serviceContext, result, _lsid, _txnNumber);
-
-            return _driver
-                .persistDecision(_lsid, _txnNumber, participantShards, decision.commitTimestamp)
-                .then([decision] { return decision; });
-        });
+void TransactionCoordinator::_logSlowTwoPhaseCommit(
+    const txn::CoordinatorCommitDecision& decision) {
+    log() << _twoPhaseCommitInfoForLog(decision);
 }
 
-Future<void> TransactionCoordinator::_runPhaseTwo(const std::vector<ShardId>& participantShards,
-                                                  const CoordinatorCommitDecision& decision) {
-    return _sendDecisionToParticipants(participantShards, decision)
-        .then([this] {
-            if (getGlobalFailPointRegistry()
-                    ->getFailPoint("doNotForgetCoordinator")
-                    ->shouldFail()) {
-                return Future<void>::makeReady();
-            }
+std::string TransactionCoordinator::_twoPhaseCommitInfoForLog(
+    const txn::CoordinatorCommitDecision& decision) const {
+    StringBuilder s;
 
-            return _driver.deleteCoordinatorDoc(_lsid, _txnNumber);
-        })
-        .then([this] {
-            LOG(3) << "Two-phase commit completed for session " << _lsid.toBSON()
-                   << ", transaction number " << _txnNumber;
+    s << "two-phase commit";
 
-            stdx::unique_lock<stdx::mutex> ul(_mutex);
-            _transitionToDone(std::move(ul));
-        });
-}
+    BSONObjBuilder parametersBuilder;
 
-Future<void> TransactionCoordinator::_sendDecisionToParticipants(
-    const std::vector<ShardId>& participantShards, CoordinatorCommitDecision decision) {
-    invariant(_state == CoordinatorState::kPreparing);
-    _decisionPromise.emplaceValue(decision.decision);
+    BSONObjBuilder lsidBuilder(parametersBuilder.subobjStart("lsid"));
+    _lsid.serialize(&lsidBuilder);
+    lsidBuilder.doneFast();
 
-    // Send the decision to all participants.
-    switch (decision.decision) {
+    parametersBuilder.append("txnNumber", _txnNumber);
+
+    s << " parameters:" << parametersBuilder.obj().toString();
+
+    switch (decision.getDecision()) {
         case txn::CommitDecision::kCommit:
-            _state = CoordinatorState::kCommitting;
-            invariant(decision.commitTimestamp);
-            return _driver.sendCommit(
-                participantShards, _lsid, _txnNumber, decision.commitTimestamp.get());
+            s << ", terminationCause:committed";
+            s << ", commitTimestamp: " << decision.getCommitTimestamp()->toString();
+            break;
         case txn::CommitDecision::kAbort:
-            _state = CoordinatorState::kAborting;
-            return _driver.sendAbort(participantShards, _lsid, _txnNumber);
-        case txn::CommitDecision::kCanceled:
+            s << ", terminationCause:aborted";
+            s << ", terminationDetails: " << *decision.getAbortStatus();
+            break;
+        default:
             MONGO_UNREACHABLE;
     };
-    MONGO_UNREACHABLE;
-};
 
-void TransactionCoordinator::_handleCompletionStatus(Status s) {
-    if (s.isOK()) {
-        return;
-    }
+    s << ", numParticipants:" << _participants->size();
 
-    stdx::unique_lock<stdx::mutex> lk(_mutex);
+    auto tickSource = _serviceContext->getTickSource();
+    auto curTick = tickSource->getTicks();
+    const auto& singleTransactionCoordinatorStats =
+        _transactionCoordinatorMetricsObserver->getSingleTransactionCoordinatorStats();
 
-    LOG(3) << "Two-phase commit failed with error in state " << _state << " for transaction "
-           << _txnNumber << " on session " << _lsid.toBSON() << causedBy(s);
+    BSONObjBuilder stepDurations;
+    stepDurations.append("writingParticipantListMicros",
+                         durationCount<Microseconds>(
+                             singleTransactionCoordinatorStats.getWritingParticipantListDuration(
+                                 tickSource, curTick)));
+    stepDurations.append(
+        "waitingForVotesMicros",
+        durationCount<Microseconds>(
+            singleTransactionCoordinatorStats.getWaitingForVotesDuration(tickSource, curTick)));
+    stepDurations.append(
+        "writingDecisionMicros",
+        durationCount<Microseconds>(
+            singleTransactionCoordinatorStats.getWritingDecisionDuration(tickSource, curTick)));
+    stepDurations.append("waitingForDecisionAcksMicros",
+                         durationCount<Microseconds>(
+                             singleTransactionCoordinatorStats.getWaitingForDecisionAcksDuration(
+                                 tickSource, curTick)));
+    stepDurations.append("deletingCoordinatorDocMicros",
+                         durationCount<Microseconds>(
+                             singleTransactionCoordinatorStats.getDeletingCoordinatorDocDuration(
+                                 tickSource, curTick)));
+    s << ", stepDurations:" << stepDurations.obj();
 
-    // If an error occurred prior to making a decision, set an error on the decision promise to
-    // propagate it to callers of runCommit
-    if (!_decisionPromise.getFuture().isReady()) {
-        invariant(_state == CoordinatorState::kPreparing);
-        _decisionPromise.setError(s == ErrorCodes::TransactionCoordinatorReachedAbortDecision
-                                      ? Status{ErrorCodes::InterruptedDueToStepDown, s.reason()}
-                                      : s);
-    }
+    // Total duration of the commit coordination. Logged at the end of the line for consistency with
+    // slow command logging.
+    // Note that this is reported in milliseconds while the step durations are reported in
+    // microseconds.
+    s << " "
+      << duration_cast<Milliseconds>(
+             singleTransactionCoordinatorStats.getTwoPhaseCommitDuration(tickSource, curTick));
 
-    _transitionToDone(std::move(lk));
+    return s.str();
 }
 
-void TransactionCoordinator::_transitionToDone(stdx::unique_lock<stdx::mutex> lk) noexcept {
-    _state = CoordinatorState::kDone;
+TransactionCoordinator::Step TransactionCoordinator::getStep() const {
+    stdx::lock_guard<Latch> lk(_mutex);
+    return _step;
+}
 
-    auto promisesToTrigger = std::move(_completionPromises);
-    lk.unlock();
+void TransactionCoordinator::reportState(BSONObjBuilder& parent) const {
+    BSONObjBuilder doc;
+    TickSource* tickSource = _serviceContext->getTickSource();
+    TickSource::Tick currentTick = tickSource->getTicks();
 
-    // No fields from 'this' are allowed to be accessed after the for loop below runs, because the
-    // future handlers indicate to the potential lifetime controller that the object can be
-    // destroyed
-    for (auto&& promise : promisesToTrigger) {
-        promise.emplaceValue();
+    stdx::lock_guard<Latch> lk(_mutex);
+
+    BSONObjBuilder lsidBuilder(doc.subobjStart("lsid"));
+    _lsid.serialize(&lsidBuilder);
+    lsidBuilder.doneFast();
+    doc.append("txnNumber", _txnNumber);
+
+    if (_participants) {
+        doc.append("numParticipants", static_cast<long long>(_participants->size()));
+    }
+
+    doc.append("state", toString(_step));
+
+    const auto& singleStats =
+        _transactionCoordinatorMetricsObserver->getSingleTransactionCoordinatorStats();
+    singleStats.reportMetrics(doc, tickSource, currentTick);
+    singleStats.reportLastClient(parent);
+
+    if (_decision)
+        doc.append("decision", _decision->toBSON());
+
+    doc.append("deadline", _deadline);
+
+    parent.append("desc", "transaction coordinator");
+    parent.append("twoPhaseCommitCoordinator", doc.obj());
+}
+
+std::string TransactionCoordinator::toString(Step step) const {
+    switch (step) {
+        case Step::kInactive:
+            return "inactive";
+        case Step::kWritingParticipantList:
+            return "writingParticipantList";
+        case Step::kWaitingForVotes:
+            return "waitingForVotes";
+        case Step::kWritingDecision:
+            return "writingDecision";
+        case Step::kWaitingForDecisionAcks:
+            return "waitingForDecisionAck";
+        case Step::kDeletingCoordinatorDoc:
+            return "deletingCoordinatorDoc";
+        default:
+            MONGO_UNREACHABLE;
     }
 }
 
-StatusWith<CoordinatorCommitDecision> CoordinatorCommitDecision::fromBSON(const BSONObj& doc) {
-    CoordinatorCommitDecision decision;
-
-    for (const auto& e : doc) {
-        const auto fieldName = e.fieldNameStringData();
-
-        if (fieldName == "decision") {
-            if (e.type() != String) {
-                return Status(ErrorCodes::TypeMismatch, "decision must be a string");
-            }
-
-            if (e.str() == "commit") {
-                decision.decision = txn::CommitDecision::kCommit;
-            } else if (e.str() == "abort") {
-                decision.decision = txn::CommitDecision::kAbort;
-            } else {
-                return Status(ErrorCodes::BadValue, "decision must be either 'abort' or 'commit'");
-            }
-        } else if (fieldName == "commitTimestamp") {
-            if (e.type() != bsonTimestamp && e.type() != Date) {
-                return Status(ErrorCodes::TypeMismatch, "commit timestamp must be a timestamp");
-            }
-            decision.commitTimestamp = {e.timestamp()};
-        }
-    }
-
-    if (decision.decision == txn::CommitDecision::kAbort && decision.commitTimestamp) {
-        return Status(ErrorCodes::BadValue, "abort decision cannot have a timestamp");
-    }
-    if (decision.decision == txn::CommitDecision::kCommit && !decision.commitTimestamp) {
-        return Status(ErrorCodes::BadValue, "commit decision must have a timestamp");
-    }
-
-    return decision;
-}
-
-BSONObj CoordinatorCommitDecision::toBSON() const {
-    BSONObjBuilder builder;
-
-    if (decision == txn::CommitDecision::kCommit) {
-        builder.append("decision", "commit");
-    } else {
-        builder.append("decision", "abort");
-    }
-    if (commitTimestamp) {
-        builder.append("commitTimestamp", *commitTimestamp);
-    }
-
-    return builder.obj();
-}
-
-logger::LogstreamBuilder& operator<<(logger::LogstreamBuilder& stream,
-                                     const TransactionCoordinator::CoordinatorState& state) {
-    using State = TransactionCoordinator::CoordinatorState;
-    // clang-format off
-    switch (state) {
-        case State::kInit:  stream.stream() << "kInit"; break;
-        case State::kPreparing:   stream.stream() << "kPreparing"; break;
-        case State::kAborting: stream.stream() << "kAborting"; break;
-        case State::kCommitting: stream.stream() << "kCommitting"; break;
-        case State::kDone: stream.stream() << "kDone"; break;
-    };
-    // clang-format on
-    return stream;
-}
-
-logger::LogstreamBuilder& operator<<(logger::LogstreamBuilder& stream,
-                                     const txn::CommitDecision& decision) {
-    // clang-format off
-    switch (decision) {
-        case txn::CommitDecision::kCommit:     stream.stream() << "kCommit"; break;
-        case txn::CommitDecision::kAbort:      stream.stream() << "kAbort"; break;
-        case txn::CommitDecision::kCanceled:   stream.stream() << "kCanceled"; break;
-    };
-    // clang-format on
-    return stream;
+void TransactionCoordinator::_updateAssociatedClient(Client* client) {
+    stdx::lock_guard<Latch> lk(_mutex);
+    _transactionCoordinatorMetricsObserver->updateLastClientInfo(client);
 }
 
 }  // namespace mongo

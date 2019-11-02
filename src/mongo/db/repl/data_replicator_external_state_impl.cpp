@@ -77,21 +77,16 @@ OpTimeWithTerm DataReplicatorExternalStateImpl::getCurrentTermAndLastCommittedOp
     return {_replicationCoordinator->getTerm(), _replicationCoordinator->getLastCommittedOpTime()};
 }
 
-void DataReplicatorExternalStateImpl::processMetadata(
-    const rpc::ReplSetMetadata& replMetadata, boost::optional<rpc::OplogQueryMetadata> oqMetadata) {
-    OpTime newCommitPoint;
-    // If OplogQueryMetadata was provided, use its values, otherwise use the ones in
-    // ReplSetMetadata.
-    if (oqMetadata) {
-        newCommitPoint = oqMetadata->getLastOpCommitted();
-    } else {
-        newCommitPoint = replMetadata.getLastOpCommitted();
-    }
-    _replicationCoordinator->advanceCommitPoint(newCommitPoint);
+void DataReplicatorExternalStateImpl::processMetadata(const rpc::ReplSetMetadata& replMetadata,
+                                                      rpc::OplogQueryMetadata oqMetadata) {
+    OpTimeAndWallTime newCommitPoint = oqMetadata.getLastOpCommitted();
+
+    const bool fromSyncSource = true;
+    _replicationCoordinator->advanceCommitPoint(newCommitPoint, fromSyncSource);
 
     _replicationCoordinator->processReplSetMetadata(replMetadata);
 
-    if ((oqMetadata && (oqMetadata->getPrimaryIndex() != rpc::OplogQueryMetadata::kNoPrimary)) ||
+    if ((oqMetadata.getPrimaryIndex() != rpc::OplogQueryMetadata::kNoPrimary) ||
         (replMetadata.getPrimaryIndex() != rpc::ReplSetMetadata::kNoPrimary)) {
         _replicationCoordinator->cancelAndRescheduleElectionTimeout();
     }
@@ -128,10 +123,10 @@ std::unique_ptr<OplogBuffer> DataReplicatorExternalStateImpl::makeInitialSyncOpl
         invariant(initialSyncOplogBufferPeekCacheSize >= 0);
         OplogBufferCollection::Options options;
         options.peekCacheSize = std::size_t(initialSyncOplogBufferPeekCacheSize);
-        return stdx::make_unique<OplogBufferProxy>(
-            stdx::make_unique<OplogBufferCollection>(StorageInterface::get(opCtx), options));
+        return std::make_unique<OplogBufferProxy>(
+            std::make_unique<OplogBufferCollection>(StorageInterface::get(opCtx), options));
     } else {
-        return stdx::make_unique<OplogBufferBlockingQueue>();
+        return std::make_unique<OplogBufferBlockingQueue>();
     }
 }
 

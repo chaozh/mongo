@@ -44,11 +44,12 @@
 namespace mongo {
 namespace {
 
+using namespace shardmetadatautil;
+
 using std::string;
 using std::unique_ptr;
 using std::vector;
 using unittest::assertGet;
-using namespace shardmetadatautil;
 
 const NamespaceString kNss = NamespaceString("test.foo");
 const NamespaceString kChunkMetadataNss = NamespaceString("config.cache.chunks.test.foo");
@@ -61,22 +62,23 @@ struct ShardMetadataUtilTest : public ShardServerTestFixture {
      */
     ShardCollectionType setUpCollection() {
         BSONObjBuilder builder;
-        builder.append(ShardCollectionType::ns(), kNss.ns());
-        uuid.appendToBuilder(&builder, ShardCollectionType::uuid());
-        builder.append(ShardCollectionType::epoch(), maxCollVersion.epoch());
-        builder.append(ShardCollectionType::keyPattern(), keyPattern.toBSON());
-        builder.append(ShardCollectionType::defaultCollation(), defaultCollation);
-        builder.append(ShardCollectionType::unique(), kUnique);
+        builder.append(ShardCollectionType::kNssFieldName, kNss.ns());
+        builder.append(ShardCollectionType::kEpochFieldName, maxCollVersion.epoch());
+        builder.append(ShardCollectionType::kKeyPatternFieldName, keyPattern.toBSON());
+        builder.append(ShardCollectionType::kDefaultCollationFieldName, defaultCollation);
+        builder.append(ShardCollectionType::kUniqueFieldName, kUnique);
+
         ShardCollectionType shardCollectionType =
             assertGet(ShardCollectionType::fromBSON(builder.obj()));
-
+        shardCollectionType.setUuid(uuid);
         shardCollectionType.setRefreshing(true);
 
         ASSERT_OK(updateShardCollectionsEntry(operationContext(),
-                                              BSON(ShardCollectionType::ns(kNss.ns())),
+                                              BSON(ShardCollectionType::kNssFieldName << kNss.ns()),
                                               shardCollectionType.toBSON(),
                                               BSONObj(),
                                               true /*upsert*/));
+
         return shardCollectionType;
     }
 
@@ -101,8 +103,7 @@ struct ShardMetadataUtilTest : public ShardServerTestFixture {
             maxCollVersion.incMajor();
             BSONObj shardChunk =
                 BSON(ChunkType::minShardID(mins[i])
-                     << ChunkType::max(maxs[i])
-                     << ChunkType::shard(kShardId.toString())
+                     << ChunkType::max(maxs[i]) << ChunkType::shard(kShardId.toString())
                      << ChunkType::lastmod(Date_t::fromMillisSinceEpoch(maxCollVersion.toLong())));
 
             chunks.push_back(
@@ -128,7 +129,7 @@ struct ShardMetadataUtilTest : public ShardServerTestFixture {
     void checkCollectionIsEmpty(const NamespaceString& nss) {
         try {
             DBDirectClient client(operationContext());
-            ASSERT_EQUALS(client.count(nss.ns()), 0ULL);
+            ASSERT_EQUALS(client.count(nss), 0ULL);
         } catch (const DBException&) {
             ASSERT(false);
         }
@@ -142,8 +143,8 @@ struct ShardMetadataUtilTest : public ShardServerTestFixture {
         try {
             DBDirectClient client(operationContext());
             for (auto& chunk : chunks) {
-                Query query(BSON(ChunkType::minShardID() << chunk.getMin() << ChunkType::max()
-                                                         << chunk.getMax()));
+                Query query(BSON(ChunkType::minShardID()
+                                 << chunk.getMin() << ChunkType::max() << chunk.getMax()));
                 query.readPref(ReadPreference::Nearest, BSONArray());
 
                 std::unique_ptr<DBClientCursor> cursor = client.query(chunkMetadataNss, query, 1);
@@ -175,8 +176,8 @@ TEST_F(ShardMetadataUtilTest, UpdateAndReadCollectionsEntry) {
     ShardCollectionType readShardCollectionType =
         assertGet(readShardCollectionsEntry(operationContext(), kNss));
 
-    ASSERT_TRUE(readShardCollectionType.getUUID());
-    ASSERT_EQUALS(*updateShardCollectionType.getUUID(), *readShardCollectionType.getUUID());
+    ASSERT(readShardCollectionType.getUuid());
+    ASSERT_EQUALS(*updateShardCollectionType.getUuid(), *readShardCollectionType.getUuid());
     ASSERT_EQUALS(updateShardCollectionType.getNss(), readShardCollectionType.getNss());
     ASSERT_EQUALS(updateShardCollectionType.getEpoch(), readShardCollectionType.getEpoch());
     ASSERT_BSONOBJ_EQ(updateShardCollectionType.getKeyPattern().toBSON(),
@@ -184,12 +185,12 @@ TEST_F(ShardMetadataUtilTest, UpdateAndReadCollectionsEntry) {
     ASSERT_BSONOBJ_EQ(updateShardCollectionType.getDefaultCollation(),
                       readShardCollectionType.getDefaultCollation());
     ASSERT_EQUALS(updateShardCollectionType.getUnique(), readShardCollectionType.getUnique());
-    ASSERT_EQUALS(updateShardCollectionType.hasRefreshing(),
-                  readShardCollectionType.hasRefreshing());
+    ASSERT_EQUALS(*updateShardCollectionType.getRefreshing(),
+                  *readShardCollectionType.getRefreshing());
 
     // Refresh fields should not have been set.
-    ASSERT(!updateShardCollectionType.hasLastRefreshedCollectionVersion());
-    ASSERT(!readShardCollectionType.hasLastRefreshedCollectionVersion());
+    ASSERT(!updateShardCollectionType.getLastRefreshedCollectionVersion());
+    ASSERT(!readShardCollectionType.getLastRefreshedCollectionVersion());
 }
 
 TEST_F(ShardMetadataUtilTest, PersistedRefreshSignalStartAndFinish) {
@@ -198,19 +199,19 @@ TEST_F(ShardMetadataUtilTest, PersistedRefreshSignalStartAndFinish) {
     ShardCollectionType shardCollectionsEntry =
         assertGet(readShardCollectionsEntry(operationContext(), kNss));
 
-    ASSERT_EQUALS(*shardCollectionsEntry.getUUID(), uuid);
+    ASSERT_EQUALS(*shardCollectionsEntry.getUuid(), uuid);
     ASSERT_EQUALS(shardCollectionsEntry.getNss().ns(), kNss.ns());
     ASSERT_EQUALS(shardCollectionsEntry.getEpoch(), maxCollVersion.epoch());
     ASSERT_BSONOBJ_EQ(shardCollectionsEntry.getKeyPattern().toBSON(), keyPattern.toBSON());
     ASSERT_BSONOBJ_EQ(shardCollectionsEntry.getDefaultCollation(), defaultCollation);
     ASSERT_EQUALS(shardCollectionsEntry.getUnique(), kUnique);
-    ASSERT_EQUALS(shardCollectionsEntry.getRefreshing(), true);
-    ASSERT(!shardCollectionsEntry.hasLastRefreshedCollectionVersion());
+    ASSERT_EQUALS(*shardCollectionsEntry.getRefreshing(), true);
+    ASSERT(!shardCollectionsEntry.getLastRefreshedCollectionVersion());
 
     // Signal refresh start again to make sure nothing changes
     ASSERT_OK(updateShardCollectionsEntry(operationContext(),
-                                          BSON(ShardCollectionType::ns() << kNss.ns()),
-                                          BSON(ShardCollectionType::refreshing() << true),
+                                          BSON(ShardCollectionType::kNssFieldName << kNss.ns()),
+                                          BSON(ShardCollectionType::kRefreshingFieldName << true),
                                           BSONObj(),
                                           false));
 
@@ -259,7 +260,7 @@ TEST_F(ShardMetadataUtilTest, WriteAndReadChunks) {
                                            boost::none,
                                            maxCollVersion.epoch()));
 
-    ASSERT_TRUE(readChunks.size() == 1);
+    ASSERT(readChunks.size() == 1);
     ASSERT_BSONOBJ_EQ(chunks.back().toShardBSON(), readChunks.front().toShardBSON());
 }
 

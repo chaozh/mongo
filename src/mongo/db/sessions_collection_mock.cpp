@@ -27,15 +27,16 @@
  *    it in the license file.
  */
 
+#include <functional>
+
 #include "mongo/db/sessions_collection_mock.h"
 #include "mongo/platform/basic.h"
-#include "mongo/stdx/functional.h"
 
 namespace mongo {
 
 MockSessionsCollectionImpl::MockSessionsCollectionImpl()
-    : _refresh([=](const LogicalSessionRecordSet& sessions) { return _refreshSessions(sessions); }),
-      _remove([=](const LogicalSessionIdSet& sessions) { return _removeRecords(sessions); }) {}
+    : _refresh([=](const LogicalSessionRecordSet& sessions) { _refreshSessions(sessions); }),
+      _remove([=](const LogicalSessionIdSet& sessions) { _removeRecords(sessions); }) {}
 
 void MockSessionsCollectionImpl::setRefreshHook(RefreshHook hook) {
     _refresh = std::move(hook);
@@ -46,35 +47,35 @@ void MockSessionsCollectionImpl::setRemoveHook(RemoveHook hook) {
 }
 
 void MockSessionsCollectionImpl::clearHooks() {
-    _refresh = [=](const LogicalSessionRecordSet& sessions) { return _refreshSessions(sessions); };
-    _remove = [=](const LogicalSessionIdSet& sessions) { return _removeRecords(sessions); };
+    _refresh = [=](const LogicalSessionRecordSet& sessions) { _refreshSessions(sessions); };
+    _remove = [=](const LogicalSessionIdSet& sessions) { _removeRecords(sessions); };
 }
 
-Status MockSessionsCollectionImpl::refreshSessions(const LogicalSessionRecordSet& sessions) {
-    return _refresh(sessions);
+void MockSessionsCollectionImpl::refreshSessions(const LogicalSessionRecordSet& sessions) {
+    _refresh(sessions);
 }
 
-Status MockSessionsCollectionImpl::removeRecords(const LogicalSessionIdSet& sessions) {
-    return _remove(std::move(sessions));
+void MockSessionsCollectionImpl::removeRecords(const LogicalSessionIdSet& sessions) {
+    _remove(std::move(sessions));
 }
 
 void MockSessionsCollectionImpl::add(LogicalSessionRecord record) {
-    stdx::unique_lock<stdx::mutex> lk(_mutex);
+    stdx::unique_lock<Latch> lk(_mutex);
     _sessions.insert({record.getId(), std::move(record)});
 }
 
 void MockSessionsCollectionImpl::remove(LogicalSessionId lsid) {
-    stdx::unique_lock<stdx::mutex> lk(_mutex);
+    stdx::unique_lock<Latch> lk(_mutex);
     _sessions.erase(lsid);
 }
 
 bool MockSessionsCollectionImpl::has(LogicalSessionId lsid) {
-    stdx::unique_lock<stdx::mutex> lk(_mutex);
+    stdx::unique_lock<Latch> lk(_mutex);
     return _sessions.find(lsid) != _sessions.end();
 }
 
 void MockSessionsCollectionImpl::clearSessions() {
-    stdx::unique_lock<stdx::mutex> lk(_mutex);
+    stdx::unique_lock<Latch> lk(_mutex);
     _sessions.clear();
 }
 
@@ -82,28 +83,25 @@ const MockSessionsCollectionImpl::SessionMap& MockSessionsCollectionImpl::sessio
     return _sessions;
 }
 
-Status MockSessionsCollectionImpl::_refreshSessions(const LogicalSessionRecordSet& sessions) {
+void MockSessionsCollectionImpl::_refreshSessions(const LogicalSessionRecordSet& sessions) {
     for (auto& record : sessions) {
         if (!has(record.getId())) {
             _sessions.insert({record.getId(), record});
         }
     }
-    return Status::OK();
 }
 
-Status MockSessionsCollectionImpl::_removeRecords(const LogicalSessionIdSet& sessions) {
-    stdx::unique_lock<stdx::mutex> lk(_mutex);
+void MockSessionsCollectionImpl::_removeRecords(const LogicalSessionIdSet& sessions) {
+    stdx::unique_lock<Latch> lk(_mutex);
     for (auto& lsid : sessions) {
         _sessions.erase(lsid);
     }
-
-    return Status::OK();
 }
 
-StatusWith<LogicalSessionIdSet> MockSessionsCollectionImpl::findRemovedSessions(
+LogicalSessionIdSet MockSessionsCollectionImpl::findRemovedSessions(
     OperationContext* opCtx, const LogicalSessionIdSet& sessions) {
     LogicalSessionIdSet lsids;
-    stdx::unique_lock<stdx::mutex> lk(_mutex);
+    stdx::unique_lock<Latch> lk(_mutex);
     for (auto& lsid : sessions) {
         if (_sessions.find(lsid) == _sessions.end()) {
             lsids.emplace(lsid);

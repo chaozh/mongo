@@ -38,6 +38,8 @@
 #include "mongo/client/dbclient_connection.h"
 
 #include <algorithm>
+#include <functional>
+#include <memory>
 #include <utility>
 
 #include "mongo/base/status.h"
@@ -49,6 +51,7 @@
 #include "mongo/client/dbclient_cursor.h"
 #include "mongo/client/replica_set_monitor.h"
 #include "mongo/config.h"
+#include "mongo/db/auth/user_name.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/test_commands_enabled.h"
@@ -59,12 +62,10 @@
 #include "mongo/db/wire_version.h"
 #include "mongo/executor/remote_command_request.h"
 #include "mongo/executor/remote_command_response.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/rpc/metadata/client_metadata.h"
 #include "mongo/s/stale_exception.h"
-#include "mongo/stdx/functional.h"
-#include "mongo/stdx/memory.h"
-#include "mongo/stdx/mutex.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/concurrency/mutex.h"
 #include "mongo/util/debug_util.h"
@@ -79,10 +80,12 @@
 
 namespace mongo {
 
-using std::unique_ptr;
 using std::endl;
 using std::map;
 using std::string;
+using std::unique_ptr;
+
+MONGO_FAIL_POINT_DEFINE(dbClientConnectionDisableChecksum);
 
 namespace {
 
@@ -106,10 +109,12 @@ private:
 };
 
 /**
-* Initializes the wire version of conn, and returns the isMaster reply.
-*/
+ * Initializes the wire version of conn, and returns the isMaster reply.
+ */
 executor::RemoteCommandResponse initWireVersion(DBClientConnection* conn,
-                                                StringData applicationName) {
+                                                StringData applicationName,
+                                                const MongoURI& uri,
+                                                std::vector<std::string>* saslMechsForAuth) {
     try {
         // We need to force the usage of OP_QUERY on this command, even if we have previously
         // detected support for OP_MSG on a connection. This is necessary to handle the case
@@ -118,6 +123,12 @@ executor::RemoteCommandResponse initWireVersion(DBClientConnection* conn,
 
         BSONObjBuilder bob;
         bob.append("isMaster", 1);
+
+        if (!uri.getUser().empty()) {
+            const auto authDatabase = uri.getAuthenticationDatabase();
+            UserName user(uri.getUser(), authDatabase);
+            bob.append("saslSupportedMechs", user.getUnambiguousName());
+        }
 
         if (getTestCommandsEnabled()) {
             // Only include the host:port of this process in the isMaster command request if test
@@ -152,6 +163,14 @@ executor::RemoteCommandResponse initWireVersion(DBClientConnection* conn,
             int minWireVersion = isMasterObj["minWireVersion"].numberInt();
             int maxWireVersion = isMasterObj["maxWireVersion"].numberInt();
             conn->setWireVersions(minWireVersion, maxWireVersion);
+        }
+
+        if (isMasterObj.hasField("saslSupportedMechs") &&
+            isMasterObj["saslSupportedMechs"].type() == Array) {
+            auto array = isMasterObj["saslSupportedMechs"].Array();
+            for (const auto& elem : array) {
+                saslMechsForAuth->push_back(elem.checkAndGetStringData().toString());
+            }
         }
 
         conn->getCompressorManager().clientFinish(isMasterObj);
@@ -209,7 +228,7 @@ Status DBClientConnection::connect(const HostAndPort& serverAddress, StringData 
     // access the application name, do it through the _applicationName member.
     _applicationName = applicationName.toString();
 
-    auto swIsMasterReply = initWireVersion(this, _applicationName);
+    auto swIsMasterReply = initWireVersion(this, _applicationName, _uri, &_saslMechsForAuth);
     if (!swIsMasterReply.isOK()) {
         _markFailed(kSetFlag);
         return swIsMasterReply.status;
@@ -308,12 +327,11 @@ Status DBClientConnection::connectSocketOnly(const HostAndPort& serverAddress) {
     if (!sws.isOK()) {
         return Status(ErrorCodes::HostUnreachable,
                       str::stream() << "couldn't connect to server " << _serverAddress.toString()
-                                    << ", connection attempt failed: "
-                                    << sws.getStatus());
+                                    << ", connection attempt failed: " << sws.getStatus());
     }
 
     {
-        stdx::lock_guard<stdx::mutex> lk(_sessionMutex);
+        stdx::lock_guard<Latch> lk(_sessionMutex);
         if (_stayFailed.load()) {
             // This object is still in a failed state. The session we just created will be destroyed
             // immediately since we aren't holding on to it.
@@ -382,7 +400,7 @@ void DBClientConnection::_markFailed(FailAction action) {
         } else if (action == kReleaseSession) {
             transport::SessionHandle destroyedOutsideMutex;
 
-            stdx::lock_guard<stdx::mutex> lk(_sessionMutex);
+            stdx::lock_guard<Latch> lk(_sessionMutex);
             _session.swap(destroyedOutsideMutex);
         }
     }
@@ -434,7 +452,7 @@ void DBClientConnection::setTags(transport::Session::TagMask tags) {
 }
 
 void DBClientConnection::shutdownAndDisallowReconnect() {
-    stdx::lock_guard<stdx::mutex> lk(_sessionMutex);
+    stdx::lock_guard<Latch> lk(_sessionMutex);
     _stayFailed.store(true);
     _markFailed(kEndSession);
 }
@@ -501,7 +519,7 @@ uint64_t DBClientConnection::getSockCreationMicroSec() const {
     }
 }
 
-unsigned long long DBClientConnection::query(stdx::function<void(DBClientCursorBatchIterator&)> f,
+unsigned long long DBClientConnection::query(std::function<void(DBClientCursorBatchIterator&)> f,
                                              const NamespaceStringOrUUID& nsOrUuid,
                                              Query query,
                                              const BSONObj* fieldsToReturn,
@@ -559,6 +577,15 @@ void DBClientConnection::say(Message& toSend, bool isRetry, string* actualServer
 
     toSend.header().setId(nextMessageId());
     toSend.header().setResponseToMsgId(0);
+    if (!MONGO_unlikely(dbClientConnectionDisableChecksum.shouldFail())) {
+#ifdef MONGO_CONFIG_SSL
+        if (!SSLPeerInfo::forSession(_session).isTLS) {
+            OpMsg::appendChecksum(&toSend);
+        }
+#else
+        OpMsg::appendChecksum(&toSend);
+#endif
+    }
     uassertStatusOK(
         _session->sinkMessage(uassertStatusOK(_compressorManager.compressMessage(toSend))));
     killSessionOnError.dismiss();
@@ -594,19 +621,28 @@ bool DBClientConnection::call(Message& toSend,
         if (assertOk)
             uasserted(10278,
                       str::stream() << "dbclient error communicating with server "
-                                    << getServerAddress()
-                                    << ": "
-                                    << redact(errStatus));
+                                    << getServerAddress() << ": " << redact(errStatus));
         return false;
     };
 
     toSend.header().setId(nextMessageId());
     toSend.header().setResponseToMsgId(0);
+    if (!MONGO_unlikely(dbClientConnectionDisableChecksum.shouldFail())) {
+#ifdef MONGO_CONFIG_SSL
+        if (!SSLPeerInfo::forSession(_session).isTLS) {
+            OpMsg::appendChecksum(&toSend);
+        }
+#else
+        OpMsg::appendChecksum(&toSend);
+#endif
+    }
     auto swm = _compressorManager.compressMessage(toSend);
     uassertStatusOK(swm.getStatus());
 
     auto sinkStatus = _session->sinkMessage(swm.getValue());
     if (!sinkStatus.isOK()) {
+        log() << "DBClientConnection failed to send message to " << getServerAddress() << " - "
+              << redact(sinkStatus);
         return maybeThrow(sinkStatus);
     }
 
@@ -614,6 +650,8 @@ bool DBClientConnection::call(Message& toSend,
     if (swm.isOK()) {
         response = std::move(swm.getValue());
     } else {
+        log() << "DBClientConnection failed to receive message from " << getServerAddress() << " - "
+              << redact(swm.getStatus());
         return maybeThrow(swm.getStatus());
     }
 
@@ -631,7 +669,7 @@ void DBClientConnection::checkResponse(const std::vector<BSONObj>& batch,
                                        string* host) {
     /* check for errors.  the only one we really care about at
      * this stage is "not master"
-    */
+     */
 
     *retry = false;
     *host = _serverAddress.toString();
@@ -660,8 +698,7 @@ void DBClientConnection::handleNotMasterResponse(const BSONObj& replyBody,
         monitor->failedHost(_serverAddress,
                             {ErrorCodes::NotMaster,
                              str::stream() << "got not master from: " << _serverAddress
-                                           << " of repl set: "
-                                           << _parentReplSetName});
+                                           << " of repl set: " << _parentReplSetName});
     }
 
     _markFailed(kSetFlag);

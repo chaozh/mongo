@@ -93,10 +93,6 @@ public:
         UASSERT_NOT_IMPLEMENTED;
     }
 
-    std::string getAuthenticatedUserNamesToken() override {
-        UASSERT_NOT_IMPLEMENTED;
-    }
-
     void grantInternalAuthorization(Client* client) override {
         // Always okay to do something, on embedded.
     }
@@ -121,8 +117,11 @@ public:
         return Status::OK();
     }
 
-    Status checkAuthForUpdate(
-        OperationContext*, const NamespaceString&, const BSONObj&, const BSONObj&, bool) override {
+    Status checkAuthForUpdate(OperationContext*,
+                              const NamespaceString&,
+                              const BSONObj&,
+                              const write_ops::UpdateModification&,
+                              bool) override {
         return Status::OK();
     }
 

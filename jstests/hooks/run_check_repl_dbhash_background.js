@@ -18,19 +18,28 @@
 'use strict';
 
 (function() {
-    load('jstests/libs/discover_topology.js');  // For Topology and DiscoverTopology.
+load('jstests/libs/discover_topology.js');  // For Topology and DiscoverTopology.
+load('jstests/libs/parallelTester.js');     // For Thread.
 
-    if (typeof db === 'undefined') {
-        throw new Error(
-            "Expected mongo shell to be connected a server, but global 'db' object isn't defined");
-    }
+if (typeof db === 'undefined') {
+    throw new Error(
+        "Expected mongo shell to be connected a server, but global 'db' object isn't defined");
+}
 
+// We turn off printing the JavaScript stacktrace in doassert() to avoid generating an
+// overwhelming amount of log messages when handling transient errors.
+TestData = TestData || {};
+TestData.traceExceptions = false;
+
+// Disable implicit sessions so FSM workloads that kill random sessions won't interrupt the
+// operations in this test that aren't resilient to interruptions.
+TestData.disableImplicitSessions = true;
+
+const conn = db.getMongo();
+const topology = DiscoverTopology.findConnectedNodes(conn);
+
+function checkReplDbhashBackgroundThread(hosts) {
     let debugInfo = [];
-
-    // We turn off printing the JavaScript stacktrace in doassert() to avoid generating an
-    // overwhelming amount of log messages when handling transient errors.
-    TestData = TestData || {};
-    TestData.traceExceptions = false;
 
     // Calls 'func' with the print() function overridden to be a no-op.
     const quietly = (func) => {
@@ -43,22 +52,21 @@
         }
     };
 
-    const conn = db.getMongo();
-    const topology = DiscoverTopology.findConnectedNodes(conn);
-
-    if (topology.type !== Topology.kReplicaSet) {
-        throw new Error('Unsupported topology configuration: ' + tojson(topology));
-    }
-
     let rst;
-
-    // We construct the ReplSetTest instance with the print() function overridden to be a no-op in
-    // order to suppress the log messages about the replica set configuration. The
+    // We construct the ReplSetTest instance with the print() function overridden to be a no-op
+    // in order to suppress the log messages about the replica set configuration. The
     // run_check_repl_dbhash_background.js hook is executed frequently by resmoke.py and would
     // otherwise lead to generating an overwhelming amount of log messages.
     quietly(() => {
-        rst = new ReplSetTest(topology.nodes[0]);
+        rst = new ReplSetTest(hosts[0]);
     });
+
+    if (!rst.getPrimary().adminCommand("serverStatus").storageEngine.supportsSnapshotReadConcern) {
+        print("Skipping data consistency checks for replica set: " + rst.getURL() +
+              " because storage engine does not support snapshot reads.");
+        return {ok: 1};
+    }
+    print("Running data consistency checks for replica set: " + rst.getURL());
 
     const sessions = [
         rst.getPrimary(),
@@ -74,21 +82,23 @@
     // We enable the "WTPreserveSnapshotHistoryIndefinitely" failpoint to ensure that the same
     // snapshot will be available to read at on the primary and secondaries.
     for (let session of sessions) {
-        const db = session.getDatabase('admin');
+        // Use the session's client directly so FSM workloads that kill random sessions won't
+        // interrupt these operations.
+        const dbNoSession = session.getClient().getDB('admin');
 
-        let preserveRes = assert.commandWorked(db.runCommand({
+        let preserveRes = assert.commandWorked(dbNoSession.runCommand({
             configureFailPoint: 'WTPreserveSnapshotHistoryIndefinitely',
             mode: 'alwaysOn',
         }),
                                                debugInfo);
         debugInfo.push({
-            "node": db.getMongo(),
+            "node": dbNoSession.getMongo(),
             "session": session,
             "preserveFailPointOpTime": preserveRes['operationTime']
         });
 
         resetFns.push(() => {
-            assert.commandWorked(db.runCommand({
+            assert.commandWorked(dbNoSession.runCommand({
                 configureFailPoint: 'WTPreserveSnapshotHistoryIndefinitely',
                 mode: 'off',
             }));
@@ -96,13 +106,16 @@
     }
 
     for (let session of sessions) {
-        const db = session.getDatabase('admin');
-        const res = assert.commandWorked(db.runCommand({listDatabases: 1, nameOnly: true}));
+        // Use the session's client directly so FSM workloads that kill random sessions won't
+        // interrupt these operations.
+        const dbNoSession = session.getClient().getDB('admin');
+        const res =
+            assert.commandWorked(dbNoSession.runCommand({listDatabases: 1, nameOnly: true}));
         for (let dbInfo of res.databases) {
             dbNames.add(dbInfo.name);
         }
         debugInfo.push({
-            "node": db.getMongo(),
+            "node": dbNoSession.getMongo(),
             "session": session,
             "listDatabaseOpTime": res['operationTime']
         });
@@ -125,17 +138,17 @@
             const session = sessions[i];
             const db = session.getDatabase('admin');
 
-            // We advance the clusterTime on the secondary's session to ensure that 'clusterTime'
-            // doesn't exceed the node's notion of the latest clusterTime.
+            // We advance the clusterTime on the secondary's session to ensure that
+            // 'clusterTime' doesn't exceed the node's notion of the latest clusterTime.
             session.advanceClusterTime(signedClusterTime);
 
-            // We need to make sure the secondary has applied up to 'clusterTime' and advanced its
-            // majority commit point.
+            // We need to make sure the secondary has applied up to 'clusterTime' and advanced
+            // its majority commit point.
 
             if (jsTest.options().enableMajorityReadConcern !== false) {
                 // If majority reads are supported, we can issue an afterClusterTime read on
-                // a nonexistent collection and wait on it. This has the advantage of being easier
-                // to debug in case of a timeout.
+                // a nonexistent collection and wait on it. This has the advantage of being
+                // easier to debug in case of a timeout.
                 let res = assert.commandWorked(db.runCommand({
                     find: 'run_check_repl_dbhash_background',
                     readConcern: {level: 'majority', afterClusterTime: clusterTime},
@@ -176,11 +189,11 @@
         }
     };
 
-    // The checkCollectionHashesForDB() function identifies a collection by its UUID and ignores the
-    // case where a collection isn't present on a node to work around how the collection catalog
-    // isn't multi-versioned. Unlike with ReplSetTest#checkReplicatedDataHashes(), it is possible
-    // for a collection catalog operation (e.g. a drop or rename) to have been applied on the
-    // primary but not yet applied on the secondary.
+    // The checkCollectionHashesForDB() function identifies a collection by its UUID and ignores
+    // the case where a collection isn't present on a node to work around how the collection
+    // catalog isn't multi-versioned. Unlike with ReplSetTest#checkReplicatedDataHashes(), it is
+    // possible for a collection catalog operation (e.g. a drop or rename) to have been applied
+    // on the primary but not yet applied on the secondary.
     const checkCollectionHashesForDB = (dbName, clusterTime) => {
         const result = [];
         const hashes =
@@ -230,8 +243,8 @@
 
                 if (primaryInfo.hash !== secondaryInfo.hash) {
                     print("DBHash mismatch found for collection with uuid: " + uuid +
-                          ". Primary info: " + tojsononeline(primaryInfo) + ". Secondary info: " +
-                          tojsononeline(secondaryInfo));
+                          ". Primary info: " + tojsononeline(primaryInfo) +
+                          ". Secondary info: " + tojsononeline(secondaryInfo));
                     const diff = rst.getCollectionDiffUsingSessions(
                         primarySession, secondarySession, dbName, primaryInfo.uuid);
 
@@ -248,35 +261,62 @@
         return result;
     };
 
+    // Outside of checkCollectionHashesForDB(), operations in this function are not resilient to
+    // their session being killed by a concurrent FSM workload, so the driver sessions started above
+    // have not been used and will have contain null logical time values. The process for selecting
+    // a read timestamp below assumes each session has valid logical times, so run a dummy command
+    // through each session to populate its logical times.
+    sessions.forEach(session => session.getDatabase('admin').runCommand({ping: 1}));
+
     for (let dbName of dbNames) {
         let result;
         let clusterTime;
+        let previousClusterTime;
         let hasTransientError;
+        let performNoopWrite;
 
         // The isTransientError() function is responsible for setting hasTransientError to true.
         const isTransientError = (e) => {
             // It is possible for the ReplSetTest#getHashesUsingSessions() function to be
-            // interrupted due to active sessions being killed by a test running concurrently. We
-            // treat this as a transient error and simply retry running the dbHash check.
+            // interrupted due to active sessions being killed by a test running concurrently.
+            // We treat this as a transient error and simply retry running the dbHash check.
             //
             // Note that unlike auto_retry_transaction.js, we do not treat CursorKilled or
             // CursorNotFound error responses as transient errors because the
             // run_check_repl_dbhash_background.js hook would only establish a cursor via
-            // ReplSetTest#getCollectionDiffUsingSessions() upon detecting a dbHash mismatch. It is
-            // presumed to still useful to know that a bug exists even if we cannot get more
+            // ReplSetTest#getCollectionDiffUsingSessions() upon detecting a dbHash mismatch. It
+            // is presumed to still useful to know that a bug exists even if we cannot get more
             // diagnostics for it.
-            if (e.code === ErrorCodes.Interrupted || e.code === ErrorCodes.SnapshotUnavailable) {
+            if (e.code === ErrorCodes.Interrupted) {
                 hasTransientError = true;
-                return true;
             }
 
-            return false;
+            // Perform a no-op write to the primary if the clusterTime between each call remain
+            // the same and if we encounter the SnapshotUnavailable error as the secondaries
+            // minimum timestamp can be greater than the primaries minimum timestamp.
+            if (e.code === ErrorCodes.SnapshotUnavailable) {
+                if (bsonBinaryEqual(clusterTime, previousClusterTime)) {
+                    performNoopWrite = true;
+                }
+                hasTransientError = true;
+            }
+
+            // InvalidOptions can be returned when $_internalReadAtClusterTime is greater than
+            // the all-committed timestamp. As the dbHash command is running in the background
+            // at varying times, it's possible that we may run dbHash while a prepared
+            // transactions has yet to commit or abort.
+            if (e.code === ErrorCodes.InvalidOptions) {
+                hasTransientError = true;
+            }
+
+            return hasTransientError;
         };
 
         do {
             // SERVER-38928: Due to races around advancing last applied, there's technically no
             // guarantee that a primary will report a later operation time than its
             // secondaries. Perform the snapshot read at the latest reported operation time.
+            previousClusterTime = clusterTime;
             clusterTime = sessions[0].getOperationTime();
             let signedClusterTime = sessions[0].getClusterTime();
             for (let sess of sessions.slice(1)) {
@@ -286,23 +326,38 @@
                     signedClusterTime = sess.getClusterTime();
                 }
             }
-            waitForSecondaries(clusterTime, signedClusterTime);
-
-            for (let session of sessions) {
-                debugInfo.push({
-                    "node": session.getClient(),
-                    "session": session,
-                    "readAtClusterTime": clusterTime
-                });
-            }
 
             hasTransientError = false;
+            performNoopWrite = false;
 
             try {
+                waitForSecondaries(clusterTime, signedClusterTime);
+
+                for (let session of sessions) {
+                    debugInfo.push({
+                        "node": session.getClient(),
+                        "session": session,
+                        "readAtClusterTime": clusterTime
+                    });
+                }
+
                 result = checkCollectionHashesForDB(dbName, clusterTime);
             } catch (e) {
                 if (isTransientError(e)) {
-                    debugInfo.push({"transientError": e});
+                    if (performNoopWrite) {
+                        // Use the session's client directly so FSM workloads that kill random
+                        // sessions won't interrupt appendOplogNote.
+                        const primaryConn = sessions[0].getClient();
+
+                        // If the no-op write fails due to the global lock not being able to be
+                        // acquired within 1 millisecond, retry the operation again at a later
+                        // time.
+                        assert.commandWorkedOrFailedWithCode(
+                            primaryConn.adminCommand({appendOplogNote: 1, data: {}}),
+                            ErrorCodes.LockFailed);
+                    }
+
+                    debugInfo.push({"transientError": e, "performNoopWrite": performNoopWrite});
                     continue;
                 }
 
@@ -342,9 +397,7 @@
         if (diff.docsWithDifferentContents.length > 0) {
             errorBlob += '\nThe following documents have different contents on the primary and' +
                 ' secondary:';
-            for (let {
-                     primary, secondary
-                 } of diff.docsWithDifferentContents) {
+            for (let {primary, secondary} of diff.docsWithDifferentContents) {
                 errorBlob += `\n  primary:   ${tojsononeline(primary)}`;
                 errorBlob += `\n  secondary: ${tojsononeline(secondary)}`;
             }
@@ -379,6 +432,75 @@
         }
 
         print(errorBlob);
-        throw new Error(`dbhash mismatch (search for the following headings): ${tojson(headings)}`);
+        return {
+            ok: 0,
+            hosts: hosts,
+            error: `dbhash mismatch (search for the following headings): ${tojson(headings)}`
+        };
     }
+
+    return {ok: 1};
+}
+
+if (topology.type === Topology.kReplicaSet) {
+    let res = checkReplDbhashBackgroundThread(topology.nodes);
+    assert.commandWorked(res, () => 'data consistency checks failed: ' + tojson(res));
+} else if (topology.type === Topology.kShardedCluster) {
+    const threads = [];
+    try {
+        if (topology.configsvr.nodes.length > 1) {
+            const thread = new Thread(checkReplDbhashBackgroundThread, topology.configsvr.nodes);
+            threads.push(thread);
+            thread.start();
+        } else {
+            print('Skipping data consistency checks for 1-node CSRS: ' +
+                  tojsononeline(topology.configsvr));
+        }
+
+        for (let shardName of Object.keys(topology.shards)) {
+            const shard = topology.shards[shardName];
+
+            if (shard.type === Topology.kStandalone) {
+                print('Skipping data consistency checks for stand-alone shard ' + shardName + ": " +
+                      tojsononeline(shard));
+                continue;
+            }
+
+            if (shard.type !== Topology.kReplicaSet) {
+                throw new Error('Unrecognized topology format: ' + tojson(topology));
+            }
+
+            if (shard.nodes.length > 1) {
+                const thread = new Thread(checkReplDbhashBackgroundThread, shard.nodes);
+                threads.push(thread);
+                thread.start();
+            } else {
+                print('Skipping data consistency checks for stand-alone shard ' + shardName + ": " +
+                      tojsononeline(shard));
+            }
+        }
+    } finally {
+        // Wait for each thread to finish. Throw an error if any thread fails.
+        let exception;
+        const returnData = threads.map(thread => {
+            try {
+                thread.join();
+                return thread.returnData();
+            } catch (e) {
+                if (!exception) {
+                    exception = e;
+                }
+            }
+        });
+        if (exception) {
+            throw exception;
+        }
+
+        returnData.forEach(res => {
+            assert.commandWorked(res, () => 'data consistency checks failed: ' + tojson(res));
+        });
+    }
+} else {
+    throw new Error('Unsupported topology configuration: ' + tojson(topology));
+}
 })();

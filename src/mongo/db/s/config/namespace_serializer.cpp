@@ -49,12 +49,12 @@ NamespaceSerializer::ScopedLock::ScopedLock(StringData ns, NamespaceSerializer& 
     : _ns(ns.toString()), _nsSerializer(nsSerializer) {}
 
 NamespaceSerializer::ScopedLock::~ScopedLock() {
-    stdx::unique_lock<stdx::mutex> lock(_nsSerializer._mutex);
+    stdx::unique_lock<Latch> lock(_nsSerializer._mutex);
     auto iter = _nsSerializer._inProgressMap.find(_ns);
 
     iter->second->numWaiting--;
     iter->second->isInProgress = false;
-    iter->second->cvLocked.notify_one();
+    iter->second->cvLocked.notify_all();
 
     if (iter->second->numWaiting == 0) {
         _nsSerializer._inProgressMap.erase(_ns);
@@ -62,7 +62,7 @@ NamespaceSerializer::ScopedLock::~ScopedLock() {
 }
 
 NamespaceSerializer::ScopedLock NamespaceSerializer::lock(OperationContext* opCtx, StringData nss) {
-    stdx::unique_lock<stdx::mutex> lock(_mutex);
+    stdx::unique_lock<Latch> lock(_mutex);
     auto iter = _inProgressMap.find(nss);
 
     if (iter == _inProgressMap.end()) {
@@ -70,8 +70,10 @@ NamespaceSerializer::ScopedLock NamespaceSerializer::lock(OperationContext* opCt
     } else {
         auto nsLock = iter->second;
         nsLock->numWaiting++;
+        auto guard = makeGuard([&] { nsLock->numWaiting--; });
         opCtx->waitForConditionOrInterrupt(
             nsLock->cvLocked, lock, [nsLock]() { return !nsLock->isInProgress; });
+        guard.dismiss();
         nsLock->isInProgress = true;
     }
 

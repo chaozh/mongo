@@ -35,10 +35,10 @@
 
 #include "mongo/base/parse_number.h"
 #include "mongo/base/string_data.h"
-#include "mongo/db/pipeline/document.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/pipeline/field_path.h"
-#include "mongo/db/pipeline/value.h"
-#include "mongo/util/stringutils.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 namespace document_path_support {
@@ -49,8 +49,7 @@ namespace {
  * If 'value' is an array, invokes 'callback' once on each element of 'value'. Otherwise, if 'value'
  * is not missing, invokes 'callback' on 'value' itself.
  */
-void invokeCallbackOnTrailingValue(const Value& value,
-                                   stdx::function<void(const Value&)> callback) {
+void invokeCallbackOnTrailingValue(const Value& value, std::function<void(const Value&)> callback) {
     if (value.isArray()) {
         for (auto&& finalValue : value.getArray()) {
             if (!finalValue.missing()) {
@@ -65,7 +64,7 @@ void invokeCallbackOnTrailingValue(const Value& value,
 void visitAllValuesAtPathHelper(Document doc,
                                 const FieldPath& path,
                                 size_t fieldPathIndex,
-                                stdx::function<void(const Value&)> callback) {
+                                std::function<void(const Value&)> callback) {
     invariant(path.getPathLength() > 0 && fieldPathIndex < path.getPathLength());
 
     // The first field in the path must be treated as a field name, even if it is numeric as in
@@ -81,7 +80,7 @@ void visitAllValuesAtPathHelper(Document doc,
     // positional specifications, if applicable. For example, it will consume "0" and "1" from the
     // path "a.0.1.b" if the value at "a" is an array with arrays inside it.
     while (fieldPathIndex < path.getPathLength() && nextValue.isArray()) {
-        if (auto index = parseUnsignedBase10Integer(path.getFieldName(fieldPathIndex))) {
+        if (auto index = str::parseUnsignedBase10Integer(path.getFieldName(fieldPathIndex))) {
             nextValue = nextValue[*index];
             ++fieldPathIndex;
         } else {
@@ -116,7 +115,7 @@ void visitAllValuesAtPathHelper(Document doc,
 
 void visitAllValuesAtPath(const Document& doc,
                           const FieldPath& path,
-                          stdx::function<void(const Value&)> callback) {
+                          std::function<void(const Value&)> callback) {
     visitAllValuesAtPathHelper(doc, path, 0, callback);
 }
 

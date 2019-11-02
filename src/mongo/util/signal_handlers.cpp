@@ -65,7 +65,7 @@ const char* strsignal(int signalNum) {
             return "UNKNOWN";
     }
 }
-}
+}  // namespace
 #endif
 
 namespace mongo {
@@ -131,8 +131,8 @@ BOOL WINAPI CtrlHandler(DWORD fdwCtrlType) {
 void eventProcessingThread() {
     std::string eventName = getShutdownSignalName(ProcessId::getCurrent().asUInt32());
 
-    HANDLE event = CreateEventA(NULL, TRUE, FALSE, eventName.c_str());
-    if (event == NULL) {
+    HANDLE event = CreateEventA(nullptr, TRUE, FALSE, eventName.c_str());
+    if (event == nullptr) {
         warning() << "eventProcessingThread CreateEvent failed: " << errnoWithDescription();
         return;
     }
@@ -180,14 +180,15 @@ void signalProcessingThread(LogFileStatus rotate) {
         switch (actualSignal) {
             case SIGUSR1:
                 // log rotate signal
-                signalTimeSeconds = time(0);
+                signalTimeSeconds = time(nullptr);
                 if (signalTimeSeconds <= lastSignalTimeSeconds) {
                     // ignore multiple signals in the same or earlier second.
                     break;
                 }
 
                 lastSignalTimeSeconds = signalTimeSeconds;
-                fassert(16782, rotateLogs(serverGlobalParams.logRenameOnRotate));
+                fassert(16782,
+                        rotateLogs(serverGlobalParams.logRenameOnRotate, serverGlobalParams.logV2));
                 if (rotate == LogFileStatus::kNeedToRotateLogFile) {
                     logProcessDetailsForLogRotate(getGlobalServiceContext());
                 }
@@ -227,7 +228,7 @@ void startSignalProcessingThread(LogFileStatus rotate) {
     stdx::thread(eventProcessingThread).detach();
 #else
     // Mask signals in the current (only) thread. All new threads will inherit this mask.
-    invariant(pthread_sigmask(SIG_SETMASK, &asyncSignals, 0) == 0);
+    invariant(pthread_sigmask(SIG_SETMASK, &asyncSignals, nullptr) == 0);
     // Spawn a thread to capture the signals we just masked off.
     stdx::thread(signalProcessingThread, rotate).detach();
 #endif

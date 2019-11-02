@@ -31,9 +31,9 @@
 
 #include "mongo/db/query/explain.h"
 
-#include "mongo/base/owned_pointer_vector.h"
 #include "mongo/bson/util/builder.h"
 #include "mongo/db/exec/cached_plan.h"
+#include "mongo/db/exec/collection_scan.h"
 #include "mongo/db/exec/count_scan.h"
 #include "mongo/db/exec/distinct_scan.h"
 #include "mongo/db/exec/idhack.h"
@@ -41,10 +41,12 @@
 #include "mongo/db/exec/multi_plan.h"
 #include "mongo/db/exec/near.h"
 #include "mongo/db/exec/pipeline_proxy.h"
+#include "mongo/db/exec/sort.h"
 #include "mongo/db/exec/text.h"
 #include "mongo/db/exec/working_set_common.h"
 #include "mongo/db/keypattern.h"
 #include "mongo/db/query/canonical_query_encoder.h"
+#include "mongo/db/query/collection_query_info.h"
 #include "mongo/db/query/get_executor.h"
 #include "mongo/db/query/plan_executor.h"
 #include "mongo/db/query/plan_summary_stats.h"
@@ -53,8 +55,8 @@
 #include "mongo/db/query/stage_builder.h"
 #include "mongo/db/server_options.h"
 #include "mongo/util/hex.h"
-#include "mongo/util/mongoutils/str.h"
 #include "mongo/util/net/socket_utils.h"
+#include "mongo/util/str.h"
 #include "mongo/util/version.h"
 
 namespace {
@@ -296,7 +298,7 @@ unique_ptr<PlanStageStats> getWinningPlanStatsTree(const PlanExecutor* exec) {
 
 namespace mongo {
 
-using mongoutils::str::stream;
+using str::stream;
 
 // static
 void Explain::statsToBSON(const PlanStageStats& stats,
@@ -331,6 +333,8 @@ void Explain::statsToBSON(const PlanStageStats& stats,
         bob->appendNumber("needYield", stats.common.needYield);
         bob->appendNumber("saveState", stats.common.yields);
         bob->appendNumber("restoreState", stats.common.unyields);
+        if (stats.common.failed)
+            bob->appendBool("failed", stats.common.failed);
         bob->appendNumber("isEOF", stats.common.isEOF);
     }
 
@@ -358,6 +362,9 @@ void Explain::statsToBSON(const PlanStageStats& stats,
     } else if (STAGE_COLLSCAN == stats.stageType) {
         CollectionScanStats* spec = static_cast<CollectionScanStats*>(stats.specific.get());
         bob->append("direction", spec->direction > 0 ? "forward" : "backward");
+        if (spec->minTs) {
+            bob->append("minTs", *(spec->minTs));
+        }
         if (spec->maxTs) {
             bob->append("maxTs", *(spec->maxTs));
         }
@@ -534,14 +541,15 @@ void Explain::statsToBSON(const PlanStageStats& stats,
     } else if (STAGE_SORT == stats.stageType) {
         SortStats* spec = static_cast<SortStats*>(stats.specific.get());
         bob->append("sortPattern", spec->sortPattern);
-
-        if (verbosity >= ExplainOptions::Verbosity::kExecStats) {
-            bob->appendNumber("memUsage", spec->memUsage);
-            bob->appendNumber("memLimit", spec->memLimit);
-        }
+        bob->appendIntOrLL("memLimit", spec->maxMemoryUsageBytes);
 
         if (spec->limit > 0) {
-            bob->appendNumber("limitAmount", spec->limit);
+            bob->appendIntOrLL("limitAmount", spec->limit);
+        }
+
+        if (verbosity >= ExplainOptions::Verbosity::kExecStats) {
+            bob->appendIntOrLL("totalDataSizeSorted", spec->totalDataSizeBytes);
+            bob->appendBool("usedDisk", spec->wasDiskUsed);
         }
     } else if (STAGE_SORT_MERGE == stats.stageType) {
         MergeSortStats* spec = static_cast<MergeSortStats*>(stats.specific.get());
@@ -577,7 +585,6 @@ void Explain::statsToBSON(const PlanStageStats& stats,
             bob->appendNumber("nMatched", spec->nMatched);
             bob->appendNumber("nWouldModify", spec->nModified);
             bob->appendBool("wouldInsert", spec->inserted);
-            bob->appendBool("fastmodinsert", spec->fastmodinsert);
         }
     }
 
@@ -637,6 +644,7 @@ void Explain::getWinningPlanStats(const PlanExecutor* exec, BSONObjBuilder* bob)
 // static
 void Explain::generatePlannerInfo(PlanExecutor* exec,
                                   const Collection* collection,
+                                  BSONObj extraInfo,
                                   BSONObjBuilder* out) {
     CanonicalQuery* query = exec->getCanonicalQuery();
 
@@ -651,10 +659,11 @@ void Explain::generatePlannerInfo(PlanExecutor* exec,
     boost::optional<uint32_t> queryHash;
     boost::optional<uint32_t> planCacheKeyHash;
     if (collection && exec->getCanonicalQuery()) {
-        const CollectionInfoCache* infoCache = collection->infoCache();
-        const QuerySettings* querySettings = infoCache->getQuerySettings();
-        PlanCacheKey planCacheKey =
-            infoCache->getPlanCache()->computeKey(*exec->getCanonicalQuery());
+        const QuerySettings* querySettings =
+            CollectionQueryInfo::get(collection).getQuerySettings();
+        PlanCacheKey planCacheKey = CollectionQueryInfo::get(collection)
+                                        .getPlanCache()
+                                        ->computeKey(*exec->getCanonicalQuery());
         planCacheKeyHash = canonical_query_encoder::computeHash(planCacheKey.toString());
         queryHash = canonical_query_encoder::computeHash(planCacheKey.getStableKeyStringData());
 
@@ -669,7 +678,7 @@ void Explain::generatePlannerInfo(PlanExecutor* exec,
     // In general we should have a canonical query, but sometimes we may avoid
     // creating a canonical query as an optimization (specifically, the update system
     // does not canonicalize for idhack updates). In these cases, 'query' is NULL.
-    if (NULL != query) {
+    if (nullptr != query) {
         BSONObjBuilder parsedQueryBob(plannerBob.subobjStart("parsedQuery"));
         query->root()->serialize(&parsedQueryBob);
         parsedQueryBob.doneFast();
@@ -685,6 +694,10 @@ void Explain::generatePlannerInfo(PlanExecutor* exec,
 
     if (planCacheKeyHash) {
         plannerBob.append("planCacheKey", unsignedIntToFixedLengthHex(*planCacheKeyHash));
+    }
+
+    if (!extraInfo.isEmpty()) {
+        plannerBob.appendElements(extraInfo);
     }
 
     BSONObjBuilder winningPlanBob(plannerBob.subobjStart("winningPlan"));
@@ -735,6 +748,8 @@ void Explain::generateSinglePlanExecutionInfo(const PlanStageStats* stats,
 
     out->appendNumber("totalKeysExamined", totalKeysExamined);
     out->appendNumber("totalDocsExamined", totalDocsExamined);
+    if (stats->common.failed)
+        out->appendBool("failed", stats->common.failed);
 
     // Add the tree of stages, with individual execution stats for each stage.
     BSONObjBuilder stagesBob(out->subobjStart("executionStages"));
@@ -830,13 +845,14 @@ void Explain::explainStages(PlanExecutor* exec,
                             ExplainOptions::Verbosity verbosity,
                             Status executePlanStatus,
                             PlanStageStats* winningPlanTrialStats,
+                            BSONObj extraInfo,
                             BSONObjBuilder* out) {
     //
     // Use the stats trees to produce explain BSON.
     //
 
     if (verbosity >= ExplainOptions::Verbosity::kQueryPlanner) {
-        generatePlannerInfo(exec, collection, out);
+        generatePlannerInfo(exec, collection, extraInfo, out);
     }
 
     if (verbosity >= ExplainOptions::Verbosity::kExecStats) {
@@ -867,6 +883,7 @@ void Explain::explainPipelineExecutor(PlanExecutor* exec,
 void Explain::explainStages(PlanExecutor* exec,
                             const Collection* collection,
                             ExplainOptions::Verbosity verbosity,
+                            BSONObj extraInfo,
                             BSONObjBuilder* out) {
     auto winningPlanTrialStats = Explain::getWinningPlanTrialStats(exec);
 
@@ -876,14 +893,21 @@ void Explain::explainStages(PlanExecutor* exec,
     if (verbosity >= ExplainOptions::Verbosity::kExecStats) {
         executePlanStatus = exec->executePlan();
 
-        // If executing the query failed because it was killed, then the collection may no longer be
-        // valid. We indicate this by setting our collection pointer to null.
-        if (executePlanStatus == ErrorCodes::QueryPlanKilled) {
+        // If executing the query failed, for any number of reasons other than a planning failure,
+        // then the collection may no longer be valid. We conservatively set our collection pointer
+        // to null in case it is invalid.
+        if (executePlanStatus != ErrorCodes::NoQueryExecutionPlans) {
             collection = nullptr;
         }
     }
 
-    explainStages(exec, collection, verbosity, executePlanStatus, winningPlanTrialStats.get(), out);
+    explainStages(exec,
+                  collection,
+                  verbosity,
+                  executePlanStatus,
+                  winningPlanTrialStats.get(),
+                  extraInfo,
+                  out);
 
     generateServerInfo(out);
 }
@@ -926,7 +950,7 @@ std::string Explain::getPlanSummary(const PlanStage* root) {
 
 // static
 void Explain::getSummaryStats(const PlanExecutor& exec, PlanSummaryStats* statsOut) {
-    invariant(NULL != statsOut);
+    invariant(nullptr != statsOut);
 
     PlanStage* root = exec.getRootStage();
 
@@ -959,6 +983,10 @@ void Explain::getSummaryStats(const PlanExecutor& exec, PlanSummaryStats* statsO
 
         if (STAGE_SORT == stages[i]->stageType()) {
             statsOut->hasSortStage = true;
+
+            auto sortStage = static_cast<const SortStage*>(stages[i]);
+            auto sortStats = static_cast<const SortStats*>(sortStage->getSpecificStats());
+            statsOut->usedDisk = sortStats->wasDiskUsed;
         }
 
         if (STAGE_IXSCAN == stages[i]->stageType()) {
@@ -999,6 +1027,13 @@ void Explain::getSummaryStats(const PlanExecutor& exec, PlanSummaryStats* statsO
             statsOut->replanned = cachedStats->replanned;
         } else if (STAGE_MULTI_PLAN == stages[i]->stageType()) {
             statsOut->fromMultiPlanner = true;
+        } else if (STAGE_COLLSCAN == stages[i]->stageType()) {
+            statsOut->collectionScans++;
+            const auto collScan = static_cast<const CollectionScan*>(stages[i]);
+            const auto collScanStats =
+                static_cast<const CollectionScanStats*>(collScan->getSpecificStats());
+            if (!collScanStats->tailable)
+                statsOut->collectionScansNonTailable++;
         }
     }
 }
@@ -1039,6 +1074,11 @@ void Explain::planCacheEntryToBSON(const PlanCacheEntry& entry, BSONObjBuilder* 
     for (double score : entry.decision->scores) {
         scoresBuilder.append(score);
     }
+
+    std::for_each(entry.decision->failedCandidates.begin(),
+                  entry.decision->failedCandidates.end(),
+                  [&scoresBuilder](const auto&) { scoresBuilder.append(0.0); });
+
     scoresBuilder.doneFast();
 
     out->append("indexFilterSet", entry.plannerData[0]->indexFilterApplied);

@@ -35,7 +35,7 @@
 namespace mongo {
 
 /**
- * This class comprises a mock Collection for use by UUIDCatalog unit tests.
+ * This class comprises a mock Collection for use by CollectionCatalog unit tests.
  */
 class CollectionMock : public Collection {
 public:
@@ -56,23 +56,6 @@ public:
         _ns = std::move(nss);
     }
 
-    bool ok() const {
-        std::abort();
-    }
-
-    CollectionCatalogEntry* getCatalogEntry() {
-        std::abort();
-    }
-    const CollectionCatalogEntry* getCatalogEntry() const {
-        std::abort();
-    }
-
-    CollectionInfoCache* infoCache() {
-        std::abort();
-    }
-    const CollectionInfoCache* infoCache() const {
-        std::abort();
-    }
     const IndexCatalog* getIndexCatalog() const {
         return _indexCatalog.get();
     }
@@ -84,6 +67,10 @@ public:
         std::abort();
     }
     RecordStore* getRecordStore() {
+        std::abort();
+    }
+
+    const BSONObj getValidatorDoc() const {
         std::abort();
     }
 
@@ -129,9 +116,8 @@ public:
     }
 
     Status insertDocumentsForOplog(OperationContext* opCtx,
-                                   const DocWriter* const* docs,
-                                   Timestamp* timestamps,
-                                   size_t nDocs) {
+                                   std::vector<Record>* records,
+                                   const std::vector<Timestamp>& timestamps) {
         std::abort();
     }
 
@@ -165,22 +151,6 @@ public:
     }
 
     Status truncate(OperationContext* opCtx) {
-        std::abort();
-    }
-
-    Status validate(OperationContext* opCtx,
-                    ValidateCmdLevel level,
-                    bool background,
-                    std::unique_ptr<Lock::CollectionLock> collLk,
-                    ValidateResults* results,
-                    BSONObjBuilder* output) {
-        std::abort();
-    }
-
-    Status touch(OperationContext* opCtx,
-                 bool touchData,
-                 bool touchIndexes,
-                 BSONObjBuilder* output) const {
         std::abort();
     }
 
@@ -222,6 +192,10 @@ public:
         std::abort();
     }
 
+    bool isTemporary(OperationContext* opCtx) const {
+        std::abort();
+    }
+
     bool isCapped() const {
         std::abort();
     }
@@ -246,7 +220,7 @@ public:
         std::abort();
     }
 
-    uint64_t getIndexSize(OperationContext* opCtx, BSONObjBuilder* details, int scale) {
+    uint64_t getIndexSize(OperationContext* opCtx, BSONObjBuilder* details, int scale) const {
         std::abort();
     }
 
@@ -278,11 +252,7 @@ public:
         std::abort();
     }
 
-    DatabaseCatalogEntry* dbce() const {
-        std::abort();
-    }
-
-    OptionalCollectionUUID uuid() const {
+    UUID uuid() const {
         return _uuid;
     }
 
@@ -291,7 +261,7 @@ public:
     }
 
 private:
-    OptionalCollectionUUID _uuid = UUID::gen();
+    UUID _uuid = UUID::gen();
     NamespaceString _ns;
     std::unique_ptr<IndexCatalog> _indexCatalog;
 };

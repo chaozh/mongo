@@ -29,6 +29,7 @@
 
 #pragma once
 
+#include <functional>
 #include <set>
 #include <string>
 
@@ -37,8 +38,11 @@
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/bson/bsontypes.h"
 #include "mongo/stdx/unordered_map.h"
+#include "mongo/util/string_map.h"
 
 namespace mongo {
+
+using findBSONTypeAliasFun = std::function<boost::optional<BSONType>(StringData)>;
 
 /**
  * Represents a set of types or of type aliases in the match language. The set consists of the BSON
@@ -53,6 +57,8 @@ struct MatcherTypeSet {
     // supported.
     static const StringMap<BSONType> kJsonSchemaTypeAliasMap;
 
+    static boost::optional<BSONType> findJsonSchemaTypeAlias(StringData key);
+
     /**
      * Given a mapping from string alias to BSON type, creates a MatcherTypeSet from a
      * BSONElement. This BSON alias may either represent a single type (via numerical type code or
@@ -60,7 +66,7 @@ struct MatcherTypeSet {
      *
      * Returns an error if the element cannot be parsed to a set of types.
      */
-    static StatusWith<MatcherTypeSet> parse(BSONElement, const StringMap<BSONType>& aliasMap);
+    static StatusWith<MatcherTypeSet> parse(BSONElement);
 
     /**
      * Given a set of string type alias and a mapping from string alias to BSON type, returns the
@@ -69,7 +75,7 @@ struct MatcherTypeSet {
      * Returns an error if any of the string aliases are unknown.
      */
     static StatusWith<MatcherTypeSet> fromStringAliases(std::set<StringData> typeAliases,
-                                                        const StringMap<BSONType>& aliasMap);
+                                                        const findBSONTypeAliasFun& aliasMapFind);
 
     /**
      * Constructs an empty type set.
@@ -118,4 +124,39 @@ struct MatcherTypeSet {
     std::set<BSONType> bsonTypes;
 };
 
+/**
+ * An IDL-compatible wrapper class for MatcherTypeSet for BSON type aliases.
+ * It represents a set of types or of type aliases in the match language.
+ */
+class BSONTypeSet {
+public:
+    static BSONTypeSet parseFromBSON(const BSONElement& element);
+
+    BSONTypeSet(MatcherTypeSet typeSet) : _typeSet(std::move(typeSet)) {}
+
+    void serializeToBSON(StringData fieldName, BSONObjBuilder* builder) const;
+
+    const MatcherTypeSet& typeSet() const {
+        return _typeSet;
+    }
+
+    bool operator==(const BSONTypeSet& other) const {
+        return _typeSet == other._typeSet;
+    }
+
+    /**
+     * IDL requires overload of all comparison operators, however for this class the only viable
+     * comparison is equality. These should be removed once SERVER-39677 is implemented.
+     */
+    bool operator>(const BSONTypeSet& other) const {
+        MONGO_UNREACHABLE;
+    }
+
+    bool operator<(const BSONTypeSet& other) const {
+        MONGO_UNREACHABLE;
+    }
+
+private:
+    MatcherTypeSet _typeSet;
+};
 }  // namespace mongo

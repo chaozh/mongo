@@ -36,20 +36,24 @@
 
 namespace mongo {
 
+MONGO_FAIL_POINT_DEFINE(skipWriteConflictRetries);
+
 AtomicWord<bool> WriteConflictException::trace(false);
 
 WriteConflictException::WriteConflictException()
-    : DBException(Status(ErrorCodes::WriteConflict, "WriteConflict")) {
+    : DBException(Status(ErrorCodes::WriteConflict,
+                         "WriteConflict error: this operation conflicted with another operation. "
+                         "Please retry your operation or multi-document transaction.")) {
     if (trace.load()) {
         printStackTrace();
     }
 }
 
 void WriteConflictException::logAndBackoff(int attempt, StringData operation, StringData ns) {
-    mongo::logAndBackoff(
-        ::mongo::logger::LogComponent::kWrite,
-        logger::LogSeverity::Debug(1),
-        static_cast<size_t>(attempt),
-        str::stream() << "Caught WriteConflictException doing " << operation << " on " << ns);
+    mongo::logAndBackoff(::mongo::logger::LogComponent::kWrite,
+                         logger::LogSeverity::Debug(1),
+                         static_cast<size_t>(attempt),
+                         str::stream() << "Caught WriteConflictException doing " << operation
+                                       << " on " << ns);
 }
-}
+}  // namespace mongo

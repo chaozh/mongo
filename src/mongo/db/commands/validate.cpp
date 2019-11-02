@@ -32,37 +32,46 @@
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/catalog/collection.h"
-#include "mongo/db/catalog/collection_catalog_entry.h"
+#include "mongo/db/catalog/collection_validation.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
-#include "mongo/db/db_raii.h"
 #include "mongo/db/query/internal_plans.h"
+#include "mongo/db/storage/durable_catalog.h"
 #include "mongo/db/storage/record_store.h"
-#include "mongo/db/views/view_catalog.h"
-#include "mongo/util/fail_point_service.h"
+#include "mongo/util/fail_point.h"
 #include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
 
 namespace mongo {
 
-using std::endl;
-using std::string;
-using std::stringstream;
-
+// Sets the 'valid' result field to false and returns immediately.
 MONGO_FAIL_POINT_DEFINE(validateCmdCollectionNotValid);
 
 namespace {
 
-// Protects `_validationQueue`
-stdx::mutex _validationMutex;
+// Protects the state below.
+Mutex _validationMutex;
 
-// Wakes up `_validationQueue`
+// Holds the set of full `databaseName.collectionName` namespace strings in progress. Validation
+// commands register themselves in this data structure so that subsequent commands on the same
+// namespace will wait rather than run in parallel.
+std::set<std::string> _validationsInProgress;
+
+// This is waited upon if there is found to already be a validation command running on the targeted
+// namespace, as _validationsInProgress would indicate. This is signaled when a validation command
+// finishes on any namespace.
 stdx::condition_variable _validationNotifier;
 
-// Holds the set of full `database.collections` namespace strings in progress.
-std::set<std::string> _validationsInProgress;
 }  // namespace
 
+/**
+ * Example validate command:
+ *   {
+ *       validate: "collectionNameWithoutTheDBPart",
+ *       full: <bool>  // If true, a more thorough (and slower) collection validation is performed.
+ *       background: <bool>  // If true, performs validation on the checkpoint of the collection.
+ *   }
+ */
 class ValidateCmd : public BasicCommand {
 public:
     ValidateCmd() : BasicCommand("validate") {}
@@ -72,16 +81,29 @@ public:
     }
 
     std::string help() const override {
-        return "Validate contents of a namespace by scanning its data structures for correctness.  "
-               "Slow.\n"
-               "Add full:true option to do a more thorough check\n"
-               "Add scandata:false to skip the scan of the collection data without skipping scans "
-               "of any indexes";
+        return str::stream() << "Validate contents of a namespace by scanning its data structures "
+                             << "for correctness.\nThis is a slow operation.\n"
+                             << "\tAdd {full: true} option to do a more thorough check.\n"
+                             << "\tAdd {background: true} to validate in the background.\n"
+                             << "Cannot specify both {full: true, background: true}.";
     }
 
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
+
+    bool allowsAfterClusterTime(const BSONObj& cmd) const override {
+        return false;
+    }
+
+    bool canIgnorePrepareConflicts() const override {
+        return true;
+    }
+
+    bool maintenanceOk() const override {
+        return false;
+    }
+
     virtual void addRequiredPrivileges(const std::string& dbname,
                                        const BSONObj& cmdObj,
                                        std::vector<Privilege>* out) const {
@@ -89,64 +111,53 @@ public:
         actions.addAction(ActionType::validate);
         out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), actions));
     }
-    //{ validate: "collectionnamewithoutthedbpart" [, scandata: <bool>] [, full: <bool> } */
 
     bool run(OperationContext* opCtx,
-             const string& dbname,
+             const std::string& dbname,
              const BSONObj& cmdObj,
              BSONObjBuilder& result) {
-        if (MONGO_FAIL_POINT(validateCmdCollectionNotValid)) {
+        if (MONGO_unlikely(validateCmdCollectionNotValid.shouldFail())) {
             result.appendBool("valid", false);
             return true;
         }
 
         const NamespaceString nss(CommandHelpers::parseNsCollectionRequired(dbname, cmdObj));
 
-        const bool full = cmdObj["full"].trueValue();
-        const bool scanData = cmdObj["scandata"].trueValue();
+        const bool background = cmdObj["background"].trueValue();
 
-        ValidateCmdLevel level = kValidateIndex;
-
-        if (full) {
-            level = kValidateFull;
-        } else if (scanData) {
-            level = kValidateRecordStore;
+        // Background validation requires the storage engine to support checkpoints because it
+        // performs the validation on a checkpoint using checkpoint cursors.
+        if (background && !opCtx->getServiceContext()->getStorageEngine()->supportsCheckpoints()) {
+            uasserted(ErrorCodes::CommandNotSupported,
+                      str::stream() << "Running validate on collection " << nss
+                                    << " with { background: true } is not supported on the "
+                                    << storageGlobalParams.engine << " storage engine");
         }
 
-        if (!nss.isNormal() && full) {
-            uasserted(ErrorCodes::CommandFailed,
-                      "Can only run full validate on a regular collection");
+        const bool fullValidate = cmdObj["full"].trueValue();
+        if (background && fullValidate) {
+            uasserted(ErrorCodes::CommandNotSupported,
+                      str::stream() << "Running the validate command with both { background: true }"
+                                    << " and { full: true } is not supported.");
         }
 
         if (!serverGlobalParams.quiet.load()) {
-            LOG(0) << "CMD: validate " << nss.ns();
+            LOG(0) << "CMD: validate " << nss.ns() << (background ? ", background:true" : "")
+                   << (fullValidate ? ", full:true" : "");
         }
 
-        AutoGetDb ctx(opCtx, nss.db(), MODE_IX);
-        auto collLk = stdx::make_unique<Lock::CollectionLock>(opCtx->lockState(), nss.ns(), MODE_X);
-        Collection* collection = ctx.getDb() ? ctx.getDb()->getCollection(opCtx, nss) : NULL;
-        if (!collection) {
-            if (ctx.getDb() && ViewCatalog::get(ctx.getDb())->lookup(opCtx, nss.ns())) {
-                uasserted(ErrorCodes::CommandNotSupportedOnView, "Cannot validate a view");
-            }
-
-            uasserted(ErrorCodes::NamespaceNotFound, "ns not found");
-        }
-
-        result.append("ns", nss.ns());
-
-        // Only one validation per collection can be in progress, the rest wait in order.
+        // Only one validation per collection can be in progress, the rest wait.
         {
-            stdx::unique_lock<stdx::mutex> lock(_validationMutex);
+            stdx::unique_lock<Latch> lock(_validationMutex);
             try {
-                while (_validationsInProgress.find(nss.ns()) != _validationsInProgress.end()) {
-                    opCtx->waitForConditionOrInterrupt(_validationNotifier, lock);
-                }
+                opCtx->waitForConditionOrInterrupt(_validationNotifier, lock, [&] {
+                    return _validationsInProgress.find(nss.ns()) == _validationsInProgress.end();
+                });
             } catch (AssertionException& e) {
                 CommandHelpers::appendCommandStatusNoThrow(
                     result,
                     {ErrorCodes::CommandFailed,
-                     str::stream() << "Exception during validation: " << e.toString()});
+                     str::stream() << "Exception thrown during validation: " << e.toString()});
                 return false;
             }
 
@@ -154,41 +165,25 @@ public:
         }
 
         ON_BLOCK_EXIT([&] {
-            stdx::lock_guard<stdx::mutex> lock(_validationMutex);
+            stdx::lock_guard<Latch> lock(_validationMutex);
             _validationsInProgress.erase(nss.ns());
             _validationNotifier.notify_all();
         });
 
-        // TODO SERVER-30357: Add support for background validation.
-        const bool background = false;
-
-        ValidateResults results;
-        Status status =
-            collection->validate(opCtx, level, background, std::move(collLk), &results, &result);
+        ValidateResults validateResults;
+        Status status = CollectionValidation::validate(
+            opCtx, nss, fullValidate, background, &validateResults, &result);
         if (!status.isOK()) {
             return CommandHelpers::appendCommandStatusNoThrow(result, status);
         }
 
-        CollectionCatalogEntry* catalogEntry = collection->getCatalogEntry();
-        CollectionOptions opts = catalogEntry->getCollectionOptions(opCtx);
+        result.appendBool("valid", validateResults.valid);
+        result.append("warnings", validateResults.warnings);
+        result.append("errors", validateResults.errors);
+        result.append("extraIndexEntries", validateResults.extraIndexEntries);
+        result.append("missingIndexEntries", validateResults.missingIndexEntries);
 
-        // All collections must have a UUID.
-        if (!opts.uuid) {
-            results.errors.push_back(str::stream() << "UUID missing on collection " << nss.ns()
-                                                   << " but SchemaVersion=3.6");
-            results.valid = false;
-        }
-
-        if (!full) {
-            results.warnings.push_back(
-                "Some checks omitted for speed. use {full:true} option to do more thorough scan.");
-        }
-
-        result.appendBool("valid", results.valid);
-        result.append("warnings", results.warnings);
-        result.append("errors", results.errors);
-
-        if (!results.valid) {
+        if (!validateResults.valid) {
             result.append("advice",
                           "A corrupt namespace has been detected. See "
                           "http://dochub.mongodb.org/core/data-recovery for recovery steps.");
@@ -198,4 +193,4 @@ public:
     }
 
 } validateCmd;
-}
+}  // namespace mongo

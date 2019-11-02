@@ -31,14 +31,16 @@
 
 #include "mongo/platform/basic.h"
 
+#include <memory>
+
 #include "mongo/bson/bsontypes.h"
 #include "mongo/bson/json.h"
 #include "mongo/db/query/collation/collator_interface_mock.h"
 #include "mongo/db/query/index_bounds_builder.h"
 #include "mongo/db/query/index_entry.h"
+#include "mongo/db/query/projection_parser.h"
 #include "mongo/db/query/query_solution.h"
 #include "mongo/db/query/query_test_service_context.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/unittest/unittest.h"
 
 namespace {
@@ -713,7 +715,7 @@ TEST(QuerySolutionTest, IndexScanNodeHasFieldExcludesSimpleBoundsStringFieldWhen
     ASSERT_FALSE(node.hasField("b"));
 }
 
-auto createMatchExprAndParsedProjection(const BSONObj& query, const BSONObj& projObj) {
+auto createMatchExprAndProjection(const BSONObj& query, const BSONObj& projObj) {
     QueryTestServiceContext serviceCtx;
     auto opCtx = serviceCtx.makeOperationContext();
     const CollatorInterface* collator = nullptr;
@@ -722,33 +724,22 @@ auto createMatchExprAndParsedProjection(const BSONObj& query, const BSONObj& pro
     StatusWithMatchExpression queryMatchExpr =
         MatchExpressionParser::parse(query, std::move(expCtx));
     ASSERT(queryMatchExpr.isOK());
-    ParsedProjection* out = nullptr;
-    Status status =
-        ParsedProjection::make(opCtx.get(), projObj, queryMatchExpr.getValue().get(), &out);
-    if (!status.isOK()) {
-        FAIL(mongoutils::str::stream() << "failed to parse projection " << projObj << " (query: "
-                                       << query
-                                       << "): "
-                                       << status.toString());
-    }
-    ASSERT(out);
-    return std::make_pair(std::move(queryMatchExpr.getValue()),
-                          std::unique_ptr<ParsedProjection>(out));
+    projection_ast::Projection res = projection_ast::parse(
+        expCtx, projObj, queryMatchExpr.getValue().get(), query, ProjectionPolicies{});
+    return std::make_pair(std::move(queryMatchExpr.getValue()), std::move(res));
 }
 
 TEST(QuerySolutionTest, InclusionProjectionPreservesSort) {
     auto index = buildSimpleIndexEntry(BSON("a" << 1));
-    auto node = stdx::make_unique<IndexScanNode>(index);
+    auto node = std::make_unique<IndexScanNode>(index);
 
     BSONObj projection = BSON("a" << 1);
     BSONObj match;
 
-    auto matchExprAndParsedProjection = createMatchExprAndParsedProjection(match, projection);
+    auto matchExprAndProjection = createMatchExprAndProjection(match, projection);
 
-    ProjectionNodeDefault proj{std::move(node),
-                               *matchExprAndParsedProjection.first,
-                               projection,
-                               *matchExprAndParsedProjection.second};
+    ProjectionNodeDefault proj{
+        std::move(node), *matchExprAndProjection.first, matchExprAndProjection.second};
     proj.computeProperties();
 
     ASSERT_EQ(proj.getSort().size(), 1U);
@@ -757,34 +748,30 @@ TEST(QuerySolutionTest, InclusionProjectionPreservesSort) {
 
 TEST(QuerySolutionTest, ExclusionProjectionDoesNotPreserveSort) {
     auto index = buildSimpleIndexEntry(BSON("a" << 1));
-    auto node = stdx::make_unique<IndexScanNode>(index);
+    auto node = std::make_unique<IndexScanNode>(index);
 
     BSONObj projection = BSON("a" << 0);
     BSONObj match;
 
-    auto matchExprAndParsedProjection = createMatchExprAndParsedProjection(match, projection);
+    auto matchExprAndProjection = createMatchExprAndProjection(match, projection);
 
-    ProjectionNodeDefault proj{std::move(node),
-                               *matchExprAndParsedProjection.first,
-                               projection,
-                               *matchExprAndParsedProjection.second};
+    ProjectionNodeDefault proj{
+        std::move(node), *matchExprAndProjection.first, matchExprAndProjection.second};
     proj.computeProperties();
 
     ASSERT_EQ(proj.getSort().size(), 0U);
 }
 
 TEST(QuerySolutionTest, InclusionProjectionTruncatesSort) {
-    auto node = stdx::make_unique<IndexScanNode>(buildSimpleIndexEntry(BSON("a" << 1 << "b" << 1)));
+    auto node = std::make_unique<IndexScanNode>(buildSimpleIndexEntry(BSON("a" << 1 << "b" << 1)));
 
     BSONObj projection = BSON("a" << 1);
     BSONObj match;
 
-    auto matchExprAndParsedProjection = createMatchExprAndParsedProjection(match, projection);
+    auto matchExprAndProjection = createMatchExprAndProjection(match, projection);
 
-    ProjectionNodeDefault proj{std::move(node),
-                               *matchExprAndParsedProjection.first,
-                               projection,
-                               *matchExprAndParsedProjection.second};
+    ProjectionNodeDefault proj{
+        std::move(node), *matchExprAndProjection.first, matchExprAndProjection.second};
     proj.computeProperties();
 
     ASSERT_EQ(proj.getSort().size(), 1U);
@@ -792,17 +779,15 @@ TEST(QuerySolutionTest, InclusionProjectionTruncatesSort) {
 }
 
 TEST(QuerySolutionTest, ExclusionProjectionTruncatesSort) {
-    auto node = stdx::make_unique<IndexScanNode>(buildSimpleIndexEntry(BSON("a" << 1 << "b" << 1)));
+    auto node = std::make_unique<IndexScanNode>(buildSimpleIndexEntry(BSON("a" << 1 << "b" << 1)));
 
     BSONObj projection = BSON("b" << 0);
     BSONObj match;
 
-    auto matchExprAndParsedProjection = createMatchExprAndParsedProjection(match, projection);
+    auto matchExprAndProjection = createMatchExprAndProjection(match, projection);
 
-    ProjectionNodeDefault proj{std::move(node),
-                               *matchExprAndParsedProjection.first,
-                               projection,
-                               *matchExprAndParsedProjection.second};
+    ProjectionNodeDefault proj{
+        std::move(node), *matchExprAndProjection.first, matchExprAndProjection.second};
     proj.computeProperties();
 
     ASSERT_EQ(proj.getSort().size(), 1U);
@@ -811,7 +796,7 @@ TEST(QuerySolutionTest, ExclusionProjectionTruncatesSort) {
 
 TEST(QuerySolutionTest, NonMultikeyIndexWithoutPathLevelInfoCanCoverItsFields) {
     auto node =
-        stdx::make_unique<IndexScanNode>(buildSimpleIndexEntry(BSON("a" << 1 << "b.c.d" << 1)));
+        std::make_unique<IndexScanNode>(buildSimpleIndexEntry(BSON("a" << 1 << "b.c.d" << 1)));
     node->index.multikey = false;
     node->index.multikeyPaths = MultikeyPaths{};
     ASSERT_TRUE(node->hasField("a"));
@@ -823,7 +808,7 @@ TEST(QuerySolutionTest, NonMultikeyIndexWithoutPathLevelInfoCanCoverItsFields) {
 
 TEST(QuerySolutionTest, NonMultikeyIndexWithPathLevelInfoCanCoverItsFields) {
     auto node =
-        stdx::make_unique<IndexScanNode>(buildSimpleIndexEntry(BSON("a" << 1 << "b.c.d" << 1)));
+        std::make_unique<IndexScanNode>(buildSimpleIndexEntry(BSON("a" << 1 << "b.c.d" << 1)));
     node->index.multikey = false;
     node->index.multikeyPaths = MultikeyPaths{{}, {}};
     ASSERT_TRUE(node->hasField("a"));
@@ -835,7 +820,7 @@ TEST(QuerySolutionTest, NonMultikeyIndexWithPathLevelInfoCanCoverItsFields) {
 
 TEST(QuerySolutionTest, MultikeyIndexWithoutPathLevelInfoCannotCoverAnyFields) {
     auto node =
-        stdx::make_unique<IndexScanNode>(buildSimpleIndexEntry(BSON("a" << 1 << "b.c.d" << 1)));
+        std::make_unique<IndexScanNode>(buildSimpleIndexEntry(BSON("a" << 1 << "b.c.d" << 1)));
     node->index.multikey = true;
     node->index.multikeyPaths = MultikeyPaths{};
     ASSERT_FALSE(node->hasField("a"));
@@ -846,7 +831,7 @@ TEST(QuerySolutionTest, MultikeyIndexWithoutPathLevelInfoCannotCoverAnyFields) {
 }
 
 TEST(QuerySolutionTest, MultikeyIndexWithPathLevelInfoCanCoverNonMultikeyFields) {
-    auto node = stdx::make_unique<IndexScanNode>(
+    auto node = std::make_unique<IndexScanNode>(
         buildSimpleIndexEntry(BSON("a" << 1 << "b" << 1 << "c" << 1)));
 
     // Add metadata indicating that "b" is multikey.
@@ -860,7 +845,7 @@ TEST(QuerySolutionTest, MultikeyIndexWithPathLevelInfoCanCoverNonMultikeyFields)
 }
 
 TEST(QuerySolutionTest, MultikeyIndexCannotCoverFieldWithAnyMultikeyPathComponent) {
-    auto node = stdx::make_unique<IndexScanNode>(
+    auto node = std::make_unique<IndexScanNode>(
         buildSimpleIndexEntry(BSON("a" << 1 << "b.c.d" << 1 << "e" << 1)));
 
     // Add metadata indicating that "b.c" is multikey.

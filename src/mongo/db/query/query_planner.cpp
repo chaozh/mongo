@@ -58,8 +58,8 @@
 
 namespace mongo {
 
-using std::unique_ptr;
 using std::numeric_limits;
+using std::unique_ptr;
 
 namespace dps = ::mongo::dotted_path_support;
 
@@ -79,7 +79,7 @@ static bool is2DIndex(const BSONObj& pattern) {
     BSONObjIterator it(pattern);
     while (it.more()) {
         BSONElement e = it.next();
-        if (String == e.type() && str::equals("2d", e.valuestr())) {
+        if (String == e.type() && (e.valueStringData() == "2d")) {
             return true;
         }
     }
@@ -87,7 +87,7 @@ static bool is2DIndex(const BSONObj& pattern) {
 }
 
 string optionString(size_t options) {
-    mongoutils::str::stream ss;
+    str::stream ss;
 
     if (QueryPlannerParams::DEFAULT == options) {
         ss << "DEFAULT ";
@@ -108,9 +108,6 @@ string optionString(size_t options) {
             case QueryPlannerParams::INCLUDE_SHARD_FILTER:
                 ss << "INCLUDE_SHARD_FILTER ";
                 break;
-            case QueryPlannerParams::NO_BLOCKING_SORT:
-                ss << "NO_BLOCKING_SORT ";
-                break;
             case QueryPlannerParams::INDEX_INTERSECTION:
                 ss << "INDEX_INTERSECTION ";
                 break;
@@ -119,9 +116,6 @@ string optionString(size_t options) {
                 break;
             case QueryPlannerParams::SPLIT_LIMITED_SORT:
                 ss << "SPLIT_LIMITED_SORT ";
-                break;
-            case QueryPlannerParams::NO_UNCOVERED_PROJECTIONS:
-                ss << "NO_UNCOVERED_PROJECTIONS ";
                 break;
             case QueryPlannerParams::GENERATE_COVERED_IXSCANS:
                 ss << "GENERATE_COVERED_IXSCANS ";
@@ -151,6 +145,7 @@ static BSONObj getKeyFromQuery(const BSONObj& keyPattern, const BSONObj& query) 
 static bool indexCompatibleMaxMin(const BSONObj& obj,
                                   const CollatorInterface* queryCollator,
                                   const IndexEntry& indexEntry) {
+    // Wildcard indexes should have been filtered out by the time this is called.
     if (indexEntry.type == IndexType::INDEX_WILDCARD) {
         return false;
     }
@@ -175,7 +170,7 @@ static bool indexCompatibleMaxMin(const BSONObj& obj,
         // Field names must match and be in the same order.
         BSONElement kpElt = kpIt.next();
         BSONElement objElt = objIt.next();
-        if (!mongoutils::str::equals(kpElt.fieldName(), objElt.fieldName())) {
+        if (kpElt.fieldNameStringData() != objElt.fieldNameStringData()) {
             return false;
         }
 
@@ -302,13 +297,13 @@ StatusWith<std::unique_ptr<PlanCacheIndexTree>> QueryPlanner::cacheDataFromTagge
         return Status(ErrorCodes::BadValue, "Cannot produce cache data: tree is NULL.");
     }
 
-    auto indexTree = stdx::make_unique<PlanCacheIndexTree>();
+    auto indexTree = std::make_unique<PlanCacheIndexTree>();
 
     if (taggedTree->getTag() &&
         taggedTree->getTag()->getType() == MatchExpression::TagData::Type::IndexTag) {
         IndexTag* itag = static_cast<IndexTag*>(taggedTree->getTag());
         if (itag->index >= relevantIndices.size()) {
-            mongoutils::str::stream ss;
+            str::stream ss;
             ss << "Index number is " << itag->index << " but there are only "
                << relevantIndices.size() << " relevant indices.";
             return Status(ErrorCodes::BadValue, ss);
@@ -340,7 +335,7 @@ StatusWith<std::unique_ptr<PlanCacheIndexTree>> QueryPlanner::cacheDataFromTagge
             }
 
             std::unique_ptr<IndexEntry> indexEntry =
-                stdx::make_unique<IndexEntry>(relevantIndices[itag->index]);
+                std::make_unique<IndexEntry>(relevantIndices[itag->index]);
             indexTree->entry.reset(indexEntry.release());
             indexTree->index_pos = itag->pos;
             indexTree->canCombineBounds = itag->canCombineBounds;
@@ -372,23 +367,23 @@ StatusWith<std::unique_ptr<PlanCacheIndexTree>> QueryPlanner::cacheDataFromTagge
 Status QueryPlanner::tagAccordingToCache(MatchExpression* filter,
                                          const PlanCacheIndexTree* const indexTree,
                                          const map<IndexEntry::Identifier, size_t>& indexMap) {
-    if (NULL == filter) {
-        return Status(ErrorCodes::BadValue, "Cannot tag tree: filter is NULL.");
+    if (nullptr == filter) {
+        return Status(ErrorCodes::NoQueryExecutionPlans, "Cannot tag tree: filter is NULL.");
     }
-    if (NULL == indexTree) {
-        return Status(ErrorCodes::BadValue, "Cannot tag tree: indexTree is NULL.");
+    if (nullptr == indexTree) {
+        return Status(ErrorCodes::NoQueryExecutionPlans, "Cannot tag tree: indexTree is NULL.");
     }
 
     // We're tagging the tree here, so it shouldn't have
     // any tags hanging off yet.
-    verify(NULL == filter->getTag());
+    verify(nullptr == filter->getTag());
 
     if (filter->numChildren() != indexTree->children.size()) {
-        mongoutils::str::stream ss;
+        str::stream ss;
         ss << "Cache topology and query did not match: "
            << "query has " << filter->numChildren() << " children "
            << "and cache has " << indexTree->children.size() << " children.";
-        return Status(ErrorCodes::BadValue, ss);
+        return Status(ErrorCodes::NoQueryExecutionPlans, ss);
     }
 
     // Continue the depth-first tree traversal.
@@ -405,12 +400,12 @@ Status QueryPlanner::tagAccordingToCache(MatchExpression* filter,
         for (const auto& orPushdown : indexTree->orPushdowns) {
             auto index = indexMap.find(orPushdown.indexEntryId);
             if (index == indexMap.end()) {
-                return Status(ErrorCodes::BadValue,
+                return Status(ErrorCodes::NoQueryExecutionPlans,
                               str::stream() << "Did not find index: " << orPushdown.indexEntryId);
             }
             OrPushdownTag::Destination dest;
             dest.route = orPushdown.route;
-            dest.tagData = stdx::make_unique<IndexTag>(
+            dest.tagData = std::make_unique<IndexTag>(
                 index->second, orPushdown.position, orPushdown.canCombineBounds);
             orPushdownTag->addDestination(std::move(dest));
         }
@@ -419,9 +414,9 @@ Status QueryPlanner::tagAccordingToCache(MatchExpression* filter,
     if (indexTree->entry.get()) {
         const auto got = indexMap.find(indexTree->entry->identifier);
         if (got == indexMap.end()) {
-            mongoutils::str::stream ss;
+            str::stream ss;
             ss << "Did not find index with name: " << indexTree->entry->identifier.catalogName;
-            return Status(ErrorCodes::BadValue, ss);
+            return Status(ErrorCodes::NoQueryExecutionPlans, ss);
         }
         if (filter->getTag()) {
             OrPushdownTag* orPushdownTag = static_cast<OrPushdownTag*>(filter->getTag());
@@ -453,7 +448,7 @@ StatusWith<std::unique_ptr<QuerySolution>> QueryPlanner::planFromCache(
         auto soln = buildWholeIXSoln(
             *winnerCacheData.tree->entry, query, params, winnerCacheData.wholeIXSolnDir);
         if (!soln) {
-            return Status(ErrorCodes::BadValue,
+            return Status(ErrorCodes::NoQueryExecutionPlans,
                           "plan cache error: soln that uses index to provide sort");
         } else {
             return {std::move(soln)};
@@ -463,7 +458,8 @@ StatusWith<std::unique_ptr<QuerySolution>> QueryPlanner::planFromCache(
         // with tailable==true, hence the false below.
         auto soln = buildCollscanSoln(query, false, params);
         if (!soln) {
-            return Status(ErrorCodes::BadValue, "plan cache error: collection scan soln");
+            return Status(ErrorCodes::NoQueryExecutionPlans,
+                          "plan cache error: collection scan soln");
         } else {
             return {std::move(soln)};
         }
@@ -478,7 +474,7 @@ StatusWith<std::unique_ptr<QuerySolution>> QueryPlanner::planFromCache(
 
     LOG(5) << "Tagging the match expression according to cache data: " << endl
            << "Filter:" << endl
-           << redact(clone->toString()) << "Cache data:" << endl
+           << redact(clone->debugString()) << "Cache data:" << endl
            << redact(winnerCacheData.toString());
 
     stdx::unordered_set<string> fields;
@@ -504,23 +500,23 @@ StatusWith<std::unique_ptr<QuerySolution>> QueryPlanner::planFromCache(
     // The MatchExpression tree is in canonical order. We must order the nodes for access planning.
     prepareForAccessPlanning(clone.get());
 
-    LOG(5) << "Tagged tree:" << endl << redact(clone->toString());
+    LOG(5) << "Tagged tree:" << endl << redact(clone->debugString());
 
     // Use the cached index assignments to build solnRoot.
     std::unique_ptr<QuerySolutionNode> solnRoot(QueryPlannerAccess::buildIndexedDataAccess(
         query, std::move(clone), expandedIndexes, params));
 
     if (!solnRoot) {
-        return Status(ErrorCodes::BadValue,
+        return Status(ErrorCodes::NoQueryExecutionPlans,
                       str::stream() << "Failed to create data access plan from cache. Query: "
                                     << query.toStringShort());
     }
 
     auto soln = QueryPlannerAnalysis::analyzeDataAccess(query, params, std::move(solnRoot));
     if (!soln) {
-        return Status(ErrorCodes::BadValue,
-                      str::stream() << "Failed to analyze plan from cache. Query: "
-                                    << query.toStringShort());
+        return Status(ErrorCodes::NoQueryExecutionPlans,
+                      str::stream()
+                          << "Failed to analyze plan from cache. Query: " << query.toStringShort());
     }
 
     LOG(5) << "Planner: solution constructed from the cache:\n" << redact(soln->toString());
@@ -596,6 +592,8 @@ StatusWith<std::vector<std::unique_ptr<QuerySolution>>> QueryPlanner::plan(
     // indexes.
     std::vector<IndexEntry> fullIndexList;
 
+    // Will hold a copy of the index entry chosen by the hint.
+    boost::optional<IndexEntry> hintedIndexEntry;
     if (hintedIndex.isEmpty()) {
         fullIndexList = params.indices;
     } else {
@@ -607,12 +605,13 @@ StatusWith<std::vector<std::unique_ptr<QuerySolution>>> QueryPlanner::plan(
         }
         if (fullIndexList.size() > 1) {
             return Status(ErrorCodes::IndexNotFound,
-                          str::stream() << "Hint matched multiple indexes, "
-                                        << "must hint by index name. Matched: "
-                                        << fullIndexList[0].toString()
-                                        << " and "
-                                        << fullIndexList[1].toString());
+                          str::stream()
+                              << "Hint matched multiple indexes, "
+                              << "must hint by index name. Matched: " << fullIndexList[0].toString()
+                              << " and " << fullIndexList[1].toString());
         }
+
+        hintedIndexEntry.emplace(fullIndexList.front());
     }
 
     // Figure out what fields we care about.
@@ -625,7 +624,7 @@ StatusWith<std::vector<std::unique_ptr<QuerySolution>>> QueryPlanner::plan(
     fullIndexList = QueryPlannerIXSelect::expandIndexes(fields, std::move(fullIndexList));
     std::vector<IndexEntry> relevantIndices;
 
-    if (hintedIndex.isEmpty()) {
+    if (!hintedIndexEntry) {
         relevantIndices = QueryPlannerIXSelect::findRelevantIndices(fields, fullIndexList);
     } else {
         relevantIndices = fullIndexList;
@@ -639,60 +638,47 @@ StatusWith<std::vector<std::unique_ptr<QuerySolution>>> QueryPlanner::plan(
         }
     }
 
-    // TODO SERVER-35335 Ensure min/max can generate bounds over $** index.
     // Deal with the .min() and .max() query options.  If either exist we can only use an index
     // that matches the object inside.
     if (!query.getQueryRequest().getMin().isEmpty() ||
         !query.getQueryRequest().getMax().isEmpty()) {
+
+        if (!hintedIndexEntry) {
+            return Status(ErrorCodes::Error(51173),
+                          "When using min()/max() a hint of which index to use must be provided");
+        }
+
         BSONObj minObj = query.getQueryRequest().getMin();
         BSONObj maxObj = query.getQueryRequest().getMax();
 
-        // The unfinished siblings of these objects may not be proper index keys because they
-        // may be empty objects or have field names. When an index is picked to use for the
-        // min/max query, these "finished" objects will always be valid index keys for the
-        // index's key pattern.
-        BSONObj finishedMinObj;
-        BSONObj finishedMaxObj;
+        if ((!minObj.isEmpty() &&
+             !indexCompatibleMaxMin(minObj, query.getCollator(), *hintedIndexEntry)) ||
+            (!maxObj.isEmpty() &&
+             !indexCompatibleMaxMin(maxObj, query.getCollator(), *hintedIndexEntry))) {
+            return Status(ErrorCodes::Error(51174),
+                          "The index chosen is not compatible with min/max");
+        }
+        // Be sure that index expansion didn't do anything. As wildcard indexes are banned for
+        // min/max, we expect to find a single hinted index entry.
+        invariant(fullIndexList.size() == 1);
+        invariant(*hintedIndexEntry == fullIndexList.front());
 
-        // Index into the 'fulledIndexList' vector indicating the index that we will use to answer
-        // this min/max query.
-        size_t idxNo = numeric_limits<size_t>::max();
+        // In order to be fully compatible, the min has to be less than the max according to the
+        // index key pattern ordering. The first step in verifying this is "finish" the min and max
+        // by replacing empty objects and stripping field names.
+        BSONObj finishedMinObj = finishMinObj(*hintedIndexEntry, minObj, maxObj);
+        BSONObj finishedMaxObj = finishMaxObj(*hintedIndexEntry, minObj, maxObj);
 
-        for (size_t i = 0; i < fullIndexList.size(); ++i) {
-            const auto& indexEntry = fullIndexList[i];
-
-            const BSONObj toUse = minObj.isEmpty() ? maxObj : minObj;
-            if (indexCompatibleMaxMin(toUse, query.getCollator(), indexEntry)) {
-                // In order to be fully compatible, the min has to be less than the max
-                // according to the index key pattern ordering. The first step in verifying
-                // this is "finish" the min and max by replacing empty objects and stripping
-                // field names.
-                finishedMinObj = finishMinObj(indexEntry, minObj, maxObj);
-                finishedMaxObj = finishMaxObj(indexEntry, minObj, maxObj);
-
-                // Now we have the final min and max. This index is only relevant for
-                // the min/max query if min < max.
-                if (0 > finishedMinObj.woCompare(finishedMaxObj, indexEntry.keyPattern, false)) {
-                    // Found a relevant index.
-                    idxNo = i;
-                    break;
-                }
-
-                // This index is not relevant; move on to the next.
-            }
+        // Now we have the final min and max. This index is only relevant for the min/max query if
+        // min < max.
+        if (finishedMinObj.woCompare(finishedMaxObj, hintedIndexEntry->keyPattern, false) >= 0) {
+            return Status(ErrorCodes::Error(51175),
+                          "The value provided for min() does not come before the value provided "
+                          "for max() in the hinted index");
         }
 
-        if (idxNo == numeric_limits<size_t>::max()) {
-            LOG(5) << "Can't find relevant index to use for max/min query";
-            // Can't find an index to use, bail out.
-            return Status(ErrorCodes::BadValue, "unable to find relevant index for max/min query");
-        }
-
-        LOG(5) << "Max/min query using index " << fullIndexList[idxNo].toString();
-
-        // Make our scan and output.
         std::unique_ptr<QuerySolutionNode> solnRoot(QueryPlannerAccess::makeIndexScan(
-            fullIndexList[idxNo], query, params, finishedMinObj, finishedMaxObj));
+            *hintedIndexEntry, query, params, finishedMinObj, finishedMaxObj));
         invariant(solnRoot);
 
         auto soln = QueryPlannerAnalysis::analyzeDataAccess(query, params, std::move(solnRoot));
@@ -726,10 +712,10 @@ StatusWith<std::vector<std::unique_ptr<QuerySolution>>> QueryPlanner::plan(
     }
 
     // query.root() is now annotated with RelevantTag(s).
-    LOG(5) << "Rated tree:" << endl << redact(query.root()->toString());
+    LOG(5) << "Rated tree:" << endl << redact(query.root()->debugString());
 
     // If there is a GEO_NEAR it must have an index it can use directly.
-    const MatchExpression* gnNode = NULL;
+    const MatchExpression* gnNode = nullptr;
     if (QueryPlannerCommon::hasNode(query.root(), MatchExpression::GEO_NEAR, &gnNode)) {
         // No index for GEO_NEAR?  No query.
         RelevantTag* tag = static_cast<RelevantTag*>(gnNode->getTag());
@@ -737,14 +723,15 @@ StatusWith<std::vector<std::unique_ptr<QuerySolution>>> QueryPlanner::plan(
             LOG(5) << "Unable to find index for $geoNear query.";
             // Don't leave tags on query tree.
             query.root()->resetTag();
-            return Status(ErrorCodes::BadValue, "unable to find index for $geoNear query");
+            return Status(ErrorCodes::NoQueryExecutionPlans,
+                          "unable to find index for $geoNear query");
         }
 
-        LOG(5) << "Rated tree after geonear processing:" << redact(query.root()->toString());
+        LOG(5) << "Rated tree after geonear processing:" << redact(query.root()->debugString());
     }
 
     // Likewise, if there is a TEXT it must have an index it can use directly.
-    const MatchExpression* textNode = NULL;
+    const MatchExpression* textNode = nullptr;
     if (QueryPlannerCommon::hasNode(query.root(), MatchExpression::TEXT, &textNode)) {
         RelevantTag* tag = static_cast<RelevantTag*>(textNode->getTag());
 
@@ -760,14 +747,15 @@ StatusWith<std::vector<std::unique_ptr<QuerySolution>>> QueryPlanner::plan(
         if (textIndexCount != 1) {
             // Don't leave tags on query tree.
             query.root()->resetTag();
-            return Status(ErrorCodes::BadValue, "need exactly one text index for $text query");
+            return Status(ErrorCodes::NoQueryExecutionPlans,
+                          "need exactly one text index for $text query");
         }
 
         // Error if the text node is tagged with zero indices.
         if (0 == tag->first.size() && 0 == tag->notFirst.size()) {
             // Don't leave tags on query tree.
             query.root()->resetTag();
-            return Status(ErrorCodes::BadValue,
+            return Status(ErrorCodes::NoQueryExecutionPlans,
                           "failed to use text index to satisfy $text query (if text index is "
                           "compound, are equality predicates given for all prefix fields?)");
         }
@@ -776,7 +764,7 @@ StatusWith<std::vector<std::unique_ptr<QuerySolution>>> QueryPlanner::plan(
         // assigned to it.
         invariant(1 == tag->first.size() + tag->notFirst.size());
 
-        LOG(5) << "Rated tree after text processing:" << redact(query.root()->toString());
+        LOG(5) << "Rated tree after text processing:" << redact(query.root()->debugString());
     }
 
     // If we have any relevant indices, we try to create indexed plans.
@@ -793,7 +781,7 @@ StatusWith<std::vector<std::unique_ptr<QuerySolution>>> QueryPlanner::plan(
         unique_ptr<MatchExpression> nextTaggedTree;
         while ((nextTaggedTree = isp.getNext()) && (out.size() < params.maxIndexedSolutions)) {
             LOG(5) << "About to build solntree from tagged tree:" << endl
-                   << redact(nextTaggedTree->toString());
+                   << redact(nextTaggedTree->debugString());
 
             // Store the plan cache index tree before calling prepareForAccessingPlanning(), so that
             // the PlanCacheIndexTree has the same sort as the MatchExpression used to generate the
@@ -840,11 +828,12 @@ StatusWith<std::vector<std::unique_ptr<QuerySolution>>> QueryPlanner::plan(
 
     // Produce legible error message for failed OR planning with a TEXT child.
     // TODO: support collection scan for non-TEXT children of OR.
-    if (out.size() == 0 && textNode != NULL && MatchExpression::OR == query.root()->matchType()) {
+    if (out.size() == 0 && textNode != nullptr &&
+        MatchExpression::OR == query.root()->matchType()) {
         MatchExpression* root = query.root();
         for (size_t i = 0; i < root->numChildren(); ++i) {
             if (textNode == root->getChild(i)) {
-                return Status(ErrorCodes::BadValue,
+                return Status(ErrorCodes::NoQueryExecutionPlans,
                               "Failed to produce a solution for TEXT under OR - "
                               "other non-TEXT clauses under OR have to be indexed as well.");
             }
@@ -857,9 +846,7 @@ StatusWith<std::vector<std::unique_ptr<QuerySolution>>> QueryPlanner::plan(
     // $** index is hinted, we do not want this behavior.
     if (!hintedIndex.isEmpty() && relevantIndices.size() == 1) {
         if (0 == out.size() && relevantIndices.front().type != IndexType::INDEX_WILDCARD) {
-            // Push hinted index solution to output list if found. It is possible to end up without
-            // a solution in the case where a filtering QueryPlannerParams argument, such as
-            // NO_BLOCKING_SORT, leads to its exclusion.
+            // Push hinted index solution to output list if found.
             auto soln = buildWholeIXSoln(relevantIndices.front(), query, params);
             if (soln) {
                 LOG(5) << "Planner: outputting soln that uses hinted index as scan.";
@@ -974,10 +961,8 @@ StatusWith<std::vector<std::unique_ptr<QuerySolution>>> QueryPlanner::plan(
             }
 
             QueryPlannerParams paramsForCoveredIxScan;
-            paramsForCoveredIxScan.options =
-                params.options | QueryPlannerParams::NO_UNCOVERED_PROJECTIONS;
             auto soln = buildWholeIXSoln(index, query, paramsForCoveredIxScan);
-            if (soln) {
+            if (soln && !soln->root->fetched()) {
                 LOG(5) << "Planner: outputting soln that uses index to provide projection.";
                 PlanCacheIndexTree* indexTree = new PlanCacheIndexTree();
                 indexTree->setIndexEntry(index);

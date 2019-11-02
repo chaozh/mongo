@@ -33,9 +33,8 @@
 #include <ostream>
 #include <string>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/base/status.h"
-#include "mongo/stdx/mutex.h"
+#include "mongo/platform/mutex.h"
 
 namespace mongo {
 namespace logger {
@@ -53,14 +52,16 @@ namespace logger {
  * same value for their fileName.
  */
 class RotatableFileWriter {
-    MONGO_DISALLOW_COPYING(RotatableFileWriter);
+    RotatableFileWriter(const RotatableFileWriter&) = delete;
+    RotatableFileWriter& operator=(const RotatableFileWriter&) = delete;
 
 public:
     /**
      * Guard class representing synchronous use of an instance of RotatableFileWriter.
      */
     class Use {
-        MONGO_DISALLOW_COPYING(Use);
+        Use(const Use&) = delete;
+        Use& operator=(const Use&) = delete;
 
     public:
         /**
@@ -117,7 +118,7 @@ public:
         Status _openFileStream(bool append);
 
         RotatableFileWriter* _writer;
-        stdx::unique_lock<stdx::mutex> _lock;
+        stdx::unique_lock<Latch> _lock;
     };
 
     /**
@@ -127,7 +128,7 @@ public:
 
 private:
     friend class RotatableFileWriter::Use;
-    stdx::mutex _mutex;
+    Mutex _mutex = MONGO_MAKE_LATCH("RotatableFileWriter::_mutex");
     std::string _fileName;
     std::unique_ptr<std::ostream> _stream;
 };

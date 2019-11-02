@@ -55,8 +55,7 @@ boost::intrusive_ptr<DocumentSource> DocumentSourceInternalInhibitOptimization::
     return new DocumentSourceInternalInhibitOptimization(expCtx);
 }
 
-DocumentSource::GetNextResult DocumentSourceInternalInhibitOptimization::getNext() {
-    pExpCtx->checkForInterrupt();
+DocumentSource::GetNextResult DocumentSourceInternalInhibitOptimization::doGetNext() {
     return pSource->getNext();
 }
 
@@ -65,4 +64,4 @@ Value DocumentSourceInternalInhibitOptimization::serialize(
     return Value(Document{{getSourceName(), Value{Document{}}}});
 }
 
-}  // namesace mongo
+}  // namespace mongo

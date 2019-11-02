@@ -31,7 +31,6 @@
 
 #include <memory>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/db/baton.h"
 #include "mongo/platform/atomic_word.h"
 #include "mongo/rpc/message.h"
@@ -39,6 +38,7 @@
 #include "mongo/util/decorable.h"
 #include "mongo/util/future.h"
 #include "mongo/util/net/hostandport.h"
+#include "mongo/util/net/sockaddr.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
@@ -55,7 +55,8 @@ using ConstSessionHandle = std::shared_ptr<const Session>;
  * (on the transport side) and Messages with Client objects (on the database side).
  */
 class Session : public std::enable_shared_from_this<Session>, public Decorable<Session> {
-    MONGO_DISALLOW_COPYING(Session);
+    Session(const Session&) = delete;
+    Session& operator=(const Session&) = delete;
 
 public:
     /**
@@ -123,13 +124,13 @@ public:
     virtual void cancelAsyncOperations(const BatonHandle& handle = nullptr) = 0;
 
     /**
-    * This should only be used to detect when the remote host has disappeared without
-    * notice. It does NOT work correctly for ensuring that operations complete or fail
-    * by some deadline.
-    *
-    * This timeout will only effect calls sourceMessage()/sinkMessage(). Async operations do not
-    * currently support timeouts.
-    */
+     * This should only be used to detect when the remote host has disappeared without
+     * notice. It does NOT work correctly for ensuring that operations complete or fail
+     * by some deadline.
+     *
+     * This timeout will only effect calls sourceMessage()/sinkMessage(). Async operations do not
+     * currently support timeouts.
+     */
     virtual void setTimeout(boost::optional<Milliseconds> timeout) = 0;
 
     /**
@@ -144,6 +145,13 @@ public:
 
     virtual const HostAndPort& remote() const = 0;
     virtual const HostAndPort& local() const = 0;
+
+    virtual const SockAddr& remoteAddr() const = 0;
+    virtual const SockAddr& localAddr() const = 0;
+
+    virtual boost::optional<std::string> getSniName() const {
+        return boost::none;
+    }
 
     /**
      * Atomically set all of the session tags specified in the 'tagsToSet' bit field. If the
@@ -172,7 +180,7 @@ public:
      * of the 'mutateFunc' call. The 'kPending' tag is only for new sessions; callers should never
      * try to set it.
      */
-    void mutateTags(const stdx::function<TagMask(TagMask)>& mutateFunc);
+    void mutateTags(const std::function<TagMask(TagMask)>& mutateFunc);
 
     TagMask getTags() const;
 

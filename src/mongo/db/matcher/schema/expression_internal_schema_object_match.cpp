@@ -51,10 +51,11 @@ bool InternalSchemaObjectMatchExpression::matchesSingleElement(const BSONElement
     return _sub->matchesBSON(elem.Obj());
 }
 
-void InternalSchemaObjectMatchExpression::debugString(StringBuilder& debug, int level) const {
-    _debugAddSpace(debug, level);
+void InternalSchemaObjectMatchExpression::debugString(StringBuilder& debug,
+                                                      int indentationLevel) const {
+    _debugAddSpace(debug, indentationLevel);
     debug << kName << "\n";
-    _sub->debugString(debug, level + 1);
+    _sub->debugString(debug, indentationLevel + 1);
 }
 
 BSONObj InternalSchemaObjectMatchExpression::getSerializedRightHandSide() const {
@@ -75,7 +76,7 @@ bool InternalSchemaObjectMatchExpression::equivalent(const MatchExpression* othe
 
 std::unique_ptr<MatchExpression> InternalSchemaObjectMatchExpression::shallowClone() const {
     auto clone =
-        stdx::make_unique<InternalSchemaObjectMatchExpression>(path(), _sub->shallowClone());
+        std::make_unique<InternalSchemaObjectMatchExpression>(path(), _sub->shallowClone());
     if (getTag()) {
         clone->setTag(getTag()->clone());
     }

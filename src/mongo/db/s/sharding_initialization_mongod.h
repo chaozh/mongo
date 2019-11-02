@@ -29,11 +29,12 @@
 
 #pragma once
 
-#include "mongo/base/disallow_copying.h"
+#include <functional>
+
 #include "mongo/base/string_data.h"
+#include "mongo/client/replica_set_change_notifier.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/db/s/type_shard_identity.h"
-#include "mongo/stdx/functional.h"
 
 namespace mongo {
 
@@ -48,10 +49,11 @@ class ServiceContext;
  * ShardingState in the initialized state.
  */
 class ShardingInitializationMongoD {
-    MONGO_DISALLOW_COPYING(ShardingInitializationMongoD);
+    ShardingInitializationMongoD(const ShardingInitializationMongoD&) = delete;
+    ShardingInitializationMongoD& operator=(const ShardingInitializationMongoD&) = delete;
 
 public:
-    using ShardingEnvironmentInitFunc = stdx::function<void(
+    using ShardingEnvironmentInitFunc = std::function<void(
         OperationContext* opCtx, const ShardIdentity& shardIdentity, StringData distLockProcessId)>;
 
     ShardingInitializationMongoD();
@@ -59,6 +61,10 @@ public:
 
     static ShardingInitializationMongoD* get(OperationContext* opCtx);
     static ShardingInitializationMongoD* get(ServiceContext* service);
+
+    void initializeShardingEnvironmentOnShardServer(OperationContext* opCtx,
+                                                    const ShardIdentity& shardIdentity,
+                                                    StringData distLockProcessId);
 
     /**
      * If started with --shardsvr, initializes sharding awareness from the shardIdentity document on
@@ -94,8 +100,8 @@ public:
      * Updates the config server field of the shardIdentity document with the given connection
      * string.
      */
-    static Status updateShardIdentityConfigString(OperationContext* opCtx,
-                                                  const ConnectionString& newConnectionString);
+    static void updateShardIdentityConfigString(OperationContext* opCtx,
+                                                const ConnectionString& newConnectionString);
 
     /**
      * For testing only. Mock the initialization method used by initializeFromConfigConnString and
@@ -108,10 +114,13 @@ public:
 private:
     // This mutex ensures that only one thread at a time executes the sharding
     // initialization/teardown sequence
-    stdx::mutex _initSynchronizationMutex;
+    Mutex _initSynchronizationMutex =
+        MONGO_MAKE_LATCH("ShardingInitializationMongod::_initSynchronizationMutex");
 
     // Function for initializing the sharding environment components (i.e. everything on the Grid)
     ShardingEnvironmentInitFunc _initFunc;
+
+    ReplicaSetChangeListenerHandle _replicaSetChangeListener;
 };
 
 /**

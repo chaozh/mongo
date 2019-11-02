@@ -1,7 +1,5 @@
 """The unittest.TestCase for JavaScript tests."""
 
-from __future__ import absolute_import
-
 import os
 import os.path
 import sys
@@ -69,6 +67,7 @@ class _SingleJSTestCase(interface.ProcessTestCase):
         test_data = global_vars.get("TestData", {}).copy()
         test_data["minPort"] = core.network.PortAllocator.min_test_port(self.fixture.job_num)
         test_data["maxPort"] = core.network.PortAllocator.max_test_port(self.fixture.job_num)
+        test_data["peerPids"] = self.fixture.pids()
         test_data["failIfUnterminatedProcesses"] = True
 
         global_vars["TestData"] = test_data
@@ -201,7 +200,7 @@ class JSTestCase(interface.ProcessTestCase):
         test_cases = []
         try:
             # If there are multiple clients, make a new thread for each client.
-            for thread_id in xrange(self.num_clients):
+            for thread_id in range(self.num_clients):
                 logger = self.logger.new_test_thread_logger(self.test_kind, str(thread_id))
                 test_case = self._create_test_case_for_thread(logger, thread_id)
                 test_cases.append(test_case)

@@ -29,11 +29,12 @@
 
 #include "mongo/platform/basic.h"
 
+#include <memory>
+
 #include "mongo/db/repl/reporter.h"
 #include "mongo/db/repl/update_position_args.h"
 #include "mongo/executor/network_interface_mock.h"
 #include "mongo/executor/thread_pool_task_executor_test_fixture.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/unittest/task_executor_proxy.h"
 #include "mongo/unittest/unittest.h"
 
@@ -72,8 +73,12 @@ public:
             BSONObjBuilder entry(arrayBuilder.subobjStart());
             itr.second.lastDurableOpTime.append(&entry,
                                                 UpdatePositionArgs::kDurableOpTimeFieldName);
+            entry.appendDate(UpdatePositionArgs::kDurableWallTimeFieldName,
+                             Date_t() + Seconds(itr.second.lastDurableOpTime.getSecs()));
             itr.second.lastAppliedOpTime.append(&entry,
                                                 UpdatePositionArgs::kAppliedOpTimeFieldName);
+            entry.appendDate(UpdatePositionArgs::kAppliedWallTimeFieldName,
+                             Date_t() + Seconds(itr.second.lastAppliedOpTime.getSecs()));
             entry.append(UpdatePositionArgs::kMemberIdFieldName, itr.first);
             if (_configVersion != -1) {
                 entry.append(UpdatePositionArgs::kConfigVersionFieldName, _configVersion);
@@ -142,9 +147,9 @@ ReporterTest::ReporterTest() {}
 void ReporterTest::setUp() {
     executor::ThreadPoolExecutorTest::setUp();
 
-    _executorProxy = stdx::make_unique<unittest::TaskExecutorProxy>(&getExecutor());
+    _executorProxy = std::make_unique<unittest::TaskExecutorProxy>(&getExecutor());
 
-    posUpdater = stdx::make_unique<MockProgressManager>();
+    posUpdater = std::make_unique<MockProgressManager>();
     posUpdater->updateMap(0, OpTime({3, 0}, 1), OpTime({3, 0}, 1));
 
     prepareReplSetUpdatePositionCommandFn = [updater = posUpdater.get()] {
@@ -152,11 +157,11 @@ void ReporterTest::setUp() {
     };
 
     reporter =
-        stdx::make_unique<Reporter>(_executorProxy.get(),
-                                    [this]() { return prepareReplSetUpdatePositionCommandFn(); },
-                                    HostAndPort("h1"),
-                                    Milliseconds(1000),
-                                    Milliseconds(5000));
+        std::make_unique<Reporter>(_executorProxy.get(),
+                                   [this]() { return prepareReplSetUpdatePositionCommandFn(); },
+                                   HostAndPort("h1"),
+                                   Milliseconds(1000),
+                                   Milliseconds(5000));
     launchExecutorThread();
 
     if (triggerAtSetUp()) {
@@ -375,8 +380,7 @@ TEST_F(ReporterTestNoTriggerAtSetUp,
     processNetworkResponse(BSON("ok" << 0 << "code" << int(ErrorCodes::InvalidReplicaSetConfig)
                                      << "errmsg"
                                      << "newer config"
-                                     << "configVersion"
-                                     << 100));
+                                     << "configVersion" << 100));
 
     ASSERT_EQUALS(Status(ErrorCodes::InvalidReplicaSetConfig, "invalid config"), reporter->join());
     assertReporterDone();
@@ -395,8 +399,7 @@ TEST_F(ReporterTest, InvalidReplicaSetResponseWithSameConfigVersionOnSyncTargetS
     processNetworkResponse(BSON("ok" << 0 << "code" << int(ErrorCodes::InvalidReplicaSetConfig)
                                      << "errmsg"
                                      << "invalid config"
-                                     << "configVersion"
-                                     << posUpdater->getConfigVersion()));
+                                     << "configVersion" << posUpdater->getConfigVersion()));
 
     ASSERT_EQUALS(Status(ErrorCodes::InvalidReplicaSetConfig, "invalid config"), reporter->join());
     assertReporterDone();
@@ -412,8 +415,7 @@ TEST_F(ReporterTest,
     processNetworkResponse(BSON("ok" << 0 << "code" << int(ErrorCodes::InvalidReplicaSetConfig)
                                      << "errmsg"
                                      << "newer config"
-                                     << "configVersion"
-                                     << posUpdater->getConfigVersion() + 1));
+                                     << "configVersion" << posUpdater->getConfigVersion() + 1));
 
     ASSERT_TRUE(reporter->isActive());
 }
@@ -578,7 +580,7 @@ TEST_F(ReporterTestNoTriggerAtSetUp,
         TaskExecutorWithFailureInScheduleWork(executor::TaskExecutor* executor)
             : unittest::TaskExecutorProxy(executor) {}
         virtual StatusWith<executor::TaskExecutor::CallbackHandle> scheduleWork(
-            CallbackFn work) override {
+            CallbackFn&& override) {
             return Status(ErrorCodes::OperationFailed, "failed to schedule work");
         }
     };
@@ -600,9 +602,9 @@ TEST_F(ReporterTestNoTriggerAtSetUp, FailingToScheduleRemoteCommandTaskShouldMak
     public:
         TaskExecutorWithFailureInScheduleRemoteCommand(executor::TaskExecutor* executor)
             : unittest::TaskExecutorProxy(executor) {}
-        virtual StatusWith<executor::TaskExecutor::CallbackHandle> scheduleRemoteCommand(
-            const executor::RemoteCommandRequest& request,
-            const RemoteCommandCallbackFn& cb,
+        virtual StatusWith<executor::TaskExecutor::CallbackHandle> scheduleRemoteCommandOnAny(
+            const executor::RemoteCommandRequestOnAny& request,
+            const RemoteCommandOnAnyCallbackFn& cb,
             const BatonHandle& baton = nullptr) override {
             // Any error status other than ShutdownInProgress will cause the reporter to fassert.
             return Status(ErrorCodes::ShutdownInProgress,
@@ -630,7 +632,7 @@ TEST_F(ReporterTest, FailingToScheduleTimeoutShouldMakeReporterInactive) {
         TaskExecutorWithFailureInScheduleWorkAt(executor::TaskExecutor* executor)
             : unittest::TaskExecutorProxy(executor) {}
         virtual StatusWith<executor::TaskExecutor::CallbackHandle> scheduleWorkAt(
-            Date_t when, CallbackFn work) override {
+            Date_t when, CallbackFn&&) override {
             return Status(ErrorCodes::OperationFailed, "failed to schedule work");
         }
     };

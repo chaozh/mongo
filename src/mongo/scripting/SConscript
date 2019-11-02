@@ -40,16 +40,6 @@ env.Library(
     ],
 )
 
-env.CppUnitTest(
-    target='bson_template_evaluator_test',
-    source=[
-        'bson_template_evaluator_test.cpp',
-    ],
-    LIBDEPS=[
-        'bson_template_evaluator',
-    ],
-)
-
 env.Library(
     target='scripting_none',
     source=[
@@ -63,42 +53,7 @@ env.Library(
 
 if usemozjs:
     scriptingEnv = env.Clone()
-    scriptingEnv.InjectThirdParty(libraries=['mozjs'])
-
-    # TODO: get rid of all of this /FI and -include stuff and migrate to a shim
-    # header we include in all of our files.
-    if env.TargetOSIs('windows'):
-        scriptingEnv.Append(
-            CCFLAGS=[
-                '/FI', 'js-config.h',
-                '/FI', 'js/RequiredDefines.h',
-            ],
-            CPPDEFINES=[
-                '_SILENCE_CXX17_ITERATOR_BASE_CLASS_DEPRECATION_WARNING',
-            ]
-        )
-    else:
-        scriptingEnv.Append(
-            CCFLAGS=[
-                '-include', 'js-config.h',
-                '-include', 'js/RequiredDefines.h',
-                '-Wno-invalid-offsetof',
-            ],
-            CXXFLAGS=[
-                '-Wno-non-virtual-dtor',
-            ],
-        )
-
-    scriptingEnv.Prepend(CPPDEFINES=[
-        'JS_USE_CUSTOM_ALLOCATOR',
-        'STATIC_JS_API=1',
-    ])
-
-    if get_option('spider-monkey-dbg') == "on":
-        scriptingEnv.Prepend(CPPDEFINES=[
-            'DEBUG',
-            'JS_DEBUG',
-        ])
+    scriptingEnv.InjectMozJS()
 
     scriptingEnv.JSHeader(
         target='mozjs/mongohelpers_js.cpp',
@@ -156,7 +111,7 @@ if usemozjs:
             'mozjs/valuereader.cpp',
             'mozjs/valuewriter.cpp',
             env.Idlc('mozjs/engine.idl')[0],
-            env.Idlc('mozjs/end_sessions.idl')[0],
+            env.Idlc('mozjs/scripting_util.idl')[0],
         ],
         LIBDEPS=[
             'bson_template_evaluator',
@@ -192,11 +147,13 @@ env.Library(
 )
 
 env.CppUnitTest(
-    target='deadline_monitor_test',
+    target='scripting_test',
     source=[
+        'bson_template_evaluator_test.cpp',
         'deadline_monitor_test.cpp',
     ],
     LIBDEPS=[
+        'bson_template_evaluator',
         'scripting_common',
     ],
 )

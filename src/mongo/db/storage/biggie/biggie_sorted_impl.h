@@ -28,6 +28,7 @@
  */
 #pragma once
 
+#include "mongo/db/index/index_descriptor_fwd.h"
 #include "mongo/db/storage/biggie/store.h"
 #include "mongo/db/storage/key_string.h"
 #include "mongo/db/storage/sorted_data_interface.h"
@@ -43,11 +44,11 @@ public:
                                Ordering order,
                                const std::string& prefix,
                                const std::string& identEnd,
-                               const std::string& collectionNamespace,
+                               const NamespaceString& collectionNamespace,
                                const std::string& indexName,
                                const BSONObj& keyPattern);
-    SpecialFormatInserted commit(bool mayInterrupt) override;
-    virtual StatusWith<SpecialFormatInserted> addKey(const BSONObj& key, const RecordId& loc);
+    void commit(bool mayInterrupt) override;
+    virtual Status addKey(const KeyString::Value& keyString);
 
 private:
     OperationContext* _opCtx;
@@ -59,7 +60,7 @@ private:
     std::string _prefix;
     std::string _identEnd;
     // Index metadata.
-    const std::string _collectionNamespace;
+    const NamespaceString _collectionNamespace;
     const std::string _indexName;
     const BSONObj _keyPattern;
     // Whether or not we've already added something before.
@@ -79,15 +80,13 @@ public:
     SortedDataInterface(const Ordering& ordering, bool isUnique, StringData ident);
     virtual SortedDataBuilderInterface* getBulkBuilder(OperationContext* opCtx,
                                                        bool dupsAllowed) override;
-    virtual StatusWith<SpecialFormatInserted> insert(OperationContext* opCtx,
-                                                     const BSONObj& key,
-                                                     const RecordId& loc,
-                                                     bool dupsAllowed) override;
+    virtual Status insert(OperationContext* opCtx,
+                          const KeyString::Value& keyString,
+                          bool dupsAllowed) override;
     virtual void unindex(OperationContext* opCtx,
-                         const BSONObj& key,
-                         const RecordId& loc,
+                         const KeyString::Value& keyString,
                          bool dupsAllowed) override;
-    virtual Status dupKeyCheck(OperationContext* opCtx, const BSONObj& key) override;
+    virtual Status dupKeyCheck(OperationContext* opCtx, const KeyString::Value& keyString) override;
     virtual void fullValidate(OperationContext* opCtx,
                               long long* numKeysOut,
                               ValidateResults* fullResults) const override;
@@ -119,23 +118,29 @@ public:
                std::string KSForIdentEnd);
         virtual void setEndPosition(const BSONObj& key, bool inclusive) override;
         virtual boost::optional<IndexKeyEntry> next(RequestedInfo parts = kKeyAndLoc) override;
-        virtual boost::optional<IndexKeyEntry> seek(const BSONObj& key,
-                                                    bool inclusive,
+        virtual boost::optional<KeyStringEntry> nextKeyString() override;
+        virtual boost::optional<IndexKeyEntry> seek(const KeyString::Value& keyString,
                                                     RequestedInfo parts = kKeyAndLoc) override;
-        virtual boost::optional<IndexKeyEntry> seek(const IndexSeekPoint& seekPoint,
-                                                    RequestedInfo parts = kKeyAndLoc) override;
+        virtual boost::optional<KeyStringEntry> seekForKeyString(
+            const KeyString::Value& keyStringValue) override;
+        virtual boost::optional<KeyStringEntry> seekExactForKeyString(
+            const KeyString::Value& keyStringValue) override;
+        virtual boost::optional<IndexKeyEntry> seekExact(const KeyString::Value& keyStringValue,
+                                                         RequestedInfo) override;
         virtual void save() override;
         virtual void restore() override;
         virtual void detachFromOperationContext() override;
         virtual void reattachToOperationContext(OperationContext* opCtx) override;
 
     private:
+        bool advanceNext();
         // This is a helper function to check if the cursor was explicitly set by the user or not.
         bool endPosSet();
         // This is a helper function to check if the cursor is valid or not.
         bool checkCursorValid();
         // This is a helper function for seek.
-        boost::optional<IndexKeyEntry> seekAfterProcessing(BSONObj finalKey, bool inclusive);
+        boost::optional<IndexKeyEntry> seekAfterProcessing(BSONObj finalKey);
+        boost::optional<KeyStringEntry> seekAfterProcessing(const KeyString::Value& keyString);
         OperationContext* _opCtx;
         // This is the "working copy" of the master "branch" in the git analogy.
         StringStore* _workingCopy;
@@ -183,12 +188,11 @@ private:
 
     bool keyExists(OperationContext* opCtx, const BSONObj& key);
 
-    const Ordering _order;
     // These two are the same as before.
     std::string _prefix;
     std::string _identEnd;
     // Index metadata.
-    const std::string _collectionNamespace;
+    const NamespaceString _collectionNamespace;
     const std::string _indexName;
     const BSONObj _keyPattern;
     // These are the keystring representations of the _prefix and the _identEnd.

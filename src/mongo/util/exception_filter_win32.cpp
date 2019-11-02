@@ -60,7 +60,7 @@ namespace {
 void doMinidumpWithException(struct _EXCEPTION_POINTERS* exceptionInfo) {
     WCHAR moduleFileName[MAX_PATH];
 
-    DWORD ret = GetModuleFileNameW(NULL, &moduleFileName[0], ARRAYSIZE(moduleFileName));
+    DWORD ret = GetModuleFileNameW(nullptr, &moduleFileName[0], ARRAYSIZE(moduleFileName));
     if (ret == 0) {
         int gle = GetLastError();
         log() << "GetModuleFileName failed " << errnoWithDescription(gle);
@@ -68,8 +68,8 @@ void doMinidumpWithException(struct _EXCEPTION_POINTERS* exceptionInfo) {
         // Fallback name
         wcscpy_s(moduleFileName, L"mongo");
     } else {
-        WCHAR* dotStr = wcschr(&moduleFileName[0], L'.');
-        if (dotStr != NULL) {
+        WCHAR* dotStr = wcsrchr(&moduleFileName[0], L'.');
+        if (dotStr != nullptr) {
             *dotStr = L'\0';
         }
     }
@@ -85,7 +85,7 @@ void doMinidumpWithException(struct _EXCEPTION_POINTERS* exceptionInfo) {
     dumpName += L".mdmp";
 
     HANDLE hFile = CreateFileW(
-        dumpName.c_str(), GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+        dumpName.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (INVALID_HANDLE_VALUE == hFile) {
         DWORD lasterr = GetLastError();
         log() << "failed to open minidump file " << toUtf8String(dumpName.c_str()) << " : "
@@ -111,9 +111,9 @@ void doMinidumpWithException(struct _EXCEPTION_POINTERS* exceptionInfo) {
                                      GetCurrentProcessId(),
                                      hFile,
                                      miniDumpType,
-                                     exceptionInfo != NULL ? &aMiniDumpInfo : NULL,
-                                     NULL,
-                                     NULL);
+                                     exceptionInfo != nullptr ? &aMiniDumpInfo : nullptr,
+                                     nullptr,
+                                     nullptr);
     if (FALSE == bstatus) {
         DWORD lasterr = GetLastError();
         log() << "failed to create minidump : " << errnoWithDescription(lasterr);
@@ -178,7 +178,7 @@ LONG WINAPI exceptionFilter(struct _EXCEPTION_POINTERS* excPointers) {
     // We won't reach here
     return EXCEPTION_EXECUTE_HANDLER;
 }
-}
+}  // namespace
 
 LPTOP_LEVEL_EXCEPTION_FILTER filtLast = 0;
 
@@ -192,6 +192,6 @@ void setWindowsUnhandledExceptionFilter() {
 
 namespace mongo {
 void setWindowsUnhandledExceptionFilter() {}
-}
+}  // namespace mongo
 
 #endif  // _WIN32

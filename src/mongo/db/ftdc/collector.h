@@ -30,10 +30,10 @@
 #pragma once
 
 #include <memory>
+#include <string>
 #include <tuple>
 #include <vector>
 
-#include "mongo/base/disallow_copying.h"
 
 namespace mongo {
 
@@ -49,7 +49,8 @@ class OperationContext;
  * Provides an interface to collect BSONObjs from system providers
  */
 class FTDCCollectorInterface {
-    MONGO_DISALLOW_COPYING(FTDCCollectorInterface);
+    FTDCCollectorInterface(const FTDCCollectorInterface&) = delete;
+    FTDCCollectorInterface& operator=(const FTDCCollectorInterface&) = delete;
 
 public:
     virtual ~FTDCCollectorInterface() = default;
@@ -79,7 +80,8 @@ protected:
  * Not Thread-Safe. Locking is owner's responsibility.
  */
 class FTDCCollectorCollection {
-    MONGO_DISALLOW_COPYING(FTDCCollectorCollection);
+    FTDCCollectorCollection(const FTDCCollectorCollection&) = delete;
+    FTDCCollectorCollection& operator=(const FTDCCollectorCollection&) = delete;
 
 public:
     FTDCCollectorCollection() = default;

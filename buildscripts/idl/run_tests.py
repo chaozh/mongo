@@ -1,4 +1,4 @@
-#!/usr/bin/env python2
+#!/usr/bin/env python3
 #
 # Copyright (C) 2018-present MongoDB, Inc.
 #
@@ -32,7 +32,6 @@ IDL Unit Test runner.
 
 Generates a file called results.xml in the XUnit format.
 """
-from __future__ import absolute_import, print_function
 
 import sys
 import unittest

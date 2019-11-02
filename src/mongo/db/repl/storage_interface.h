@@ -35,7 +35,6 @@
 #include <iosfwd>
 #include <string>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/base/string_data.h"
 #include "mongo/bson/timestamp.h"
 #include "mongo/db/catalog/collection.h"
@@ -71,7 +70,8 @@ struct TimestampedBSONObj {
  *      * Insert documents into a collection
  */
 class StorageInterface {
-    MONGO_DISALLOW_COPYING(StorageInterface);
+    StorageInterface(const StorageInterface&) = delete;
+    StorageInterface& operator=(const StorageInterface&) = delete;
 
 public:
     // Operation Context binding.
@@ -342,12 +342,6 @@ public:
                                                                  const NamespaceString& nss) = 0;
 
     /**
-     * Updates unique indexes belonging to all non-replicated collections. To be called at the
-     * end of initial sync.
-     */
-    virtual Status upgradeNonReplicatedUniqueIndexes(OperationContext* opCtx) = 0;
-
-    /**
      * Sets the highest timestamp at which the storage engine is allowed to take a checkpoint.
      * This timestamp can never decrease, and thus should be a timestamp that can never roll back.
      */
@@ -380,6 +374,14 @@ public:
     virtual bool supportsRecoveryTimestamp(ServiceContext* serviceCtx) const = 0;
 
     /**
+     * Responsible for initializing independent processes for replication that manage
+     * and interact with the storage layer.
+     *
+     * Initializes the OplogCapMaintainerThread to control deletion of oplog stones.
+     */
+    virtual void initializeStorageControlsForReplication(ServiceContext* serviceCtx) const = 0;
+
+    /**
      * Returns the stable timestamp that the storage engine recovered to on startup. If the
      * recovery point was not stable, returns "none".
      */
@@ -396,12 +398,16 @@ public:
                                                          bool primaryOnly = false) = 0;
 
     /**
-     * Returns the all committed timestamp. All transactions with timestamps earlier than the
-     * all committed timestamp are committed. Only storage engines that support document level
-     * locking must provide an implementation. Other storage engines may provide a no-op
-     * implementation.
+     * Returns the all_durable timestamp. All transactions with timestamps earlier than the
+     * all_durable timestamp are committed. Only storage engines that support document level locking
+     * must provide an implementation. Other storage engines may provide a no-op implementation.
+     *
+     * The all_durable timestamp only includes non-prepared transactions that have been given a
+     * commit_timestamp and prepared transactions that have been given a durable_timestamp.
+     * Previously, the deprecated all_committed timestamp would also include prepared transactions
+     * that were prepared but not committed which could make the stable timestamp briefly jump back.
      */
-    virtual Timestamp getAllCommittedTimestamp(ServiceContext* serviceCtx) const = 0;
+    virtual Timestamp getAllDurableTimestamp(ServiceContext* serviceCtx) const = 0;
 
     /**
      * Returns the oldest read timestamp in use by an open transaction. Storage engines that support
@@ -436,18 +442,6 @@ public:
      * require resync. Returns boost::none if `supportsRecoverToStableTimestamp` returns false.
      */
     virtual boost::optional<Timestamp> getLastStableRecoveryTimestamp(
-        ServiceContext* serviceCtx) const = 0;
-
-    /**
-     * DEPRECATED. Use getLastStableRecoveryTimestamp instead!
-     *
-     * Returns a timestamp that is guaranteed to be persisted on disk in a checkpoint. Returns
-     * `Timestamp::min()` if no stable checkpoint has been taken. Returns boost::none if
-     * `supportsRecoverToStableTimestamp` returns false or if this is not a persisted data engine.
-     *
-     * TODO: delete this in v4.4 (SERVER-36194).
-     */
-    virtual boost::optional<Timestamp> getLastStableCheckpointTimestampDeprecated(
         ServiceContext* serviceCtx) const = 0;
 
     /**

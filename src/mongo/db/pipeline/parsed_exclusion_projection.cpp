@@ -31,10 +31,11 @@
 
 #include "mongo/db/pipeline/parsed_exclusion_projection.h"
 
-#include "mongo/db/pipeline/document.h"
+#include <memory>
+
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/pipeline/field_path.h"
-#include "mongo/db/pipeline/value.h"
-#include "mongo/stdx/memory.h"
 
 namespace mongo {
 
@@ -54,9 +55,6 @@ void ParsedExclusionProjection::parse(const BSONObj& spec, ExclusionNode* node, 
 
     for (auto elem : spec) {
         const auto fieldName = elem.fieldNameStringData();
-
-        // A $ should have been detected by ParsedAggregationProjection before we get here.
-        invariant(fieldName[0] != '$');
 
         // Track whether the projection spec specifies a desired behavior for the _id field.
         idSpecified = idSpecified || fieldName == "_id"_sd || fieldName.startsWith("_id."_sd);

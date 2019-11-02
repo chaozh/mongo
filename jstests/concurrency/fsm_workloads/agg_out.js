@@ -19,7 +19,6 @@ load('jstests/concurrency/fsm_workloads/agg_base.js');             // for $confi
 load('jstests/concurrency/fsm_workload_helpers/server_types.js');  // for isMongos
 
 var $config = extendWorkload($config, function($config, $super) {
-
     // Use a smaller document size, but more iterations. The smaller documents will ensure each
     // operation is faster, giving us time to do more operations and thus increasing the likelihood
     // that any two operations will be happening concurrently.
@@ -67,8 +66,7 @@ var $config = extendWorkload($config, function($config, $super) {
 
         const allowedErrorCodes = [
             ErrorCodes.CommandFailed,  // indexes of target collection changed during processing.
-            17017,  // $out with mode replaceCollection is not supported to an existing *sharded*
-                    // output collection.
+            17017,  // $out is not supported to an existing *sharded* output collection.
             17152,  // namespace is capped so it can't be used for $out.
             28769,  // $out collection cannot be sharded.
         ];

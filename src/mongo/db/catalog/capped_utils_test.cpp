@@ -29,15 +29,16 @@
 
 #include "mongo/platform/basic.h"
 
+#include <memory>
+
 #include "mongo/db/catalog/capped_utils.h"
-#include "mongo/db/catalog/collection_catalog_entry.h"
 #include "mongo/db/client.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/replication_coordinator_mock.h"
 #include "mongo/db/repl/storage_interface_impl.h"
 #include "mongo/db/service_context_d_test_fixture.h"
-#include "mongo/stdx/memory.h"
+#include "mongo/db/storage/durable_catalog.h"
 #include "mongo/unittest/unittest.h"
 
 namespace {
@@ -61,11 +62,11 @@ void CappedUtilsTest::setUp() {
     auto service = getServiceContext();
 
     // Set up ReplicationCoordinator and ensure that we are primary.
-    auto replCoord = stdx::make_unique<repl::ReplicationCoordinatorMock>(service);
+    auto replCoord = std::make_unique<repl::ReplicationCoordinatorMock>(service);
     ASSERT_OK(replCoord->setFollowerMode(repl::MemberState::RS_PRIMARY));
     repl::ReplicationCoordinator::set(service, std::move(replCoord));
 
-    _storage = stdx::make_unique<repl::StorageInterfaceImpl>();
+    _storage = std::make_unique<repl::StorageInterfaceImpl>();
 }
 
 void CappedUtilsTest::tearDown() {
@@ -97,8 +98,7 @@ CollectionOptions getCollectionOptions(OperationContext* opCtx, const NamespaceS
     auto collection = autoColl.getCollection();
     ASSERT_TRUE(collection) << "Unable to get collections options for " << nss
                             << " because collection does not exist.";
-    auto catalogEntry = collection->getCatalogEntry();
-    return catalogEntry->getCollectionOptions(opCtx);
+    return DurableCatalog::get(opCtx)->getCollectionOptions(opCtx, nss);
 }
 
 // Size of capped collection to be passed to convertToCapped() which accepts a double.

@@ -48,20 +48,25 @@ public:
     static const BSONObj Acknowledged;
     static const BSONObj Unacknowledged;
     static const BSONObj Majority;
-    static const BSONObj InternalMajorityNoSnapshot;
 
     static constexpr StringData kWriteConcernField = "writeConcern"_sd;
-    static const char kMajority[];                    // = "majority"
-    static const char kInternalMajorityNoSnapshot[];  // = "internalMajorityNoSnapshot"
+    static const char kMajority[];  // = "majority"
 
     static constexpr Seconds kWriteConcernTimeoutSystem{15};
     static constexpr Seconds kWriteConcernTimeoutMigration{30};
     static constexpr Seconds kWriteConcernTimeoutSharding{60};
     static constexpr Seconds kWriteConcernTimeoutUserCommand{60};
 
-    WriteConcernOptions() {
-        reset();
-    }
+    // It is assumed that a default-constructed WriteConcernOptions will be populated with the
+    // default options. If it is subsequently populated with non-default options, it is the caller's
+    // responsibility to set the usedDefault and usedDefaultW flag correctly.
+    WriteConcernOptions()
+        : syncMode(SyncMode::UNSET),
+          wNumNodes(1),
+          wMode(""),
+          wTimeout(0),
+          usedDefault(true),
+          usedDefaultW(true) {}
 
     WriteConcernOptions(int numNodes, SyncMode sync, int timeout);
 
@@ -84,21 +89,13 @@ public:
      * Attempts to extract a writeConcern from cmdObj.
      * Verifies that the writeConcern is of type Object (BSON type).
      */
-    static StatusWith<WriteConcernOptions> extractWCFromCommand(
-        const BSONObj& cmdObj, const WriteConcernOptions& defaultWC = WriteConcernOptions());
+    static StatusWith<WriteConcernOptions> extractWCFromCommand(const BSONObj& cmdObj);
 
     /**
      * Return true if the server needs to wait for other secondary nodes to satisfy this
      * write concern setting. Errs on the false positive for non-empty wMode.
      */
-    bool shouldWaitForOtherNodes() const;
-
-    void reset() {
-        syncMode = SyncMode::UNSET;
-        wNumNodes = 0;
-        wMode = "";
-        wTimeout = 0;
-    }
+    bool needToWaitForOtherNodes() const;
 
     // Returns the BSON representation of this object.
     // Warning: does not return the same object passed on the last parse() call.

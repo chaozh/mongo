@@ -29,10 +29,11 @@
 
 #pragma once
 
+#include <memory>
+
 #include "mongo/base/string_data.h"
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/update/modifier_node.h"
-#include "mongo/stdx/memory.h"
 
 namespace mongo {
 
@@ -44,10 +45,14 @@ public:
     Status init(BSONElement modExpr, const boost::intrusive_ptr<ExpressionContext>& expCtx) final;
 
     std::unique_ptr<UpdateNode> clone() const final {
-        return stdx::make_unique<BitNode>(*this);
+        return std::make_unique<BitNode>(*this);
     }
 
     void setCollator(const CollatorInterface* collator) final {}
+
+    void acceptVisitor(UpdateNodeVisitor* visitor) final {
+        visitor->visit(this);
+    }
 
 protected:
     ModifyResult updateExistingElement(mutablebson::Element* element,
@@ -67,7 +72,7 @@ private:
         BSONObjBuilder bob;
         {
             BSONObjBuilder subBuilder(bob.subobjStart(""));
-            for (const auto[bitOperator, operand] : _opList) {
+            for (const auto [bitOperator, operand] : _opList) {
                 operand.toBSON(
                     [](SafeNum (SafeNum::*bitOperator)(const SafeNum&) const) {
                         if (bitOperator == &SafeNum::bitAnd)

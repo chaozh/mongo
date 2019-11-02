@@ -32,7 +32,6 @@
 #include "mongo/platform/basic.h"
 
 #include "mongo/s/client/shard_remote.h"
-#include "mongo/s/client/shard_remote_gen.h"
 
 #include <algorithm>
 #include <string>
@@ -51,14 +50,13 @@
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/rpc/metadata/repl_set_metadata.h"
 #include "mongo/rpc/metadata/tracking_metadata.h"
+#include "mongo/s/client/shard_remote_gen.h"
 #include "mongo/s/grid.h"
 #include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
-
-using std::string;
 
 using executor::RemoteCommandRequest;
 using executor::RemoteCommandResponse;
@@ -67,6 +65,7 @@ using rpc::TrackingMetadata;
 using RemoteCommandCallbackArgs = TaskExecutor::RemoteCommandCallbackArgs;
 
 namespace {
+
 // Include kReplSetMetadataFieldName in a request to get the shard's ReplSetMetadata in the
 // response.
 const BSONObj kReplMetadata(BSON(rpc::kReplSetMetadataFieldName << 1));
@@ -80,7 +79,7 @@ BSONObj appendMaxTimeToCmdObj(Milliseconds maxTimeMSOverride, const BSONObj& cmd
 
     // Remove the user provided maxTimeMS so we can attach the one from the override
     for (const auto& elem : cmdObj) {
-        if (!str::equals(elem.fieldName(), QueryRequest::cmdOptionMaxTimeMS)) {
+        if (elem.fieldNameStringData() != QueryRequest::cmdOptionMaxTimeMS) {
             updatedCmdBuilder.append(elem);
         }
     }
@@ -107,14 +106,21 @@ bool ShardRemote::isRetriableError(ErrorCodes::Error code, RetryPolicy options) 
         return false;
     }
 
-    if (options == RetryPolicy::kNoRetry) {
-        return false;
+    switch (options) {
+        case RetryPolicy::kNoRetry: {
+            return false;
+        } break;
+
+        case RetryPolicy::kIdempotent: {
+            return ErrorCodes::isRetriableError(code);
+        } break;
+
+        case RetryPolicy::kNotIdempotent: {
+            return ErrorCodes::isNotMasterError(code);
+        } break;
     }
 
-    const auto& retriableErrors = options == RetryPolicy::kIdempotent
-        ? RemoteCommandRetryScheduler::kAllRetriableErrors
-        : RemoteCommandRetryScheduler::kNotMasterErrors;
-    return std::find(retriableErrors.begin(), retriableErrors.end(), code) != retriableErrors.end();
+    MONGO_UNREACHABLE;
 }
 
 const ConnectionString ShardRemote::getConnString() const {
@@ -137,7 +143,7 @@ void ShardRemote::updateReplSetMonitor(const HostAndPort& remoteHost,
 }
 
 void ShardRemote::updateLastCommittedOpTime(LogicalTime lastCommittedOpTime) {
-    stdx::lock_guard<stdx::mutex> lk(_lastCommittedOpTimeMutex);
+    stdx::lock_guard<Latch> lk(_lastCommittedOpTimeMutex);
 
     // A secondary may return a lastCommittedOpTime less than the latest seen so far.
     if (lastCommittedOpTime > _lastCommittedOpTime) {
@@ -146,7 +152,7 @@ void ShardRemote::updateLastCommittedOpTime(LogicalTime lastCommittedOpTime) {
 }
 
 LogicalTime ShardRemote::getLastCommittedOpTime() const {
-    stdx::lock_guard<stdx::mutex> lk(_lastCommittedOpTimeMutex);
+    stdx::lock_guard<Latch> lk(_lastCommittedOpTimeMutex);
     return _lastCommittedOpTime;
 }
 
@@ -183,7 +189,7 @@ BSONObj ShardRemote::_appendMetadataForCommand(OperationContext* opCtx,
 
 StatusWith<Shard::CommandResponse> ShardRemote::_runCommand(OperationContext* opCtx,
                                                             const ReadPreferenceSetting& readPref,
-                                                            const string& dbName,
+                                                            StringData dbName,
                                                             Milliseconds maxTimeMSOverride,
                                                             const BSONObj& cmdObj) {
     RemoteCommandResponse response =
@@ -245,7 +251,7 @@ StatusWith<Shard::CommandResponse> ShardRemote::_runCommand(OperationContext* op
 StatusWith<Shard::QueryResponse> ShardRemote::_runExhaustiveCursorCommand(
     OperationContext* opCtx,
     const ReadPreferenceSetting& readPref,
-    const string& dbName,
+    StringData dbName,
     Milliseconds maxTimeMSOverride,
     const BSONObj& cmdObj) {
     const auto host = _targeter->findHost(opCtx, readPref);
@@ -262,7 +268,6 @@ StatusWith<Shard::QueryResponse> ShardRemote::_runExhaustiveCursorCommand(
     auto fetcherCallback = [&status, &response](const Fetcher::QueryResponseStatus& dataStatus,
                                                 Fetcher::NextAction* nextAction,
                                                 BSONObjBuilder* getMoreBob) {
-
         // Throw out any accumulated results on error
         if (!dataStatus.isOK()) {
             status = dataStatus.getStatus();
@@ -273,6 +278,7 @@ StatusWith<Shard::QueryResponse> ShardRemote::_runExhaustiveCursorCommand(
         const auto& data = dataStatus.getValue();
 
         if (data.otherFields.metadata.hasField(rpc::kReplSetMetadataFieldName)) {
+            // Sharding users of ReplSetMetadata do not require the wall clock time field to be set
             auto replParseStatus =
                 rpc::ReplSetMetadata::readFromMetadata(data.otherFields.metadata);
             if (!replParseStatus.isOK()) {
@@ -282,7 +288,7 @@ StatusWith<Shard::QueryResponse> ShardRemote::_runExhaustiveCursorCommand(
             }
 
             const auto& replSetMetadata = replParseStatus.getValue();
-            response.opTime = replSetMetadata.getLastOpCommitted();
+            response.opTime = replSetMetadata.getLastOpCommitted().opTime;
         }
 
         for (const BSONObj& doc : data.documents) {
@@ -301,9 +307,10 @@ StatusWith<Shard::QueryResponse> ShardRemote::_runExhaustiveCursorCommand(
     const Milliseconds requestTimeout =
         std::min(opCtx->getRemainingMaxTimeMillis(), maxTimeMSOverride);
 
-    Fetcher fetcher(Grid::get(opCtx)->getExecutorPool()->getFixedExecutor(),
+    auto executor = Grid::get(opCtx)->getExecutorPool()->getFixedExecutor();
+    Fetcher fetcher(executor.get(),
                     host.getValue(),
-                    dbName,
+                    dbName.toString(),
                     cmdObj,
                     fetcherCallback,
                     _appendMetadataForCommand(opCtx, readPref),
@@ -401,7 +408,7 @@ void ShardRemote::runFireAndForgetCommand(OperationContext* opCtx,
 StatusWith<ShardRemote::AsyncCmdHandle> ShardRemote::_scheduleCommand(
     OperationContext* opCtx,
     const ReadPreferenceSetting& readPref,
-    const std::string& dbName,
+    StringData dbName,
     Milliseconds maxTimeMSOverride,
     const BSONObj& cmdObj,
     const TaskExecutor::RemoteCommandCallbackFn& cb) {
@@ -424,7 +431,7 @@ StatusWith<ShardRemote::AsyncCmdHandle> ShardRemote::_scheduleCommand(
 
     const RemoteCommandRequest request(
         asyncHandle.hostTargetted,
-        dbName,
+        dbName.toString(),
         appendMaxTimeToCmdObj(requestTimeout, cmdObj),
         _appendMetadataForCommand(opCtx, readPrefWithMinOpTime),
         opCtx,

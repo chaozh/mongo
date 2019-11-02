@@ -35,7 +35,6 @@
 #include "mongo/db/catalog/coll_mod.h"
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/database_holder.h"
-#include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/feature_compatibility_version.h"
 #include "mongo/db/commands/feature_compatibility_version_command_parser.h"
@@ -43,21 +42,16 @@
 #include "mongo/db/commands/feature_compatibility_version_parser.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/db_raii.h"
-#include "mongo/db/dbdirectclient.h"
-#include "mongo/db/logical_session_id.h"
-#include "mongo/db/namespace_string.h"
-#include "mongo/db/ops/write_ops.h"
 #include "mongo/db/repl/repl_client_info.h"
+#include "mongo/db/s/active_shard_collection_registry.h"
 #include "mongo/db/s/config/sharding_catalog_manager.h"
 #include "mongo/db/server_options.h"
-#include "mongo/db/session_catalog_mongod.h"
-#include "mongo/db/transaction_participant.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/s/catalog/type_collection.h"
 #include "mongo/s/database_version_helpers.h"
 #include "mongo/s/grid.h"
 #include "mongo/util/exit.h"
-#include "mongo/util/fail_point_service.h"
+#include "mongo/util/fail_point.h"
 #include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
 
@@ -67,158 +61,11 @@ namespace {
 
 MONGO_FAIL_POINT_DEFINE(featureCompatibilityDowngrade);
 MONGO_FAIL_POINT_DEFINE(featureCompatibilityUpgrade);
-MONGO_FAIL_POINT_DEFINE(pauseBeforeUpgradingSessions);
-MONGO_FAIL_POINT_DEFINE(pauseBeforeDowngradingSessions);
+MONGO_FAIL_POINT_DEFINE(pauseBeforeDowngradingConfigMetadata);  // TODO SERVER-44034: Remove.
+MONGO_FAIL_POINT_DEFINE(pauseBeforeUpgradingConfigMetadata);    // TODO SERVER-44034: Remove.
 
 /**
- * Returns a set of the logical session ids of each entry in config.transactions that matches the
- * given query.
- */
-LogicalSessionIdSet getMatchingSessionIdsFromTransactionTable(OperationContext* opCtx,
-                                                              Query query) {
-    LogicalSessionIdSet sessionIds = {};
-
-    DBDirectClient client(opCtx);
-    auto cursor = client.query(NamespaceString::kSessionTransactionsTableNamespace, query);
-    while (cursor->more()) {
-        auto txnRecord = SessionTxnRecord::parse(
-            IDLParserErrorContext("setFCV-find-matching-sessions"), cursor->next());
-        sessionIds.insert(txnRecord.getSessionId());
-    }
-    return sessionIds;
-}
-
-/**
- * Checks out each given session with a new operation context, verifies the session's transaction
- * participant passes the validation function, runs the modification function with a direct
- * client from another new operation context while the session is checked out, then invalidates the
- * session.
- */
-void forEachSessionWithCheckout(
-    OperationContext* opCtx,
-    LogicalSessionIdSet sessionIds,
-    stdx::function<bool(OperationContext* opCtx)> verifyTransactionParticipantFn,
-    stdx::function<void(DBDirectClient* client, LogicalSessionId sessionId)>
-        performModificationFn) {
-    // Construct a new operation context to check out the session with.
-    auto clientForCheckout =
-        opCtx->getServiceContext()->makeClient("setFCV-transaction-table-checkout");
-    AlternativeClientRegion acrForCheckout(clientForCheckout);
-    for (const auto& sessionId : sessionIds) {
-        // Check for interrupt on the parent opCtx because killing it won't be propagated to the
-        // opCtx checking out the session and performing the modification.
-        opCtx->checkForInterrupt();
-
-        const auto opCtxForCheckout = cc().makeOperationContext();
-        opCtxForCheckout->setLogicalSessionId(sessionId);
-        MongoDOperationContextSession ocs(opCtxForCheckout.get());
-
-        // Now that the session is checked out, verify it still needs to be modified using its
-        // transaction participant.
-        if (!verifyTransactionParticipantFn(opCtxForCheckout.get())) {
-            continue;
-        }
-
-        {
-            // Perform the modification on another operation context to bypass retryable writes and
-            // transactions machinery.
-            auto clientForModification =
-                opCtx->getServiceContext()->makeClient("setFCV-transaction-table-modification");
-            AlternativeClientRegion acrForModification(clientForModification);
-
-            const auto opCtxForModification = cc().makeOperationContext();
-            DBDirectClient directClient(opCtxForModification.get());
-            performModificationFn(&directClient, sessionId);
-        }
-
-        // Note that invalidating the session here is unnecessary if the modification function
-        // writes directly to config.transactions, which already invalidates the affected session.
-        auto txnParticipant = TransactionParticipant::get(opCtxForCheckout.get());
-        txnParticipant.invalidate(opCtxForCheckout.get());
-    }
-}
-
-/**
- * Removes all documents from config.transactions with a "state" field because they may point to
- * oplog entries in a format a 4.0 mongod cannot process.
- */
-void downgradeTransactionTable(OperationContext* opCtx) {
-    // In FCV 4.0, all transaction table entries associated with a transaction have a "state" field.
-    Query query(BSON("state" << BSON("$exists" << true)));
-    LogicalSessionIdSet sessionIdsWithState =
-        getMatchingSessionIdsFromTransactionTable(opCtx, query);
-
-    if (MONGO_FAIL_POINT(pauseBeforeDowngradingSessions)) {
-        LOG(0) << "Hit pauseBeforeDowngradingSessions failpoint";
-        MONGO_FAIL_POINT_PAUSE_WHILE_SET(pauseBeforeDowngradingSessions);
-    }
-
-    // Remove all transaction table entries associated with a committed / aborted transaction. Note
-    // that transactions that abort before prepare have no entry.
-    forEachSessionWithCheckout(
-        opCtx,
-        sessionIdsWithState,
-        [](OperationContext* opCtx) {
-            auto txnParticipant = TransactionParticipant::get(opCtx);
-            return txnParticipant.transactionIsCommitted() || txnParticipant.transactionIsAborted();
-        },
-        [](DBDirectClient* directClient, LogicalSessionId sessionId) {
-            const auto commandResponse = directClient->runCommand([&] {
-                write_ops::Delete deleteOp(NamespaceString::kSessionTransactionsTableNamespace);
-                deleteOp.setDeletes({[&] {
-                    write_ops::DeleteOpEntry entry;
-                    entry.setQ(BSON("_id" << sessionId.toBSON()));
-                    entry.setMulti(false);
-                    return entry;
-                }()});
-                return deleteOp.serialize({});
-            }());
-            uassertStatusOK(getStatusFromWriteCommandReply(commandResponse->getCommandReply()));
-        });
-}
-
-/**
- * Adds a "state" field to all documents in config.transactions that represent committed
- * transactions so they are in the 4.2 format.
- */
-void upgradeTransactionTable(OperationContext* opCtx) {
-    // Retryable writes and committed transactions have the same format in FCV 4.0, so use an empty
-    // query to return all session ids in the transaction table.
-    LogicalSessionIdSet allSessionIds = getMatchingSessionIdsFromTransactionTable(opCtx, Query());
-
-    if (MONGO_FAIL_POINT(pauseBeforeUpgradingSessions)) {
-        LOG(0) << "Hit pauseBeforeUpgradingSessions failpoint";
-        MONGO_FAIL_POINT_PAUSE_WHILE_SET(pauseBeforeUpgradingSessions);
-    }
-
-    // Add state=committed to the transaction table entry for each session that most recently
-    // committed a transaction.
-    forEachSessionWithCheckout(
-        opCtx,
-        allSessionIds,
-        [](OperationContext* opCtx) {
-            auto txnParticipant = TransactionParticipant::get(opCtx);
-            return txnParticipant.transactionIsCommitted();
-        },
-        [](DBDirectClient* directClient, LogicalSessionId sessionId) {
-            const auto commandResponse = directClient->runCommand([&] {
-                write_ops::Update updateOp(NamespaceString::kSessionTransactionsTableNamespace);
-                updateOp.setUpdates({[&] {
-                    write_ops::UpdateOpEntry entry;
-                    entry.setQ(BSON("_id" << sessionId.toBSON()));
-                    entry.setU(BSON("$set" << BSON("state"
-                                                   << "committed")));
-                    entry.setMulti(false);
-                    return entry;
-                }()});
-                return updateOp.serialize({});
-            }());
-            uassertStatusOK(getStatusFromWriteCommandReply(commandResponse->getCommandReply()));
-        });
-}
-
-/**
- * Sets the minimum allowed version for the cluster. If it is 4.0, then the node should not use 4.2
+ * Sets the minimum allowed version for the cluster. If it is 4.2, then the node should not use 4.4
  * features.
  *
  * Format:
@@ -244,13 +91,13 @@ public:
     }
 
     std::string help() const override {
+        using FCVP = FeatureCompatibilityVersionParser;
         std::stringstream h;
-        h << "Set the API version exposed by this node. If set to \""
-          << FeatureCompatibilityVersionParser::kVersion40
-          << "\", then 4.2 features are disabled. If \""
-          << FeatureCompatibilityVersionParser::kVersion42
-          << "\", then 4.2 features are enabled, and all nodes in the cluster must be binary "
-             "version 4.2. See "
+        h << "Set the API version exposed by this node. If set to '" << FCVP::kVersion42
+          << "', then " << FCVP::kVersion44 << " features are disabled. If set to '"
+          << FCVP::kVersion44 << "', then " << FCVP::kVersion44
+          << " features are enabled, and all nodes in the cluster must be binary version "
+          << FCVP::kVersion44 << ". See "
           << feature_compatibility_version_documentation::kCompatibilityLink << ".";
         return h.str();
     }
@@ -299,16 +146,16 @@ public:
         ServerGlobalParams::FeatureCompatibility::Version actualVersion =
             serverGlobalParams.featureCompatibility.getVersion();
 
-        if (requestedVersion == FeatureCompatibilityVersionParser::kVersion42) {
+        if (requestedVersion == FeatureCompatibilityVersionParser::kVersion44) {
             uassert(ErrorCodes::IllegalOperation,
-                    "cannot initiate featureCompatibilityVersion upgrade to 4.2 while a previous "
-                    "featureCompatibilityVersion downgrade to 4.0 has not completed. Finish "
-                    "downgrade to 4.0, then upgrade to 4.2.",
+                    "cannot initiate featureCompatibilityVersion upgrade to 4.4 while a previous "
+                    "featureCompatibilityVersion downgrade to 4.2 has not completed. Finish "
+                    "downgrade to 4.2, then upgrade to 4.4.",
                     actualVersion !=
-                        ServerGlobalParams::FeatureCompatibility::Version::kDowngradingTo40);
+                        ServerGlobalParams::FeatureCompatibility::Version::kDowngradingTo42);
 
             if (actualVersion ==
-                ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo42) {
+                ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo44) {
                 // Set the client's last opTime to the system last opTime so no-ops wait for
                 // writeConcern.
                 repl::ReplClientInfo::forClient(opCtx->getClient())
@@ -322,16 +169,20 @@ public:
                 // Take the global lock in S mode to create a barrier for operations taking the
                 // global IX or X locks. This ensures that either
                 //   - The global IX/X locked operation will start after the FCV change, see the
-                //     upgrading to 4.2 FCV and act accordingly.
+                //     upgrading to 4.4 FCV and act accordingly.
                 //   - The global IX/X locked operation began prior to the FCV change, is acting on
                 //     that assumption and will finish before upgrade procedures begin right after
                 //     this.
                 Lock::GlobalLock lk(opCtx, MODE_S);
             }
 
-            updateUniqueIndexesOnUpgrade(opCtx);
-
-            upgradeTransactionTable(opCtx);
+            if (serverGlobalParams.clusterRole == ClusterRole::ShardServer) {
+                // The primary shard sharding a collection will write the initial chunks for a
+                // collection directly to the config server, so wait for all shard collections to
+                // complete to guarantee no chunks are missed by the update on the config server.
+                ActiveShardCollectionRegistry::get(opCtx).waitForActiveShardCollectionsToComplete(
+                    opCtx);
+            }
 
             // Upgrade shards before config finishes its upgrade.
             if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
@@ -343,18 +194,25 @@ public:
                                 cmdObj,
                                 BSON(FeatureCompatibilityVersionCommandParser::kCommandName
                                      << requestedVersion)))));
+
+                if (MONGO_unlikely(pauseBeforeUpgradingConfigMetadata.shouldFail())) {
+                    log() << "Hit pauseBeforeUpgradingConfigMetadata";
+                    pauseBeforeUpgradingConfigMetadata.pauseWhileSet(opCtx);
+                }
+                ShardingCatalogManager::get(opCtx)->upgradeOrDowngradeChunksAndTags(
+                    opCtx, ShardingCatalogManager::ConfigUpgradeType::kUpgrade);
             }
 
             FeatureCompatibilityVersion::unsetTargetUpgradeOrDowngrade(opCtx, requestedVersion);
-        } else if (requestedVersion == FeatureCompatibilityVersionParser::kVersion40) {
+        } else if (requestedVersion == FeatureCompatibilityVersionParser::kVersion42) {
             uassert(ErrorCodes::IllegalOperation,
-                    "cannot initiate setting featureCompatibilityVersion to 4.0 while a previous "
-                    "featureCompatibilityVersion upgrade to 4.2 has not completed.",
+                    "cannot initiate setting featureCompatibilityVersion to 4.2 while a previous "
+                    "featureCompatibilityVersion upgrade to 4.4 has not completed.",
                     actualVersion !=
-                        ServerGlobalParams::FeatureCompatibility::Version::kUpgradingTo42);
+                        ServerGlobalParams::FeatureCompatibility::Version::kUpgradingTo44);
 
             if (actualVersion ==
-                ServerGlobalParams::FeatureCompatibility::Version::kFullyDowngradedTo40) {
+                ServerGlobalParams::FeatureCompatibility::Version::kFullyDowngradedTo42) {
                 // Set the client's last opTime to the system last opTime so no-ops wait for
                 // writeConcern.
                 repl::ReplClientInfo::forClient(opCtx->getClient())
@@ -368,14 +226,20 @@ public:
                 // Take the global lock in S mode to create a barrier for operations taking the
                 // global IX or X locks. This ensures that either
                 //   - The global IX/X locked operation will start after the FCV change, see the
-                //     downgrading to 4.0 FCV and act accordingly.
+                //     downgrading to 4.2 FCV and act accordingly.
                 //   - The global IX/X locked operation began prior to the FCV change, is acting on
                 //     that assumption and will finish before downgrade procedures begin right after
                 //     this.
                 Lock::GlobalLock lk(opCtx, MODE_S);
             }
 
-            downgradeTransactionTable(opCtx);
+            if (serverGlobalParams.clusterRole == ClusterRole::ShardServer) {
+                // The primary shard sharding a collection will write the initial chunks for a
+                // collection directly to the config server, so wait for all shard collections to
+                // complete to guarantee no chunks are missed by the update on the config server.
+                ActiveShardCollectionRegistry::get(opCtx).waitForActiveShardCollectionsToComplete(
+                    opCtx);
+            }
 
             // Downgrade shards before config finishes its downgrade.
             if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
@@ -387,6 +251,13 @@ public:
                                 cmdObj,
                                 BSON(FeatureCompatibilityVersionCommandParser::kCommandName
                                      << requestedVersion)))));
+
+                if (MONGO_unlikely(pauseBeforeDowngradingConfigMetadata.shouldFail())) {
+                    log() << "Hit pauseBeforeDowngradingConfigMetadata";
+                    pauseBeforeDowngradingConfigMetadata.pauseWhileSet(opCtx);
+                }
+                ShardingCatalogManager::get(opCtx)->upgradeOrDowngradeChunksAndTags(
+                    opCtx, ShardingCatalogManager::ConfigUpgradeType::kDowngrade);
             }
 
             FeatureCompatibilityVersion::unsetTargetUpgradeOrDowngrade(opCtx, requestedVersion);

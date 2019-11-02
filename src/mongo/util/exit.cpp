@@ -34,11 +34,11 @@
 #include "mongo/util/exit.h"
 
 #include <boost/optional.hpp>
+#include <functional>
 #include <stack>
 
+#include "mongo/platform/mutex.h"
 #include "mongo/stdx/condition_variable.h"
-#include "mongo/stdx/functional.h"
-#include "mongo/stdx/mutex.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/util/log.h"
 #include "mongo/util/quick_exit.h"
@@ -47,18 +47,18 @@ namespace mongo {
 
 namespace {
 
-stdx::mutex shutdownMutex;
+Mutex shutdownMutex;
 stdx::condition_variable shutdownTasksComplete;
 boost::optional<ExitCode> shutdownExitCode;
 bool shutdownTasksInProgress = false;
 AtomicWord<unsigned> shutdownFlag;
-std::stack<stdx::function<void()>> shutdownTasks;
+std::stack<unique_function<void(const ShutdownTaskArgs&)>> shutdownTasks;
 stdx::thread::id shutdownTasksThreadId;
 
-void runTasks(decltype(shutdownTasks) tasks) noexcept {
+void runTasks(decltype(shutdownTasks) tasks, const ShutdownTaskArgs& shutdownArgs) noexcept {
     while (!tasks.empty()) {
         const auto& task = tasks.top();
-        task();
+        task(shutdownArgs);
         tasks.pop();
     }
 }
@@ -83,7 +83,7 @@ bool globalInShutdownDeprecated() {
 }
 
 ExitCode waitForShutdown() {
-    stdx::unique_lock<stdx::mutex> lk(shutdownMutex);
+    stdx::unique_lock<Latch> lk(shutdownMutex);
     shutdownTasksComplete.wait(lk, [] {
         const auto shutdownStarted = static_cast<bool>(shutdownExitCode);
         return shutdownStarted && !shutdownTasksInProgress;
@@ -92,17 +92,17 @@ ExitCode waitForShutdown() {
     return shutdownExitCode.get();
 }
 
-void registerShutdownTask(stdx::function<void()> task) {
-    stdx::lock_guard<stdx::mutex> lock(shutdownMutex);
+void registerShutdownTask(unique_function<void(const ShutdownTaskArgs&)> task) {
+    stdx::lock_guard<Latch> lock(shutdownMutex);
     invariant(!globalInShutdownDeprecated());
     shutdownTasks.emplace(std::move(task));
 }
 
-void shutdown(ExitCode code) {
+void shutdown(ExitCode code, const ShutdownTaskArgs& shutdownArgs) {
     decltype(shutdownTasks) localTasks;
 
     {
-        stdx::unique_lock<stdx::mutex> lock(shutdownMutex);
+        stdx::unique_lock<Latch> lock(shutdownMutex);
 
         if (shutdownTasksInProgress) {
             // Someone better have called shutdown in some form already.
@@ -114,8 +114,9 @@ void shutdown(ExitCode code) {
             ExitCode originallyRequestedCode = shutdownExitCode.get();
             if (code != originallyRequestedCode) {
                 log() << "While running shutdown tasks with the intent to exit with code "
-                      << originallyRequestedCode << ", an additional shutdown request arrived with "
-                                                    "the intent to exit with a different exit code "
+                      << originallyRequestedCode
+                      << ", an additional shutdown request arrived with "
+                         "the intent to exit with a different exit code "
                       << code << "; ignoring the conflicting exit code";
             }
 
@@ -134,10 +135,10 @@ void shutdown(ExitCode code) {
         localTasks.swap(shutdownTasks);
     }
 
-    runTasks(std::move(localTasks));
+    runTasks(std::move(localTasks), shutdownArgs);
 
     {
-        stdx::lock_guard<stdx::mutex> lock(shutdownMutex);
+        stdx::lock_guard<Latch> lock(shutdownMutex);
         shutdownTasksInProgress = false;
 
         shutdownTasksComplete.notify_all();
@@ -146,11 +147,11 @@ void shutdown(ExitCode code) {
     }
 }
 
-void shutdownNoTerminate() {
+void shutdownNoTerminate(const ShutdownTaskArgs& shutdownArgs) {
     decltype(shutdownTasks) localTasks;
 
     {
-        stdx::lock_guard<stdx::mutex> lock(shutdownMutex);
+        stdx::lock_guard<Latch> lock(shutdownMutex);
 
         if (globalInShutdownDeprecated())
             return;
@@ -162,10 +163,10 @@ void shutdownNoTerminate() {
         localTasks.swap(shutdownTasks);
     }
 
-    runTasks(std::move(localTasks));
+    runTasks(std::move(localTasks), shutdownArgs);
 
     {
-        stdx::lock_guard<stdx::mutex> lock(shutdownMutex);
+        stdx::lock_guard<Latch> lock(shutdownMutex);
         shutdownTasksInProgress = false;
         shutdownExitCode.emplace(EXIT_CLEAN);
     }

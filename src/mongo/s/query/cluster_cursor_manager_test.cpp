@@ -29,21 +29,18 @@
 
 #include "mongo/platform/basic.h"
 
-#include "mongo/s/query/cluster_cursor_manager.h"
-
+#include <memory>
 #include <vector>
 
-#include "mongo/db/logical_session_cache.h"
 #include "mongo/db/logical_session_cache_noop.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/service_context_test_fixture.h"
 #include "mongo/s/query/cluster_client_cursor_mock.h"
-#include "mongo/stdx/memory.h"
+#include "mongo/s/query/cluster_cursor_manager.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/clock_source_mock.h"
 
 namespace mongo {
-
 namespace {
 
 using unittest::assertGet;
@@ -52,7 +49,7 @@ const NamespaceString nss("test.collection");
 class ClusterCursorManagerTest : public ServiceContextTest {
 protected:
     ClusterCursorManagerTest() : _opCtx(makeOperationContext()), _manager(&_clockSourceMock) {
-        LogicalSessionCache::set(getServiceContext(), stdx::make_unique<LogicalSessionCacheNoop>());
+        LogicalSessionCache::set(getServiceContext(), std::make_unique<LogicalSessionCacheNoop>());
     }
 
     ~ClusterCursorManagerTest() {
@@ -97,7 +94,7 @@ protected:
         // (std::list<>::push_back() does not invalidate references, and our list outlives the
         // manager).
         bool& killedFlag = _cursorKilledFlags.back();
-        return stdx::make_unique<ClusterClientCursorMock>(
+        return std::make_unique<ClusterClientCursorMock>(
             std::move(lsid), std::move(txnNumber), [&killedFlag]() { killedFlag = true; });
     }
 
@@ -111,7 +108,6 @@ protected:
     }
 
     void killCursorFromDifferentOpCtx(const NamespaceString& nss, CursorId cursorId) {
-
         // Set up another client to kill the cursor.
         auto killCursorClient = getServiceContext()->makeClient("killCursorClient");
         auto killCursorOpCtx = killCursorClient->makeOperationContext();
@@ -147,11 +143,11 @@ TEST_F(ClusterCursorManagerTest, RegisterCursor) {
     auto pinnedCursor =
         getManager()->checkOutCursor(nss, cursorId, _opCtx.get(), successAuthChecker);
     ASSERT_OK(pinnedCursor.getStatus());
-    auto nextResult = pinnedCursor.getValue().next(RouterExecStage::ExecContext::kInitialFind);
+    auto nextResult = pinnedCursor.getValue()->next(RouterExecStage::ExecContext::kInitialFind);
     ASSERT_OK(nextResult.getStatus());
     ASSERT(nextResult.getValue().getResult());
     ASSERT_BSONOBJ_EQ(BSON("a" << 1), *nextResult.getValue().getResult());
-    nextResult = pinnedCursor.getValue().next(RouterExecStage::ExecContext::kInitialFind);
+    nextResult = pinnedCursor.getValue()->next(RouterExecStage::ExecContext::kInitialFind);
     ASSERT_OK(nextResult.getStatus());
     ASSERT_TRUE(nextResult.getValue().isEOF());
 }
@@ -183,11 +179,11 @@ TEST_F(ClusterCursorManagerTest, CheckOutCursorBasic) {
         getManager()->checkOutCursor(nss, cursorId, _opCtx.get(), successAuthChecker);
     ASSERT_OK(checkedOutCursor.getStatus());
     ASSERT_EQ(cursorId, checkedOutCursor.getValue().getCursorId());
-    auto nextResult = checkedOutCursor.getValue().next(RouterExecStage::ExecContext::kInitialFind);
+    auto nextResult = checkedOutCursor.getValue()->next(RouterExecStage::ExecContext::kInitialFind);
     ASSERT_OK(nextResult.getStatus());
     ASSERT(nextResult.getValue().getResult());
     ASSERT_BSONOBJ_EQ(BSON("a" << 1), *nextResult.getValue().getResult());
-    nextResult = checkedOutCursor.getValue().next(RouterExecStage::ExecContext::kInitialFind);
+    nextResult = checkedOutCursor.getValue()->next(RouterExecStage::ExecContext::kInitialFind);
     ASSERT_OK(nextResult.getStatus());
     ASSERT_TRUE(nextResult.getValue().isEOF());
 }
@@ -212,11 +208,11 @@ TEST_F(ClusterCursorManagerTest, CheckOutCursorMultipleCursors) {
         auto pinnedCursor =
             getManager()->checkOutCursor(nss, cursorIds[i], _opCtx.get(), successAuthChecker);
         ASSERT_OK(pinnedCursor.getStatus());
-        auto nextResult = pinnedCursor.getValue().next(RouterExecStage::ExecContext::kInitialFind);
+        auto nextResult = pinnedCursor.getValue()->next(RouterExecStage::ExecContext::kInitialFind);
         ASSERT_OK(nextResult.getStatus());
         ASSERT(nextResult.getValue().getResult());
         ASSERT_BSONOBJ_EQ(BSON("a" << i), *nextResult.getValue().getResult());
-        nextResult = pinnedCursor.getValue().next(RouterExecStage::ExecContext::kInitialFind);
+        nextResult = pinnedCursor.getValue()->next(RouterExecStage::ExecContext::kInitialFind);
         ASSERT_OK(nextResult.getStatus());
         ASSERT_TRUE(nextResult.getValue().isEOF());
     }
@@ -672,7 +668,8 @@ TEST_F(ClusterCursorManagerTest, StatsExhaustShardedCursor) {
     auto pinnedCursor =
         getManager()->checkOutCursor(nss, cursorId, _opCtx.get(), successAuthChecker);
     ASSERT_OK(pinnedCursor.getStatus());
-    ASSERT_OK(pinnedCursor.getValue().next(RouterExecStage::ExecContext::kInitialFind).getStatus());
+    ASSERT_OK(
+        pinnedCursor.getValue()->next(RouterExecStage::ExecContext::kInitialFind).getStatus());
     ASSERT_EQ(1U, getManager()->stats().cursorsMultiTarget);
     pinnedCursor.getValue().returnCursor(ClusterCursorManager::CursorState::Exhausted);
     ASSERT_EQ(0U, getManager()->stats().cursorsMultiTarget);
@@ -690,7 +687,8 @@ TEST_F(ClusterCursorManagerTest, StatsExhaustNotShardedCursor) {
     auto pinnedCursor =
         getManager()->checkOutCursor(nss, cursorId, _opCtx.get(), successAuthChecker);
     ASSERT_OK(pinnedCursor.getStatus());
-    ASSERT_OK(pinnedCursor.getValue().next(RouterExecStage::ExecContext::kInitialFind).getStatus());
+    ASSERT_OK(
+        pinnedCursor.getValue()->next(RouterExecStage::ExecContext::kInitialFind).getStatus());
     ASSERT_EQ(1U, getManager()->stats().cursorsSingleTarget);
     pinnedCursor.getValue().returnCursor(ClusterCursorManager::CursorState::Exhausted);
     ASSERT_EQ(0U, getManager()->stats().cursorsSingleTarget);
@@ -709,7 +707,8 @@ TEST_F(ClusterCursorManagerTest, StatsExhaustPinnedCursor) {
     auto pinnedCursor =
         getManager()->checkOutCursor(nss, cursorId, _opCtx.get(), successAuthChecker);
     ASSERT_OK(pinnedCursor.getStatus());
-    ASSERT_OK(pinnedCursor.getValue().next(RouterExecStage::ExecContext::kInitialFind).getStatus());
+    ASSERT_OK(
+        pinnedCursor.getValue()->next(RouterExecStage::ExecContext::kInitialFind).getStatus());
     ASSERT_EQ(1U, getManager()->stats().cursorsPinned);
     pinnedCursor.getValue().returnCursor(ClusterCursorManager::CursorState::Exhausted);
     ASSERT_EQ(0U, getManager()->stats().cursorsPinned);
@@ -728,7 +727,8 @@ TEST_F(ClusterCursorManagerTest, StatsCheckInWithoutExhaustingPinnedCursor) {
     auto pinnedCursor =
         getManager()->checkOutCursor(nss, cursorId, _opCtx.get(), successAuthChecker);
     ASSERT_OK(pinnedCursor.getStatus());
-    ASSERT_OK(pinnedCursor.getValue().next(RouterExecStage::ExecContext::kInitialFind).getStatus());
+    ASSERT_OK(
+        pinnedCursor.getValue()->next(RouterExecStage::ExecContext::kInitialFind).getStatus());
     ASSERT_EQ(1U, getManager()->stats().cursorsPinned);
     pinnedCursor.getValue().returnCursor(ClusterCursorManager::CursorState::NotExhausted);
     ASSERT_EQ(0U, getManager()->stats().cursorsPinned);
@@ -845,7 +845,7 @@ TEST_F(ClusterCursorManagerTest, PinnedCursorReturnCursorExhausted) {
     ASSERT_EQ(cursorId, registeredCursor.getValue().getCursorId());
     ASSERT_NE(0, cursorId);
     ASSERT_OK(
-        registeredCursor.getValue().next(RouterExecStage::ExecContext::kInitialFind).getStatus());
+        registeredCursor.getValue()->next(RouterExecStage::ExecContext::kInitialFind).getStatus());
     registeredCursor.getValue().returnCursor(ClusterCursorManager::CursorState::Exhausted);
     ASSERT_EQ(0, registeredCursor.getValue().getCursorId());
 
@@ -860,9 +860,6 @@ TEST_F(ClusterCursorManagerTest, PinnedCursorReturnCursorExhausted) {
 TEST_F(ClusterCursorManagerTest, PinnedCursorReturnCursorExhaustedWithNonExhaustedRemotes) {
     auto mockCursor = allocateMockCursor();
 
-    // The mock should indicate that is has open remote cursors.
-    mockCursor->markRemotesNotExhausted();
-
     auto cursorId =
         assertGet(getManager()->registerCursor(_opCtx.get(),
                                                std::move(mockCursor),
@@ -876,7 +873,7 @@ TEST_F(ClusterCursorManagerTest, PinnedCursorReturnCursorExhaustedWithNonExhaust
     ASSERT_EQ(cursorId, registeredCursor.getValue().getCursorId());
     ASSERT_NE(0, cursorId);
     ASSERT_OK(
-        registeredCursor.getValue().next(RouterExecStage::ExecContext::kInitialFind).getStatus());
+        registeredCursor.getValue()->next(RouterExecStage::ExecContext::kInitialFind).getStatus());
     registeredCursor.getValue().returnCursor(ClusterCursorManager::CursorState::Exhausted);
     ASSERT_EQ(0, registeredCursor.getValue().getCursorId());
 
@@ -921,7 +918,6 @@ TEST_F(ClusterCursorManagerTest, PinnedCursorDestructorKill) {
 // Test that PinnedCursor::remotesExhausted() correctly forwards to the underlying mock cursor.
 TEST_F(ClusterCursorManagerTest, RemotesExhausted) {
     auto mockCursor = allocateMockCursor();
-    mockCursor->markRemotesNotExhausted();
     ASSERT_FALSE(mockCursor->remotesExhausted());
 
     auto cursorId =
@@ -934,7 +930,7 @@ TEST_F(ClusterCursorManagerTest, RemotesExhausted) {
     auto pinnedCursor =
         getManager()->checkOutCursor(nss, cursorId, _opCtx.get(), successAuthChecker);
     ASSERT_OK(pinnedCursor.getStatus());
-    ASSERT_FALSE(pinnedCursor.getValue().remotesExhausted());
+    ASSERT_FALSE(pinnedCursor.getValue()->remotesExhausted());
 }
 
 // Test that killed cursors which are still pinned are not destroyed immediately.
@@ -1256,8 +1252,8 @@ TEST_F(ClusterCursorManagerTest, PinnedCursorReturnsUnderlyingCursorTxnNumber) {
     ASSERT_OK(pinnedCursor.getStatus());
 
     // The underlying cursor's txnNumber should be returned.
-    ASSERT(pinnedCursor.getValue().getTxnNumber());
-    ASSERT_EQ(txnNumber, *pinnedCursor.getValue().getTxnNumber());
+    ASSERT(pinnedCursor.getValue()->getTxnNumber());
+    ASSERT_EQ(txnNumber, *pinnedCursor.getValue()->getTxnNumber());
 }
 
 }  // namespace

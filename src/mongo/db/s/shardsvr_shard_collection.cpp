@@ -62,12 +62,26 @@
 #include "mongo/s/request_types/clone_collection_options_from_primary_shard_gen.h"
 #include "mongo/s/request_types/shard_collection_gen.h"
 #include "mongo/s/shard_util.h"
+#include "mongo/util/fail_point.h"
 #include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
 #include "mongo/util/scopeguard.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
+
 namespace {
+
+MONGO_FAIL_POINT_DEFINE(pauseShardCollectionBeforeReturning);
+
+struct ShardCollectionTargetState {
+    UUID uuid;
+    ShardKeyPattern shardKeyPattern;
+    std::vector<TagsType> tags;
+    bool collectionIsEmpty;
+    std::vector<BSONObj> splitPoints;
+    int numContiguousChunksPerShard;
+    bool fromMapReduce;
+};
 
 const ReadPreferenceSetting kConfigReadSelector(ReadPreference::Nearest, TagSet{});
 
@@ -80,6 +94,41 @@ void uassertStatusOKWithWarning(const Status& status) {
         warning() << "shardsvrShardCollection failed" << causedBy(redact(status));
         uassertStatusOK(status);
     }
+}
+
+void checkForExistingChunks(OperationContext* opCtx, const NamespaceString& nss) {
+    BSONObjBuilder countBuilder;
+    countBuilder.append("count", ChunkType::ConfigNS.coll());
+    countBuilder.append("query", BSON(ChunkType::ns(nss.ns())));
+
+    // OK to use limit=1, since if any chunks exist, we will fail.
+    countBuilder.append("limit", 1);
+
+    // Use readConcern local to guarantee we see any chunks that have been written and may
+    // become committed; readConcern majority will not see the chunks if they have not made it
+    // to the majority snapshot.
+    repl::ReadConcernArgs readConcern(Grid::get(opCtx)->configOpTime(),
+                                      repl::ReadConcernLevel::kMajorityReadConcern);
+    readConcern.appendInfo(&countBuilder);
+
+    auto cmdResponse = uassertStatusOK(
+        Grid::get(opCtx)->shardRegistry()->getConfigShard()->runCommandWithFixedRetryAttempts(
+            opCtx,
+            kConfigReadSelector,
+            ChunkType::ConfigNS.db().toString(),
+            countBuilder.done(),
+            Shard::kDefaultConfigCommandTimeout,
+            Shard::RetryPolicy::kIdempotent));
+    uassertStatusOK(cmdResponse.commandStatus);
+
+    long long numChunks;
+    uassertStatusOK(bsonExtractIntegerField(cmdResponse.response, "n", &numChunks));
+    uassert(ErrorCodes::ManualInterventionRequired,
+            str::stream() << "A previous attempt to shard collection " << nss.ns()
+                          << " failed after writing some initial chunks to config.chunks. Please "
+                             "manually delete the partially written chunks for collection "
+                          << nss.ns() << " from config.chunks",
+            numChunks == 0);
 }
 
 /**
@@ -136,22 +185,6 @@ BSONObj makeCreateIndexesCmd(const NamespaceString& nss,
     return appendAllowImplicitCreate(createIndexes.obj(), true);
 }
 
-bool checkIfCollectionAlreadyShardedWithSameOptions(OperationContext* opCtx,
-                                                    const NamespaceString& nss,
-                                                    const ShardsvrShardCollection& request,
-                                                    BSONObjBuilder& result) {
-    if (auto existingColl = InitialSplitPolicy::checkIfCollectionAlreadyShardedWithSameOptions(
-            opCtx, nss, request, repl::ReadConcernLevel::kMajorityReadConcern)) {
-        result << "collectionsharded" << nss.ns();
-        if (existingColl->getUUID()) {
-            result << "collectionUUID" << *existingColl->getUUID();
-        }
-
-        return true;
-    }
-    return false;
-}
-
 /**
  * Compares the proposed shard key with the collection's existing indexes on the primary shard to
  * ensure they are a legal combination.
@@ -175,9 +208,8 @@ void createCollectionOrValidateExisting(OperationContext* opCtx,
     //    Useful Index:
     //         i. contains proposedKey as a prefix
     //         ii. is not a sparse index, partial index, or index with a non-simple collation
-    //         iii. contains no null values
-    //         iv. is not multikey (maybe lift this restriction later)
-    //         v. if a hashed index, has default seed (lift this restriction later)
+    //         iii. is not multikey (maybe lift this restriction later)
+    //         iv. if a hashed index, has default seed (lift this restriction later)
     //
     // 3. If the proposed shard key is specified as unique, there must exist a useful,
     //    unique index exactly equal to the proposedKey (not just a prefix).
@@ -190,7 +222,7 @@ void createCollectionOrValidateExisting(OperationContext* opCtx,
     // 5. If the collection is empty, and it's still possible to create an index
     //    on the proposed key, we go ahead and do so.
     DBDirectClient localClient(opCtx);
-    std::list<BSONObj> indexes = localClient.getIndexSpecs(nss.ns());
+    std::list<BSONObj> indexes = localClient.getIndexSpecs(nss);
 
     // 1. Verify consistency with existing unique indexes
     for (const auto& idx : indexes) {
@@ -198,9 +230,7 @@ void createCollectionOrValidateExisting(OperationContext* opCtx,
         bool isUnique = idx["unique"].trueValue();
         uassert(ErrorCodes::InvalidOptions,
                 str::stream() << "can't shard collection '" << nss.ns() << "' with unique index on "
-                              << currentKey
-                              << " and proposed shard key "
-                              << proposedKey
+                              << currentKey << " and proposed shard key " << proposedKey
                               << ". Uniqueness can't be maintained unless shard key is a prefix",
                 !isUnique || shardKeyPattern.isUniqueIndexCompatible(currentKey));
     }
@@ -218,8 +248,7 @@ void createCollectionOrValidateExisting(OperationContext* opCtx,
             // per field per collection.
             uassert(ErrorCodes::InvalidOptions,
                     str::stream() << "can't shard collection " << nss.ns()
-                                  << " with hashed shard key "
-                                  << proposedKey
+                                  << " with hashed shard key " << proposedKey
                                   << " because the hashed index uses a non-default seed of "
                                   << idx["seed"].numberInt(),
                     !shardKeyPattern.isHashedPattern() || idx["seed"].eoo() ||
@@ -231,7 +260,7 @@ void createCollectionOrValidateExisting(OperationContext* opCtx,
     // 3. If proposed key is required to be unique, additionally check for exact match.
 
     if (hasUsefulIndexForKey && request.getUnique()) {
-        BSONObj eqQuery = BSON("ns" << nss.ns() << "key" << proposedKey);
+        BSONObj eqQuery = BSON("key" << proposedKey);
         BSONObj eqQueryResult;
 
         for (const auto& idx : indexes) {
@@ -248,7 +277,7 @@ void createCollectionOrValidateExisting(OperationContext* opCtx,
         } else {
             bool isExplicitlyUnique = eqQueryResult["unique"].trueValue();
             BSONObj currKey = eqQueryResult["key"].embeddedObject();
-            bool isCurrentID = str::equals(currKey.firstElementFieldName(), "_id");
+            bool isCurrentID = (currKey.firstElementFieldNameStringData() == "_id");
             uassert(ErrorCodes::InvalidOptions,
                     str::stream() << "can't shard collection " << nss.ns() << ", " << proposedKey
                                   << " index not unique, and unique index explicitly specified",
@@ -257,8 +286,7 @@ void createCollectionOrValidateExisting(OperationContext* opCtx,
     }
 
     if (hasUsefulIndexForKey) {
-        // Check 2.iii and 2.iv. Make sure no null entries in the sharding index
-        // and that there is a useful, non-multikey index available
+        // Check 2.iii Make sure that there is a useful, non-multikey index available.
         BSONObjBuilder checkShardingIndexCmd;
         checkShardingIndexCmd.append("checkShardingIndex", nss.ns());
         checkShardingIndexCmd.append("keyPattern", proposedKey);
@@ -305,38 +333,47 @@ void validateShardKeyAgainstExistingZones(OperationContext* opCtx,
             BSONElement tagMaxKeyElement = tagMaxFields.next();
             uassert(ErrorCodes::InvalidOptions,
                     str::stream() << "the min and max of the existing zone " << tag.getMinKey()
-                                  << " -->> "
-                                  << tag.getMaxKey()
-                                  << " have non-matching keys",
-                    str::equals(tagMinKeyElement.fieldName(), tagMaxKeyElement.fieldName()));
+                                  << " -->> " << tag.getMaxKey() << " have non-matching keys",
+                    tagMinKeyElement.fieldNameStringData() ==
+                        tagMaxKeyElement.fieldNameStringData());
 
             BSONElement proposedKeyElement = proposedFields.next();
-            bool match =
-                (str::equals(tagMinKeyElement.fieldName(), proposedKeyElement.fieldName()) &&
-                 ((tagMinFields.more() && proposedFields.more()) ||
-                  (!tagMinFields.more() && !proposedFields.more())));
+            bool match = ((tagMinKeyElement.fieldNameStringData() ==
+                           proposedKeyElement.fieldNameStringData()) &&
+                          ((tagMinFields.more() && proposedFields.more()) ||
+                           (!tagMinFields.more() && !proposedFields.more())));
             uassert(ErrorCodes::InvalidOptions,
                     str::stream() << "the proposed shard key " << proposedKey.toString()
                                   << " does not match with the shard key of the existing zone "
-                                  << tag.getMinKey()
-                                  << " -->> "
-                                  << tag.getMaxKey(),
+                                  << tag.getMinKey() << " -->> " << tag.getMaxKey(),
                     match);
 
             if (ShardKeyPattern::isHashedPatternEl(proposedKeyElement) &&
                 (tagMinKeyElement.type() != NumberLong || tagMaxKeyElement.type() != NumberLong)) {
                 uasserted(ErrorCodes::InvalidOptions,
                           str::stream() << "cannot do hash sharding with the proposed key "
-                                        << proposedKey.toString()
-                                        << " because there exists a zone "
-                                        << tag.getMinKey()
-                                        << " -->> "
-                                        << tag.getMaxKey()
+                                        << proposedKey.toString() << " because there exists a zone "
+                                        << tag.getMinKey() << " -->> " << tag.getMaxKey()
                                         << " whose boundaries are not "
                                            "of type NumberLong");
             }
         }
     }
+}
+
+std::vector<TagsType> getTagsAndValidate(OperationContext* opCtx,
+                                         const NamespaceString& nss,
+                                         const BSONObj& proposedKey,
+                                         const ShardKeyPattern& shardKeyPattern) {
+    // Read zone info
+    const auto catalogClient = Grid::get(opCtx)->catalogClient();
+    auto tags = uassertStatusOK(catalogClient->getTagsForCollection(opCtx, nss));
+
+    if (!tags.empty()) {
+        validateShardKeyAgainstExistingZones(opCtx, proposedKey, shardKeyPattern, tags);
+    }
+
+    return tags;
 }
 
 boost::optional<UUID> getUUIDFromPrimaryShard(OperationContext* opCtx, const NamespaceString& nss) {
@@ -371,79 +408,139 @@ boost::optional<UUID> getUUIDFromPrimaryShard(OperationContext* opCtx, const Nam
 
     uassert(ErrorCodes::InternalError,
             str::stream() << "expected to return a UUID for collection " << nss.ns()
-                          << " as part of 'info' field but got "
-                          << res,
+                          << " as part of 'info' field but got " << res,
             collectionInfo.hasField("uuid"));
 
     return uassertStatusOK(UUID::parse(collectionInfo["uuid"]));
 }
 
-void checkForExistingChunks(OperationContext* opCtx, const NamespaceString& nss) {
-    BSONObjBuilder countBuilder;
-    countBuilder.append("count", ChunkType::ConfigNS.coll());
-    countBuilder.append("query", BSON(ChunkType::ns(nss.ns())));
+UUID getOrGenerateUUID(OperationContext* opCtx,
+                       const NamespaceString& nss,
+                       const ShardsvrShardCollection& request) {
+    if (request.getGetUUIDfromPrimaryShard()) {
+        return *getUUIDFromPrimaryShard(opCtx, nss);
+    }
 
-    // OK to use limit=1, since if any chunks exist, we will fail.
-    countBuilder.append("limit", 1);
-
-    // Use readConcern local to guarantee we see any chunks that have been written and may
-    // become committed; readConcern majority will not see the chunks if they have not made it
-    // to the majority snapshot.
-    repl::ReadConcernArgs readConcern(Grid::get(opCtx)->configOpTime(),
-                                      repl::ReadConcernLevel::kMajorityReadConcern);
-    readConcern.appendInfo(&countBuilder);
-
-    auto cmdResponse = uassertStatusOK(
-        Grid::get(opCtx)->shardRegistry()->getConfigShard()->runCommandWithFixedRetryAttempts(
-            opCtx,
-            kConfigReadSelector,
-            ChunkType::ConfigNS.db().toString(),
-            countBuilder.done(),
-            Shard::kDefaultConfigCommandTimeout,
-            Shard::RetryPolicy::kIdempotent));
-    uassertStatusOK(cmdResponse.commandStatus);
-
-    long long numChunks;
-    uassertStatusOK(bsonExtractIntegerField(cmdResponse.response, "n", &numChunks));
-    uassert(ErrorCodes::ManualInterventionRequired,
-            str::stream() << "A previous attempt to shard collection " << nss.ns()
-                          << " failed after writing some initial chunks to config.chunks. Please "
-                             "manually delete the partially written chunks for collection "
-                          << nss.ns()
-                          << " from config.chunks",
-            numChunks == 0);
+    return UUID::gen();
 }
 
-void shardCollection(OperationContext* opCtx,
-                     const NamespaceString& nss,
-                     const boost::optional<UUID> uuid,
-                     const ShardKeyPattern& fieldsAndOrder,
-                     const BSONObj& defaultCollation,
-                     bool unique,
-                     const std::vector<BSONObj>& splitPoints,
-                     const std::vector<TagsType>& tags,
-                     bool fromMapReduce,
-                     const ShardId& dbPrimaryShardId,
-                     int numContiguousChunksPerShard,
-                     bool isEmpty) {
+bool checkIfCollectionIsEmpty(OperationContext* opCtx, const NamespaceString& nss) {
+    // Use find with predicate instead of count in order to ensure that the count
+    // command doesn't just consult the cached metadata, which may not always be
+    // correct
+    DBDirectClient localClient(opCtx);
+    return localClient.findOne(nss.ns(), Query()).isEmpty();
+}
+
+int getNumShards(OperationContext* opCtx) {
     const auto shardRegistry = Grid::get(opCtx)->shardRegistry();
+    shardRegistry->reload(opCtx);
 
-    const auto primaryShard = uassertStatusOK(shardRegistry->getShard(opCtx, dbPrimaryShardId));
+    std::vector<ShardId> shardIds;
+    shardRegistry->getAllShardIds(opCtx, &shardIds);
+    return shardIds.size();
+}
 
+struct SplitPoints {
+    std::vector<BSONObj> initialPoints;
+    std::vector<BSONObj> finalPoints;
+};
+
+SplitPoints calculateInitialAndFinalSplitPoints(const ShardsvrShardCollection& request,
+                                                const ShardKeyPattern& shardKeyPattern,
+                                                std::vector<TagsType>& tags,
+                                                int numShards,
+                                                bool collectionIsEmpty) {
+    std::vector<BSONObj> initialSplitPoints;
+    std::vector<BSONObj> finalSplitPoints;
+
+    if (request.getInitialSplitPoints()) {
+        finalSplitPoints = *request.getInitialSplitPoints();
+    } else if (tags.empty()) {
+        InitialSplitPolicy::calculateHashedSplitPointsForEmptyCollection(
+            shardKeyPattern,
+            collectionIsEmpty,
+            numShards,
+            request.getNumInitialChunks(),
+            &initialSplitPoints,
+            &finalSplitPoints);
+    }
+
+    return {std::move(initialSplitPoints), std::move(finalSplitPoints)};
+}
+
+ShardCollectionTargetState calculateTargetState(OperationContext* opCtx,
+                                                const NamespaceString& nss,
+                                                const ShardsvrShardCollection& request) {
     // Fail if there are partially written chunks from a previous failed shardCollection.
     checkForExistingChunks(opCtx, nss);
+
+    auto proposedKey(request.getKey().getOwned());
+    ShardKeyPattern shardKeyPattern(proposedKey);
+
+    createCollectionOrValidateExisting(opCtx, nss, proposedKey, shardKeyPattern, request);
+
+    auto tags = getTagsAndValidate(opCtx, nss, proposedKey, shardKeyPattern);
+    auto uuid = getOrGenerateUUID(opCtx, nss, request);
+
+    const bool isEmpty = checkIfCollectionIsEmpty(opCtx, nss);
+    const bool fromMapReduce = bool(request.getInitialSplitPoints());
+
+    // Map/reduce with output to an empty collection assumes it has full control of the
+    // output collection and it would be an unsupported operation if the collection is
+    // being concurrently written
+    if (fromMapReduce) {
+        uassert(ErrorCodes::ConflictingOperationInProgress,
+                str::stream() << "Map reduce with sharded output to a new collection found "
+                              << nss.ns() << " to be non-empty which is not supported.",
+                isEmpty);
+    }
+
+    int numShards = getNumShards(opCtx);
+
+    auto splitPoints =
+        calculateInitialAndFinalSplitPoints(request, shardKeyPattern, tags, numShards, isEmpty);
+
+    auto initialSplitPoints = splitPoints.initialPoints;
+    auto finalSplitPoints = splitPoints.finalPoints;
+
+    const int numContiguousChunksPerShard = initialSplitPoints.empty()
+        ? 1
+        : (finalSplitPoints.size() + 1) / (initialSplitPoints.size() + 1);
+
+    return {uuid,
+            std::move(shardKeyPattern),
+            tags,
+            isEmpty,
+            finalSplitPoints,
+            numContiguousChunksPerShard};
+}
+
+void logStartShardCollection(OperationContext* opCtx,
+                             const BSONObj& cmdObj,
+                             const NamespaceString& nss,
+                             const ShardsvrShardCollection& request,
+                             const ShardCollectionTargetState& prerequisites,
+                             const ShardId& dbPrimaryShardId) {
+    LOG(0) << "CMD: shardcollection: " << cmdObj;
+
+    audit::logShardCollection(
+        opCtx->getClient(), nss.ns(), prerequisites.shardKeyPattern.toBSON(), request.getUnique());
+
+    const auto shardRegistry = Grid::get(opCtx)->shardRegistry();
+    const auto primaryShard = uassertStatusOK(shardRegistry->getShard(opCtx, dbPrimaryShardId));
 
     // Record start in changelog
     {
         BSONObjBuilder collectionDetail;
-        collectionDetail.append("shardKey", fieldsAndOrder.toBSON());
+        collectionDetail.append("shardKey", prerequisites.shardKeyPattern.toBSON());
         collectionDetail.append("collection", nss.ns());
-        if (uuid)
-            uuid->appendToBuilder(&collectionDetail, "uuid");
-        collectionDetail.append("empty", isEmpty);
-        collectionDetail.append("fromMapReduce", fromMapReduce);
+        prerequisites.uuid.appendToBuilder(&collectionDetail, "uuid");
+        collectionDetail.append("empty", prerequisites.collectionIsEmpty);
+        collectionDetail.append("fromMapReduce", prerequisites.fromMapReduce);
         collectionDetail.append("primary", primaryShard->toString());
-        collectionDetail.append("numChunks", static_cast<int>(splitPoints.size() + 1));
+        collectionDetail.append("numChunks",
+                                static_cast<int>(prerequisites.splitPoints.size() + 1));
         uassertStatusOK(ShardingLogging::get(opCtx)->logChangeChecked(
             opCtx,
             "shardCollection.start",
@@ -451,7 +548,90 @@ void shardCollection(OperationContext* opCtx,
             collectionDetail.obj(),
             ShardingCatalogClient::kMajorityWriteConcern));
     }
+}
 
+void createCollectionOnShardsReceivingChunks(OperationContext* opCtx,
+                                             const NamespaceString& nss,
+                                             const std::vector<ChunkType>& initialChunks,
+                                             const ShardId& dbPrimaryShardId) {
+
+    std::vector<AsyncRequestsSender::Request> requests;
+    std::set<ShardId> initializedShards;
+    for (const auto& chunk : initialChunks) {
+        const auto& chunkShardId = chunk.getShard();
+        if (chunkShardId == dbPrimaryShardId ||
+            initializedShards.find(chunkShardId) != initializedShards.end()) {
+            continue;
+        }
+
+
+        CloneCollectionOptionsFromPrimaryShard cloneCollectionOptionsFromPrimaryShardRequest(nss);
+        cloneCollectionOptionsFromPrimaryShardRequest.setPrimaryShard(dbPrimaryShardId.toString());
+        cloneCollectionOptionsFromPrimaryShardRequest.setDbName(nss.db());
+
+        requests.emplace_back(
+            chunkShardId,
+            cloneCollectionOptionsFromPrimaryShardRequest.toBSON(
+                BSON("writeConcern" << ShardingCatalogClient::kMajorityWriteConcern.toBSON())));
+
+        initializedShards.emplace(chunkShardId);
+    }
+
+    if (!requests.empty()) {
+        auto responses = gatherResponses(opCtx,
+                                         nss.db(),
+                                         ReadPreferenceSetting(ReadPreference::PrimaryOnly),
+                                         Shard::RetryPolicy::kIdempotent,
+                                         requests);
+
+        // If any shards fail to create the collection, fail the entire shardCollection command
+        // (potentially leaving incomplely created sharded collection)
+        for (const auto& response : responses) {
+            auto shardResponse =
+                uassertStatusOKWithContext(std::move(response.swResponse),
+                                           str::stream() << "Unable to create collection "
+                                                         << nss.ns() << " on " << response.shardId);
+            auto status = getStatusFromCommandResult(shardResponse.data);
+            uassertStatusOK(status.withContext(str::stream()
+                                               << "Unable to create collection " << nss.ns()
+                                               << " on " << response.shardId));
+
+            auto wcStatus = getWriteConcernStatusFromCommandResult(shardResponse.data);
+            uassertStatusOK(wcStatus.withContext(str::stream()
+                                                 << "Unable to create collection " << nss.ns()
+                                                 << " on " << response.shardId));
+        }
+    }
+}
+
+void writeFirstChunksToConfig(OperationContext* opCtx,
+                              const InitialSplitPolicy::ShardCollectionConfig& initialChunks) {
+
+    std::vector<BSONObj> chunkObjs;
+    chunkObjs.reserve(initialChunks.chunks.size());
+    for (const auto& chunk : initialChunks.chunks) {
+        if (serverGlobalParams.featureCompatibility.getVersion() >=
+            ServerGlobalParams::FeatureCompatibility::Version::kUpgradingTo44) {
+            chunkObjs.push_back(chunk.toConfigBSON());
+        } else {
+            chunkObjs.push_back(chunk.toConfigBSONLegacyID());
+        }
+    }
+
+    Grid::get(opCtx)->catalogClient()->insertConfigDocumentsAsRetryableWrite(
+        opCtx,
+        ChunkType::ConfigNS,
+        std::move(chunkObjs),
+        ShardingCatalogClient::kMajorityWriteConcern);
+}
+
+void updateShardingCatalogEntryForCollection(
+    OperationContext* opCtx,
+    const NamespaceString& nss,
+    const ShardCollectionTargetState& prerequisites,
+    const InitialSplitPolicy::ShardCollectionConfig& initialChunks,
+    const BSONObj& defaultCollation,
+    const bool unique) {
     // Construct the collection default collator.
     std::unique_ptr<CollatorInterface> defaultCollator;
     if (!defaultCollation.isEmpty()) {
@@ -459,89 +639,37 @@ void shardCollection(OperationContext* opCtx,
                                               ->makeFromBSON(defaultCollation));
     }
 
-    const auto initialChunks = InitialSplitPolicy::createFirstChunks(opCtx,
-                                                                     nss,
-                                                                     fieldsAndOrder,
-                                                                     dbPrimaryShardId,
-                                                                     splitPoints,
-                                                                     tags,
-                                                                     isEmpty,
-                                                                     numContiguousChunksPerShard);
+    CollectionType coll;
+    coll.setNs(nss);
+    coll.setUUID(prerequisites.uuid);
+    coll.setEpoch(initialChunks.collVersion().epoch());
+    coll.setUpdatedAt(Date_t::fromMillisSinceEpoch(initialChunks.collVersion().toLong()));
+    coll.setKeyPattern(prerequisites.shardKeyPattern.toBSON());
+    coll.setDefaultCollation(defaultCollator ? defaultCollator->getSpec().toBSON() : BSONObj());
+    coll.setUnique(unique);
+    coll.setDistributionMode(CollectionType::DistributionMode::kSharded);
 
-    // Create collections on all shards that will receive chunks. We need to do this after we mark
-    // the collection as sharded so that the shards will update their metadata correctly. We do not
-    // want to do this for mapReduce.
-    if (!fromMapReduce) {
-        std::vector<AsyncRequestsSender::Request> requests;
-        for (const auto& chunk : initialChunks.chunks) {
-            if (chunk.getShard() == dbPrimaryShardId)
-                continue;
+    uassertStatusOK(ShardingCatalogClientImpl::updateShardingCatalogEntryForCollection(
+        opCtx, nss, coll, true /*upsert*/));
+}
 
-            CloneCollectionOptionsFromPrimaryShard cloneCollectionOptionsFromPrimaryShardRequest(
-                nss);
-            cloneCollectionOptionsFromPrimaryShardRequest.setPrimaryShard(
-                dbPrimaryShardId.toString());
-            cloneCollectionOptionsFromPrimaryShardRequest.setDbName(nss.db());
-
-            requests.emplace_back(
-                chunk.getShard(),
-                cloneCollectionOptionsFromPrimaryShardRequest.toBSON(
-                    BSON("writeConcern" << ShardingCatalogClient::kMajorityWriteConcern.toBSON())));
-        }
-
-        if (!requests.empty()) {
-            auto responses = gatherResponses(opCtx,
-                                             nss.db(),
-                                             ReadPreferenceSetting::get(opCtx),
-                                             Shard::RetryPolicy::kIdempotent,
-                                             requests);
-
-            // If any shards fail to create the collection, fail the entire shardCollection command
-            // (potentially leaving incomplely created sharded collection)
-            for (const auto& response : responses) {
-                auto shardResponse = uassertStatusOKWithContext(
-                    std::move(response.swResponse),
-                    str::stream() << "Unable to create collection on " << response.shardId);
-                auto status = getStatusFromCommandResult(shardResponse.data);
-                uassertStatusOK(status.withContext(
-                    str::stream() << "Unable to create collection on " << response.shardId));
-
-                auto wcStatus = getWriteConcernStatusFromCommandResult(shardResponse.data);
-                uassertStatusOK(wcStatus.withContext(
-                    str::stream() << "Unable to create collection on " << response.shardId));
-            }
-        }
-    }
-
-    // Insert chunk documents to config.chunks on the config server.
-    InitialSplitPolicy::writeFirstChunksToConfig(opCtx, initialChunks);
-
-    {
-        CollectionType coll;
-        coll.setNs(nss);
-        if (uuid)
-            coll.setUUID(*uuid);
-        coll.setEpoch(initialChunks.collVersion().epoch());
-        coll.setUpdatedAt(Date_t::fromMillisSinceEpoch(initialChunks.collVersion().toLong()));
-        coll.setKeyPattern(fieldsAndOrder.toBSON());
-        coll.setDefaultCollation(defaultCollator ? defaultCollator->getSpec().toBSON() : BSONObj());
-        coll.setUnique(unique);
-
-        uassertStatusOK(ShardingCatalogClientImpl::updateShardingCatalogEntryForCollection(
-            opCtx, nss, coll, true /*upsert*/));
-    }
-
+void refreshAllShards(OperationContext* opCtx,
+                      const NamespaceString& nss,
+                      const ShardId& dbPrimaryShardId,
+                      const std::vector<ChunkType>& initialChunks) {
     forceShardFilteringMetadataRefresh(opCtx, nss);
 
-    std::vector<ShardId> shardsRefreshed;
-    for (const auto& chunk : initialChunks.chunks) {
-        if ((chunk.getShard() == dbPrimaryShardId) ||
-            std::find(shardsRefreshed.begin(), shardsRefreshed.end(), chunk.getShard()) !=
-                shardsRefreshed.end()) {
+    auto shardRegistry = Grid::get(opCtx)->shardRegistry();
+
+    std::set<ShardId> shardsRefreshed;
+    for (const auto& chunk : initialChunks) {
+        const auto& chunkShardId = chunk.getShard();
+        if (chunkShardId == dbPrimaryShardId ||
+            shardsRefreshed.find(chunkShardId) != shardsRefreshed.end()) {
             continue;
         }
 
-        auto shard = uassertStatusOK(shardRegistry->getShard(opCtx, chunk.getShard()));
+        auto shard = uassertStatusOK(shardRegistry->getShard(opCtx, chunkShardId));
         auto refreshCmdResponse = uassertStatusOK(shard->runCommandWithFixedRetryAttempts(
             opCtx,
             ReadPreferenceSetting{ReadPreference::PrimaryOnly},
@@ -551,8 +679,105 @@ void shardCollection(OperationContext* opCtx,
             Shard::RetryPolicy::kIdempotent));
 
         uassertStatusOK(refreshCmdResponse.commandStatus);
-        shardsRefreshed.emplace_back(chunk.getShard());
+        shardsRefreshed.emplace(chunkShardId);
     }
+}
+
+UUID shardCollection(OperationContext* opCtx,
+                     const NamespaceString& nss,
+                     const BSONObj& cmdObj,
+                     const ShardsvrShardCollection& request,
+                     const ShardId& dbPrimaryShardId) {
+    if (auto collectionOptional =
+            InitialSplitPolicy::checkIfCollectionAlreadyShardedWithSameOptions(
+                opCtx, nss, request, repl::ReadConcernLevel::kMajorityReadConcern)) {
+        uassert(ErrorCodes::InvalidUUID,
+                str::stream() << "Collection " << nss << " is sharded without UUID",
+                collectionOptional->getUUID());
+        return *collectionOptional->getUUID();
+    }
+
+    InitialSplitPolicy::ShardingOptimizationType optimizationType;
+    InitialSplitPolicy::ShardCollectionConfig initialChunks;
+    boost::optional<ShardCollectionTargetState> targetState;
+
+    auto writeChunkDocumentsAndRefreshShards =
+        [&](const ShardCollectionTargetState& targetState,
+            const InitialSplitPolicy::ShardCollectionConfig& initialChunks) {
+            // Insert chunk documents to config.chunks on the config server.
+            writeFirstChunksToConfig(opCtx, initialChunks);
+
+            updateShardingCatalogEntryForCollection(opCtx,
+                                                    nss,
+                                                    targetState,
+                                                    initialChunks,
+                                                    *request.getCollation(),
+                                                    request.getUnique());
+
+            refreshAllShards(opCtx, nss, dbPrimaryShardId, initialChunks.chunks);
+        };
+
+    {
+        // From this point onward the collection can only be read, not written to, so it is safe to
+        // construct the prerequisites and generate the target state.
+        CollectionCriticalSection critSec(opCtx, nss);
+
+        if (auto collectionOptional =
+                InitialSplitPolicy::checkIfCollectionAlreadyShardedWithSameOptions(
+                    opCtx, nss, request, repl::ReadConcernLevel::kMajorityReadConcern)) {
+            uassert(ErrorCodes::InvalidUUID,
+                    str::stream() << "Collection " << nss << " is sharded without UUID",
+                    collectionOptional->getUUID());
+            return *collectionOptional->getUUID();
+        }
+
+        targetState = calculateTargetState(opCtx, nss, request);
+
+        // From this point onward, the collection can not be written to or read from.
+        critSec.enterCommitPhase();
+
+        logStartShardCollection(opCtx, cmdObj, nss, request, *targetState, dbPrimaryShardId);
+
+        optimizationType = InitialSplitPolicy::calculateOptimizationType(
+            targetState->splitPoints, targetState->tags, targetState->collectionIsEmpty);
+        if (optimizationType != InitialSplitPolicy::ShardingOptimizationType::None) {
+            initialChunks = InitialSplitPolicy::createFirstChunksOptimized(
+                opCtx,
+                nss,
+                targetState->shardKeyPattern,
+                dbPrimaryShardId,
+                targetState->splitPoints,
+                targetState->tags,
+                optimizationType,
+                targetState->collectionIsEmpty,
+                targetState->numContiguousChunksPerShard);
+
+            // If we are coming from mapReduce, we will have created chunks with a distribution
+            // such that all reduce writes end up being local. In that case, we do not need to
+            // create the chunk on other shards.
+            if (!targetState->fromMapReduce) {
+                createCollectionOnShardsReceivingChunks(
+                    opCtx, nss, initialChunks.chunks, dbPrimaryShardId);
+            }
+
+            writeChunkDocumentsAndRefreshShards(*targetState, initialChunks);
+        }
+    }
+
+    // We have now left the critical section.
+
+    if (optimizationType == InitialSplitPolicy::ShardingOptimizationType::None) {
+        invariant(initialChunks.chunks.empty());
+
+        initialChunks = InitialSplitPolicy::createFirstChunksUnoptimized(
+            opCtx, nss, targetState->shardKeyPattern, dbPrimaryShardId);
+
+        writeChunkDocumentsAndRefreshShards(*targetState, initialChunks);
+    }
+
+    LOG(0) << "Created " << initialChunks.chunks.size() << " chunk(s) for: " << nss
+           << ", producing collection version " << initialChunks.collVersion();
+
 
     ShardingLogging::get(opCtx)->logChange(
         opCtx,
@@ -560,6 +785,8 @@ void shardCollection(OperationContext* opCtx,
         nss.ns(),
         BSON("version" << initialChunks.collVersion().toString()),
         ShardingCatalogClient::kMajorityWriteConcern);
+
+    return targetState->uuid;
 }
 
 /**
@@ -603,7 +830,6 @@ public:
              const std::string& dbname,
              const BSONObj& cmdObj,
              BSONObjBuilder& result) override {
-        auto const grid = Grid::get(opCtx);
         auto const shardingState = ShardingState::get(opCtx);
         uassertStatusOK(shardingState->canAcceptShardedCommands());
 
@@ -613,137 +839,18 @@ public:
 
         auto scopedShardCollection = uassertStatusOK(
             ActiveShardCollectionRegistry::get(opCtx).registerShardCollection(request));
-        Status status = {ErrorCodes::InternalError, "Uninitialized value"};
+        OptionalCollectionUUID uuid;
 
         // Check if this collection is currently being sharded and if so, join it
         if (!scopedShardCollection.mustExecute()) {
-            auto swUUID = scopedShardCollection.getUUID().getNoThrow();
-            status = swUUID.getStatus();
-
-            result << "collectionsharded" << nss.ns();
-            if (status.isOK() && swUUID.getValue()) {
-                result << "collectionUUID" << swUUID.getValue().get();
-            }
+            uuid = scopedShardCollection.getUUID().get();
         } else {
-            boost::optional<UUID> uuid;
             try {
-                if (checkIfCollectionAlreadyShardedWithSameOptions(opCtx, nss, request, result)) {
-                    status = Status::OK();
-                    auto existingUUID =
-                        uassertStatusOK(UUID::parse(result.asTempObj()["collectionUUID"]));
-                    scopedShardCollection.emplaceUUID(existingUUID);
-
-                    return true;
-                }
-
-                // Take the collection critical section so that no writes can happen.
-                CollectionCriticalSection critSec(opCtx, nss);
-
-                if (checkIfCollectionAlreadyShardedWithSameOptions(opCtx, nss, request, result)) {
-                    status = Status::OK();
-                    auto existingUUID =
-                        uassertStatusOK(UUID::parse(result.asTempObj()["collectionUUID"]));
-                    scopedShardCollection.emplaceUUID(existingUUID);
-
-                    return true;
-                }
-
-                auto proposedKey(request.getKey().getOwned());
-                ShardKeyPattern shardKeyPattern(proposedKey);
-
-                createCollectionOrValidateExisting(
-                    opCtx, nss, proposedKey, shardKeyPattern, request);
-
-                // Read zone info
-                const auto catalogClient = grid->catalogClient();
-                auto tags = uassertStatusOK(catalogClient->getTagsForCollection(opCtx, nss));
-
-                if (!tags.empty()) {
-                    validateShardKeyAgainstExistingZones(opCtx, proposedKey, shardKeyPattern, tags);
-                }
-
-                if (request.getGetUUIDfromPrimaryShard()) {
-                    uuid = getUUIDFromPrimaryShard(opCtx, nss);
-                } else {
-                    uuid = UUID::gen();
-                }
-
-                const auto shardRegistry = grid->shardRegistry();
-                shardRegistry->reload(opCtx);
-
-                const bool isEmpty = [&] {
-                    // Use find with predicate instead of count in order to ensure that the count
-                    // command doesn't just consult the cached metadata, which may not always be
-                    // correct
-                    DBDirectClient localClient(opCtx);
-                    return localClient.findOne(nss.ns(), Query()).isEmpty();
-                }();
-
-                std::vector<ShardId> shardIds;
-                shardRegistry->getAllShardIds(opCtx, &shardIds);
-                const int numShards = shardIds.size();
-
-                std::vector<BSONObj> initialSplitPoints;
-                std::vector<BSONObj> finalSplitPoints;
-
-                if (request.getInitialSplitPoints()) {
-                    finalSplitPoints = *request.getInitialSplitPoints();
-                } else if (tags.empty()) {
-                    InitialSplitPolicy::calculateHashedSplitPointsForEmptyCollection(
-                        shardKeyPattern,
-                        isEmpty,
-                        numShards,
-                        request.getNumInitialChunks(),
-                        &initialSplitPoints,
-                        &finalSplitPoints);
-                }
-
-                result << "collectionsharded" << nss.ns();
-                if (uuid) {
-                    result << "collectionUUID" << *uuid;
-                }
-
-                critSec.enterCommitPhase();
-
-                LOG(0) << "CMD: shardcollection: " << cmdObj;
-
-                audit::logShardCollection(
-                    opCtx->getClient(), nss.ns(), proposedKey, request.getUnique());
-
-                // Map/reduce with output to an empty collection assumes it has full control of the
-                // output collection and it would be an unsupported operation if the collection is
-                // being concurrently written
-                const bool fromMapReduce = bool(request.getInitialSplitPoints());
-                if (fromMapReduce) {
-                    uassert(ErrorCodes::ConflictingOperationInProgress,
-                            str::stream()
-                                << "Map reduce with sharded output to a new collection found "
-                                << nss.ns()
-                                << " to be non-empty which is not supported.",
-                            isEmpty);
-                }
-
-                const int numContiguousChunksPerShard = initialSplitPoints.empty()
-                    ? 1
-                    : (finalSplitPoints.size() + 1) / (initialSplitPoints.size() + 1);
-
-                // Step 6. Actually shard the collection.
-                shardCollection(opCtx,
-                                nss,
-                                uuid,
-                                shardKeyPattern,
-                                *request.getCollation(),
-                                request.getUnique(),
-                                finalSplitPoints,
-                                tags,
-                                fromMapReduce,
-                                ShardingState::get(opCtx)->shardId(),
-                                numContiguousChunksPerShard,
-                                isEmpty);
-
-                status = Status::OK();
+                uuid = shardCollection(
+                    opCtx, nss, cmdObj, request, ShardingState::get(opCtx)->shardId());
             } catch (const DBException& e) {
-                status = e.toStatus();
+                scopedShardCollection.emplaceUUID(e.toStatus());
+                throw;
             } catch (const std::exception& e) {
                 scopedShardCollection.emplaceUUID(
                     {ErrorCodes::InternalError,
@@ -753,14 +860,20 @@ public:
                 throw;
             }
 
-            if (!status.isOK()) {
-                scopedShardCollection.emplaceUUID(status);
-            } else {
-                scopedShardCollection.emplaceUUID(uuid);
+            uassert(ErrorCodes::InvalidUUID,
+                    str::stream() << "Collection " << nss << " is sharded without UUID",
+                    uuid);
+
+            if (MONGO_unlikely(pauseShardCollectionBeforeReturning.shouldFail())) {
+                log() << "Hit pauseShardCollectionBeforeReturning";
+                pauseShardCollectionBeforeReturning.pauseWhileSet(opCtx);
             }
+
+            scopedShardCollection.emplaceUUID(uuid);
         }
 
-        uassertStatusOK(status);
+        result << "collectionsharded" << nss.ns();
+        result << "collectionUUID" << *uuid;
 
         return true;
     }

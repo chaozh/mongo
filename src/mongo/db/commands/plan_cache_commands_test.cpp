@@ -34,15 +34,15 @@
 #include "mongo/db/commands/plan_cache_commands.h"
 
 #include <algorithm>
+#include <memory>
 
 #include "mongo/db/json.h"
 #include "mongo/db/operation_context_noop.h"
 #include "mongo/db/query/plan_ranker.h"
 #include "mongo/db/query/query_solution.h"
 #include "mongo/db/query/query_test_service_context.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/unittest/unittest.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 using namespace mongo;
 
@@ -63,7 +63,7 @@ static const NamespaceString nss("test.collection");
  */
 std::vector<BSONObj> getShapes(const PlanCache& planCache) {
     BSONObjBuilder bob;
-    ASSERT_OK(PlanCacheListQueryShapes::list(planCache, &bob));
+    ASSERT_OK(PlanCacheListQueryShapesDeprecated::list(planCache, &bob));
     BSONObj resultObj = bob.obj();
     BSONElement shapesElt = resultObj.getField("shapes");
     ASSERT_EQUALS(shapesElt.type(), mongo::Array);
@@ -117,7 +117,7 @@ std::unique_ptr<PlanRankingDecision> createDecision(size_t numPlans, size_t work
     unique_ptr<PlanRankingDecision> why(new PlanRankingDecision());
     for (size_t i = 0; i < numPlans; ++i) {
         CommonStats common("COLLSCAN");
-        auto stats = stdx::make_unique<PlanStageStats>(common, STAGE_COLLSCAN);
+        auto stats = std::make_unique<PlanStageStats>(common, STAGE_COLLSCAN);
         stats->specific.reset(new CollectionScanStats());
         why->stats.push_back(std::move(stats));
         why->stats[i]->common.works = works;
@@ -138,7 +138,7 @@ TEST(PlanCacheCommandsTest, planCacheListQueryShapesOneKey) {
     auto opCtx = serviceContext.makeOperationContext();
 
     // Create a canonical query
-    auto qr = stdx::make_unique<QueryRequest>(nss);
+    auto qr = std::make_unique<QueryRequest>(nss);
     qr->setFilter(fromjson("{a: 1}"));
     qr->setSort(fromjson("{a: -1}"));
     qr->setProj(fromjson("{_id: 0}"));
@@ -175,7 +175,7 @@ TEST(PlanCacheCommandsTest, planCacheClearAllShapes) {
     auto opCtx = serviceContext.makeOperationContext();
 
     // Create a canonical query
-    auto qr = stdx::make_unique<QueryRequest>(nss);
+    auto qr = std::make_unique<QueryRequest>(nss);
     qr->setFilter(fromjson("{a: 1}"));
     auto statusWithCQ = CanonicalQuery::canonicalize(opCtx.get(), std::move(qr));
     ASSERT_OK(statusWithCQ.getStatus());
@@ -312,11 +312,11 @@ TEST(PlanCacheCommandsTest, planCacheClearOneKey) {
     auto opCtx = serviceContext.makeOperationContext();
 
     // Create 2 canonical queries.
-    auto qrA = stdx::make_unique<QueryRequest>(nss);
+    auto qrA = std::make_unique<QueryRequest>(nss);
     qrA->setFilter(fromjson("{a: 1}"));
     auto statusWithCQA = CanonicalQuery::canonicalize(opCtx.get(), std::move(qrA));
     ASSERT_OK(statusWithCQA.getStatus());
-    auto qrB = stdx::make_unique<QueryRequest>(nss);
+    auto qrB = std::make_unique<QueryRequest>(nss);
     qrB->setFilter(fromjson("{b: 1}"));
     unique_ptr<CanonicalQuery> cqA = std::move(statusWithCQA.getValue());
     auto statusWithCQB = CanonicalQuery::canonicalize(opCtx.get(), std::move(qrB));
@@ -341,12 +341,12 @@ TEST(PlanCacheCommandsTest, planCacheClearOneKey) {
     // Check keys in cache before dropping {b: 1}
     vector<BSONObj> shapesBefore = getShapes(planCache);
     ASSERT_EQUALS(shapesBefore.size(), 2U);
-    BSONObj shapeA = BSON(
-        "query" << cqA->getQueryObj() << "sort" << cqA->getQueryRequest().getSort() << "projection"
-                << cqA->getQueryRequest().getProj());
-    BSONObj shapeB = BSON(
-        "query" << cqB->getQueryObj() << "sort" << cqB->getQueryRequest().getSort() << "projection"
-                << cqB->getQueryRequest().getProj());
+    BSONObj shapeA =
+        BSON("query" << cqA->getQueryObj() << "sort" << cqA->getQueryRequest().getSort()
+                     << "projection" << cqA->getQueryRequest().getProj());
+    BSONObj shapeB =
+        BSON("query" << cqB->getQueryObj() << "sort" << cqB->getQueryRequest().getSort()
+                     << "projection" << cqB->getQueryRequest().getProj());
     ASSERT_TRUE(
         std::find_if(shapesBefore.begin(), shapesBefore.end(), [&shapeA](const BSONObj& obj) {
             auto filteredObj = obj.removeField("queryHash");
@@ -374,12 +374,12 @@ TEST(PlanCacheCommandsTest, planCacheClearOneKeyCollation) {
     auto opCtx = serviceContext.makeOperationContext();
 
     // Create 2 canonical queries, one with collation.
-    auto qr = stdx::make_unique<QueryRequest>(nss);
+    auto qr = std::make_unique<QueryRequest>(nss);
     qr->setFilter(fromjson("{a: 'foo'}"));
     auto statusWithCQ = CanonicalQuery::canonicalize(opCtx.get(), std::move(qr));
     ASSERT_OK(statusWithCQ.getStatus());
     unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
-    auto qrCollation = stdx::make_unique<QueryRequest>(nss);
+    auto qrCollation = std::make_unique<QueryRequest>(nss);
     qrCollation->setFilter(fromjson("{a: 'foo'}"));
     qrCollation->setCollation(fromjson("{locale: 'mock_reverse_string'}"));
     auto statusWithCQCollation = CanonicalQuery::canonicalize(opCtx.get(), std::move(qrCollation));
@@ -413,14 +413,11 @@ TEST(PlanCacheCommandsTest, planCacheClearOneKeyCollation) {
     vector<BSONObj> shapesBefore = getShapes(planCache);
     ASSERT_EQUALS(shapesBefore.size(), 2U);
     BSONObj shape = BSON("query" << cq->getQueryObj() << "sort" << cq->getQueryRequest().getSort()
-                                 << "projection"
-                                 << cq->getQueryRequest().getProj());
-    BSONObj shapeWithCollation = BSON("query" << cqCollation->getQueryObj() << "sort"
-                                              << cqCollation->getQueryRequest().getSort()
-                                              << "projection"
-                                              << cqCollation->getQueryRequest().getProj()
-                                              << "collation"
-                                              << cqCollation->getCollator()->getSpec().toBSON());
+                                 << "projection" << cq->getQueryRequest().getProj());
+    BSONObj shapeWithCollation = BSON(
+        "query" << cqCollation->getQueryObj() << "sort" << cqCollation->getQueryRequest().getSort()
+                << "projection" << cqCollation->getQueryRequest().getProj() << "collation"
+                << cqCollation->getCollator()->getSpec().toBSON());
     ASSERT_TRUE(
         std::find_if(shapesBefore.begin(), shapesBefore.end(), [&shape](const BSONObj& obj) {
             auto filteredObj = obj.removeField("queryHash");
@@ -499,7 +496,7 @@ BSONObj getCmdResult(const PlanCache& planCache,
         cmdObjBuilder.append("collation", collation);
     }
     BSONObj cmdObj = cmdObjBuilder.obj();
-    ASSERT_OK(PlanCacheListPlans::list(opCtx.get(), planCache, nss.ns(), cmdObj, &bob));
+    ASSERT_OK(PlanCacheListPlansDeprecated::list(opCtx.get(), planCache, nss.ns(), cmdObj, &bob));
     BSONObj resultObj = bob.obj();
 
     return resultObj;
@@ -532,11 +529,12 @@ TEST(PlanCacheCommandsTest, planCacheListPlansInvalidParameter) {
     OperationContextNoop opCtx;
 
     // Missing query field is not ok.
-    ASSERT_NOT_OK(PlanCacheListPlans::list(&opCtx, planCache, nss.ns(), BSONObj(), &ignored));
+    ASSERT_NOT_OK(
+        PlanCacheListPlansDeprecated::list(&opCtx, planCache, nss.ns(), BSONObj(), &ignored));
     // Query field type must be BSON object.
-    ASSERT_NOT_OK(PlanCacheListPlans::list(
+    ASSERT_NOT_OK(PlanCacheListPlansDeprecated::list(
         &opCtx, planCache, nss.ns(), fromjson("{query: 12345}"), &ignored));
-    ASSERT_NOT_OK(PlanCacheListPlans::list(
+    ASSERT_NOT_OK(PlanCacheListPlansDeprecated::list(
         &opCtx, planCache, nss.ns(), fromjson("{query: /keyisnotregex/}"), &ignored));
 }
 
@@ -546,7 +544,7 @@ TEST(PlanCacheCommandsTest, planCacheListPlansUnknownKey) {
     OperationContextNoop opCtx;
 
     BSONObjBuilder ignored;
-    ASSERT_OK(PlanCacheListPlans::list(
+    ASSERT_OK(PlanCacheListPlansDeprecated::list(
         &opCtx, planCache, nss.ns(), fromjson("{query: {a: 1}}"), &ignored));
 }
 
@@ -555,7 +553,7 @@ TEST(PlanCacheCommandsTest, planCacheListPlansOnlyOneSolutionTrue) {
     auto opCtx = serviceContext.makeOperationContext();
 
     // Create a canonical query
-    auto qr = stdx::make_unique<QueryRequest>(nss);
+    auto qr = std::make_unique<QueryRequest>(nss);
     qr->setFilter(fromjson("{a: 1}"));
     auto statusWithCQ = CanonicalQuery::canonicalize(opCtx.get(), std::move(qr));
     ASSERT_OK(statusWithCQ.getStatus());
@@ -588,7 +586,7 @@ TEST(PlanCacheCommandsTest, planCacheListPlansOnlyOneSolutionFalse) {
     auto opCtx = serviceContext.makeOperationContext();
 
     // Create a canonical query
-    auto qr = stdx::make_unique<QueryRequest>(nss);
+    auto qr = std::make_unique<QueryRequest>(nss);
     qr->setFilter(fromjson("{a: 1}"));
     auto statusWithCQ = CanonicalQuery::canonicalize(opCtx.get(), std::move(qr));
     ASSERT_OK(statusWithCQ.getStatus());
@@ -624,12 +622,12 @@ TEST(PlanCacheCommandsTest, planCacheListPlansCollation) {
     auto opCtx = serviceContext.makeOperationContext();
 
     // Create 2 canonical queries, one with collation.
-    auto qr = stdx::make_unique<QueryRequest>(nss);
+    auto qr = std::make_unique<QueryRequest>(nss);
     qr->setFilter(fromjson("{a: 'foo'}"));
     auto statusWithCQ = CanonicalQuery::canonicalize(opCtx.get(), std::move(qr));
     ASSERT_OK(statusWithCQ.getStatus());
     unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
-    auto qrCollation = stdx::make_unique<QueryRequest>(nss);
+    auto qrCollation = std::make_unique<QueryRequest>(nss);
     qrCollation->setFilter(fromjson("{a: 'foo'}"));
     qrCollation->setCollation(fromjson("{locale: 'mock_reverse_string'}"));
     auto statusWithCQCollation = CanonicalQuery::canonicalize(opCtx.get(), std::move(qrCollation));
@@ -684,7 +682,7 @@ TEST(PlanCacheCommandsTest, planCacheListPlansTimeOfCreationIsCorrect) {
     auto opCtx = serviceContext.makeOperationContext();
 
     // Create a canonical query.
-    auto qr = stdx::make_unique<QueryRequest>(nss);
+    auto qr = std::make_unique<QueryRequest>(nss);
     qr->setFilter(fromjson("{a: 1}"));
     auto statusWithCQ = CanonicalQuery::canonicalize(opCtx.get(), std::move(qr));
     ASSERT_OK(statusWithCQ.getStatus());

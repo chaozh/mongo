@@ -32,150 +32,67 @@
 #include <cstdint>
 
 #ifdef _MSC_VER
-#include <intrin.h>
-#include <safeint.h>
+#include <SafeInt.hpp>
 #endif
 
-namespace mongo {
+#include "mongo/stdx/type_traits.h"
+#include "mongo/util/assert_util.h"
+
+namespace mongo::overflow {
 
 /**
- * Returns true if multiplying lhs by rhs would overflow. Otherwise, multiplies 64-bit signed
- * or unsigned integers lhs by rhs and stores the result in *product.
+ * Synopsis:
+ *
+ *   bool mul(A a, A b, T* r);
+ *   bool add(A a, A b, T* r);
+ *   bool sub(A a, A b, T* r);
+ *
+ * The domain type `A` evaluates to `T`, which is deduced from the `r` parameter.
+ * That is, the input parameters are coerced into the type accepted by the output parameter.
+ * All functions return true if operation would overflow, otherwise they store result in `*r`.
  */
-inline bool mongoSignedMultiplyOverflow64(int64_t lhs, int64_t rhs, int64_t* product);
-inline bool mongoUnsignedMultiplyOverflow64(uint64_t lhs, uint64_t rhs, uint64_t* product);
 
-/**
- * Returns true if adding lhs and rhs would overflow. Otherwise, adds 64-bit signed or unsigned
- * integers lhs and rhs and stores the result in *sum.
- */
-inline bool mongoSignedAddOverflow64(int64_t lhs, int64_t rhs, int64_t* sum);
-inline bool mongoUnsignedAddOverflow64(uint64_t lhs, uint64_t rhs, uint64_t* sum);
+// MSVC : The SafeInt functions return false on overflow.
+// GCC, Clang: The __builtin_*_overflow functions return true on overflow.
 
-/**
- * Returns true if subtracting rhs from lhs would overflow. Otherwise, subtracts 64-bit signed or
- * unsigned integers rhs from lhs and stores the result in *difference.
- */
-inline bool mongoSignedSubtractOverflow64(int64_t lhs, int64_t rhs, int64_t* difference);
-inline bool mongoUnsignedSubtractOverflow64(uint64_t lhs, uint64_t rhs, uint64_t* difference);
-
-
+template <typename T>
+constexpr bool mul(stdx::type_identity_t<T> a, stdx::type_identity_t<T> b, T* r) {
 #ifdef _MSC_VER
-
-// The microsoft SafeInt functions return true on success, false on overflow. Unfortunately the
-// MSVC2015 version contains a typo that prevents the signed variants from compiling in our
-// environment.
-// TODO The typo was fixed in MSVC2017 so we should try again after we upgrade our toolchain.
-
-inline bool mongoSignedMultiplyOverflow64(int64_t lhs, int64_t rhs, int64_t* product) {
-    int64_t hi;
-    *product = _mul128(lhs, rhs, &hi);
-    if (hi == 0) {
-        return *product < 0;
-    }
-    if (hi == -1) {
-        return *product >= 0;
-    }
-    return true;
-}
-
-inline bool mongoUnsignedMultiplyOverflow64(uint64_t lhs, uint64_t rhs, uint64_t* product) {
-    return !msl::utilities::SafeMultiply(lhs, rhs, *product);
-}
-
-inline bool mongoSignedAddOverflow64(int64_t lhs, int64_t rhs, int64_t* sum) {
-    *sum = static_cast<int64_t>(static_cast<uint64_t>(lhs) + static_cast<uint64_t>(rhs));
-    if (lhs >= 0 && rhs >= 0) {
-        return (*sum) < 0;
-    }
-    if (lhs < 0 && rhs < 0) {
-        return (*sum) >= 0;
-    }
-    return false;
-}
-
-inline bool mongoUnsignedAddOverflow64(uint64_t lhs, uint64_t rhs, uint64_t* sum) {
-    return !msl::utilities::SafeAdd(lhs, rhs, *sum);
-}
-
-inline bool mongoSignedSubtractOverflow64(int64_t lhs, int64_t rhs, int64_t* difference) {
-    *difference = static_cast<int64_t>(static_cast<uint64_t>(lhs) - static_cast<uint64_t>(rhs));
-    if (lhs >= 0 && rhs < 0) {
-        return (*difference) < 0;
-    }
-    if (lhs < 0 && rhs >= 0) {
-        return (*difference >= 0);
-    }
-    return false;
-}
-
-inline bool mongoUnsignedSubtractOverflow64(uint64_t lhs, uint64_t rhs, uint64_t* difference) {
-    return !msl::utilities::SafeSubtract(lhs, rhs, *difference);
-}
-
+    return !SafeMultiply(a, b, *r);
 #else
-
-// On GCC and CLANG we can use __builtin functions to perform these calculations. These return true
-// on overflow and false on success.
-
-inline bool mongoSignedMultiplyOverflow64(long lhs, long rhs, long* product) {
-    return __builtin_mul_overflow(lhs, rhs, product);
-}
-
-inline bool mongoSignedMultiplyOverflow64(long long lhs, long long rhs, long long* product) {
-    return __builtin_mul_overflow(lhs, rhs, product);
-}
-
-inline bool mongoUnsignedMultiplyOverflow64(unsigned long lhs,
-                                            unsigned long rhs,
-                                            unsigned long* product) {
-    return __builtin_mul_overflow(lhs, rhs, product);
-}
-
-inline bool mongoUnsignedMultiplyOverflow64(unsigned long long lhs,
-                                            unsigned long long rhs,
-                                            unsigned long long* product) {
-    return __builtin_mul_overflow(lhs, rhs, product);
-}
-
-inline bool mongoSignedAddOverflow64(long lhs, long rhs, long* sum) {
-    return __builtin_add_overflow(lhs, rhs, sum);
-}
-
-inline bool mongoSignedAddOverflow64(long long lhs, long long rhs, long long* sum) {
-    return __builtin_add_overflow(lhs, rhs, sum);
-}
-
-inline bool mongoUnsignedAddOverflow64(unsigned long lhs, unsigned long rhs, unsigned long* sum) {
-    return __builtin_add_overflow(lhs, rhs, sum);
-}
-
-inline bool mongoUnsignedAddOverflow64(unsigned long long lhs,
-                                       unsigned long long rhs,
-                                       unsigned long long* sum) {
-    return __builtin_add_overflow(lhs, rhs, sum);
-}
-
-inline bool mongoSignedSubtractOverflow64(long lhs, long rhs, long* difference) {
-    return __builtin_sub_overflow(lhs, rhs, difference);
-}
-
-inline bool mongoSignedSubtractOverflow64(long long lhs, long long rhs, long long* difference) {
-    return __builtin_sub_overflow(lhs, rhs, difference);
-}
-
-inline bool mongoUnsignedSubtractOverflow64(unsigned long lhs,
-                                            unsigned long rhs,
-                                            unsigned long* sum) {
-    return __builtin_sub_overflow(lhs, rhs, sum);
-}
-
-inline bool mongoUnsignedSubtractOverflow64(unsigned long long lhs,
-                                            unsigned long long rhs,
-                                            unsigned long long* sum) {
-    return __builtin_sub_overflow(lhs, rhs, sum);
-}
-
+    return __builtin_mul_overflow(a, b, r);
 #endif
+}
 
-}  // namespace mongo
+template <typename T>
+constexpr bool add(stdx::type_identity_t<T> a, stdx::type_identity_t<T> b, T* r) {
+#ifdef _MSC_VER
+    return !SafeAdd(a, b, *r);
+#else
+    return __builtin_add_overflow(a, b, r);
+#endif
+}
+
+template <typename T>
+constexpr bool sub(stdx::type_identity_t<T> a, stdx::type_identity_t<T> b, T* r) {
+#ifdef _MSC_VER
+    return !SafeSubtract(a, b, *r);
+#else
+    return __builtin_sub_overflow(a, b, r);
+#endif
+}
+
+/**
+ * Safe mod function which throws if the divisor is 0 and avoids potential overflow in cases where
+ * the divisor is -1. If the absolute value of the divisor is 1, mod will always return 0. We fast-
+ * path this to avoid the scenario where the dividend is the smallest negative long or int value and
+ * the divisor is -1. Naively performing this % may result in an overflow when the -2^N value is
+ * divided and becomes 2^N. See SERVER-43699.
+ */
+template <typename T>
+constexpr T safeMod(T dividend, T divisor) {
+    uassert(51259, "can't mod by zero", divisor != 0);
+    return (divisor == 1 || divisor == -1 ? 0 : dividend % divisor);
+}
+
+}  // namespace mongo::overflow

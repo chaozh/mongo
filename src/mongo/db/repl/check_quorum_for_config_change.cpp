@@ -33,7 +33,6 @@
 
 #include "mongo/db/repl/check_quorum_for_config_change.h"
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/base/status.h"
 #include "mongo/db/repl/repl_set_config.h"
 #include "mongo/db/repl/repl_set_heartbeat_args_v1.h"
@@ -43,7 +42,7 @@
 #include "mongo/db/server_options.h"
 #include "mongo/rpc/metadata/repl_set_metadata.h"
 #include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 namespace repl {
@@ -94,7 +93,7 @@ std::vector<RemoteCommandRequest> QuorumChecker::getRequests() const {
         hbArgs.setCheckEmpty();
     }
     hbArgs.setSenderHost(myConfig.getHostAndPort());
-    hbArgs.setSenderId(myConfig.getId());
+    hbArgs.setSenderId(myConfig.getId().getData());
     hbArgs.setTerm(_term);
     hbRequest = hbArgs.toBSON();
 
@@ -199,8 +198,8 @@ void QuorumChecker::_tabulateHeartbeatResponse(const RemoteCommandRequest& reque
     Status hbStatus = hbResp.initialize(resBSON, 0);
 
     if (hbStatus.code() == ErrorCodes::InconsistentReplicaSetNames) {
-        std::string message = str::stream() << "Our set name did not match that of "
-                                            << request.target.toString();
+        std::string message = str::stream()
+            << "Our set name did not match that of " << request.target.toString();
         _vetoStatus = Status(ErrorCodes::NewReplicaSetConfigurationIncompatible, message);
         warning() << message;
         return;

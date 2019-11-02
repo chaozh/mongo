@@ -51,12 +51,12 @@ namespace mongo {
 
 bool shouldOverrideMaxConns(const transport::SessionHandle& session,
                             const std::vector<stdx::variant<CIDR, std::string>>& exemptions) {
-    const auto& remoteAddr = session->remote().sockAddr();
-    const auto& localAddr = session->local().sockAddr();
+    const auto& remoteAddr = session->remoteAddr();
+    const auto& localAddr = session->localAddr();
     boost::optional<CIDR> remoteCIDR;
 
-    if (remoteAddr && remoteAddr->isIP()) {
-        remoteCIDR = uassertStatusOK(CIDR::parse(remoteAddr->getAddr()));
+    if (remoteAddr.isValid() && remoteAddr.isIP()) {
+        remoteCIDR = uassertStatusOK(CIDR::parse(remoteAddr.getAddr()));
     }
     for (const auto& exemption : exemptions) {
         // If this exemption is a CIDR range, then we check that the remote IP is in the
@@ -70,8 +70,8 @@ bool shouldOverrideMaxConns(const transport::SessionHandle& session,
 //
 // On Windows we don't check this at all and only CIDR ranges are supported
 #ifndef _WIN32
-        } else if ((stdx::holds_alternative<std::string>(exemption)) && (localAddr) &&
-                   (localAddr->getAddr() == stdx::get<std::string>(exemption))) {
+        } else if ((stdx::holds_alternative<std::string>(exemption)) && localAddr.isValid() &&
+                   (localAddr.getAddr() == stdx::get<std::string>(exemption))) {
             return true;
 #endif
         }
@@ -121,11 +121,10 @@ Status ServiceEntryPointImpl::start() {
 
 void ServiceEntryPointImpl::startSession(transport::SessionHandle session) {
     // Setup the restriction environment on the Session, if the Session has local/remote Sockaddrs
-    const auto& remoteAddr = session->remote().sockAddr();
-    const auto& localAddr = session->local().sockAddr();
-    invariant(remoteAddr && localAddr);
-    auto restrictionEnvironment =
-        stdx::make_unique<RestrictionEnvironment>(*remoteAddr, *localAddr);
+    const auto& remoteAddr = session->remoteAddr();
+    const auto& localAddr = session->localAddr();
+    invariant(remoteAddr.isValid() && localAddr.isValid());
+    auto restrictionEnvironment = std::make_unique<RestrictionEnvironment>(remoteAddr, localAddr);
     RestrictionEnvironment::set(session, std::move(restrictionEnvironment));
 
     SSMListIterator ssmIt;
@@ -168,7 +167,7 @@ void ServiceEntryPointImpl::startSession(transport::SessionHandle session) {
               << connectionCount << word << " now open)";
     }
 
-    ssm->setCleanupHook([ this, ssmIt, quiet, session = std::move(session) ] {
+    ssm->setCleanupHook([this, ssmIt, quiet, session = std::move(session)] {
         size_t connectionCount;
         auto remote = session->remote();
         {
@@ -224,8 +223,8 @@ bool ServiceEntryPointImpl::shutdown(Milliseconds timeout) {
     auto noWorkersLeft = [this] { return numOpenSessions() == 0; };
     while (timeSpent < timeout &&
            !_shutdownCondition.wait_for(lk, checkInterval.toSystemDuration(), noWorkersLeft)) {
-        log(LogComponent::kNetwork) << "shutdown: still waiting on " << numOpenSessions()
-                                    << " active workers to drain... ";
+        log(LogComponent::kNetwork)
+            << "shutdown: still waiting on " << numOpenSessions() << " active workers to drain... ";
         timeSpent += checkInterval;
     }
 

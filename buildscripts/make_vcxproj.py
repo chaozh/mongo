@@ -12,13 +12,11 @@ To build mongodb, you must use scons. You can use this project to navigate code 
 
   where FILE_NAME is the of the file to generate e.g., "mongod"
 """
-from __future__ import absolute_import, print_function
 
 import io
 import json
 import os
 import re
-import StringIO
 import sys
 import uuid
 import xml.etree.ElementTree as ET
@@ -111,17 +109,17 @@ def _replace_vcxproj(file_name, restore_elements):
                 saved_value = restore_elements[(parent.tag, child.tag, cond)]
                 child.text = saved_value
 
-    stream = StringIO.StringIO()
+    stream = io.StringIO()
 
-    tree.write(stream)
+    tree.write(stream, encoding='unicode')
 
-    str_value = stream.getvalue().encode()
+    str_value = stream.getvalue()
 
     # Strip the "ns0:" namespace prefix because ElementTree does not support default namespaces.
     str_value = str_value.replace("<ns0:", "<").replace("</ns0:", "</").replace(
         "xmlns:ns0", "xmlns")
 
-    with io.open(file_name, mode='wb') as file_handle:
+    with io.open(file_name, mode='w') as file_handle:
         file_handle.write(str_value)
 
 
@@ -151,7 +149,10 @@ class ProjFileGenerator(object):  # pylint: disable=too-many-instance-attributes
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
-        self.vcxproj = open(self.vcxproj_file_name, "wb")
+        self.vcxproj = open(
+            self.vcxproj_file_name,
+            "w",
+        )
 
         with open('buildscripts/vcxproj.header', 'r') as header_file:
             header_str = header_file.read()
@@ -173,15 +174,15 @@ class ProjFileGenerator(object):  # pylint: disable=too-many-instance-attributes
         for command in self.compiles:
             defines = command["defines"].difference(common_defines)
             if defines:
-                self.vcxproj.write(
-                    "    <ClCompile Include=\"" + command["file"] + "\"><PreprocessorDefinitions>" +
-                    ';'.join(defines) + ";%(PreprocessorDefinitions)" +
-                    "</PreprocessorDefinitions></ClCompile>\n")
+                self.vcxproj.write("    <ClCompile Include=\"" + command["file"] +
+                                   "\"><PreprocessorDefinitions>" + ';'.join(defines) +
+                                   ";%(PreprocessorDefinitions)" +
+                                   "</PreprocessorDefinitions></ClCompile>\n")
             else:
                 self.vcxproj.write("    <ClCompile Include=\"" + command["file"] + "\" />\n")
         self.vcxproj.write("  </ItemGroup>\n")
 
-        self.filters = open(self.target + ".vcxproj.filters", "wb")
+        self.filters = open(self.target + ".vcxproj.filters", "w")
         self.filters.write("<?xml version='1.0' encoding='utf-8'?>\n")
         self.filters.write("<Project ToolsVersion='14.0' " +
                            "xmlns='http://schemas.microsoft.com/developer/msbuild/2003'>\n")

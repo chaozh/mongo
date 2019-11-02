@@ -37,14 +37,19 @@
 #include "mongo/db/s/operation_sharding_state.h"
 #include "mongo/db/s/sharded_connection_info.h"
 #include "mongo/s/stale_exception.h"
+#include "mongo/util/fail_point.h"
 #include "mongo/util/log.h"
 #include "mongo/util/string_map.h"
 
 namespace mongo {
+
+MONGO_FAIL_POINT_DEFINE(useFCV44CheckShardVersionProtocol);
+
 namespace {
 
 class CollectionShardingStateMap {
-    MONGO_DISALLOW_COPYING(CollectionShardingStateMap);
+    CollectionShardingStateMap(const CollectionShardingStateMap&) = delete;
+    CollectionShardingStateMap& operator=(const CollectionShardingStateMap&) = delete;
 
 public:
     static const ServiceContext::Decoration<boost::optional<CollectionShardingStateMap>> get;
@@ -53,7 +58,7 @@ public:
         : _factory(std::move(factory)) {}
 
     CollectionShardingState& getOrCreate(const NamespaceString& nss) {
-        stdx::lock_guard<stdx::mutex> lg(_mutex);
+        stdx::lock_guard<Latch> lg(_mutex);
 
         auto it = _collections.find(nss.ns());
         if (it == _collections.end()) {
@@ -69,7 +74,7 @@ public:
         BSONObjBuilder versionB(builder->subobjStart("versions"));
 
         {
-            stdx::lock_guard<stdx::mutex> lg(_mutex);
+            stdx::lock_guard<Latch> lg(_mutex);
 
             for (auto& coll : _collections) {
                 const auto optMetadata = coll.second->getCurrentMetadataIfKnown();
@@ -88,7 +93,7 @@ private:
 
     std::unique_ptr<CollectionShardingStateFactory> _factory;
 
-    stdx::mutex _mutex;
+    Mutex _mutex = MONGO_MAKE_LATCH("CollectionShardingStateMap::_mutex");
     CollectionsMap _collections;
 };
 
@@ -147,18 +152,21 @@ CollectionShardingState* CollectionShardingState::get(OperationContext* opCtx,
     return &collectionsMap->getOrCreate(nss);
 }
 
+CollectionShardingState* CollectionShardingState::get_UNSAFE(ServiceContext* svcCtx,
+                                                             const NamespaceString& nss) {
+    auto& collectionsMap = CollectionShardingStateMap::get(svcCtx);
+    return &collectionsMap->getOrCreate(nss);
+}
+
 void CollectionShardingState::report(OperationContext* opCtx, BSONObjBuilder* builder) {
     auto& collectionsMap = CollectionShardingStateMap::get(opCtx->getServiceContext());
     collectionsMap->report(opCtx, builder);
 }
 
-ScopedCollectionMetadata CollectionShardingState::getOrphansFilter(OperationContext* opCtx) {
-    const auto receivedShardVersion = getOperationReceivedVersion(opCtx, _nss);
-    if (!receivedShardVersion)
-        return {kUnshardedCollection};
-
+ScopedCollectionMetadata CollectionShardingState::getOrphansFilter(OperationContext* opCtx,
+                                                                   bool isCollection) {
     const auto atClusterTime = repl::ReadConcernArgs::get(opCtx).getArgsAtClusterTime();
-    auto optMetadata = _getMetadata(atClusterTime);
+    auto optMetadata = _getMetadataWithVersionCheckAt(opCtx, atClusterTime, isCollection);
 
     if (!optMetadata)
         return {kUnshardedCollection};
@@ -191,27 +199,51 @@ boost::optional<ChunkVersion> CollectionShardingState::getCurrentShardVersionIfK
     return metadata->getCollVersion();
 }
 
-void CollectionShardingState::checkShardVersionOrThrow(OperationContext* opCtx) {
-    const auto optReceivedShardVersion = getOperationReceivedVersion(opCtx, _nss);
+void CollectionShardingState::checkShardVersionOrThrow(OperationContext* opCtx, bool isCollection) {
+    (void)_getMetadataWithVersionCheckAt(opCtx, boost::none, isCollection);
+}
 
-    if (!optReceivedShardVersion)
-        return;
+boost::optional<ScopedCollectionMetadata> CollectionShardingState::_getMetadataWithVersionCheckAt(
+    OperationContext* opCtx,
+    const boost::optional<mongo::LogicalTime>& atClusterTime,
+    bool isCollection) {
+    const auto optReceivedShardVersion = getOperationReceivedVersion(opCtx, _nss);
+    if (!optReceivedShardVersion) {
+        return boost::none;
+    }
 
     const auto& receivedShardVersion = *optReceivedShardVersion;
     if (ChunkVersion::isIgnoredVersion(receivedShardVersion)) {
-        return;
+        return boost::none;
     }
 
     // An operation with read concern 'available' should never have shardVersion set.
     invariant(repl::ReadConcernArgs::get(opCtx).getLevel() !=
               repl::ReadConcernLevel::kAvailableReadConcern);
 
-    const auto metadata = getCurrentMetadata();
-    const auto wantedShardVersion =
-        metadata->isSharded() ? metadata->getShardVersion() : ChunkVersion::UNSHARDED();
+    auto csrLock = CSRLock::lockShared(opCtx, this);
+
+    auto metadata = _getMetadata(atClusterTime);
+    auto wantedShardVersion = ChunkVersion::UNSHARDED();
+
+    if (MONGO_unlikely(useFCV44CheckShardVersionProtocol.shouldFail())) {
+        LOG(0) << "Received shardVersion: " << receivedShardVersion << " for " << _nss.ns();
+        if (isCollection) {
+            LOG(0) << "Namespace " << _nss.ns() << " is collection, "
+                   << (metadata ? "have shardVersion cached" : "don't know shardVersion");
+            uassert(StaleConfigInfo(_nss, receivedShardVersion, wantedShardVersion),
+                    "don't know shardVersion",
+                    metadata);
+            wantedShardVersion = (*metadata)->getShardVersion();
+        }
+        LOG(0) << "Wanted shardVersion: " << wantedShardVersion << " for " << _nss.ns();
+    } else {
+        if (metadata && (*metadata)->isSharded()) {
+            wantedShardVersion = (*metadata)->getShardVersion();
+        }
+    }
 
     auto criticalSectionSignal = [&] {
-        auto csrLock = CSRLock::lock(opCtx, this);
         return _critSec.getSignal(opCtx->lockState()->isWriteLocked()
                                       ? ShardingMigrationCriticalSection::kWrite
                                       : ShardingMigrationCriticalSection::kRead);
@@ -228,7 +260,7 @@ void CollectionShardingState::checkShardVersionOrThrow(OperationContext* opCtx) 
     }
 
     if (receivedShardVersion.isWriteCompatibleWith(wantedShardVersion)) {
-        return;
+        return metadata;
     }
 
     //

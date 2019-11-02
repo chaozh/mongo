@@ -35,6 +35,7 @@
 #include <memory>
 
 #include "asio/detail/assert.hpp"
+#include "mongo/base/init.h"
 #include "mongo/util/assert_util.h"
 
 namespace asio {
@@ -323,14 +324,38 @@ ssl_want SSLHandshakeManager::doServerHandshake(asio::error_code& ec,
         return ssl_want::want_nothing;
     }
 
+    if (!_sni_set) {
+        DWORD client_hello_size = _pInBuffer->size();
+        DWORD sni_size = client_hello_size + 1;
+        PBYTE sni_ptr = nullptr;
+
+        SECURITY_STATUS status =
+            _sslGetServerIdentityFn(_pInBuffer->data(), client_hello_size, &sni_ptr, &sni_size, 0);
+        if (status != SEC_E_OK) {
+            ec = asio::error_code(status, asio::error::get_ssl_category());
+        } else if (sni_ptr == nullptr) {
+            _sni = boost::none;
+            _sni_set = true;
+        } else {
+            std::vector<BYTE> sni(sni_size);
+            std::memcpy(sni.data(), sni_ptr, sni_size);
+            sni.push_back('\0');
+            _sni = sni;
+            _sni_set = true;
+        }
+    }
+
     // ASC_RET_EXTENDED_ERROR is not support on Windows 7/Windows 2008 R2.
     // ASC_RET_MUTUAL_AUTH is not set since we do our own certificate validation later.
     invariant(attribs == (retAttribs | ASC_RET_EXTENDED_ERROR | ASC_RET_MUTUAL_AUTH));
 
-    if (inputBuffers[1].BufferType == SECBUFFER_EXTRA && inputBuffers[1].pvBuffer != nullptr &&
-        inputBuffers[1].cbBuffer > 0) {
+    if (inputBuffers[1].BufferType == SECBUFFER_EXTRA && inputBuffers[1].cbBuffer > 0) {
+        // SECBUFFER_EXTRA do not set pvBuffer, just cbBuffer.
+        // cbBuffer tells us how much remaining in the buffer is extra
         _pExtraEncryptedBuffer->reset();
-        _pExtraEncryptedBuffer->append(inputBuffers[1].pvBuffer, inputBuffers[1].cbBuffer);
+        _pExtraEncryptedBuffer->append(_pInBuffer->data() +
+                                           (_pInBuffer->size() - inputBuffers[1].cbBuffer),
+                                       inputBuffers[1].cbBuffer);
     }
 
 
@@ -350,12 +375,14 @@ ssl_want SSLHandshakeManager::doServerHandshake(asio::error_code& ec,
     // Reset the input buffer
     _pInBuffer->reset();
 
-    // Check if we have any additional encrypted data
+    // Check if we have any additional data
     if (!_pExtraEncryptedBuffer->empty()) {
         _pInBuffer->swap(*_pExtraEncryptedBuffer);
         _pExtraEncryptedBuffer->reset();
 
-        setState(State::HaveEncryptedData);
+        // When doing the handshake and we have extra data, this means we have an incomplete tls
+        // record and need more bytes to complete the tls record.
+        setState(State::NeedMoreHandshakeData);
     }
 
     if (needOutput) {
@@ -467,10 +494,13 @@ ssl_want SSLHandshakeManager::doClientHandshake(asio::error_code& ec) {
 
     if (_pInBuffer->size()) {
         // Locate (optional) extra buffer
-        if (inputBuffers[1].BufferType == SECBUFFER_EXTRA && inputBuffers[1].pvBuffer != nullptr &&
-            inputBuffers[1].cbBuffer > 0) {
+        if (inputBuffers[1].BufferType == SECBUFFER_EXTRA && inputBuffers[1].cbBuffer > 0) {
+            // SECBUFFER_EXTRA do not set pvBuffer, just cbBuffer
+            // cbBuffer tells us how much remaining in the buffer is extra
             _pExtraEncryptedBuffer->reset();
-            _pExtraEncryptedBuffer->append(inputBuffers[1].pvBuffer, inputBuffers[1].cbBuffer);
+            _pExtraEncryptedBuffer->append(_pInBuffer->data() +
+                                               (_pInBuffer->size() - inputBuffers[1].cbBuffer),
+                                           inputBuffers[1].cbBuffer);
         }
     }
 
@@ -495,7 +525,9 @@ ssl_want SSLHandshakeManager::doClientHandshake(asio::error_code& ec) {
         _pInBuffer->swap(*_pExtraEncryptedBuffer);
         _pExtraEncryptedBuffer->reset();
 
-        setState(State::HaveEncryptedData);
+        // When doing the handshake and we have extra data, this means we have an incomplete tls
+        // record and need more bytes to complete the tls record.
+        setState(State::NeedMoreHandshakeData);
     }
 
     if (needOutput) {
@@ -766,6 +798,16 @@ ssl_want SSLWriteManager::encryptMessage(const void* pMessage,
     bytes_transferred = messageLength;
 
     return ssl_want::want_output;
+}
+
+
+MONGO_INITIALIZER(InitializeSchannelGetServerIdentityFn)(mongo::InitializerContext*) {
+    auto sc = std::move(mongo::SharedLibrary::create("Schannel.dll").getValue());
+
+    SSLHandshakeManager::setSslGetServerIdentityFn(
+        sc->getFunctionAs<SslGetServerIdentityFn>("SslGetServerIdentity").getValue());
+
+    return mongo::Status::OK();
 }
 
 }  // namespace detail

@@ -1,10 +1,8 @@
 """Unit tests for the util/taskname.py script."""
 
-from __future__ import absolute_import
-
 import unittest
 
-from buildscripts.util import taskname as taskname
+from buildscripts.util import taskname
 
 # pylint: disable=missing-docstring,protected-access
 

@@ -33,11 +33,12 @@
 #include <initializer_list>
 #include <memory>
 
-#include "mongo/base/disallow_copying.h"
+#include <fmt/format.h>
+
 #include "mongo/base/error_codes.h"
 #include "mongo/executor/task_executor.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/stdx/condition_variable.h"
-#include "mongo/stdx/mutex.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
@@ -58,20 +59,11 @@ namespace mongo {
  *     - list of error codes, if present in the response, should stop the scheduler.
  */
 class RemoteCommandRetryScheduler {
-    MONGO_DISALLOW_COPYING(RemoteCommandRetryScheduler);
+    RemoteCommandRetryScheduler(const RemoteCommandRetryScheduler&) = delete;
+    RemoteCommandRetryScheduler& operator=(const RemoteCommandRetryScheduler&) = delete;
 
 public:
     class RetryPolicy;
-
-    /**
-     * List of not master error codes.
-     */
-    static const std::initializer_list<ErrorCodes::Error> kNotMasterErrors;
-
-    /**
-     * List of retriable error codes.
-     */
-    static const std::initializer_list<ErrorCodes::Error> kAllRetriableErrors;
 
     /**
      * Generates a retry policy that will send the remote command request to the source at most
@@ -81,15 +73,12 @@ public:
 
     /**
      * Creates a retry policy that will send the remote command request at most "maxAttempts".
-     * This policy will also direct the scheduler to stop retrying if it encounters any of the
-     * errors in "nonRetryableErrors".
      * (Requires SERVER-24067) The scheduler will also stop retrying if the total elapsed time
      * of all failed requests exceeds "maxResponseElapsedTotal".
      */
-    static std::unique_ptr<RetryPolicy> makeRetryPolicy(
-        std::size_t maxAttempts,
-        Milliseconds maxResponseElapsedTotal,
-        const std::initializer_list<ErrorCodes::Error>& retryableErrors);
+    template <ErrorCategory kCategory>
+    static std::unique_ptr<RetryPolicy> makeRetryPolicy(std::size_t maxAttempts,
+                                                        Milliseconds maxResponseElapsedTotal);
 
     /**
      * Creates scheduler but does not schedule any remote command request.
@@ -128,6 +117,10 @@ public:
     std::string toString() const;
 
 private:
+    class NoRetryPolicy;
+    template <ErrorCategory kCategory>
+    class RetryPolicyForCategory;
+
     /**
      * Schedules remote command to be run by the executor.
      * "requestCount" is number of requests scheduled before calling this function.
@@ -157,7 +150,7 @@ private:
     Milliseconds _currentUsedMillis{0};
 
     // Protects member data of this scheduler declared after mutex.
-    mutable stdx::mutex _mutex;
+    mutable Mutex _mutex = MONGO_MAKE_LATCH("RemoteCommandRetryScheduler::_mutex");
 
     mutable stdx::condition_variable _condition;
 
@@ -206,5 +199,70 @@ public:
 
     virtual std::string toString() const = 0;
 };
+
+class RemoteCommandRetryScheduler::NoRetryPolicy final
+    : public RemoteCommandRetryScheduler::RetryPolicy {
+public:
+    std::size_t getMaximumAttempts() const override {
+        return 1U;
+    }
+
+    Milliseconds getMaximumResponseElapsedTotal() const override {
+        return executor::RemoteCommandRequest::kNoTimeout;
+    }
+
+    bool shouldRetryOnError(ErrorCodes::Error error) const override {
+        return false;
+    }
+
+    std::string toString() const override {
+        return R"!({type: "NoRetryPolicy"})!";
+    }
+};
+
+inline auto RemoteCommandRetryScheduler::makeNoRetryPolicy() -> std::unique_ptr<RetryPolicy> {
+    return std::make_unique<NoRetryPolicy>();
+}
+
+template <ErrorCategory kCategory>
+class RemoteCommandRetryScheduler::RetryPolicyForCategory final
+    : public RemoteCommandRetryScheduler::RetryPolicy {
+public:
+    RetryPolicyForCategory(std::size_t maximumAttempts, Milliseconds maximumResponseElapsedTotal)
+        : _maximumAttempts(maximumAttempts),
+          _maximumResponseElapsedTotal(maximumResponseElapsedTotal){};
+
+    std::size_t getMaximumAttempts() const override {
+        return _maximumAttempts;
+    }
+
+    Milliseconds getMaximumResponseElapsedTotal() const override {
+        return _maximumResponseElapsedTotal;
+    }
+
+    bool shouldRetryOnError(ErrorCodes::Error error) const override {
+        return ErrorCodes::isA<kCategory>(error);
+    }
+
+    std::string toString() const override {
+        using namespace fmt::literals;
+        return R"!({{type: "RetryPolicyForCategory",categoryIndex: {}, maxAttempts: {}, maxTimeMS: {}}})!"_format(
+            static_cast<std::underlying_type_t<ErrorCategory>>(kCategory),
+            _maximumAttempts,
+            _maximumResponseElapsedTotal.count());
+    }
+
+private:
+    std::size_t _maximumAttempts;
+    Milliseconds _maximumResponseElapsedTotal;
+};
+
+template <ErrorCategory kCategory>
+auto RemoteCommandRetryScheduler::makeRetryPolicy(std::size_t maxAttempts,
+                                                  Milliseconds maxResponseElapsedTotal)
+    -> std::unique_ptr<RetryPolicy> {
+    return std::make_unique<RetryPolicyForCategory<kCategory>>(maxAttempts,
+                                                               maxResponseElapsedTotal);
+}
 
 }  // namespace mongo

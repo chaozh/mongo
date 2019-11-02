@@ -34,12 +34,11 @@
 #include <string>
 #include <type_traits>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/base/static_assert.h"
 #include "mongo/base/status.h"
 #include "mongo/executor/task_executor.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/stdx/condition_variable.h"
-#include "mongo/stdx/mutex.h"
 
 namespace mongo {
 namespace repl {
@@ -53,7 +52,8 @@ namespace repl {
  * _getMutex()).
  */
 class AbstractAsyncComponent {
-    MONGO_DISALLOW_COPYING(AbstractAsyncComponent);
+    AbstractAsyncComponent(const AbstractAsyncComponent&) = delete;
+    AbstractAsyncComponent& operator=(const AbstractAsyncComponent&) = delete;
 
 public:
     AbstractAsyncComponent(executor::TaskExecutor* executor, const std::string& componentName);
@@ -207,7 +207,7 @@ private:
     /**
      * Returns mutex to guard this component's state variable.
      */
-    virtual stdx::mutex* _getMutex() noexcept = 0;
+    virtual Mutex* _getMutex() noexcept = 0;
 
 private:
     // All member variables are labeled with one of the following codes indicating the
@@ -247,8 +247,7 @@ Status AbstractAsyncComponent::_startupComponent_inlock(std::unique_ptr<T>& comp
         component.reset();
         return Status(ErrorCodes::CallbackCanceled,
                       str::stream() << "failed to start up " << componentToStartUp << ": "
-                                    << _componentName
-                                    << " is shutting down");
+                                    << _componentName << " is shutting down");
     }
 
     auto status = component->startup();
@@ -260,7 +259,7 @@ Status AbstractAsyncComponent::_startupComponent_inlock(std::unique_ptr<T>& comp
 
 template <typename T>
 Status AbstractAsyncComponent::_startupComponent(std::unique_ptr<T>& component) {
-    stdx::lock_guard<stdx::mutex> lock(*_getMutex());
+    stdx::lock_guard<Latch> lock(*_getMutex());
     return _startupComponent_inlock(component);
 }
 
@@ -276,7 +275,7 @@ void AbstractAsyncComponent::_shutdownComponent_inlock(const std::unique_ptr<T>&
 
 template <typename T>
 void AbstractAsyncComponent::_shutdownComponent(const std::unique_ptr<T>& component) {
-    stdx::lock_guard<stdx::mutex> lock(*_getMutex());
+    stdx::lock_guard<Latch> lock(*_getMutex());
     _shutdownComponent_inlock(component);
 }
 

@@ -32,13 +32,13 @@
 #include "mongo/platform/basic.h"
 
 #include <initializer_list>
+#include <memory>
 #include <utility>
 
-#include "mongo/db/catalog/collection_catalog_entry.h"
+#include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/catalog/drop_indexes.h"
 #include "mongo/db/catalog/index_catalog.h"
-#include "mongo/db/catalog/uuid_catalog.h"
 #include "mongo/db/client.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/db_raii.h"
@@ -56,7 +56,7 @@
 #include "mongo/db/repl/rollback_test_fixture.h"
 #include "mongo/db/repl/rs_rollback.h"
 #include "mongo/db/s/shard_identity_rollback_notifier.h"
-#include "mongo/stdx/memory.h"
+#include "mongo/db/storage/durable_catalog.h"
 #include "mongo/unittest/death_test.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/net/hostandport.h"
@@ -82,20 +82,15 @@ OplogInterfaceMock::Operation makeDropIndexOplogEntry(Collection* collection,
                                                       std::string indexName,
                                                       int time) {
     auto indexSpec =
-        BSON("ns" << collection->ns().ns() << "key" << key << "name" << indexName << "v"
-                  << static_cast<int>(kIndexVersion));
+        BSON("key" << key << "name" << indexName << "v" << static_cast<int>(kIndexVersion));
 
     return std::make_pair(
         BSON("ts" << Timestamp(Seconds(time), 0) << "op"
                   << "c"
-                  << "ui"
-                  << collection->uuid().get()
-                  << "ns"
+                  << "ui" << collection->uuid() << "ns"
                   << "test.$cmd"
-                  << "o"
-                  << BSON("dropIndexes" << collection->ns().coll() << "index" << indexName)
-                  << "o2"
-                  << indexSpec),
+                  << "o" << BSON("dropIndexes" << collection->ns().coll() << "index" << indexName)
+                  << "o2" << indexSpec << "wall" << Date_t()),
         RecordId(time));
 }
 
@@ -104,21 +99,15 @@ OplogInterfaceMock::Operation makeCreateIndexOplogEntry(Collection* collection,
                                                         std::string indexName,
                                                         int time) {
     auto indexSpec =
-        BSON("createIndexes" << collection->ns().coll() << "ns" << collection->ns().ns() << "v"
-                             << static_cast<int>(kIndexVersion)
-                             << "key"
-                             << key
-                             << "name"
-                             << indexName);
+        BSON("createIndexes" << collection->ns().coll() << "v" << static_cast<int>(kIndexVersion)
+                             << "key" << key << "name" << indexName);
 
     return std::make_pair(BSON("ts" << Timestamp(Seconds(time), 0) << "op"
                                     << "c"
                                     << "ns"
                                     << "test.$cmd"
-                                    << "ui"
-                                    << collection->uuid().get()
-                                    << "o"
-                                    << indexSpec),
+                                    << "ui" << collection->uuid() << "o" << indexSpec << "wall"
+                                    << Date_t()),
                           RecordId(time));
 }
 
@@ -140,12 +129,8 @@ OplogInterfaceMock::Operation makeRenameCollectionOplogEntry(const NamespaceStri
     }
     return std::make_pair(BSON("ts" << opTime.getTimestamp() << "t" << opTime.getTerm() << "op"
                                     << "c"
-                                    << "ui"
-                                    << collectionUUID
-                                    << "ns"
-                                    << renameFrom.ns()
-                                    << "o"
-                                    << obj),
+                                    << "ui" << collectionUUID << "ns" << renameFrom.ns() << "o"
+                                    << obj << "wall" << Date_t()),
                           RecordId(opTime.getTimestamp().getSecs()));
 }
 
@@ -153,12 +138,9 @@ BSONObj makeOp(long long seconds) {
     auto uuid = unittest::assertGet(UUID::parse("f005ba11-cafe-bead-f00d-123456789abc"));
     return BSON("ts" << Timestamp(seconds, seconds) << "t" << seconds << "op"
                      << "n"
-                     << "o"
-                     << BSONObj()
-                     << "ns"
+                     << "o" << BSONObj() << "ns"
                      << "rs_rollback.test"
-                     << "ui"
-                     << uuid);
+                     << "ui" << uuid << "wall" << Date_t());
 }
 
 int recordId = 0;
@@ -187,7 +169,7 @@ TEST_F(RSRollbackTest, InconsistentMinValid) {
                                                               OpTime(Timestamp(Seconds(1), 0), 0));
     auto status = syncRollback(_opCtx.get(),
                                OplogInterfaceMock(),
-                               RollbackSourceMock(stdx::make_unique<OplogInterfaceMock>()),
+                               RollbackSourceMock(std::make_unique<OplogInterfaceMock>()),
                                {},
                                _coordinator,
                                _replicationProcess.get());
@@ -199,7 +181,7 @@ TEST_F(RSRollbackTest, OplogStartMissing) {
     OpTime ts(Timestamp(Seconds(1), 0), 0);
     auto operation = std::make_pair(BSON("ts" << ts.getTimestamp()), RecordId());
     OplogInterfaceMock::Operations remoteOperations({operation});
-    auto remoteOplog = stdx::make_unique<OplogInterfaceMock>(remoteOperations);
+    auto remoteOplog = std::make_unique<OplogInterfaceMock>(remoteOperations);
     ASSERT_EQUALS(ErrorCodes::OplogStartMissing,
                   syncRollback(_opCtx.get(),
                                OplogInterfaceMock(),
@@ -215,7 +197,7 @@ TEST_F(RSRollbackTest, NoRemoteOpLog) {
     auto operation = std::make_pair(BSON("ts" << ts.getTimestamp()), RecordId());
     auto status = syncRollback(_opCtx.get(),
                                OplogInterfaceMock({operation}),
-                               RollbackSourceMock(stdx::make_unique<OplogInterfaceMock>()),
+                               RollbackSourceMock(std::make_unique<OplogInterfaceMock>()),
                                {},
                                _coordinator,
                                _replicationProcess.get());
@@ -236,7 +218,7 @@ TEST_F(RSRollbackTest, RemoteGetRollbackIdThrows) {
     };
     ASSERT_THROWS_CODE(syncRollback(_opCtx.get(),
                                     OplogInterfaceMock({operation}),
-                                    RollbackSourceLocal(stdx::make_unique<OplogInterfaceMock>()),
+                                    RollbackSourceLocal(std::make_unique<OplogInterfaceMock>()),
                                     {},
                                     _coordinator,
                                     _replicationProcess.get()),
@@ -258,7 +240,7 @@ TEST_F(RSRollbackTest, RemoteGetRollbackIdDiffersFromRequiredRBID) {
 
     ASSERT_THROWS_CODE(syncRollback(_opCtx.get(),
                                     OplogInterfaceMock({operation}),
-                                    RollbackSourceLocal(stdx::make_unique<OplogInterfaceMock>()),
+                                    RollbackSourceLocal(std::make_unique<OplogInterfaceMock>()),
                                     1,
                                     _coordinator,
                                     _replicationProcess.get()),
@@ -292,15 +274,13 @@ int _testRollbackDelete(OperationContext* opCtx,
                         const BSONObj& documentAtSource,
                         const bool collectionAtSourceExists = true) {
     auto commonOperation = makeOpAndRecordId(1);
-    auto deleteOperation = std::make_pair(BSON("ts" << Timestamp(Seconds(2), 0) << "op"
-                                                    << "d"
-                                                    << "ui"
-                                                    << uuid
-                                                    << "ns"
-                                                    << "test.t"
-                                                    << "o"
-                                                    << BSON("_id" << 0)),
-                                          RecordId(2));
+    auto deleteOperation =
+        std::make_pair(BSON("ts" << Timestamp(Seconds(2), 0) << "op"
+                                 << "d"
+                                 << "ui" << uuid << "ns"
+                                 << "test.t"
+                                 << "o" << BSON("_id" << 0) << "wall" << Date_t()),
+                       RecordId(2));
     class RollbackSourceLocal : public RollbackSourceMock {
     public:
         RollbackSourceLocal(const BSONObj& documentAtSource,
@@ -341,11 +321,12 @@ int _testRollbackDelete(OperationContext* opCtx,
     ASSERT_TRUE(rollbackSource.called);
 
     Lock::DBLock dbLock(opCtx, "test", MODE_S);
-    Lock::CollectionLock collLock(opCtx->lockState(), "test.t", MODE_S);
+    Lock::CollectionLock collLock(opCtx, NamespaceString("test.t"), MODE_S);
     auto databaseHolder = DatabaseHolder::get(opCtx);
     auto db = databaseHolder->getDb(opCtx, "test");
     ASSERT_TRUE(db);
-    auto collection = db->getCollection(opCtx, "test.t");
+    auto collection =
+        CollectionCatalog::get(opCtx).lookupCollectionByNamespace(NamespaceString("test.t"));
     if (!collection) {
         return -1;
     }
@@ -385,11 +366,11 @@ TEST_F(RSRollbackTest, RollbackDeleteNoDocumentAtSourceCollectionExistsNonCapped
     options.uuid = UUID::gen();
     auto coll = _createCollection(_opCtx.get(), "test.t", options);
     _testRollbackDelete(
-        _opCtx.get(), _coordinator, _replicationProcess.get(), coll->uuid().get(), BSONObj());
+        _opCtx.get(), _coordinator, _replicationProcess.get(), coll->uuid(), BSONObj());
     ASSERT_EQUALS(
         0,
         _testRollbackDelete(
-            _opCtx.get(), _coordinator, _replicationProcess.get(), coll->uuid().get(), BSONObj()));
+            _opCtx.get(), _coordinator, _replicationProcess.get(), coll->uuid(), BSONObj()));
 }
 
 TEST_F(RSRollbackTest, RollbackDeleteNoDocumentAtSourceCollectionExistsCapped) {
@@ -401,7 +382,7 @@ TEST_F(RSRollbackTest, RollbackDeleteNoDocumentAtSourceCollectionExistsCapped) {
     ASSERT_EQUALS(
         0,
         _testRollbackDelete(
-            _opCtx.get(), _coordinator, _replicationProcess.get(), coll->uuid().get(), BSONObj()));
+            _opCtx.get(), _coordinator, _replicationProcess.get(), coll->uuid(), BSONObj()));
 }
 
 TEST_F(RSRollbackTest, RollbackDeleteRestoreDocument) {
@@ -410,26 +391,22 @@ TEST_F(RSRollbackTest, RollbackDeleteRestoreDocument) {
     options.uuid = UUID::gen();
     auto coll = _createCollection(_opCtx.get(), "test.t", options);
     BSONObj doc = BSON("_id" << 0 << "a" << 1);
-    _testRollbackDelete(
-        _opCtx.get(), _coordinator, _replicationProcess.get(), coll->uuid().get(), doc);
-    ASSERT_EQUALS(
-        1,
-        _testRollbackDelete(
-            _opCtx.get(), _coordinator, _replicationProcess.get(), coll->uuid().get(), doc));
+    _testRollbackDelete(_opCtx.get(), _coordinator, _replicationProcess.get(), coll->uuid(), doc);
+    ASSERT_EQUALS(1,
+                  _testRollbackDelete(
+                      _opCtx.get(), _coordinator, _replicationProcess.get(), coll->uuid(), doc));
 }
 
 TEST_F(RSRollbackTest, RollbackInsertDocumentWithNoId) {
     createOplog(_opCtx.get());
     auto commonOperation = makeOpAndRecordId(1);
-    auto insertDocumentOperation = std::make_pair(BSON("ts" << Timestamp(Seconds(2), 0) << "op"
-                                                            << "i"
-                                                            << "ui"
-                                                            << UUID::gen()
-                                                            << "ns"
-                                                            << "test.t"
-                                                            << "o"
-                                                            << BSON("a" << 1)),
-                                                  RecordId(2));
+    auto insertDocumentOperation =
+        std::make_pair(BSON("ts" << Timestamp(Seconds(2), 0) << "op"
+                                 << "i"
+                                 << "ui" << UUID::gen() << "ns"
+                                 << "test.t"
+                                 << "wall" << Date_t() << "o" << BSON("a" << 1)),
+                       RecordId(2));
     class RollbackSourceLocal : public RollbackSourceMock {
     public:
         RollbackSourceLocal(std::unique_ptr<OplogInterface> oplog)
@@ -466,10 +443,9 @@ TEST_F(RSRollbackTest, RollbackCreateIndexCommand) {
     options.uuid = UUID::gen();
     NamespaceString nss("test", "coll");
     auto collection = _createCollection(_opCtx.get(), nss.toString(), options);
-    auto indexSpec = BSON("ns" << nss.toString() << "v" << static_cast<int>(kIndexVersion) << "key"
-                               << BSON("a" << 1)
-                               << "name"
-                               << "a_1");
+    auto indexSpec =
+        BSON("v" << static_cast<int>(kIndexVersion) << "key" << BSON("a" << 1) << "name"
+                 << "a_1");
 
     int numIndexes = _createIndexOnEmptyCollection(_opCtx.get(), collection, nss, indexSpec);
     ASSERT_EQUALS(2, numIndexes);
@@ -492,13 +468,11 @@ TEST_F(RSRollbackTest, RollbackCreateIndexCommand) {
         _coordinator,
         _replicationProcess.get()));
     stopCapturingLogMessages();
-    ASSERT_EQUALS(1,
-                  countLogLinesContaining(str::stream()
-                                          << "Dropped index in rollback for collection: "
-                                          << nss.toString()
-                                          << ", UUID: "
-                                          << options.uuid->toString()
-                                          << ", index: a_1"));
+    ASSERT_EQUALS(
+        1,
+        countLogLinesContaining(str::stream()
+                                << "Dropped index in rollback for collection: " << nss.toString()
+                                << ", UUID: " << options.uuid->toString() << ", index: a_1"));
     {
         Lock::DBLock dbLock(_opCtx.get(), nss.db(), MODE_S);
         auto indexCatalog = collection->getIndexCatalog();
@@ -512,12 +486,8 @@ TEST_F(RSRollbackTest, RollbackCreateIndexCommandIndexNotInCatalog) {
     CollectionOptions options;
     options.uuid = UUID::gen();
     auto collection = _createCollection(_opCtx.get(), "test.t", options);
-    auto indexSpec = BSON("ns"
-                          << "test.t"
-                          << "key"
-                          << BSON("a" << 1)
-                          << "name"
-                          << "a_1");
+    auto indexSpec = BSON("key" << BSON("a" << 1) << "name"
+                                << "a_1");
     // Skip index creation to trigger warning during rollback.
     {
         Lock::DBLock dbLock(_opCtx.get(), "test", MODE_S);
@@ -664,10 +634,8 @@ TEST_F(RSRollbackTest, RollingBackCreateIndexAndRenameWithLongName) {
     auto collection = _createCollection(_opCtx.get(), nss.toString(), options);
 
     auto longName = std::string(115, 'a');
-    auto indexSpec = BSON("ns" << nss.toString() << "v" << static_cast<int>(kIndexVersion) << "key"
-                               << BSON("b" << 1)
-                               << "name"
-                               << longName);
+    auto indexSpec = BSON("v" << static_cast<int>(kIndexVersion) << "key" << BSON("b" << 1)
+                              << "name" << longName);
 
     int numIndexes = _createIndexOnEmptyCollection(_opCtx.get(), collection, nss, indexSpec);
     ASSERT_EQUALS(2, numIndexes);
@@ -680,13 +648,8 @@ TEST_F(RSRollbackTest, RollingBackCreateIndexAndRenameWithLongName) {
     // The old collection name plus the index name is not too long, but the new collection name
     // plus the index name is too long.
     auto newName = NamespaceString("test", "collcollcollcollcoll");
-    auto renameCollectionOperation =
-        makeRenameCollectionOplogEntry(newName,
-                                       nss,
-                                       collection->uuid().get(),
-                                       boost::none,
-                                       false,
-                                       OpTime(Timestamp(Seconds(2), 0), 1));
+    auto renameCollectionOperation = makeRenameCollectionOplogEntry(
+        newName, nss, collection->uuid(), boost::none, false, OpTime(Timestamp(Seconds(2), 0), 1));
 
     RollbackSourceMock rollbackSource(std::unique_ptr<OplogInterface>(new OplogInterfaceMock({
         commonOperation,
@@ -719,10 +682,9 @@ TEST_F(RSRollbackTest, RollingBackDropAndCreateOfSameIndexNameWithDifferentSpecs
     NamespaceString nss("test", "coll");
     auto collection = _createCollection(_opCtx.get(), nss.toString(), options);
 
-    auto indexSpec = BSON("ns" << nss.toString() << "v" << static_cast<int>(kIndexVersion) << "key"
-                               << BSON("b" << 1)
-                               << "name"
-                               << "a_1");
+    auto indexSpec =
+        BSON("v" << static_cast<int>(kIndexVersion) << "key" << BSON("b" << 1) << "name"
+                 << "a_1");
 
     int numIndexes = _createIndexOnEmptyCollection(_opCtx.get(), collection, nss, indexSpec);
     ASSERT_EQUALS(2, numIndexes);
@@ -752,19 +714,15 @@ TEST_F(RSRollbackTest, RollingBackDropAndCreateOfSameIndexNameWithDifferentSpecs
         ASSERT(indexCatalog);
         ASSERT_EQUALS(2, indexCatalog->numIndexesReady(_opCtx.get()));
         ASSERT_EQUALS(1,
-                      countLogLinesContaining(str::stream()
-                                              << "Dropped index in rollback for collection: "
-                                              << nss.toString()
-                                              << ", UUID: "
-                                              << options.uuid->toString()
-                                              << ", index: a_1"));
+                      countLogLinesContaining(
+                          str::stream()
+                          << "Dropped index in rollback for collection: " << nss.toString()
+                          << ", UUID: " << options.uuid->toString() << ", index: a_1"));
         ASSERT_EQUALS(1,
-                      countLogLinesContaining(str::stream()
-                                              << "Created index in rollback for collection: "
-                                              << nss.toString()
-                                              << ", UUID: "
-                                              << options.uuid->toString()
-                                              << ", index: a_1"));
+                      countLogLinesContaining(
+                          str::stream()
+                          << "Created index in rollback for collection: " << nss.toString()
+                          << ", UUID: " << options.uuid->toString() << ", index: a_1"));
         std::vector<const IndexDescriptor*> indexes;
         indexCatalog->findIndexesByKeyPattern(_opCtx.get(), BSON("a" << 1), false, &indexes);
         ASSERT(indexes.size() == 1);
@@ -786,19 +744,15 @@ TEST_F(RSRollbackTest, RollbackCreateIndexCommandMissingIndexName) {
                            << "t"
                            << "ns"
                            << "test.t"
-                           << "v"
-                           << static_cast<int>(kIndexVersion)
-                           << "key"
+                           << "wall" << Date_t() << "v" << static_cast<int>(kIndexVersion) << "key"
                            << BSON("a" << 1));
 
     auto createIndexOperation = std::make_pair(BSON("ts" << Timestamp(Seconds(2), 0) << "op"
                                                          << "c"
                                                          << "ns"
                                                          << "test.$cmd"
-                                                         << "ui"
-                                                         << collection->uuid().get()
-                                                         << "o"
-                                                         << command),
+                                                         << "wall" << Date_t() << "ui"
+                                                         << collection->uuid() << "o" << command),
                                                RecordId(2));
     RollbackSourceMock rollbackSource(std::unique_ptr<OplogInterface>(new OplogInterfaceMock({
         commonOperation,
@@ -828,10 +782,8 @@ std::string idxName(std::string id) {
 
 // Create an index spec object given the namespace and the index 'id'.
 BSONObj idxSpec(NamespaceString nss, std::string id) {
-    return BSON("ns" << nss.toString() << "v" << static_cast<int>(kIndexVersion) << "key"
-                     << BSON(idxKey(id) << 1)
-                     << "name"
-                     << idxName(id));
+    return BSON("v" << static_cast<int>(kIndexVersion) << "key" << BSON(idxKey(id) << 1) << "name"
+                    << idxName(id));
 }
 
 // Returns the number of indexes that exist on the given collection.
@@ -865,7 +817,7 @@ TEST_F(RSRollbackTest, RollbackDropIndexOnCollectionWithTwoExistingIndexes) {
     auto localOplog = {dropIndex0Op, createIndex1Op, createIndex0Op, commonOp};
 
     // Set up the mock rollback source and then run rollback.
-    RollbackSourceMock rollbackSource(stdx::make_unique<OplogInterfaceMock>(remoteOplog));
+    RollbackSourceMock rollbackSource(std::make_unique<OplogInterfaceMock>(remoteOplog));
     ASSERT_OK(syncRollback(_opCtx.get(),
                            OplogInterfaceMock(localOplog),
                            rollbackSource,
@@ -896,7 +848,7 @@ TEST_F(RSRollbackTest, RollbackTwoIndexDropsPrecededByTwoIndexCreationsOnSameCol
     auto localOplog = {dropIndex1Op, dropIndex0Op, createIndex1Op, createIndex0Op, commonOp};
 
     // Set up the mock rollback source and then run rollback.
-    RollbackSourceMock rollbackSource(stdx::make_unique<OplogInterfaceMock>(remoteOplog));
+    RollbackSourceMock rollbackSource(std::make_unique<OplogInterfaceMock>(remoteOplog));
     ASSERT_OK(syncRollback(_opCtx.get(),
                            OplogInterfaceMock(localOplog),
                            rollbackSource,
@@ -932,7 +884,7 @@ TEST_F(RSRollbackTest, RollbackMultipleCreateIndexesOnSameCollection) {
     auto localOplog = {createIndex2Op, createIndex1Op, createIndex0Op, commonOp};
 
     // Set up the mock rollback source and then run rollback.
-    RollbackSourceMock rollbackSource(stdx::make_unique<OplogInterfaceMock>(remoteOplog));
+    RollbackSourceMock rollbackSource(std::make_unique<OplogInterfaceMock>(remoteOplog));
     ASSERT_OK(syncRollback(_opCtx.get(),
                            OplogInterfaceMock(localOplog),
                            rollbackSource,
@@ -953,10 +905,8 @@ TEST_F(RSRollbackTest, RollbackCreateDropRecreateIndexOnCollection) {
 
     // Create the necessary indexes. Index 0 is created, dropped, and created again in the
     // sequence of ops, so we create that index.
-    auto indexSpec = BSON("ns" << nss.toString() << "v" << static_cast<int>(kIndexVersion) << "key"
-                               << BSON(idxKey("0") << 1)
-                               << "name"
-                               << idxName("0"));
+    auto indexSpec = BSON("v" << static_cast<int>(kIndexVersion) << "key" << BSON(idxKey("0") << 1)
+                              << "name" << idxName("0"));
 
     int numIndexes = _createIndexOnEmptyCollection(_opCtx.get(), coll, nss, indexSpec);
     ASSERT_EQUALS(2, numIndexes);
@@ -973,7 +923,7 @@ TEST_F(RSRollbackTest, RollbackCreateDropRecreateIndexOnCollection) {
     auto localOplog = {createIndex0AgainOp, dropIndex0Op, createIndex0Op, commonOp};
 
     // Set up the mock rollback source and then run rollback.
-    RollbackSourceMock rollbackSource(stdx::make_unique<OplogInterfaceMock>(remoteOplog));
+    RollbackSourceMock rollbackSource(std::make_unique<OplogInterfaceMock>(remoteOplog));
     ASSERT_OK(syncRollback(_opCtx.get(),
                            OplogInterfaceMock(localOplog),
                            rollbackSource,
@@ -991,11 +941,9 @@ TEST_F(RSRollbackTest, RollbackUnknownCommand) {
     auto commonOperation = makeOpAndRecordId(1);
     auto unknownCommandOperation = std::make_pair(BSON("ts" << Timestamp(Seconds(2), 0) << "op"
                                                             << "c"
-                                                            << "ui"
-                                                            << UUID::gen()
-                                                            << "ns"
+                                                            << "ui" << UUID::gen() << "ns"
                                                             << "test.t"
-                                                            << "o"
+                                                            << "wall" << Date_t() << "o"
                                                             << BSON("convertToCapped"
                                                                     << "t")),
                                                   RecordId(2));
@@ -1021,17 +969,15 @@ TEST_F(RSRollbackTest, RollbackDropCollectionCommand) {
     CollectionOptions options;
     options.uuid = UUID::gen();
     auto coll = _createCollection(_opCtx.get(), dpns, options);
-    _dropPendingCollectionReaper->addDropPendingNamespace(dropTime, dpns);
+    _dropPendingCollectionReaper->addDropPendingNamespace(_opCtx.get(), dropTime, dpns);
 
     auto commonOperation = makeOpAndRecordId(1);
     auto dropCollectionOperation =
         std::make_pair(BSON("ts" << dropTime.getTimestamp() << "t" << dropTime.getTerm() << "op"
                                  << "c"
-                                 << "ui"
-                                 << coll->uuid().get()
-                                 << "ns"
+                                 << "ui" << coll->uuid() << "ns"
                                  << "test.t"
-                                 << "o"
+                                 << "wall" << Date_t() << "o"
                                  << BSON("drop"
                                          << "t")),
                        RecordId(2));
@@ -1075,7 +1021,7 @@ TEST_F(RSRollbackTest, RollbackRenameCollectionInSameDatabaseCommand) {
     CollectionOptions options;
     options.uuid = UUID::gen();
     auto collection = _createCollection(_opCtx.get(), "test.y", options);
-    UUID collectionUUID = collection->uuid().get();
+    UUID collectionUUID = collection->uuid();
 
     OpTime renameTime = OpTime(Timestamp(2, 0), 5);
 
@@ -1114,7 +1060,8 @@ TEST_F(RSRollbackTest, RollbackRenameCollectionInSameDatabaseCommand) {
 
         // Remote collection options should have been empty.
         auto collAfterRollbackOptions =
-            oldCollName.getCollection()->getCatalogEntry()->getCollectionOptions(_opCtx.get());
+            DurableCatalog::get(_opCtx.get())
+                ->getCollectionOptions(_opCtx.get(), oldCollName.getCollection()->ns());
         ASSERT_BSONOBJ_EQ(BSON("uuid" << *options.uuid), collAfterRollbackOptions.toBSON());
     }
 }
@@ -1132,7 +1079,7 @@ TEST_F(RSRollbackTest,
 
     // Create the collection and save its UUID.
     auto collection = _createCollection(_opCtx.get(), renameToNss, options);
-    auto collectionUUID = collection->uuid().get();
+    auto collectionUUID = collection->uuid();
 
     class RollbackSourceLocal : public RollbackSourceMock {
     public:
@@ -1169,9 +1116,8 @@ TEST_F(RSRollbackTest,
     ASSERT_TRUE(rollbackSource.getCollectionInfoCalled);
 
     AutoGetCollectionForReadCommand autoColl(_opCtx.get(), NamespaceString(renameFromNss));
-    auto collAfterRollback = autoColl.getCollection();
     auto collAfterRollbackOptions =
-        collAfterRollback->getCatalogEntry()->getCollectionOptions(_opCtx.get());
+        DurableCatalog::get(_opCtx.get())->getCollectionOptions(_opCtx.get(), renameFromNss);
     ASSERT_TRUE(collAfterRollbackOptions.temp);
     ASSERT_BSONOBJ_EQ(BSON("uuid" << *options.uuid << "temp" << true),
                       collAfterRollbackOptions.toBSON());
@@ -1185,13 +1131,13 @@ TEST_F(RSRollbackTest, RollbackRenameCollectionInDatabaseWithDropTargetTrueComma
     CollectionOptions droppedCollOptions;
     droppedCollOptions.uuid = UUID::gen();
     auto droppedColl = _createCollection(_opCtx.get(), dpns, droppedCollOptions);
-    _dropPendingCollectionReaper->addDropPendingNamespace(dropTime, dpns);
-    auto droppedCollectionUUID = droppedColl->uuid().get();
+    _dropPendingCollectionReaper->addDropPendingNamespace(_opCtx.get(), dropTime, dpns);
+    auto droppedCollectionUUID = droppedColl->uuid();
 
     CollectionOptions renamedCollOptions;
     renamedCollOptions.uuid = UUID::gen();
     auto renamedCollection = _createCollection(_opCtx.get(), "test.y", renamedCollOptions);
-    auto renamedCollectionUUID = renamedCollection->uuid().get();
+    auto renamedCollectionUUID = renamedCollection->uuid();
 
     auto commonOperation = makeOpAndRecordId(1);
     auto renameCollectionOperation = makeRenameCollectionOplogEntry(NamespaceString("test.x"),
@@ -1227,11 +1173,11 @@ TEST_F(RSRollbackTest, RollbackRenameCollectionInDatabaseWithDropTargetTrueComma
 
         AutoGetCollectionForReadCommand renamedColl(_opCtx.get(), NamespaceString("test.x"));
         ASSERT_TRUE(renamedColl.getCollection());
-        ASSERT_EQUALS(renamedColl.getCollection()->uuid().get(), renamedCollectionUUID);
+        ASSERT_EQUALS(renamedColl.getCollection()->uuid(), renamedCollectionUUID);
 
         AutoGetCollectionForReadCommand droppedColl(_opCtx.get(), NamespaceString("test.y"));
         ASSERT_TRUE(droppedColl.getCollection());
-        ASSERT_EQUALS(droppedColl.getCollection()->uuid().get(), droppedCollectionUUID);
+        ASSERT_EQUALS(droppedColl.getCollection()->uuid(), droppedCollectionUUID);
     }
 }
 
@@ -1244,10 +1190,10 @@ void _testRollbackRenamingCollectionsToEachOther(OperationContext* opCtx,
     createOplog(opCtx);
 
     auto collection1 = RollbackTest::_createCollection(opCtx, "test.y", coll1Options);
-    auto collection1UUID = collection1->uuid().get();
+    auto collection1UUID = collection1->uuid();
 
     auto collection2 = RollbackTest::_createCollection(opCtx, "test.x", coll2Options);
-    auto collection2UUID = collection2->uuid().get();
+    auto collection2UUID = collection2->uuid();
 
     ASSERT_NOT_EQUALS(collection1UUID, collection2UUID);
 
@@ -1291,11 +1237,11 @@ void _testRollbackRenamingCollectionsToEachOther(OperationContext* opCtx,
 
         AutoGetCollectionForReadCommand coll1(opCtx, NamespaceString("test.x"));
         ASSERT_TRUE(coll1.getCollection());
-        ASSERT_EQUALS(coll1.getCollection()->uuid().get(), collection1UUID);
+        ASSERT_EQUALS(coll1.getCollection()->uuid(), collection1UUID);
 
         AutoGetCollectionForReadCommand coll2(opCtx, NamespaceString("test.y"));
         ASSERT_TRUE(coll2.getCollection());
-        ASSERT_EQUALS(coll2.getCollection()->uuid().get(), collection2UUID);
+        ASSERT_EQUALS(coll2.getCollection()->uuid(), collection2UUID);
     }
 }
 
@@ -1336,26 +1282,24 @@ TEST_F(RSRollbackTest, RollbackDropCollectionThenRenameCollectionToDroppedCollec
     CollectionOptions renamedCollOptions;
     renamedCollOptions.uuid = UUID::gen();
     auto renamedCollection = _createCollection(_opCtx.get(), "test.x", renamedCollOptions);
-    auto renamedCollectionUUID = renamedCollection->uuid().get();
+    auto renamedCollectionUUID = renamedCollection->uuid();
 
     OpTime dropTime = OpTime(Timestamp(2, 0), 5);
     auto dpns = NamespaceString("test.x").makeDropPendingNamespace(dropTime);
     CollectionOptions droppedCollOptions;
     droppedCollOptions.uuid = UUID::gen();
     auto droppedCollection = _createCollection(_opCtx.get(), dpns, droppedCollOptions);
-    auto droppedCollectionUUID = droppedCollection->uuid().get();
-    _dropPendingCollectionReaper->addDropPendingNamespace(dropTime, dpns);
+    auto droppedCollectionUUID = droppedCollection->uuid();
+    _dropPendingCollectionReaper->addDropPendingNamespace(_opCtx.get(), dropTime, dpns);
 
     auto commonOperation = makeOpAndRecordId(1);
 
     auto dropCollectionOperation =
         std::make_pair(BSON("ts" << dropTime.getTimestamp() << "t" << dropTime.getTerm() << "op"
                                  << "c"
-                                 << "ui"
-                                 << droppedCollectionUUID
-                                 << "ns"
+                                 << "ui" << droppedCollectionUUID << "ns"
                                  << "test.x"
-                                 << "o"
+                                 << "wall" << Date_t() << "o"
                                  << BSON("drop"
                                          << "x")),
                        RecordId(2));
@@ -1393,11 +1337,11 @@ TEST_F(RSRollbackTest, RollbackDropCollectionThenRenameCollectionToDroppedCollec
 
         AutoGetCollectionForReadCommand autoCollX(_opCtx.get(), NamespaceString("test.x"));
         ASSERT_TRUE(autoCollX.getCollection());
-        ASSERT_EQUALS(autoCollX.getCollection()->uuid().get(), droppedCollectionUUID);
+        ASSERT_EQUALS(autoCollX.getCollection()->uuid(), droppedCollectionUUID);
 
         AutoGetCollectionForReadCommand autoCollY(_opCtx.get(), NamespaceString("test.y"));
         ASSERT_TRUE(autoCollY.getCollection());
-        ASSERT_EQUALS(autoCollY.getCollection()->uuid().get(), renamedCollectionUUID);
+        ASSERT_EQUALS(autoCollY.getCollection()->uuid(), renamedCollectionUUID);
     }
 }
 
@@ -1407,12 +1351,12 @@ TEST_F(RSRollbackTest, RollbackRenameCollectionThenCreateNewCollectionWithOldNam
     CollectionOptions renamedCollOptions;
     renamedCollOptions.uuid = UUID::gen();
     auto renamedCollection = _createCollection(_opCtx.get(), "test.y", renamedCollOptions);
-    auto renamedCollectionUUID = renamedCollection->uuid().get();
+    auto renamedCollectionUUID = renamedCollection->uuid();
 
     CollectionOptions createdCollOptions;
     createdCollOptions.uuid = UUID::gen();
     auto createdCollection = _createCollection(_opCtx.get(), "test.x", createdCollOptions);
-    auto createdCollectionUUID = createdCollection->uuid().get();
+    auto createdCollectionUUID = createdCollection->uuid();
 
     auto commonOperation = makeOpAndRecordId(1);
 
@@ -1423,16 +1367,15 @@ TEST_F(RSRollbackTest, RollbackRenameCollectionThenCreateNewCollectionWithOldNam
                                                                     false,
                                                                     OpTime(Timestamp(2, 0), 5));
 
-    auto createCollectionOperation = std::make_pair(BSON("ts" << Timestamp(Seconds(3), 0) << "op"
-                                                              << "c"
-                                                              << "ui"
-                                                              << createdCollectionUUID
-                                                              << "ns"
-                                                              << "test.x"
-                                                              << "o"
-                                                              << BSON("create"
-                                                                      << "x")),
-                                                    RecordId(3));
+    auto createCollectionOperation =
+        std::make_pair(BSON("ts" << Timestamp(Seconds(3), 0) << "op"
+                                 << "c"
+                                 << "ui" << createdCollectionUUID << "ns"
+                                 << "test.x"
+                                 << "wall" << Date_t() << "o"
+                                 << BSON("create"
+                                         << "x")),
+                       RecordId(3));
 
 
     RollbackSourceMock rollbackSource(std::unique_ptr<OplogInterface>(new OplogInterfaceMock({
@@ -1457,7 +1400,7 @@ TEST_F(RSRollbackTest, RollbackRenameCollectionThenCreateNewCollectionWithOldNam
 
         AutoGetCollectionForReadCommand renamedColl(_opCtx.get(), NamespaceString("test.x"));
         ASSERT_TRUE(renamedColl.getCollection());
-        ASSERT_EQUALS(renamedColl.getCollection()->uuid().get(), renamedCollectionUUID);
+        ASSERT_EQUALS(renamedColl.getCollection()->uuid(), renamedCollectionUUID);
 
         AutoGetCollectionForReadCommand createdColl(_opCtx.get(), NamespaceString("test.y"));
         ASSERT_FALSE(createdColl.getCollection());
@@ -1473,11 +1416,9 @@ TEST_F(RSRollbackTest, RollbackCollModCommandFailsIfRBIDChangesWhileSyncingColle
     auto commonOperation = makeOpAndRecordId(1);
     auto collModOperation = std::make_pair(BSON("ts" << Timestamp(Seconds(2), 0) << "op"
                                                      << "c"
-                                                     << "ui"
-                                                     << coll->uuid().get()
-                                                     << "ns"
+                                                     << "ui" << coll->uuid() << "ns"
                                                      << "test.t"
-                                                     << "o"
+                                                     << "wall" << Date_t() << "o"
                                                      << BSON("collMod"
                                                              << "t"
                                                              << "validationLevel"
@@ -1515,13 +1456,13 @@ TEST_F(RSRollbackTest, RollbackDropDatabaseCommand) {
     createOplog(_opCtx.get());
     auto commonOperation = makeOpAndRecordId(1);
     // 'dropDatabase' operations are special and do not include a UUID field.
-    auto dropDatabaseOperation = std::make_pair(BSON("ts" << Timestamp(Seconds(2), 0) << "op"
-                                                          << "c"
-                                                          << "ns"
-                                                          << "test.$cmd"
-                                                          << "o"
-                                                          << BSON("dropDatabase" << 1)),
-                                                RecordId(2));
+    auto dropDatabaseOperation =
+        std::make_pair(BSON("ts" << Timestamp(Seconds(2), 0) << "op"
+                                 << "c"
+                                 << "ns"
+                                 << "test.$cmd"
+                                 << "wall" << Date_t() << "o" << BSON("dropDatabase" << 1)),
+                       RecordId(2));
     RollbackSourceMock rollbackSource(std::unique_ptr<OplogInterface>(new OplogInterfaceMock({
         commonOperation,
     })));
@@ -1539,7 +1480,8 @@ BSONObj makeApplyOpsOplogEntry(Timestamp ts, std::initializer_list<BSONObj> ops)
     entry << "ts" << ts << "op"
           << "c"
           << "ns"
-          << "admin";
+          << "admin"
+          << "wall" << Date_t();
     {
         BSONObjBuilder cmd(entry.subobjStart("o"));
         BSONArrayBuilder subops(entry.subarrayStart("applyOps"));
@@ -1570,9 +1512,11 @@ TEST_F(RSRollbackTest, RollbackApplyOpsCommand) {
     {
         AutoGetOrCreateDb autoDb(_opCtx.get(), "test", MODE_X);
         mongo::WriteUnitOfWork wuow(_opCtx.get());
-        coll = autoDb.getDb()->getCollection(_opCtx.get(), "test.t");
+        coll = CollectionCatalog::get(_opCtx.get())
+                   .lookupCollectionByNamespace(NamespaceString("test.t"));
         if (!coll) {
-            coll = autoDb.getDb()->createCollection(_opCtx.get(), "test.t", options);
+            coll =
+                autoDb.getDb()->createCollection(_opCtx.get(), NamespaceString("test.t"), options);
         }
         ASSERT(coll);
         OpDebug* const nullOpDebug = nullptr;
@@ -1584,96 +1528,50 @@ TEST_F(RSRollbackTest, RollbackApplyOpsCommand) {
             _opCtx.get(), InsertStatement(BSON("_id" << 4)), nullOpDebug, false));
         wuow.commit();
     }
-    UUID uuid = coll->uuid().get();
+    UUID uuid = coll->uuid();
     const auto commonOperation = makeOpAndRecordId(1);
     const auto applyOpsOperation =
-        std::make_pair(makeApplyOpsOplogEntry(Timestamp(Seconds(2), 0),
-                                              {BSON("op"
-                                                    << "u"
-                                                    << "ui"
-                                                    << uuid
-                                                    << "ts"
-                                                    << Timestamp(1, 1)
-                                                    << "t"
-                                                    << 1LL
-                                                    << "ns"
-                                                    << "test.t"
-                                                    << "o2"
-                                                    << BSON("_id" << 1)
-                                                    << "o"
-                                                    << BSON("_id" << 1 << "v" << 2)),
-                                               BSON("op"
-                                                    << "u"
-                                                    << "ui"
-                                                    << uuid
-                                                    << "ts"
-                                                    << Timestamp(2, 1)
-                                                    << "t"
-                                                    << 1LL
-                                                    << "ns"
-                                                    << "test.t"
-                                                    << "o2"
-                                                    << BSON("_id" << 2)
-                                                    << "o"
-                                                    << BSON("_id" << 2 << "v" << 4)),
-                                               BSON("op"
-                                                    << "d"
-                                                    << "ui"
-                                                    << uuid
-                                                    << "ts"
-                                                    << Timestamp(3, 1)
-                                                    << "t"
-                                                    << 1LL
-                                                    << "ns"
-                                                    << "test.t"
-                                                    << "o"
-                                                    << BSON("_id" << 3)),
-                                               BSON("op"
-                                                    << "i"
-                                                    << "ui"
-                                                    << uuid
-                                                    << "ts"
-                                                    << Timestamp(4, 1)
-                                                    << "t"
-                                                    << 1LL
-                                                    << "ns"
-                                                    << "test.t"
-                                                    << "o"
-                                                    << BSON("_id" << 4)),
-                                               // applyOps internal oplog entries are not required
-                                               // to have a timestamp.
-                                               BSON("op"
-                                                    << "i"
-                                                    << "ui"
-                                                    << uuid
-                                                    << "ts"
-                                                    << Timestamp(4, 1)
-                                                    << "t"
-                                                    << 1LL
-                                                    << "ns"
-                                                    << "test.t"
-                                                    << "o"
-                                                    << BSON("_id" << 4)),
-                                               BSON("op"
-                                                    << "i"
-                                                    << "ui"
-                                                    << uuid
-                                                    << "t"
-                                                    << 1LL
-                                                    << "ns"
-                                                    << "test.t"
-                                                    << "o"
-                                                    << BSON("_id" << 4)),
-                                               BSON("op"
-                                                    << "i"
-                                                    << "ui"
-                                                    << uuid
-                                                    << "t"
-                                                    << 1LL
-                                                    << "ns"
-                                                    << "test.t"
-                                                    << "o"
-                                                    << BSON("_id" << 4))}),
+        std::make_pair(makeApplyOpsOplogEntry(
+                           Timestamp(Seconds(2), 0),
+                           {BSON("op"
+                                 << "u"
+                                 << "ui" << uuid << "ts" << Timestamp(1, 1) << "t" << 1LL << "ns"
+                                 << "test.t"
+                                 << "o2" << BSON("_id" << 1) << "wall" << Date_t() << "o"
+                                 << BSON("_id" << 1 << "v" << 2)),
+                            BSON("op"
+                                 << "u"
+                                 << "ui" << uuid << "ts" << Timestamp(2, 1) << "t" << 1LL << "ns"
+                                 << "test.t"
+                                 << "o2" << BSON("_id" << 2) << "wall" << Date_t() << "o"
+                                 << BSON("_id" << 2 << "v" << 4)),
+                            BSON("op"
+                                 << "d"
+                                 << "ui" << uuid << "ts" << Timestamp(3, 1) << "t" << 1LL << "ns"
+                                 << "test.t"
+                                 << "wall" << Date_t() << "o" << BSON("_id" << 3)),
+                            BSON("op"
+                                 << "i"
+                                 << "ui" << uuid << "ts" << Timestamp(4, 1) << "t" << 1LL << "ns"
+                                 << "test.t"
+                                 << "wall" << Date_t() << "o" << BSON("_id" << 4)),
+                            // applyOps internal oplog entries are not required
+                            // to have a timestamp.
+                            BSON("op"
+                                 << "i"
+                                 << "ui" << uuid << "ts" << Timestamp(4, 1) << "t" << 1LL << "ns"
+                                 << "test.t"
+                                 << "wall" << Date_t() << "o" << BSON("_id" << 4)),
+                            BSON("op"
+                                 << "i"
+                                 << "ui" << uuid << "t" << 1LL << "ns"
+                                 << "test.t"
+                                 << "wall" << Date_t() << "o" << BSON("_id" << 4)),
+                            BSON("op"
+                                 << "i"
+                                 << "ui" << uuid << "t" << 1LL << "ns"
+                                 << "test.t"
+                                 << "wall" << Date_t() << "o" << BSON("_id" << 4))}),
                        RecordId(2));
 
     class RollbackSourceLocal : public RollbackSourceMock {
@@ -1708,7 +1606,6 @@ TEST_F(RSRollbackTest, RollbackApplyOpsCommand) {
         mutable std::multiset<int> searchedIds;
     } rollbackSource(std::unique_ptr<OplogInterface>(new OplogInterfaceMock({commonOperation})));
 
-    _createCollection(_opCtx.get(), "test.t", options);
     ASSERT_OK(syncRollback(_opCtx.get(),
                            OplogInterfaceMock({applyOpsOperation, commonOperation}),
                            rollbackSource,
@@ -1742,11 +1639,9 @@ TEST_F(RSRollbackTest, RollbackCreateCollectionCommand) {
     auto commonOperation = makeOpAndRecordId(1);
     auto createCollectionOperation = std::make_pair(BSON("ts" << Timestamp(Seconds(2), 0) << "op"
                                                               << "c"
-                                                              << "ui"
-                                                              << coll->uuid().get()
-                                                              << "ns"
+                                                              << "ui" << coll->uuid() << "ns"
                                                               << "test.t"
-                                                              << "o"
+                                                              << "wall" << Date_t() << "o"
                                                               << BSON("create"
                                                                       << "t")),
                                                     RecordId(2));
@@ -1763,7 +1658,8 @@ TEST_F(RSRollbackTest, RollbackCreateCollectionCommand) {
         auto databaseHolder = DatabaseHolder::get(_opCtx.get());
         auto db = databaseHolder->getDb(_opCtx.get(), "test");
         ASSERT_TRUE(db);
-        ASSERT_FALSE(db->getCollection(_opCtx.get(), "test.t"));
+        ASSERT_FALSE(CollectionCatalog::get(_opCtx.get())
+                         .lookupCollectionByNamespace(NamespaceString("test.t")));
     }
 }
 
@@ -1777,10 +1673,10 @@ TEST_F(RSRollbackTest, RollbackCollectionModificationCommand) {
 
     BSONObj collModCmd = BSON("collMod"
                               << "t"
-                              << "noPadding"
-                              << false);
+                              << "validationLevel"
+                              << "strict");
     auto collectionModificationOperation =
-        makeCommandOp(Timestamp(Seconds(2), 0), coll->uuid().get(), "test.t", collModCmd, 2);
+        makeCommandOp(Timestamp(Seconds(2), 0), coll->uuid(), "test.t", collModCmd, 2);
 
     class RollbackSourceLocal : public RollbackSourceMock {
     public:
@@ -1815,7 +1711,8 @@ TEST_F(RSRollbackTest, RollbackCollectionModificationCommand) {
     // Make sure the collection options are correct.
     AutoGetCollectionForReadCommand autoColl(_opCtx.get(), NamespaceString("test.t"));
     auto collAfterRollbackOptions =
-        autoColl.getCollection()->getCatalogEntry()->getCollectionOptions(_opCtx.get());
+        DurableCatalog::get(_opCtx.get())
+            ->getCollectionOptions(_opCtx.get(), NamespaceString("test.t"));
     ASSERT_BSONOBJ_EQ(BSON("uuid" << *options.uuid), collAfterRollbackOptions.toBSON());
 }
 
@@ -1940,10 +1837,10 @@ TEST_F(RSRollbackTest, RollbackCollectionModificationCommandInvalidCollectionOpt
 
     BSONObj collModCmd = BSON("collMod"
                               << "t"
-                              << "noPadding"
-                              << false);
+                              << "validationLevel"
+                              << "strict");
     auto collectionModificationOperation =
-        makeCommandOp(Timestamp(Seconds(2), 0), coll->uuid().get(), "test.t", collModCmd, 2);
+        makeCommandOp(Timestamp(Seconds(2), 0), coll->uuid(), "test.t", collModCmd, 2);
 
 
     class RollbackSourceLocal : public RollbackSourceMock {
@@ -1971,195 +1868,118 @@ TEST_F(RSRollbackTest, RollbackCollectionModificationCommandInvalidCollectionOpt
 TEST(RSRollbackTest, LocalEntryWithoutNsIsFatal) {
     const auto validOplogEntry = BSON("op"
                                       << "i"
-                                      << "ui"
-                                      << UUID::gen()
-                                      << "ts"
-                                      << Timestamp(1, 1)
-                                      << "t"
-                                      << 1LL
-                                      << "ns"
+                                      << "ui" << UUID::gen() << "ts" << Timestamp(1, 1) << "t"
+                                      << 1LL << "ns"
                                       << "test.t"
-                                      << "o"
-                                      << BSON("_id" << 1 << "a" << 1));
+                                      << "wall" << Date_t() << "o" << BSON("_id" << 1 << "a" << 1));
     FixUpInfo fui;
-    ASSERT_OK(updateFixUpInfoFromLocalOplogEntry(fui, validOplogEntry, false));
+    ASSERT_OK(updateFixUpInfoFromLocalOplogEntry(
+        nullptr /* opCtx */, OplogInterfaceMock(), fui, validOplogEntry, false));
     const auto invalidOplogEntry = BSON("op"
                                         << "i"
-                                        << "ui"
-                                        << UUID::gen()
-                                        << "ts"
-                                        << Timestamp(1, 1)
-                                        << "t"
-                                        << 1LL
-                                        << "ns"
+                                        << "ui" << UUID::gen() << "ts" << Timestamp(1, 1) << "t"
+                                        << 1LL << "ns"
                                         << ""
-                                        << "o"
+                                        << "wall" << Date_t() << "o"
                                         << BSON("_id" << 1 << "a" << 1));
-    ASSERT_THROWS(updateFixUpInfoFromLocalOplogEntry(fui, invalidOplogEntry, false),
+    ASSERT_THROWS(updateFixUpInfoFromLocalOplogEntry(
+                      nullptr /* opCtx */, OplogInterfaceMock(), fui, invalidOplogEntry, false),
                   RSFatalException);
 }
 
 TEST(RSRollbackTest, LocalEntryWithoutOIsFatal) {
     const auto validOplogEntry = BSON("op"
                                       << "i"
-                                      << "ui"
-                                      << UUID::gen()
-                                      << "ts"
-                                      << Timestamp(1, 1)
-                                      << "t"
-                                      << 1LL
-                                      << "ns"
+                                      << "ui" << UUID::gen() << "ts" << Timestamp(1, 1) << "t"
+                                      << 1LL << "ns"
                                       << "test.t"
-                                      << "o"
-                                      << BSON("_id" << 1 << "a" << 1));
+                                      << "wall" << Date_t() << "o" << BSON("_id" << 1 << "a" << 1));
     FixUpInfo fui;
-    ASSERT_OK(updateFixUpInfoFromLocalOplogEntry(fui, validOplogEntry, false));
+    ASSERT_OK(updateFixUpInfoFromLocalOplogEntry(
+        nullptr /* opCtx */, OplogInterfaceMock(), fui, validOplogEntry, false));
     const auto invalidOplogEntry = BSON("op"
                                         << "i"
-                                        << "ui"
-                                        << UUID::gen()
-                                        << "ts"
-                                        << Timestamp(1, 1)
-                                        << "t"
-                                        << 1LL
-                                        << "ns"
+                                        << "ui" << UUID::gen() << "ts" << Timestamp(1, 1) << "t"
+                                        << 1LL << "ns"
                                         << "test.t"
-                                        << "o"
-                                        << BSONObj());
-    ASSERT_THROWS(updateFixUpInfoFromLocalOplogEntry(fui, invalidOplogEntry, false),
+                                        << "wall" << Date_t() << "o" << BSONObj());
+    ASSERT_THROWS(updateFixUpInfoFromLocalOplogEntry(
+                      nullptr /* opCtx */, OplogInterfaceMock(), fui, invalidOplogEntry, false),
                   RSFatalException);
 }
 
-TEST(RSRollbackTest, LocalUpdateEntryWithoutO2IsFatal) {
-    const auto validOplogEntry = BSON("op"
-                                      << "u"
-                                      << "ui"
-                                      << UUID::gen()
-                                      << "ts"
-                                      << Timestamp(1, 1)
-                                      << "t"
-                                      << 1LL
-                                      << "ns"
-                                      << "test.t"
-                                      << "o"
-                                      << BSON("_id" << 1 << "a" << 1)
-                                      << "o2"
-                                      << BSON("_id" << 1));
-    FixUpInfo fui;
-    ASSERT_OK(updateFixUpInfoFromLocalOplogEntry(fui, validOplogEntry, false));
+DEATH_TEST_F(RSRollbackTest, LocalUpdateEntryWithoutO2IsFatal, "Fatal Assertion") {
     const auto invalidOplogEntry = BSON("op"
                                         << "u"
-                                        << "ui"
-                                        << UUID::gen()
-                                        << "ts"
-                                        << Timestamp(1, 1)
-                                        << "t"
-                                        << 1LL
-                                        << "ns"
+                                        << "ui" << UUID::gen() << "ts" << Timestamp(1, 1) << "t"
+                                        << 1LL << "ns"
                                         << "test.t"
-                                        << "o"
+                                        << "wall" << Date_t() << "o"
                                         << BSON("_id" << 1 << "a" << 1));
-    ASSERT_THROWS(updateFixUpInfoFromLocalOplogEntry(fui, invalidOplogEntry, false),
-                  RSFatalException);
+    FixUpInfo fui;
+    updateFixUpInfoFromLocalOplogEntry(
+        nullptr /* opCtx */, OplogInterfaceMock(), fui, invalidOplogEntry, false)
+        .ignore();
 }
 
 TEST(RSRollbackTest, LocalUpdateEntryWithEmptyO2IsFatal) {
     const auto validOplogEntry = BSON("op"
                                       << "u"
-                                      << "ui"
-                                      << UUID::gen()
-                                      << "ts"
-                                      << Timestamp(1, 1)
-                                      << "t"
-                                      << 1LL
-                                      << "ns"
+                                      << "ui" << UUID::gen() << "ts" << Timestamp(1, 1) << "t"
+                                      << 1LL << "ns"
                                       << "test.t"
-                                      << "o"
-                                      << BSON("_id" << 1 << "a" << 1)
-                                      << "o2"
-                                      << BSON("_id" << 1));
+                                      << "wall" << Date_t() << "o" << BSON("_id" << 1 << "a" << 1)
+                                      << "o2" << BSON("_id" << 1));
     FixUpInfo fui;
-    ASSERT_OK(updateFixUpInfoFromLocalOplogEntry(fui, validOplogEntry, false));
+    ASSERT_OK(updateFixUpInfoFromLocalOplogEntry(
+        nullptr /* opCtx */, OplogInterfaceMock(), fui, validOplogEntry, false));
     const auto invalidOplogEntry = BSON("op"
                                         << "u"
-                                        << "ui"
-                                        << UUID::gen()
-                                        << "ts"
-                                        << Timestamp(1, 1)
-                                        << "t"
-                                        << 1LL
-                                        << "ns"
+                                        << "ui" << UUID::gen() << "ts" << Timestamp(1, 1) << "t"
+                                        << 1LL << "ns"
                                         << "test.t"
-                                        << "o"
-                                        << BSON("_id" << 1 << "a" << 1)
-                                        << "o2"
-                                        << BSONObj());
-    ASSERT_THROWS(updateFixUpInfoFromLocalOplogEntry(fui, invalidOplogEntry, false),
+                                        << "wall" << Date_t() << "o" << BSON("_id" << 1 << "a" << 1)
+                                        << "o2" << BSONObj());
+    ASSERT_THROWS(updateFixUpInfoFromLocalOplogEntry(
+                      nullptr /* opCtx */, OplogInterfaceMock(), fui, invalidOplogEntry, false),
                   RSFatalException);
 }
 
 DEATH_TEST_F(RSRollbackTest, LocalEntryWithTxnNumberWithoutSessionIdIsFatal, "invariant") {
     auto validOplogEntry = BSON("ts" << Timestamp(Seconds(1), 0) << "t" << 1LL << "op"
                                      << "i"
-                                     << "ui"
-                                     << UUID::gen()
-                                     << "ns"
+                                     << "ui" << UUID::gen() << "ns"
                                      << "test.t"
-                                     << "o"
-                                     << BSON("_id" << 1 << "a" << 1));
+                                     << "wall" << Date_t() << "o" << BSON("_id" << 1 << "a" << 1));
     FixUpInfo fui;
-    ASSERT_OK(updateFixUpInfoFromLocalOplogEntry(fui, validOplogEntry, false));
+    ASSERT_OK(updateFixUpInfoFromLocalOplogEntry(
+        nullptr /* opCtx */, OplogInterfaceMock(), fui, validOplogEntry, false));
 
     const auto txnNumber = BSON("txnNumber" << 1LL);
     const auto noSessionIdOrStmtId = validOplogEntry.addField(txnNumber.firstElement());
 
     const auto stmtId = BSON("stmtId" << 1);
     const auto noSessionId = noSessionIdOrStmtId.addField(stmtId.firstElement());
-    ASSERT_THROWS(updateFixUpInfoFromLocalOplogEntry(fui, noSessionId, false), RSFatalException);
-}
-
-DEATH_TEST_F(RSRollbackTest, LocalEntryWithTxnNumberWithoutStmtIdIsFatal, "invariant") {
-    auto validOplogEntry = BSON("ts" << Timestamp(Seconds(1), 0) << "t" << 1LL << "op"
-                                     << "i"
-                                     << "ui"
-                                     << UUID::gen()
-                                     << "ns"
-                                     << "test.t"
-                                     << "o"
-                                     << BSON("_id" << 1 << "a" << 1));
-    FixUpInfo fui;
-    ASSERT_OK(updateFixUpInfoFromLocalOplogEntry(fui, validOplogEntry, false));
-
-    const auto txnNumber = BSON("txnNumber" << 1LL);
-    const auto noSessionIdOrStmtId = validOplogEntry.addField(txnNumber.firstElement());
-
-    const auto lsid = makeLogicalSessionIdForTest();
-    const auto sessionId = BSON("lsid" << lsid.toBSON());
-    const auto noStmtId = noSessionIdOrStmtId.addField(sessionId.firstElement());
-    ASSERT_THROWS(updateFixUpInfoFromLocalOplogEntry(fui, noStmtId, false), RSFatalException);
+    ASSERT_THROWS(updateFixUpInfoFromLocalOplogEntry(
+                      nullptr /* opCtx */, OplogInterfaceMock(), fui, noSessionId, false),
+                  RSFatalException);
 }
 
 TEST_F(RSRollbackTest, LocalEntryWithTxnNumberWithoutTxnTableUUIDIsFatal) {
     // If txnNumber is present, but the transaction collection has no UUID, rollback fails.
     UUID uuid = UUID::gen();
     auto lsid = makeLogicalSessionIdForTest();
-    auto entryWithTxnNumber = BSON("ts" << Timestamp(Seconds(1), 0) << "t" << 1LL << "op"
-                                        << "i"
-                                        << "ui"
-                                        << uuid
-                                        << "ns"
-                                        << "test.t"
-                                        << "o"
-                                        << BSON("_id" << 1 << "a" << 1)
-                                        << "txnNumber"
-                                        << 1LL
-                                        << "stmtId"
-                                        << 1
-                                        << "lsid"
-                                        << lsid.toBSON());
+    auto entryWithTxnNumber =
+        BSON("ts" << Timestamp(Seconds(1), 0) << "t" << 1LL << "op"
+                  << "i"
+                  << "ui" << uuid << "ns"
+                  << "test.t"
+                  << "wall" << Date_t() << "o" << BSON("_id" << 1 << "a" << 1) << "txnNumber" << 1LL
+                  << "stmtId" << 1 << "lsid" << lsid.toBSON());
 
     FixUpInfo fui;
-    ASSERT_THROWS(updateFixUpInfoFromLocalOplogEntry(fui, entryWithTxnNumber, false),
+    ASSERT_THROWS(updateFixUpInfoFromLocalOplogEntry(
+                      nullptr /* opCtx */, OplogInterfaceMock(), fui, entryWithTxnNumber, false),
                   RSFatalException);
 }
 
@@ -2167,16 +1987,15 @@ TEST_F(RSRollbackTest, LocalEntryWithTxnNumberAddsTransactionTableDocToBeRefetch
     FixUpInfo fui;
 
     // With no txnNumber present, no extra documents need to be refetched.
-    auto entryWithoutTxnNumber = BSON("ts" << Timestamp(Seconds(1), 0) << "t" << 1LL << "op"
-                                           << "i"
-                                           << "ui"
-                                           << UUID::gen()
-                                           << "ns"
-                                           << "test.t2"
-                                           << "o"
-                                           << BSON("_id" << 2 << "a" << 2));
+    auto entryWithoutTxnNumber =
+        BSON("ts" << Timestamp(Seconds(1), 0) << "t" << 1LL << "op"
+                  << "i"
+                  << "ui" << UUID::gen() << "ns"
+                  << "test.t2"
+                  << "wall" << Date_t() << "o" << BSON("_id" << 2 << "a" << 2));
 
-    ASSERT_OK(updateFixUpInfoFromLocalOplogEntry(fui, entryWithoutTxnNumber, false));
+    ASSERT_OK(updateFixUpInfoFromLocalOplogEntry(
+        nullptr /* opCtx */, OplogInterfaceMock(), fui, entryWithoutTxnNumber, false));
     ASSERT_EQ(fui.docsToRefetch.size(), 1U);
 
     // If txnNumber is present, and the transaction table exists and has a UUID, the session
@@ -2184,29 +2003,384 @@ TEST_F(RSRollbackTest, LocalEntryWithTxnNumberAddsTransactionTableDocToBeRefetch
     // refetched.
     UUID uuid = UUID::gen();
     auto lsid = makeLogicalSessionIdForTest();
-    auto entryWithTxnNumber = BSON("ts" << Timestamp(Seconds(1), 0) << "t" << 1LL << "op"
-                                        << "i"
-                                        << "ui"
-                                        << uuid
-                                        << "ns"
-                                        << "test.t"
-                                        << "o"
-                                        << BSON("_id" << 1 << "a" << 1)
-                                        << "txnNumber"
-                                        << 1LL
-                                        << "stmtId"
-                                        << 1
-                                        << "lsid"
-                                        << lsid.toBSON());
+    auto entryWithTxnNumber =
+        BSON("ts" << Timestamp(Seconds(1), 0) << "t" << 1LL << "op"
+                  << "i"
+                  << "ui" << uuid << "ns"
+                  << "test.t"
+                  << "wall" << Date_t() << "o" << BSON("_id" << 1 << "a" << 1) << "txnNumber" << 1LL
+                  << "stmtId" << 1 << "lsid" << lsid.toBSON());
     UUID transactionTableUUID = UUID::gen();
     fui.transactionTableUUID = transactionTableUUID;
 
-    ASSERT_OK(updateFixUpInfoFromLocalOplogEntry(fui, entryWithTxnNumber, false));
+    ASSERT_OK(updateFixUpInfoFromLocalOplogEntry(
+        nullptr /* opCtx */, OplogInterfaceMock(), fui, entryWithTxnNumber, false));
     ASSERT_EQ(fui.docsToRefetch.size(), 3U);
 
     auto expectedObj = BSON("_id" << lsid.toBSON());
     DocID expectedTxnDoc(expectedObj, expectedObj.firstElement(), transactionTableUUID);
     ASSERT_TRUE(fui.docsToRefetch.find(expectedTxnDoc) != fui.docsToRefetch.end());
+}
+
+TEST_F(RSRollbackTest, LocalEntryWithPartialTxnAddsTransactionTableDocToBeRefetched) {
+    FixUpInfo fui;
+
+    // If txnNumber is present, and the transaction table exists and has a UUID, the session
+    // transactions table document corresponding to the oplog entry's sessionId also needs to be
+    // refetched.  This is true even if "partialTxn" is set indicating this is part of a transaction
+    // that may not have been committed.
+    UUID uuid = UUID::gen();
+    auto lsid = makeLogicalSessionIdForTest();
+    auto entryWithTxnNumber =
+        BSON("ts" << Timestamp(Seconds(1), 0) << "t" << 1LL << "op"
+                  << "c"
+                  << "ns"
+                  << "admin.$cmd"
+                  << "wall" << Date_t() << "o"
+                  << BSON("applyOps" << BSON_ARRAY(BSON("op"
+                                                        << "i"
+                                                        << "ui" << uuid << "ns"
+                                                        << "test.t"
+                                                        << "o" << BSON("_id" << 1 << "a" << 1)))
+                                     << "partialTxn" << true)
+                  << "txnNumber" << 1LL << "stmtId" << 1 << "lsid" << lsid.toBSON());
+    UUID transactionTableUUID = UUID::gen();
+    fui.transactionTableUUID = transactionTableUUID;
+
+    ASSERT_OK(updateFixUpInfoFromLocalOplogEntry(
+        nullptr /* opCtx */, OplogInterfaceMock(), fui, entryWithTxnNumber, false));
+    ASSERT_EQ(fui.docsToRefetch.size(), 1U);
+
+    auto expectedObj = BSON("_id" << lsid.toBSON());
+    DocID expectedTxnDoc(expectedObj, expectedObj.firstElement(), transactionTableUUID);
+    ASSERT_TRUE(fui.docsToRefetch.find(expectedTxnDoc) != fui.docsToRefetch.end());
+}
+
+TEST_F(RSRollbackTest, LocalAbortTxnRefetchesTransactionTableEntry) {
+    // A rolled back abort, even if we rolled back no transaction operations, should refetch the
+    // transaction table entry.
+    FixUpInfo fui;
+
+    auto lsid = makeLogicalSessionIdForTest();
+    auto abortTxnEntry =
+        BSON("ts" << Timestamp(Seconds(1), 1) << "t" << 1LL << "op"
+                  << "c"
+                  << "ns"
+                  << "admin.$cmd"
+                  << "wall" << Date_t() << "o" << BSON("abortTransaction" << 1) << "txnNumber"
+                  << 1LL << "stmtId" << 1 << "lsid" << lsid.toBSON() << "prevOpTime"
+                  << BSON("ts" << Timestamp(Seconds(1), 0) << "t" << 1LL));
+
+    UUID transactionTableUUID = UUID::gen();
+    fui.transactionTableUUID = transactionTableUUID;
+
+    ASSERT_OK(updateFixUpInfoFromLocalOplogEntry(
+        nullptr /* opCtx */, OplogInterfaceMock(), fui, abortTxnEntry, false));
+    ASSERT_EQ(fui.docsToRefetch.size(), 1U);
+
+    auto expectedObj = BSON("_id" << lsid.toBSON());
+    DocID expectedTxnDoc(expectedObj, expectedObj.firstElement(), transactionTableUUID);
+    ASSERT_TRUE(fui.docsToRefetch.find(expectedTxnDoc) != fui.docsToRefetch.end());
+}
+
+TEST_F(RSRollbackTest, LocalEntryWithAbortedPartialTxnRefetchesOnlyTransactionTableEntry) {
+    FixUpInfo fui;
+
+    // If txnNumber is present, and the transaction table exists and has a UUID, the session
+    // transactions table document corresponding to the oplog entry's sessionId also needs to be
+    // refetched.  This is true even if "partialTxn" is set indicating this is part of a transaction
+    // that may not have been committed, and even if it is known that the transaction aborted.
+    UUID uuid = UUID::gen();
+    auto lsid = makeLogicalSessionIdForTest();
+    auto abortTxnEntry =
+        BSON("ts" << Timestamp(Seconds(1), 2) << "t" << 1LL << "op"
+                  << "c"
+                  << "ns"
+                  << "admin.$cmd"
+                  << "wall" << Date_t() << "o" << BSON("abortTransaction" << 1) << "txnNumber"
+                  << 1LL << "stmtId" << 1 << "lsid" << lsid.toBSON() << "prevOpTime"
+                  << BSON("ts" << Timestamp(Seconds(1), 1) << "t" << 1LL));
+
+    auto entryWithTxnNumber =
+        BSON("ts" << Timestamp(Seconds(1), 1) << "t" << 1LL << "op"
+                  << "c"
+                  << "ns"
+                  << "admin.$cmd"
+                  << "wall" << Date_t() << "o"
+                  << BSON("applyOps" << BSON_ARRAY(BSON("op"
+                                                        << "i"
+                                                        << "ui" << uuid << "ns"
+                                                        << "test.t"
+                                                        << "o" << BSON("_id" << 1 << "a" << 1)))
+                                     << "partialTxn" << true)
+                  << "txnNumber" << 1LL << "stmtId" << 1 << "lsid" << lsid.toBSON());
+    UUID transactionTableUUID = UUID::gen();
+    fui.transactionTableUUID = transactionTableUUID;
+
+    ASSERT_OK(updateFixUpInfoFromLocalOplogEntry(
+        nullptr /* opCtx */, OplogInterfaceMock(), fui, abortTxnEntry, false));
+    ASSERT_OK(updateFixUpInfoFromLocalOplogEntry(
+        nullptr /* opCtx */, OplogInterfaceMock(), fui, entryWithTxnNumber, false));
+    ASSERT_EQ(fui.docsToRefetch.size(), 1U);
+
+    auto expectedObj = BSON("_id" << lsid.toBSON());
+    DocID expectedTxnDoc(expectedObj, expectedObj.firstElement(), transactionTableUUID);
+    ASSERT_TRUE(fui.docsToRefetch.find(expectedTxnDoc) != fui.docsToRefetch.end());
+}
+
+TEST_F(RSRollbackTest, LocalEntryWithCommittedTxnRefetchesDocsAndTransactionTableEntry) {
+    FixUpInfo fui;
+    UUID uuid = UUID::gen();
+    auto lsid = makeLogicalSessionIdForTest();
+    auto commitTxnEntry =
+        BSON("ts" << Timestamp(Seconds(1), 2) << "t" << 1LL << "op"
+                  << "c"
+                  << "ns"
+                  << "admin.$cmd"
+                  << "wall" << Date_t() << "o"
+                  << BSON("applyOps" << BSON_ARRAY(BSON("op"
+                                                        << "i"
+                                                        << "ui" << uuid << "ns"
+                                                        << "test.t"
+                                                        << "o" << BSON("_id" << 2 << "a" << 2)))
+                                     << "count" << 2)
+                  << "txnNumber" << 1LL << "stmtId" << 2 << "lsid" << lsid.toBSON() << "prevOpTime"
+                  << BSON("ts" << Timestamp(Seconds(1), 1) << "t" << 1LL));
+    auto commitTxnOperation = std::make_pair(commitTxnEntry, RecordId(2));
+
+    auto partialTxnEntry =
+        BSON("ts" << Timestamp(Seconds(1), 1) << "t" << 1LL << "op"
+                  << "c"
+                  << "ns"
+                  << "admin.$cmd"
+                  << "wall" << Date_t() << "o"
+                  << BSON("applyOps" << BSON_ARRAY(BSON("op"
+                                                        << "i"
+                                                        << "ui" << uuid << "ns"
+                                                        << "test.t"
+                                                        << "o" << BSON("_id" << 1 << "a" << 1)))
+                                     << "partialTxn" << true)
+                  << "txnNumber" << 1LL << "stmtId" << 1 << "lsid" << lsid.toBSON() << "prevOpTime"
+                  << BSON("ts" << Timestamp(0, 0) << "t" << -1LL));
+
+    auto partialTxnOperation = std::make_pair(partialTxnEntry, RecordId(1));
+    UUID transactionTableUUID = UUID::gen();
+    fui.transactionTableUUID = transactionTableUUID;
+
+    ASSERT_OK(updateFixUpInfoFromLocalOplogEntry(
+        nullptr /* opCtx */,
+        OplogInterfaceMock({commitTxnOperation, partialTxnOperation}),
+        fui,
+        commitTxnEntry,
+        false));
+    ASSERT_OK(updateFixUpInfoFromLocalOplogEntry(
+        nullptr /* opCtx */,
+        OplogInterfaceMock({commitTxnOperation, partialTxnOperation}),
+        fui,
+        partialTxnEntry,
+        false));
+    ASSERT_EQ(fui.docsToRefetch.size(), 3U);
+
+    auto expectedObj = BSON("_id" << lsid.toBSON());
+    DocID expectedTxnDoc(expectedObj, expectedObj.firstElement(), transactionTableUUID);
+    ASSERT_TRUE(fui.docsToRefetch.find(expectedTxnDoc) != fui.docsToRefetch.end());
+
+    auto expectedCrudObj = BSON("_id" << 2);
+    auto expectedCrudDoc = DocID(expectedObj, expectedObj.firstElement(), transactionTableUUID);
+    ASSERT_TRUE(fui.docsToRefetch.find(expectedCrudDoc) != fui.docsToRefetch.end());
+
+    expectedCrudObj = BSON("_id" << 1);
+    expectedCrudDoc = DocID(expectedObj, expectedObj.firstElement(), transactionTableUUID);
+    ASSERT_TRUE(fui.docsToRefetch.find(expectedCrudDoc) != fui.docsToRefetch.end());
+}
+
+TEST_F(RSRollbackTest, RollbackFetchesTransactionOperationBeforeCommonPoint) {
+    createOplog(_opCtx.get());
+    CollectionOptions options;
+    options.uuid = UUID::gen();
+    auto coll = _createCollection(_opCtx.get(), "test.t", options);
+    options.uuid = UUID::gen();
+    auto txnTable = _createCollection(_opCtx.get(), "config.transactions", options);
+
+    auto commonOperation = makeOpAndRecordId(10);
+    UUID uuid = coll->uuid();
+    auto lsid = makeLogicalSessionIdForTest();
+    auto commitTxnEntry =
+        BSON("ts" << Timestamp(Seconds(10), 12) << "t" << 10LL << "op"
+                  << "c"
+                  << "ns"
+                  << "admin.$cmd"
+                  << "wall" << Date_t() << "o"
+                  << BSON("applyOps" << BSON_ARRAY(BSON("op"
+                                                        << "i"
+                                                        << "ui" << uuid << "ns"
+                                                        << "test.t"
+                                                        << "o" << BSON("_id" << 0 << "a" << 0)))
+                                     << "count" << 3)
+                  << "txnNumber" << 1LL << "stmtId" << 3 << "lsid" << lsid.toBSON() << "prevOpTime"
+                  << BSON("ts" << Timestamp(Seconds(10), 11) << "t" << 10LL));
+    auto commitTxnOperation = std::make_pair(commitTxnEntry, RecordId(12));
+
+    auto entryAfterCommonPoint =
+        BSON("ts" << Timestamp(Seconds(10), 11) << "t" << 10LL << "op"
+                  << "c"
+                  << "ns"
+                  << "admin.$cmd"
+                  << "wall" << Date_t() << "o"
+                  << BSON("applyOps" << BSON_ARRAY(BSON("op"
+                                                        << "i"
+                                                        << "ui" << uuid << "ns"
+                                                        << "test.t"
+                                                        << "o" << BSON("_id" << 1 << "a" << 1)))
+                                     << "partialTxn" << true)
+                  << "txnNumber" << 1LL << "stmtId" << 2 << "lsid" << lsid.toBSON() << "prevOpTime"
+                  << BSON("ts" << Timestamp(Seconds(10), 9) << "t" << 10LL));
+    auto operationAfterCommonPoint = std::make_pair(entryAfterCommonPoint, RecordId(11));
+
+    auto entryBeforeCommonPoint =
+        BSON("ts" << Timestamp(Seconds(10), 9) << "t" << 10LL << "op"
+                  << "c"
+                  << "ns"
+                  << "admin.$cmd"
+                  << "wall" << Date_t() << "o"
+                  << BSON("applyOps" << BSON_ARRAY(BSON("op"
+                                                        << "i"
+                                                        << "ui" << uuid << "ns"
+                                                        << "test.t"
+                                                        << "o" << BSON("_id" << 2 << "a" << 2)))
+                                     << "partialTxn" << true)
+                  << "txnNumber" << 1LL << "stmtId" << 1 << "lsid" << lsid.toBSON() << "prevOpTime"
+                  << BSON("ts" << Timestamp(0, 0) << "t" << -1LL));
+    auto operationBeforeCommonPoint = std::make_pair(entryBeforeCommonPoint, RecordId(9));
+
+    class RollbackSourceLocal : public RollbackSourceMock {
+    public:
+        RollbackSourceLocal(std::unique_ptr<OplogInterface> oplog, const UUID& txnTableUuid)
+            : RollbackSourceMock(std::move(oplog)), _txnTableUuid(txnTableUuid) {}
+
+        std::pair<BSONObj, NamespaceString> findOneByUUID(const std::string& db,
+                                                          UUID uuid,
+                                                          const BSONObj& filter) const override {
+            int numFields = 0;
+            if (uuid == _txnTableUuid) {
+                // This unit test does not test transaction table fetches.
+                return {BSONObj(), NamespaceString::kSessionTransactionsTableNamespace};
+            }
+            for (const auto element : filter) {
+                ++numFields;
+                ASSERT_EQUALS("_id", element.fieldNameStringData()) << filter;
+            }
+            ASSERT_EQUALS(1, numFields) << filter;
+            searchedIds.insert(filter.firstElement().numberInt());
+            switch (filter.firstElement().numberInt()) {
+                case 0:
+                    return {BSON("_id" << 0 << "v" << 0), NamespaceString()};
+                case 1:
+                    return {BSON("_id" << 1 << "v" << 1), NamespaceString()};
+                case 2:
+                    return {BSON("_id" << 2 << "v" << 3), NamespaceString()};
+            }
+            FAIL("Unexpected findOne request") << filter;
+            return {};  // Unreachable; why doesn't compiler know?
+        }
+
+        mutable std::multiset<int> searchedIds;
+
+    private:
+        UUID _txnTableUuid;
+
+    } rollbackSource(std::unique_ptr<OplogInterface>(
+                         new OplogInterfaceMock({commonOperation, operationBeforeCommonPoint})),
+                     txnTable->uuid());
+
+    ASSERT_OK(syncRollback(_opCtx.get(),
+                           OplogInterfaceMock({commitTxnOperation,
+                                               operationAfterCommonPoint,
+                                               commonOperation,
+                                               operationBeforeCommonPoint}),
+                           rollbackSource,
+                           {},
+                           _coordinator,
+                           _replicationProcess.get()));
+    ASSERT_EQUALS(3U, rollbackSource.searchedIds.size());
+    ASSERT_EQUALS(1U, rollbackSource.searchedIds.count(0));
+    ASSERT_EQUALS(1U, rollbackSource.searchedIds.count(1));
+    ASSERT_EQUALS(1U, rollbackSource.searchedIds.count(2));
+}
+
+TEST_F(RSRollbackTest, RollbackIncompleteTransactionReturnsUnrecoverableRollbackError) {
+    createOplog(_opCtx.get());
+    CollectionOptions options;
+    options.uuid = UUID::gen();
+    auto coll = _createCollection(_opCtx.get(), "test.t", options);
+    options.uuid = UUID::gen();
+    auto txnTable = _createCollection(_opCtx.get(), "config.transactions", options);
+
+    auto commonOperation = makeOpAndRecordId(10);
+    UUID uuid = coll->uuid();
+    auto lsid = makeLogicalSessionIdForTest();
+    auto commitTxnEntry =
+        BSON("ts" << Timestamp(Seconds(10), 12) << "t" << 10LL << "op"
+                  << "c"
+                  << "ns"
+                  << "admin.$cmd"
+                  << "wall" << Date_t() << "o"
+                  << BSON("applyOps" << BSON_ARRAY(BSON("op"
+                                                        << "i"
+                                                        << "ui" << uuid << "ns"
+                                                        << "test.t"
+                                                        << "o" << BSON("_id" << 0 << "a" << 0)))
+                                     << "count" << 3)
+                  << "stmtId" << 3 << "lsid" << lsid.toBSON() << "prevOpTime"
+                  << BSON("ts" << Timestamp(Seconds(10), 11) << "t" << 10LL));
+    auto commitTxnOperation = std::make_pair(commitTxnEntry, RecordId(12));
+
+    auto entryAfterCommonPoint =
+        BSON("ts" << Timestamp(Seconds(10), 11) << "t" << 10LL << "op"
+                  << "c"
+                  << "ns"
+                  << "admin.$cmd"
+                  << "wall" << Date_t() << "o"
+                  << BSON("applyOps" << BSON_ARRAY(BSON("op"
+                                                        << "i"
+                                                        << "ui" << uuid << "ns"
+                                                        << "test.t"
+                                                        << "o" << BSON("_id" << 1 << "a" << 1)))
+                                     << "partialTxn" << true)
+                  << "txnNumber" << 1LL << "stmtId" << 2 << "lsid" << lsid.toBSON() << "prevOpTime"
+                  << BSON("ts" << Timestamp(Seconds(10), 9) << "t" << 10LL));
+    auto operationAfterCommonPoint = std::make_pair(entryAfterCommonPoint, RecordId(11));
+
+    class RollbackSourceLocal : public RollbackSourceMock {
+    public:
+        RollbackSourceLocal(std::unique_ptr<OplogInterface> oplog, const UUID& txnTableUuid)
+            : RollbackSourceMock(std::move(oplog)), _txnTableUuid(txnTableUuid) {}
+
+        std::pair<BSONObj, NamespaceString> findOneByUUID(const std::string& db,
+                                                          UUID uuid,
+                                                          const BSONObj& filter) const override {
+            if (uuid == _txnTableUuid) {
+                // This unit test does not test transaction table fetches.
+                return {BSONObj(), NamespaceString::kSessionTransactionsTableNamespace};
+            } else {
+                return {BSONObj(), NamespaceString()};
+            }
+        }
+
+    private:
+        UUID _txnTableUuid;
+    } rollbackSource(std::unique_ptr<OplogInterface>(new OplogInterfaceMock({commonOperation})),
+                     txnTable->uuid());
+
+
+    auto status = syncRollback(
+        _opCtx.get(),
+        OplogInterfaceMock({commitTxnOperation, operationAfterCommonPoint, commonOperation}),
+        rollbackSource,
+        {},
+        _coordinator,
+        _replicationProcess.get());
+    ASSERT_EQUALS(ErrorCodes::UnrecoverableRollbackError, status.code());
 }
 
 TEST_F(RSRollbackTest, RollbackFailsIfTransactionDocumentRefetchReturnsDifferentNamespace) {
@@ -2216,32 +2390,26 @@ TEST_F(RSRollbackTest, RollbackFailsIfTransactionDocumentRefetchReturnsDifferent
     // transaction number and session id.
     FixUpInfo fui;
 
-    auto entryWithTxnNumber = BSON("ts" << Timestamp(Seconds(2), 0) << "t" << 1LL << "op"
-                                        << "i"
-                                        << "ui"
-                                        << UUID::gen()
-                                        << "ns"
-                                        << "test.t"
-                                        << "o"
-                                        << BSON("_id" << 1 << "a" << 1)
-                                        << "txnNumber"
-                                        << 1LL
-                                        << "stmtId"
-                                        << 1
-                                        << "lsid"
-                                        << makeLogicalSessionIdForTest().toBSON());
+    auto entryWithTxnNumber =
+        BSON("ts" << Timestamp(Seconds(2), 1) << "t" << 1LL << "op"
+                  << "i"
+                  << "ui" << UUID::gen() << "ns"
+                  << "test.t"
+                  << "wall" << Date_t() << "o" << BSON("_id" << 1 << "a" << 1) << "txnNumber" << 1LL
+                  << "stmtId" << 1 << "lsid" << makeLogicalSessionIdForTest().toBSON());
 
     UUID transactionTableUUID = UUID::gen();
     fui.transactionTableUUID = transactionTableUUID;
 
     auto commonOperation = makeOpAndRecordId(1);
-    fui.commonPoint = OpTime(Timestamp(Seconds(1), 0), 1LL);
+    fui.commonPoint = OpTime(Timestamp(Seconds(1), 1), 1LL);
     fui.commonPointOurDiskloc = RecordId(1);
 
     fui.rbid = 1;
 
     // The FixUpInfo will have an extra doc to refetch: the corresponding transaction table entry.
-    ASSERT_OK(updateFixUpInfoFromLocalOplogEntry(fui, entryWithTxnNumber, false));
+    ASSERT_OK(updateFixUpInfoFromLocalOplogEntry(
+        nullptr /* opCtx */, OplogInterfaceMock(), fui, entryWithTxnNumber, false));
     ASSERT_EQ(fui.docsToRefetch.size(), 2U);
 
     {
@@ -2298,7 +2466,7 @@ TEST_F(RSRollbackTest, RollbackReturnsImmediatelyOnFailureToTransitionToRollback
     // syncRollback(). We provide an empty oplog so that if syncRollback() is called erroneously,
     // we would go fatal.
     OplogInterfaceMock localOplogWithSingleOplogEntry({makeNoopOplogEntryAndRecordId(Seconds(1))});
-    RollbackSourceMock rollbackSourceWithInvalidOplog(stdx::make_unique<OplogInterfaceMock>());
+    RollbackSourceMock rollbackSourceWithInvalidOplog(std::make_unique<OplogInterfaceMock>());
 
     // Inject ReplicationCoordinator::setFollowerMode() error. We set the current member state
     // because it will be logged by rollback() on failing to transition to ROLLBACK.
@@ -2327,7 +2495,7 @@ DEATH_TEST_F(
     // rollback() should abort on getting UnrecoverableRollbackError from syncRollback(). An empty
     // local oplog will make syncRollback() return the intended error.
     OplogInterfaceMock localOplogWithSingleOplogEntry({makeNoopOplogEntryAndRecordId(Seconds(1))});
-    RollbackSourceMock rollbackSourceWithInvalidOplog(stdx::make_unique<OplogInterfaceMock>());
+    RollbackSourceMock rollbackSourceWithInvalidOplog(std::make_unique<OplogInterfaceMock>());
 
     rollback(_opCtx.get(),
              localOplogWithSingleOplogEntry,
@@ -2343,7 +2511,7 @@ TEST_F(RSRollbackTest, RollbackLogsRetryMessageAndReturnsOnNonUnrecoverableRollb
     // about retrying rollback later before returning.
     OplogInterfaceMock localOplogWithNoEntries;
     OplogInterfaceMock::Operations remoteOperations({makeNoopOplogEntryAndRecordId(Seconds(1))});
-    auto remoteOplog = stdx::make_unique<OplogInterfaceMock>(remoteOperations);
+    auto remoteOplog = std::make_unique<OplogInterfaceMock>(remoteOperations);
     RollbackSourceMock rollbackSourceWithValidOplog(std::move(remoteOplog));
     auto noopSleepSecsFn = [](int) {};
 

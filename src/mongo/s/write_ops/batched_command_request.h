@@ -30,11 +30,12 @@
 #pragma once
 
 #include <boost/optional.hpp>
+#include <memory>
 
 #include "mongo/db/ops/write_ops.h"
 #include "mongo/rpc/op_msg.h"
 #include "mongo/s/chunk_version.h"
-#include "mongo/stdx/memory.h"
+#include "mongo/s/database_version_helpers.h"
 
 namespace mongo {
 
@@ -48,15 +49,15 @@ public:
 
     BatchedCommandRequest(write_ops::Insert insertOp)
         : _batchType(BatchType_Insert),
-          _insertReq(stdx::make_unique<write_ops::Insert>(std::move(insertOp))) {}
+          _insertReq(std::make_unique<write_ops::Insert>(std::move(insertOp))) {}
 
     BatchedCommandRequest(write_ops::Update updateOp)
         : _batchType(BatchType_Update),
-          _updateReq(stdx::make_unique<write_ops::Update>(std::move(updateOp))) {}
+          _updateReq(std::make_unique<write_ops::Update>(std::move(updateOp))) {}
 
     BatchedCommandRequest(write_ops::Delete deleteOp)
         : _batchType(BatchType_Delete),
-          _deleteReq(stdx::make_unique<write_ops::Delete>(std::move(deleteOp))) {}
+          _deleteReq(std::make_unique<write_ops::Delete>(std::move(deleteOp))) {}
 
     BatchedCommandRequest(BatchedCommandRequest&&) = default;
 
@@ -115,6 +116,34 @@ public:
         return *_shardVersion;
     }
 
+    void setDbVersion(DatabaseVersion dbVersion) {
+        _dbVersion = std::move(dbVersion);
+    }
+
+    bool hasDbVersion() const {
+        return _dbVersion.is_initialized();
+    }
+
+    const DatabaseVersion& getDbVersion() const {
+        invariant(_dbVersion);
+        return *_dbVersion;
+    }
+
+    void setRuntimeConstants(RuntimeConstants runtimeConstants) {
+        invariant(_updateReq);
+        _updateReq->setRuntimeConstants(std::move(runtimeConstants));
+    }
+
+    bool hasRuntimeConstants() const {
+        invariant(_updateReq);
+        return _updateReq->getRuntimeConstants().has_value();
+    }
+
+    const boost::optional<RuntimeConstants>& getRuntimeConstants() const {
+        invariant(_updateReq);
+        return _updateReq->getRuntimeConstants();
+    }
+
     const write_ops::WriteCommandBase& getWriteCommandBase() const;
     void setWriteCommandBase(write_ops::WriteCommandBase writeCommandBase);
 
@@ -164,9 +193,10 @@ private:
     std::unique_ptr<write_ops::Delete> _deleteReq;
 
     boost::optional<ChunkVersion> _shardVersion;
+    boost::optional<DatabaseVersion> _dbVersion;
 
     boost::optional<BSONObj> _writeConcern;
-    bool _allowImplicitCollectionCreation = true;
+    bool _allowImplicitCollectionCreation = false;
 };
 
 /**

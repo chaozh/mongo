@@ -248,10 +248,12 @@ MONGO_INITIALIZER(AuthorizationBuiltinRoles)(InitializerContext* context) {
         << ActionType::setFreeMonitoring;
 
     clusterManagerRoleDatabaseActions
+        << ActionType::clearJumboFlag
         << ActionType::splitChunk
         << ActionType::moveChunk
         << ActionType::enableSharding
-        << ActionType::splitVector;
+        << ActionType::splitVector
+        << ActionType::refineCollectionShardKey;
 
     return Status::OK();
 }
@@ -304,6 +306,7 @@ void addDbOwnerPrivileges(PrivilegeVector* privileges, StringData dbName) {
 void addEnableShardingPrivileges(PrivilegeVector* privileges) {
     ActionSet enableShardingActions;
     enableShardingActions.addAction(ActionType::enableSharding);
+    enableShardingActions.addAction(ActionType::refineCollectionShardKey);
     Privilege::addPrivilegeToPrivilegeVector(
         privileges, Privilege(ResourcePattern::forAnyNormalResource(), enableShardingActions));
 }

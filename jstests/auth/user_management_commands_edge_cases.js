@@ -257,7 +257,6 @@ function runTest(conn) {
         assert.throws(function() {
             db.getUser(['user1']);
         });
-
     })();
 
     (function testDropUser() {
@@ -277,13 +276,10 @@ function runTest(conn) {
 
 jsTest.log('Test standalone');
 var conn = MongoRunner.runMongod({auth: ''});
-conn.getDB('admin').runCommand({setParameter: 1, newCollectionsUsePowerOf2Sizes: false});
 runTest(conn);
 MongoRunner.stopMongod(conn);
 
 jsTest.log('Test sharding');
-// TODO: Remove 'shardAsReplicaSet: false' when SERVER-32672 is fixed.
-var st = new ShardingTest(
-    {shards: 2, config: 3, keyFile: 'jstests/libs/key1', other: {shardAsReplicaSet: false}});
+var st = new ShardingTest({shards: 2, config: 3, keyFile: 'jstests/libs/key1'});
 runTest(st.s);
 st.stop();

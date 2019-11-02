@@ -32,6 +32,7 @@
 #include "mongo/base/status.h"
 #include "mongo/bson/mutable/document.h"
 #include "mongo/bson/mutable/element.h"
+#include "mongo/bson/unordered_fields_bsonobj_comparator.h"
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/db/auth/address_restriction.h"
 #include "mongo/db/auth/authorization_manager.h"
@@ -39,7 +40,7 @@
 #include "mongo/db/auth/role_graph.h"
 #include "mongo/db/auth/user_management_commands_parser.h"
 #include "mongo/db/update/update_driver.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -89,12 +90,9 @@ Status checkIdMatchesRoleName(const BSONElement& idElement, const RoleName& role
     if (firstDot == std::string::npos || idField.substr(0, firstDot) != roleName.getDB() ||
         idField.substr(firstDot + 1) != roleName.getRole()) {
         return Status(ErrorCodes::FailedToParse,
-                      mongoutils::str::stream()
-                          << "Role document _id fields must be encoded as the string "
-                             "dbname.rolename.  Found "
-                          << idField
-                          << " for "
-                          << roleName.getFullName());
+                      str::stream() << "Role document _id fields must be encoded as the string "
+                                       "dbname.rolename.  Found "
+                                    << idField << " for " << roleName.getFullName());
     }
     return Status::OK();
 }
@@ -297,6 +295,10 @@ Status handleOplogCommand(RoleGraph* roleGraph, const BSONObj& cmdObj) {
         return Status::OK();
     }
 
+    if (cmdName == "commitTransaction" || cmdName == "abortTransaction") {
+        return Status::OK();
+    }
+
     if (cmdName == "dropIndexes" || cmdName == "deleteIndexes") {
         return Status::OK();
     }
@@ -305,9 +307,39 @@ Status handleOplogCommand(RoleGraph* roleGraph, const BSONObj& cmdObj) {
         // We don't care about these if they're not on the roles collection.
         return Status::OK();
     }
+    if (cmdName == "createIndexes" &&
+        cmdObj.firstElement().str() == rolesCollectionNamespace.coll()) {
+        UnorderedFieldsBSONObjComparator instance;
+        if (instance.evaluate(
+                cmdObj ==
+                (BSON("createIndexes"
+                      << "system.roles"
+                      << "v" << 2 << "name"
+                      << "role_1_db_1"
+                      << "key" << BSON("role" << 1 << "db" << 1) << "unique" << true)))) {
+            return Status::OK();
+        }
+    }
+    if (cmdName == "startIndexBuild" || cmdName == "abortIndexBuild" ||
+        cmdName == "commitIndexBuild") {
+        if (cmdObj.firstElement().str() != rolesCollectionNamespace.coll()) {
+            return Status::OK();
+        }
+        for (auto indexSpecElem : cmdObj["indexes"].Array()) {
+            UnorderedFieldsBSONObjComparator instance;
+            auto indexSpec = indexSpecElem.Obj();
+            if (instance.evaluate(
+                    indexSpec ==
+                    (BSON("v" << 2 << "name"
+                              << "role_1_db_1"
+                              << "key" << BSON("role" << 1 << "db" << 1) << "unique" << true)))) {
+                return Status::OK();
+            }
+        }
+    }
 
-    if ((cmdName == "collMod") && (cmdObj.nFields() == 1)) {
-        // We also don't care about empty modifications even if they are on roles collection
+    if (cmdName == "collMod" && cmdObj.nFields() == 1) {
+        // We don't care about empty modifications, even if they are on roles collection.
         return Status::OK();
     }
 
@@ -334,8 +366,7 @@ Status RoleGraph::handleLogOp(OperationContext* opCtx,
         return Status::OK();
     if (op[0] == '\0' || op[1] != '\0') {
         return Status(ErrorCodes::BadValue,
-                      mongoutils::str::stream() << "Unrecognized \"op\" field value \"" << op
-                                                << '"');
+                      str::stream() << "Unrecognized \"op\" field value \"" << op << '"');
     }
 
     if (ns.db() != AuthorizationManager::rolesCollectionNamespace.db())
@@ -370,8 +401,7 @@ Status RoleGraph::handleLogOp(OperationContext* opCtx,
                           "Namespace admin.system.roles is not a valid target for commands");
         default:
             return Status(ErrorCodes::BadValue,
-                          mongoutils::str::stream() << "Unrecognized \"op\" field value \"" << op
-                                                    << '"');
+                          str::stream() << "Unrecognized \"op\" field value \"" << op << '"');
     }
 }
 

@@ -13,6 +13,9 @@ env.Library(
         '$BUILD_DIR/mongo/db/dbhelpers',
         '$BUILD_DIR/mongo/db/views/views',
     ],
+    LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/db/catalog/database_holder',
+    ],
 )
 
 env.Library(
@@ -42,7 +45,7 @@ env.Library(
 )
 
 env.CppUnitTest(
-    target='views_test',
+    target='db_views_test',
     source=[
         'resolved_view_test.cpp',
         'view_catalog_test.cpp',
@@ -51,7 +54,9 @@ env.CppUnitTest(
     ],
     LIBDEPS=[
         'views',
+        'views_mongod',
         '$BUILD_DIR/mongo/db/auth/authmocks',
+        '$BUILD_DIR/mongo/db/catalog/catalog_test_fixture',
         '$BUILD_DIR/mongo/db/query/collation/collator_interface_mock',
         '$BUILD_DIR/mongo/db/query/query_test_service_context',
         '$BUILD_DIR/mongo/db/repl/replmocks',

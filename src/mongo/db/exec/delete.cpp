@@ -33,6 +33,8 @@
 
 #include "mongo/db/exec/delete.h"
 
+#include <memory>
+
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/curop.h"
@@ -43,7 +45,6 @@
 #include "mongo/db/query/canonical_query.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/service_context.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
 
@@ -51,7 +52,6 @@ namespace mongo {
 
 using std::unique_ptr;
 using std::vector;
-using stdx::make_unique;
 
 namespace {
 
@@ -183,18 +183,16 @@ PlanStage::StageState DeleteStage::doWork(WorkingSetID* out) {
     if (_params->returnDeleted) {
         // Save a copy of the document that is about to get deleted, but keep it in the RID_AND_OBJ
         // state in case we need to retry deleting it.
-        BSONObj deletedDoc = member->obj.value();
-        member->obj.setValue(deletedDoc.getOwned());
+        member->makeObjOwnedIfNeeded();
     }
 
     if (_params->removeSaver) {
-        uassertStatusOK(_params->removeSaver->goingToDelete(member->obj.value()));
+        uassertStatusOK(_params->removeSaver->goingToDelete(member->doc.value().toBson()));
     }
 
     // TODO: Do we want to buffer docs and delete them in a group rather than saving/restoring state
     // repeatedly?
 
-    WorkingSetCommon::prepareForSnapshotChange(_ws);
     try {
         child()->saveState();
     } catch (const WriteConflictException&) {
@@ -270,8 +268,8 @@ void DeleteStage::doRestoreStateRequiresCollection() {
 
 unique_ptr<PlanStageStats> DeleteStage::getStats() {
     _commonStats.isEOF = isEOF();
-    unique_ptr<PlanStageStats> ret = make_unique<PlanStageStats>(_commonStats, STAGE_DELETE);
-    ret->specific = make_unique<DeleteStats>(_specificStats);
+    unique_ptr<PlanStageStats> ret = std::make_unique<PlanStageStats>(_commonStats, STAGE_DELETE);
+    ret->specific = std::make_unique<DeleteStats>(_specificStats);
     ret->children.emplace_back(child()->getStats());
     return ret;
 }

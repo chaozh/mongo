@@ -71,9 +71,16 @@ struct CollectionOptions {
     Status validateForStorage() const;
 
     /**
-     * Parses the "options" subfield of the collection info object.
+     * Parses the collection 'options' into the appropriate struct fields.
+     *
+     * When 'kind' is set to ParseKind::parseForStorage, the 'uuid' field is parsed,
+     * otherwise the 'uuid' field is not parsed.
+     *
+     * When 'kind' is set to ParseKind::parseForCommand, the 'idIndex' field is parsed,
+     * otherwise the 'idIndex' field is not parsed.
      */
-    Status parse(const BSONObj& obj, ParseKind kind = parseForCommand);
+    static StatusWith<CollectionOptions> parse(const BSONObj& options,
+                                               ParseKind kind = parseForCommand);
 
     void appendBSON(BSONObjBuilder* builder) const;
     BSONObj toBSON() const;
@@ -94,18 +101,12 @@ struct CollectionOptions {
     bool matchesStorageOptions(const CollectionOptions& other,
                                CollatorFactoryInterface* collatorFactory) const;
 
-    // ----
-
     // Collection UUID. Present for all CollectionOptions parsed for storage.
     OptionalCollectionUUID uuid;
 
     bool capped = false;
     long long cappedSize = 0;
     long long cappedMaxDocs = 0;
-
-    // (MMAPv1) The following 2 are mutually exclusive, can only have one set.
-    long long initialNumExtents = 0;
-    std::vector<long long> initialExtentSizes;
 
     // The behavior of _id index creation when collection created
     void setNoIdIndex() {
@@ -116,14 +117,6 @@ struct CollectionOptions {
         YES,      // create _id index
         NO        // do not create _id index
     } autoIndexId = DEFAULT;
-
-    // user flags
-    enum UserFlags {
-        Flag_UsePowerOf2Sizes = 1 << 0,
-        Flag_NoPadding = 1 << 1,
-    };
-    int flags = Flag_UsePowerOf2Sizes;  // a bitvector of UserFlags
-    bool flagsSet = false;
 
     bool temp = false;
 
@@ -151,4 +144,4 @@ struct CollectionOptions {
     // The aggregation pipeline that defines this view.
     BSONObj pipeline;
 };
-}
+}  // namespace mongo

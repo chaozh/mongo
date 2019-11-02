@@ -31,12 +31,13 @@
 
 #include "mongo/db/repl/rollback_source_impl.h"
 
+#include "mongo/client/dbclient_connection.h"
 #include "mongo/db/cloner.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/db/repl/oplogreader.h"
+#include "mongo/db/repl/replication_auth.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 namespace repl {
@@ -67,11 +68,13 @@ int RollbackSourceImpl::getRollbackId() const {
 
 BSONObj RollbackSourceImpl::getLastOperation() const {
     const Query query = Query().sort(BSON("$natural" << -1));
-    return _getConnection()->findOne(_collectionName, query, 0, QueryOption_SlaveOk);
+    return _getConnection()->findOne(_collectionName, query, nullptr, QueryOption_SlaveOk);
 }
 
 BSONObj RollbackSourceImpl::findOne(const NamespaceString& nss, const BSONObj& filter) const {
-    return _getConnection()->findOne(nss.toString(), filter, NULL, QueryOption_SlaveOk).getOwned();
+    return _getConnection()
+        ->findOne(nss.toString(), filter, nullptr, QueryOption_SlaveOk)
+        .getOwned();
 }
 
 std::pair<BSONObj, NamespaceString> RollbackSourceImpl::findOneByUUID(const std::string& db,
@@ -83,7 +86,7 @@ std::pair<BSONObj, NamespaceString> RollbackSourceImpl::findOneByUUID(const std:
 void RollbackSourceImpl::copyCollectionFromRemote(OperationContext* opCtx,
                                                   const NamespaceString& nss) const {
     std::string errmsg;
-    auto tmpConn = stdx::make_unique<DBClientConnection>();
+    auto tmpConn = std::make_unique<DBClientConnection>();
     uassert(15908,
             errmsg,
             tmpConn->connect(_source, StringData(), errmsg) && replAuthenticate(tmpConn.get()));
@@ -105,9 +108,7 @@ StatusWith<BSONObj> RollbackSourceImpl::getCollectionInfoByUUID(const std::strin
         return StatusWith<BSONObj>(ErrorCodes::NoSuchKey,
                                    str::stream()
                                        << "No collection info found for collection with uuid: "
-                                       << uuid.toString()
-                                       << " in db: "
-                                       << db);
+                                       << uuid.toString() << " in db: " << db);
     }
     invariant(info.size() == 1U);
     return info.front();

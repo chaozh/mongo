@@ -72,13 +72,13 @@ class TaskExecutor;
  * @ cursorManager the ClusterCursorManager on which to register the resulting ClusterClientCursor
  * @ privileges the PrivilegeVector of privileges needed for the original command, to be used for
  * auth checking by GetMore
-*/
+ */
 StatusWith<BSONObj> storePossibleCursor(OperationContext* opCtx,
                                         const ShardId& shardId,
                                         const HostAndPort& server,
                                         const BSONObj& cmdResult,
                                         const NamespaceString& requestedNss,
-                                        executor::TaskExecutor* executor,
+                                        std::shared_ptr<executor::TaskExecutor> executor,
                                         ClusterCursorManager* cursorManager,
                                         PrivilegeVector privileges,
                                         TailableModeEnum tailableMode = TailableModeEnum::kNormal);

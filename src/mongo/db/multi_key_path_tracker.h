@@ -56,7 +56,18 @@ class MultikeyPathTracker {
 public:
     static const OperationContext::Decoration<MultikeyPathTracker> get;
 
+    /**
+     * Returns a string representation of MultikeyPaths for logging.
+     */
+    static std::string dumpMultikeyPaths(const MultikeyPaths& multikeyPaths);
+
     static void mergeMultikeyPaths(MultikeyPaths* toMergeInto, const MultikeyPaths& newPaths);
+
+    /**
+     * Returns whether paths contains only empty sets, i.e., {{}, {}, {}}. This includes the case
+     * where the MultikeyPaths vector itself has no elements, e.g., {}.
+     */
+    static bool isMultikeyPathsTrivial(const MultikeyPaths& paths);
 
     // Decoration requires a default constructor.
     MultikeyPathTracker() = default;

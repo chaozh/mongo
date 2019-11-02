@@ -54,7 +54,6 @@
 #include "mongo/db/storage/wiredtiger/wiredtiger_session_cache.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_size_storer.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_util.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/unittest/temp_dir.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/clock_source_mock.h"
@@ -64,9 +63,9 @@
 namespace mongo {
 namespace {
 
-using std::unique_ptr;
 using std::string;
 using std::stringstream;
+using std::unique_ptr;
 
 class WiredTigerHarnessHelper final : public RecordStoreHarnessHelper {
 public:
@@ -79,6 +78,7 @@ public:
                   &_cs,
                   extraStrings.toString(),
                   1,
+                  0,
                   false,
                   false,
                   false,
@@ -123,8 +123,9 @@ public:
         params.cappedMaxDocs = -1;
         params.cappedCallback = nullptr;
         params.sizeStorer = nullptr;
+        params.tracksSizeAdjustments = true;
 
-        auto ret = stdx::make_unique<StandardWiredTigerRecordStore>(&_engine, &opCtx, params);
+        auto ret = std::make_unique<StandardWiredTigerRecordStore>(&_engine, &opCtx, params);
         ret->postConstructorInit(&opCtx);
         return std::move(ret);
     }
@@ -169,8 +170,9 @@ public:
         params.cappedMaxDocs = cappedMaxDocs;
         params.cappedCallback = nullptr;
         params.sizeStorer = nullptr;
+        params.tracksSizeAdjustments = true;
 
-        auto ret = stdx::make_unique<StandardWiredTigerRecordStore>(&_engine, &opCtx, params);
+        auto ret = std::make_unique<StandardWiredTigerRecordStore>(&_engine, &opCtx, params);
         ret->postConstructorInit(&opCtx);
         return std::move(ret);
     }
@@ -194,12 +196,12 @@ private:
     WiredTigerKVEngine _engine;
 };
 
-std::unique_ptr<HarnessHelper> makeHarnessHelper() {
-    return stdx::make_unique<WiredTigerHarnessHelper>();
+std::unique_ptr<RecordStoreHarnessHelper> makeWTRSHarnessHelper() {
+    return std::make_unique<WiredTigerHarnessHelper>();
 }
 
-MONGO_INITIALIZER(RegisterHarnessFactory)(InitializerContext* const) {
-    mongo::registerHarnessHelperFactory(makeHarnessHelper);
+MONGO_INITIALIZER(RegisterRecordStoreHarnessFactory)(InitializerContext* const) {
+    mongo::registerRecordStoreHarnessHelperFactory(makeWTRSHarnessHelper);
     return Status::OK();
 }
 
@@ -242,7 +244,7 @@ TEST(WiredTigerRecordStoreTest, SizeStorer1) {
         ASSERT_EQUALS(N, rs->numRecords(opCtx.get()));
     }
 
-    rs.reset(NULL);
+    rs.reset(nullptr);
 
     {
         auto& info = *ss.load(uri);
@@ -261,6 +263,7 @@ TEST(WiredTigerRecordStoreTest, SizeStorer1) {
         params.cappedMaxDocs = -1;
         params.cappedCallback = nullptr;
         params.sizeStorer = &ss;
+        params.tracksSizeAdjustments = true;
 
         auto ret = new StandardWiredTigerRecordStore(nullptr, opCtx.get(), params);
         ret->postConstructorInit(opCtx.get());

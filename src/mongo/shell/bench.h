@@ -36,15 +36,16 @@
 #include "mongo/client/dbclient_base.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/logical_session_id.h"
+#include "mongo/db/ops/write_ops_parsers.h"
 #include "mongo/platform/atomic_word.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/stdx/condition_variable.h"
-#include "mongo/stdx/mutex.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/util/timer.h"
 
 namespace pcrecpp {
 class RE;
-}  // namespace pcrecpp;
+}  // namespace pcrecpp
 
 namespace mongo {
 
@@ -116,7 +117,7 @@ struct BenchRunOp {
     bool showResult = false;
     std::string target;
     bool throwGLE = false;
-    BSONObj update;
+    write_ops::UpdateModification update;
     bool upsert = false;
     bool useCheck = false;
     bool useReadCmd = false;
@@ -146,7 +147,8 @@ struct BenchRunOp {
  * Configuration object describing a bench run activity.
  */
 class BenchRunConfig {
-    MONGO_DISALLOW_COPYING(BenchRunConfig);
+    BenchRunConfig(const BenchRunConfig&) = delete;
+    BenchRunConfig& operator=(const BenchRunConfig&) = delete;
 
 public:
     /**
@@ -314,7 +316,8 @@ private:
  * In all cases, the counter objects must outlive the trace object.
  */
 class BenchRunEventTrace {
-    MONGO_DISALLOW_COPYING(BenchRunEventTrace);
+    BenchRunEventTrace(const BenchRunEventTrace&) = delete;
+    BenchRunEventTrace& operator=(const BenchRunEventTrace&) = delete;
 
 public:
     explicit BenchRunEventTrace(BenchRunEventCounter* eventCounter) {
@@ -381,7 +384,8 @@ struct BenchRunStats {
  * Logically, the states are "starting up", "running" and "finished."
  */
 class BenchRunState {
-    MONGO_DISALLOW_COPYING(BenchRunState);
+    BenchRunState(const BenchRunState&) = delete;
+    BenchRunState& operator=(const BenchRunState&) = delete;
 
 public:
     enum State { BRS_STARTING_UP, BRS_RUNNING, BRS_FINISHED };
@@ -427,9 +431,9 @@ public:
     bool shouldWorkerFinish() const;
 
     /**
-    * Predicate that workers call to see if they should start collecting stats (as a result
-    * of a call to tellWorkersToCollectStats()).
-    */
+     * Predicate that workers call to see if they should start collecting stats (as a result
+     * of a call to tellWorkersToCollectStats()).
+     */
     bool shouldWorkerCollectStats() const;
 
     /**
@@ -445,7 +449,7 @@ public:
     void onWorkerFinished();
 
 private:
-    mutable stdx::mutex _mutex;
+    mutable Mutex _mutex = MONGO_MAKE_LATCH("BenchRunState::_mutex");
 
     stdx::condition_variable _stateChangeCondition;
 
@@ -462,7 +466,8 @@ private:
  * Represents the behavior of one thread working in a bench run activity.
  */
 class BenchRunWorker {
-    MONGO_DISALLOW_COPYING(BenchRunWorker);
+    BenchRunWorker(const BenchRunWorker&) = delete;
+    BenchRunWorker& operator=(const BenchRunWorker&) = delete;
 
 public:
     /**
@@ -526,7 +531,8 @@ private:
  * Object representing a "bench run" activity.
  */
 class BenchRunner {
-    MONGO_DISALLOW_COPYING(BenchRunner);
+    BenchRunner(const BenchRunner&) = delete;
+    BenchRunner& operator=(const BenchRunner&) = delete;
 
 public:
     /**
@@ -593,7 +599,7 @@ public:
 
 private:
     // TODO: Same as for createWithConfig.
-    static stdx::mutex _staticMutex;
+    static Mutex _staticMutex;
     static std::map<OID, BenchRunner*> _activeRuns;
 
     OID _oid;

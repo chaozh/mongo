@@ -29,11 +29,15 @@
 
 #pragma once
 
+#include <memory>
+
 #include "mongo/db/pipeline/exchange_spec_gen.h"
 #include "mongo/db/pipeline/lite_parsed_pipeline.h"
 #include "mongo/db/pipeline/pipeline.h"
 #include "mongo/s/catalog/type_chunk.h"
+#include "mongo/s/query/cluster_client_cursor_guard.h"
 #include "mongo/s/query/cluster_client_cursor_impl.h"
+#include "mongo/s/query/cluster_client_cursor_params.h"
 #include "mongo/s/query/owned_remote_cursor.h"
 #include "mongo/s/shard_id.h"
 
@@ -77,12 +81,12 @@ SplitPipeline splitPipeline(std::unique_ptr<Pipeline, PipelineDeleter> pipeline)
  * front of 'mergePipeline'.
  */
 void addMergeCursorsSource(Pipeline* mergePipeline,
-                           const LiteParsedPipeline&,
                            BSONObj cmdSentToShards,
-                           std::vector<OwnedRemoteCursor> remoteCursors,
+                           std::vector<OwnedRemoteCursor> ownedCursors,
                            const std::vector<ShardId>& targetedShards,
                            boost::optional<BSONObj> shardCursorsSortSpec,
-                           executor::TaskExecutor*);
+                           std::shared_ptr<executor::TaskExecutor> executor,
+                           bool hasChangeStream);
 
 /**
  * Builds a ClusterClientCursor which will execute 'pipeline'. If 'pipeline' consists entirely of

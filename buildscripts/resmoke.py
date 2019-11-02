@@ -1,7 +1,5 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 """Command line utility for executing MongoDB tests of all kinds."""
-
-from __future__ import absolute_import
 
 import os.path
 import platform
@@ -64,26 +62,39 @@ class Resmoke(object):  # pylint: disable=too-many-instance-attributes
         self._resmoke_logger = self._exec_logger.new_resmoke_logger()
 
     def _exit_logging(self):
-        if not self._interrupted:
-            logging.flush.stop_thread()
+        if self._interrupted:
+            # We want to exit as quickly as possible when interrupted by a user and therefore don't
+            # bother waiting for all log output to be flushed to logkeeper.
+            return
+
+        if logging.buildlogger.is_log_output_incomplete():
+            # If we already failed to write log output to logkeeper, then we don't bother waiting
+            # for any remaining log output to be flushed as it'll likely fail too. Exiting without
+            # joining the flush thread here also means that resmoke.py won't hang due a logger from
+            # a fixture or a background hook not being closed.
+            self._exit_on_incomplete_logging()
+            return
+
+        logging.flush.stop_thread()
+
+        if logging.buildlogger.is_log_output_incomplete():
             self._exit_on_incomplete_logging()
 
     def _exit_on_incomplete_logging(self):
-        if logging.buildlogger.is_log_output_incomplete():
-            if self._exit_code == 0:
-                # We don't anticipate users to look at passing Evergreen tasks very often that even
-                # if the log output is incomplete, we'd still rather not show anything in the
-                # Evergreen UI or cause a JIRA ticket to be created.
-                self._resmoke_logger.info(
-                    "We failed to flush all log output to logkeeper but all tests passed, so"
-                    " ignoring.")
-                return
-
-            exit_code = errors.LoggerRuntimeConfigError.EXIT_CODE
+        if self._exit_code == 0:
+            # We don't anticipate users to look at passing Evergreen tasks very often that even if
+            # the log output is incomplete, we'd still rather not show anything in the Evergreen UI
+            # or cause a JIRA ticket to be created.
             self._resmoke_logger.info(
-                "Exiting with code %d rather than requested code %d because we failed to flush all"
-                " log output to logkeeper.", exit_code, self._exit_code)
-            self.exit(exit_code)
+                "We failed to flush all log output to logkeeper but all tests passed, so"
+                " ignoring.")
+            return
+
+        exit_code = errors.LoggerRuntimeConfigError.EXIT_CODE
+        self._resmoke_logger.info(
+            "Exiting with code %d rather than requested code %d because we failed to flush all"
+            " log output to logkeeper.", exit_code, self._exit_code)
+        self.exit(exit_code)
 
     def run(self):
         """Run resmoke."""
@@ -144,7 +155,14 @@ class Resmoke(object):  # pylint: disable=too-many-instance-attributes
 
     def run_tests(self):
         """Run the suite and tests specified."""
-        self._resmoke_logger.info("resmoke.py invocation: %s", " ".join(sys.argv))
+        self._resmoke_logger.info("verbatim resmoke.py invocation: %s", " ".join(sys.argv))
+
+        if config.EVERGREEN_TASK_ID:
+            local_args = parser.to_local_args()
+            self._resmoke_logger.info("resmoke.py invocation for local usage: %s %s",
+                                      os.path.join("buildscripts", "resmoke.py"),
+                                      " ".join(local_args))
+
         suites = None
         try:
             suites = self._get_suites()
@@ -318,11 +336,14 @@ class Resmoke(object):  # pylint: disable=too-many-instance-attributes
         jasper_process.Process.jasper_pb2_grpc = jasper_pb2_grpc
 
         curator_path = "build/curator"
-        git_hash = "1b8c7344aa1daed0846e32204dffb21cfdda208c"
+        if sys.platform == "win32":
+            curator_path += ".exe"
+        git_hash = "d846f0c875716e9377044ab2a50542724369662a"
         curator_exists = os.path.isfile(curator_path)
         curator_same_version = False
         if curator_exists:
-            curator_version = subprocess.check_output([curator_path, "--version"]).split()
+            curator_version = subprocess.check_output([curator_path,
+                                                       "--version"]).decode('utf-8').split()
             curator_same_version = git_hash in curator_version
 
         if curator_exists and not curator_same_version:

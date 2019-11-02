@@ -31,37 +31,21 @@
 
 #include "mongo/s/query/cluster_client_cursor_impl.h"
 
+#include <memory>
+
 #include "mongo/s/query/router_stage_limit.h"
 #include "mongo/s/query/router_stage_merge.h"
 #include "mongo/s/query/router_stage_remove_metadata_fields.h"
 #include "mongo/s/query/router_stage_skip.h"
-#include "mongo/stdx/memory.h"
 
 namespace mongo {
 
-ClusterClientCursorGuard::ClusterClientCursorGuard(OperationContext* opCtx,
-                                                   std::unique_ptr<ClusterClientCursor> ccc)
-    : _opCtx(opCtx), _ccc(std::move(ccc)) {}
-
-ClusterClientCursorGuard::~ClusterClientCursorGuard() {
-    if (_ccc && !_ccc->remotesExhausted()) {
-        _ccc->kill(_opCtx);
-    }
-}
-
-ClusterClientCursor* ClusterClientCursorGuard::operator->() {
-    return _ccc.get();
-}
-
-std::unique_ptr<ClusterClientCursor> ClusterClientCursorGuard::releaseCursor() {
-    return std::move(_ccc);
-}
-
-ClusterClientCursorGuard ClusterClientCursorImpl::make(OperationContext* opCtx,
-                                                       executor::TaskExecutor* executor,
-                                                       ClusterClientCursorParams&& params) {
+ClusterClientCursorGuard ClusterClientCursorImpl::make(
+    OperationContext* opCtx,
+    std::shared_ptr<executor::TaskExecutor> executor,
+    ClusterClientCursorParams&& params) {
     std::unique_ptr<ClusterClientCursor> cursor(new ClusterClientCursorImpl(
-        opCtx, executor, std::move(params), opCtx->getLogicalSessionId()));
+        opCtx, std::move(executor), std::move(params), opCtx->getLogicalSessionId()));
     return ClusterClientCursorGuard(opCtx, std::move(cursor));
 }
 
@@ -74,11 +58,11 @@ ClusterClientCursorGuard ClusterClientCursorImpl::make(OperationContext* opCtx,
 }
 
 ClusterClientCursorImpl::ClusterClientCursorImpl(OperationContext* opCtx,
-                                                 executor::TaskExecutor* executor,
+                                                 std::shared_ptr<executor::TaskExecutor> executor,
                                                  ClusterClientCursorParams&& params,
                                                  boost::optional<LogicalSessionId> lsid)
     : _params(std::move(params)),
-      _root(buildMergerPlan(opCtx, executor, &_params)),
+      _root(buildMergerPlan(opCtx, std::move(executor), &_params)),
       _lsid(lsid),
       _opCtx(opCtx),
       _createdDate(opCtx->getServiceContext()->getPreciseClockSource()->now()),
@@ -222,7 +206,9 @@ boost::optional<ReadPreferenceSetting> ClusterClientCursorImpl::getReadPreferenc
 }
 
 std::unique_ptr<RouterExecStage> ClusterClientCursorImpl::buildMergerPlan(
-    OperationContext* opCtx, executor::TaskExecutor* executor, ClusterClientCursorParams* params) {
+    OperationContext* opCtx,
+    std::shared_ptr<executor::TaskExecutor> executor,
+    ClusterClientCursorParams* params) {
     const auto skip = params->skip;
     const auto limit = params->limit;
 
@@ -230,18 +216,18 @@ std::unique_ptr<RouterExecStage> ClusterClientCursorImpl::buildMergerPlan(
         std::make_unique<RouterStageMerge>(opCtx, executor, params->extractARMParams());
 
     if (skip) {
-        root = stdx::make_unique<RouterStageSkip>(opCtx, std::move(root), *skip);
+        root = std::make_unique<RouterStageSkip>(opCtx, std::move(root), *skip);
     }
 
     if (limit) {
-        root = stdx::make_unique<RouterStageLimit>(opCtx, std::move(root), *limit);
+        root = std::make_unique<RouterStageLimit>(opCtx, std::move(root), *limit);
     }
 
     const bool hasSort = !params->sort.isEmpty();
     if (hasSort) {
         // Strip out the sort key after sorting.
-        root = stdx::make_unique<RouterStageRemoveMetadataFields>(
-            opCtx, std::move(root), std::vector<StringData>{AsyncResultsMerger::kSortKeyField});
+        root = std::make_unique<RouterStageRemoveMetadataFields>(
+            opCtx, std::move(root), StringDataSet{AsyncResultsMerger::kSortKeyField});
     }
 
     return root;

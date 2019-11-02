@@ -45,22 +45,22 @@ namespace PdfileTests {
 namespace Insert {
 class Base {
 public:
-    Base() : _lk(&_opCtx), _context(&_opCtx, ns()) {}
+    Base() : _lk(&_opCtx), _context(&_opCtx, nss().ns()) {}
 
     virtual ~Base() {
         if (!collection())
             return;
         WriteUnitOfWork wunit(&_opCtx);
-        _context.db()->dropCollection(&_opCtx, ns()).transitional_ignore();
+        _context.db()->dropCollection(&_opCtx, nss()).transitional_ignore();
         wunit.commit();
     }
 
 protected:
-    const char* ns() {
-        return "unittests.pdfiletests.Insert";
+    static NamespaceString nss() {
+        return NamespaceString("unittests.pdfiletests.Insert");
     }
     Collection* collection() {
-        return _context.db()->getCollection(&_opCtx, ns());
+        return CollectionCatalog::get(&_opCtx).lookupCollectionByNamespace(nss());
     }
 
     const ServiceContext::UniqueOperationContext _opCtxPtr = cc().makeOperationContext();
@@ -75,16 +75,19 @@ public:
         WriteUnitOfWork wunit(&_opCtx);
         BSONObj x = BSON("x" << 1);
         ASSERT(x["_id"].type() == 0);
-        Collection* collection =
-            _context.db()->getOrCreateCollection(&_opCtx, NamespaceString(ns()));
+        Collection* coll = CollectionCatalog::get(&_opCtx).lookupCollectionByNamespace(nss());
+        if (!coll) {
+            coll = _context.db()->createCollection(&_opCtx, nss());
+        }
+        ASSERT(coll);
         OpDebug* const nullOpDebug = nullptr;
-        ASSERT(!collection->insertDocument(&_opCtx, InsertStatement(x), nullOpDebug, true).isOK());
+        ASSERT(!coll->insertDocument(&_opCtx, InsertStatement(x), nullOpDebug, true).isOK());
 
         StatusWith<BSONObj> fixed = fixDocumentForInsert(_opCtx.getServiceContext(), x);
         ASSERT(fixed.isOK());
         x = fixed.getValue();
         ASSERT(x["_id"].type() == jstOID);
-        ASSERT(collection->insertDocument(&_opCtx, InsertStatement(x), nullOpDebug, true).isOK());
+        ASSERT(coll->insertDocument(&_opCtx, InsertStatement(x), nullOpDebug, true).isOK());
         wunit.commit();
     }
 };
@@ -155,9 +158,9 @@ public:
 };
 }  // namespace Insert
 
-class All : public Suite {
+class All : public OldStyleSuiteSpecification {
 public:
-    All() : Suite("pdfile") {}
+    All() : OldStyleSuiteSpecification("pdfile") {}
 
     void setupTests() {
         add<Insert::InsertNoId>();
@@ -167,6 +170,6 @@ public:
     }
 };
 
-SuiteInstance<All> myall;
+OldStyleSuiteInitializer<All> myall;
 
 }  // namespace PdfileTests

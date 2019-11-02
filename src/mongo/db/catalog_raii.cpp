@@ -31,24 +31,16 @@
 
 #include "mongo/db/catalog_raii.h"
 
+#include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/catalog/database_holder.h"
-#include "mongo/db/catalog/uuid_catalog.h"
 #include "mongo/db/s/database_sharding_state.h"
 #include "mongo/db/views/view_catalog.h"
-#include "mongo/util/fail_point_service.h"
+#include "mongo/util/fail_point.h"
 
 namespace mongo {
 namespace {
 
 MONGO_FAIL_POINT_DEFINE(setAutoGetCollectionWait);
-
-void uassertLockTimeout(std::string resourceName, LockMode lockMode, bool isLocked) {
-    uassert(ErrorCodes::LockTimeout,
-            str::stream() << "Failed to acquire " << modeName(lockMode) << " lock for "
-                          << resourceName
-                          << " due to lock timeout.",
-            isLocked);
-}
 
 }  // namespace
 
@@ -57,30 +49,32 @@ AutoGetDb::AutoGetDb(OperationContext* opCtx, StringData dbName, LockMode mode, 
           auto databaseHolder = DatabaseHolder::get(opCtx);
           return databaseHolder->getDb(opCtx, dbName);
       }()) {
-    if (_db) {
-        auto& dss = DatabaseShardingState::get(_db);
-        auto dssLock = DatabaseShardingState::DSSLock::lock(opCtx, &dss);
-        dss.checkDbVersion(opCtx, dssLock);
-    }
+    auto dss = DatabaseShardingState::get(opCtx, dbName);
+    auto dssLock = DatabaseShardingState::DSSLock::lockShared(opCtx, dss);
+    dss->checkDbVersion(opCtx, dssLock);
 }
 
 AutoGetCollection::AutoGetCollection(OperationContext* opCtx,
                                      const NamespaceStringOrUUID& nsOrUUID,
-                                     LockMode modeDB,
                                      LockMode modeColl,
                                      ViewMode viewMode,
                                      Date_t deadline)
     : _autoDb(opCtx,
               !nsOrUUID.dbname().empty() ? nsOrUUID.dbname() : nsOrUUID.nss()->db(),
-              modeDB,
-              deadline),
-      _resolvedNss(resolveNamespaceStringOrUUID(opCtx, nsOrUUID)) {
-    _collLock.emplace(opCtx->lockState(), _resolvedNss.ns(), modeColl, deadline);
-    // Wait for a configured amount of time after acquiring locks if the failpoint is enabled
-    MONGO_FAIL_POINT_BLOCK(setAutoGetCollectionWait, customWait) {
-        const BSONObj& data = customWait.getData();
-        sleepFor(Milliseconds(data["waitForMillis"].numberInt()));
+              isSharedLockMode(modeColl) ? MODE_IS : MODE_IX,
+              deadline) {
+    if (auto& nss = nsOrUUID.nss()) {
+        uassert(ErrorCodes::InvalidNamespace,
+                str::stream() << "Namespace " << *nss << " is not a valid collection name",
+                nss->isValid());
     }
+
+    _collLock.emplace(opCtx, nsOrUUID, modeColl, deadline);
+    _resolvedNss = CollectionCatalog::get(opCtx).resolveNamespaceStringOrUUID(nsOrUUID);
+
+    // Wait for a configured amount of time after acquiring locks if the failpoint is enabled
+    setAutoGetCollectionWait.execute(
+        [&](const BSONObj& data) { sleepFor(Milliseconds(data["waitForMillis"].numberInt())); });
 
     Database* const db = _autoDb.getDb();
     invariant(!nsOrUUID.uuid() || db,
@@ -101,18 +95,19 @@ AutoGetCollection::AutoGetCollection(OperationContext* opCtx,
     if (!db)
         return;
 
-    _coll = db->getCollection(opCtx, _resolvedNss);
+    _coll = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(_resolvedNss);
     invariant(!nsOrUUID.uuid() || _coll,
               str::stream() << "Collection for " << _resolvedNss.ns()
                             << " disappeared after successufully resolving "
                             << nsOrUUID.toString());
 
     if (_coll) {
-        // Unlike read concern majority, read concern snapshot cannot yield and wait when there are
-        // pending catalog changes. Instead, we must return an error in such situations. We ignore
-        // this restriction for the oplog, since it never has pending catalog changes.
-        auto readConcernLevel = repl::ReadConcernArgs::get(opCtx).getLevel();
-        if (readConcernLevel == repl::ReadConcernLevel::kSnapshotReadConcern &&
+        // If we are in a transaction and have a read timestamp, we cannot yield and wait when there
+        // are pending catalog changes. Instead, we must return an error in such situations. We
+        // ignore this restriction for the oplog, since it never has pending catalog changes.
+        if (opCtx->inMultiDocumentTransaction() &&
+            opCtx->recoveryUnit()->getTimestampReadSource() !=
+                RecoveryUnit::ReadSource::kNoTimestamp &&
             _resolvedNss != NamespaceString::kRsOplogNamespace) {
             auto mySnapshot = opCtx->recoveryUnit()->getPointInTimeReadTimestamp();
             if (mySnapshot) {
@@ -121,8 +116,7 @@ AutoGetCollection::AutoGetCollection(OperationContext* opCtx,
                         str::stream()
                             << "Unable to read from a snapshot due to pending collection catalog "
                                "changes; please retry the operation. Snapshot timestamp is "
-                            << mySnapshot->toString()
-                            << ". Collection minimum is "
+                            << mySnapshot->toString() << ". Collection minimum is "
                             << minSnapshot->toString(),
                         !minSnapshot || *mySnapshot >= *minSnapshot);
             }
@@ -138,59 +132,54 @@ AutoGetCollection::AutoGetCollection(OperationContext* opCtx,
             !_view || viewMode == kViewsPermitted);
 }
 
-NamespaceString AutoGetCollection::resolveNamespaceStringOrUUID(OperationContext* opCtx,
-                                                                NamespaceStringOrUUID nsOrUUID) {
-    if (nsOrUUID.nss())
-        return *nsOrUUID.nss();
-
-    UUIDCatalog& uuidCatalog = UUIDCatalog::get(opCtx);
-    auto resolvedNss = uuidCatalog.lookupNSSByUUID(*nsOrUUID.uuid());
-
-    uassert(ErrorCodes::NamespaceNotFound,
-            str::stream() << "Unable to resolve " << nsOrUUID.toString(),
-            resolvedNss.isValid());
-
-    uassert(ErrorCodes::NamespaceNotFound,
-            str::stream() << "UUID " << nsOrUUID.toString() << " specified in " << nsOrUUID.dbname()
-                          << " resolved to a collection in a different database: "
-                          << resolvedNss.toString(),
-            resolvedNss.db() == nsOrUUID.dbname());
-
-    return resolvedNss;
-}
-
 AutoGetOrCreateDb::AutoGetOrCreateDb(OperationContext* opCtx,
                                      StringData dbName,
                                      LockMode mode,
-                                     Date_t deadline) {
+                                     Date_t deadline)
+    : _autoDb(opCtx, dbName, mode, deadline) {
     invariant(mode == MODE_IX || mode == MODE_X);
 
-    _autoDb.emplace(opCtx, dbName, mode, deadline);
-    _db = _autoDb->getDb();
-
-    // If the database didn't exist, relock in MODE_X
+    _db = _autoDb.getDb();
     if (!_db) {
-        if (mode != MODE_X) {
-            _autoDb.emplace(opCtx, dbName, MODE_X, deadline);
-        }
-
         auto databaseHolder = DatabaseHolder::get(opCtx);
         _db = databaseHolder->openDb(opCtx, dbName, &_justCreated);
     }
 
-    auto& dss = DatabaseShardingState::get(_db);
-    auto dssLock = DatabaseShardingState::DSSLock::lock(opCtx, &dss);
-    dss.checkDbVersion(opCtx, dssLock);
+    auto dss = DatabaseShardingState::get(opCtx, dbName);
+    auto dssLock = DatabaseShardingState::DSSLock::lockShared(opCtx, dss);
+    dss->checkDbVersion(opCtx, dssLock);
 }
 
-ConcealUUIDCatalogChangesBlock::ConcealUUIDCatalogChangesBlock(OperationContext* opCtx)
+ConcealCollectionCatalogChangesBlock::ConcealCollectionCatalogChangesBlock(OperationContext* opCtx)
     : _opCtx(opCtx) {
-    UUIDCatalog::get(_opCtx).onCloseCatalog(_opCtx);
+    CollectionCatalog::get(_opCtx).onCloseCatalog(_opCtx);
 }
 
-ConcealUUIDCatalogChangesBlock::~ConcealUUIDCatalogChangesBlock() {
+ConcealCollectionCatalogChangesBlock::~ConcealCollectionCatalogChangesBlock() {
     invariant(_opCtx);
-    UUIDCatalog::get(_opCtx).onOpenCatalog(_opCtx);
+    CollectionCatalog::get(_opCtx).onOpenCatalog(_opCtx);
+}
+
+ReadSourceScope::ReadSourceScope(OperationContext* opCtx,
+                                 RecoveryUnit::ReadSource readSource,
+                                 boost::optional<Timestamp> provided)
+    : _opCtx(opCtx), _originalReadSource(opCtx->recoveryUnit()->getTimestampReadSource()) {
+
+    if (_originalReadSource == RecoveryUnit::ReadSource::kProvided) {
+        _originalReadTimestamp = *_opCtx->recoveryUnit()->getPointInTimeReadTimestamp();
+    }
+
+    _opCtx->recoveryUnit()->abandonSnapshot();
+    _opCtx->recoveryUnit()->setTimestampReadSource(readSource, provided);
+}
+
+ReadSourceScope::~ReadSourceScope() {
+    _opCtx->recoveryUnit()->abandonSnapshot();
+    if (_originalReadSource == RecoveryUnit::ReadSource::kProvided) {
+        _opCtx->recoveryUnit()->setTimestampReadSource(_originalReadSource, _originalReadTimestamp);
+    } else {
+        _opCtx->recoveryUnit()->setTimestampReadSource(_originalReadSource);
+    }
 }
 
 }  // namespace mongo

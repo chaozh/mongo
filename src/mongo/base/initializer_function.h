@@ -29,8 +29,9 @@
 
 #pragma once
 
+#include <functional>
+
 #include "mongo/base/status.h"
-#include "mongo/stdx/functional.h"
 
 namespace mongo {
 
@@ -43,15 +44,15 @@ class DeinitializerContext;
  * On successful execution, an InitializerFunction returns Status::OK().  It may
  * inspect and mutate the supplied InitializerContext.
  */
-typedef stdx::function<Status(InitializerContext*)> InitializerFunction;
+typedef std::function<Status(InitializerContext*)> InitializerFunction;
 
 /**
-* A DeinitializerFunction implements the behavior of a deinitializer operation.
-*
-* On successful execution, a DeinitializerFunction returns Status::OK(). It may
-* inspect and mutate the supplied DeinitializerContext.
-*/
-typedef stdx::function<Status(DeinitializerContext*)> DeinitializerFunction;
+ * A DeinitializerFunction implements the behavior of a deinitializer operation.
+ *
+ * On successful execution, a DeinitializerFunction returns Status::OK(). It may
+ * inspect and mutate the supplied DeinitializerContext.
+ */
+typedef std::function<Status(DeinitializerContext*)> DeinitializerFunction;
 
 
 }  // namespace mongo

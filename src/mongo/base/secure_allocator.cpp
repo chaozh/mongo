@@ -43,10 +43,8 @@
 #include <sys/types.h>
 #endif
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/base/init.h"
-#include "mongo/stdx/memory.h"
-#include "mongo/stdx/mutex.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/stdx/unordered_map.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/log.h"
@@ -115,7 +113,7 @@ void EnablePrivilege(const wchar_t* name) {
  * size, and then raising the working set. This is the same reason that "i++" has race conditions
  * across multiple threads.
  */
-stdx::mutex workingSizeMutex;
+stdx::mutex workingSizeMutex;  // NOLINT
 
 /**
  * There is a minimum gap between the minimum working set size and maximum working set size.
@@ -290,7 +288,8 @@ void systemDeallocate(void* ptr, std::size_t bytes) {
  * page size and allocate returns aligned pointers.
  */
 class Allocation {
-    MONGO_DISALLOW_COPYING(Allocation);
+    Allocation(const Allocation&) = delete;
+    Allocation& operator=(const Allocation&) = delete;
 
 public:
     explicit Allocation(std::size_t initialAllocation) {

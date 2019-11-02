@@ -46,7 +46,8 @@ namespace mongo {
  * retrieves chunk metadata from the shard persisted chunk metadata.
  */
 class ShardServerCatalogCacheLoader : public CatalogCacheLoader {
-    MONGO_DISALLOW_COPYING(ShardServerCatalogCacheLoader);
+    ShardServerCatalogCacheLoader(const ShardServerCatalogCacheLoader&) = delete;
+    ShardServerCatalogCacheLoader& operator=(const ShardServerCatalogCacheLoader&) = delete;
 
 public:
     ShardServerCatalogCacheLoader(std::unique_ptr<CatalogCacheLoader> configServerLoader);
@@ -68,6 +69,8 @@ public:
      */
     void onStepUp() override;
 
+    void shutDown() override;
+
     /**
      * Sets any notifications waiting for this version to arrive and invalidates the catalog cache's
      * chunk metadata for collection 'nss' so that the next caller provokes a refresh.
@@ -81,7 +84,7 @@ public:
 
     void getDatabase(
         StringData dbName,
-        stdx::function<void(OperationContext*, StatusWith<DatabaseType>)> callbackFn) override;
+        std::function<void(OperationContext*, StatusWith<DatabaseType>)> callbackFn) override;
 
     void waitForCollectionFlush(OperationContext* opCtx, const NamespaceString& nss) override;
 
@@ -98,7 +101,8 @@ private:
      * metadata for a specific collection.
      */
     struct collAndChunkTask {
-        MONGO_DISALLOW_COPYING(collAndChunkTask);
+        collAndChunkTask(const collAndChunkTask&) = delete;
+        collAndChunkTask& operator=(const collAndChunkTask&) = delete;
         collAndChunkTask(collAndChunkTask&&) = default;
 
         /**
@@ -200,7 +204,7 @@ private:
          * same task object on which it was called because it might have been deleted during the
          * unlocked period.
          */
-        void waitForActiveTaskCompletion(stdx::unique_lock<stdx::mutex>& lg);
+        void waitForActiveTaskCompletion(stdx::unique_lock<Latch>& lg);
 
         /**
          * Checks whether 'term' matches the term of the latest task in the task list. This is
@@ -234,7 +238,8 @@ private:
      * metadata for a specific database.
      */
     struct DBTask {
-        MONGO_DISALLOW_COPYING(DBTask);
+        DBTask(const DBTask&) = delete;
+        DBTask& operator=(const DBTask&) = delete;
         DBTask(DBTask&&) = default;
 
         /**
@@ -309,7 +314,7 @@ private:
          * same task object on which it was called because it might have been deleted during the
          * unlocked period.
          */
-        void waitForActiveTaskCompletion(stdx::unique_lock<stdx::mutex>& lg);
+        void waitForActiveTaskCompletion(stdx::unique_lock<Latch>& lg);
 
         /**
          * Checks whether 'term' matches the term of the latest task in the task list. This is
@@ -339,7 +344,7 @@ private:
         OperationContext* opCtx,
         const NamespaceString& nss,
         const ChunkVersion& catalogCacheSinceVersion,
-        stdx::function<void(OperationContext*, StatusWith<CollectionAndChangedChunks>)> callbackFn,
+        std::function<void(OperationContext*, StatusWith<CollectionAndChangedChunks>)> callbackFn,
         std::shared_ptr<Notification<void>> notify);
 
     /**
@@ -358,7 +363,7 @@ private:
         const NamespaceString& nss,
         const ChunkVersion& catalogCacheSinceVersion,
         long long currentTerm,
-        stdx::function<void(OperationContext*, StatusWith<CollectionAndChangedChunks>)> callbackFn,
+        std::function<void(OperationContext*, StatusWith<CollectionAndChangedChunks>)> callbackFn,
         std::shared_ptr<Notification<void>> notify);
 
     /**
@@ -370,7 +375,7 @@ private:
     void _runSecondaryGetDatabase(
         OperationContext* opCtx,
         StringData dbName,
-        stdx::function<void(OperationContext*, StatusWith<DatabaseType>)> callbackFn);
+        std::function<void(OperationContext*, StatusWith<DatabaseType>)> callbackFn);
 
     /**
      * Refreshes db version from the config server's metadata store, and schedules maintenance
@@ -386,7 +391,7 @@ private:
         OperationContext* opCtx,
         StringData dbName,
         long long termScheduled,
-        stdx::function<void(OperationContext*, StatusWith<DatabaseType>)> callbackFn);
+        std::function<void(OperationContext*, StatusWith<DatabaseType>)> callbackFn);
 
     /**
      * Loads chunk metadata from the shard persisted metadata store and any in-memory tasks with
@@ -430,13 +435,13 @@ private:
      *
      * Only run on the shard primary.
      */
-    Status _ensureMajorityPrimaryAndScheduleCollAndChunksTask(OperationContext* opCtx,
-                                                              const NamespaceString& nss,
-                                                              collAndChunkTask task);
+    void _ensureMajorityPrimaryAndScheduleCollAndChunksTask(OperationContext* opCtx,
+                                                            const NamespaceString& nss,
+                                                            collAndChunkTask task);
 
-    Status _ensureMajorityPrimaryAndScheduleDbTask(OperationContext* opCtx,
-                                                   StringData dbName,
-                                                   DBTask task);
+    void _ensureMajorityPrimaryAndScheduleDbTask(OperationContext* opCtx,
+                                                 StringData dbName,
+                                                 DBTask task);
     /**
      * Schedules tasks in the 'nss' task list to execute until the task list is depleted.
      *
@@ -470,7 +475,7 @@ private:
 
     // Loader used by the shard primary to retrieve the authoritative routing metadata from the
     // config server
-    const std::unique_ptr<CatalogCacheLoader> _configServerLoader;
+    std::unique_ptr<CatalogCacheLoader> _configServerLoader;
 
     // Thread pool used to run blocking tasks which perform disk reads and writes
     ThreadPool _threadPool;
@@ -479,7 +484,10 @@ private:
     NamespaceMetadataChangeNotifications _namespaceNotifications;
 
     // Protects the class state below
-    stdx::mutex _mutex;
+    Mutex _mutex = MONGO_MAKE_LATCH("ShardServerCatalogCacheLoader::_mutex");
+
+    // True if shutDown was called.
+    bool _inShutdown{false};
 
     // This value is bumped every time the set of currently scheduled tasks should no longer be
     // running. This includes, replica set state transitions and shutdown.

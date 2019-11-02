@@ -38,7 +38,6 @@
 #include "mongo/db/operation_context.h"
 #include "mongo/db/sessions_collection_standalone.h"
 #include "mongo/dbtests/dbtests.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
@@ -87,7 +86,7 @@ StatusWith<LogicalSessionRecord> fetchRecord(OperationContext* opCtx,
 class SessionsCollectionStandaloneTest {
 public:
     SessionsCollectionStandaloneTest()
-        : _collection(stdx::make_unique<SessionsCollectionStandalone>()) {
+        : _collection(std::make_unique<SessionsCollectionStandalone>()) {
         _opCtx = cc().makeOperationContext();
         DBDirectClient db(opCtx());
         db.remove(ns(), BSONObj());
@@ -129,8 +128,7 @@ public:
         ASSERT_OK(res);
 
         // Remove one record, the other stays
-        res = collection()->removeRecords(opCtx(), {record1.getId()});
-        ASSERT_OK(res);
+        collection()->removeRecords(opCtx(), {record1.getId()});
 
         auto swRecord = fetchRecord(opCtx(), record1.getId());
         ASSERT(!swRecord.isOK());
@@ -150,15 +148,13 @@ public:
         auto thePast = now - Minutes(5);
 
         // Attempt to refresh with no active records, should succeed (and do nothing).
-        auto resRefresh = collection()->refreshSessions(opCtx(), LogicalSessionRecordSet{});
-        ASSERT(resRefresh.isOK());
+        collection()->refreshSessions(opCtx(), LogicalSessionRecordSet{});
 
         // Attempt to refresh one active record, should succeed.
         auto record1 = makeRecord(thePast);
         auto res = insertRecord(opCtx(), record1);
         ASSERT_OK(res);
-        resRefresh = collection()->refreshSessions(opCtx(), {record1});
-        ASSERT(resRefresh.isOK());
+        collection()->refreshSessions(opCtx(), {record1});
 
         // The timestamp on the refreshed record should be updated.
         auto swRecord = fetchRecord(opCtx(), record1.getId());
@@ -170,8 +166,7 @@ public:
 
         // Attempt to refresh a record that is not present, should upsert it.
         auto record2 = makeRecord(thePast);
-        resRefresh = collection()->refreshSessions(opCtx(), {record2});
-        ASSERT(resRefresh.isOK());
+        collection()->refreshSessions(opCtx(), {record2});
 
         swRecord = fetchRecord(opCtx(), record2.getId());
         ASSERT(swRecord.isOK());
@@ -196,11 +191,10 @@ public:
         }
 
         // Run the refresh, should succeed.
-        resRefresh = collection()->refreshSessions(opCtx(), toRefresh);
-        ASSERT(resRefresh.isOK());
+        collection()->refreshSessions(opCtx(), toRefresh);
 
         // Ensure that the right number of timestamps were updated.
-        auto n = db.count(ns(), BSON("lastUse" << now));
+        auto n = db.count(NamespaceString(ns()), BSON("lastUse" << now));
         ASSERT_EQ(n, notRefreshed);
     }
 };
@@ -220,9 +214,8 @@ public:
             LogicalSessionIdSet lsids{notInsertedRecord.getId()};
 
             auto response = collection()->findRemovedSessions(opCtx(), lsids);
-            ASSERT_EQ(response.isOK(), true);
-            ASSERT_EQ(response.getValue().size(), 1u);
-            ASSERT(*(response.getValue().begin()) == notInsertedRecord.getId());
+            ASSERT_EQ(response.size(), 1u);
+            ASSERT(*(response.begin()) == notInsertedRecord.getId());
         }
 
         // if a record is there, it hasn't been removed
@@ -230,8 +223,7 @@ public:
             LogicalSessionIdSet lsids{insertedRecord.getId()};
 
             auto response = collection()->findRemovedSessions(opCtx(), lsids);
-            ASSERT_EQ(response.isOK(), true);
-            ASSERT_EQ(response.getValue().size(), 0u);
+            ASSERT_EQ(response.size(), 0u);
         }
 
         // We can tell the difference with multiple records
@@ -239,9 +231,8 @@ public:
             LogicalSessionIdSet lsids{insertedRecord.getId(), notInsertedRecord.getId()};
 
             auto response = collection()->findRemovedSessions(opCtx(), lsids);
-            ASSERT_EQ(response.isOK(), true);
-            ASSERT_EQ(response.getValue().size(), 1u);
-            ASSERT(*(response.getValue().begin()) == notInsertedRecord.getId());
+            ASSERT_EQ(response.size(), 1u);
+            ASSERT(*(response.begin()) == notInsertedRecord.getId());
         }
 
         // Batch logic works
@@ -263,16 +254,15 @@ public:
             }
 
             auto response = collection()->findRemovedSessions(opCtx(), mixedRecords);
-            ASSERT_EQ(response.isOK(), true);
-            ASSERT_EQ(response.getValue().size(), 5000u);
-            ASSERT(response.getValue() == uninsertedRecords);
+            ASSERT_EQ(response.size(), 5000u);
+            ASSERT(response == uninsertedRecords);
         }
     }
 };
 
-class All : public Suite {
+class All : public OldStyleSuiteSpecification {
 public:
-    All() : Suite("logical_sessions") {}
+    All() : OldStyleSuiteSpecification("logical_sessions") {}
 
     void setupTests() {
         add<SessionsCollectionStandaloneRemoveTest>();
@@ -281,7 +271,7 @@ public:
     }
 };
 
-SuiteInstance<All> all;
+OldStyleSuiteInitializer<All> all;
 
 }  // namespace
 }  // namespace mongo

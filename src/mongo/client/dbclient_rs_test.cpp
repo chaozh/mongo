@@ -86,10 +86,11 @@ protected:
     }
 
     void tearDown() {
-        ReplicaSetMonitor::cleanup();
         _replSet.reset();
 
         mongo::ScopedDbConnection::clearPool();
+
+        ReplicaSetMonitor::shutdown();
     }
 
     MockReplicaSet* getReplSet() {
@@ -552,11 +553,12 @@ protected:
                 const string host(_replSet->getPrimary());
                 const mongo::repl::MemberConfig* member =
                     oldConfig.findMemberByHostAndPort(HostAndPort(host));
-                membersBuilder.append(
-                    BSON("_id" << member->getId() << "host" << host << "tags" << BSON("dc"
-                                                                                      << "ny"
-                                                                                      << "p"
-                                                                                      << "1")));
+                membersBuilder.append(BSON("_id" << member->getId().getData() << "host" << host
+                                                 << "tags"
+                                                 << BSON("dc"
+                                                         << "ny"
+                                                         << "p"
+                                                         << "1")));
                 _replSet->getNode(host)->insert(IdentityNS, BSON(HostField(host)));
             }
 
@@ -567,13 +569,14 @@ protected:
                 const string host(*secIter);
                 const mongo::repl::MemberConfig* member =
                     oldConfig.findMemberByHostAndPort(HostAndPort(host));
-                membersBuilder.append(
-                    BSON("_id" << member->getId() << "host" << host << "tags" << BSON("dc"
-                                                                                      << "sf"
-                                                                                      << "s"
-                                                                                      << "1"
-                                                                                      << "group"
-                                                                                      << "1")));
+                membersBuilder.append(BSON("_id" << member->getId().getData() << "host" << host
+                                                 << "tags"
+                                                 << BSON("dc"
+                                                         << "sf"
+                                                         << "s"
+                                                         << "1"
+                                                         << "group"
+                                                         << "1")));
                 _replSet->getNode(host)->insert(IdentityNS, BSON(HostField(host)));
             }
 
@@ -582,13 +585,14 @@ protected:
                 const string host(*secIter);
                 const mongo::repl::MemberConfig* member =
                     oldConfig.findMemberByHostAndPort(HostAndPort(host));
-                membersBuilder.append(
-                    BSON("_id" << member->getId() << "host" << host << "tags" << BSON("dc"
-                                                                                      << "ma"
-                                                                                      << "s"
-                                                                                      << "2"
-                                                                                      << "group"
-                                                                                      << "1")));
+                membersBuilder.append(BSON("_id" << member->getId().getData() << "host" << host
+                                                 << "tags"
+                                                 << BSON("dc"
+                                                         << "ma"
+                                                         << "s"
+                                                         << "2"
+                                                         << "group"
+                                                         << "1")));
                 _replSet->getNode(host)->insert(IdentityNS, BSON(HostField(host)));
             }
 
@@ -597,11 +601,12 @@ protected:
                 const string host(*secIter);
                 const mongo::repl::MemberConfig* member =
                     oldConfig.findMemberByHostAndPort(HostAndPort(host));
-                membersBuilder.append(
-                    BSON("_id" << member->getId() << "host" << host << "tags" << BSON("dc"
-                                                                                      << "eu"
-                                                                                      << "s"
-                                                                                      << "3")));
+                membersBuilder.append(BSON("_id" << member->getId().getData() << "host" << host
+                                                 << "tags"
+                                                 << BSON("dc"
+                                                         << "eu"
+                                                         << "s"
+                                                         << "3")));
                 _replSet->getNode(host)->insert(IdentityNS, BSON(HostField(host)));
             }
 
@@ -610,11 +615,12 @@ protected:
                 const string host(*secIter);
                 const mongo::repl::MemberConfig* member =
                     oldConfig.findMemberByHostAndPort(HostAndPort(host));
-                membersBuilder.append(
-                    BSON("_id" << member->getId() << "host" << host << "tags" << BSON("dc"
-                                                                                      << "jp"
-                                                                                      << "s"
-                                                                                      << "4")));
+                membersBuilder.append(BSON("_id" << member->getId().getData() << "host" << host
+                                                 << "tags"
+                                                 << BSON("dc"
+                                                         << "jp"
+                                                         << "s"
+                                                         << "4")));
                 _replSet->getNode(host)->insert(IdentityNS, BSON(HostField(host)));
             }
 

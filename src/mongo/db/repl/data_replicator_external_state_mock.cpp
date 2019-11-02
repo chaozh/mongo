@@ -31,8 +31,9 @@
 
 #include "mongo/db/repl/data_replicator_external_state_mock.h"
 
+#include <memory>
+
 #include "mongo/db/repl/oplog_buffer_blocking_queue.h"
-#include "mongo/stdx/memory.h"
 
 namespace mongo {
 namespace repl {
@@ -40,22 +41,25 @@ namespace repl {
 namespace {
 
 class OplogApplierMock : public OplogApplier {
-    MONGO_DISALLOW_COPYING(OplogApplierMock);
+    OplogApplierMock(const OplogApplierMock&) = delete;
+    OplogApplierMock& operator=(const OplogApplierMock&) = delete;
 
 public:
     OplogApplierMock(executor::TaskExecutor* executor,
                      OplogBuffer* oplogBuffer,
                      Observer* observer,
                      DataReplicatorExternalStateMock* externalState)
-        : OplogApplier(executor, oplogBuffer, observer),
+        : OplogApplier(executor,
+                       oplogBuffer,
+                       observer,
+                       OplogApplier::Options(OplogApplication::Mode::kSecondary)),
           _observer(observer),
           _externalState(externalState) {}
 
 private:
     void _run(OplogBuffer* oplogBuffer) final {}
-    void _shutdown() final {}
-    StatusWith<OpTime> _multiApply(OperationContext* opCtx, Operations ops) final {
-        return _externalState->multiApplyFn(opCtx, ops, _observer);
+    StatusWith<OpTime> _applyOplogBatch(OperationContext* opCtx, Operations ops) final {
+        return _externalState->applyOplogBatchFn(opCtx, ops, _observer);
     }
 
     OplogApplier::Observer* const _observer;
@@ -65,9 +69,9 @@ private:
 }  // namespace
 
 DataReplicatorExternalStateMock::DataReplicatorExternalStateMock()
-    : multiApplyFn([](OperationContext*,
-                      const MultiApplier::Operations& ops,
-                      OplogApplier::Observer*) { return ops.back().getOpTime(); }) {}
+    : applyOplogBatchFn([](OperationContext*,
+                           const MultiApplier::Operations& ops,
+                           OplogApplier::Observer*) { return ops.back().getOpTime(); }) {}
 
 executor::TaskExecutor* DataReplicatorExternalStateMock::getTaskExecutor() const {
     return taskExecutor;
@@ -77,12 +81,10 @@ OpTimeWithTerm DataReplicatorExternalStateMock::getCurrentTermAndLastCommittedOp
     return {currentTerm, lastCommittedOpTime};
 }
 
-void DataReplicatorExternalStateMock::processMetadata(
-    const rpc::ReplSetMetadata& replMetadata, boost::optional<rpc::OplogQueryMetadata> oqMetadata) {
+void DataReplicatorExternalStateMock::processMetadata(const rpc::ReplSetMetadata& replMetadata,
+                                                      rpc::OplogQueryMetadata oqMetadata) {
     replMetadataProcessed = replMetadata;
-    if (oqMetadata) {
-        oqMetadataProcessed = oqMetadata.get();
-    }
+    oqMetadataProcessed = oqMetadata;
     metadataWasProcessed = true;
 }
 
@@ -106,7 +108,7 @@ bool DataReplicatorExternalStateMock::shouldStopFetching(
 
 std::unique_ptr<OplogBuffer> DataReplicatorExternalStateMock::makeInitialSyncOplogBuffer(
     OperationContext* opCtx) const {
-    return stdx::make_unique<OplogBufferBlockingQueue>();
+    return std::make_unique<OplogBufferBlockingQueue>();
 }
 
 std::unique_ptr<OplogApplier> DataReplicatorExternalStateMock::makeOplogApplier(

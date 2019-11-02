@@ -37,7 +37,7 @@
 #include "mongo/base/string_data.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/db/catalog/collection.h"
-#include "mongo/db/pipeline/document.h"
+#include "mongo/db/exec/document_value/document.h"
 #include "mongo/db/pipeline/document_source_cursor.h"
 #include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/field_path.h"
@@ -53,7 +53,7 @@ public:
     /**
      * The name of this stage.
      */
-    static constexpr auto kStageName = "$geoNearCursor";
+    static constexpr StringData kStageName = "$geoNearCursor"_sd;
 
     /**
      * Create a new DocumentSourceGeoNearCursor. If specified, 'distanceMultiplier' must be
@@ -69,12 +69,6 @@ public:
 
     const char* getSourceName() const final;
 
-    /**
-     * $geoNear returns documents ordered from nearest to furthest, which is an ascending sort on
-     * '_distanceField'.
-     */
-    BSONObjSet getOutputSorts() final;
-
 private:
     DocumentSourceGeoNearCursor(Collection*,
                                 std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>,
@@ -88,7 +82,7 @@ private:
     /**
      * Transforms 'obj' into a Document, calculating the distance.
      */
-    Document transformBSONObjToDocument(const BSONObj& obj) const final;
+    Document transformDoc(Document&& obj) const override final;
 
     // The output field in which to store the computed distance.
     FieldPath _distanceField;

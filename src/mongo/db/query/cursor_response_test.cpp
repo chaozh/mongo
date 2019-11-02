@@ -41,13 +41,11 @@ namespace mongo {
 namespace {
 
 TEST(CursorResponseTest, parseFromBSONFirstBatch) {
-    StatusWith<CursorResponse> result = CursorResponse::parseFromBSON(
-        BSON("cursor" << BSON("id" << CursorId(123) << "ns"
-                                   << "db.coll"
-                                   << "firstBatch"
-                                   << BSON_ARRAY(BSON("_id" << 1) << BSON("_id" << 2)))
-                      << "ok"
-                      << 1));
+    StatusWith<CursorResponse> result = CursorResponse::parseFromBSON(BSON(
+        "cursor" << BSON("id" << CursorId(123) << "ns"
+                              << "db.coll"
+                              << "firstBatch" << BSON_ARRAY(BSON("_id" << 1) << BSON("_id" << 2)))
+                 << "ok" << 1));
     ASSERT_OK(result.getStatus());
 
     CursorResponse response = std::move(result.getValue());
@@ -56,17 +54,14 @@ TEST(CursorResponseTest, parseFromBSONFirstBatch) {
     ASSERT_EQ(response.getBatch().size(), 2U);
     ASSERT_BSONOBJ_EQ(response.getBatch()[0], BSON("_id" << 1));
     ASSERT_BSONOBJ_EQ(response.getBatch()[1], BSON("_id" << 2));
-    ASSERT_FALSE(response.getLastOplogTimestamp());
 }
 
 TEST(CursorResponseTest, parseFromBSONNextBatch) {
-    StatusWith<CursorResponse> result = CursorResponse::parseFromBSON(
-        BSON("cursor" << BSON("id" << CursorId(123) << "ns"
-                                   << "db.coll"
-                                   << "nextBatch"
-                                   << BSON_ARRAY(BSON("_id" << 1) << BSON("_id" << 2)))
-                      << "ok"
-                      << 1));
+    StatusWith<CursorResponse> result = CursorResponse::parseFromBSON(BSON(
+        "cursor" << BSON("id" << CursorId(123) << "ns"
+                              << "db.coll"
+                              << "nextBatch" << BSON_ARRAY(BSON("_id" << 1) << BSON("_id" << 2)))
+                 << "ok" << 1));
     ASSERT_OK(result.getStatus());
 
     CursorResponse response = std::move(result.getValue());
@@ -75,17 +70,14 @@ TEST(CursorResponseTest, parseFromBSONNextBatch) {
     ASSERT_EQ(response.getBatch().size(), 2U);
     ASSERT_BSONOBJ_EQ(response.getBatch()[0], BSON("_id" << 1));
     ASSERT_BSONOBJ_EQ(response.getBatch()[1], BSON("_id" << 2));
-    ASSERT_FALSE(response.getLastOplogTimestamp());
 }
 
 TEST(CursorResponseTest, parseFromBSONCursorIdZero) {
-    StatusWith<CursorResponse> result = CursorResponse::parseFromBSON(
-        BSON("cursor" << BSON("id" << CursorId(0) << "ns"
-                                   << "db.coll"
-                                   << "nextBatch"
-                                   << BSON_ARRAY(BSON("_id" << 1) << BSON("_id" << 2)))
-                      << "ok"
-                      << 1));
+    StatusWith<CursorResponse> result = CursorResponse::parseFromBSON(BSON(
+        "cursor" << BSON("id" << CursorId(0) << "ns"
+                              << "db.coll"
+                              << "nextBatch" << BSON_ARRAY(BSON("_id" << 1) << BSON("_id" << 2)))
+                 << "ok" << 1));
     ASSERT_OK(result.getStatus());
 
     CursorResponse response = std::move(result.getValue());
@@ -97,38 +89,17 @@ TEST(CursorResponseTest, parseFromBSONCursorIdZero) {
 }
 
 TEST(CursorResponseTest, parseFromBSONEmptyBatch) {
-    StatusWith<CursorResponse> result =
-        CursorResponse::parseFromBSON(BSON("cursor" << BSON("id" << CursorId(123) << "ns"
-                                                                 << "db.coll"
-                                                                 << "nextBatch"
-                                                                 << BSONArrayBuilder().arr())
-                                                    << "ok"
-                                                    << 1));
+    StatusWith<CursorResponse> result = CursorResponse::parseFromBSON(
+        BSON("cursor" << BSON("id" << CursorId(123) << "ns"
+                                   << "db.coll"
+                                   << "nextBatch" << BSONArrayBuilder().arr())
+                      << "ok" << 1));
     ASSERT_OK(result.getStatus());
 
     CursorResponse response = std::move(result.getValue());
     ASSERT_EQ(response.getCursorId(), CursorId(123));
     ASSERT_EQ(response.getNSS().ns(), "db.coll");
     ASSERT_EQ(response.getBatch().size(), 0U);
-}
-
-TEST(CursorResponseTest, parseFromBSONLatestOplogEntry) {
-    StatusWith<CursorResponse> result =
-        CursorResponse::parseFromBSON(BSON("cursor" << BSON("id" << CursorId(123) << "ns"
-                                                                 << "db.coll"
-                                                                 << "nextBatch"
-                                                                 << BSONArrayBuilder().arr())
-                                                    << "$_internalLatestOplogTimestamp"
-                                                    << Timestamp(1, 2)
-                                                    << "ok"
-                                                    << 1));
-    ASSERT_OK(result.getStatus());
-
-    CursorResponse response = std::move(result.getValue());
-    ASSERT_EQ(response.getCursorId(), CursorId(123));
-    ASSERT_EQ(response.getNSS().ns(), "db.coll");
-    ASSERT_EQ(response.getBatch().size(), 0U);
-    ASSERT_EQ(*response.getLastOplogTimestamp(), Timestamp(1, 2));
 }
 
 TEST(CursorResponseTest, parseFromBSONMissingCursorField) {
@@ -146,8 +117,7 @@ TEST(CursorResponseTest, parseFromBSONNsFieldMissing) {
     StatusWith<CursorResponse> result = CursorResponse::parseFromBSON(
         BSON("cursor" << BSON("id" << CursorId(123) << "firstBatch"
                                    << BSON_ARRAY(BSON("_id" << 1) << BSON("_id" << 2)))
-                      << "ok"
-                      << 1));
+                      << "ok" << 1));
     ASSERT_NOT_OK(result.getStatus());
 }
 
@@ -155,8 +125,7 @@ TEST(CursorResponseTest, parseFromBSONNsFieldWrongType) {
     StatusWith<CursorResponse> result = CursorResponse::parseFromBSON(
         BSON("cursor" << BSON("id" << CursorId(123) << "ns" << 456 << "firstBatch"
                                    << BSON_ARRAY(BSON("_id" << 1) << BSON("_id" << 2)))
-                      << "ok"
-                      << 1));
+                      << "ok" << 1));
     ASSERT_NOT_OK(result.getStatus());
 }
 
@@ -164,10 +133,8 @@ TEST(CursorResponseTest, parseFromBSONIdFieldMissing) {
     StatusWith<CursorResponse> result = CursorResponse::parseFromBSON(
         BSON("cursor" << BSON("ns"
                               << "db.coll"
-                              << "nextBatch"
-                              << BSON_ARRAY(BSON("_id" << 1) << BSON("_id" << 2)))
-                      << "ok"
-                      << 1));
+                              << "nextBatch" << BSON_ARRAY(BSON("_id" << 1) << BSON("_id" << 2)))
+                      << "ok" << 1));
     ASSERT_NOT_OK(result.getStatus());
 }
 
@@ -177,10 +144,8 @@ TEST(CursorResponseTest, parseFromBSONIdFieldWrongType) {
                               << "123"
                               << "ns"
                               << "db.coll"
-                              << "nextBatch"
-                              << BSON_ARRAY(BSON("_id" << 1) << BSON("_id" << 2)))
-                      << "ok"
-                      << 1));
+                              << "nextBatch" << BSON_ARRAY(BSON("_id" << 1) << BSON("_id" << 2)))
+                      << "ok" << 1));
     ASSERT_NOT_OK(result.getStatus());
 }
 
@@ -188,19 +153,16 @@ TEST(CursorResponseTest, parseFromBSONBatchFieldMissing) {
     StatusWith<CursorResponse> result =
         CursorResponse::parseFromBSON(BSON("cursor" << BSON("id" << CursorId(123) << "ns"
                                                                  << "db.coll")
-                                                    << "ok"
-                                                    << 1));
+                                                    << "ok" << 1));
     ASSERT_NOT_OK(result.getStatus());
 }
 
 TEST(CursorResponseTest, parseFromBSONFirstBatchFieldWrongType) {
-    StatusWith<CursorResponse> result =
-        CursorResponse::parseFromBSON(BSON("cursor" << BSON("id" << CursorId(123) << "ns"
-                                                                 << "db.coll"
-                                                                 << "firstBatch"
-                                                                 << BSON("_id" << 1))
-                                                    << "ok"
-                                                    << 1));
+    StatusWith<CursorResponse> result = CursorResponse::parseFromBSON(
+        BSON("cursor" << BSON("id" << CursorId(123) << "ns"
+                                   << "db.coll"
+                                   << "firstBatch" << BSON("_id" << 1))
+                      << "ok" << 1));
     ASSERT_NOT_OK(result.getStatus());
 }
 
@@ -208,32 +170,16 @@ TEST(CursorResponseTest, parseFromBSONNextBatchFieldWrongType) {
     StatusWith<CursorResponse> result =
         CursorResponse::parseFromBSON(BSON("cursor" << BSON("id" << CursorId(123) << "ns"
                                                                  << "db.coll"
-                                                                 << "nextBatch"
-                                                                 << BSON("_id" << 1))
-                                                    << "ok"
-                                                    << 1));
-    ASSERT_NOT_OK(result.getStatus());
-}
-
-TEST(CursorResponseTest, parseFromBSONLatestOplogEntryWrongType) {
-    StatusWith<CursorResponse> result =
-        CursorResponse::parseFromBSON(BSON("cursor" << BSON("id" << CursorId(123) << "ns"
-                                                                 << "db.coll"
-                                                                 << "nextBatch"
-                                                                 << BSON_ARRAY(BSON("_id" << 1)))
-                                                    << "$_internalLatestOplogTimestamp"
-                                                    << 1
-                                                    << "ok"
-                                                    << 1));
+                                                                 << "nextBatch" << BSON("_id" << 1))
+                                                    << "ok" << 1));
     ASSERT_NOT_OK(result.getStatus());
 }
 
 TEST(CursorResponseTest, parseFromBSONOkFieldMissing) {
-    StatusWith<CursorResponse> result = CursorResponse::parseFromBSON(
-        BSON("cursor" << BSON("id" << CursorId(123) << "ns"
-                                   << "db.coll"
-                                   << "nextBatch"
-                                   << BSON_ARRAY(BSON("_id" << 1) << BSON("_id" << 2)))));
+    StatusWith<CursorResponse> result = CursorResponse::parseFromBSON(BSON(
+        "cursor" << BSON("id" << CursorId(123) << "ns"
+                              << "db.coll"
+                              << "nextBatch" << BSON_ARRAY(BSON("_id" << 1) << BSON("_id" << 2)))));
     ASSERT_NOT_OK(result.getStatus());
 }
 
@@ -250,13 +196,11 @@ TEST(CursorResponseTest, toBSONInitialResponse) {
     std::vector<BSONObj> batch = {BSON("_id" << 1), BSON("_id" << 2)};
     CursorResponse response(NamespaceString("testdb.testcoll"), CursorId(123), batch);
     BSONObj responseObj = response.toBSON(CursorResponse::ResponseType::InitialResponse);
-    BSONObj expectedResponse =
-        BSON("cursor" << BSON("id" << CursorId(123) << "ns"
-                                   << "testdb.testcoll"
-                                   << "firstBatch"
-                                   << BSON_ARRAY(BSON("_id" << 1) << BSON("_id" << 2)))
-                      << "ok"
-                      << 1.0);
+    BSONObj expectedResponse = BSON(
+        "cursor" << BSON("id" << CursorId(123) << "ns"
+                              << "testdb.testcoll"
+                              << "firstBatch" << BSON_ARRAY(BSON("_id" << 1) << BSON("_id" << 2)))
+                 << "ok" << 1.0);
     ASSERT_BSONOBJ_EQ(responseObj, expectedResponse);
 }
 
@@ -264,13 +208,11 @@ TEST(CursorResponseTest, toBSONSubsequentResponse) {
     std::vector<BSONObj> batch = {BSON("_id" << 1), BSON("_id" << 2)};
     CursorResponse response(NamespaceString("testdb.testcoll"), CursorId(123), batch);
     BSONObj responseObj = response.toBSON(CursorResponse::ResponseType::SubsequentResponse);
-    BSONObj expectedResponse =
-        BSON("cursor" << BSON("id" << CursorId(123) << "ns"
-                                   << "testdb.testcoll"
-                                   << "nextBatch"
-                                   << BSON_ARRAY(BSON("_id" << 1) << BSON("_id" << 2)))
-                      << "ok"
-                      << 1.0);
+    BSONObj expectedResponse = BSON(
+        "cursor" << BSON("id" << CursorId(123) << "ns"
+                              << "testdb.testcoll"
+                              << "nextBatch" << BSON_ARRAY(BSON("_id" << 1) << BSON("_id" << 2)))
+                 << "ok" << 1.0);
     ASSERT_BSONOBJ_EQ(responseObj, expectedResponse);
 }
 
@@ -282,13 +224,11 @@ TEST(CursorResponseTest, addToBSONInitialResponse) {
     response.addToBSON(CursorResponse::ResponseType::InitialResponse, &builder);
     BSONObj responseObj = builder.obj();
 
-    BSONObj expectedResponse =
-        BSON("cursor" << BSON("id" << CursorId(123) << "ns"
-                                   << "testdb.testcoll"
-                                   << "firstBatch"
-                                   << BSON_ARRAY(BSON("_id" << 1) << BSON("_id" << 2)))
-                      << "ok"
-                      << 1.0);
+    BSONObj expectedResponse = BSON(
+        "cursor" << BSON("id" << CursorId(123) << "ns"
+                              << "testdb.testcoll"
+                              << "firstBatch" << BSON_ARRAY(BSON("_id" << 1) << BSON("_id" << 2)))
+                 << "ok" << 1.0);
     ASSERT_BSONOBJ_EQ(responseObj, expectedResponse);
 }
 
@@ -300,60 +240,28 @@ TEST(CursorResponseTest, addToBSONSubsequentResponse) {
     response.addToBSON(CursorResponse::ResponseType::SubsequentResponse, &builder);
     BSONObj responseObj = builder.obj();
 
-    BSONObj expectedResponse =
-        BSON("cursor" << BSON("id" << CursorId(123) << "ns"
-                                   << "testdb.testcoll"
-                                   << "nextBatch"
-                                   << BSON_ARRAY(BSON("_id" << 1) << BSON("_id" << 2)))
-                      << "ok"
-                      << 1.0);
+    BSONObj expectedResponse = BSON(
+        "cursor" << BSON("id" << CursorId(123) << "ns"
+                              << "testdb.testcoll"
+                              << "nextBatch" << BSON_ARRAY(BSON("_id" << 1) << BSON("_id" << 2)))
+                 << "ok" << 1.0);
     ASSERT_BSONOBJ_EQ(responseObj, expectedResponse);
-}
-
-TEST(CursorResponseTest, serializeLatestOplogEntry) {
-    std::vector<BSONObj> batch = {BSON("_id" << 1), BSON("_id" << 2)};
-    CursorResponse response(
-        NamespaceString("db.coll"), CursorId(123), batch, boost::none, Timestamp(1, 2));
-    auto serialized = response.toBSON(CursorResponse::ResponseType::SubsequentResponse);
-    ASSERT_BSONOBJ_EQ(serialized,
-                      BSON("cursor"
-                           << BSON("id" << CursorId(123) << "ns"
-                                        << "db.coll"
-                                        << "nextBatch"
-                                        << BSON_ARRAY(BSON("_id" << 1) << BSON("_id" << 2)))
-                           << "$_internalLatestOplogTimestamp"
-                           << Timestamp(1, 2)
-                           << "ok"
-                           << 1));
-    auto reparsed = CursorResponse::parseFromBSON(serialized);
-    ASSERT_OK(reparsed.getStatus());
-    CursorResponse reparsedResponse = std::move(reparsed.getValue());
-    ASSERT_EQ(reparsedResponse.getCursorId(), CursorId(123));
-    ASSERT_EQ(reparsedResponse.getNSS().ns(), "db.coll");
-    ASSERT_EQ(reparsedResponse.getBatch().size(), 2U);
-    ASSERT_EQ(*reparsedResponse.getLastOplogTimestamp(), Timestamp(1, 2));
 }
 
 TEST(CursorResponseTest, serializePostBatchResumeToken) {
     std::vector<BSONObj> batch = {BSON("_id" << 1), BSON("_id" << 2)};
     auto postBatchResumeToken =
-        ResumeToken::makeHighWaterMarkToken(Timestamp(1, 2), boost::none).toDocument().toBson();
-    CursorResponse response(NamespaceString("db.coll"),
-                            CursorId(123),
-                            batch,
-                            boost::none,
-                            boost::none,
-                            postBatchResumeToken);
+        ResumeToken::makeHighWaterMarkToken(Timestamp(1, 2)).toDocument().toBson();
+    CursorResponse response(
+        NamespaceString("db.coll"), CursorId(123), batch, boost::none, postBatchResumeToken);
     auto serialized = response.toBSON(CursorResponse::ResponseType::SubsequentResponse);
     ASSERT_BSONOBJ_EQ(serialized,
                       BSON("cursor" << BSON("id" << CursorId(123) << "ns"
                                                  << "db.coll"
                                                  << "nextBatch"
                                                  << BSON_ARRAY(BSON("_id" << 1) << BSON("_id" << 2))
-                                                 << "postBatchResumeToken"
-                                                 << postBatchResumeToken)
-                                    << "ok"
-                                    << 1));
+                                                 << "postBatchResumeToken" << postBatchResumeToken)
+                                    << "ok" << 1));
     auto reparsed = CursorResponse::parseFromBSON(serialized);
     ASSERT_OK(reparsed.getStatus());
     CursorResponse reparsedResponse = std::move(reparsed.getValue());

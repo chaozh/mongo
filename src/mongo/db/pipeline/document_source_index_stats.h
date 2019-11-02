@@ -40,11 +40,13 @@ namespace mongo {
  */
 class DocumentSourceIndexStats final : public DocumentSource {
 public:
+    static constexpr StringData kStageName = "$indexStats"_sd;
+
     class LiteParsed final : public LiteParsedDocumentSource {
     public:
         static std::unique_ptr<LiteParsed> parse(const AggregationRequest& request,
                                                  const BSONElement& spec) {
-            return stdx::make_unique<LiteParsed>(request.getNamespaceString());
+            return std::make_unique<LiteParsed>(request.getNamespaceString());
         }
 
         explicit LiteParsed(NamespaceString nss) : _nss(std::move(nss)) {}
@@ -66,7 +68,6 @@ public:
     };
 
     // virtuals from DocumentSource
-    GetNextResult getNext() final;
     const char* getSourceName() const final;
     Value serialize(boost::optional<ExplainOptions::Verbosity> explain = boost::none) const final;
 
@@ -76,13 +77,14 @@ public:
                                      HostTypeRequirement::kAnyShard,
                                      DiskUseRequirement::kNoDiskUse,
                                      FacetRequirement::kNotAllowed,
-                                     TransactionRequirement::kNotAllowed);
+                                     TransactionRequirement::kNotAllowed,
+                                     LookupRequirement::kAllowed);
 
         constraints.requiresInputDocSource = false;
         return constraints;
     }
 
-    boost::optional<MergingLogic> mergingLogic() final {
+    boost::optional<DistributedPlanLogic> distributedPlanLogic() final {
         return boost::none;
     }
 
@@ -91,6 +93,7 @@ public:
 
 private:
     DocumentSourceIndexStats(const boost::intrusive_ptr<ExpressionContext>& pExpCtx);
+    GetNextResult doGetNext() final;
 
     CollectionIndexUsageMap _indexStatsMap;
     CollectionIndexUsageMap::const_iterator _indexStatsIter;

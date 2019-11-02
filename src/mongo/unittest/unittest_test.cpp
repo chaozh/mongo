@@ -33,11 +33,11 @@
 
 #include "mongo/platform/basic.h"
 
+#include <functional>
 #include <limits>
 #include <string>
 
 #include "mongo/bson/bsonobjbuilder.h"
-#include "mongo/stdx/functional.h"
 #include "mongo/unittest/death_test.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/assert_util.h"
@@ -122,6 +122,27 @@ TEST(UnitTestSelfTest, TestStringComparisons) {
 
     ASSERT_TEST_FAILS(ASSERT_EQUALS(std::string("hello"), "good bye!"));
     ASSERT_TEST_FAILS(ASSERT_EQUALS("hello", std::string("good bye!")));
+}
+
+TEST(UnitTestSelfTest, TestAssertStringContains) {
+    ASSERT_STRING_CONTAINS("abcdef", "bcd");
+    ASSERT_TEST_FAILS(ASSERT_STRING_CONTAINS("abcdef", "AAA"));
+    ASSERT_TEST_FAILS_MATCH(ASSERT_STRING_CONTAINS("abcdef", "AAA") << "XmsgX", "XmsgX");
+}
+
+TEST(UnitTestSelfTest, TestAssertStringOmits) {
+    ASSERT_STRING_OMITS("abcdef", "AAA");
+    ASSERT_TEST_FAILS(ASSERT_STRING_OMITS("abcdef", "bcd"));
+    ASSERT_TEST_FAILS_MATCH(ASSERT_STRING_OMITS("abcdef", "bcd") << "XmsgX", "XmsgX");
+}
+
+TEST(UnitTestSelfTest, TestAssertIdentity) {
+    auto intIdentity = [](int x) { return x; };
+    ASSERT_IDENTITY(123, intIdentity);
+    ASSERT_IDENTITY(123, [](int x) { return x; });
+    auto zero = [](auto) { return 0; };
+    ASSERT_TEST_FAILS(ASSERT_IDENTITY(1, zero));
+    ASSERT_TEST_FAILS_MATCH(ASSERT_IDENTITY(1, zero) << "XmsgX", "XmsgX");
 }
 
 TEST(UnitTestSelfTest, TestStreamingIntoFailures) {
@@ -268,5 +289,39 @@ TEST(UnitTestSelfTest, StackTraceForAssertion) {
     ASSERT_TRUE(threw);
     ASSERT_STRING_CONTAINS(stacktrace, "printStackTrace");
 }
+
+TEST(UnitTestSelfTest, ComparisonAssertionOverloadResolution) {
+    using namespace mongo;
+
+    char xBuf[] = "x";  // Guaranteed different address than "x".
+    const char* x = xBuf;
+
+    // At least one StringData, compare contents:
+    ASSERT_EQ("x"_sd, "x"_sd);
+    ASSERT_EQ("x"_sd, "x");
+    ASSERT_EQ("x"_sd, xBuf);
+    ASSERT_EQ("x"_sd, x);
+    ASSERT_EQ("x", "x"_sd);
+    ASSERT_EQ(xBuf, "x"_sd);
+    ASSERT_EQ(x, "x"_sd);
+
+    // Otherwise, compare pointers:
+    ASSERT_EQ(x, x);
+    ASSERT_EQ(xBuf, xBuf);
+    ASSERT_EQ(x, xBuf);
+    ASSERT_NE("x", xBuf);
+    ASSERT_NE("x", x);
+    ASSERT_NE(xBuf, "x");
+    ASSERT_NE(x, "x");
+}
+
+ASSERT_DOES_NOT_COMPILE(typename Char = char, *std::declval<Char>());
+ASSERT_DOES_NOT_COMPILE(bool B = false, std::enable_if_t<B, int>{});
+
+// Uncomment to check that it fails when it is supposed to. Unfortunately we can't check in a test
+// that this fails when it is supposed to, only that it passes when it should.
+//
+// ASSERT_DOES_NOT_COMPILE(typename Char = char, *std::declval<Char*>());
+// ASSERT_DOES_NOT_COMPILE(bool B = true, std::enable_if_t<B, int>{});
 
 }  // namespace

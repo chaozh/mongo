@@ -30,20 +30,15 @@
 #include "mongo/platform/basic.h"
 
 #include "mongo/base/init.h"
-#include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/logical_session_cache.h"
 #include "mongo/db/logical_session_id_helpers.h"
-#include "mongo/db/operation_context.h"
 
 namespace mongo {
-
 namespace {
 
 class RefreshLogicalSessionCacheNowCommand final : public BasicCommand {
-    MONGO_DISALLOW_COPYING(RefreshLogicalSessionCacheNowCommand);
-
 public:
     RefreshLogicalSessionCacheNowCommand() : BasicCommand("refreshLogicalSessionCacheNow") {}
 
@@ -74,14 +69,13 @@ public:
         return Status::OK();
     }
 
-    virtual bool run(OperationContext* opCtx,
-                     const std::string& db,
-                     const BSONObj& cmdObj,
-                     BSONObjBuilder& result) override {
-        auto cache = LogicalSessionCache::get(opCtx);
-        auto client = opCtx->getClient();
+    bool run(OperationContext* opCtx,
+             const std::string& db,
+             const BSONObj& cmdObj,
+             BSONObjBuilder& result) override {
+        const auto cache = LogicalSessionCache::get(opCtx);
 
-        auto res = cache->refreshNow(client);
+        auto res = cache->refreshNow(opCtx);
         if (res.code() != ErrorCodes::DuplicateKey) {
             uassertStatusOK(res);
         }
@@ -93,5 +87,4 @@ public:
 MONGO_REGISTER_TEST_COMMAND(RefreshLogicalSessionCacheNowCommand);
 
 }  // namespace
-
 }  // namespace mongo

@@ -38,6 +38,7 @@
 #include "mongo/db/pipeline/aggregation_request.h"
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/s/async_requests_sender.h"
+#include "mongo/s/catalog_cache.h"
 #include "mongo/s/commands/strategy.h"
 #include "mongo/s/query/cluster_client_cursor_params.h"
 #include "mongo/s/query/document_source_merge_cursors.h"
@@ -103,18 +104,6 @@ public:
                                    const PrivilegeVector& privileges,
                                    BSONObjBuilder* result,
                                    unsigned numberRetries = 0);
-
-private:
-    static void uassertAllShardsSupportExplain(
-        const std::vector<AsyncRequestsSender::Response>& shardResults);
-
-    static Status aggPassthrough(OperationContext*,
-                                 const Namespaces&,
-                                 const ShardId&,
-                                 const AggregationRequest&,
-                                 const LiteParsedPipeline&,
-                                 const PrivilegeVector& privileges,
-                                 BSONObjBuilder* result);
 };
 
 }  // namespace mongo

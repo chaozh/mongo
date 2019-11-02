@@ -60,6 +60,7 @@ public:
                            CollectionUUID collUUID,
                            const UUID& indexBuildUUID,
                            const std::vector<BSONObj>& indexes,
+                           const Status& cause,
                            bool fromMigrate) override {}
 
     void onInserts(OperationContext* opCtx,
@@ -144,7 +145,7 @@ public:
         Timestamp commitTimestamp,
         const std::vector<repl::ReplOperation>& statements) noexcept override{};
     void onTransactionPrepare(OperationContext* opCtx,
-                              const OplogSlot& prepareOpTime,
+                              const std::vector<OplogSlot>& reservedSlots,
                               std::vector<repl::ReplOperation>& statements) override{};
     void onTransactionAbort(OperationContext* opCtx,
                             boost::optional<OplogSlot> abortOplogEntryOpTime) override{};

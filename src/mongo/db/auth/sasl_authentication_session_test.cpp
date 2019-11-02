@@ -95,7 +95,7 @@ SaslConversation::SaslConversation(std::string mech)
           std::unique_ptr<AuthzManagerExternalState>(authManagerExternalState),
           AuthorizationManagerImpl::InstallMockForTestingOrAuthImpl{})),
       authSession(authManager->makeAuthorizationSession()),
-      registry({"SCRAM-SHA-1", "SCRAM-SHA-256", "PLAIN"}),
+      registry(opCtx->getServiceContext(), {"SCRAM-SHA-1", "SCRAM-SHA-256", "PLAIN"}),
       mechanism(mech) {
 
     AuthorizationManager::set(getServiceContext(),
@@ -131,19 +131,17 @@ SaslConversation::SaslConversation(std::string mech)
                            << scram::Secrets<SHA256Block>::generateCredentials(
                                   "frim", saslGlobalParams.scramSHA256IterationCount.load()));
 
-    ASSERT_OK(authManagerExternalState->insert(opCtx.get(),
-                                               NamespaceString("admin.system.users"),
-                                               BSON("_id"
-                                                    << "test.andy"
-                                                    << "user"
-                                                    << "andy"
-                                                    << "db"
-                                                    << "test"
-                                                    << "credentials"
-                                                    << creds
-                                                    << "roles"
-                                                    << BSONArray()),
-                                               BSONObj()));
+    ASSERT_OK(
+        authManagerExternalState->insert(opCtx.get(),
+                                         NamespaceString("admin.system.users"),
+                                         BSON("_id"
+                                              << "test.andy"
+                                              << "user"
+                                              << "andy"
+                                              << "db"
+                                              << "test"
+                                              << "credentials" << creds << "roles" << BSONArray()),
+                                         BSONObj()));
 }
 
 void SaslConversation::assertConversationFailure() {

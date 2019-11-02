@@ -42,12 +42,13 @@
 #include "mongo/db/s/migration_source_manager.h"
 #include "mongo/db/s/move_timing_helper.h"
 #include "mongo/db/s/sharding_state.h"
+#include "mongo/db/s/sharding_statistics.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/request_types/migration_secondary_throttle_options.h"
 #include "mongo/s/request_types/move_chunk_request.h"
 #include "mongo/util/concurrency/notification.h"
-#include "mongo/util/fail_point_service.h"
+#include "mongo/util/fail_point.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
@@ -142,11 +143,14 @@ public:
                 status = Status::OK();
             } catch (const DBException& e) {
                 status = e.toStatus();
+                if (status.code() == ErrorCodes::LockTimeout) {
+                    ShardingStatistics::get(opCtx).countDonorMoveChunkLockTimeout.addAndFetch(1);
+                }
             } catch (const std::exception& e) {
                 scopedMigration.signalComplete(
                     {ErrorCodes::InternalError,
-                     str::stream() << "Severe error occurred while running moveChunk command: "
-                                   << e.what()});
+                     str::stream()
+                         << "Severe error occurred while running moveChunk command: " << e.what()});
                 throw;
             }
 
@@ -213,30 +217,30 @@ private:
                                           moveChunkRequest.getFromShardId());
 
         moveTimingHelper.done(1);
-        MONGO_FAIL_POINT_PAUSE_WHILE_SET(moveChunkHangAtStep1);
+        moveChunkHangAtStep1.pauseWhileSet();
 
         MigrationSourceManager migrationSourceManager(
             opCtx, moveChunkRequest, donorConnStr, recipientHost);
 
         moveTimingHelper.done(2);
-        MONGO_FAIL_POINT_PAUSE_WHILE_SET(moveChunkHangAtStep2);
+        moveChunkHangAtStep2.pauseWhileSet();
 
         uassertStatusOKWithWarning(migrationSourceManager.startClone(opCtx));
         moveTimingHelper.done(3);
-        MONGO_FAIL_POINT_PAUSE_WHILE_SET(moveChunkHangAtStep3);
+        moveChunkHangAtStep3.pauseWhileSet();
 
         uassertStatusOKWithWarning(migrationSourceManager.awaitToCatchUp(opCtx));
         moveTimingHelper.done(4);
-        MONGO_FAIL_POINT_PAUSE_WHILE_SET(moveChunkHangAtStep4);
+        moveChunkHangAtStep4.pauseWhileSet();
 
         uassertStatusOKWithWarning(migrationSourceManager.enterCriticalSection(opCtx));
         uassertStatusOKWithWarning(migrationSourceManager.commitChunkOnRecipient(opCtx));
         moveTimingHelper.done(5);
-        MONGO_FAIL_POINT_PAUSE_WHILE_SET(moveChunkHangAtStep5);
+        moveChunkHangAtStep5.pauseWhileSet();
 
         uassertStatusOKWithWarning(migrationSourceManager.commitChunkMetadataOnConfig(opCtx));
         moveTimingHelper.done(6);
-        MONGO_FAIL_POINT_PAUSE_WHILE_SET(moveChunkHangAtStep6);
+        moveChunkHangAtStep6.pauseWhileSet();
     }
 
 } moveChunkCmd;

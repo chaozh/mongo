@@ -31,11 +31,10 @@
 
 #include "mongo/base/status_with.h"
 #include "mongo/executor/task_executor.h"
+#include "mongo/platform/mutex.h"
 
 namespace mongo {
 namespace repl {
-
-class Mutex;
 
 /**
  * The RollbackChecker maintains a sync source and its baseline rollback ID (rbid). It
@@ -60,13 +59,14 @@ class Mutex;
  *
  */
 class RollbackChecker {
-    MONGO_DISALLOW_COPYING(RollbackChecker);
+    RollbackChecker(const RollbackChecker&) = delete;
+    RollbackChecker& operator=(const RollbackChecker&) = delete;
 
 public:
     // Rollback checker result - true if rollback occurred; false if rollback IDs
     // were the same; Otherwise, error status indicating why rollback check failed.
     using Result = StatusWith<bool>;
-    using CallbackFn = stdx::function<void(const Result& result)>;
+    using CallbackFn = std::function<void(const Result& result)>;
     using RemoteCommandCallbackFn = executor::TaskExecutor::RemoteCommandCallbackFn;
     using CallbackHandle = executor::TaskExecutor::CallbackHandle;
 
@@ -118,7 +118,7 @@ private:
     executor::TaskExecutor* const _executor;
 
     // Protects member data of this RollbackChecker.
-    mutable stdx::mutex _mutex;
+    mutable Mutex _mutex = MONGO_MAKE_LATCH("RollbackChecker::_mutex");
 
     // The sync source to check for rollbacks against.
     HostAndPort _syncSource;

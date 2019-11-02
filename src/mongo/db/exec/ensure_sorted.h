@@ -30,6 +30,7 @@
 #pragma once
 
 #include "mongo/db/exec/plan_stage.h"
+#include "mongo/db/exec/sort_key_comparator.h"
 
 namespace mongo {
 
@@ -42,7 +43,10 @@ namespace mongo {
  */
 class EnsureSortedStage final : public PlanStage {
 public:
-    EnsureSortedStage(OperationContext* opCtx, BSONObj pattern, WorkingSet* ws, PlanStage* child);
+    EnsureSortedStage(OperationContext* opCtx,
+                      BSONObj pattern,
+                      WorkingSet* ws,
+                      std::unique_ptr<PlanStage> child);
 
     bool isEOF() final;
     StageState doWork(WorkingSetID* out) final;
@@ -62,15 +66,15 @@ private:
      * Returns whether the result with the lhsSortKey should come before the result with the
      * rhsSortKey in sort order.
      */
-    bool isInOrder(const BSONObj& lhsSortKey, const BSONObj& rhsSortKey) const;
+    bool isInOrder(const Value& lhsSortKey, const Value& rhsSortKey) const;
 
     WorkingSet* _ws;
 
-    // The pattern that we're sorting by.
-    BSONObj _pattern;
+    // Comparator that is aware of the pattern that we're sorting by.
+    SortKeyComparator _sortKeyComparator;
 
     // The sort key of the previous result.
-    BSONObj _prevSortKey;
+    Value _prevSortKey;
 
     EnsureSortedStats _specificStats;
 };

@@ -36,8 +36,8 @@
 
 #include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/exec/document_value/value_comparator.h"
 #include "mongo/db/pipeline/document_source_change_stream_gen.h"
-#include "mongo/db/pipeline/value_comparator.h"
 #include "mongo/db/storage/key_string.h"
 #include "mongo/util/hex.h"
 
@@ -59,7 +59,7 @@ ResumeTokenData makeHighWaterMarkResumeTokenData(Timestamp clusterTime,
 
 bool ResumeTokenData::operator==(const ResumeTokenData& other) const {
     return clusterTime == other.clusterTime && version == other.version &&
-        tokenType == other.tokenType && applyOpsIndex == other.applyOpsIndex &&
+        tokenType == other.tokenType && txnOpIndex == other.txnOpIndex &&
         fromInvalidate == other.fromInvalidate && uuid == other.uuid &&
         (Value::compare(this->documentKey, other.documentKey, nullptr) == 0);
 }
@@ -70,7 +70,7 @@ std::ostream& operator<<(std::ostream& out, const ResumeTokenData& tokenData) {
     if (tokenData.version > 0) {
         out << ", tokenType: " << tokenData.tokenType;
     }
-    out << ", applyOpsIndex: " << tokenData.applyOpsIndex;
+    out << ", txnOpIndex: " << tokenData.txnOpIndex;
     if (tokenData.version > 0) {
         out << ", fromInvalidate: " << static_cast<bool>(tokenData.fromInvalidate);
     }
@@ -90,13 +90,14 @@ ResumeToken::ResumeToken(const Document& resumeDoc) {
     _typeBits = resumeDoc[kTypeBitsFieldName];
     uassert(40648,
             str::stream() << "Bad resume token: _typeBits of wrong type " << resumeDoc.toString(),
-            _typeBits.missing() || (_typeBits.getType() == BSONType::BinData &&
-                                    _typeBits.getBinData().type == BinDataGeneral));
+            _typeBits.missing() ||
+                (_typeBits.getType() == BSONType::BinData &&
+                 _typeBits.getBinData().type == BinDataGeneral));
 }
 
 // We encode the resume token as a KeyString with the sequence:
-// clusterTime, version, applyOpsIndex, fromInvalidate, uuid, documentKey
-// Only the clusterTime, version, applyOpsIndex, and fromInvalidate are required.
+// clusterTime, version, txnOpIndex, fromInvalidate, uuid, documentKey Only the clusterTime,
+// version, txnOpIndex, and fromInvalidate are required.
 ResumeToken::ResumeToken(const ResumeTokenData& data) {
     BSONObjBuilder builder;
     builder.append("", data.clusterTime);
@@ -104,7 +105,7 @@ ResumeToken::ResumeToken(const ResumeTokenData& data) {
     if (data.version >= 1) {
         builder.appendNumber("", data.tokenType);
     }
-    builder.appendNumber("", data.applyOpsIndex);
+    builder.appendNumber("", data.txnOpIndex);
     if (data.version >= 1) {
         builder.appendBool("", data.fromInvalidate);
     }
@@ -117,7 +118,7 @@ ResumeToken::ResumeToken(const ResumeTokenData& data) {
     }
     data.documentKey.addToBsonObj(&builder, "");
     auto keyObj = builder.obj();
-    KeyString encodedToken(KeyString::Version::V1, keyObj, Ordering::make(BSONObj()));
+    KeyString::Builder encodedToken(KeyString::Version::V1, keyObj, Ordering::make(BSONObj()));
     _hexKeyString = toHex(encodedToken.getBuffer(), encodedToken.getSize());
     const auto& typeBits = encodedToken.getTypeBits();
     if (!typeBits.isAllZeros())
@@ -186,15 +187,15 @@ ResumeTokenData ResumeToken::getData() const {
         result.tokenType = static_cast<ResumeTokenData::TokenType>(typeInt);
     }
 
-    // Next comes the applyOps index.
-    uassert(50793, "Resume Token does not contain applyOpsIndex", i.more());
-    auto applyOpsElt = i.next();
+    // Next comes the txnOpIndex value.
+    uassert(50793, "Resume Token does not contain txnOpIndex", i.more());
+    auto txnOpIndexElt = i.next();
     uassert(50855,
-            "Resume Token applyOpsIndex is not an integer",
-            applyOpsElt.type() == BSONType::NumberInt);
-    const int applyOpsInd = applyOpsElt.numberInt();
-    uassert(50794, "Invalid Resume Token: applyOpsIndex should be non-negative", applyOpsInd >= 0);
-    result.applyOpsIndex = applyOpsInd;
+            "Resume Token txnOpIndex is not an integer",
+            txnOpIndexElt.type() == BSONType::NumberInt);
+    const int txnOpIndexInd = txnOpIndexElt.numberInt();
+    uassert(50794, "Invalid Resume Token: txnOpIndex should be non-negative", txnOpIndexInd >= 0);
+    result.txnOpIndex = txnOpIndexInd;
 
     if (result.version >= 1) {
         // The 'fromInvalidate' bool was added in version 1 resume tokens. We don't expect to see it
@@ -230,8 +231,8 @@ ResumeToken ResumeToken::parse(const Document& resumeDoc) {
     return ResumeToken(resumeDoc);
 }
 
-ResumeToken ResumeToken::makeHighWaterMarkToken(Timestamp clusterTime, boost::optional<UUID> uuid) {
-    return ResumeToken(makeHighWaterMarkResumeTokenData(clusterTime, uuid));
+ResumeToken ResumeToken::makeHighWaterMarkToken(Timestamp clusterTime) {
+    return ResumeToken(makeHighWaterMarkResumeTokenData(clusterTime, boost::none));
 }
 
 bool ResumeToken::isHighWaterMarkToken(const ResumeTokenData& tokenData) {

@@ -32,6 +32,7 @@
 #include "mongo/db/matcher/expression_leaf.h"
 
 #include <cmath>
+#include <memory>
 #include <pcrecpp.h>
 
 #include "mongo/bson/bsonelement_comparator.h"
@@ -43,8 +44,8 @@
 #include "mongo/db/matcher/expression_parser.h"
 #include "mongo/db/matcher/path.h"
 #include "mongo/db/query/collation/collator_interface.h"
-#include "mongo/stdx/memory.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/regex_util.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -72,8 +73,8 @@ bool ComparisonMatchExpressionBase::equivalent(const MatchExpression* other) con
     return path() == realOther->path() && eltCmp.evaluate(_rhs == realOther->_rhs);
 }
 
-void ComparisonMatchExpressionBase::debugString(StringBuilder& debug, int level) const {
-    _debugAddSpace(debug, level);
+void ComparisonMatchExpressionBase::debugString(StringBuilder& debug, int indentationLevel) const {
+    _debugAddSpace(debug, indentationLevel);
     debug << path() << " " << name();
     debug << " " << _rhs.toString(false);
 
@@ -196,33 +197,13 @@ constexpr StringData LTEMatchExpression::kName;
 constexpr StringData GTMatchExpression::kName;
 constexpr StringData GTEMatchExpression::kName;
 
-// ---------------
-
-// TODO: move
-inline pcrecpp::RE_Options flags2options(const char* flags) {
-    pcrecpp::RE_Options options;
-    options.set_utf8(true);
-    while (flags && *flags) {
-        if (*flags == 'i')
-            options.set_caseless(true);
-        else if (*flags == 'm')
-            options.set_multiline(true);
-        else if (*flags == 'x')
-            options.set_extended(true);
-        else if (*flags == 's')
-            options.set_dotall(true);
-        flags++;
-    }
-    return options;
-}
-
 const std::set<char> RegexMatchExpression::kValidRegexFlags = {'i', 'm', 's', 'x'};
 
 RegexMatchExpression::RegexMatchExpression(StringData path, const BSONElement& e)
     : LeafMatchExpression(REGEX, path),
       _regex(e.regex()),
       _flags(e.regexFlags()),
-      _re(new pcrecpp::RE(_regex.c_str(), flags2options(_flags.c_str()))) {
+      _re(new pcrecpp::RE(_regex.c_str(), regex_util::flagsToPcreOptions(_flags, true))) {
     uassert(ErrorCodes::BadValue, "regex not a regex", e.type() == RegEx);
     _init();
 }
@@ -231,7 +212,7 @@ RegexMatchExpression::RegexMatchExpression(StringData path, StringData regex, St
     : LeafMatchExpression(REGEX, path),
       _regex(regex.toString()),
       _flags(options.toString()),
-      _re(new pcrecpp::RE(_regex.c_str(), flags2options(_flags.c_str()))) {
+      _re(new pcrecpp::RE(_regex.c_str(), regex_util::flagsToPcreOptions(_flags, true))) {
     _init();
 }
 
@@ -277,12 +258,12 @@ bool RegexMatchExpression::matchesSingleElement(const BSONElement& e, MatchDetai
     }
 }
 
-void RegexMatchExpression::debugString(StringBuilder& debug, int level) const {
-    _debugAddSpace(debug, level);
+void RegexMatchExpression::debugString(StringBuilder& debug, int indentationLevel) const {
+    _debugAddSpace(debug, indentationLevel);
     debug << path() << " regex /" << _regex << "/" << _flags;
 
     MatchExpression::TagData* td = getTag();
-    if (NULL != td) {
+    if (nullptr != td) {
         debug << " ";
         td->debugString(&debug);
     }
@@ -318,14 +299,14 @@ ModMatchExpression::ModMatchExpression(StringData path, int divisor, int remaind
 bool ModMatchExpression::matchesSingleElement(const BSONElement& e, MatchDetails* details) const {
     if (!e.isNumber())
         return false;
-    return e.numberLong() % _divisor == _remainder;
+    return overflow::safeMod(e.numberLong(), static_cast<long long>(_divisor)) == _remainder;
 }
 
-void ModMatchExpression::debugString(StringBuilder& debug, int level) const {
-    _debugAddSpace(debug, level);
+void ModMatchExpression::debugString(StringBuilder& debug, int indentationLevel) const {
+    _debugAddSpace(debug, indentationLevel);
     debug << path() << " mod " << _divisor << " % x == " << _remainder;
     MatchExpression::TagData* td = getTag();
-    if (NULL != td) {
+    if (nullptr != td) {
         debug << " ";
         td->debugString(&debug);
     }
@@ -355,11 +336,11 @@ bool ExistsMatchExpression::matchesSingleElement(const BSONElement& e,
     return !e.eoo();
 }
 
-void ExistsMatchExpression::debugString(StringBuilder& debug, int level) const {
-    _debugAddSpace(debug, level);
+void ExistsMatchExpression::debugString(StringBuilder& debug, int indentationLevel) const {
+    _debugAddSpace(debug, indentationLevel);
     debug << path() << " exists";
     MatchExpression::TagData* td = getTag();
-    if (NULL != td) {
+    if (nullptr != td) {
         debug << " ";
         td->debugString(&debug);
     }
@@ -383,11 +364,10 @@ bool ExistsMatchExpression::equivalent(const MatchExpression* other) const {
 
 InMatchExpression::InMatchExpression(StringData path)
     : LeafMatchExpression(MATCH_IN, path),
-      _eltCmp(BSONElementComparator::FieldNamesMode::kIgnore, _collator),
-      _equalitySet(_eltCmp.makeBSONEltFlatSet(_originalEqualityVector)) {}
+      _eltCmp(BSONElementComparator::FieldNamesMode::kIgnore, _collator) {}
 
 std::unique_ptr<MatchExpression> InMatchExpression::shallowClone() const {
-    auto next = stdx::make_unique<InMatchExpression>(path());
+    auto next = std::make_unique<InMatchExpression>(path());
     next->setCollator(_collator);
     if (getTag()) {
         next->setTag(getTag()->clone());
@@ -404,11 +384,15 @@ std::unique_ptr<MatchExpression> InMatchExpression::shallowClone() const {
     return std::move(next);
 }
 
+bool InMatchExpression::contains(const BSONElement& e) const {
+    return std::binary_search(_equalitySet.begin(), _equalitySet.end(), e, _eltCmp.makeLessThan());
+}
+
 bool InMatchExpression::matchesSingleElement(const BSONElement& e, MatchDetails* details) const {
     if (_hasNull && e.eoo()) {
         return true;
     }
-    if (_equalitySet.find(e) != _equalitySet.end()) {
+    if (contains(e)) {
         return true;
     }
     for (auto&& regex : _regexes) {
@@ -419,8 +403,8 @@ bool InMatchExpression::matchesSingleElement(const BSONElement& e, MatchDetails*
     return false;
 }
 
-void InMatchExpression::debugString(StringBuilder& debug, int level) const {
-    _debugAddSpace(debug, level);
+void InMatchExpression::debugString(StringBuilder& debug, int indentationLevel) const {
+    _debugAddSpace(debug, indentationLevel);
     debug << path() << " $in ";
     debug << "[ ";
     for (auto&& equality : _equalitySet) {
@@ -432,7 +416,7 @@ void InMatchExpression::debugString(StringBuilder& debug, int level) const {
     }
     debug << "]";
     MatchExpression::TagData* td = getTag();
-    if (NULL != td) {
+    if (nullptr != td) {
         debug << " ";
         td->debugString(&debug);
     }
@@ -501,17 +485,17 @@ void InMatchExpression::_doSetCollator(const CollatorInterface* collator) {
     if (!std::is_sorted(_originalEqualityVector.begin(),
                         _originalEqualityVector.end(),
                         _eltCmp.makeLessThan())) {
-        // Re-sort the list of equalities according to our current comparator. This is necessary to
-        // work around https://svn.boost.org/trac10/ticket/13140.
         std::sort(
             _originalEqualityVector.begin(), _originalEqualityVector.end(), _eltCmp.makeLessThan());
     }
 
     // We need to re-compute '_equalitySet', since our set comparator has changed.
-    _equalitySet = _eltCmp.makeBSONEltFlatSetFromSortedUniqueRange(
-        _originalEqualityVector.begin(),
-        std::unique(
-            _originalEqualityVector.begin(), _originalEqualityVector.end(), _eltCmp.makeEqualTo()));
+    _equalitySet.clear();
+    _equalitySet.reserve(_originalEqualityVector.size());
+    std::unique_copy(_originalEqualityVector.begin(),
+                     _originalEqualityVector.end(),
+                     std::back_inserter(_equalitySet),
+                     _eltCmp.makeEqualTo());
 }
 
 Status InMatchExpression::setEqualities(std::vector<BSONElement> equalities) {
@@ -535,15 +519,16 @@ Status InMatchExpression::setEqualities(std::vector<BSONElement> equalities) {
     if (!std::is_sorted(_originalEqualityVector.begin(),
                         _originalEqualityVector.end(),
                         _eltCmp.makeLessThan())) {
-        // Sort the list of equalities to work around https://svn.boost.org/trac10/ticket/13140.
         std::sort(
             _originalEqualityVector.begin(), _originalEqualityVector.end(), _eltCmp.makeLessThan());
     }
 
-    _equalitySet = _eltCmp.makeBSONEltFlatSetFromSortedUniqueRange(
-        _originalEqualityVector.begin(),
-        std::unique(
-            _originalEqualityVector.begin(), _originalEqualityVector.end(), _eltCmp.makeEqualTo()));
+    _equalitySet.clear();
+    _equalitySet.reserve(_originalEqualityVector.size());
+    std::unique_copy(_originalEqualityVector.begin(),
+                     _originalEqualityVector.end(),
+                     std::back_inserter(_equalitySet),
+                     _eltCmp.makeEqualTo());
 
     return Status::OK();
 }
@@ -566,7 +551,7 @@ MatchExpression::ExpressionOptimizerFunc InMatchExpression::getOptimizer() const
             auto& childRe = regexList.front();
             invariant(!childRe->getTag());
 
-            auto simplifiedExpression = stdx::make_unique<RegexMatchExpression>(
+            auto simplifiedExpression = std::make_unique<RegexMatchExpression>(
                 expression->path(), childRe->getString(), childRe->getFlags());
             if (expression->getTag()) {
                 simplifiedExpression->setTag(expression->getTag()->clone());
@@ -574,7 +559,7 @@ MatchExpression::ExpressionOptimizerFunc InMatchExpression::getOptimizer() const
             return std::move(simplifiedExpression);
         } else if (equalitySet.size() == 1 && regexList.empty()) {
             // Simplify IN of exactly one equality to be an EqualityMatchExpression.
-            auto simplifiedExpression = stdx::make_unique<EqualityMatchExpression>(
+            auto simplifiedExpression = std::make_unique<EqualityMatchExpression>(
                 expression->path(), *(equalitySet.begin()));
             simplifiedExpression->setCollator(collator);
             if (expression->getTag()) {
@@ -740,8 +725,8 @@ bool BitTestMatchExpression::matchesSingleElement(const BSONElement& e,
     return performBitTest(eValue);
 }
 
-void BitTestMatchExpression::debugString(StringBuilder& debug, int level) const {
-    _debugAddSpace(debug, level);
+void BitTestMatchExpression::debugString(StringBuilder& debug, int indentationLevel) const {
+    _debugAddSpace(debug, indentationLevel);
 
     debug << path() << " ";
 
@@ -800,7 +785,7 @@ BSONObj BitTestMatchExpression::getSerializedRightHandSide() const {
 
     BSONArrayBuilder arrBob;
     for (auto bitPosition : _bitPositions) {
-        arrBob.append(bitPosition);
+        arrBob.append(static_cast<int32_t>(bitPosition));
     }
     arrBob.doneFast();
 
@@ -821,4 +806,4 @@ bool BitTestMatchExpression::equivalent(const MatchExpression* other) const {
 
     return path() == realOther->path() && myBitPositions == otherBitPositions;
 }
-}
+}  // namespace mongo

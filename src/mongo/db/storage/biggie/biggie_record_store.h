@@ -38,7 +38,7 @@
 #include "mongo/db/storage/capped_callback.h"
 #include "mongo/db/storage/record_store.h"
 #include "mongo/platform/atomic_word.h"
-#include "mongo/stdx/mutex.h"
+#include "mongo/platform/mutex.h"
 
 namespace mongo {
 namespace biggie {
@@ -64,7 +64,7 @@ public:
     virtual bool isCapped() const;
     virtual void setCappedCallback(CappedCallback*);
     virtual int64_t storageSize(OperationContext* opCtx,
-                                BSONObjBuilder* extraInfo = NULL,
+                                BSONObjBuilder* extraInfo = nullptr,
                                 int infoLevel = 0) const;
 
     virtual bool findRecord(OperationContext* opCtx, const RecordId& loc, RecordData* rd) const;
@@ -74,12 +74,6 @@ public:
     virtual Status insertRecords(OperationContext* opCtx,
                                  std::vector<Record>* inOutRecords,
                                  const std::vector<Timestamp>& timestamps);
-
-    virtual Status insertRecordsWithDocWriter(OperationContext* opCtx,
-                                              const DocWriter* const* docs,
-                                              const Timestamp*,
-                                              size_t nDocs,
-                                              RecordId* idsOut);
 
     virtual Status updateRecord(OperationContext* opCtx,
                                 const RecordId& oldLocation,
@@ -105,8 +99,6 @@ public:
     virtual void appendCustomStats(OperationContext* opCtx,
                                    BSONObjBuilder* result,
                                    double scale) const;
-
-    virtual Status touch(OperationContext* opCtx, BSONObjBuilder* output) const;
 
     virtual boost::optional<RecordId> oplogStartHack(OperationContext* opCtx,
                                                      const RecordId& startingPosition) const;
@@ -144,10 +136,11 @@ private:
     std::string _prefix;
     std::string _postfix;
 
-    mutable stdx::mutex _cappedCallbackMutex;  // Guards _cappedCallback
+    mutable Mutex _cappedCallbackMutex =
+        MONGO_MAKE_LATCH("RecordStore::_cappedCallbackMutex");  // Guards _cappedCallback
     CappedCallback* _cappedCallback;
 
-    mutable stdx::mutex _cappedDeleterMutex;
+    mutable Mutex _cappedDeleterMutex = MONGO_MAKE_LATCH("RecordStore::_cappedDeleterMutex");
 
     AtomicWord<long long> _highestRecordId{1};
     AtomicWord<long long> _numRecords{0};

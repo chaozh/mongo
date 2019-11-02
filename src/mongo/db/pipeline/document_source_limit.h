@@ -55,17 +55,12 @@ public:
                 HostTypeRequirement::kNone,
                 DiskUseRequirement::kNoDiskUse,
                 FacetRequirement::kAllowed,
-                TransactionRequirement::kAllowed};
+                TransactionRequirement::kAllowed,
+                LookupRequirement::kAllowed};
     }
 
-    GetNextResult getNext() final;
     const char* getSourceName() const final {
         return kStageName.rawData();
-    }
-
-    BSONObjSet getOutputSorts() final {
-        return pSource ? pSource->getOutputSorts()
-                       : SimpleBSONObjComparator::kInstance.makeBSONObjSet();
     }
 
     /**
@@ -80,14 +75,15 @@ public:
     }
 
     /**
-     * Returns a MergingLogic with two identical $limit stages; one for the shards pipeline and one
-     * for the merging pipeline.
+     * Returns a DistributedPlanLogic with two identical $limit stages; one for the shards pipeline
+     * and one for the merging pipeline.
      */
-    boost::optional<MergingLogic> mergingLogic() final {
+    boost::optional<DistributedPlanLogic> distributedPlanLogic() final {
         // Running this stage on the shards is an optimization, but is not strictly necessary in
         // order to produce correct pipeline output.
         // {shardsStage, mergingStage, sortPattern}
-        return MergingLogic{this, DocumentSourceLimit::create(pExpCtx, _limit), boost::none};
+        return DistributedPlanLogic{
+            this, DocumentSourceLimit::create(pExpCtx, _limit), boost::none};
     }
 
     long long getLimit() const {
@@ -99,6 +95,7 @@ public:
 
 private:
     DocumentSourceLimit(const boost::intrusive_ptr<ExpressionContext>& pExpCtx, long long limit);
+    GetNextResult doGetNext() final;
 
     long long _limit;
     long long _nReturned = 0;

@@ -33,10 +33,11 @@
 
 #include <cstring>
 
+#include "mongo/db/concurrency/lock_state.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_kv_engine.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_oplog_manager.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_util.h"
-#include "mongo/stdx/mutex.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/util/concurrency/idle_thread_block.h"
 #include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
@@ -73,7 +74,7 @@ void WiredTigerOplogManager::start(OperationContext* opCtx,
 
     // Need to obtain the mutex before starting the thread, as otherwise it may race ahead
     // see _shuttingDown as true and quit prematurely.
-    stdx::lock_guard<stdx::mutex> lk(_oplogVisibilityStateMutex);
+    stdx::lock_guard<Latch> lk(_oplogVisibilityStateMutex);
     _oplogJournalThread = stdx::thread(&WiredTigerOplogManager::_oplogJournalThreadLoop,
                                        this,
                                        WiredTigerRecoveryUnit::get(opCtx)->getSessionCache(),
@@ -85,7 +86,7 @@ void WiredTigerOplogManager::start(OperationContext* opCtx,
 
 void WiredTigerOplogManager::halt() {
     {
-        stdx::lock_guard<stdx::mutex> lk(_oplogVisibilityStateMutex);
+        stdx::lock_guard<Latch> lk(_oplogVisibilityStateMutex);
         invariant(_isRunning);
         _shuttingDown = true;
         _isRunning = false;
@@ -119,7 +120,7 @@ void WiredTigerOplogManager::waitForAllEarlierOplogWritesToBeVisible(
     // Close transaction before we wait.
     opCtx->recoveryUnit()->abandonSnapshot();
 
-    stdx::unique_lock<stdx::mutex> lk(_oplogVisibilityStateMutex);
+    stdx::unique_lock<Latch> lk(_oplogVisibilityStateMutex);
 
     // Prevent any scheduled journal flushes from being delayed and blocking this wait excessively.
     _opsWaitingForVisibility++;
@@ -139,15 +140,15 @@ void WiredTigerOplogManager::waitForAllEarlierOplogWritesToBeVisible(
         currentLatestVisibleTimestamp = newLatestVisibleTimestamp;
         RecordId latestVisible = RecordId(currentLatestVisibleTimestamp);
         if (latestVisible < waitingFor) {
-            LOG(2) << "Operation is waiting for " << waitingFor << "; latestVisible is "
-                   << Timestamp(currentLatestVisibleTimestamp);
+            LOG(2) << "Operation is waiting for " << Timestamp(waitingFor.repr())
+                   << "; latestVisible is " << Timestamp(currentLatestVisibleTimestamp);
         }
         return latestVisible >= waitingFor;
     });
 }
 
 void WiredTigerOplogManager::triggerJournalFlush() {
-    stdx::lock_guard<stdx::mutex> lk(_oplogVisibilityStateMutex);
+    stdx::lock_guard<Latch> lk(_oplogVisibilityStateMutex);
     if (!_opsWaitingForJournal) {
         _opsWaitingForJournal = true;
         _opsWaitingForJournalCV.notify_one();
@@ -162,7 +163,18 @@ void WiredTigerOplogManager::_oplogJournalThreadLoop(WiredTigerSessionCache* ses
     // forward cursors.  The timestamp is used to hide oplog entries that might be committed but
     // have uncommitted entries ahead of them.
     while (true) {
-        stdx::unique_lock<stdx::mutex> lk(_oplogVisibilityStateMutex);
+        auto opCtx = cc().makeOperationContext();
+
+        // This thread is started before we finish creating the StorageEngine and consequently
+        // makeOperationContext() returns an OperationContext with a LockerNoop. Rather than trying
+        // to refactor the code to start this thread after the StorageEngine is fully instantiated,
+        // we will use this temporary hack to give the opCtx a real Locker.
+        //
+        // TODO (SERVER-41392): the Replicate Before Journaling project will be removing the
+        // waitUntilDurable() call requiring an opCtx parameter.
+        opCtx->swapLockState(std::make_unique<LockerImpl>());
+
+        stdx::unique_lock<Latch> lk(_oplogVisibilityStateMutex);
         {
             MONGO_IDLE_THREAD_BLOCK;
             _opsWaitingForJournalCV.wait(lk,
@@ -171,9 +183,6 @@ void WiredTigerOplogManager::_oplogJournalThreadLoop(WiredTigerSessionCache* ses
             // If we're not shutting down and nobody is actively waiting for the oplog to become
             // durable, delay journaling a bit to reduce the sync rate.
             auto journalDelay = Milliseconds(storageGlobalParams.journalCommitIntervalMs.load());
-            if (journalDelay == Milliseconds(0)) {
-                journalDelay = Milliseconds(WiredTigerKVEngine::kDefaultJournalDelayMillis);
-            }
             auto now = Date_t::now();
             auto deadline = now + journalDelay;
             auto shouldSyncOpsWaitingForJournal = [&] {
@@ -196,7 +205,7 @@ void WiredTigerOplogManager::_oplogJournalThreadLoop(WiredTigerSessionCache* ses
             }
         }
 
-        while (!_shuttingDown && MONGO_FAIL_POINT(WTPausePrimaryOplogDurabilityLoop)) {
+        while (!_shuttingDown && MONGO_unlikely(WTPausePrimaryOplogDurabilityLoop.shouldFail())) {
             lk.unlock();
             sleepmillis(10);
             lk.lock();
@@ -210,7 +219,7 @@ void WiredTigerOplogManager::_oplogJournalThreadLoop(WiredTigerSessionCache* ses
         _opsWaitingForJournal = false;
         lk.unlock();
 
-        const uint64_t newTimestamp = fetchAllCommittedValue(sessionCache->conn());
+        const uint64_t newTimestamp = fetchAllDurableValue(sessionCache->conn());
 
         // The newTimestamp may actually go backward during secondary batch application,
         // where we commit data file changes separately from oplog changes, so ignore
@@ -222,7 +231,7 @@ void WiredTigerOplogManager::_oplogJournalThreadLoop(WiredTigerSessionCache* ses
 
         // In order to avoid oplog holes after an unclean shutdown, we must ensure this proposed
         // oplog read timestamp's documents are durable before publishing that timestamp.
-        sessionCache->waitUntilDurable(/*forceCheckpoint=*/false, false);
+        sessionCache->waitUntilDurable(opCtx.get(), /*forceCheckpoint=*/false, false);
 
         lk.lock();
         // Publish the new timestamp value.  Avoid going backward.
@@ -242,7 +251,7 @@ std::uint64_t WiredTigerOplogManager::getOplogReadTimestamp() const {
 }
 
 void WiredTigerOplogManager::setOplogReadTimestamp(Timestamp ts) {
-    stdx::lock_guard<stdx::mutex> lk(_oplogVisibilityStateMutex);
+    stdx::lock_guard<Latch> lk(_oplogVisibilityStateMutex);
     _setOplogReadTimestamp(lk, ts.asULL());
 }
 
@@ -252,11 +261,11 @@ void WiredTigerOplogManager::_setOplogReadTimestamp(WithLock, uint64_t newTimest
     LOG(2) << "Setting new oplogReadTimestamp: " << Timestamp(newTimestamp);
 }
 
-uint64_t WiredTigerOplogManager::fetchAllCommittedValue(WT_CONNECTION* conn) {
-    // Fetch the latest all_committed value from the storage engine.  This value will be a
-    // timestamp that has no holes (uncommitted transactions with lower timestamps) behind it.
+uint64_t WiredTigerOplogManager::fetchAllDurableValue(WT_CONNECTION* conn) {
+    // Fetch the latest all_durable value from the storage engine. This value will be a timestamp
+    // that has no holes (uncommitted transactions with lower timestamps) behind it.
     char buf[(2 * 8 /*bytes in hex*/) + 1 /*nul terminator*/];
-    auto wtstatus = conn->query_timestamp(conn, buf, "get=all_committed");
+    auto wtstatus = conn->query_timestamp(conn, buf, "get=all_durable");
     if (wtstatus == WT_NOTFOUND) {
         // Treat this as lowest possible timestamp; we need to see all preexisting data but no new
         // (timestamped) data.
@@ -266,7 +275,7 @@ uint64_t WiredTigerOplogManager::fetchAllCommittedValue(WT_CONNECTION* conn) {
     }
 
     uint64_t tmp;
-    fassert(38002, parseNumberFromStringWithBase(buf, 16, &tmp));
+    fassert(38002, NumberParser().base(16)(buf, &tmp));
     return tmp;
 }
 

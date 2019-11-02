@@ -35,6 +35,7 @@
 #include "mongo/client/dbclient_base.h"
 #include "mongo/client/mongo_uri.h"
 #include "mongo/platform/atomic_word.h"
+#include "mongo/stdx/condition_variable.h"
 #include "mongo/util/background.h"
 #include "mongo/util/concurrency/mutex.h"
 #include "mongo/util/time_support.h"
@@ -69,7 +70,8 @@ struct ConnectionPoolStats;
  * PoolForHost is not thread-safe; thread safety is handled by DBConnectionPool.
  */
 class PoolForHost {
-    MONGO_DISALLOW_COPYING(PoolForHost);
+    PoolForHost(const PoolForHost&) = delete;
+    PoolForHost& operator=(const PoolForHost&) = delete;
 
 public:
     // Sentinel value indicating pool has no cleanup limit
@@ -178,7 +180,7 @@ public:
      * throw if a free connection cannot be acquired within that amount of
      * time. Timeout is in seconds.
      */
-    void waitForFreeConnection(int timeout, stdx::unique_lock<stdx::mutex>& lk);
+    void waitForFreeConnection(int timeout, stdx::unique_lock<Latch>& lk);
 
     /**
      * Notifies any waiters that there are new connections available.
@@ -331,6 +333,7 @@ public:
     int getNumBadConns(const std::string& host, double socketTimeout = 0) const;
 
     void release(const std::string& host, DBClientBase* c);
+    void decrementEgress(const std::string& host, DBClientBase* c);
 
     void addHook(DBConnectionHook* hook);  // we take ownership
     void appendConnectionStats(executor::ConnectionPoolStats* stats) const;
@@ -390,7 +393,7 @@ private:
 
     typedef std::map<PoolKey, PoolForHost, poolKeyCompare> PoolMap;  // servername -> pool
 
-    mutable stdx::mutex _mutex;
+    mutable Mutex _mutex = MONGO_MAKE_LATCH("DBConnectionPool::_mutex");
     std::string _name;
 
     // The maximum number of connections we'll save in the pool per-host
@@ -411,7 +414,8 @@ private:
 };
 
 class AScopedConnection {
-    MONGO_DISALLOW_COPYING(AScopedConnection);
+    AScopedConnection(const AScopedConnection&) = delete;
+    AScopedConnection& operator=(const AScopedConnection&) = delete;
 
 public:
     AScopedConnection() {
@@ -454,7 +458,7 @@ public:
     explicit ScopedDbConnection(const ConnectionString& host, double socketTimeout = 0);
     explicit ScopedDbConnection(const MongoURI& host, double socketTimeout = 0);
 
-    ScopedDbConnection() : _host(""), _conn(0), _socketTimeoutSecs(0) {}
+    ScopedDbConnection() : _host(""), _conn(nullptr), _socketTimeoutSecs(0) {}
 
     /* @param conn - bind to an existing connection */
     ScopedDbConnection(const std::string& host, DBClientBase* conn, double socketTimeout = 0)
@@ -485,7 +489,7 @@ public:
     }
 
     bool ok() const {
-        return _conn != NULL;
+        return _conn != nullptr;
     }
 
     std::string getHost() const {
@@ -495,10 +499,7 @@ public:
     /** Force closure of the connection.  You should call this if you leave it in
         a bad state.  Destructor will do this too, but it is verbose.
     */
-    void kill() {
-        delete _conn;
-        _conn = 0;
-    }
+    void kill();
 
     /** Call this when you are done with the connection.
 

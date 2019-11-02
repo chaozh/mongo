@@ -1,7 +1,5 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 """Generate fuzzer tests to run in evergreen in parallel."""
-
-from __future__ import absolute_import
 
 import argparse
 import math
@@ -15,8 +13,8 @@ from shrub.task import TaskDependency
 from shrub.variant import DisplayTaskDefinition
 from shrub.variant import TaskSpec
 
-import util.read_config as read_config
-import util.taskname as taskname
+import buildscripts.util.read_config as read_config
+import buildscripts.util.taskname as taskname
 
 CONFIG_DIRECTORY = "generated_resmoke_config"
 
@@ -115,6 +113,7 @@ def _generate_evg_tasks(options):
         if options.use_multiversion:
             commands.append(CommandDefinition().function("do multiversion setup"))
 
+        commands.append(CommandDefinition().function("setup jstestfuzz"))
         commands.append(CommandDefinition().function("run jstestfuzz").vars({
             "jstestfuzz_vars":
                 "--numGeneratedFiles {0} {1}".format(options.num_files, options.jstestfuzz_vars),

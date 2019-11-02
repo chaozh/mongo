@@ -29,13 +29,14 @@
 
 #pragma once
 
+#include <functional>
+#include <memory>
+
 #include "mongo/db/repl/optime.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/s/catalog/sharding_catalog_client.h"
 #include "mongo/s/catalog_cache.h"
 #include "mongo/s/client/shard_registry.h"
-#include "mongo/stdx/functional.h"
-#include "mongo/stdx/memory.h"
-#include "mongo/stdx/mutex.h"
 
 namespace mongo {
 
@@ -58,7 +59,7 @@ public:
     Grid();
     ~Grid();
 
-    using CustomConnectionPoolStatsFn = stdx::function<void(executor::ConnectionPoolStats* stats)>;
+    using CustomConnectionPoolStatsFn = std::function<void(executor::ConnectionPoolStats* stats)>;
 
     /**
      * Retrieves the instance of Grid associated with the current service/operation context.
@@ -153,9 +154,12 @@ public:
     /**
      * Called whenever a mongos or shard gets a response from a config server or shard and updates
      * what we've seen as the last config server optime.
+     * If the config optime was updated, returns the previous value.
      * NOTE: This is not valid to call on a config server instance.
      */
-    void advanceConfigOpTime(repl::OpTime opTime);
+    boost::optional<repl::OpTime> advanceConfigOpTime(OperationContext* opCtx,
+                                                      repl::OpTime opTime,
+                                                      StringData what);
 
     /**
      * Clears the grid object so that it can be reused between test executions. This will not
@@ -188,11 +192,18 @@ private:
     AtomicWord<bool> _shardingInitialized{false};
 
     // Protects _configOpTime.
-    mutable stdx::mutex _mutex;
+    mutable Mutex _mutex = MONGO_MAKE_LATCH("Grid::_mutex");
 
     // Last known highest opTime from the config server that should be used when doing reads.
     // This value is updated any time a shard or mongos talks to a config server or a shard.
     repl::OpTime _configOpTime;
+
+    /**
+     * Called to update what we've seen as the last config server optime.
+     * If the config optime was updated, returns the previous value.
+     * NOTE: This is not valid to call on a config server instance.
+     */
+    boost::optional<repl::OpTime> _advanceConfigOpTime(const repl::OpTime& opTime);
 
     // Deprecated. This is only used on mongos, and once addShard is solely handled by the configs,
     // it can be deleted.

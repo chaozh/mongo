@@ -78,7 +78,7 @@ ElementIterator::Context SimpleArrayElementIterator::next() {
 
 // ------
 BSONElementIterator::BSONElementIterator() {
-    _path = NULL;
+    _path = nullptr;
 }
 
 BSONElementIterator::BSONElementIterator(const ElementPath* path,
@@ -359,4 +359,4 @@ ElementIterator::Context BSONElementIterator::next() {
     _next.reset();
     return x;
 }
-}
+}  // namespace mongo

@@ -73,12 +73,11 @@ public:
              BSONObjBuilder& result) override {
         const NamespaceString nss(parseNs(dbName, cmdObj));
 
-        uassertStatusOK(createShardDatabase(opCtx, dbName));
+        createShardDatabase(opCtx, dbName);
 
         uassert(ErrorCodes::InvalidOptions,
                 "specify size:<n> when capped is true",
-                !cmdObj["capped"].trueValue() || cmdObj["size"].isNumber() ||
-                    cmdObj.hasField("$nExtents"));
+                !cmdObj["capped"].trueValue() || cmdObj["size"].isNumber());
 
         ConfigsvrCreateCollection configCreateCmd(nss);
         configCreateCmd.setDbName(NamespaceString::kAdminDb);
@@ -92,14 +91,14 @@ public:
             configCreateCmd.setOptions(optionsBuilder.obj());
         }
 
-        auto response =
-            Grid::get(opCtx)->shardRegistry()->getConfigShard()->runCommandWithFixedRetryAttempts(
-                opCtx,
-                ReadPreferenceSetting{ReadPreference::PrimaryOnly},
-                "admin",
-                CommandHelpers::appendMajorityWriteConcern(
-                    CommandHelpers::appendPassthroughFields(cmdObj, configCreateCmd.toBSON({}))),
-                Shard::RetryPolicy::kIdempotent);
+        const auto shardRegistry = Grid::get(opCtx)->shardRegistry();
+        auto response = shardRegistry->getConfigShard()->runCommandWithFixedRetryAttempts(
+            opCtx,
+            ReadPreferenceSetting{ReadPreference::PrimaryOnly},
+            "admin",
+            CommandHelpers::appendMajorityWriteConcern(
+                CommandHelpers::appendPassthroughFields(cmdObj, configCreateCmd.toBSON({}))),
+            Shard::RetryPolicy::kIdempotent);
 
         uassertStatusOK(Shard::CommandResponse::getEffectiveStatus(response));
         return true;

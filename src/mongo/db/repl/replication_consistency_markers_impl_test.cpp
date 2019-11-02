@@ -27,9 +27,11 @@
  *    it in the license file.
  */
 
+#include "mongo/platform/basic.h"
+
 #include "mongo/db/repl/replication_consistency_markers_impl.h"
 
-#include "mongo/platform/basic.h"
+#include <memory>
 
 #include "mongo/db/client.h"
 #include "mongo/db/concurrency/d_concurrency.h"
@@ -43,10 +45,9 @@
 #include "mongo/db/repl/storage_interface_impl.h"
 #include "mongo/db/service_context_d_test_fixture.h"
 #include "mongo/db/storage/recovery_unit_noop.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace {
 
@@ -58,8 +59,7 @@ using namespace mongo::repl;
  */
 template <typename T>
 NamespaceString makeNamespace(const T& t, const std::string& suffix = "") {
-    return NamespaceString(std::string("local." + t.getSuiteName() + "_" + t.getTestName())
-                               .substr(0, NamespaceString::MaxNsCollectionLen - suffix.length()) +
+    return NamespaceString(std::string("local." + t.getSuiteName() + "_" + t.getTestName()) +
                            suffix);
 }
 
@@ -69,7 +69,7 @@ NamespaceString makeNamespace(const T& t, const std::string& suffix = "") {
 BSONObj getMinValidDocument(OperationContext* opCtx, const NamespaceString& minValidNss) {
     return writeConflictRetry(opCtx, "getMinValidDocument", minValidNss.ns(), [opCtx, minValidNss] {
         Lock::DBLock dblk(opCtx, minValidNss.db(), MODE_IS);
-        Lock::CollectionLock lk(opCtx->lockState(), minValidNss.ns(), MODE_IS);
+        Lock::CollectionLock lk(opCtx, minValidNss, MODE_IS);
         BSONObj mv;
         if (Helpers::getSingleton(opCtx, minValidNss.ns().c_str(), mv)) {
             return mv;
@@ -89,7 +89,7 @@ BSONObj getOplogTruncateAfterPointDocument(OperationContext* opCtx,
         oplogTruncateAfterPointNss.ns(),
         [opCtx, oplogTruncateAfterPointNss] {
             Lock::DBLock dblk(opCtx, oplogTruncateAfterPointNss.db(), MODE_IS);
-            Lock::CollectionLock lk(opCtx->lockState(), oplogTruncateAfterPointNss.ns(), MODE_IS);
+            Lock::CollectionLock lk(opCtx, oplogTruncateAfterPointNss, MODE_IS);
             BSONObj mv;
             if (Helpers::getSingleton(opCtx, oplogTruncateAfterPointNss.ns().c_str(), mv)) {
                 return mv;
@@ -112,9 +112,9 @@ private:
     void setUp() override {
         ServiceContextMongoDTest::setUp();
         _createOpCtx();
-        auto replCoord = stdx::make_unique<ReplicationCoordinatorMock>(getServiceContext());
+        auto replCoord = std::make_unique<ReplicationCoordinatorMock>(getServiceContext());
         ReplicationCoordinator::set(getServiceContext(), std::move(replCoord));
-        _storageInterface = stdx::make_unique<StorageInterfaceImpl>();
+        _storageInterface = std::make_unique<StorageInterfaceImpl>();
     }
 
     void tearDown() override {
@@ -136,13 +136,13 @@ private:
  */
 class RecoveryUnitWithDurabilityTracking : public RecoveryUnitNoop {
 public:
-    bool waitUntilDurable() override;
+    bool waitUntilDurable(OperationContext* opCtx) override;
     bool waitUntilDurableCalled = false;
 };
 
-bool RecoveryUnitWithDurabilityTracking::waitUntilDurable() {
+bool RecoveryUnitWithDurabilityTracking::waitUntilDurable(OperationContext* opCtx) {
     waitUntilDurableCalled = true;
-    return RecoveryUnitNoop::waitUntilDurable();
+    return RecoveryUnitNoop::waitUntilDurable(opCtx);
 }
 
 TEST_F(ReplicationConsistencyMarkersTest, InitialSyncFlag) {

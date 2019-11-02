@@ -34,6 +34,7 @@
 #include "mongo/db/s/balancer/balancer_chunk_selection_policy_impl.h"
 
 #include <algorithm>
+#include <memory>
 #include <vector>
 
 #include "mongo/base/status_with.h"
@@ -43,9 +44,8 @@
 #include "mongo/s/catalog/type_tags.h"
 #include "mongo/s/catalog_cache.h"
 #include "mongo/s/grid.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -117,7 +117,8 @@ StatusWith<DistributionStatus> createCollectionDistributionStatus(
  * splitting a chunk does not yield the same chunk anymore.
  */
 class SplitCandidatesBuffer {
-    MONGO_DISALLOW_COPYING(SplitCandidatesBuffer);
+    SplitCandidatesBuffer(const SplitCandidatesBuffer&) = delete;
+    SplitCandidatesBuffer& operator=(const SplitCandidatesBuffer&) = delete;
 
 public:
     SplitCandidatesBuffer(NamespaceString nss, ChunkVersion collectionVersion)
@@ -440,12 +441,10 @@ StatusWith<MigrateInfoVector> BalancerChunkSelectionPolicyImpl::_getMigrateCandi
         if (chunkAtZoneMin.getMin().woCompare(tagRange.min)) {
             return {ErrorCodes::IllegalOperation,
                     str::stream()
-                        << "Tag boundaries "
-                        << tagRange.toString()
+                        << "Tag boundaries " << tagRange.toString()
                         << " fall in the middle of an existing chunk "
                         << ChunkRange(chunkAtZoneMin.getMin(), chunkAtZoneMin.getMax()).toString()
-                        << ". Balancing for collection "
-                        << nss.ns()
+                        << ". Balancing for collection " << nss.ns()
                         << " will be postponed until the chunk is split appropriately."};
         }
 
@@ -461,12 +460,10 @@ StatusWith<MigrateInfoVector> BalancerChunkSelectionPolicyImpl::_getMigrateCandi
             chunkAtZoneMax.getMax().woCompare(tagRange.max)) {
             return {ErrorCodes::IllegalOperation,
                     str::stream()
-                        << "Tag boundaries "
-                        << tagRange.toString()
+                        << "Tag boundaries " << tagRange.toString()
                         << " fall in the middle of an existing chunk "
                         << ChunkRange(chunkAtZoneMax.getMin(), chunkAtZoneMax.getMax()).toString()
-                        << ". Balancing for collection "
-                        << nss.ns()
+                        << ". Balancing for collection " << nss.ns()
                         << " will be postponed until the chunk is split appropriately."};
         }
     }

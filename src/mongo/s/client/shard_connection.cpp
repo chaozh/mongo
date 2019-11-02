@@ -63,19 +63,19 @@ class ClientConnections;
 class ActiveClientConnections {
 public:
     void add(const ClientConnections* cc) {
-        stdx::lock_guard<stdx::mutex> lg(_mutex);
+        stdx::lock_guard<Latch> lg(_mutex);
         _clientConnections.insert(cc);
     }
 
     void remove(const ClientConnections* cc) {
-        stdx::lock_guard<stdx::mutex> lg(_mutex);
+        stdx::lock_guard<Latch> lg(_mutex);
         _clientConnections.erase(cc);
     }
 
     void appendInfo(BSONObjBuilder* b) const;
 
 private:
-    mutable stdx::mutex _mutex;
+    mutable Mutex _mutex = MONGO_MAKE_LATCH("ActiveClientConnections::_mutex");
     std::set<const ClientConnections*> _clientConnections;
 
 } activeClientConnections;
@@ -85,7 +85,8 @@ private:
  * to be thread safe.
  */
 class ClientConnections {
-    MONGO_DISALLOW_COPYING(ClientConnections);
+    ClientConnections(const ClientConnections&) = delete;
+    ClientConnections& operator=(const ClientConnections&) = delete;
 
 public:
     struct Status {
@@ -108,7 +109,7 @@ public:
 
     static ClientConnections* threadInstance() {
         if (!_perThread) {
-            _perThread = stdx::make_unique<ClientConnections>();
+            _perThread = std::make_unique<ClientConnections>();
         }
         return _perThread.get();
     }
@@ -126,7 +127,7 @@ public:
         std::unique_ptr<DBClientBase> c;
         if (s->avail) {
             c.reset(s->avail);
-            s->avail = 0;
+            s->avail = nullptr;
 
             // May throw an exception
             shardConnectionPool.onHandedOut(c.get());
@@ -161,7 +162,7 @@ public:
                     release(addr, ss->avail);
                 }
 
-                ss->avail = 0;
+                ss->avail = nullptr;
             }
 
             if (fromDestructor) {
@@ -180,7 +181,7 @@ public:
 
         const bool isConnGood = shardConnectionPool.isConnectionGood(addr, conn);
 
-        if (s->avail != NULL) {
+        if (s->avail != nullptr) {
             warning() << "Detected additional sharded connection in the "
                       << "thread local pool for " << addr;
 
@@ -192,7 +193,7 @@ public:
 
             if (!isConnGood) {
                 delete s->avail;
-                s->avail = NULL;
+                s->avail = nullptr;
             }
 
             // Let the internal pool handle the bad connection, this can also
@@ -267,7 +268,7 @@ public:
      */
     void clearPool() {
         for (HostMap::iterator iter = _hosts.begin(); iter != _hosts.end(); ++iter) {
-            if (iter->second->avail != NULL) {
+            if (iter->second->avail != nullptr) {
                 delete iter->second->avail;
             }
             delete iter->second;
@@ -330,7 +331,7 @@ void ActiveClientConnections::appendInfo(BSONObjBuilder* b) const {
     BSONArrayBuilder arr(64 * 1024);
 
     {
-        stdx::lock_guard<stdx::mutex> lock(_mutex);
+        stdx::lock_guard<Latch> lock(_mutex);
         for (const auto* conn : _clientConnections) {
             BSONObjBuilder bb(arr.subobjStart());
             conn->appendInfo(bb);
@@ -442,7 +443,7 @@ void ShardConnection::kill() {
             delete _conn;
         }
 
-        _conn = 0;
+        _conn = nullptr;
         _finishedInit = true;
     }
 }

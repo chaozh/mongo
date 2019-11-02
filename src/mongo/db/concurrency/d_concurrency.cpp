@@ -33,18 +33,19 @@
 
 #include "mongo/db/concurrency/d_concurrency.h"
 
+#include <memory>
 #include <string>
 #include <vector>
 
-#include "mongo/db/concurrency/global_lock_acquisition_tracker.h"
+#include "mongo/db/catalog/collection_catalog.h"
+#include "mongo/db/concurrency/flow_control_ticketholder.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/service_context.h"
-#include "mongo/stdx/memory.h"
-#include "mongo/stdx/mutex.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
 #include "mongo/util/stacktrace.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -76,7 +77,7 @@ public:
     }
 
     static std::string nameForId(ResourceId resourceId) {
-        stdx::lock_guard<stdx::mutex> lk(resourceIdFactory->labelsMutex);
+        stdx::lock_guard<Latch> lk(resourceIdFactory->labelsMutex);
         return resourceIdFactory->labels.at(resourceId.getHashId());
     }
 
@@ -92,7 +93,7 @@ public:
 
 private:
     ResourceId _newResourceIdForMutex(std::string resourceLabel) {
-        stdx::lock_guard<stdx::mutex> lk(labelsMutex);
+        stdx::lock_guard<Latch> lk(labelsMutex);
         invariant(nextId == labels.size());
         labels.push_back(std::move(resourceLabel));
 
@@ -103,7 +104,7 @@ private:
 
     std::uint64_t nextId = 0;
     std::vector<std::string> labels;
-    stdx::mutex labelsMutex;
+    Mutex labelsMutex = MONGO_MAKE_LATCH("ResourceIdFactory::labelsMutex");
 };
 
 ResourceIdFactory* ResourceIdFactory::resourceIdFactory;
@@ -140,37 +141,16 @@ Lock::GlobalLock::GlobalLock(OperationContext* opCtx,
                              LockMode lockMode,
                              Date_t deadline,
                              InterruptBehavior behavior)
-    : GlobalLock(opCtx, lockMode, deadline, behavior, EnqueueOnly()) {
-    waitForLockUntil(deadline);
-}
-
-Lock::GlobalLock::GlobalLock(OperationContext* opCtx,
-                             LockMode lockMode,
-                             Date_t deadline,
-                             InterruptBehavior behavior,
-                             EnqueueOnly enqueueOnly)
     : _opCtx(opCtx),
       _result(LOCK_INVALID),
       _pbwm(opCtx->lockState(), resourceIdParallelBatchWriterMode),
       _interruptBehavior(behavior),
       _isOutermostLock(!opCtx->lockState()->isLocked()) {
-    _enqueue(lockMode, deadline);
-}
+    _opCtx->lockState()->getFlowControlTicket(_opCtx, lockMode);
 
-Lock::GlobalLock::GlobalLock(GlobalLock&& otherLock)
-    : _opCtx(otherLock._opCtx),
-      _result(otherLock._result),
-      _pbwm(std::move(otherLock._pbwm)),
-      _interruptBehavior(otherLock._interruptBehavior),
-      _isOutermostLock(otherLock._isOutermostLock) {
-    // Mark as moved so the destructor doesn't invalidate the newly-constructed lock.
-    otherLock._result = LOCK_INVALID;
-}
-
-void Lock::GlobalLock::_enqueue(LockMode lockMode, Date_t deadline) {
     try {
         if (_opCtx->lockState()->shouldConflictWithSecondaryBatchApplication()) {
-            _pbwm.lock(MODE_IS);
+            _pbwm.lock(opCtx, MODE_IS);
         }
         auto unlockPBWM = makeGuard([this] {
             if (_opCtx->lockState()->shouldConflictWithSecondaryBatchApplication()) {
@@ -185,7 +165,8 @@ void Lock::GlobalLock::_enqueue(LockMode lockMode, Date_t deadline) {
             [this] { _opCtx->lockState()->unlock(resourceIdReplicationStateTransitionLock); });
 
         _result = LOCK_INVALID;
-        _result = _opCtx->lockState()->lockGlobalBegin(_opCtx, lockMode, deadline);
+        _opCtx->lockState()->lockGlobal(_opCtx, lockMode, deadline);
+        _result = LOCK_OK;
 
         unlockRSTL.dismiss();
         unlockPBWM.dismiss();
@@ -194,28 +175,18 @@ void Lock::GlobalLock::_enqueue(LockMode lockMode, Date_t deadline) {
         if (_interruptBehavior == InterruptBehavior::kThrow)
             throw;
     }
+    auto acquiredLockMode = _opCtx->lockState()->getLockMode(resourceIdGlobal);
+    _opCtx->lockState()->setGlobalLockTakenInMode(acquiredLockMode);
 }
 
-void Lock::GlobalLock::waitForLockUntil(Date_t deadline) {
-    try {
-        if (_result == LOCK_WAITING) {
-            _result = LOCK_INVALID;
-            _opCtx->lockState()->lockGlobalComplete(_opCtx, deadline);
-            _result = LOCK_OK;
-        }
-    } catch (const ExceptionForCat<ErrorCategory::Interruption>&) {
-        _opCtx->lockState()->unlock(resourceIdReplicationStateTransitionLock);
-        if (_opCtx->lockState()->shouldConflictWithSecondaryBatchApplication()) {
-            _pbwm.unlock();
-        }
-        // The kLeaveUnlocked behavior suppresses this exception.
-        if (_interruptBehavior == InterruptBehavior::kThrow)
-            throw;
-    }
-
-    const ResourceId globalResId(RESOURCE_GLOBAL, ResourceId::SINGLETON_GLOBAL);
-    auto lockMode = _opCtx->lockState()->getLockMode(globalResId);
-    GlobalLockAcquisitionTracker::get(_opCtx).setGlobalLockModeBit(lockMode);
+Lock::GlobalLock::GlobalLock(GlobalLock&& otherLock)
+    : _opCtx(otherLock._opCtx),
+      _result(otherLock._result),
+      _pbwm(std::move(otherLock._pbwm)),
+      _interruptBehavior(otherLock._interruptBehavior),
+      _isOutermostLock(otherLock._isOutermostLock) {
+    // Mark as moved so the destructor doesn't invalidate the newly-constructed lock.
+    otherLock._result = LOCK_INVALID;
 }
 
 void Lock::GlobalLock::_unlock() {
@@ -262,68 +233,80 @@ void Lock::DBLock::relockWithMode(LockMode newMode) {
     // 2PL would delay the unlocking
     invariant(!_opCtx->lockState()->inAWriteUnitOfWork());
 
-    // Not allowed to change global intent
-    invariant(!isSharedLockMode(_mode) || isSharedLockMode(newMode));
+    // Not allowed to change global intent, so check when going from shared to exclusive.
+    if (isSharedLockMode(_mode) && !isSharedLockMode(newMode))
+        invariant(_opCtx->lockState()->isWriteLocked());
 
     _opCtx->lockState()->unlock(_id);
     _mode = newMode;
+
+    // Verify we still have at least the Global resource locked.
+    invariant(_opCtx->lockState()->isLocked());
 
     _opCtx->lockState()->lock(_opCtx, _id, _mode);
     _result = LOCK_OK;
 }
 
-
-Lock::CollectionLock::CollectionLock(Locker* lockState,
-                                     StringData ns,
+Lock::CollectionLock::CollectionLock(OperationContext* opCtx,
+                                     const NamespaceStringOrUUID& nssOrUUID,
                                      LockMode mode,
                                      Date_t deadline)
-    : _id(RESOURCE_COLLECTION, ns), _result(LOCK_INVALID), _lockState(lockState) {
-    massert(28538, "need a non-empty collection name", nsIsFull(ns));
-
-    dassert(_lockState->isDbLockedForMode(nsToDatabaseSubstring(ns),
-                                          isSharedLockMode(mode) ? MODE_IS : MODE_IX));
+    : _opCtx(opCtx) {
     LockMode actualLockMode = mode;
     if (!supportsDocLocking()) {
         actualLockMode = isSharedLockMode(mode) ? MODE_S : MODE_X;
     }
 
-    _lockState->lock(_id, actualLockMode, deadline);
-    _result = LOCK_OK;
+    if (nssOrUUID.nss()) {
+        auto& nss = *nssOrUUID.nss();
+        _id = {RESOURCE_COLLECTION, nss.ns()};
+
+        invariant(nss.coll().size(), str::stream() << "expected non-empty collection name:" << nss);
+        dassert(_opCtx->lockState()->isDbLockedForMode(nss.db(),
+                                                       isSharedLockMode(mode) ? MODE_IS : MODE_IX));
+
+        _opCtx->lockState()->lock(_opCtx, _id, actualLockMode, deadline);
+        return;
+    }
+
+    // 'nsOrUUID' must be a UUID and dbName.
+
+    auto& collectionCatalog = CollectionCatalog::get(opCtx);
+    auto nss = collectionCatalog.resolveNamespaceStringOrUUID(nssOrUUID);
+
+    // The UUID cannot move between databases so this one dassert is sufficient.
+    dassert(_opCtx->lockState()->isDbLockedForMode(nss.db(),
+                                                   isSharedLockMode(mode) ? MODE_IS : MODE_IX));
+
+    // We cannot be sure that the namespace we lock matches the UUID given because we resolve the
+    // namespace from the UUID without the safety of a lock. Therefore, we will continue to re-lock
+    // until the namespace we resolve from the UUID before and after taking the lock is the same.
+    bool locked = false;
+    NamespaceString prevResolvedNss;
+    do {
+        if (locked) {
+            _opCtx->lockState()->unlock(_id);
+        }
+
+        _id = ResourceId(RESOURCE_COLLECTION, nss.ns());
+        _opCtx->lockState()->lock(_opCtx, _id, actualLockMode, deadline);
+        locked = true;
+
+        // We looked up UUID without a collection lock so it's possible that the
+        // collection name changed now. Look it up again.
+        prevResolvedNss = nss;
+        nss = collectionCatalog.resolveNamespaceStringOrUUID(nssOrUUID);
+    } while (nss != prevResolvedNss);
 }
 
 Lock::CollectionLock::CollectionLock(CollectionLock&& otherLock)
-    : _id(otherLock._id), _result(otherLock._result), _lockState(otherLock._lockState) {
-    otherLock._lockState = nullptr;
-    otherLock._result = LOCK_INVALID;
+    : _id(otherLock._id), _opCtx(otherLock._opCtx) {
+    otherLock._opCtx = nullptr;
 }
 
 Lock::CollectionLock::~CollectionLock() {
-    if (isLocked()) {
-        _lockState->unlock(_id);
-    }
-}
-
-namespace {
-stdx::mutex oplogSerialization;  // for OplogIntentWriteLock
-}  // namespace
-
-Lock::OplogIntentWriteLock::OplogIntentWriteLock(Locker* lockState)
-    : _lockState(lockState), _serialized(false) {
-    _lockState->lock(resourceIdOplog, MODE_IX);
-}
-
-Lock::OplogIntentWriteLock::~OplogIntentWriteLock() {
-    if (_serialized) {
-        oplogSerialization.unlock();
-    }
-    _lockState->unlock(resourceIdOplog);
-}
-
-void Lock::OplogIntentWriteLock::serializeIfNeeded() {
-    if (!supportsDocLocking() && !_serialized) {
-        oplogSerialization.lock();
-        _serialized = true;
-    }
+    if (_opCtx)
+        _opCtx->lockState()->unlock(_id);
 }
 
 Lock::ParallelBatchWriterMode::ParallelBatchWriterMode(Locker* lockState)
@@ -331,8 +314,12 @@ Lock::ParallelBatchWriterMode::ParallelBatchWriterMode(Locker* lockState)
       _shouldNotConflictBlock(lockState) {}
 
 void Lock::ResourceLock::lock(LockMode mode) {
+    lock(nullptr, mode);
+}
+
+void Lock::ResourceLock::lock(OperationContext* opCtx, LockMode mode) {
     invariant(_result == LOCK_INVALID);
-    _locker->lock(_rid, mode);
+    _locker->lock(opCtx, _rid, mode);
     _result = LOCK_OK;
 }
 

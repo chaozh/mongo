@@ -94,18 +94,22 @@ TEST_F(CatalogCacheRefreshTest, FullLoad) {
                          {shardKeyPattern.getKeyPattern().globalMin(), BSON("_id" << -100)},
                          version,
                          {"0"});
+        chunk1.setName(OID::gen());
         version.incMinor();
 
         ChunkType chunk2(kNss, {BSON("_id" << -100), BSON("_id" << 0)}, version, {"1"});
+        chunk2.setName(OID::gen());
         version.incMinor();
 
         ChunkType chunk3(kNss, {BSON("_id" << 0), BSON("_id" << 100)}, version, {"0"});
+        chunk3.setName(OID::gen());
         version.incMinor();
 
         ChunkType chunk4(kNss,
                          {BSON("_id" << 100), shardKeyPattern.getKeyPattern().globalMax()},
                          version,
                          {"1"});
+        chunk4.setName(OID::gen());
         version.incMinor();
 
         return std::vector<BSONObj>{chunk1.toConfigBSON(),
@@ -114,7 +118,7 @@ TEST_F(CatalogCacheRefreshTest, FullLoad) {
                                     chunk4.toConfigBSON()};
     }());
 
-    auto routingInfo = future.timed_get(kFutureTimeout);
+    auto routingInfo = future.default_timed_get();
     ASSERT(routingInfo->cm());
     auto cm = routingInfo->cm();
 
@@ -144,7 +148,7 @@ TEST_F(CatalogCacheRefreshTest, DatabaseNotFound) {
     expectFindSendBSONObjVector(kConfigHostAndPort, {});
 
     try {
-        auto routingInfo = future.timed_get(kFutureTimeout);
+        auto routingInfo = future.default_timed_get();
         auto cm = routingInfo->cm();
         auto primary = routingInfo->db().primary();
 
@@ -165,7 +169,7 @@ TEST_F(CatalogCacheRefreshTest, DatabaseBSONCorrupted) {
                                     << "This value should not be in a database config document")});
 
     try {
-        auto routingInfo = future.timed_get(kFutureTimeout);
+        auto routingInfo = future.default_timed_get();
         auto cm = routingInfo->cm();
         auto primary = routingInfo->db().primary();
 
@@ -184,7 +188,7 @@ TEST_F(CatalogCacheRefreshTest, CollectionNotFound) {
     // Return an empty collection
     expectFindSendBSONObjVector(kConfigHostAndPort, {});
 
-    auto routingInfo = future.timed_get(kFutureTimeout);
+    auto routingInfo = future.default_timed_get();
     ASSERT(!routingInfo->cm());
     ASSERT(routingInfo->db().primary());
     ASSERT_EQ(ShardId{"0"}, routingInfo->db().primaryId());
@@ -202,7 +206,7 @@ TEST_F(CatalogCacheRefreshTest, CollectionBSONCorrupted) {
               << "This value should not be in a collection config document")});
 
     try {
-        auto routingInfo = future.timed_get(kFutureTimeout);
+        auto routingInfo = future.default_timed_get();
         auto cm = routingInfo->cm();
         auto primary = routingInfo->db().primary();
 
@@ -233,7 +237,7 @@ TEST_F(CatalogCacheRefreshTest, NoChunksFoundForCollection) {
     expectFindSendBSONObjVector(kConfigHostAndPort, {});
 
     try {
-        auto routingInfo = future.timed_get(kFutureTimeout);
+        auto routingInfo = future.default_timed_get();
         auto cm = routingInfo->cm();
         auto primary = routingInfo->db().primary();
 
@@ -267,7 +271,7 @@ TEST_F(CatalogCacheRefreshTest, ChunksBSONCorrupted) {
     }());
 
     try {
-        auto routingInfo = future.timed_get(kFutureTimeout);
+        auto routingInfo = future.default_timed_get();
         auto cm = routingInfo->cm();
         auto primary = routingInfo->db().primary();
 
@@ -295,15 +299,18 @@ TEST_F(CatalogCacheRefreshTest, IncompleteChunksFoundForCollection) {
         version.incMinor();
 
         ChunkType chunk2(kNss, {BSON("_id" << -100), BSON("_id" << 0)}, version, {"1"});
+        chunk2.setName(OID::gen());
         version.incMinor();
 
         ChunkType chunk3(kNss, {BSON("_id" << 0), BSON("_id" << 100)}, version, {"0"});
+        chunk3.setName(OID::gen());
         version.incMinor();
 
         ChunkType chunk4(kNss,
                          {BSON("_id" << 100), shardKeyPattern.getKeyPattern().globalMax()},
                          version,
                          {"1"});
+        chunk4.setName(OID::gen());
         version.incMinor();
 
         return std::vector<BSONObj>{
@@ -322,7 +329,7 @@ TEST_F(CatalogCacheRefreshTest, IncompleteChunksFoundForCollection) {
     expectFindSendBSONObjVector(kConfigHostAndPort, incompleteChunks);
 
     try {
-        auto routingInfo = future.timed_get(kFutureTimeout);
+        auto routingInfo = future.default_timed_get();
         auto cm = routingInfo->cm();
         auto primary = routingInfo->db().primary();
 
@@ -348,11 +355,13 @@ TEST_F(CatalogCacheRefreshTest, ChunkEpochChangeDuringIncrementalLoad) {
         version.incMajor();
         ChunkType chunk1(
             kNss, {shardKeyPattern.getKeyPattern().globalMin(), BSON("_id" << 0)}, version, {"0"});
+        chunk1.setName(OID::gen());
 
         ChunkType chunk2(kNss,
                          {BSON("_id" << 0), shardKeyPattern.getKeyPattern().globalMax()},
                          ChunkVersion(1, 0, OID::gen()),
                          {"1"});
+        chunk2.setName(OID::gen());
 
         return std::vector<BSONObj>{chunk1.toConfigBSON(), chunk2.toConfigBSON()};
     }();
@@ -361,7 +370,6 @@ TEST_F(CatalogCacheRefreshTest, ChunkEpochChangeDuringIncrementalLoad) {
     // frequently the catalog cache retries.
     expectGetCollection(initialRoutingInfo->getVersion().epoch(), shardKeyPattern);
     expectFindSendBSONObjVector(kConfigHostAndPort, inconsistentChunks);
-
     expectGetCollection(initialRoutingInfo->getVersion().epoch(), shardKeyPattern);
     expectFindSendBSONObjVector(kConfigHostAndPort, inconsistentChunks);
 
@@ -369,7 +377,7 @@ TEST_F(CatalogCacheRefreshTest, ChunkEpochChangeDuringIncrementalLoad) {
     expectFindSendBSONObjVector(kConfigHostAndPort, inconsistentChunks);
 
     try {
-        auto routingInfo = future.timed_get(kFutureTimeout);
+        auto routingInfo = future.default_timed_get();
         auto cm = routingInfo->cm();
         auto primary = routingInfo->db().primary();
 
@@ -412,6 +420,7 @@ TEST_F(CatalogCacheRefreshTest, ChunkEpochChangeDuringIncrementalLoadRecoveryAft
                          {shardKeyPattern.getKeyPattern().globalMin(), BSON("_id" << 0)},
                          oldVersion,
                          {"0"});
+        chunk1.setName(OID::gen());
 
         // "Yield" happens here with drop and recreate in between. This is the "last" chunk from the
         // recreated collection.
@@ -419,6 +428,7 @@ TEST_F(CatalogCacheRefreshTest, ChunkEpochChangeDuringIncrementalLoadRecoveryAft
                          {BSON("_id" << 100), shardKeyPattern.getKeyPattern().globalMax()},
                          ChunkVersion(5, 2, newEpoch),
                          {"1"});
+        chunk3.setName(OID::gen());
 
         return std::vector<BSONObj>{chunk1.toConfigBSON(), chunk3.toConfigBSON()};
     });
@@ -439,21 +449,24 @@ TEST_F(CatalogCacheRefreshTest, ChunkEpochChangeDuringIncrementalLoadRecoveryAft
                          {shardKeyPattern.getKeyPattern().globalMin(), BSON("_id" << 0)},
                          newVersion,
                          {"0"});
+        chunk1.setName(OID::gen());
 
         newVersion.incMinor();
         ChunkType chunk2(kNss, {BSON("_id" << 0), BSON("_id" << 100)}, newVersion, {"0"});
+        chunk2.setName(OID::gen());
 
         newVersion.incMinor();
         ChunkType chunk3(kNss,
                          {BSON("_id" << 100), shardKeyPattern.getKeyPattern().globalMax()},
                          newVersion,
                          {"1"});
+        chunk3.setName(OID::gen());
 
         return std::vector<BSONObj>{
             chunk1.toConfigBSON(), chunk2.toConfigBSON(), chunk3.toConfigBSON()};
     });
 
-    auto routingInfo = future.timed_get(kFutureTimeout);
+    auto routingInfo = future.default_timed_get();
     ASSERT(routingInfo->cm());
     auto cm = routingInfo->cm();
 
@@ -490,17 +503,19 @@ TEST_F(CatalogCacheRefreshTest, IncrementalLoadAfterCollectionEpochChange) {
                          {shardKeyPattern.getKeyPattern().globalMin(), BSON("_id" << 0)},
                          newVersion,
                          {"0"});
+        chunk1.setName(OID::gen());
         newVersion.incMinor();
 
         ChunkType chunk2(kNss,
                          {BSON("_id" << 0), shardKeyPattern.getKeyPattern().globalMax()},
                          newVersion,
                          {"1"});
+        chunk2.setName(OID::gen());
 
         return std::vector<BSONObj>{chunk1.toConfigBSON(), chunk2.toConfigBSON()};
     });
 
-    auto routingInfo = future.timed_get(kFutureTimeout);
+    auto routingInfo = future.default_timed_get();
     ASSERT(routingInfo->cm());
     auto cm = routingInfo->cm();
 
@@ -535,15 +550,17 @@ TEST_F(CatalogCacheRefreshTest, IncrementalLoadAfterSplit) {
         version.incMajor();
         ChunkType chunk1(
             kNss, {shardKeyPattern.getKeyPattern().globalMin(), BSON("_id" << 0)}, version, {"0"});
+        chunk1.setName(OID::gen());
 
         version.incMinor();
         ChunkType chunk2(
             kNss, {BSON("_id" << 0), shardKeyPattern.getKeyPattern().globalMax()}, version, {"0"});
+        chunk2.setName(OID::gen());
 
         return std::vector<BSONObj>{chunk1.toConfigBSON(), chunk2.toConfigBSON()};
     });
 
-    auto routingInfo = future.timed_get(kFutureTimeout);
+    auto routingInfo = future.default_timed_get();
     ASSERT(routingInfo->cm());
     auto cm = routingInfo->cm();
 
@@ -574,15 +591,17 @@ TEST_F(CatalogCacheRefreshTest, IncrementalLoadAfterMove) {
         expectedDestShardVersion = version;
         ChunkType chunk1(
             kNss, {shardKeyPattern.getKeyPattern().globalMin(), BSON("_id" << 0)}, version, {"1"});
+        chunk1.setName(OID::gen());
 
         version.incMinor();
         ChunkType chunk2(
             kNss, {BSON("_id" << 0), shardKeyPattern.getKeyPattern().globalMax()}, version, {"0"});
+        chunk2.setName(OID::gen());
 
         return std::vector<BSONObj>{chunk1.toConfigBSON(), chunk2.toConfigBSON()};
     }());
 
-    auto routingInfo = future.timed_get(kFutureTimeout);
+    auto routingInfo = future.default_timed_get();
     ASSERT(routingInfo->cm());
     auto cm = routingInfo->cm();
 
@@ -614,11 +633,12 @@ TEST_F(CatalogCacheRefreshTest, IncrementalLoadAfterMoveLastChunk) {
                           shardKeyPattern.getKeyPattern().globalMax()},
                          version,
                          {"1"});
+        chunk1.setName(OID::gen());
 
         return std::vector<BSONObj>{chunk1.toConfigBSON()};
     }());
 
-    auto routingInfo = future.timed_get(kFutureTimeout);
+    auto routingInfo = future.default_timed_get();
     ASSERT(routingInfo->cm());
     auto cm = routingInfo->cm();
 

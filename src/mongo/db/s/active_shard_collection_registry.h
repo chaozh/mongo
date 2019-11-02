@@ -30,12 +30,12 @@
 #pragma once
 
 #include <boost/optional.hpp>
+#include <memory>
 
-#include "mongo/base/disallow_copying.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/s/request_types/shard_collection_gen.h"
-#include "mongo/stdx/memory.h"
-#include "mongo/stdx/mutex.h"
 #include "mongo/util/concurrency/notification.h"
+#include "mongo/util/string_map.h"
 
 namespace mongo {
 
@@ -49,7 +49,8 @@ class StatusWith;
  * one instance of this object per shard.
  */
 class ActiveShardCollectionRegistry {
-    MONGO_DISALLOW_COPYING(ActiveShardCollectionRegistry);
+    ActiveShardCollectionRegistry(const ActiveShardCollectionRegistry&) = delete;
+    ActiveShardCollectionRegistry& operator=(const ActiveShardCollectionRegistry&) = delete;
 
 public:
     ActiveShardCollectionRegistry();
@@ -72,6 +73,14 @@ public:
      */
     StatusWith<ScopedShardCollection> registerShardCollection(
         const ShardsvrShardCollection& request);
+
+    /**
+     * Takes a snapshot of all currently active shard collections and synchronously waits for each
+     * to complete.
+     *
+     * TODO SERVER-44034: Remove this method.
+     */
+    void waitForActiveShardCollectionsToComplete(OperationContext* opCtx);
 
 private:
     friend class ScopedShardCollection;
@@ -107,7 +116,7 @@ private:
     void _setUUIDOrError(std::string nss, StatusWith<boost::optional<UUID>> swUUID);
 
     // Protects the state below
-    stdx::mutex _mutex;
+    Mutex _mutex = MONGO_MAKE_LATCH("ActiveShardCollectionRegistry::_mutex");
 
     // Map containing any collections currently being sharded
     StringMap<std::shared_ptr<ActiveShardCollectionState>> _activeShardCollectionMap;
@@ -119,7 +128,8 @@ private:
  * registerShardCollection method for more details.
  */
 class ScopedShardCollection {
-    MONGO_DISALLOW_COPYING(ScopedShardCollection);
+    ScopedShardCollection(const ScopedShardCollection&) = delete;
+    ScopedShardCollection& operator=(const ScopedShardCollection&) = delete;
 
 public:
     ScopedShardCollection(std::string nss,

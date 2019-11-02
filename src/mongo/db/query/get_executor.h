@@ -35,6 +35,7 @@
 #include "mongo/db/ops/parsed_update.h"
 #include "mongo/db/ops/update_request.h"
 #include "mongo/db/query/canonical_query.h"
+#include "mongo/db/query/count_command_gen.h"
 #include "mongo/db/query/parsed_distinct.h"
 #include "mongo/db/query/plan_executor.h"
 #include "mongo/db/query/query_planner_params.h"
@@ -66,6 +67,17 @@ void fillOutPlannerParams(OperationContext* opCtx,
                           QueryPlannerParams* plannerParams);
 
 /**
+ * Return whether or not any component of the path 'path' is multikey given an index key pattern
+ * and multikeypaths. If no multikey metdata is available for the index, and the index is marked
+ * multikey, conservatively assumes that a component of 'path' _is_ multikey. The 'isMultikey'
+ * property of an index is false for indexes that definitely have no multikey paths.
+ */
+bool isAnyComponentOfPathMultikey(const BSONObj& indexKeyPattern,
+                                  bool isMultikey,
+                                  const MultikeyPaths& indexMultikeyInfo,
+                                  StringData path);
+
+/**
  * Converts the catalog metadata for an index into an IndexEntry, which is a format that is meant to
  * be consumed by the query planner. This function can perform index reads and should not be called
  * unless access to the storage engine is permitted.
@@ -77,13 +89,6 @@ void fillOutPlannerParams(OperationContext* opCtx,
 IndexEntry indexEntryFromIndexCatalogEntry(OperationContext* opCtx,
                                            const IndexCatalogEntry& ice,
                                            const CanonicalQuery* canonicalQuery = nullptr);
-
-/**
- * Converts the catalog metadata for an index into a CoreIndexInfo, which is a format that is meant
- * to be used to update the plan cache. This function has no side effects and is safe to call in
- * all contexts.
- */
-CoreIndexInfo indexInfoFromIndexCatalogEntry(const IndexCatalogEntry& ice);
 
 /**
  * Determines whether or not to wait for oplog visibility for a query. This is only used for
@@ -109,7 +114,9 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutor(
     size_t plannerOptions = 0);
 
 /**
- * Get a plan executor for a .find() operation.
+ * Get a plan executor for a .find() operation. The executor will have a 'YIELD_AUTO' yield policy
+ * unless a false value for 'permitYield' or being part of a multi-document transaction forces it to
+ * have a 'NO_INTERRUPT' yield policy.
  *
  * If the query is valid and an executor could be created, returns a StatusWith with the
  * PlanExecutor.
@@ -120,6 +127,7 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorFind
     OperationContext* opCtx,
     Collection* collection,
     std::unique_ptr<CanonicalQuery> canonicalQuery,
+    bool permitYield = false,
     size_t plannerOptions = QueryPlannerParams::DEFAULT);
 
 /**
@@ -150,12 +158,12 @@ bool turnIxscanIntoDistinctIxscan(QuerySolution* soln,
  * or an aggregation pipeline that uses a $group stage with distinct-like semantics.
  *
  * Distinct is unique in that it doesn't care about getting all the results; it just wants all
- * possible values of a certain field.  As such, we can skip lots of data in certain cases (see
- * body of method for detail).
+ * possible values of a certain field.  As such, we can skip lots of data in certain cases (see body
+ * of method for detail).
  *
  * A $group stage on a single field behaves similarly to a distinct command. If it has no
- * accumulators or only $first accumulators, the $group command only needs to visit one document
- * for each distinct value of the grouped-by (_id) field to compute its result. When there is a sort
+ * accumulators or only $first accumulators, the $group command only needs to visit one document for
+ * each distinct value of the grouped-by (_id) field to compute its result. When there is a sort
  * order specified in parsedDistinct->getQuery()->getQueryRequest.getSort(), the DISTINCT_SCAN will
  * follow that sort order, ensuring that it chooses the correct document from each group to compute
  * any $first accumulators.
@@ -165,6 +173,18 @@ bool turnIxscanIntoDistinctIxscan(QuerySolution* soln,
  * field. Without this flag, getExecutorDistinct() may use a plan that takes advantage of
  * DISTINCT_SCAN to filter some but not all duplicates (so that de-duplication is still necessary
  * after query execution), or it may fall back to a regular IXSCAN.
+ *
+ * Providing QueryPlannerParams::STRICT_DISTINCT_ONLY also implies that the resulting plan may not
+ * "unwind" arrays. That is, it will not return separate values for each element in an array. For
+ * example, in a collection with documents {a: [10, 11]}, {a: 12}, a distinct command on field 'a'
+ * can process the "unwound" values 10, 11, and 12, but a $group by 'a' needs to see documents for
+ * the original [10, 11] and 12 values. In the latter case (in which the caller provides a
+ * STRICT_DISTINCT_ONLY), a DISTINCT_SCAN is not possible, and the caller would have to fall back
+ * to a different plan.
+ *
+ * Note that this function uses the projection in 'parsedDistinct' to produce a covered query when
+ * possible, but when a covered query is not possible, the resulting plan may elide the projection
+ * stage (instead returning entire fetched documents).
  *
  * For example, a distinct query on field 'b' could use a DISTINCT_SCAN over index {a: 1, b: 1}.
  * This plan will reduce the output set by filtering out documents that are equal on both the 'a'
@@ -185,7 +205,11 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorDist
  * executing a count.
  */
 StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorCount(
-    OperationContext* opCtx, Collection* collection, const CountRequest& request, bool explain);
+    OperationContext* opCtx,
+    Collection* collection,
+    const CountCommand& request,
+    bool explain,
+    const NamespaceString& nss);
 
 /**
  * Get a PlanExecutor for a delete operation. 'parsedDelete' describes the query predicate

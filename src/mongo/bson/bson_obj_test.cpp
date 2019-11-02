@@ -637,10 +637,7 @@ TEST(BSONObj, getFields) {
 TEST(BSONObj, getFieldsWithDuplicates) {
     auto e = BSON("a" << 2 << "b"
                       << "3"
-                      << "a"
-                      << 9
-                      << "b"
-                      << 10);
+                      << "a" << 9 << "b" << 10);
     std::array<StringData, 2> fieldNames{"a", "b"};
     std::array<BSONElement, 2> fields;
     e.getFields(fieldNames, &fields);
@@ -689,7 +686,7 @@ TEST(BSONObj, sizeChecks) {
     auto generateBuffer = [](std::int32_t size) {
         std::vector<char> buffer(size);
         DataRange bufferRange(&buffer.front(), &buffer.back());
-        ASSERT_OK(bufferRange.write(LittleEndian<int32_t>(size)));
+        ASSERT_OK(bufferRange.writeNoThrow(LittleEndian<int32_t>(size)));
 
         return buffer;
     };

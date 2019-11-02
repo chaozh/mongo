@@ -33,11 +33,12 @@
 
 #include "mongo/db/exec/shard_filter.h"
 
+#include <memory>
+
 #include "mongo/db/exec/filter.h"
 #include "mongo/db/exec/scoped_timer.h"
 #include "mongo/db/exec/working_set_common.h"
 #include "mongo/s/shard_key_pattern.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
@@ -45,7 +46,6 @@ namespace mongo {
 using std::shared_ptr;
 using std::unique_ptr;
 using std::vector;
-using stdx::make_unique;
 
 // static
 const char* ShardFilterStage::kStageType = "SHARDING_FILTER";
@@ -53,9 +53,9 @@ const char* ShardFilterStage::kStageType = "SHARDING_FILTER";
 ShardFilterStage::ShardFilterStage(OperationContext* opCtx,
                                    ScopedCollectionMetadata metadata,
                                    WorkingSet* ws,
-                                   PlanStage* child)
-    : PlanStage(kStageType, opCtx), _ws(ws), _metadata(std::move(metadata)) {
-    _children.emplace_back(child);
+                                   std::unique_ptr<PlanStage> child)
+    : PlanStage(kStageType, opCtx), _ws(ws), _shardFilterer(std::move(metadata)) {
+    _children.emplace_back(std::move(child));
 }
 
 ShardFilterStage::~ShardFilterStage() {}
@@ -76,37 +76,30 @@ PlanStage::StageState ShardFilterStage::doWork(WorkingSetID* out) {
         // If we're sharded make sure that we don't return data that is not owned by us,
         // including pending documents from in-progress migrations and orphaned documents from
         // aborted migrations
-        if (_metadata->isSharded()) {
-            ShardKeyPattern shardKeyPattern(_metadata->getKeyPattern());
+        if (_shardFilterer.isCollectionSharded()) {
             WorkingSetMember* member = _ws->get(*out);
             WorkingSetMatchableDocument matchable(member);
-            BSONObj shardKey = shardKeyPattern.extractShardKeyFromMatchable(matchable);
 
-            if (shardKey.isEmpty()) {
-                // We can't find a shard key for this document - this should never happen with
-                // a non-fetched result unless our query planning is screwed up
-                if (!member->hasObj()) {
-                    Status status(ErrorCodes::InternalError,
-                                  "shard key not found after a covered stage, "
-                                  "query planning has failed");
+            ShardFilterer::DocumentBelongsResult res =
+                _shardFilterer.documentBelongsToMe(matchable);
 
-                    // Fail loudly and cleanly in production, fatally in debug
-                    error() << redact(status);
-                    dassert(false);
+            if (res != ShardFilterer::DocumentBelongsResult::kBelongs) {
+                if (res == ShardFilterer::DocumentBelongsResult::kNoShardKey) {
+                    // We can't find a shard key for this working set member - this should never
+                    // happen with a non-fetched result unless our query planning is screwed up
+                    invariant(member->hasObj());
 
-                    _ws->free(*out);
-                    *out = WorkingSetCommon::allocateStatusMember(_ws, status);
-                    return PlanStage::FAILURE;
+                    // Skip this working set member with a warning - no shard key should not be
+                    // possible unless manually inserting data into a shard
+                    warning() << "no shard key found in document "
+                              << redact(member->doc.value().toBson()) << " for shard key pattern "
+                              << _shardFilterer.getKeyPattern() << ", "
+                              << "document may have been inserted manually into shard";
+                } else {
+                    invariant(res == ShardFilterer::DocumentBelongsResult::kDoesNotBelong);
                 }
 
-                // Skip this document with a warning - no shard key should not be possible
-                // unless manually inserting data into a shard
-                warning() << "no shard key found in document " << redact(member->obj.value()) << " "
-                          << "for shard key pattern " << _metadata->getKeyPattern() << ", "
-                          << "document may have been inserted manually into shard";
-            }
-
-            if (!_metadata->keyBelongsToMe(shardKey)) {
+                // If the document had no shard key, or doesn't belong to us, skip it.
                 _ws->free(*out);
                 ++_specificStats.chunkSkips;
                 return PlanStage::NEED_TIME;
@@ -124,9 +117,9 @@ PlanStage::StageState ShardFilterStage::doWork(WorkingSetID* out) {
 unique_ptr<PlanStageStats> ShardFilterStage::getStats() {
     _commonStats.isEOF = isEOF();
     unique_ptr<PlanStageStats> ret =
-        make_unique<PlanStageStats>(_commonStats, STAGE_SHARDING_FILTER);
+        std::make_unique<PlanStageStats>(_commonStats, STAGE_SHARDING_FILTER);
     ret->children.emplace_back(child()->getStats());
-    ret->specific = make_unique<ShardingFilterStats>(_specificStats);
+    ret->specific = std::make_unique<ShardingFilterStats>(_specificStats);
     return ret;
 }
 

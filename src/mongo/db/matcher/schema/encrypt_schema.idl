@@ -29,6 +29,7 @@
 global:
     cpp_namespace: "mongo"
     cpp_includes:
+        - "mongo/db/matcher/matcher_type_set.h"
         - "mongo/db/matcher/schema/encrypt_schema_types.h"
 
 imports:
@@ -49,6 +50,13 @@ types:
         serializer: mongo::EncryptSchemaKeyId::serializeToBSON
         deserializer: mongo::EncryptSchemaKeyId::parseFromBSON
 
+    bsonTypeSet:
+        bson_serialization_type: any
+        description: "A string or array of strings representing BSONType names."
+        cpp_type: "mongo::BSONTypeSet"
+        serializer: mongo::BSONTypeSet::serializeToBSON
+        deserializer: mongo::BSONTypeSet::parseFromBSON
+
 enums:
     FleAlgorithm:
         description: "The algorithm used to encrypt fields for field level encryption."
@@ -56,6 +64,13 @@ enums:
         values:
             kDeterministic: "AEAD_AES_256_CBC_HMAC_SHA_512-Deterministic"
             kRandom: "AEAD_AES_256_CBC_HMAC_SHA_512-Random"
+    FleAlgorithmInt:
+        description: "The algorithm used to encrypt fields for field level encryption represented
+            as an unsigned integer."
+        type: int
+        values:
+            kDeterministic: 1
+            kRandom: 2
 
 structs:
     # Maps to the encrypt keyword in JSON Schema.
@@ -66,15 +81,11 @@ structs:
         fields:
           bsonType:
             description: "Specifies the type of the to-be-encrypted value."
-            type: string
+            type: bsonTypeSet
             optional: true
           algorithm:
             description: "The encryption algorithm to be used."
             type: FleAlgorithm
-            optional: true
-          initializationVector:
-            description: "Provided to be used for unique encryption for different collections."
-            type: bindata_generic
             optional: true
           keyId:
             description: "A JSONPointer to a key or an array of UUIDs identifying a set of keys."
@@ -92,10 +103,6 @@ structs:
             description: "The encryption algorithm to be used."
             type: FleAlgorithm
             optional: true
-          initializationVector:
-            description: "Provided to be used for unique encryption for different collections."
-            type: bindata_generic
-            optional: true
           keyId:
             description: "A JSONPointer to a key or an array of UUIDs identifying a set of keys."
             type: encryptSchemaKeyId
@@ -108,14 +115,8 @@ structs:
         fields:
           a:
             description: "The encryption algorithm to be used."
-            type: FleAlgorithm
+            type: FleAlgorithmInt
             cpp_name: algorithm
-          iv:
-            description: "Provided to be used for unique encryption for different collections."
-            type: bindata_generic
-            cpp_name: initializationVector
-            # Only present if algorithm is deterministic.
-            optional: true
           ki:
             description: "Used to query the key vault by _id. If omitted, ka must be specified."
             type: uuid
@@ -124,10 +125,10 @@ structs:
           ka:
             description: "Used to query the key vault by keyAltName. If omitted,
                 ki must be specified."
-            type: encryptSchemaAnyType
+            type: string
             cpp_name: keyAltName
             optional: true
           v:
             description: "value to encrypt"
             type: encryptSchemaAnyType
-            cpp_name: encryptSchemaAnyType
+            cpp_name: value

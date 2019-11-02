@@ -55,7 +55,7 @@ unique_ptr<CanonicalQuery> canonicalize(BSONObj query,
     QueryTestServiceContext serviceContext;
     auto opCtx = serviceContext.makeOperationContext();
 
-    auto qr = stdx::make_unique<QueryRequest>(nss);
+    auto qr = std::make_unique<QueryRequest>(nss);
     qr->setFilter(query);
     qr->setSort(sort);
     qr->setProj(proj);
@@ -123,50 +123,74 @@ TEST(CanonicalQueryEncoderTest, ComputeKey) {
     // With sort
     testComputeKey("{}", "{a: 1}", "{}", "an~aa");
     testComputeKey("{}", "{a: -1}", "{}", "an~da");
-    testComputeKey("{}",
-                   "{a: {$meta: 'textScore'}}",
-                   "{a: {$meta: 'textScore'}}",
-                   "an~ta|{ $meta: \"textScore\" }a");
+    testComputeKey("{}", "{a: {$meta: 'textScore'}}", "{a: {$meta: 'textScore'}}", "an~ta");
     testComputeKey("{a: 1}", "{b: 1}", "{}", "eqa~ab");
 
     // With projection
-    testComputeKey("{}", "{}", "{a: 1}", "an|ia");
-    testComputeKey("{}", "{}", "{a: -1}", "an|ia");
-    testComputeKey("{}", "{}", "{a: -1.0}", "an|ia");
-    testComputeKey("{}", "{}", "{a: true}", "an|ia");
-    testComputeKey("{}", "{}", "{a: 0}", "an|ea");
-    testComputeKey("{}", "{}", "{a: false}", "an|ea");
-    testComputeKey("{}", "{}", "{a: 99}", "an|ia");
-    testComputeKey("{}", "{}", "{a: 'foo'}", "an|ia");
-    testComputeKey("{}", "{}", "{a: {$slice: [3, 5]}}", "an|{ $slice: \\[ 3\\, 5 \\] }a");
-    testComputeKey("{}", "{}", "{a: {$elemMatch: {x: 2}}}", "an|{ $elemMatch: { x: 2 } }a");
-    testComputeKey("{}", "{}", "{a: ObjectId('507f191e810c19729de860ea')}", "an|ia");
-    testComputeKey("{a: 1}", "{}", "{'a.$': 1}", "eqa|ia.$");
-    testComputeKey("{a: 1}", "{}", "{a: 1}", "eqa|ia");
+    testComputeKey("{}", "{}", "{a: 1}", "an|_id-a");
+    testComputeKey("{}", "{}", "{a: -1}", "an|_id-a");
+    testComputeKey("{}", "{}", "{a: -1.0}", "an|_id-a");
+    testComputeKey("{}", "{}", "{a: true}", "an|_id-a");
+    testComputeKey("{}", "{}", "{a: 0}", "an");
+    testComputeKey("{}", "{}", "{a: false}", "an");
+    testComputeKey("{}", "{}", "{a: 99}", "an|_id-a");
+    // TODO SERVER-44118: Since "foo" is a computed field it's treated as an expression and means
+    // the entire document is required. This should not be the case.
+    testComputeKey("{}", "{}", "{a: 'foo'}", "an");
+
+    // $slice defaults to exclusion.
+    testComputeKey("{}", "{}", "{a: {$slice: [3, 5]}}", "an");
+    testComputeKey("{}", "{}", "{a: {$slice: [3, 5]}, b: 0}", "an");
+
+    // But even when using $slice in an inclusion, the entire document is needed.
+    testComputeKey("{}", "{}", "{a: {$slice: [3, 5]}, b: 1}", "an");
+
+    testComputeKey("{}", "{}", "{a: {$elemMatch: {x: 2}}}", "an");
+    testComputeKey("{}", "{}", "{a: {$elemMatch: {x: 2}}, b: 0}", "an");
+    testComputeKey("{}", "{}", "{a: {$elemMatch: {x: 2}}, b: 1}", "an");
+
+    testComputeKey("{}", "{}", "{a: {$slice: [3, 5]}, b: {$elemMatch: {x: 2}}}", "an");
+
+    // Since ObjectId is a literal value and is treated as an Expression, the entire document is
+    // required. TODO SERVER-44118: The entire document shouldn't be necessary.
+    testComputeKey("{}", "{}", "{a: ObjectId('507f191e810c19729de860ea')}", "an");
+    testComputeKey("{a: 1}", "{}", "{'a.$': 1}", "eqa");
+    testComputeKey("{a: 1}", "{}", "{a: 1}", "eqa|_id-a");
 
     // Projection should be order-insensitive
-    testComputeKey("{}", "{}", "{a: 1, b: 1}", "an|iaib");
-    testComputeKey("{}", "{}", "{b: 1, a: 1}", "an|iaib");
+    testComputeKey("{}", "{}", "{a: 1, b: 1}", "an|_id-a-b");
+    testComputeKey("{}", "{}", "{b: 1, a: 1}", "an|_id-a-b");
+
+    // And should escape the separation character.
+    testComputeKey("{}", "{}", "{'b-1': 1, 'a-2': 1}", "an|_id-a\\-2-b\\-1");
+
+    // And should exclude $-prefixed fields which can be added internally.
+    testComputeKey("{}", "{x: 1}", "{$sortKey: {$meta: 'sortKey'}}", "an~ax");
+    testComputeKey("{}", "{}", "{}", "an");
+
+    testComputeKey("{}", "{x: 1}", "{a: 1, $sortKey: {$meta: 'sortKey'}}", "an~ax|_id-a");
+    testComputeKey("{}", "{}", "{a: 1}", "an|_id-a");
 
     // With or-elimination and projection
-    testComputeKey("{$or: [{a: 1}]}", "{}", "{_id: 0, a: 1}", "eqa|e_idia");
-    testComputeKey("{$or: [{a: 1}]}", "{}", "{'a.$': 1}", "eqa|ia.$");
+    testComputeKey("{$or: [{a: 1}]}", "{}", "{_id: 0, a: 1}", "eqa|a");
+    testComputeKey("{$or: [{a: 1}]}", "{}", "{'a.$': 1}", "eqa");
 }
 
 // Delimiters found in user field names or non-standard projection field values
 // must be escaped.
 TEST(CanonicalQueryEncoderTest, ComputeKeyEscaped) {
     // Field name in query.
-    testComputeKey("{'a,[]~|<>': 1}", "{}", "{}", "eqa\\,\\[\\]\\~\\|<>");
+    testComputeKey("{'a,[]~|-<>': 1}", "{}", "{}", "eqa\\,\\[\\]\\~\\|\\-<>");
 
     // Field name in sort.
-    testComputeKey("{}", "{'a,[]~|<>': 1}", "{}", "an~aa\\,\\[\\]\\~\\|<>");
+    testComputeKey("{}", "{'a,[]~|-<>': 1}", "{}", "an~aa\\,\\[\\]\\~\\|\\-<>");
 
     // Field name in projection.
-    testComputeKey("{}", "{}", "{'a,[]~|<>': 1}", "an|ia\\,\\[\\]\\~\\|<>");
+    testComputeKey("{}", "{}", "{'a,[]~|-<>': 1}", "an|_id-a\\,\\[\\]\\~\\|\\-<>");
 
-    // Value in projection.
-    testComputeKey("{}", "{}", "{a: 'foo,[]~|<>'}", "an|ia");
+    // String literal provided as value. TODO SERVER-44118: Since this is treated as an Expression,
+    // the entire document is required.
+    testComputeKey("{}", "{}", "{a: 'foo,[]~|-<>'}", "an");
 }
 
 // Cache keys for $geoWithin queries with legacy and GeoJSON coordinates should

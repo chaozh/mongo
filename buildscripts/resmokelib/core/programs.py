@@ -3,8 +3,6 @@
 Handles all the nitty-gritty parameter conversion.
 """
 
-from __future__ import absolute_import
-
 import json
 import os
 import os.path
@@ -32,12 +30,27 @@ DEFAULT_EVERGREEN_MONGOD_LOG_COMPONENT_VERBOSITY = {
     "storage": {"recovery": 2}, "transaction": 4
 }
 
+# The default verbosity setting for any tests that are not started with an Evergreen task id. This
+# will apply to any tests run locally.
+DEFAULT_MONGOS_LOG_COMPONENT_VERBOSITY = {"transaction": 3}
+
+# The default verbosity setting for any tests running in Evergreen i.e. started with an Evergreen
+# task id.
+DEFAULT_EVERGREEN_MONGOS_LOG_COMPONENT_VERBOSITY = {"transaction": 3}
+
 
 def make_process(*args, **kwargs):
     """Choose whether to use python built in process or jasper."""
     process_cls = process.Process
     if config.SPAWN_USING == "jasper":
         process_cls = jasper_process.Process
+    # Add the current working directory and /data/multiversion to the PATH.
+    process_kwargs = kwargs.get("process_kwargs", {}).copy()
+    env_vars = process_kwargs.get("env_vars", {}).copy()
+    path = [env_vars.get("PATH", os.environ.get("PATH", ""))]
+    path = [os.getcwd(), config.DEFAULT_MULTIVERSION_DIR] + path
+    env_vars["PATH"] = os.pathsep.join(path)
+    kwargs["env_vars"] = env_vars
     return process_cls(*args, **kwargs)
 
 
@@ -46,6 +59,13 @@ def default_mongod_log_component_verbosity():
     if config.EVERGREEN_TASK_ID:
         return DEFAULT_EVERGREEN_MONGOD_LOG_COMPONENT_VERBOSITY
     return DEFAULT_MONGOD_LOG_COMPONENT_VERBOSITY
+
+
+def default_mongos_log_component_verbosity():
+    """Return the default 'logComponentVerbosity' value to use for mongos processes."""
+    if config.EVERGREEN_TASK_ID:
+        return DEFAULT_EVERGREEN_MONGOS_LOG_COMPONENT_VERBOSITY
+    return DEFAULT_MONGOS_LOG_COMPONENT_VERBOSITY
 
 
 def mongod_program(  # pylint: disable=too-many-branches
@@ -82,10 +102,17 @@ def mongod_program(  # pylint: disable=too-many-branches
     # There's a periodic background thread that checks for and aborts expired transactions.
     # "transactionLifetimeLimitSeconds" specifies for how long a transaction can run before expiring
     # and being aborted by the background thread. It defaults to 60 seconds, which is too short to
-    # be reliable for our tests. Setting it to 3 hours, so that it is longer than the 2 hours we
-    # allow JS tests to run before timing them out.
+    # be reliable for our tests. Setting it to 24 hours, so that it is longer than the Evergreen
+    # execution timeout.
     if "transactionLifetimeLimitSeconds" not in suite_set_parameters:
-        suite_set_parameters["transactionLifetimeLimitSeconds"] = 3 * 60 * 60
+        suite_set_parameters["transactionLifetimeLimitSeconds"] = 24 * 60 * 60
+
+    # Hybrid index builds drain writes received during the build process in batches of 1000 writes
+    # by default. Not all tests perform enough writes to exercise the code path where multiple
+    # batches are applied, which means certain bugs are harder to encounter. Set this level lower
+    # so there are more opportunities to drain writes in multiple batches.
+    if "maxIndexBuildDrainBatchSize" not in suite_set_parameters:
+        suite_set_parameters["maxIndexBuildDrainBatchSize"] = 10
 
     # The periodic no-op writer writes an oplog entry of type='n' once every 10 seconds. This has
     # the potential to mask issues such as SERVER-31609 because it allows the operationTime of
@@ -93,6 +120,20 @@ def mongod_program(  # pylint: disable=too-many-branches
     # periodic no-op writer. Set in the .yml file to override this.
     if "replSet" in kwargs and "writePeriodicNoops" not in suite_set_parameters:
         suite_set_parameters["writePeriodicNoops"] = False
+
+    # By default the primary waits up to 10 sec to complete a stepdown and to hand off its duties to
+    # a secondary before shutting down in response to SIGTERM. Make it shut down more abruptly.
+    if "replSet" in kwargs and "waitForStepDownOnNonCommandShutdown" not in suite_set_parameters:
+        suite_set_parameters["waitForStepDownOnNonCommandShutdown"] = False
+
+    if "enableFlowControl" not in suite_set_parameters and config.FLOW_CONTROL is not None:
+        suite_set_parameters["enableFlowControl"] = (config.FLOW_CONTROL == "on")
+
+    if ("failpoint.flowControlTicketOverride" not in suite_set_parameters
+            and config.FLOW_CONTROL_TICKETS is not None):
+        suite_set_parameters["failpoint.flowControlTicketOverride"] = {
+            "mode": "alwaysOn", "data": {"numTickets": config.FLOW_CONTROL_TICKETS}
+        }
 
     _apply_set_parameters(args, suite_set_parameters)
 
@@ -167,6 +208,10 @@ def mongos_program(logger, executable=None, process_kwargs=None, **kwargs):
     if config.MONGOS_SET_PARAMETERS is not None:
         suite_set_parameters.update(utils.load_yaml(config.MONGOS_SET_PARAMETERS))
 
+    # Set default log verbosity levels if none were specified.
+    if "logComponentVerbosity" not in suite_set_parameters:
+        suite_set_parameters["logComponentVerbosity"] = default_mongos_log_component_verbosity()
+
     _apply_set_parameters(args, suite_set_parameters)
 
     # Apply the rest of the command line arguments.
@@ -199,6 +244,7 @@ def mongo_shell_program(  # pylint: disable=too-many-branches,too-many-locals,to
         test_name = None
     shortcut_opts = {
         "enableMajorityReadConcern": (config.MAJORITY_READ_CONCERN, True),
+        "mixedBinVersions": (config.MIXED_BIN_VERSIONS, ""),
         "noJournal": (config.NO_JOURNAL, False),
         "serviceExecutor": (config.SERVICE_EXECUTOR, ""),
         "storageEngine": (config.STORAGE_ENGINE, ""),
@@ -224,34 +270,44 @@ def mongo_shell_program(  # pylint: disable=too-many-branches,too-many-locals,to
     # Initialize setParameters for mongod and mongos, to be passed to the shell via TestData. Since
     # they are dictionaries, they will be converted to JavaScript objects when passed to the shell
     # by the _format_shell_vars() function.
-    mongod_set_parameters = {}
+    mongod_set_parameters = test_data.get("setParameters", {}).copy()
+    mongos_set_parameters = test_data.get("setParametersMongos", {}).copy()
+
+    # Propagate additional setParameters to mongod processes spawned by the mongo shell. Command
+    # line options to resmoke.py override the YAML configuration.
     if config.MONGOD_SET_PARAMETERS is not None:
-        if "setParameters" in test_data:
-            raise ValueError("setParameters passed via TestData can only be set from either the"
-                             " command line or the suite YAML, not both")
-        mongod_set_parameters = utils.load_yaml(config.MONGOD_SET_PARAMETERS)
+        mongod_set_parameters.update(utils.load_yaml(config.MONGOD_SET_PARAMETERS))
+
+    # Propagate additional setParameters to mongos processes spawned by the mongo shell. Command
+    # line options to resmoke.py override the YAML configuration.
+    if config.MONGOS_SET_PARAMETERS is not None:
+        mongos_set_parameters.update(utils.load_yaml(config.MONGOS_SET_PARAMETERS))
 
     # If the 'logComponentVerbosity' setParameter for mongod was not already specified, we set its
     # value to a default.
     mongod_set_parameters.setdefault("logComponentVerbosity",
                                      default_mongod_log_component_verbosity())
 
-    test_data["setParameters"] = mongod_set_parameters
+    # If the 'enableFlowControl' setParameter for mongod was not already specified, we set its value
+    # to a default.
+    if config.FLOW_CONTROL is not None:
+        mongod_set_parameters.setdefault("enableFlowControl", config.FLOW_CONTROL == "on")
 
-    if config.MONGOS_SET_PARAMETERS is not None:
-        if "setParametersMongos" in test_data:
-            raise ValueError("setParametersMongos passed via TestData can only be set from either"
-                             " the command line or the suite YAML, not both")
-        mongos_set_parameters = utils.load_yaml(config.MONGOS_SET_PARAMETERS)
-        test_data["setParametersMongos"] = mongos_set_parameters
+    # If the 'logComponentVerbosity' setParameter for mongos was not already specified, we set its
+    # value to a default.
+    mongos_set_parameters.setdefault("logComponentVerbosity",
+                                     default_mongos_log_component_verbosity())
+
+    test_data["setParameters"] = mongod_set_parameters
+    test_data["setParametersMongos"] = mongos_set_parameters
 
     # There's a periodic background thread that checks for and aborts expired transactions.
     # "transactionLifetimeLimitSeconds" specifies for how long a transaction can run before expiring
     # and being aborted by the background thread. It defaults to 60 seconds, which is too short to
-    # be reliable for our tests. Setting it to 3 hours, so that it is longer than the 2 hours we
-    # allow JS tests to run before timing them out.
+    # be reliable for our tests. Setting it to 24 hours, so that it is longer than the Evergreen
+    # execution timeout.
     if "transactionLifetimeLimitSeconds" not in test_data:
-        test_data["transactionLifetimeLimitSeconds"] = 3 * 60 * 60
+        test_data["transactionLifetimeLimitSeconds"] = 24 * 60 * 60
 
     if "eval_prepend" in kwargs:
         eval_sb.append(str(kwargs.pop("eval_prepend")))
@@ -347,6 +403,9 @@ def dbtest_program(logger, executable=None, suites=None, process_kwargs=None, **
     kwargs["enableMajorityReadConcern"] = config.MAJORITY_READ_CONCERN
     if config.STORAGE_ENGINE is not None:
         kwargs["storageEngine"] = config.STORAGE_ENGINE
+
+    if config.FLOW_CONTROL is not None:
+        kwargs["flowControl"] = (config.FLOW_CONTROL == "on")
 
     return generic_program(logger, args, process_kwargs=process_kwargs, **kwargs)
 

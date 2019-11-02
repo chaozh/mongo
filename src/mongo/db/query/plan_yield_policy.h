@@ -29,9 +29,10 @@
 
 #pragma once
 
+#include <functional>
+
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/query/plan_executor.h"
-#include "mongo/stdx/functional.h"
 #include "mongo/util/elapsed_tracker.h"
 
 namespace mongo {
@@ -76,7 +77,7 @@ public:
      * Calls 'whileYieldingFn' after relinquishing locks and before reacquiring the locks that have
      * been relinquished.
      */
-    virtual Status yieldOrInterrupt(stdx::function<void()> whileYieldingFn = nullptr);
+    virtual Status yieldOrInterrupt(std::function<void()> whileYieldingFn = nullptr);
 
     /**
      * All calls to shouldYieldOrInterrupt() will return true until the next call to
@@ -144,11 +145,17 @@ private:
     // not outlive the plan executor.
     PlanExecutor* const _planYielding;
 
-    // Returns true to indicate it's time to release locks or storage engine state.
-    bool shouldYield();
-
-    // Releases locks or storage engine state.
-    Status yield(stdx::function<void()> whileYieldingFn);
+    /**
+     * If not in a nested context, unlocks all locks, suggests to the operating system to
+     * switch to another thread, and then reacquires all locks.
+     *
+     * If in a nested context (eg DBDirectClient), does nothing.
+     *
+     * The whileYieldingFn will be executed after unlocking the locks and before re-acquiring them.
+     */
+    void _yieldAllLocks(OperationContext* opCtx,
+                        std::function<void()> whileYieldingFn,
+                        const NamespaceString& planExecNS);
 };
 
 }  // namespace mongo

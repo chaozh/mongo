@@ -33,7 +33,7 @@
 #include <vector>
 
 #include "mongo/db/service_context_fwd.h"
-#include "mongo/stdx/mutex.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/util/clock_source.h"
 #include "mongo/util/concurrency/with_lock.h"
 #include "mongo/util/periodic_runner.h"
@@ -47,31 +47,28 @@ namespace mongo {
 class PeriodicRunnerEmbedded : public PeriodicRunner {
 public:
     PeriodicRunnerEmbedded(ServiceContext* svc, ClockSource* clockSource);
-    ~PeriodicRunnerEmbedded();
 
-    std::unique_ptr<PeriodicRunner::PeriodicJobHandle> makeJob(PeriodicJob job) override;
-    void scheduleJob(PeriodicJob job) override;
-
-    void startup() override;
-
-    void shutdown() override;
+    JobAnchor makeJob(PeriodicJob job) override;
 
     // Safe to call from multiple threads but will only execute on one thread at a time.
     // Returns true if it attempted to run any jobs.
     bool tryPump();
 
 private:
-    class PeriodicJobImpl {
-        MONGO_DISALLOW_COPYING(PeriodicJobImpl);
+    class PeriodicJobImpl : public ControllableJob {
+        PeriodicJobImpl(const PeriodicJobImpl&) = delete;
+        PeriodicJobImpl& operator=(const PeriodicJobImpl&) = delete;
 
     public:
         friend class PeriodicRunnerEmbedded;
         PeriodicJobImpl(PeriodicJob job, ClockSource* source, PeriodicRunnerEmbedded* runner);
 
-        void start();
-        void pause();
-        void resume();
-        void stop();
+        void start() override;
+        void pause() override;
+        void resume() override;
+        void stop() override;
+        Milliseconds getPeriod() override;
+        void setPeriod(Milliseconds ms) override;
 
         bool isAlive(WithLock lk);
 
@@ -91,28 +88,12 @@ private:
 
         // The mutex is protecting _execStatus, the variable that can be accessed from other
         // threads.
-        stdx::mutex _mutex;
+        Mutex _mutex = MONGO_MAKE_LATCH("PeriodicJobImpl::_mutex");
 
         // The current execution status of the job.
         ExecutionStatus _execStatus{ExecutionStatus::kNotScheduled};
     };
     struct PeriodicJobSorter;
-
-    std::shared_ptr<PeriodicRunnerEmbedded::PeriodicJobImpl> createAndAddJob(PeriodicJob job,
-                                                                             bool shouldStart);
-
-    class PeriodicJobHandleImpl : public PeriodicJobHandle {
-    public:
-        explicit PeriodicJobHandleImpl(std::weak_ptr<PeriodicJobImpl> jobImpl)
-            : _jobWeak(jobImpl) {}
-        void start() override;
-        void stop() override;
-        void pause() override;
-        void resume() override;
-
-    private:
-        std::weak_ptr<PeriodicJobImpl> _jobWeak;
-    };
 
     ServiceContext* _svc;
     ClockSource* _clockSource;
@@ -121,8 +102,7 @@ private:
     std::vector<std::shared_ptr<PeriodicJobImpl>> _jobs;
     std::vector<std::shared_ptr<PeriodicJobImpl>> _Pausedjobs;
 
-    stdx::mutex _mutex;
-    bool _running = false;
+    Mutex _mutex = MONGO_MAKE_LATCH("PeriodicRunnerEmbedded::_mutex");
 };
 
 }  // namespace mongo

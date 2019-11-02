@@ -34,13 +34,13 @@
 #include "mongo/scripting/mozjs/session.h"
 
 #include "mongo/scripting/mozjs/bson.h"
-#include "mongo/scripting/mozjs/end_sessions_gen.h"
 #include "mongo/scripting/mozjs/implscope.h"
 #include "mongo/scripting/mozjs/mongo.h"
+#include "mongo/scripting/mozjs/scripting_util_gen.h"
 #include "mongo/scripting/mozjs/valuereader.h"
 #include "mongo/scripting/mozjs/wrapconstrainedmethod.h"
 #include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 namespace mozjs {
@@ -122,9 +122,7 @@ void endSession(SessionHolder* holder) {
     if (holder->txnState == SessionHolder::TransactionState::kActive) {
         holder->txnState = SessionHolder::TransactionState::kAborted;
         BSONObj abortObj = BSON("abortTransaction" << 1 << "lsid" << holder->lsid << "txnNumber"
-                                                   << holder->txnNumber
-                                                   << "autocommit"
-                                                   << false);
+                                                   << holder->txnNumber << "autocommit" << false);
 
         MONGO_COMPILER_VARIABLE_UNUSED auto ignored =
             holder->client->runCommand("admin", abortObj, out);

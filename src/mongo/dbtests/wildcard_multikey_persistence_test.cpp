@@ -97,11 +97,15 @@ protected:
         auto collection = autoColl.getCollection();
 
         // Verify whether or not the index has been marked as multikey.
-        ASSERT_EQ(expectIndexIsMultikey, getIndexDesc(collection, indexName)->isMultikey(opCtx()));
+        ASSERT_EQ(expectIndexIsMultikey, getIndexDesc(collection, indexName)->isMultikey());
 
         // Obtain a cursor over the index, and confirm that the keys are present in order.
         auto indexCursor = getIndexCursor(collection, indexName);
-        auto indexKey = indexCursor->seek(kMinBSONKey, true);
+
+        KeyString::Value keyStringForSeek = IndexEntryComparison::makeKeyStringFromBSONKeyForSeek(
+            BSONObj(), KeyString::Version::V1, Ordering::make(BSONObj()), true, true);
+
+        auto indexKey = indexCursor->seek(keyStringForSeek);
         try {
             for (const auto& expectedKey : expectedKeys) {
                 ASSERT(indexKey);
@@ -181,8 +185,7 @@ protected:
                                   BSONObj key,
                                   BSONObj pathProjection,
                                   bool background) {
-        BSONObjBuilder bob =
-            std::move(BSONObjBuilder() << "ns" << nss.ns() << "name" << name << "key" << key);
+        BSONObjBuilder bob = std::move(BSONObjBuilder() << "name" << name << "key" << key);
 
         if (!pathProjection.isEmpty())
             bob << IndexDescriptor::kPathProjectionFieldName << pathProjection;
@@ -194,12 +197,14 @@ protected:
         auto coll = autoColl.getCollection();
 
         MultiIndexBlock indexer;
-        ON_BLOCK_EXIT([&] { indexer.cleanUpAfterBuild(opCtx(), coll); });
+        ON_BLOCK_EXIT(
+            [&] { indexer.cleanUpAfterBuild(opCtx(), coll, MultiIndexBlock::kNoopOnCleanUpFn); });
 
         // Initialize the index builder and add all documents currently in the collection.
         ASSERT_OK(
             indexer.init(opCtx(), coll, indexSpec, MultiIndexBlock::kNoopOnInitFn).getStatus());
         ASSERT_OK(indexer.insertAllDocumentsInCollection(opCtx(), coll));
+        ASSERT_OK(indexer.checkConstraints(opCtx()));
 
         WriteUnitOfWork wunit(opCtx());
         ASSERT_OK(indexer.commit(

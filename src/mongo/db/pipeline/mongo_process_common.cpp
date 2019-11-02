@@ -27,6 +27,8 @@
  *    it in the license file.
  */
 
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/pipeline/mongo_process_common.h"
@@ -39,8 +41,12 @@
 #include "mongo/db/operation_context.h"
 #include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/service_context.h"
+#include "mongo/platform/atomic_word.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/s/catalog_cache.h"
 #include "mongo/s/grid.h"
+#include "mongo/util/diagnostic_info.h"
+#include "mongo/util/log.h"
 #include "mongo/util/net/socket_utils.h"
 
 namespace mongo {
@@ -51,11 +57,14 @@ std::vector<BSONObj> MongoProcessCommon::getCurrentOps(
     CurrentOpSessionsMode sessionMode,
     CurrentOpUserMode userMode,
     CurrentOpTruncateMode truncateMode,
-    CurrentOpCursorMode cursorMode) const {
+    CurrentOpCursorMode cursorMode,
+    CurrentOpBacktraceMode backtraceMode) const {
     OperationContext* opCtx = expCtx->opCtx;
     AuthorizationSession* ctxAuth = AuthorizationSession::get(opCtx->getClient());
 
     std::vector<BSONObj> ops;
+
+    auto blockedOpGuard = DiagnosticInfo::maybeMakeBlockedOpForTest(opCtx->getClient());
 
     for (ServiceContext::LockedClientsCursor cursor(opCtx->getClient()->getServiceContext());
          Client* client = cursor.next();) {
@@ -76,7 +85,7 @@ std::vector<BSONObj> MongoProcessCommon::getCurrentOps(
         }
 
         // Delegate to the mongoD- or mongoS-specific implementation of _reportCurrentOpForClient.
-        ops.emplace_back(_reportCurrentOpForClient(opCtx, client, truncateMode));
+        ops.emplace_back(_reportCurrentOpForClient(opCtx, client, truncateMode, backtraceMode));
     }
 
     // If 'cursorMode' is set to include idle cursors, retrieve them and add them to ops.
@@ -108,6 +117,12 @@ std::vector<BSONObj> MongoProcessCommon::getCurrentOps(
     // If we need to report on idle Sessions, defer to the mongoD or mongoS implementations.
     if (sessionMode == CurrentOpSessionsMode::kIncludeIdle) {
         _reportCurrentOpsForIdleSessions(opCtx, userMode, &ops);
+    }
+
+    if (!ctxAuth->getAuthorizationManager().isAuthEnabled() ||
+        userMode == CurrentOpUserMode::kIncludeAll) {
+        _reportCurrentOpsForTransactionCoordinators(
+            opCtx, sessionMode == MongoProcessInterface::CurrentOpSessionsMode::kIncludeIdle, &ops);
     }
 
     return ops;
@@ -165,6 +180,19 @@ std::vector<FieldPath> MongoProcessCommon::_shardKeyToDocumentKeyFields(
         result.emplace_back("_id");
     }
     return result;
+}
+
+std::set<FieldPath> MongoProcessCommon::_convertToFieldPaths(
+    const std::vector<std::string>& fields) const {
+    std::set<FieldPath> fieldPaths;
+
+    for (const auto& field : fields) {
+        const auto res = fieldPaths.insert(FieldPath(field));
+        uassert(ErrorCodes::BadValue,
+                str::stream() << "Found a duplicate field '" << field << "'",
+                res.second);
+    }
+    return fieldPaths;
 }
 
 }  // namespace mongo

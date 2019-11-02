@@ -1,10 +1,9 @@
 """Replica set fixture for executing JSTests against."""
 
-from __future__ import absolute_import
-
 import os.path
 import time
 
+import bson.errors
 import pymongo
 import pymongo.errors
 import pymongo.write_concern
@@ -24,16 +23,15 @@ class ReplicaSetFixture(interface.ReplFixture):  # pylint: disable=too-many-inst
     _NODE_NOT_FOUND = 74
 
     def __init__(  # pylint: disable=too-many-arguments, too-many-locals
-            self, logger, job_num, mongod_executable=None, mongod_options=None, dbpath_prefix=None,
-            preserve_dbpath=False, num_nodes=2, start_initial_sync_node=False,
-            write_concern_majority_journal_default=None, auth_options=None,
-            replset_config_options=None, voting_secondaries=None, all_nodes_electable=False,
-            use_replica_set_connection_string=None, linear_chain=False):
+            self, logger, job_num, mongod_options=None, dbpath_prefix=None, preserve_dbpath=False,
+            num_nodes=2, start_initial_sync_node=False, write_concern_majority_journal_default=None,
+            auth_options=None, replset_config_options=None, voting_secondaries=None,
+            all_nodes_electable=False, use_replica_set_connection_string=None, linear_chain=False,
+            mixed_bin_versions=None):
         """Initialize ReplicaSetFixture."""
 
         interface.ReplFixture.__init__(self, logger, job_num, dbpath_prefix=dbpath_prefix)
 
-        self.mongod_executable = mongod_executable
         self.mongod_options = utils.default_if_none(mongod_options, {})
         self.preserve_dbpath = preserve_dbpath
         self.num_nodes = num_nodes
@@ -45,6 +43,30 @@ class ReplicaSetFixture(interface.ReplFixture):  # pylint: disable=too-many-inst
         self.all_nodes_electable = all_nodes_electable
         self.use_replica_set_connection_string = use_replica_set_connection_string
         self.linear_chain = linear_chain
+        self.mixed_bin_versions = utils.default_if_none(mixed_bin_versions,
+                                                        config.MIXED_BIN_VERSIONS)
+        if self.mixed_bin_versions is not None:
+            mongod_executable = utils.default_if_none(config.MONGOD_EXECUTABLE,
+                                                      config.DEFAULT_MONGOD_EXECUTABLE)
+            latest_mongod = mongod_executable
+            last_stable_mongod = mongod_executable + "-" \
+                                + ReplicaSetFixture._LAST_STABLE_BIN_VERSION
+            is_config_svr = "configsvr" in self.replset_config_options and self.replset_config_options[
+                "configsvr"]
+            if not is_config_svr:
+                self.mixed_bin_versions = [
+                    latest_mongod if (x == "new") else last_stable_mongod
+                    for x in self.mixed_bin_versions
+                ]
+            else:
+                # Our documented recommended path for upgrading shards lets us assume that config
+                # server nodes will always be fully upgraded before shard nodes.
+                self.mixed_bin_versions = [latest_mongod, latest_mongod]
+            num_versions = len(self.mixed_bin_versions)
+            if num_versions != num_nodes and not is_config_svr:
+                msg = (("The number of binary versions specified: {} do not match the number of"\
+                        " nodes in the replica set: {}.")).format(num_versions, num_nodes)
+                raise errors.ServerFailure(msg)
 
         # If voting_secondaries has not been set, set a default. By default, secondaries have zero
         # votes unless they are also nodes capable of being elected primary.
@@ -75,13 +97,12 @@ class ReplicaSetFixture(interface.ReplFixture):  # pylint: disable=too-many-inst
     def setup(self):  # pylint: disable=too-many-branches,too-many-statements
         """Set up the replica set."""
         self.replset_name = self.mongod_options.get("replSet", "rs")
-
         if not self.nodes:
-            for i in xrange(self.num_nodes):
+            for i in range(self.num_nodes):
                 node = self._new_mongod(i, self.replset_name)
                 self.nodes.append(node)
 
-        for i in xrange(self.num_nodes):
+        for i in range(self.num_nodes):
             if self.linear_chain and i > 0:
                 self.nodes[i].mongod_options["set_parameters"][
                     "failpoint.forceSyncSourceCandidate"] = {
@@ -160,6 +181,24 @@ class ReplicaSetFixture(interface.ReplFixture):  # pylint: disable=too-many-inst
         self._configure_repl_set(client, {"replSetInitiate": repl_config})
         self._await_primary()
 
+        if self.mixed_bin_versions is not None:
+            if self.mixed_bin_versions[0] == "new":
+                fcv_response = client.admin.command(
+                    {"getParameter": 1, "featureCompatibilityVersion": 1})
+                fcv = fcv_response["featureCompatibilityVersion"]["version"]
+                if fcv != ReplicaSetFixture._LATEST_FCV:
+                    msg = (("Server returned FCV{} when we expected FCV{}.").format(
+                        fcv, ReplicaSetFixture._LATEST_FCV))
+                    raise errors.ServerFailure(msg)
+
+            # Initiating a replica set with a single node will use "latest" FCV. This will
+            # cause IncompatibleServerVersion errors if additional "last-stable" binary version
+            # nodes are subsequently added to the set, since such nodes cannot set their FCV to
+            # "latest". Therefore, we make sure the primary is "last-stable" FCV before adding in
+            # nodes of different binary versions to the replica set.
+            client.admin.command(
+                {"setFeatureCompatibilityVersion": ReplicaSetFixture._LAST_STABLE_FCV})
+
         if self.nodes[1:]:
             # Wait to connect to each of the secondaries before running the replSetReconfig
             # command.
@@ -170,6 +209,15 @@ class ReplicaSetFixture(interface.ReplFixture):  # pylint: disable=too-many-inst
             self.logger.info("Issuing replSetReconfig command: %s", repl_config)
             self._configure_repl_set(client, {"replSetReconfig": repl_config})
             self._await_secondaries()
+
+    def pids(self):
+        """:return: all pids owned by this fixture if any."""
+        pids = []
+        for node in self.nodes:
+            pids.extend(node.pids())
+        if not pids:
+            self.logger.debug('No members running when gathering replicaset fixture pids.')
+        return pids
 
     def _configure_repl_set(self, client, cmd_obj):
         # replSetInitiate and replSetReconfig commands can fail with a NodeNotFound error
@@ -207,10 +255,17 @@ class ReplicaSetFixture(interface.ReplFixture):  # pylint: disable=too-many-inst
 
         def check_rcmaj_optime(client, node):
             """Return True if all nodes have caught up with the primary."""
-            res = client.admin.command({"replSetGetStatus": 1})
+            # TODO SERVER-40078: The server is reporting invalid
+            # dates in its response to the replSetGetStatus
+            # command
+            try:
+                res = client.admin.command({"replSetGetStatus": 1})
+            except bson.errors.InvalidBSON:
+                return False
             read_concern_majority_optime = res["optimes"]["readConcernMajorityOpTime"]
 
-            if read_concern_majority_optime >= primary_optime:
+            if (read_concern_majority_optime["t"] == primary_optime["t"]
+                    and read_concern_majority_optime["ts"] >= primary_optime["ts"]):
                 up_to_date_nodes.add(node.port)
 
             return len(up_to_date_nodes) == len(self.nodes)
@@ -303,7 +358,15 @@ class ReplicaSetFixture(interface.ReplFixture):  # pylint: disable=too-many-inst
             client_admin = client["admin"]
 
             while True:
-                status = client_admin.command("replSetGetStatus")
+                # TODO SERVER-40078: The server is reporting invalid
+                # dates in its response to the replSetGetStatus
+                # command
+                try:
+                    status = client_admin.command("replSetGetStatus")
+                except bson.errors.InvalidBSON:
+                    time.sleep(0.1)
+                    continue
+
                 # The `lastStableRecoveryTimestamp` field contains a stable timestamp guaranteed to
                 # exist on storage engine recovery to a stable timestamp.
                 last_stable_recovery_timestamp = status.get("lastStableRecoveryTimestamp", None)
@@ -415,12 +478,13 @@ class ReplicaSetFixture(interface.ReplFixture):  # pylint: disable=too-many-inst
         return [node for node in self.nodes if node.port != primary.port]
 
     def get_initial_sync_node(self):
-        """Return initila sync node from the replica set."""
+        """Return initial sync node from the replica set."""
         return self.initial_sync_node
 
     def _new_mongod(self, index, replset_name):
         """Return a standalone.MongoDFixture configured to be used as replica-set member."""
-
+        mongod_executable = None if self.mixed_bin_versions is None else self.mixed_bin_versions[
+            index]
         mongod_logger = self._get_logger_for_mongod(index)
         mongod_options = self.mongod_options.copy()
         mongod_options["replSet"] = replset_name
@@ -428,7 +492,7 @@ class ReplicaSetFixture(interface.ReplFixture):  # pylint: disable=too-many-inst
         mongod_options["set_parameters"] = mongod_options.get("set_parameters", {}).copy()
 
         return standalone.MongoDFixture(
-            mongod_logger, self.job_num, mongod_executable=self.mongod_executable,
+            mongod_logger, self.job_num, mongod_executable=mongod_executable,
             mongod_options=mongod_options, preserve_dbpath=self.preserve_dbpath)
 
     def _get_logger_for_mongod(self, index):

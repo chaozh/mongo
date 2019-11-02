@@ -76,13 +76,17 @@ scratch
 /loadgen
 /mongo
 /mongobridge
+/mongocryptd
 /mongod
 /mongoed
 /mongogrid
+/mongokerberos
+/mongoldap
 /mongoperf
 /mongos
 /mongoshim
 /mongosniff
+/mongotmock
 /mongotrafficreader
 /wt
 
@@ -174,3 +178,10 @@ local.properties
 
 compile_commands.json
 generated_resmoke_config
+
+# Code review tool config
+codereview.rc
+
+# Python venvs and virtualenvs
+python3-venv
+python2-venv

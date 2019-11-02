@@ -36,30 +36,34 @@
 
 namespace mongo {
 
-HashAccessMethod::HashAccessMethod(IndexCatalogEntry* btreeState, SortedDataInterface* btree)
-    : AbstractIndexAccessMethod(btreeState, btree) {
+HashAccessMethod::HashAccessMethod(IndexCatalogEntry* btreeState,
+                                   std::unique_ptr<SortedDataInterface> btree)
+    : AbstractIndexAccessMethod(btreeState, std::move(btree)) {
     const IndexDescriptor* descriptor = btreeState->descriptor();
-
-    // We can change these if the single-field limitation is lifted later.
-    uassert(16763,
-            "Currently only single field hashed index supported.",
-            1 == descriptor->getNumFields());
 
     uassert(16764,
             "Currently hashed indexes cannot guarantee uniqueness. Use a regular index.",
             !descriptor->unique());
-
-    ExpressionParams::parseHashParams(descriptor->infoObj(), &_seed, &_hashVersion, &_hashedField);
+    ExpressionParams::parseHashParams(descriptor->infoObj(), &_seed, &_hashVersion, &_keyPattern);
 
     _collator = btreeState->getCollator();
 }
 
 void HashAccessMethod::doGetKeys(const BSONObj& obj,
-                                 BSONObjSet* keys,
-                                 BSONObjSet* multikeyMetadataKeys,
-                                 MultikeyPaths* multikeyPaths) const {
-    ExpressionKeysPrivate::getHashKeys(
-        obj, _hashedField, _seed, _hashVersion, _descriptor->isSparse(), _collator, keys);
+                                 KeyStringSet* keys,
+                                 KeyStringSet* multikeyMetadataKeys,
+                                 MultikeyPaths* multikeyPaths,
+                                 boost::optional<RecordId> id) const {
+    ExpressionKeysPrivate::getHashKeys(obj,
+                                       _keyPattern,
+                                       _seed,
+                                       _hashVersion,
+                                       _descriptor->isSparse(),
+                                       _collator,
+                                       keys,
+                                       getSortedDataInterface()->getKeyStringVersion(),
+                                       getSortedDataInterface()->getOrdering(),
+                                       id);
 }
 
 }  // namespace mongo

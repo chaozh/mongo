@@ -31,8 +31,13 @@
 
 #include <cstdint>
 #include <limits>
+#include <map>
 #include <string>
 
+#include <third_party/murmurhash3/MurmurHash3.h>
+
+#include "mongo/base/data_type_endian.h"
+#include "mongo/base/data_view.h"
 #include "mongo/base/static_assert.h"
 #include "mongo/base/string_data.h"
 #include "mongo/config.h"
@@ -148,13 +153,18 @@ enum LockResult {
  * ordering is consistent so deadlock cannot occur.
  */
 enum ResourceType {
-    /** Types used for special resources, use with a hash id from ResourceId::SingletonHashIds. */
     RESOURCE_INVALID = 0,
 
-    /**  Used for mode changes or global exclusive operations */
+    /** Parallel batch writer mode lock */
+    RESOURCE_PBWM,
+
+    /** Replication state transition lock. */
+    RESOURCE_RSTL,
+
+    /**  Used for global exclusive operations */
     RESOURCE_GLOBAL,
 
-    /** Generic resources, used for multi-granularity locking, together with RESOURCE_GLOBAL */
+    /** Generic resources, used for multi-granularity locking, together with the above locks */
     RESOURCE_DATABASE,
     RESOURCE_COLLECTION,
     RESOURCE_METADATA,
@@ -167,9 +177,27 @@ enum ResourceType {
 };
 
 /**
+ * Maps the resource id to a human-readable string.
+ */
+static const char* ResourceTypeNames[] = {"Invalid",
+                                          "ParallelBatchWriterMode",
+                                          "ReplicationStateTransition",
+                                          "Global",
+                                          "Database",
+                                          "Collection",
+                                          "Metadata",
+                                          "Mutex"};
+
+// Ensure we do not add new types without updating the names array.
+MONGO_STATIC_ASSERT((sizeof(ResourceTypeNames) / sizeof(ResourceTypeNames[0])) ==
+                    ResourceTypesCount);
+
+/**
  * Returns a human-readable name for the specified resource type.
  */
-const char* resourceTypeName(ResourceType resourceType);
+static const char* resourceTypeName(ResourceType resourceType) {
+    return ResourceTypeNames[resourceType];
+}
 
 /**
  * Uniquely identifies a lockable resource.
@@ -180,21 +208,11 @@ class ResourceId {
     MONGO_STATIC_ASSERT(ResourceTypesCount <= (1 << resourceTypeBits));
 
 public:
-    /**
-     * Assign hash ids for special resources to avoid accidental reuse of ids. For ids used
-     * with the same ResourceType, the order here must be the same as the locking order.
-     */
-    enum SingletonHashIds {
-        SINGLETON_INVALID = 0,
-        SINGLETON_PARALLEL_BATCH_WRITER_MODE,
-        SINGLETON_REPLICATION_STATE_TRANSITION_LOCK,
-        SINGLETON_GLOBAL,
-    };
-
     ResourceId() : _fullHash(0) {}
-    ResourceId(ResourceType type, StringData ns);
-    ResourceId(ResourceType type, const std::string& ns);
-    ResourceId(ResourceType type, uint64_t hashId);
+    ResourceId(ResourceType type, StringData ns) : _fullHash(fullHash(type, hashStringData(ns))) {}
+    ResourceId(ResourceType type, const std::string& ns)
+        : _fullHash(fullHash(type, hashStringData(ns))) {}
+    ResourceId(ResourceType type, uint64_t hashId) : _fullHash(fullHash(type, hashId)) {}
 
     bool isValid() const {
         return getType() != RESOURCE_INVALID;
@@ -232,13 +250,16 @@ private:
      */
     uint64_t _fullHash;
 
-    static uint64_t fullHash(ResourceType type, uint64_t hashId);
+    static uint64_t fullHash(ResourceType type, uint64_t hashId) {
+        return (static_cast<uint64_t>(type) << (64 - resourceTypeBits)) +
+            (hashId & (std::numeric_limits<uint64_t>::max() >> resourceTypeBits));
+    }
 
-#ifdef MONGO_CONFIG_DEBUG_BUILD
-    // Keep the complete namespace name for debugging purposes (TODO: this will be
-    // removed once we are confident in the robustness of the lock manager).
-    std::string _nsCopy;
-#endif
+    static uint64_t hashStringData(StringData str) {
+        char hash[16];
+        MurmurHash3_x64_128(str.rawData(), str.size(), 0, hash);
+        return static_cast<size_t>(ConstDataView(hash).read<LittleEndian<std::uint64_t>>());
+    }
 };
 
 #ifndef MONGO_CONFIG_DEBUG_BUILD
@@ -262,25 +283,17 @@ extern const ResourceId resourceIdAdminDB;
 
 // Global lock. Every server operation, which uses the Locker must acquire this lock at least
 // once. See comments in the header file (begin/endTransaction) for more information.
-//
-// There are multiple locks with the "GLOBAL" type. This one is colloquially known as the global
-// lock.
 extern const ResourceId resourceIdGlobal;
 
-// Hardcoded resource id for ParallelBatchWriterMode. We use the same resource type
-// as resourceIdGlobal. This will also ensure the waits are reported as global, which
-// is appropriate. The lock will never be contended unless the parallel batch writers
-// must stop all other accesses globally. This resource must be locked before all other
-// resources (including resourceIdGlobal). Replication applier threads don't take this
-// lock.
-// TODO: Merge this with resourceIdGlobal
+// Hardcoded resource id for ParallelBatchWriterMode (PBWM). The lock will never be contended unless
+// the parallel batch writers must stop all other accesses globally. This resource must be locked
+// before all other resources (including resourceIdGlobal). Replication applier threads don't take
+// this lock.
 extern const ResourceId resourceIdParallelBatchWriterMode;
 
-// Hardcoded resource id for the ReplicationStateTransitionLock (RSTL). We use the same resource
-// type as resourceIdGlobal. This will also ensure the waits are reported as global, which is
-// appropriate. This lock is acquired in mode X for any replication state transition and is acquired
-// by all other reads and writes in mode IX. This lock is acquired after the PBWM but before the
-// resourceIdGlobal.
+// Hardcoded resource id for the ReplicationStateTransitionLock (RSTL). This lock is acquired in
+// mode X for any replication state transition and is acquired by all other reads and writes in mode
+// IX. This lock is acquired after the PBWM but before the resourceIdGlobal.
 extern const ResourceId resourceIdReplicationStateTransitionLock;
 
 /**

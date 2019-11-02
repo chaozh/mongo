@@ -48,13 +48,14 @@
 
 namespace mongo {
 
-using std::unique_ptr;
 using std::string;
+using std::unique_ptr;
 
 namespace {
 
 class DirectClientScope {
-    MONGO_DISALLOW_COPYING(DirectClientScope);
+    DirectClientScope(const DirectClientScope&) = delete;
+    DirectClientScope& operator=(const DirectClientScope&) = delete;
 
 public:
     explicit DirectClientScope(OperationContext* opCtx)
@@ -171,15 +172,15 @@ unique_ptr<DBClientCursor> DBDirectClient::query(const NamespaceStringOrUUID& ns
         nsOrUuid, query, nToReturn, nToSkip, fieldsToReturn, queryOptions, batchSize);
 }
 
-unsigned long long DBDirectClient::count(
-    const string& ns, const BSONObj& query, int options, int limit, int skip) {
+long long DBDirectClient::count(
+    const NamespaceStringOrUUID nsOrUuid, const BSONObj& query, int options, int limit, int skip) {
     DirectClientScope directClientScope(_opCtx);
-    BSONObj cmdObj = _countCmd(ns, query, options, limit, skip);
+    BSONObj cmdObj = _countCmd(nsOrUuid, query, options, limit, skip);
 
-    NamespaceString nsString(ns);
+    auto dbName = (nsOrUuid.uuid() ? nsOrUuid.dbname() : (*nsOrUuid.nss()).db().toString());
 
     auto result = CommandHelpers::runCommandDirectly(
-        _opCtx, OpMsgRequest::fromDBAndBody(nsString.db(), std::move(cmdObj)));
+        _opCtx, OpMsgRequest::fromDBAndBody(dbName, std::move(cmdObj)));
 
     uassertStatusOK(getStatusFromCommandResult(result));
     return static_cast<unsigned long long>(result["n"].numberLong());

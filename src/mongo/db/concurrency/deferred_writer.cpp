@@ -76,7 +76,7 @@ Status DeferredWriter::_makeCollection(OperationContext* opCtx) {
 StatusWith<std::unique_ptr<AutoGetCollection>> DeferredWriter::_getCollection(
     OperationContext* opCtx) {
     std::unique_ptr<AutoGetCollection> agc;
-    agc = stdx::make_unique<AutoGetCollection>(opCtx, _nss, MODE_IX);
+    agc = std::make_unique<AutoGetCollection>(opCtx, _nss, MODE_IX);
 
     while (!agc->getCollection()) {
         // Release the previous AGC's lock before trying to rebuild the collection.
@@ -87,7 +87,7 @@ StatusWith<std::unique_ptr<AutoGetCollection>> DeferredWriter::_getCollection(
             return status;
         }
 
-        agc = stdx::make_unique<AutoGetCollection>(opCtx, _nss, MODE_IX);
+        agc = std::make_unique<AutoGetCollection>(opCtx, _nss, MODE_IX);
     }
 
     return std::move(agc);
@@ -118,7 +118,7 @@ void DeferredWriter::_worker(InsertStatement stmt) {
         return Status::OK();
     });
 
-    stdx::lock_guard<stdx::mutex> lock(_mutex);
+    stdx::lock_guard<Latch> lock(_mutex);
 
     _numBytes -= stmt.doc.objsize();
 
@@ -147,7 +147,7 @@ void DeferredWriter::startup(std::string workerName) {
     options.minThreads = 0;
     options.maxThreads = 1;
     options.onCreateThread = [](const std::string& name) { Client::initThread(name); };
-    _pool = stdx::make_unique<ThreadPool>(options);
+    _pool = std::make_unique<ThreadPool>(options);
     _pool->startup();
 }
 
@@ -166,7 +166,7 @@ bool DeferredWriter::insertDocument(BSONObj obj) {
     // We can't insert documents if we haven't been started up.
     invariant(_pool);
 
-    stdx::lock_guard<stdx::mutex> lock(_mutex);
+    stdx::lock_guard<Latch> lock(_mutex);
 
     // Check if we're allowed to insert this object.
     if (_numBytes + obj.objsize() >= _maxNumBytes) {
@@ -178,7 +178,11 @@ bool DeferredWriter::insertDocument(BSONObj obj) {
 
     // Add the object to the buffer.
     _numBytes += obj.objsize();
-    fassert(40588, _pool->schedule([this, obj] { _worker(InsertStatement(obj.getOwned())); }));
+    _pool->schedule([this, obj](auto status) {
+        fassert(40588, status);
+
+        _worker(InsertStatement(obj.getOwned()));
+    });
     return true;
 }
 

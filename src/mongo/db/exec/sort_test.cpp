@@ -34,6 +34,7 @@
 #include "mongo/db/exec/sort.h"
 
 #include <boost/optional.hpp>
+#include <memory>
 
 #include "mongo/db/exec/queued_data_stage.h"
 #include "mongo/db/json.h"
@@ -41,7 +42,6 @@
 #include "mongo/db/query/collation/collator_factory_mock.h"
 #include "mongo/db/query/collation/collator_interface_mock.h"
 #include "mongo/db/service_context_d_test_fixture.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/clock_source_mock.h"
 
@@ -51,11 +51,12 @@ namespace {
 
 class SortStageTest : public ServiceContextMongoDTest {
 public:
+    static constexpr uint64_t kMaxMemoryUsageBytes = 1024u * 1024u;
+
     SortStageTest() {
-        getServiceContext()->setFastClockSource(stdx::make_unique<ClockSourceMock>());
+        getServiceContext()->setFastClockSource(std::make_unique<ClockSourceMock>());
         _opCtx = makeOperationContext();
-        CollatorFactoryInterface::set(getServiceContext(),
-                                      stdx::make_unique<CollatorFactoryMock>());
+        CollatorFactoryInterface::set(getServiceContext(), std::make_unique<CollatorFactoryMock>());
     }
 
     OperationContext* getOpCtx() {
@@ -63,11 +64,13 @@ public:
     }
 
     /**
-     * Test function to verify sort stage.
-     * SortStageParams will be initialized using patternStr, collator, and limit.
-     * inputStr represents the input data set in a BSONObj.
+     * Test function to verify sort stage. SortStage will be initialized using 'patternStr',
+     * 'collator', and 'limit;.
+     *
+     * 'inputStr' represents the input data set in a BSONObj.
      *     {input: [doc1, doc2, doc3, ...]}
-     * expectedStr represents the expected sorted data set.
+     *
+     * 'expectedStr; represents the expected sorted data set.
      *     {output: [docA, docB, docC, ...]}
      */
     void testWork(const char* patternStr,
@@ -80,7 +83,7 @@ public:
         WorkingSet ws;
 
         // QueuedDataStage will be owned by SortStage.
-        auto queuedDataStage = stdx::make_unique<QueuedDataStage>(getOpCtx(), &ws);
+        auto queuedDataStage = std::make_unique<QueuedDataStage>(getOpCtx(), &ws);
         BSONObj inputObj = fromjson(inputStr);
         BSONElement inputElt = inputObj.getField("input");
         ASSERT(inputElt.isABSONObj());
@@ -93,21 +96,25 @@ public:
             // Insert obj from input array into working set.
             WorkingSetID id = ws.allocate();
             WorkingSetMember* wsm = ws.get(id);
-            wsm->obj = Snapshotted<BSONObj>(SnapshotId(), obj);
+            wsm->doc = {SnapshotId(), Document{obj}};
             wsm->transitionToOwnedObj();
             queuedDataStage->pushBack(id);
         }
 
-        // Initialize SortStageParams
-        // Setting limit to 0 means no limit
-        SortStageParams params;
-        params.pattern = fromjson(patternStr);
-        params.limit = limit;
+        auto sortPattern = fromjson(patternStr);
 
-        auto sortKeyGen = stdx::make_unique<SortKeyGeneratorStage>(
-            getOpCtx(), queuedDataStage.release(), &ws, params.pattern, collator);
+        // Create an ExpressionContext for the SortKeyGeneratorStage.
+        auto expCtx = make_intrusive<ExpressionContext>(getOpCtx(), collator);
 
-        SortStage sort(getOpCtx(), params, &ws, sortKeyGen.release());
+        auto sortKeyGen = std::make_unique<SortKeyGeneratorStage>(
+            expCtx, std::move(queuedDataStage), &ws, sortPattern);
+
+        SortStage sort(expCtx,
+                       &ws,
+                       SortPattern{sortPattern, expCtx},
+                       limit,
+                       kMaxMemoryUsageBytes,
+                       std::move(sortKeyGen));
 
         WorkingSetID id = WorkingSet::INVALID_ID;
         PlanStage::StageState state = PlanStage::NEED_TIME;
@@ -127,7 +134,7 @@ public:
         BSONArrayBuilder arr(bob.subarrayStart("output"));
         while (state == PlanStage::ADVANCED) {
             WorkingSetMember* member = ws.get(id);
-            const BSONObj& obj = member->obj.value();
+            BSONObj obj = member->doc.value().toBson();
             arr.append(obj);
             state = sort.work(&id);
         }
@@ -141,7 +148,7 @@ public:
         // Finally, we get to compare the sorted results against what we expect.
         BSONObj expectedObj = fromjson(expectedStr);
         if (SimpleBSONObjComparator::kInstance.evaluate(outputObj != expectedObj)) {
-            mongoutils::str::stream ss;
+            str::stream ss;
             // Even though we have the original string representation of the expected output,
             // we invoke BSONObj::toString() to get a format consistent with outputObj.
             ss << "Unexpected sort result with pattern=" << patternStr << "; limit=" << limit
@@ -159,23 +166,27 @@ private:
 TEST_F(SortStageTest, SortEmptyWorkingSet) {
     WorkingSet ws;
 
+    // Create an ExpressionContext for the SortKeyGeneratorStage.
+    auto expCtx = make_intrusive<ExpressionContext>(getOpCtx(), nullptr);
+
     // QueuedDataStage will be owned by SortStage.
-    auto queuedDataStage = stdx::make_unique<QueuedDataStage>(getOpCtx(), &ws);
-    auto sortKeyGen = stdx::make_unique<SortKeyGeneratorStage>(
-        getOpCtx(), queuedDataStage.release(), &ws, BSONObj(), nullptr);
-    SortStageParams params;
-    SortStage sort(getOpCtx(), params, &ws, sortKeyGen.release());
+    auto queuedDataStage = std::make_unique<QueuedDataStage>(getOpCtx(), &ws);
+    auto sortKeyGen =
+        std::make_unique<SortKeyGeneratorStage>(expCtx, std::move(queuedDataStage), &ws, BSONObj());
+    auto sortPattern = BSON("a" << 1);
+    SortStage sort(expCtx,
+                   &ws,
+                   SortPattern{sortPattern, expCtx},
+                   0u,
+                   kMaxMemoryUsageBytes,
+                   std::move(sortKeyGen));
 
     // Check initial EOF state.
     ASSERT_FALSE(sort.isEOF());
 
-    // First call to work() initializes sort key generator.
+    // First call to work() sorts data in vector.
     WorkingSetID id = WorkingSet::INVALID_ID;
-    PlanStage::StageState state = sort.work(&id);
-    ASSERT_EQUALS(state, PlanStage::NEED_TIME);
-
-    // Second call to work() sorts data in vector.
-    state = sort.work(&id);
+    auto state = sort.work(&id);
     ASSERT_EQUALS(state, PlanStage::NEED_TIME);
 
     // Finally we hit EOF.

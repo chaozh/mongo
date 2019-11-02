@@ -29,7 +29,6 @@
 
 #pragma once
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/db/index_builds_coordinator.h"
 #include "mongo/util/concurrency/thread_pool.h"
 
@@ -48,7 +47,8 @@ class ServiceContext;
  * accessible via the ServiceContext.
  */
 class IndexBuildsCoordinatorMongod : public IndexBuildsCoordinator {
-    MONGO_DISALLOW_COPYING(IndexBuildsCoordinatorMongod);
+    IndexBuildsCoordinatorMongod(const IndexBuildsCoordinatorMongod&) = delete;
+    IndexBuildsCoordinatorMongod& operator=(const IndexBuildsCoordinatorMongod&) = delete;
 
 public:
     /**
@@ -71,22 +71,12 @@ public:
      */
     StatusWith<SharedSemiFuture<ReplIndexBuildState::IndexCatalogStats>> startIndexBuild(
         OperationContext* opCtx,
+        StringData dbName,
         CollectionUUID collectionUUID,
         const std::vector<BSONObj>& specs,
         const UUID& buildUUID,
         IndexBuildProtocol protocol,
         IndexBuildOptions indexBuildOptions) override;
-
-    /**
-     * TODO: not yet implemented.
-     */
-    Status commitIndexBuild(OperationContext* opCtx,
-                            const std::vector<BSONObj>& specs,
-                            const UUID& buildUUID) override;
-
-    void signalChangeToPrimaryMode() override;
-    void signalChangeToSecondaryMode() override;
-    void signalChangeToInitialSyncMode() override;
 
     Status voteCommitIndexBuild(const UUID& buildUUID, const HostAndPort& hostAndPort) override;
 
@@ -132,12 +122,6 @@ private:
      * TODO: not yet implemented.
      */
     void _refreshReplStateFromPersisted(OperationContext* opCtx, const UUID& buildUUID);
-
-    // Replication hooks will call into the Coordinator to update this on relevant state
-    // transitions. The Coordinator will then use the setting to inform how index builds are run.
-    // Index builds have different inter node communication responsibilities and error checking
-    // requirements depending on the replica set member's state.
-    ReplState _replMode = ReplState::Secondary;
 
     // Thread pool on which index builds are run.
     ThreadPool _threadPool;

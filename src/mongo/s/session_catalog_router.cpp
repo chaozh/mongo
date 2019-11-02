@@ -33,11 +33,46 @@
 
 #include "mongo/s/session_catalog_router.h"
 
+#include "mongo/db/sessions_collection.h"
+#include "mongo/s/transaction_router.h"
+
 namespace mongo {
 
-RouterOperationContextSession::RouterOperationContextSession(OperationContext* opCtx)
-    : _operationContextSession(opCtx) {}
+int RouterSessionCatalog::reapSessionsOlderThan(OperationContext* opCtx,
+                                                SessionsCollection& sessionsCollection,
+                                                Date_t possiblyExpired) {
+    const auto catalog = SessionCatalog::get(opCtx);
 
-RouterOperationContextSession::~RouterOperationContextSession() = default;
+    // Capture the possbily expired in-memory session ids
+    LogicalSessionIdSet lsids;
+    catalog->scanSessions(
+        SessionKiller::Matcher(KillAllSessionsByPatternSet{makeKillAllSessionsByPattern(opCtx)}),
+        [&](const ObservableSession& session) {
+            if (session.getLastCheckout() < possiblyExpired) {
+                lsids.insert(session.getSessionId());
+            }
+        });
+
+    // From the passed-in sessions, find the ones which are actually expired/removed
+    auto expiredSessionIds = sessionsCollection.findRemovedSessions(opCtx, lsids);
+
+    // Remove the session ids from the in-memory catalog
+    int numReaped = 0;
+    for (const auto& lsid : expiredSessionIds) {
+        catalog->scanSession(lsid, [&](ObservableSession& session) {
+            session.markForReap();
+            ++numReaped;
+        });
+    }
+
+    return numReaped;
+}
+
+RouterOperationContextSession::RouterOperationContextSession(OperationContext* opCtx)
+    : _opCtx(opCtx), _operationContextSession(opCtx) {}
+
+RouterOperationContextSession::~RouterOperationContextSession() {
+    TransactionRouter::get(_opCtx).stash(_opCtx);
+};
 
 }  // namespace mongo

@@ -44,10 +44,8 @@
 #include "mongo/db/operation_context.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/s/grid.h"
-#include "mongo/stdx/memory.h"
-#include "mongo/util/mongoutils/str.h"
 #include "mongo/util/net/ssl_types.h"
-#include "mongo/util/stringutils.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -95,7 +93,7 @@ Status AuthzManagerExternalStateMongos::initialize(OperationContext* opCtx) {
 
 std::unique_ptr<AuthzSessionExternalState>
 AuthzManagerExternalStateMongos::makeAuthzSessionExternalState(AuthorizationManager* authzManager) {
-    return stdx::make_unique<AuthzSessionExternalStateMongos>(authzManager);
+    return std::make_unique<AuthzSessionExternalStateMongos>(authzManager);
 }
 
 Status AuthzManagerExternalStateMongos::getStoredAuthorizationVersion(OperationContext* opCtx,
@@ -129,12 +127,8 @@ Status AuthzManagerExternalStateMongos::getUserDescription(OperationContext* opC
                                                 << userName.getUser()
                                                 << AuthorizationManager::USER_DB_FIELD_NAME
                                                 << userName.getDB()))
-                             << "showPrivileges"
-                             << true
-                             << "showCredentials"
-                             << true
-                             << "showAuthenticationRestrictions"
-                             << true);
+                             << "showPrivileges" << true << "showCredentials" << true
+                             << "showAuthenticationRestrictions" << true);
         BSONObjBuilder builder;
         const bool ok = Grid::get(opCtx)->catalogClient()->runUserManagementReadCommand(
             opCtx, "admin", usersInfoCmd, &builder);
@@ -151,10 +145,9 @@ Status AuthzManagerExternalStateMongos::getUserDescription(OperationContext* opC
 
         if (foundUsers.size() > 1) {
             return Status(ErrorCodes::UserDataInconsistent,
-                          str::stream() << "Found multiple users on the \"" << userName.getDB()
-                                        << "\" database with name \""
-                                        << userName.getUser()
-                                        << "\"");
+                          str::stream()
+                              << "Found multiple users on the \"" << userName.getDB()
+                              << "\" database with name \"" << userName.getUser() << "\"");
         }
         *result = foundUsers[0].Obj().getOwned();
         return Status::OK();
@@ -164,10 +157,9 @@ Status AuthzManagerExternalStateMongos::getUserDescription(OperationContext* opC
         BSONArrayBuilder userRolesBuilder;
         auto& sslPeerInfo = SSLPeerInfo::forSession(opCtx->getClient()->session());
         for (const RoleName& role : sslPeerInfo.roles) {
-            userRolesBuilder.append(BSON(AuthorizationManager::ROLE_NAME_FIELD_NAME
-                                         << role.getRole()
-                                         << AuthorizationManager::ROLE_DB_FIELD_NAME
-                                         << role.getDB()));
+            userRolesBuilder.append(BSON(
+                AuthorizationManager::ROLE_NAME_FIELD_NAME
+                << role.getRole() << AuthorizationManager::ROLE_DB_FIELD_NAME << role.getDB()));
         }
         BSONArray providedRoles = userRolesBuilder.arr();
 
@@ -196,16 +188,12 @@ Status AuthzManagerExternalStateMongos::getUserDescription(OperationContext* opC
                 "Recieved malformed response to request for X509 roles from config server");
         }
 
-        *result = BSON("_id" << userName.getUser() << "user" << userName.getUser() << "db"
-                             << userName.getDB()
-                             << "credentials"
-                             << BSON("external" << true)
-                             << "roles"
-                             << BSONArray(cmdResult["roles"].Obj())
-                             << "inheritedRoles"
-                             << BSONArray(cmdResult["inheritedRoles"].Obj())
-                             << "inheritedPrivileges"
-                             << BSONArray(cmdResult["inheritedPrivileges"].Obj()));
+        *result =
+            BSON("_id" << userName.getUser() << "user" << userName.getUser() << "db"
+                       << userName.getDB() << "credentials" << BSON("external" << true) << "roles"
+                       << BSONArray(cmdResult["roles"].Obj()) << "inheritedRoles"
+                       << BSONArray(cmdResult["inheritedRoles"].Obj()) << "inheritedPrivileges"
+                       << BSONArray(cmdResult["inheritedPrivileges"].Obj()));
         return Status::OK();
     }
 }
@@ -217,11 +205,11 @@ Status AuthzManagerExternalStateMongos::getRoleDescription(
     AuthenticationRestrictionsFormat showRestrictions,
     BSONObj* result) {
     BSONObjBuilder rolesInfoCmd;
-    rolesInfoCmd.append("rolesInfo",
-                        BSON_ARRAY(BSON(AuthorizationManager::ROLE_NAME_FIELD_NAME
-                                        << roleName.getRole()
-                                        << AuthorizationManager::ROLE_DB_FIELD_NAME
-                                        << roleName.getDB())));
+    rolesInfoCmd.append(
+        "rolesInfo",
+        BSON_ARRAY(BSON(AuthorizationManager::ROLE_NAME_FIELD_NAME
+                        << roleName.getRole() << AuthorizationManager::ROLE_DB_FIELD_NAME
+                        << roleName.getDB())));
     addShowToBuilder(&rolesInfoCmd, showPrivileges, showRestrictions);
 
     BSONObjBuilder builder;
@@ -240,9 +228,7 @@ Status AuthzManagerExternalStateMongos::getRoleDescription(
     if (foundRoles.size() > 1) {
         return Status(ErrorCodes::RoleDataInconsistent,
                       str::stream() << "Found multiple roles on the \"" << roleName.getDB()
-                                    << "\" database with name \""
-                                    << roleName.getRole()
-                                    << "\"");
+                                    << "\" database with name \"" << roleName.getRole() << "\"");
     }
     *result = foundRoles[0].Obj().getOwned();
     return Status::OK();
@@ -257,8 +243,7 @@ Status AuthzManagerExternalStateMongos::getRolesDescription(
 
     for (const RoleName& roleName : roles) {
         rolesInfoCmdArray << BSON(AuthorizationManager::ROLE_NAME_FIELD_NAME
-                                  << roleName.getRole()
-                                  << AuthorizationManager::ROLE_DB_FIELD_NAME
+                                  << roleName.getRole() << AuthorizationManager::ROLE_DB_FIELD_NAME
                                   << roleName.getDB());
     }
 

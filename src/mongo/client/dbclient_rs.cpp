@@ -45,17 +45,16 @@
 #include "mongo/db/auth/sasl_command_constants.h"
 #include "mongo/db/dbmessage.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
 
-using std::shared_ptr;
-using std::unique_ptr;
 using std::endl;
 using std::map;
 using std::set;
+using std::shared_ptr;
 using std::string;
+using std::unique_ptr;
 using std::vector;
 
 namespace {
@@ -117,7 +116,7 @@ std::unique_ptr<ReadPreferenceSetting> _extractReadPref(const BSONObj& query, in
         // The readPreference is embedded in the $queryOptions field.
         readPrefContainingObj = elem.Obj();
     }
-    return stdx::make_unique<ReadPreferenceSetting>(uassertStatusOK(
+    return std::make_unique<ReadPreferenceSetting>(uassertStatusOK(
         ReadPreferenceSetting::fromContainingBSON(readPrefContainingObj, defaultReadPref)));
 }
 
@@ -138,7 +137,7 @@ DBClientReplicaSet::DBClientReplicaSet(const string& name,
       _applicationName(applicationName.toString()),
       _so_timeout(so_timeout),
       _uri(std::move(uri)) {
-    if (uri.isValid()) {
+    if (_uri.isValid()) {
         _rsm = ReplicaSetMonitor::createIfNeeded(_uri);
     } else {
         _rsm = ReplicaSetMonitor::createIfNeeded(name,
@@ -296,10 +295,10 @@ DBClientConnection* DBClientReplicaSet::checkMaster() {
 
     _masterHost = h;
 
-    MongoURI masterUri = _uri.cloneURIForServer(_masterHost);
+    MongoURI masterUri = _uri.cloneURIForServer(_masterHost, _applicationName);
 
     string errmsg;
-    DBClientConnection* newConn = NULL;
+    DBClientConnection* newConn = nullptr;
     boost::optional<double> socketTimeout;
     if (_so_timeout > 0.0)
         socketTimeout = _so_timeout;
@@ -314,10 +313,10 @@ DBClientConnection* DBClientReplicaSet::checkMaster() {
         errmsg = ex.toString();
     }
 
-    if (newConn == NULL || !errmsg.empty()) {
-        const std::string message = str::stream() << "can't connect to new replica set master ["
-                                                  << _masterHost.toString() << "]"
-                                                  << (errmsg.empty() ? "" : ", err: ") << errmsg;
+    if (newConn == nullptr || !errmsg.empty()) {
+        const std::string message = str::stream()
+            << "can't connect to new replica set master [" << _masterHost.toString() << "]"
+            << (errmsg.empty() ? "" : ", err: ") << errmsg;
         monitor->failedHost(_masterHost, {ErrorCodes::Error(40659), message});
         uasserted(ErrorCodes::FailedToSatisfyReadPreference, message);
     }
@@ -399,7 +398,7 @@ DBClientConnection& DBClientReplicaSet::slaveConn() {
 
     uassert(16369,
             str::stream() << "No good nodes available for set: " << _getMonitor()->getName(),
-            conn != NULL);
+            conn != nullptr);
 
     return *conn;
 }
@@ -494,7 +493,7 @@ void DBClientReplicaSet::logout(const string& dbname, BSONObj& info) {
      * needed when we actually have something cached and is last known to be
      * working.
      */
-    if (_lastSlaveOkConn.get() != NULL && !_lastSlaveOkConn->isFailed()) {
+    if (_lastSlaveOkConn.get() != nullptr && !_lastSlaveOkConn->isFailed()) {
         try {
             BSONObj dummy;
             _lastSlaveOkConn->logout(dbname, dummy);
@@ -537,10 +536,10 @@ unique_ptr<DBClientCursor> DBClientReplicaSet::query(const NamespaceStringOrUUID
         LOG(3) << "dbclient_rs query using secondary or tagged node selection in "
                << _getMonitor()->getName() << ", read pref is " << readPref->toString()
                << " (primary : "
-               << (_master.get() != NULL ? _master->getServerAddress() : "[not cached]")
-               << ", lastTagged : " << (_lastSlaveOkConn.get() != NULL
-                                            ? _lastSlaveOkConn->getServerAddress()
-                                            : "[not cached]")
+               << (_master.get() != nullptr ? _master->getServerAddress() : "[not cached]")
+               << ", lastTagged : "
+               << (_lastSlaveOkConn.get() != nullptr ? _lastSlaveOkConn->getServerAddress()
+                                                     : "[not cached]")
                << ")" << endl;
 
         string lastNodeErrMsg;
@@ -549,7 +548,7 @@ unique_ptr<DBClientCursor> DBClientReplicaSet::query(const NamespaceStringOrUUID
             try {
                 DBClientConnection* conn = selectNodeUsingTags(readPref);
 
-                if (conn == NULL) {
+                if (conn == nullptr) {
                     break;
                 }
 
@@ -589,10 +588,10 @@ BSONObj DBClientReplicaSet::findOne(const string& ns,
         LOG(3) << "dbclient_rs findOne using secondary or tagged node selection in "
                << _getMonitor()->getName() << ", read pref is " << readPref->toString()
                << " (primary : "
-               << (_master.get() != NULL ? _master->getServerAddress() : "[not cached]")
-               << ", lastTagged : " << (_lastSlaveOkConn.get() != NULL
-                                            ? _lastSlaveOkConn->getServerAddress()
-                                            : "[not cached]")
+               << (_master.get() != nullptr ? _master->getServerAddress() : "[not cached]")
+               << ", lastTagged : "
+               << (_lastSlaveOkConn.get() != nullptr ? _lastSlaveOkConn->getServerAddress()
+                                                     : "[not cached]")
                << ")" << endl;
 
         string lastNodeErrMsg;
@@ -601,7 +600,7 @@ BSONObj DBClientReplicaSet::findOne(const string& ns,
             try {
                 DBClientConnection* conn = selectNodeUsingTags(readPref);
 
-                if (conn == NULL) {
+                if (conn == nullptr) {
                     break;
                 }
 
@@ -648,7 +647,7 @@ void DBClientReplicaSet::isntMaster() {
 
 unique_ptr<DBClientCursor> DBClientReplicaSet::checkSlaveQueryResult(
     unique_ptr<DBClientCursor> result) {
-    if (result.get() == NULL)
+    if (result.get() == nullptr)
         return result;
 
     BSONObj error;
@@ -720,21 +719,21 @@ DBClientConnection* DBClientReplicaSet::selectNodeUsingTags(
         return _master.get();
     }
 
-    auto dtor = [host = _lastSlaveOkHost.toString()](DBClientConnection * ptr) {
+    auto dtor = [host = _lastSlaveOkHost.toString()](DBClientConnection* ptr) {
         globalConnPool.release(host, ptr);
     };
 
     // Needs to perform a dynamic_cast because we need to set the replSet
     // callback. We should eventually not need this after we remove the
     // callback.
-    DBClientConnection* newConn = dynamic_cast<DBClientConnection*>(
-        globalConnPool.get(_uri.cloneURIForServer(_lastSlaveOkHost), _so_timeout));
+    DBClientConnection* newConn = dynamic_cast<DBClientConnection*>(globalConnPool.get(
+        _uri.cloneURIForServer(_lastSlaveOkHost, _applicationName), _so_timeout));
 
     // Assert here instead of returning NULL since the contract of this method is such
     // that returning NULL means none of the nodes were good, which is not the case here.
     uassert(16532,
             str::stream() << "Failed to connect to " << _lastSlaveOkHost.toString(),
-            newConn != NULL);
+            newConn != nullptr);
 
     _lastSlaveOkConn = std::shared_ptr<DBClientConnection>(newConn, std::move(dtor));
     _lastSlaveOkConn->setParentReplSetName(_setName);
@@ -768,10 +767,10 @@ void DBClientReplicaSet::say(Message& toSend, bool isRetry, string* actualServer
             LOG(3) << "dbclient_rs say using secondary or tagged node selection in "
                    << _getMonitor()->getName() << ", read pref is " << readPref->toString()
                    << " (primary : "
-                   << (_master.get() != NULL ? _master->getServerAddress() : "[not cached]")
-                   << ", lastTagged : " << (_lastSlaveOkConn.get() != NULL
-                                                ? _lastSlaveOkConn->getServerAddress()
-                                                : "[not cached]")
+                   << (_master.get() != nullptr ? _master->getServerAddress() : "[not cached]")
+                   << ", lastTagged : "
+                   << (_lastSlaveOkConn.get() != nullptr ? _lastSlaveOkConn->getServerAddress()
+                                                         : "[not cached]")
                    << ")" << endl;
 
             string lastNodeErrMsg;
@@ -781,11 +780,11 @@ void DBClientReplicaSet::say(Message& toSend, bool isRetry, string* actualServer
                 try {
                     DBClientConnection* conn = selectNodeUsingTags(readPref);
 
-                    if (conn == NULL) {
+                    if (conn == nullptr) {
                         break;
                     }
 
-                    if (actualServer != NULL) {
+                    if (actualServer != nullptr) {
                         *actualServer = conn->getServerAddress();
                     }
 
@@ -883,8 +882,9 @@ void DBClientReplicaSet::checkResponse(const std::vector<BSONObj>& batch,
         // query could potentially go to a secondary, so see if this is an error (or empty) and
         // retry if we're not past our retry limit.
 
-        if (networkError || (hasErrField(dataObj) && !dataObj["code"].eoo() &&
-                             dataObj["code"].Int() == ErrorCodes::NotMasterOrSecondary)) {
+        if (networkError ||
+            (hasErrField(dataObj) && !dataObj["code"].eoo() &&
+             dataObj["code"].Int() == ErrorCodes::NotMasterOrSecondary)) {
             if (_lazyState._lastClient == _lastSlaveOkConn.get()) {
                 isntSecondary();
             } else if (_lazyState._lastClient == _master.get()) {
@@ -906,8 +906,9 @@ void DBClientReplicaSet::checkResponse(const std::vector<BSONObj>& batch,
     } else if (_lazyState._lastOp == dbQuery) {
         // if query could not potentially go to a secondary, just mark the master as bad
 
-        if (networkError || (hasErrField(dataObj) && !dataObj["code"].eoo() &&
-                             dataObj["code"].Int() == ErrorCodes::NotMasterNoSlaveOk)) {
+        if (networkError ||
+            (hasErrField(dataObj) && !dataObj["code"].eoo() &&
+             dataObj["code"].Int() == ErrorCodes::NotMasterNoSlaveOk)) {
             if (_lazyState._lastClient == _master.get()) {
                 isntMaster();
             }
@@ -958,8 +959,7 @@ std::pair<rpc::UniqueReply, DBClientBase*> DBClientReplicaSet::runCommandWithTar
 
     uasserted(ErrorCodes::HostNotFound,
               str::stream() << "Could not satisfy $readPreference of '" << readPref.toString()
-                            << "' while attempting to run command "
-                            << request.getCommandName());
+                            << "' while attempting to run command " << request.getCommandName());
 }
 
 std::pair<rpc::UniqueReply, std::shared_ptr<DBClientBase>> DBClientReplicaSet::runCommandWithTarget(
@@ -986,7 +986,7 @@ bool DBClientReplicaSet::call(Message& toSend,
                               Message& response,
                               bool assertOk,
                               string* actualServer) {
-    const char* ns = 0;
+    const char* ns = nullptr;
 
     if (toSend.operation() == dbQuery) {
         // TODO: might be possible to do this faster by changing api
@@ -999,21 +999,21 @@ bool DBClientReplicaSet::call(Message& toSend,
             LOG(3) << "dbclient_rs call using secondary or tagged node selection in "
                    << _getMonitor()->getName() << ", read pref is " << readPref->toString()
                    << " (primary : "
-                   << (_master.get() != NULL ? _master->getServerAddress() : "[not cached]")
-                   << ", lastTagged : " << (_lastSlaveOkConn.get() != NULL
-                                                ? _lastSlaveOkConn->getServerAddress()
-                                                : "[not cached]")
+                   << (_master.get() != nullptr ? _master->getServerAddress() : "[not cached]")
+                   << ", lastTagged : "
+                   << (_lastSlaveOkConn.get() != nullptr ? _lastSlaveOkConn->getServerAddress()
+                                                         : "[not cached]")
                    << ")" << endl;
 
             for (size_t retry = 0; retry < MAX_RETRY; retry++) {
                 try {
                     DBClientConnection* conn = selectNodeUsingTags(readPref);
 
-                    if (conn == NULL) {
+                    if (conn == nullptr) {
                         return false;
                     }
 
-                    if (actualServer != NULL) {
+                    if (actualServer != nullptr) {
                         *actualServer = conn->getServerAddress();
                     }
 
@@ -1069,7 +1069,7 @@ void DBClientReplicaSet::_invalidateLastSlaveOkCache(const Status& status) {
 
 void DBClientReplicaSet::reset() {
     resetSlaveOkConn();
-    _lazyState._lastClient = NULL;
+    _lazyState._lastClient = nullptr;
     _lastReadPref.reset();
 }
 
@@ -1090,7 +1090,7 @@ void DBClientReplicaSet::resetMaster() {
 void DBClientReplicaSet::resetSlaveOkConn() {
     if (_lastSlaveOkConn.get() == _master.get()) {
         _lastSlaveOkConn.reset();
-    } else if (_lastSlaveOkConn.get() != NULL) {
+    } else if (_lastSlaveOkConn.get() != nullptr) {
         if (_authPooledSecondaryConn) {
             logoutAll(_lastSlaveOkConn.get());
         } else {

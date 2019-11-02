@@ -41,6 +41,7 @@ public:
     using SessionMode = MongoProcessInterface::CurrentOpSessionsMode;
     using UserMode = MongoProcessInterface::CurrentOpUserMode;
     using CursorMode = MongoProcessInterface::CurrentOpCursorMode;
+    using BacktraceMode = MongoProcessInterface::CurrentOpBacktraceMode;
 
     static constexpr StringData kStageName = "$currentOp"_sd;
 
@@ -70,10 +71,6 @@ public:
             return privileges;
         }
 
-        bool allowedToForwardFromMongos() const final {
-            return _localOps == LocalOpsMode::kRemoteShardOps;
-        }
-
         bool allowedToPassthroughFromMongos() const final {
             return _localOps == LocalOpsMode::kRemoteShardOps;
         }
@@ -83,12 +80,11 @@ public:
         }
 
         void assertSupportsReadConcern(const repl::ReadConcernArgs& readConcern) const {
-            uassert(ErrorCodes::InvalidOptions,
-                    str::stream() << "Aggregation stage " << kStageName << " cannot run with a "
-                                  << "readConcern other than 'local', or in a multi-document "
-                                  << "transaction. Current readConcern: "
-                                  << readConcern.toString(),
-                    readConcern.getLevel() == repl::ReadConcernLevel::kLocalReadConcern);
+            onlyReadConcernLocalSupported(kStageName, readConcern);
+        }
+
+        void assertSupportsMultiDocumentTransaction() const {
+            transactionNotSupported(kStageName);
         }
 
     private:
@@ -103,9 +99,8 @@ public:
         UserMode includeOpsFromAllUsers = UserMode::kExcludeOthers,
         LocalOpsMode showLocalOpsOnMongoS = LocalOpsMode::kRemoteShardOps,
         TruncationMode truncateOps = TruncationMode::kNoTruncation,
-        CursorMode idleCursors = CursorMode::kExcludeCursors);
-
-    GetNextResult getNext() final;
+        CursorMode idleCursors = CursorMode::kExcludeCursors,
+        BacktraceMode backtrace = BacktraceMode::kExcludeBacktrace);
 
     const char* getSourceName() const final;
 
@@ -117,14 +112,15 @@ public:
                                           : HostTypeRequirement::kAnyShard),
                                      DiskUseRequirement::kNoDiskUse,
                                      FacetRequirement::kNotAllowed,
-                                     TransactionRequirement::kNotAllowed);
+                                     TransactionRequirement::kNotAllowed,
+                                     LookupRequirement::kAllowed);
 
         constraints.isIndependentOfAnyCollection = true;
         constraints.requiresInputDocSource = false;
         return constraints;
     }
 
-    boost::optional<MergingLogic> mergingLogic() final {
+    boost::optional<DistributedPlanLogic> distributedPlanLogic() final {
         return boost::none;
     }
 
@@ -140,14 +136,18 @@ private:
                             UserMode includeOpsFromAllUsers,
                             LocalOpsMode showLocalOpsOnMongoS,
                             TruncationMode truncateOps,
-                            CursorMode idleCursors)
-        : DocumentSource(pExpCtx),
+                            CursorMode idleCursors,
+                            BacktraceMode backtrace)
+        : DocumentSource(kStageName, pExpCtx),
           _includeIdleConnections(includeIdleConnections),
           _includeIdleSessions(includeIdleSessions),
           _includeOpsFromAllUsers(includeOpsFromAllUsers),
           _showLocalOpsOnMongoS(showLocalOpsOnMongoS),
           _truncateOps(truncateOps),
-          _idleCursors(idleCursors) {}
+          _idleCursors(idleCursors),
+          _backtrace(backtrace) {}
+
+    GetNextResult doGetNext() final;
 
     ConnMode _includeIdleConnections = ConnMode::kExcludeIdle;
     SessionMode _includeIdleSessions = SessionMode::kIncludeIdle;
@@ -155,6 +155,7 @@ private:
     LocalOpsMode _showLocalOpsOnMongoS = LocalOpsMode::kRemoteShardOps;
     TruncationMode _truncateOps = TruncationMode::kNoTruncation;
     CursorMode _idleCursors = CursorMode::kExcludeCursors;
+    BacktraceMode _backtrace = BacktraceMode::kExcludeBacktrace;
 
     std::string _shardName;
 

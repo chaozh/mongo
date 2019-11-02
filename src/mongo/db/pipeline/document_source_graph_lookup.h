@@ -29,22 +29,53 @@
 
 #pragma once
 
+#include "mongo/db/exec/document_value/value_comparator.h"
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/document_source_unwind.h"
 #include "mongo/db/pipeline/expression.h"
 #include "mongo/db/pipeline/lookup_set_cache.h"
-#include "mongo/db/pipeline/value_comparator.h"
 
 namespace mongo {
 
 class DocumentSourceGraphLookUp final : public DocumentSource {
 public:
-    static std::unique_ptr<LiteParsedDocumentSourceForeignCollections> liteParse(
-        const AggregationRequest& request, const BSONElement& spec);
+    static constexpr StringData kStageName = "$graphLookup"_sd;
 
-    GetNextResult getNext() final;
+    class LiteParsed : public LiteParsedDocumentSourceForeignCollections {
+    public:
+        LiteParsed(NamespaceString foreignNss, PrivilegeVector privileges)
+            : LiteParsedDocumentSourceForeignCollections(std::move(foreignNss),
+                                                         std::move(privileges)) {}
+
+        bool allowShardedForeignCollection(NamespaceString nss) const override {
+            return (_foreignNssSet.find(nss) == _foreignNssSet.end());
+        }
+    };
+    static std::unique_ptr<LiteParsed> liteParse(const AggregationRequest& request,
+                                                 const BSONElement& spec);
+
     const char* getSourceName() const final;
-    BSONObjSet getOutputSorts() final;
+
+    const FieldPath& getConnectFromField() const {
+        return _connectFromField;
+    }
+
+    const FieldPath& getConnectToField() const {
+        return _connectToField;
+    }
+
+    Expression* getStartWithField() const {
+        return _startWith.get();
+    }
+
+    boost::optional<BSONObj> getAdditionalFilter() const {
+        return _additionalFilter;
+    };
+
+    void setAdditionalFilter(boost::optional<BSONObj> additionalFilter) {
+        _additionalFilter = additionalFilter ? additionalFilter->getOwned() : additionalFilter;
+    };
+
     void serializeToArray(
         std::vector<Value>& array,
         boost::optional<ExplainOptions::Verbosity> explain = boost::none) const final;
@@ -55,27 +86,21 @@ public:
     GetModPathsReturn getModifiedPaths() const final;
 
     StageConstraints constraints(Pipeline::SplitState pipeState) const final {
-        // TODO SERVER-27533 Until we remove the restriction of only performing lookups from mongos,
-        // this stage must run on mongos if the output collection is sharded.
-        HostTypeRequirement hostRequirement =
-            (pExpCtx->inMongos && pExpCtx->mongoProcessInterface->isSharded(pExpCtx->opCtx, _from))
-            ? HostTypeRequirement::kMongoS
-            : HostTypeRequirement::kPrimaryShard;
-
         StageConstraints constraints(StreamType::kStreaming,
                                      PositionRequirement::kNone,
-                                     hostRequirement,
+                                     HostTypeRequirement::kPrimaryShard,
                                      DiskUseRequirement::kNoDiskUse,
                                      FacetRequirement::kAllowed,
-                                     TransactionRequirement::kAllowed);
+                                     TransactionRequirement::kAllowed,
+                                     LookupRequirement::kAllowed);
 
         constraints.canSwapWithMatch = true;
         return constraints;
     }
 
-    boost::optional<MergingLogic> mergingLogic() final {
+    boost::optional<DistributedPlanLogic> distributedPlanLogic() final {
         // {shardsStage, mergingStage, sortPattern}
-        return MergingLogic{nullptr, this, boost::none};
+        return DistributedPlanLogic{nullptr, this, boost::none};
     }
 
     DepsTracker::State getDependencies(DepsTracker* deps) const final {
@@ -105,6 +130,7 @@ public:
         BSONElement elem, const boost::intrusive_ptr<ExpressionContext>& pExpCtx);
 
 protected:
+    GetNextResult doGetNext() final;
     void doDispose() final;
 
     /**

@@ -48,11 +48,11 @@ namespace repl {
 
 class ReadConcernArgs {
 public:
-    static const std::string kReadConcernFieldName;
-    static const std::string kAfterOpTimeFieldName;
-    static const std::string kAfterClusterTimeFieldName;
-    static const std::string kAtClusterTimeFieldName;
-    static const std::string kLevelFieldName;
+    static constexpr StringData kReadConcernFieldName = "readConcern"_sd;
+    static constexpr StringData kAfterOpTimeFieldName = "afterOpTime"_sd;
+    static constexpr StringData kAfterClusterTimeFieldName = "afterClusterTime"_sd;
+    static constexpr StringData kAtClusterTimeFieldName = "atClusterTime"_sd;
+    static constexpr StringData kLevelFieldName = "level"_sd;
 
     /**
      * Represents the internal mechanism an operation uses to satisfy 'majority' read concern.
@@ -104,10 +104,11 @@ public:
     Status initialize(const BSONElement& readConcernElem);
 
     /**
-     * Upconverts the readConcern level to 'snapshot', or returns a non-ok status if this
-     * readConcern cannot be upconverted.
+     * Initializes the object by parsing the actual readConcern sub-object.
      */
-    Status upconvertReadConcernLevelToSnapshot();
+    Status parse(const BSONObj& readConcernObj);
+
+    static ReadConcernArgs fromBSONThrows(const BSONObj& readConcernObj);
 
     /**
      * Sets the mechanism we should use to satisfy 'majority' reads.
@@ -140,24 +141,20 @@ public:
     bool isEmpty() const;
 
     /**
+     * Returns true if this ReadConcernArgs represents a read concern that was actually specified.
+     * If the RC was specified as an empty BSON object this will still be true (unlike isEmpty()).
+     * False represents an absent or missing read concern, ie. one which wasn't present at all.
+     */
+    bool isSpecified() const;
+
+    /**
      *  Returns default kLocalReadConcern if _level is not set.
      */
     ReadConcernLevel getLevel() const;
-
-    /**
-     *  Returns readConcernLevel before upconverting, or same as getLevel() if not upconverted.
-     */
-    ReadConcernLevel getOriginalLevel() const;
-
     /**
      * Checks whether _level is explicitly set.
      */
     bool hasLevel() const;
-
-    /**
-     * Checks whether _originalLevel is explicitly set.
-     */
-    bool hasOriginalLevel() const;
 
     /**
      * Returns the opTime. Deprecated: will be replaced with getArgsAfterClusterTime.
@@ -187,15 +184,16 @@ private:
     boost::optional<ReadConcernLevel> _level;
 
     /**
-     * If the read concern was upconverted, the original read concern level.
-     */
-    boost::optional<ReadConcernLevel> _originalLevel;
-
-    /**
      * The mechanism to use for satisfying 'majority' reads. Only meaningful if the read concern
      * level is 'majority'.
      */
     MajorityReadMechanism _majorityReadMechanism{MajorityReadMechanism::kMajoritySnapshot};
+
+    /**
+     * True indicates that a read concern has been specified (even if it might be empty), as
+     * opposed to being absent or missing.
+     */
+    bool _specified;
 };
 
 }  // namespace repl

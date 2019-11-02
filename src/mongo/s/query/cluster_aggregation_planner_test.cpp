@@ -34,8 +34,8 @@
 #include "mongo/client/remote_command_targeter_mock.h"
 #include "mongo/db/pipeline/document_source_group.h"
 #include "mongo/db/pipeline/document_source_match.h"
+#include "mongo/db/pipeline/document_source_merge.h"
 #include "mongo/db/pipeline/document_source_out.h"
-#include "mongo/db/pipeline/document_source_out_gen.h"
 #include "mongo/db/pipeline/document_source_project.h"
 #include "mongo/db/pipeline/document_source_sort.h"
 #include "mongo/db/pipeline/expression_context_for_test.h"
@@ -49,13 +49,16 @@
 namespace mongo {
 
 namespace {
+using MergeStrategyDescriptor = DocumentSourceMerge::MergeStrategyDescriptor;
+using WhenMatched = MergeStrategyDescriptor::WhenMatched;
+using WhenNotMatched = MergeStrategyDescriptor::WhenNotMatched;
 
 const NamespaceString kTestAggregateNss = NamespaceString{"unittests", "cluster_exchange"};
 const NamespaceString kTestOutNss = NamespaceString{"unittests", "out_ns"};
 
 /**
  * For the purposes of this test, assume every collection is sharded. Stages may ask this during
- * setup. For example, to compute its constraints, the $out stage needs to know if the output
+ * setup. For example, to compute its constraints, the $merge stage needs to know if the output
  * collection is sharded.
  */
 class FakeMongoProcessInterface : public StubMongoProcessInterface {
@@ -92,6 +95,7 @@ public:
         std::vector<ChunkType> chunks;
         for (auto&& pair : chunkInfos) {
             chunks.emplace_back(nss, pair.first, version, pair.second);
+            chunks.back().setName(OID::gen());
             version.incMinor();
         }
         return chunks;
@@ -115,11 +119,15 @@ public:
             return response;
         }());
 
-        future.timed_get(kFutureTimeout).get();
+        future.default_timed_get().get();
     }
 
-private:
+protected:
     boost::intrusive_ptr<ExpressionContext> _expCtx;
+    boost::optional<BSONObj> _mergeLetVariables;
+    boost::optional<std::vector<BSONObj>> _mergePipeline;
+    std::set<FieldPath> _mergeOnFields{"_id"};
+    boost::optional<ChunkVersion> _mergeTargetCollectionVersion;
 };
 
 TEST_F(ClusterExchangeTest, ShouldNotExchangeIfPipelineDoesNotEndWithOut) {
@@ -134,27 +142,32 @@ TEST_F(ClusterExchangeTest, ShouldNotExchangeIfPipelineDoesNotEndWithOut) {
                                                                          mergePipe.get()));
 }
 
-TEST_F(ClusterExchangeTest, ShouldNotExchangeIfPipelineEndsWithReplaceCollectionOut) {
+TEST_F(ClusterExchangeTest, ShouldNotExchangeIfPipelineEndsWithOut) {
     setupNShards(2);
 
-    // For this test pretend 'kTestOutNss' is not sharded so that we can use a "replaceCollection"
-    // $out.
+    // For this test pretend 'kTestOutNss' is not sharded so that we can use $out.
     const auto originalMongoProcessInterface = expCtx()->mongoProcessInterface;
     expCtx()->mongoProcessInterface = std::make_shared<StubMongoProcessInterface>();
     ON_BLOCK_EXIT([&]() { expCtx()->mongoProcessInterface = originalMongoProcessInterface; });
 
-    auto mergePipe = unittest::assertGet(Pipeline::create(
-        {DocumentSourceOut::create(kTestOutNss, expCtx(), WriteModeEnum::kModeReplaceCollection)},
-        expCtx()));
+    auto mergePipe = unittest::assertGet(
+        Pipeline::create({DocumentSourceOut::create(kTestOutNss, expCtx())}, expCtx()));
     ASSERT_FALSE(cluster_aggregation_planner::checkIfEligibleForExchange(operationContext(),
                                                                          mergePipe.get()));
 }
 
-TEST_F(ClusterExchangeTest, SingleOutStageNotEligibleForExchangeIfOutputDatabaseDoesNotExist) {
+TEST_F(ClusterExchangeTest, SingleMergeStageNotEligibleForExchangeIfOutputDatabaseDoesNotExist) {
     setupNShards(2);
-    auto mergePipe = unittest::assertGet(Pipeline::create(
-        {DocumentSourceOut::create(kTestOutNss, expCtx(), WriteModeEnum::kModeInsertDocuments)},
-        expCtx()));
+    auto mergePipe = unittest::assertGet(
+        Pipeline::create({DocumentSourceMerge::create(kTestOutNss,
+                                                      expCtx(),
+                                                      WhenMatched::kFail,
+                                                      WhenNotMatched::kInsert,
+                                                      _mergeLetVariables,
+                                                      _mergePipeline,
+                                                      _mergeOnFields,
+                                                      _mergeTargetCollectionVersion)},
+                         expCtx()));
 
     auto future = launchAsync([&] {
         ASSERT_THROWS_CODE(cluster_aggregation_planner::checkIfEligibleForExchange(
@@ -167,16 +180,24 @@ TEST_F(ClusterExchangeTest, SingleOutStageNotEligibleForExchangeIfOutputDatabase
     expectFindSendBSONObjVector(kConfigHostAndPort, []() { return std::vector<BSONObj>{}; }());
     expectFindSendBSONObjVector(kConfigHostAndPort, []() { return std::vector<BSONObj>{}; }());
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 // If the output collection doesn't exist, we don't know how to distribute the output documents so
-// cannot insert an $exchange. The $out stage should later create a new, unsharded collection.
-TEST_F(ClusterExchangeTest, SingleOutStageNotEligibleForExchangeIfOutputCollectionDoesNotExist) {
+// cannot insert an $exchange. The $merge stage should later create a new, unsharded collection.
+TEST_F(ClusterExchangeTest, SingleMergeStageNotEligibleForExchangeIfOutputCollectionDoesNotExist) {
     setupNShards(2);
-    auto mergePipe = unittest::assertGet(Pipeline::create(
-        {DocumentSourceOut::create(kTestOutNss, expCtx(), WriteModeEnum::kModeInsertDocuments)},
-        expCtx()));
+    auto mergePipe = unittest::assertGet(
+        Pipeline::create({DocumentSourceMerge::create(kTestOutNss,
+                                                      expCtx(),
+                                                      WhenMatched::kFail,
+                                                      WhenNotMatched::kInsert,
+                                                      _mergeLetVariables,
+                                                      _mergePipeline,
+                                                      _mergeOnFields,
+                                                      _mergeTargetCollectionVersion)},
+
+                         expCtx()));
 
     auto future = launchAsync([&] {
         ASSERT_FALSE(cluster_aggregation_planner::checkIfEligibleForExchange(operationContext(),
@@ -187,37 +208,51 @@ TEST_F(ClusterExchangeTest, SingleOutStageNotEligibleForExchangeIfOutputCollecti
     // Pretend there are no collections in this database.
     expectFindSendBSONObjVector(kConfigHostAndPort, std::vector<BSONObj>());
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 // A $limit stage requires a single merger.
-TEST_F(ClusterExchangeTest, LimitFollowedByOutStageIsNotEligibleForExchange) {
+TEST_F(ClusterExchangeTest, LimitFollowedByMergeStageIsNotEligibleForExchange) {
     // Sharded by {_id: 1}, [MinKey, 0) on shard "0", [0, MaxKey) on shard "1".
     setupNShards(2);
     loadRoutingTableWithTwoChunksAndTwoShards(kTestOutNss);
 
-    auto mergePipe = unittest::assertGet(Pipeline::create(
-        {DocumentSourceLimit::create(expCtx(), 6),
-         DocumentSourceOut::create(kTestOutNss, expCtx(), WriteModeEnum::kModeInsertDocuments)},
-        expCtx()));
+    auto mergePipe = unittest::assertGet(
+        Pipeline::create({DocumentSourceLimit::create(expCtx(), 6),
+                          DocumentSourceMerge::create(kTestOutNss,
+                                                      expCtx(),
+                                                      WhenMatched::kFail,
+                                                      WhenNotMatched::kInsert,
+                                                      _mergeLetVariables,
+                                                      _mergePipeline,
+                                                      _mergeOnFields,
+                                                      _mergeTargetCollectionVersion)},
+                         expCtx()));
 
     auto future = launchAsync([&] {
         ASSERT_FALSE(cluster_aggregation_planner::checkIfEligibleForExchange(operationContext(),
                                                                              mergePipe.get()));
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
-TEST_F(ClusterExchangeTest, GroupFollowedByOutIsEligbleForExchange) {
+TEST_F(ClusterExchangeTest, GroupFollowedByMergeIsEligbleForExchange) {
     // Sharded by {_id: 1}, [MinKey, 0) on shard "0", [0, MaxKey) on shard "1".
     setupNShards(2);
     loadRoutingTableWithTwoChunksAndTwoShards(kTestOutNss);
 
-    auto mergePipe = unittest::assertGet(Pipeline::create(
-        {parse("{$group: {_id: '$x', $doingMerge: true}}"),
-         DocumentSourceOut::create(kTestOutNss, expCtx(), WriteModeEnum::kModeInsertDocuments)},
-        expCtx()));
+    auto mergePipe = unittest::assertGet(
+        Pipeline::create({parse("{$group: {_id: '$x', $doingMerge: true}}"),
+                          DocumentSourceMerge::create(kTestOutNss,
+                                                      expCtx(),
+                                                      WhenMatched::kFail,
+                                                      WhenNotMatched::kInsert,
+                                                      _mergeLetVariables,
+                                                      _mergePipeline,
+                                                      _mergeOnFields,
+                                                      _mergeTargetCollectionVersion)},
+                         expCtx()));
 
     auto future = launchAsync([&] {
         auto exchangeSpec = cluster_aggregation_planner::checkIfEligibleForExchange(
@@ -234,7 +269,7 @@ TEST_F(ClusterExchangeTest, GroupFollowedByOutIsEligbleForExchange) {
         ASSERT_BSONOBJ_EQ(boundaries[2], BSON("_id" << MAXKEY));
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(ClusterExchangeTest, RenamesAreEligibleForExchange) {
@@ -242,12 +277,19 @@ TEST_F(ClusterExchangeTest, RenamesAreEligibleForExchange) {
     setupNShards(2);
     loadRoutingTableWithTwoChunksAndTwoShards(kTestOutNss);
 
-    auto mergePipe = unittest::assertGet(Pipeline::create(
-        {parse("{$group: {_id: '$x', $doingMerge: true}}"),
-         parse("{$project: {temporarily_renamed: '$_id'}}"),
-         parse("{$project: {_id: '$temporarily_renamed'}}"),
-         DocumentSourceOut::create(kTestOutNss, expCtx(), WriteModeEnum::kModeInsertDocuments)},
-        expCtx()));
+    auto mergePipe = unittest::assertGet(
+        Pipeline::create({parse("{$group: {_id: '$x', $doingMerge: true}}"),
+                          parse("{$project: {temporarily_renamed: '$_id'}}"),
+                          parse("{$project: {_id: '$temporarily_renamed'}}"),
+                          DocumentSourceMerge::create(kTestOutNss,
+                                                      expCtx(),
+                                                      WhenMatched::kFail,
+                                                      WhenNotMatched::kInsert,
+                                                      _mergeLetVariables,
+                                                      _mergePipeline,
+                                                      _mergeOnFields,
+                                                      _mergeTargetCollectionVersion)},
+                         expCtx()));
 
     auto future = launchAsync([&] {
         auto exchangeSpec = cluster_aggregation_planner::checkIfEligibleForExchange(
@@ -268,7 +310,7 @@ TEST_F(ClusterExchangeTest, RenamesAreEligibleForExchange) {
         ASSERT_EQ(consumerIds[1], 1);
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(ClusterExchangeTest, MatchesAreEligibleForExchange) {
@@ -276,11 +318,18 @@ TEST_F(ClusterExchangeTest, MatchesAreEligibleForExchange) {
     setupNShards(2);
     loadRoutingTableWithTwoChunksAndTwoShards(kTestOutNss);
 
-    auto mergePipe = unittest::assertGet(Pipeline::create(
-        {parse("{$group: {_id: '$x', $doingMerge: true}}"),
-         parse("{$match: {_id: {$gte: 0}}}"),
-         DocumentSourceOut::create(kTestOutNss, expCtx(), WriteModeEnum::kModeInsertDocuments)},
-        expCtx()));
+    auto mergePipe = unittest::assertGet(
+        Pipeline::create({parse("{$group: {_id: '$x', $doingMerge: true}}"),
+                          parse("{$match: {_id: {$gte: 0}}}"),
+                          DocumentSourceMerge::create(kTestOutNss,
+                                                      expCtx(),
+                                                      WhenMatched::kFail,
+                                                      WhenNotMatched::kInsert,
+                                                      _mergeLetVariables,
+                                                      _mergePipeline,
+                                                      _mergeOnFields,
+                                                      _mergeTargetCollectionVersion)},
+                         expCtx()));
 
     auto future = launchAsync([&] {
         auto exchangeSpec = cluster_aggregation_planner::checkIfEligibleForExchange(
@@ -301,7 +350,7 @@ TEST_F(ClusterExchangeTest, MatchesAreEligibleForExchange) {
         ASSERT_EQ(consumerIds[1], 1);
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(ClusterExchangeTest, SortThenGroupIsEligibleForExchange) {
@@ -315,10 +364,17 @@ TEST_F(ClusterExchangeTest, SortThenGroupIsEligibleForExchange) {
     //  {$out: {to: "sharded_by_id", mode: "replaceDocuments"}}].
     // No $sort stage appears in the merging half since we'd expect that to be absorbed by the
     // $mergeCursors and AsyncResultsMerger.
-    auto mergePipe = unittest::assertGet(Pipeline::create(
-        {parse("{$group: {_id: '$x'}}"),
-         DocumentSourceOut::create(kTestOutNss, expCtx(), WriteModeEnum::kModeInsertDocuments)},
-        expCtx()));
+    auto mergePipe = unittest::assertGet(
+        Pipeline::create({parse("{$group: {_id: '$x'}}"),
+                          DocumentSourceMerge::create(kTestOutNss,
+                                                      expCtx(),
+                                                      WhenMatched::kFail,
+                                                      WhenNotMatched::kInsert,
+                                                      _mergeLetVariables,
+                                                      _mergePipeline,
+                                                      _mergeOnFields,
+                                                      _mergeTargetCollectionVersion)},
+                         expCtx()));
 
     auto future = launchAsync([&] {
         auto exchangeSpec = cluster_aggregation_planner::checkIfEligibleForExchange(
@@ -339,7 +395,7 @@ TEST_F(ClusterExchangeTest, SortThenGroupIsEligibleForExchange) {
         ASSERT_EQ(consumerIds[1], 1);
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(ClusterExchangeTest, SortThenGroupIsEligibleForExchangeHash) {
@@ -350,13 +406,20 @@ TEST_F(ClusterExchangeTest, SortThenGroupIsEligibleForExchangeHash) {
     // This would be the merging half of the pipeline if the original pipeline was
     // [{$sort: {x: 1}},
     //  {$group: {_id: "$x"}},
-    //  {$out: {to: "sharded_by_id", mode: "replaceDocuments"}}].
+    //  {$merge: {into: "sharded_by_id",  whenMatched: "fail", whenNotMatched: "insert"}}].
     // No $sort stage appears in the merging half since we'd expect that to be absorbed by the
     // $mergeCursors and AsyncResultsMerger.
-    auto mergePipe = unittest::assertGet(Pipeline::create(
-        {parse("{$group: {_id: '$x'}}"),
-         DocumentSourceOut::create(kTestOutNss, expCtx(), WriteModeEnum::kModeInsertDocuments)},
-        expCtx()));
+    auto mergePipe = unittest::assertGet(
+        Pipeline::create({parse("{$group: {_id: '$x'}}"),
+                          DocumentSourceMerge::create(kTestOutNss,
+                                                      expCtx(),
+                                                      WhenMatched::kFail,
+                                                      WhenNotMatched::kInsert,
+                                                      _mergeLetVariables,
+                                                      _mergePipeline,
+                                                      _mergeOnFields,
+                                                      _mergeTargetCollectionVersion)},
+                         expCtx()));
 
     auto future = launchAsync([&] {
         auto exchangeSpec = cluster_aggregation_planner::checkIfEligibleForExchange(
@@ -379,7 +442,7 @@ TEST_F(ClusterExchangeTest, SortThenGroupIsEligibleForExchangeHash) {
         ASSERT_EQ(consumerIds[1], 1);
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(ClusterExchangeTest, ProjectThroughDottedFieldDoesNotPreserveShardKey) {
@@ -395,7 +458,14 @@ TEST_F(ClusterExchangeTest, ProjectThroughDottedFieldDoesNotPreserveShardKey) {
                "}}"),
          parse(
              "{$project: {_id: '$_id.country', region: '$_id.region', population: 1, cities: 1}}"),
-         DocumentSourceOut::create(kTestOutNss, expCtx(), WriteModeEnum::kModeInsertDocuments)},
+         DocumentSourceMerge::create(kTestOutNss,
+                                     expCtx(),
+                                     WhenMatched::kFail,
+                                     WhenNotMatched::kInsert,
+                                     _mergeLetVariables,
+                                     _mergePipeline,
+                                     _mergeOnFields,
+                                     _mergeTargetCollectionVersion)},
         expCtx()));
 
     auto future = launchAsync([&] {
@@ -407,7 +477,7 @@ TEST_F(ClusterExchangeTest, ProjectThroughDottedFieldDoesNotPreserveShardKey) {
         ASSERT_FALSE(exchangeSpec);
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(ClusterExchangeTest, WordCountUseCaseExample) {
@@ -418,14 +488,21 @@ TEST_F(ClusterExchangeTest, WordCountUseCaseExample) {
     // As an example of a pipeline that might replace a map reduce, imagine that we are performing a
     // word count, and the shards part of the pipeline tokenized some text field of each document
     // into {word: <token>, count: 1}. Then this is the merging half of the pipeline:
-    auto mergePipe = unittest::assertGet(Pipeline::create(
-        {parse("{$group: {"
-               "  _id: '$word',"
-               "  count: {$sum: 1},"
-               "  $doingMerge: true"
-               "}}"),
-         DocumentSourceOut::create(kTestOutNss, expCtx(), WriteModeEnum::kModeInsertDocuments)},
-        expCtx()));
+    auto mergePipe = unittest::assertGet(
+        Pipeline::create({parse("{$group: {"
+                                "  _id: '$word',"
+                                "  count: {$sum: 1},"
+                                "  $doingMerge: true"
+                                "}}"),
+                          DocumentSourceMerge::create(kTestOutNss,
+                                                      expCtx(),
+                                                      WhenMatched::kFail,
+                                                      WhenNotMatched::kInsert,
+                                                      _mergeLetVariables,
+                                                      _mergePipeline,
+                                                      _mergeOnFields,
+                                                      _mergeTargetCollectionVersion)},
+                         expCtx()));
 
     auto future = launchAsync([&] {
         auto exchangeSpec = cluster_aggregation_planner::checkIfEligibleForExchange(
@@ -446,7 +523,7 @@ TEST_F(ClusterExchangeTest, WordCountUseCaseExample) {
         ASSERT_EQ(consumerIds[1], 1);
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(ClusterExchangeTest, WordCountUseCaseExampleShardedByWord) {
@@ -475,15 +552,22 @@ TEST_F(ClusterExchangeTest, WordCountUseCaseExampleShardedByWord) {
     // As an example of a pipeline that might replace a map reduce, imagine that we are performing a
     // word count, and the shards part of the pipeline tokenized some text field of each document
     // into {word: <token>, count: 1}. Then this is the merging half of the pipeline:
-    auto mergePipe = unittest::assertGet(Pipeline::create(
-        {parse("{$group: {"
-               "  _id: '$word',"
-               "  count: {$sum: 1},"
-               "  $doingMerge: true"
-               "}}"),
-         parse("{$project: {word: '$_id', count: 1}}"),
-         DocumentSourceOut::create(kTestOutNss, expCtx(), WriteModeEnum::kModeInsertDocuments)},
-        expCtx()));
+    auto mergePipe = unittest::assertGet(
+        Pipeline::create({parse("{$group: {"
+                                "  _id: '$word',"
+                                "  count: {$sum: 1},"
+                                "  $doingMerge: true"
+                                "}}"),
+                          parse("{$project: {word: '$_id', count: 1}}"),
+                          DocumentSourceMerge::create(kTestOutNss,
+                                                      expCtx(),
+                                                      WhenMatched::kFail,
+                                                      WhenNotMatched::kInsert,
+                                                      _mergeLetVariables,
+                                                      _mergePipeline,
+                                                      _mergeOnFields,
+                                                      _mergeTargetCollectionVersion)},
+                         expCtx()));
 
     auto future = launchAsync([&] {
         auto exchangeSpec = cluster_aggregation_planner::checkIfEligibleForExchange(
@@ -511,7 +595,7 @@ TEST_F(ClusterExchangeTest, WordCountUseCaseExampleShardedByWord) {
         ASSERT_EQ(consumerIds[2], 1);
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 // We'd like to test that a compound shard key pattern can be used. Strangely, the only case we can
@@ -532,31 +616,41 @@ TEST_F(ClusterExchangeTest, CompoundShardKeyThreeShards) {
                                        BSON("x" << xBoundaries[0] << "y" << MINKEY)},
                             version,
                             ShardId("0"));
+        chunks.back().setName(OID::gen());
         for (std::size_t i = 0; i < xBoundaries.size() - 1; ++i) {
             chunks.emplace_back(kTestOutNss,
                                 ChunkRange{BSON("x" << xBoundaries[i] << "y" << MINKEY),
                                            BSON("x" << xBoundaries[i + 1] << "y" << MINKEY)},
                                 version,
                                 ShardId(str::stream() << (i + 1) % 3));
+            chunks.back().setName(OID::gen());
         }
         chunks.emplace_back(kTestOutNss,
                             ChunkRange{BSON("x" << xBoundaries.back() << "y" << MINKEY),
                                        BSON("x" << MAXKEY << "y" << MAXKEY)},
                             version,
                             ShardId(str::stream() << xBoundaries.size() % 3));
+        chunks.back().setName(OID::gen());
         return chunks;
     }();
 
     loadRoutingTable(kTestOutNss, epoch, shardKey, chunks);
 
-    auto mergePipe = unittest::assertGet(Pipeline::create(
-        {parse("{$group: {"
-               "  _id: '$x',"
-               "  $doingMerge: true"
-               "}}"),
-         parse("{$project: {x: '$_id', y: '$_id'}}"),
-         DocumentSourceOut::create(kTestOutNss, expCtx(), WriteModeEnum::kModeInsertDocuments)},
-        expCtx()));
+    auto mergePipe = unittest::assertGet(
+        Pipeline::create({parse("{$group: {"
+                                "  _id: '$x',"
+                                "  $doingMerge: true"
+                                "}}"),
+                          parse("{$project: {x: '$_id', y: '$_id'}}"),
+                          DocumentSourceMerge::create(kTestOutNss,
+                                                      expCtx(),
+                                                      WhenMatched::kFail,
+                                                      WhenNotMatched::kInsert,
+                                                      _mergeLetVariables,
+                                                      _mergePipeline,
+                                                      _mergeOnFields,
+                                                      _mergeTargetCollectionVersion)},
+                         expCtx()));
 
     auto future = launchAsync([&] {
         auto exchangeSpec = cluster_aggregation_planner::checkIfEligibleForExchange(
@@ -595,7 +689,7 @@ TEST_F(ClusterExchangeTest, CompoundShardKeyThreeShards) {
         }
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 }  // namespace
 }  // namespace mongo

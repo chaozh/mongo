@@ -9,9 +9,13 @@ To build MongoDB, you will need:
     * Visual Studio 2017 version 15.9 or newer (See Windows section below for details)
 * On Linux and macOS, the libcurl library and header is required. MacOS includes libcurl.
     * Fedora/RHEL - `dnf install libcurl-devel`
-    * Ubuntu/Debian - `apt-get install libcurl-dev`
-* Python 2.7.x and Pip modules:
+    * Ubuntu/Debian - `libcurl-dev` is provided by three packages. Install one of them:
+      * `libcurl4-openssl-dev`
+      * `libcurl4-nss-dev`
+      * `libcurl4-gnutls-dev`
+* Python 3.7.x and Pip modules:
   * See the section "Python Prerequisites" below.
+* About 13 GB of free disk space for the core binaries (`mongod`, `mongos`, and `mongo`) and about 600 GB for the all target.
 
 MongoDB supports the following architectures: arm64, ppc64le, s390x, and x86-64.
 More detailed platform instructions can be found below.
@@ -28,13 +32,18 @@ The source for the tools is now available at [mongodb/mongo-tools](https://githu
 Python Prerequisites
 ---------------
 
-In order to build MongoDB, Python 2.7.x is required, and several Python modules. To install
+In order to build MongoDB, Python 3.7.x is required, and several Python modules. To install
 the required Python modules, run:
 
-    $ pip2 install -r etc/pip/compile-requirements.txt
+    $ pip3 install -r etc/pip/compile-requirements.txt
 
-Note: If the `pip2` command is not available, `pip` without a suffix may be the pip command
-associated with Python 2.7.x.
+Note: If the `pip3` command is not available, `pip` without a suffix may be the pip command
+associated with Python 3.7.x.
+
+Note: In order to compile C-based Python modules, you'll also need the Python and OpenSSL C headers. Run:
+
+* Fedora/RHEL - `dnf install python3-devel openssl-devel`
+* Ubuntu/Debian - `apt-get install python3.7-dev libssl-dev`
 
 SCons
 ---------------
@@ -43,19 +52,19 @@ For detail information about building, please see [the build manual](https://git
 
 If you want to build everything (mongod, mongo, tests, etc):
 
-    $ python2 buildscripts/scons.py all
+    $ python3 buildscripts/scons.py all
 
 If you only want to build the database:
 
-    $ python2 buildscripts/scons.py mongod
+    $ python3 buildscripts/scons.py mongod
 
 ***Note***: For C++ compilers that are newer than the supported version, the compiler may issue new warnings that cause MongoDB to fail to build since the build system treats compiler warnings as errors. To ignore the warnings, pass the switch `--disable-warnings-as-errors` to scons.
 
-    $ python2 buildscripts/scons.py mongod --disable-warnings-as-errors
+    $ python3 buildscripts/scons.py mongod --disable-warnings-as-errors
 
 To install
 
-    $ python2 buildscripts/scons.py --prefix=/opt/mongo install
+    $ python3 buildscripts/scons.py --prefix=/opt/mongo install
 
 Please note that prebuilt binaries are available on [mongodb.org](http://www.mongodb.org/downloads) and may be the easiest way to get started.
 
@@ -77,7 +86,7 @@ See [the windows build manual](https://github.com/mongodb/mongo/wiki/Build-Mongo
 
 Build requirements:
 * Visual Studio 2017 version 15.9 or newer
-* Python 2.7, ActiveState ActivePython 2.7.x Community Edition for Windows is recommended
+* Python 3.7
 
 Or download a prebuilt binary for Windows at www.mongodb.org.
 
@@ -86,12 +95,12 @@ Debian/Ubuntu
 
 To install dependencies on Debian or Ubuntu systems:
 
-    # aptitude install build-essential
-    # aptitude install libboost-filesystem-dev libboost-program-options-dev libboost-system-dev libboost-thread-dev
+    # apt-get install build-essential
+    # apt-get install libboost-filesystem-dev libboost-program-options-dev libboost-system-dev libboost-thread-dev
 
 To run tests as well, you will need PyMongo:
 
-    # aptitude install python-pymongo
+    # apt-get install python3-pymongo
 
 OS X
 --------------

@@ -46,7 +46,6 @@
 #include "mongo/db/service_context.h"
 #include "mongo/db/service_context_d_test_fixture.h"
 #include "mongo/db/transaction_history_iterator.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
@@ -73,7 +72,7 @@ repl::OplogEntry makeOplogEntry(repl::OpTime opTime,
         boost::none,                      // o2
         {},                               // sessionInfo
         boost::none,                      // upsert
-        boost::none,                      // wall clock time
+        Date_t(),                         // wall clock time
         boost::none,                      // statement id
         prevWriteOpTimeInTransaction,     // optime of previous write within same transaction
         boost::none,                      // pre-image optime

@@ -132,7 +132,7 @@ public:
                              &_exit_signal, &_processor,
                              &_rtprio, &_sched
                            */
-                           );
+        );
         if (found == 0) {
             std::cout << "system error: reading proc info" << std::endl;
         }
@@ -248,15 +248,15 @@ public:
 class LinuxSysHelper {
 public:
     /**
-    * Read the first 1023 bytes from a file
-    */
+     * Read the first 1023 bytes from a file
+     */
     static std::string readLineFromFile(const char* fname) {
         FILE* f;
         char fstr[1024] = {0};
 
         f = fopen(fname, "r");
-        if (f != NULL) {
-            if (fgets(fstr, 1023, f) != NULL)
+        if (f != nullptr) {
+            if (fgets(fstr, 1023, f) != nullptr)
                 fstr[strlen(fstr) < 1 ? 0 : strlen(fstr) - 1] = '\0';
             fclose(f);
         }
@@ -264,18 +264,18 @@ public:
     }
 
     /**
-    * Get some details about the CPU
-    */
+     * Get some details about the CPU
+     */
     static void getCpuInfo(int& procCount, std::string& freq, std::string& features) {
         FILE* f;
         char fstr[1024] = {0};
         procCount = 0;
 
         f = fopen("/proc/cpuinfo", "r");
-        if (f == NULL)
+        if (f == nullptr)
             return;
 
-        while (fgets(fstr, 1023, f) != NULL && !feof(f)) {
+        while (fgets(fstr, 1023, f) != nullptr && !feof(f)) {
             // until the end of the file
             fstr[strlen(fstr) < 1 ? 0 : strlen(fstr) - 1] = '\0';
             if (strncmp(fstr, "processor ", 10) == 0 || strncmp(fstr, "processor\t:", 11) == 0)
@@ -290,8 +290,8 @@ public:
     }
 
     /**
-    * Determine linux distro and version
-    */
+     * Determine linux distro and version
+     */
     static void getLinuxDistro(std::string& name, std::string& version) {
         char buf[4096] = {0};
 
@@ -387,8 +387,8 @@ public:
     }
 
     /**
-    * Get system memory total
-    */
+     * Get system memory total
+     */
     static unsigned long long getSystemMemorySize() {
         std::string meminfo = readLineFromFile("/proc/meminfo");
         size_t lineOff = 0;
@@ -404,7 +404,7 @@ public:
             meminfo = meminfo.substr(lineOff);
 
             unsigned long long systemMem = 0;
-            if (mongo::parseNumberFromString(meminfo, &systemMem).isOK()) {
+            if (mongo::NumberParser{}(meminfo, &systemMem).isOK()) {
                 return systemMem * 1024;  // convert from kB to bytes
             } else
                 log() << "Unable to collect system memory information";
@@ -413,17 +413,16 @@ public:
     }
 
     /**
-    * Get memory limit for the process.
-    * If memory is being limited by the applied control group and it's less
-    * than the OS system memory (default cgroup limit is ulonglong max) let's
-    * return the actual memory we'll have available to the process.
-    */
+     * Get memory limit for the process.
+     * If memory is being limited by the applied control group and it's less
+     * than the OS system memory (default cgroup limit is ulonglong max) let's
+     * return the actual memory we'll have available to the process.
+     */
     static unsigned long long getMemorySizeLimit() {
         unsigned long long systemMemBytes = getSystemMemorySize();
         unsigned long long cgroupMemBytes = 0;
         std::string cgmemlimit = readLineFromFile("/sys/fs/cgroup/memory/memory.limit_in_bytes");
-        if (!cgmemlimit.empty() &&
-            mongo::parseNumberFromString(cgmemlimit, &cgroupMemBytes).isOK()) {
+        if (!cgmemlimit.empty() && mongo::NumberParser{}(cgmemlimit, &cgroupMemBytes).isOK()) {
             return std::min(systemMemBytes, cgroupMemBytes);
         }
         return systemMemBytes;
@@ -509,8 +508,8 @@ void ProcessInfo::getExtraInfo(BSONObjBuilder& info) {
 }
 
 /**
-* Save a BSON obj representing the host system's details
-*/
+ * Save a BSON obj representing the host system's details
+ */
 void ProcessInfo::SystemInfo::collectSystemInfo() {
     utsname unameData;
     std::string distroName, distroVersion;
@@ -564,8 +563,8 @@ void ProcessInfo::SystemInfo::collectSystemInfo() {
 }
 
 /**
-* Determine if the process is running with (cc)NUMA
-*/
+ * Determine if the process is running with (cc)NUMA
+ */
 bool ProcessInfo::checkNumaEnabled() {
     bool hasMultipleNodes = false;
     bool hasNumaMaps = false;
@@ -620,4 +619,4 @@ bool ProcessInfo::pagesInMemory(const void* start, size_t numPages, std::vector<
     }
     return true;
 }
-}
+}  // namespace mongo

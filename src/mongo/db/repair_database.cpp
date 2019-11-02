@@ -41,20 +41,19 @@
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/background.h"
 #include "mongo/db/catalog/collection.h"
-#include "mongo/db/catalog/collection_catalog_entry.h"
+#include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/catalog/database.h"
-#include "mongo/db/catalog/database_catalog_entry.h"
 #include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/catalog/document_validation.h"
 #include "mongo/db/catalog/index_key_validate.h"
 #include "mongo/db/catalog/multi_index_block.h"
-#include "mongo/db/catalog/namespace_uuid_cache.h"
-#include "mongo/db/catalog/uuid_catalog.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/index_builds_coordinator.h"
 #include "mongo/db/logical_clock.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/query/query_knobs_gen.h"
+#include "mongo/db/storage/durable_catalog.h"
 #include "mongo/db/storage/storage_engine.h"
 #include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
@@ -62,15 +61,15 @@
 namespace mongo {
 
 StatusWith<IndexNameObjs> getIndexNameObjs(OperationContext* opCtx,
-                                           DatabaseCatalogEntry* dbce,
-                                           CollectionCatalogEntry* cce,
-                                           stdx::function<bool(const std::string&)> filter) {
+                                           const NamespaceString& nss,
+                                           std::function<bool(const std::string&)> filter) {
     IndexNameObjs ret;
     std::vector<std::string>& indexNames = ret.first;
     std::vector<BSONObj>& indexSpecs = ret.second;
+    auto durableCatalog = DurableCatalog::get(opCtx);
     {
         // Fetch all indexes
-        cce->getAllIndexes(opCtx, &indexNames);
+        durableCatalog->getAllIndexes(opCtx, nss, &indexNames);
         auto newEnd =
             std::remove_if(indexNames.begin(),
                            indexNames.end(),
@@ -79,8 +78,9 @@ StatusWith<IndexNameObjs> getIndexNameObjs(OperationContext* opCtx,
 
         indexSpecs.reserve(indexNames.size());
 
+
         for (const auto& name : indexNames) {
-            BSONObj spec = cce->getIndexSpec(opCtx, name);
+            BSONObj spec = durableCatalog->getIndexSpec(opCtx, nss, name);
             using IndexVersion = IndexDescriptor::IndexVersion;
             IndexVersion indexVersion = IndexVersion::kV1;
             if (auto indexVersionElem = spec[IndexDescriptor::kIndexVersionFieldName]) {
@@ -98,10 +98,7 @@ StatusWith<IndexNameObjs> getIndexNameObjs(OperationContext* opCtx,
                 return Status(
                     ErrorCodes::CannotCreateIndex,
                     str::stream()
-                        << "Cannot rebuild index "
-                        << spec
-                        << ": "
-                        << keyStatus.reason()
+                        << "Cannot rebuild index " << spec << ": " << keyStatus.reason()
                         << " For more info see http://dochub.mongodb.org/core/index-validation");
             }
         }
@@ -111,8 +108,7 @@ StatusWith<IndexNameObjs> getIndexNameObjs(OperationContext* opCtx,
 }
 
 Status rebuildIndexesOnCollection(OperationContext* opCtx,
-                                  DatabaseCatalogEntry* dbce,
-                                  CollectionCatalogEntry* cce,
+                                  Collection* collection,
                                   const std::vector<BSONObj>& indexSpecs) {
     // Skip the rest if there are no indexes to rebuild.
     if (indexSpecs.empty())
@@ -121,16 +117,15 @@ Status rebuildIndexesOnCollection(OperationContext* opCtx,
     // Rebuild the indexes provided by 'indexSpecs'.
     IndexBuildsCoordinator* indexBuildsCoord = IndexBuildsCoordinator::get(opCtx);
     UUID buildUUID = UUID::gen();
-    auto swRebuild =
-        indexBuildsCoord->startIndexRebuildForRecovery(opCtx, dbce, cce, indexSpecs, buildUUID);
+    auto swRebuild = indexBuildsCoord->startIndexRebuildForRecovery(
+        opCtx, collection->ns(), indexSpecs, buildUUID);
     if (!swRebuild.isOK()) {
         return swRebuild.getStatus();
     }
 
-    auto[numRecords, dataSize] = swRebuild.getValue();
+    auto [numRecords, dataSize] = swRebuild.getValue();
 
-    const auto& ns = cce->ns().ns();
-    auto rs = dbce->getRecordStore(ns);
+    auto rs = collection->getRecordStore();
 
     // Update the record store stats after finishing and committing the index builds.
     WriteUnitOfWork wuow(opCtx);
@@ -143,36 +138,29 @@ Status rebuildIndexesOnCollection(OperationContext* opCtx,
 namespace {
 Status repairCollections(OperationContext* opCtx,
                          StorageEngine* engine,
-                         const std::string& dbName,
-                         stdx::function<void(const std::string& dbName)> onRecordStoreRepair) {
+                         const std::string& dbName) {
 
-    DatabaseCatalogEntry* dbce = engine->getDatabaseCatalogEntry(opCtx, dbName);
+    auto colls = CollectionCatalog::get(opCtx).getAllCollectionNamesFromDb(opCtx, dbName);
 
-    std::list<std::string> colls;
-    dbce->getCollectionNamespaces(&colls);
-
-    for (std::list<std::string>::const_iterator it = colls.begin(); it != colls.end(); ++it) {
+    for (const auto& nss : colls) {
         opCtx->checkForInterrupt();
 
-        log() << "Repairing collection " << *it;
+        log() << "Repairing collection " << nss;
 
-        Status status = engine->repairRecordStore(opCtx, *it);
+        Status status = engine->repairRecordStore(opCtx, nss);
         if (!status.isOK())
             return status;
     }
 
-    onRecordStoreRepair(dbName);
-
-    for (std::list<std::string>::const_iterator it = colls.begin(); it != colls.end(); ++it) {
+    for (const auto& nss : colls) {
         opCtx->checkForInterrupt();
-
-        CollectionCatalogEntry* cce = dbce->getCollectionCatalogEntry(*it);
-        auto swIndexNameObjs = getIndexNameObjs(opCtx, dbce, cce);
+        auto collection = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(nss);
+        auto swIndexNameObjs = getIndexNameObjs(opCtx, nss);
         if (!swIndexNameObjs.isOK())
             return swIndexNameObjs.getStatus();
 
         std::vector<BSONObj> indexSpecs = swIndexNameObjs.getValue().second;
-        Status status = rebuildIndexesOnCollection(opCtx, dbce, cce, indexSpecs);
+        Status status = rebuildIndexesOnCollection(opCtx, collection, indexSpecs);
         if (!status.isOK())
             return status;
 
@@ -182,14 +170,11 @@ Status repairCollections(OperationContext* opCtx,
 }
 }  // namespace
 
-Status repairDatabase(OperationContext* opCtx,
-                      StorageEngine* engine,
-                      const std::string& dbName,
-                      stdx::function<void(const std::string& dbName)> onRecordStoreRepair) {
+Status repairDatabase(OperationContext* opCtx, StorageEngine* engine, const std::string& dbName) {
     DisableDocumentValidation validationDisabler(opCtx);
 
     // We must hold some form of lock here
-    invariant(opCtx->lockState()->isLocked());
+    invariant(opCtx->lockState()->isW());
     invariant(dbName.find('.') == std::string::npos);
 
     log() << "repairDatabase " << dbName;
@@ -201,38 +186,43 @@ Status repairDatabase(OperationContext* opCtx,
     // Close the db and invalidate all current users and caches.
     auto databaseHolder = DatabaseHolder::get(opCtx);
     databaseHolder->close(opCtx, dbName);
-    ON_BLOCK_EXIT([databaseHolder, &dbName, &opCtx] {
-        try {
-            // Ensure that we don't trigger an exception when attempting to take locks.
-            UninterruptibleLockGuard noInterrupt(opCtx->lockState());
 
-            // Open the db after everything finishes.
-            auto db = databaseHolder->openDb(opCtx, dbName);
-
-            // Set the minimum snapshot for all Collections in this db. This ensures that readers
-            // using majority readConcern level can only use the collections after their repaired
-            // versions are in the committed view.
-            auto clusterTime = LogicalClock::getClusterTimeForReplicaSet(opCtx).asTimestamp();
-
-            for (auto&& collection : *db) {
-                collection->setMinimumVisibleSnapshot(clusterTime);
-            }
-
-            // Restore oplog Collection pointer cache.
-            repl::acquireOplogCollectionForLogging(opCtx);
-        } catch (...) {
-            severe() << "Unexpected exception encountered while reopening database after repair.";
-            std::terminate();  // Logs additional info about the specific error.
-        }
-    });
-
-    auto status = repairCollections(opCtx, engine, dbName, onRecordStoreRepair);
+    auto status = repairCollections(opCtx, engine, dbName);
     if (!status.isOK()) {
         severe() << "Failed to repair database " << dbName << ": " << status.reason();
-        return status;
     }
 
-    return Status::OK();
+    try {
+        // Ensure that we don't trigger an exception when attempting to take locks.
+        UninterruptibleLockGuard noInterrupt(opCtx->lockState());
+
+        // Open the db after everything finishes.
+        auto db = databaseHolder->openDb(opCtx, dbName);
+
+        // Set the minimum snapshot for all Collections in this db. This ensures that readers
+        // using majority readConcern level can only use the collections after their repaired
+        // versions are in the committed view.
+        auto clusterTime = LogicalClock::getClusterTimeForReplicaSet(opCtx).asTimestamp();
+
+        for (auto collIt = db->begin(opCtx); collIt != db->end(opCtx); ++collIt) {
+            auto collection = *collIt;
+            if (collection) {
+                collection->setMinimumVisibleSnapshot(clusterTime);
+            }
+        }
+
+        // Restore oplog Collection pointer cache.
+        repl::acquireOplogCollectionForLogging(opCtx);
+    } catch (const ExceptionFor<ErrorCodes::MustDowngrade>&) {
+        // openDb can throw an exception with a MustDowngrade status if a collection does not
+        // have a UUID.
+        throw;
+    } catch (...) {
+        severe() << "Unexpected exception encountered while reopening database after repair.";
+        std::terminate();  // Logs additional info about the specific error.
+    }
+
+    return status;
 }
 
 }  // namespace mongo

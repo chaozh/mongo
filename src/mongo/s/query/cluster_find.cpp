@@ -33,6 +33,7 @@
 
 #include "mongo/s/query/cluster_find.h"
 
+#include <memory>
 #include <set>
 #include <vector>
 
@@ -62,8 +63,7 @@
 #include "mongo/s/query/store_possible_cursor.h"
 #include "mongo/s/stale_exception.h"
 #include "mongo/s/transaction_router.h"
-#include "mongo/stdx/memory.h"
-#include "mongo/util/fail_point_service.h"
+#include "mongo/util/fail_point.h"
 #include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
 
@@ -85,6 +85,34 @@ static const int kPerDocumentOverheadBytesUpperBound = 10;
 const char kFindCmdName[] = "find";
 
 /**
+ * Transforms the raw sort spec into one suitable for use as the ordering specification in
+ * BSONObj::woCompare().
+ *
+ * In particular, eliminates text score meta-sort from 'sortSpec'.
+ *
+ * The input must be validated (each BSON element must be either a number or text score meta-sort
+ * specification).
+ */
+BSONObj transformSortSpec(const BSONObj& sortSpec) {
+    BSONObjBuilder comparatorBob;
+
+    for (BSONElement elt : sortSpec) {
+        if (elt.isNumber()) {
+            comparatorBob.append(elt);
+        } else if (QueryRequest::isTextScoreMeta(elt)) {
+            // Sort text score decreasing by default. Field name doesn't matter but we choose
+            // something that a user shouldn't ever have.
+            comparatorBob.append("$metaTextScore", -1);
+        } else {
+            // Sort spec should have been validated before here.
+            fassertFailed(28784);
+        }
+    }
+
+    return comparatorBob.obj();
+}
+
+/**
  * Given the QueryRequest 'qr' being executed by mongos, returns a copy of the query which is
  * suitable for forwarding to the targeted hosts.
  */
@@ -94,14 +122,12 @@ StatusWith<std::unique_ptr<QueryRequest>> transformQueryForShards(
     boost::optional<long long> newLimit;
     if (qr.getLimit()) {
         long long newLimitValue;
-        if (mongoSignedAddOverflow64(*qr.getLimit(), qr.getSkip().value_or(0), &newLimitValue)) {
+        if (overflow::add(*qr.getLimit(), qr.getSkip().value_or(0), &newLimitValue)) {
             return Status(
                 ErrorCodes::Overflow,
                 str::stream()
                     << "sum of limit and skip cannot be represented as a 64-bit integer, limit: "
-                    << *qr.getLimit()
-                    << ", skip: "
-                    << qr.getSkip().value_or(0));
+                    << *qr.getLimit() << ", skip: " << qr.getSkip().value_or(0));
         }
         newLimit = newLimitValue;
     }
@@ -112,28 +138,22 @@ StatusWith<std::unique_ptr<QueryRequest>> transformQueryForShards(
         // !wantMore and ntoreturn mean the same as !wantMore and limit, so perform the conversion.
         if (!qr.wantMore()) {
             long long newLimitValue;
-            if (mongoSignedAddOverflow64(
-                    *qr.getNToReturn(), qr.getSkip().value_or(0), &newLimitValue)) {
+            if (overflow::add(*qr.getNToReturn(), qr.getSkip().value_or(0), &newLimitValue)) {
                 return Status(ErrorCodes::Overflow,
                               str::stream()
                                   << "sum of ntoreturn and skip cannot be represented as a 64-bit "
                                      "integer, ntoreturn: "
-                                  << *qr.getNToReturn()
-                                  << ", skip: "
-                                  << qr.getSkip().value_or(0));
+                                  << *qr.getNToReturn() << ", skip: " << qr.getSkip().value_or(0));
             }
             newLimit = newLimitValue;
         } else {
             long long newNToReturnValue;
-            if (mongoSignedAddOverflow64(
-                    *qr.getNToReturn(), qr.getSkip().value_or(0), &newNToReturnValue)) {
+            if (overflow::add(*qr.getNToReturn(), qr.getSkip().value_or(0), &newNToReturnValue)) {
                 return Status(ErrorCodes::Overflow,
                               str::stream()
                                   << "sum of ntoreturn and skip cannot be represented as a 64-bit "
                                      "integer, ntoreturn: "
-                                  << *qr.getNToReturn()
-                                  << ", skip: "
-                                  << qr.getSkip().value_or(0));
+                                  << *qr.getNToReturn() << ", skip: " << qr.getSkip().value_or(0));
             }
             newNToReturn = newNToReturnValue;
         }
@@ -156,7 +176,7 @@ StatusWith<std::unique_ptr<QueryRequest>> transformQueryForShards(
         newProjection = projectionBuilder.obj();
     }
 
-    auto newQR = stdx::make_unique<QueryRequest>(qr);
+    auto newQR = std::make_unique<QueryRequest>(qr);
     newQR->setProj(newProjection);
     newQR->setSkip(boost::none);
     newQR->setLimit(newLimit);
@@ -166,6 +186,9 @@ StatusWith<std::unique_ptr<QueryRequest>> transformQueryForShards(
     // multiple batches from a shard in order to return the single requested batch to the client.
     // Therefore, we must always send singleBatch=false (wantMore=true) to the shards.
     newQR->setWantMore(true);
+
+    // Any expansion of the 'showRecordId' flag should have already happened on mongos.
+    newQR->setShowRecordId(false);
 
     invariant(newQR->validate());
     return std::move(newQR);
@@ -197,6 +220,8 @@ std::vector<std::pair<ShardId, BSONObj>> constructRequestsForShards(
             routingInfo.cm()->getVersion(shardId).appendToCommand(&cmdBuilder);
         } else if (!query.nss().isOnInternalDb()) {
             ChunkVersion::UNSHARDED().appendToCommand(&cmdBuilder);
+            auto dbVersion = routingInfo.db().databaseVersion();
+            cmdBuilder.append("databaseVersion", dbVersion.toBSON());
         }
 
         if (opCtx->getTxnNumber()) {
@@ -249,7 +274,7 @@ CursorId runQueryWithoutRetrying(OperationContext* opCtx,
     // sort on mongos. Including a $natural anywhere in the sort spec results in the whole sort
     // being considered a hint to use a collection scan.
     if (!query.getQueryRequest().getSort().hasField("$natural")) {
-        params.sort = FindCommon::transformSortSpec(query.getQueryRequest().getSort());
+        params.sort = transformSortSpec(query.getQueryRequest().getSort());
     }
 
     bool appendGeoNearDistanceProjection = false;
@@ -295,12 +320,14 @@ CursorId runQueryWithoutRetrying(OperationContext* opCtx,
 
     // Retrieve enough data from the ClusterClientCursor for the first batch of results.
 
-    CurOpFailpointHelpers::waitWhileFailPointEnabled(
-        &waitInFindBeforeMakingBatch, opCtx, "waitInFindBeforeMakingBatch");
+    FindCommon::waitInFindBeforeMakingBatch(opCtx, query);
 
     auto cursorState = ClusterCursorManager::CursorState::NotExhausted;
     int bytesBuffered = 0;
 
+    // This loop will not result in actually calling getMore against shards, but just loading
+    // results from the initial batches (that were obtained while establishing cursors) into
+    // 'results'.
     while (!FindCommon::enoughForFirstBatch(query.getQueryRequest(), results->size())) {
         auto next = uassertStatusOK(ccc->next(RouterExecStage::ExecContext::kInitialFind));
 
@@ -370,11 +397,17 @@ CursorId runQueryWithoutRetrying(OperationContext* opCtx,
  */
 Status setUpOperationContextStateForGetMore(OperationContext* opCtx,
                                             const GetMoreRequest& request,
-                                            ClusterCursorManager::PinnedCursor* cursor) {
+                                            const ClusterCursorManager::PinnedCursor& cursor) {
     if (auto readPref = cursor->getReadPreference()) {
         ReadPreferenceSetting::get(opCtx) = *readPref;
     }
 
+    // If the originating command had a 'comment' field, we extract it and set it on opCtx. Note
+    // that if the 'getMore' command itself has a 'comment' field, we give precedence to it.
+    auto comment = cursor->getOriginatingCommand()["comment"];
+    if (!opCtx->getComment() && comment) {
+        opCtx->setComment(comment.wrap());
+    }
     if (cursor->isTailableAndAwaitData()) {
         // For tailable + awaitData cursors, the request may have indicated a maximum amount of time
         // to wait for new data. If not, default it to 1 second.  We track the deadline instead via
@@ -410,8 +443,7 @@ CursorId ClusterFind::runQuery(OperationContext* opCtx,
         uasserted(ErrorCodes::BadValue,
                   str::stream() << "Projection contains illegal field '"
                                 << AsyncResultsMerger::kSortKeyField
-                                << "': "
-                                << query.getQueryRequest().getProj());
+                                << "': " << query.getQueryRequest().getProj());
     }
 
     auto const catalogCache = Grid::get(opCtx)->catalogCache();
@@ -430,12 +462,39 @@ CursorId ClusterFind::runQuery(OperationContext* opCtx,
 
         try {
             return runQueryWithoutRetrying(opCtx, query, readPref, routingInfo, results);
+        } catch (ExceptionFor<ErrorCodes::StaleDbVersion>& ex) {
+            if (retries >= kMaxRetries) {
+                // Check if there are no retries remaining, so the last received error can be
+                // propagated to the caller.
+                ex.addContext(str::stream()
+                              << "Failed to run query after " << kMaxRetries << " retries");
+                throw;
+            }
+
+            LOG(1) << "Received error status for query " << redact(query.toStringShort())
+                   << " on attempt " << retries << " of " << kMaxRetries << ": " << redact(ex);
+
+            Grid::get(opCtx)->catalogCache()->onStaleDatabaseVersion(ex->getDb(),
+                                                                     ex->getVersionReceived());
+
+            if (auto txnRouter = TransactionRouter::get(opCtx)) {
+                if (!txnRouter.canContinueOnStaleShardOrDbError(kFindCmdName)) {
+                    throw;
+                }
+
+                // Reset the default global read timestamp so the retry's routing table reflects the
+                // chunk placement after the refresh (no-op if the transaction is not running with
+                // snapshot read concern).
+                txnRouter.onStaleShardOrDbError(opCtx, kFindCmdName, ex.toStatus());
+                txnRouter.setDefaultAtClusterTime(opCtx);
+            }
+
         } catch (DBException& ex) {
             if (retries >= kMaxRetries) {
                 // Check if there are no retries remaining, so the last received error can be
                 // propagated to the caller.
-                ex.addContext(str::stream() << "Failed to run query after " << kMaxRetries
-                                            << " retries");
+                ex.addContext(str::stream()
+                              << "Failed to run query after " << kMaxRetries << " retries");
                 throw;
             } else if (!ErrorCodes::isStaleShardVersionError(ex.code()) &&
                        ex.code() != ErrorCodes::ShardNotFound) {
@@ -452,15 +511,15 @@ CursorId ClusterFind::runQuery(OperationContext* opCtx,
             catalogCache->onStaleShardVersion(std::move(routingInfo));
 
             if (auto txnRouter = TransactionRouter::get(opCtx)) {
-                if (!txnRouter->canContinueOnStaleShardOrDbError(kFindCmdName)) {
+                if (!txnRouter.canContinueOnStaleShardOrDbError(kFindCmdName)) {
                     throw;
                 }
 
                 // Reset the default global read timestamp so the retry's routing table reflects the
                 // chunk placement after the refresh (no-op if the transaction is not running with
                 // snapshot read concern).
-                txnRouter->onStaleShardOrDbError(opCtx, kFindCmdName, ex.toStatus());
-                txnRouter->setDefaultAtClusterTime(opCtx);
+                txnRouter.onStaleShardOrDbError(opCtx, kFindCmdName, ex.toStatus());
+                txnRouter.setDefaultAtClusterTime(opCtx);
             }
         }
     }
@@ -474,7 +533,7 @@ CursorId ClusterFind::runQuery(OperationContext* opCtx,
  */
 void validateLSID(OperationContext* opCtx,
                   const GetMoreRequest& request,
-                  ClusterCursorManager::PinnedCursor* cursor) {
+                  const ClusterCursorManager::PinnedCursor& cursor) {
     if (opCtx->getLogicalSessionId() && !cursor->getLsid()) {
         uasserted(50799,
                   str::stream() << "Cannot run getMore on cursor " << request.cursorid
@@ -485,8 +544,7 @@ void validateLSID(OperationContext* opCtx,
     if (!opCtx->getLogicalSessionId() && cursor->getLsid()) {
         uasserted(50800,
                   str::stream() << "Cannot run getMore on cursor " << request.cursorid
-                                << ", which was created in session "
-                                << *cursor->getLsid()
+                                << ", which was created in session " << *cursor->getLsid()
                                 << ", without an lsid");
     }
 
@@ -494,10 +552,8 @@ void validateLSID(OperationContext* opCtx,
         (*opCtx->getLogicalSessionId() != *cursor->getLsid())) {
         uasserted(50801,
                   str::stream() << "Cannot run getMore on cursor " << request.cursorid
-                                << ", which was created in session "
-                                << *cursor->getLsid()
-                                << ", in session "
-                                << *opCtx->getLogicalSessionId());
+                                << ", which was created in session " << *cursor->getLsid()
+                                << ", in session " << *opCtx->getLogicalSessionId());
     }
 }
 
@@ -507,7 +563,7 @@ void validateLSID(OperationContext* opCtx,
  */
 void validateTxnNumber(OperationContext* opCtx,
                        const GetMoreRequest& request,
-                       ClusterCursorManager::PinnedCursor* cursor) {
+                       const ClusterCursorManager::PinnedCursor& cursor) {
     if (opCtx->getTxnNumber() && !cursor->getTxnNumber()) {
         uasserted(50802,
                   str::stream() << "Cannot run getMore on cursor " << request.cursorid
@@ -518,8 +574,7 @@ void validateTxnNumber(OperationContext* opCtx,
     if (!opCtx->getTxnNumber() && cursor->getTxnNumber()) {
         uasserted(50803,
                   str::stream() << "Cannot run getMore on cursor " << request.cursorid
-                                << ", which was created in transaction "
-                                << *cursor->getTxnNumber()
+                                << ", which was created in transaction " << *cursor->getTxnNumber()
                                 << ", without a txnNumber");
     }
 
@@ -527,10 +582,8 @@ void validateTxnNumber(OperationContext* opCtx,
         (*opCtx->getTxnNumber() != *cursor->getTxnNumber())) {
         uasserted(50804,
                   str::stream() << "Cannot run getMore on cursor " << request.cursorid
-                                << ", which was created in transaction "
-                                << *cursor->getTxnNumber()
-                                << ", in transaction "
-                                << *opCtx->getTxnNumber());
+                                << ", which was created in transaction " << *cursor->getTxnNumber()
+                                << ", in transaction " << *opCtx->getTxnNumber());
     }
 }
 
@@ -543,8 +596,8 @@ void validateOperationSessionInfo(OperationContext* opCtx,
                                   ClusterCursorManager::PinnedCursor* cursor) {
     auto returnCursorGuard = makeGuard(
         [cursor] { cursor->returnCursor(ClusterCursorManager::CursorState::NotExhausted); });
-    validateLSID(opCtx, request, cursor);
-    validateTxnNumber(opCtx, request, cursor);
+    validateLSID(opCtx, request, *cursor);
+    validateTxnNumber(opCtx, request, *cursor);
     returnCursorGuard.dismiss();
 }
 
@@ -570,7 +623,7 @@ StatusWith<CursorResponse> ClusterFind::runGetMore(OperationContext* opCtx,
 
     // Ensure that the client still has the privileges to run the originating command.
     if (!authzSession->isAuthorizedForPrivileges(
-            pinnedCursor.getValue().getOriginatingPrivileges())) {
+            pinnedCursor.getValue()->getOriginatingPrivileges())) {
         uasserted(ErrorCodes::Unauthorized,
                   str::stream() << "not authorized for getMore with cursor id "
                                 << request.cursorid);
@@ -578,17 +631,17 @@ StatusWith<CursorResponse> ClusterFind::runGetMore(OperationContext* opCtx,
 
     // Set the originatingCommand object and the cursorID in CurOp.
     {
-        CurOp::get(opCtx)->debug().nShards = pinnedCursor.getValue().getNumRemotes();
+        CurOp::get(opCtx)->debug().nShards = pinnedCursor.getValue()->getNumRemotes();
         CurOp::get(opCtx)->debug().cursorid = request.cursorid;
         stdx::lock_guard<Client> lk(*opCtx->getClient());
         CurOp::get(opCtx)->setOriginatingCommand_inlock(
-            pinnedCursor.getValue().getOriginatingCommand());
+            pinnedCursor.getValue()->getOriginatingCommand());
         CurOp::get(opCtx)->setGenericCursor_inlock(pinnedCursor.getValue().toGenericCursor());
     }
 
     // If the 'waitAfterPinningCursorBeforeGetMoreBatch' fail point is enabled, set the 'msg'
     // field of this operation's CurOp to signal that we've hit this point.
-    if (MONGO_FAIL_POINT(waitAfterPinningCursorBeforeGetMoreBatch)) {
+    if (MONGO_unlikely(waitAfterPinningCursorBeforeGetMoreBatch.shouldFail())) {
         CurOpFailpointHelpers::waitWhileFailPointEnabled(
             &waitAfterPinningCursorBeforeGetMoreBatch,
             opCtx,
@@ -596,7 +649,7 @@ StatusWith<CursorResponse> ClusterFind::runGetMore(OperationContext* opCtx,
     }
 
     auto opCtxSetupStatus =
-        setUpOperationContextStateForGetMore(opCtx, request, &pinnedCursor.getValue());
+        setUpOperationContextStateForGetMore(opCtx, request, pinnedCursor.getValue());
     if (!opCtxSetupStatus.isOK()) {
         return opCtxSetupStatus;
     }
@@ -604,14 +657,14 @@ StatusWith<CursorResponse> ClusterFind::runGetMore(OperationContext* opCtx,
     std::vector<BSONObj> batch;
     int bytesBuffered = 0;
     long long batchSize = request.batchSize.value_or(0);
-    long long startingFrom = pinnedCursor.getValue().getNumReturnedSoFar();
+    long long startingFrom = pinnedCursor.getValue()->getNumReturnedSoFar();
     auto cursorState = ClusterCursorManager::CursorState::NotExhausted;
     BSONObj postBatchResumeToken;
     bool stashedResult = false;
 
     // If the 'waitWithPinnedCursorDuringGetMoreBatch' fail point is enabled, set the 'msg'
     // field of this operation's CurOp to signal that we've hit this point.
-    if (MONGO_FAIL_POINT(waitWithPinnedCursorDuringGetMoreBatch)) {
+    if (MONGO_unlikely(waitWithPinnedCursorDuringGetMoreBatch.shouldFail())) {
         CurOpFailpointHelpers::waitWhileFailPointEnabled(&waitWithPinnedCursorDuringGetMoreBatch,
                                                          opCtx,
                                                          "waitWithPinnedCursorDuringGetMoreBatch");
@@ -625,7 +678,7 @@ StatusWith<CursorResponse> ClusterFind::runGetMore(OperationContext* opCtx,
         StatusWith<ClusterQueryResult> next =
             Status{ErrorCodes::InternalError, "uninitialized cluster query result"};
         try {
-            next = pinnedCursor.getValue().next(context);
+            next = pinnedCursor.getValue()->next(context);
         } catch (const ExceptionFor<ErrorCodes::CloseChangeStream>&) {
             // This exception is thrown when a $changeStream stage encounters an event
             // that invalidates the cursor. We should close the cursor and return without
@@ -643,8 +696,8 @@ StatusWith<CursorResponse> ClusterFind::runGetMore(OperationContext* opCtx,
             // exhausted. If it is tailable, usually we keep it open (i.e. "NotExhausted") even when
             // we reach end-of-stream. However, if all the remote cursors are exhausted, there is no
             // hope of returning data and thus we need to close the mongos cursor as well.
-            if (!pinnedCursor.getValue().isTailable() ||
-                pinnedCursor.getValue().remotesExhausted()) {
+            if (!pinnedCursor.getValue()->isTailable() ||
+                pinnedCursor.getValue()->remotesExhausted()) {
                 cursorState = ClusterCursorManager::CursorState::Exhausted;
             }
             break;
@@ -652,7 +705,7 @@ StatusWith<CursorResponse> ClusterFind::runGetMore(OperationContext* opCtx,
 
         if (!FindCommon::haveSpaceForNext(
                 *next.getValue().getResult(), batch.size(), bytesBuffered)) {
-            pinnedCursor.getValue().queueResult(*next.getValue().getResult());
+            pinnedCursor.getValue()->queueResult(*next.getValue().getResult());
             stashedResult = true;
             break;
         }
@@ -664,7 +717,7 @@ StatusWith<CursorResponse> ClusterFind::runGetMore(OperationContext* opCtx,
         batch.push_back(std::move(*next.getValue().getResult()));
 
         // Update the postBatchResumeToken. For non-$changeStream aggregations, this will be empty.
-        postBatchResumeToken = pinnedCursor.getValue().getPostBatchResumeToken();
+        postBatchResumeToken = pinnedCursor.getValue()->getPostBatchResumeToken();
     }
 
     // If the cursor has been exhausted, we will communicate this by returning a CursorId of zero.
@@ -675,11 +728,11 @@ StatusWith<CursorResponse> ClusterFind::runGetMore(OperationContext* opCtx,
     // For empty batches, or in the case where the final result was added to the batch rather than
     // being stashed, we update the PBRT here to ensure that it is the most recent available.
     if (idToReturn && !stashedResult) {
-        postBatchResumeToken = pinnedCursor.getValue().getPostBatchResumeToken();
+        postBatchResumeToken = pinnedCursor.getValue()->getPostBatchResumeToken();
     }
 
-    pinnedCursor.getValue().setLeftoverMaxTimeMicros(opCtx->getRemainingMaxTimeMicros());
-    pinnedCursor.getValue().incNBatches();
+    pinnedCursor.getValue()->setLeftoverMaxTimeMicros(opCtx->getRemainingMaxTimeMicros());
+    pinnedCursor.getValue()->incNBatches();
     // Upon successful completion, transfer ownership of the cursor back to the cursor manager. If
     // the cursor has been exhausted, the cursor manager will clean it up for us.
     pinnedCursor.getValue().returnCursor(cursorState);
@@ -688,7 +741,7 @@ StatusWith<CursorResponse> ClusterFind::runGetMore(OperationContext* opCtx,
     CurOp::get(opCtx)->debug().cursorExhausted = (idToReturn == 0);
     CurOp::get(opCtx)->debug().nreturned = batch.size();
 
-    if (MONGO_FAIL_POINT(waitBeforeUnpinningOrDeletingCursorAfterGetMoreBatch)) {
+    if (MONGO_unlikely(waitBeforeUnpinningOrDeletingCursorAfterGetMoreBatch.shouldFail())) {
         CurOpFailpointHelpers::waitWhileFailPointEnabled(
             &waitBeforeUnpinningOrDeletingCursorAfterGetMoreBatch,
             opCtx,
@@ -696,7 +749,7 @@ StatusWith<CursorResponse> ClusterFind::runGetMore(OperationContext* opCtx,
     }
 
     return CursorResponse(
-        request.nss, idToReturn, std::move(batch), startingFrom, boost::none, postBatchResumeToken);
+        request.nss, idToReturn, std::move(batch), startingFrom, postBatchResumeToken);
 }
 
 }  // namespace mongo

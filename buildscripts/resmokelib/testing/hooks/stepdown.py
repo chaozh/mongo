@@ -1,5 +1,4 @@
 """Test hook that periodically makes the primary of a replica set step down."""
-from __future__ import absolute_import
 
 import collections
 import os.path
@@ -26,8 +25,8 @@ class ContinuousStepdown(interface.Hook):  # pylint: disable=too-many-instance-a
     def __init__(  # pylint: disable=too-many-arguments
             self, hook_logger, fixture, config_stepdown=True, shard_stepdown=True,
             stepdown_interval_ms=8000, terminate=False, kill=False,
-            use_stepdown_permitted_file=False, use_stepping_down_file=False,
-            wait_for_mongos_retarget=False):
+            use_stepdown_permitted_file=False, wait_for_mongos_retarget=False,
+            stepdown_via_heartbeats=True):
         """Initialize the ContinuousStepdown.
 
         Args:
@@ -39,9 +38,9 @@ class ContinuousStepdown(interface.Hook):  # pylint: disable=too-many-instance-a
             terminate: shut down the node cleanly as a means of stepping it down.
             kill: With a 50% probability, kill the node instead of shutting it down cleanly.
             use_stepdown_permitted_file: use a file to control if stepdown thread should do a stepdown.
-            use_stepping_down_file: use a file to denote when stepdown is active.
             wait_for_mongos_retarget: whether to run validate on all mongoses for each collection
                 in each database, after pausing the stepdown thread.
+            stepdown_via_heartbeats: step up secondaries instead of stepping down primary.
 
         Note that the "terminate" and "kill" arguments are named after the "SIGTERM" and
         "SIGKILL" signals that are used to stop the process. On Windows, there are no signals,
@@ -54,6 +53,7 @@ class ContinuousStepdown(interface.Hook):  # pylint: disable=too-many-instance-a
         self._shard_stepdown = shard_stepdown
         self._stepdown_interval_secs = float(stepdown_interval_ms) / 1000
         self._wait_for_mongos_retarget = wait_for_mongos_retarget
+        self._stepdown_via_heartbeats = stepdown_via_heartbeats
 
         self._rs_fixtures = []
         self._mongos_fixtures = []
@@ -68,26 +68,25 @@ class ContinuousStepdown(interface.Hook):  # pylint: disable=too-many-instance-a
         dbpath_prefix = fixture.get_dbpath_prefix()
 
         if use_stepdown_permitted_file:
-            self._stepdown_permitted_file = os.path.join(
-                dbpath_prefix, "concurrency_sharded_stepdown_stepdown_permitted")
+            self.__stepdown_files = StepdownFiles._make(
+                [os.path.join(dbpath_prefix, field) for field in StepdownFiles._fields])
         else:
-            self._stepdown_permitted_file = None
-        if use_stepping_down_file:
-            self._stepping_down_file = os.path.join(dbpath_prefix,
-                                                    "concurrency_sharded_stepdown_stepping_down")
-        else:
-            self._stepping_down_file = None
+            self.__stepdown_files = None
 
     def before_suite(self, test_report):
         """Before suite."""
         if not self._rs_fixtures:
             self._add_fixture(self._fixture)
-        utils.remove_if_exists(self._stepdown_permitted_file)
-        utils.remove_if_exists(self._stepping_down_file)
+
+        if self.__stepdown_files is not None:
+            lifecycle = FileBasedStepdownLifecycle(self.__stepdown_files)
+        else:
+            lifecycle = FlagBasedStepdownLifecycle()
+
         self._stepdown_thread = _StepdownThread(
             self.logger, self._mongos_fixtures, self._rs_fixtures, self._stepdown_interval_secs,
-            self._terminate, self._kill, self._stepdown_permitted_file, self._stepping_down_file,
-            self._wait_for_mongos_retarget)
+            self._terminate, self._kill, lifecycle, self._wait_for_mongos_retarget,
+            self._stepdown_via_heartbeats)
         self.logger.info("Starting the stepdown thread.")
         self._stepdown_thread.start()
 
@@ -101,10 +100,7 @@ class ContinuousStepdown(interface.Hook):  # pylint: disable=too-many-instance-a
         """Before test."""
         self._check_thread()
         self.logger.info("Resuming the stepdown thread.")
-        # Once the stepdown thread has started any files it creates must be deleted within the
-        # thread, since the Windows file handle is still open.
         self._stepdown_thread.pause()
-        self._stepdown_thread.clean_stepdown_files()
         self._stepdown_thread.resume()
 
     def after_test(self, test, test_report):
@@ -138,10 +134,220 @@ class ContinuousStepdown(interface.Hook):  # pylint: disable=too-many-instance-a
                     self._mongos_fixtures.append(mongos_fixture)
 
 
+class FlagBasedStepdownLifecycle(object):
+    """Class for managing the various states of the stepdown thread.
+
+    The job thread alternates between calling mark_test_started() and mark_test_finished(). The
+    stepdown thread is allowed to perform stepdowns at any point between these two calls. Note that
+    the job thread synchronizes with the stepdown thread outside the context of this object to know
+    it isn't in the process of running a stepdown.
+    """
+
+    _TEST_STARTED_STATE = "start"
+    _TEST_FINISHED_STATE = "finished"
+
+    def __init__(self):
+        """Initialize the FlagBasedStepdownLifecycle instance."""
+        self.__lock = threading.Lock()
+        self.__cond = threading.Condition(self.__lock)
+
+        self.__test_state = self._TEST_FINISHED_STATE
+        self.__should_stop = False
+
+    def mark_test_started(self):
+        """Signal to the stepdown thread that a new test has started.
+
+        This function should be called during before_test(). Calling it causes the
+        wait_for_stepdown_permitted() function to no longer block and to instead return true.
+        """
+        with self.__lock:
+            self.__test_state = self._TEST_STARTED_STATE
+            self.__cond.notify_all()
+
+    def mark_test_finished(self):
+        """Signal to the stepdown thread that the current test has finished.
+
+        This function should be called during after_test(). Calling it causes the
+        wait_for_stepdown_permitted() function to block until mark_test_started() is called again.
+        """
+        with self.__lock:
+            self.__test_state = self._TEST_FINISHED_STATE
+            self.__cond.notify_all()
+
+    def stop(self):
+        """Signal to the stepdown thread that it should exit.
+
+        This function should be called during after_suite(). Calling it causes the
+        wait_for_stepdown_permitted() function to no longer block and to instead return false.
+        """
+        with self.__lock:
+            self.__should_stop = True
+            self.__cond.notify_all()
+
+    def wait_for_stepdown_permitted(self):
+        """Block until stepdowns are permitted, or until stop() is called.
+
+        :return: true if stepdowns are permitted, and false if steps are not permitted.
+        """
+        with self.__lock:
+            while not self.__should_stop:
+                if self.__test_state == self._TEST_STARTED_STATE:
+                    return True
+
+                self.__cond.wait()
+
+        return False
+
+    def wait_for_stepdown_interval(self, timeout):
+        """Block for 'timeout' seconds, or until stop() is called."""
+        with self.__lock:
+            self.__cond.wait(timeout)
+
+    def poll_for_idle_request(self):  # noqa: D205,D400
+        """Return true if the stepdown thread should continue running stepdowns, or false if it
+        should temporarily stop running stepdowns.
+        """
+        with self.__lock:
+            return self.__test_state == self._TEST_FINISHED_STATE
+
+    def send_idle_acknowledgement(self):
+        """No-op.
+
+        This method exists so this class has the same interface as FileBasedStepdownLifecycle.
+        """
+        pass
+
+
+StepdownFiles = collections.namedtuple("StepdownFiles", ["permitted", "idle_request", "idle_ack"])
+
+
+class FileBasedStepdownLifecycle(object):
+    """Class for managing the various states of the stepdown thread using files.
+
+    Unlike in the FlagBasedStepdownLifecycle class, the job thread alternating between calls to
+    mark_test_started() and mark_test_finished() doesn't automatically grant permission for the
+    stepdown thread to perform stepdowns. Instead, the test will part-way through allow stepdowns to
+    be performed and then will part-way through disallow stepdowns from continuing to be performed.
+
+    See jstests/concurrency/fsm_libs/resmoke_runner.js for the other half of the file-base protocol.
+
+        Python inside of resmoke.py                     JavaScript inside of the mongo shell
+        ---------------------------                     ------------------------------------
+
+                                                        FSM workload starts.
+                                                        Call $config.setup() function.
+                                                        Create "permitted" file.
+
+        Wait for "permitted" file to be created.
+
+        Stepdown runs.
+        Check if "idle_request" file exists.
+
+        Stepdown runs.
+        Check if "idle_request" file exists.
+
+                                                        FSM workload threads all finish.
+                                                        Create "idle_request" file.
+
+        Stepdown runs.
+        Check if "idle_request" file exists.
+        Create "idle_ack" file.
+        (No more stepdowns run.)
+
+                                                        Wait for "idle_ack" file.
+                                                        Call $config.teardown() function.
+                                                        FSM workload finishes.
+
+    Note that the job thread still synchronizes with the stepdown thread outside the context of this
+    object to know it isn't in the process of running a stepdown.
+    """
+
+    def __init__(self, stepdown_files):
+        """Initialize the FileBasedStepdownLifecycle instance."""
+        self.__stepdown_files = stepdown_files
+
+        self.__lock = threading.Lock()
+        self.__cond = threading.Condition(self.__lock)
+
+        self.__should_stop = False
+
+    def mark_test_started(self):
+        """Signal to the stepdown thread that a new test has started.
+
+        This function should be called during before_test(). Calling it does nothing because
+        permission for running stepdowns is given by the test itself writing the "permitted" file.
+        """
+        pass
+
+    def mark_test_finished(self):
+        """Signal to the stepdown thread that the current test has finished.
+
+        This function should be called during after_test(). Calling it causes the
+        wait_for_stepdown_permitted() function to block until the next test gives permission for
+        running stepdowns.
+        """
+        # It is possible something went wrong during the test's execution and prevented the
+        # "permitted" and "idle_request" files from being created. We therefore don't consider it an
+        # error if they don't exist after the test has finished.
+        utils.remove_if_exists(self.__stepdown_files.permitted)
+        utils.remove_if_exists(self.__stepdown_files.idle_request)
+        utils.remove_if_exists(self.__stepdown_files.idle_ack)
+
+    def stop(self):
+        """Signal to the stepdown thread that it should exit.
+
+        This function should be called during after_suite(). Calling it causes the
+        wait_for_stepdown_permitted() function to no longer block and to instead return false.
+        """
+        with self.__lock:
+            self.__should_stop = True
+            self.__cond.notify_all()
+
+    def wait_for_stepdown_permitted(self):
+        """Block until stepdowns are permitted, or until stop() is called.
+
+        :return: true if stepdowns are permitted, and false if steps are not permitted.
+        """
+        with self.__lock:
+            while not self.__should_stop:
+                if os.path.isfile(self.__stepdown_files.permitted):
+                    return True
+
+                # Wait a little bit before checking for the "permitted" file again.
+                self.__cond.wait(0.1)
+
+        return False
+
+    def wait_for_stepdown_interval(self, timeout):
+        """Block for 'timeout' seconds, or until stop() is called."""
+        with self.__lock:
+            self.__cond.wait(timeout)
+
+    def poll_for_idle_request(self):  # noqa: D205,D400
+        """Return true if the stepdown thread should continue running stepdowns, or false if it
+        should temporarily stop running stepdowns.
+        """
+        if os.path.isfile(self.__stepdown_files.idle_request):
+            with self.__lock:
+                return True
+
+        return False
+
+    def send_idle_acknowledgement(self):
+        """Signal to the running test that stepdown thread won't continue to run stepdowns."""
+
+        with open(self.__stepdown_files.idle_ack, "w"):
+            pass
+
+        # We remove the "permitted" file to revoke permission for the stepdown thread to continue
+        # performing stepdowns.
+        os.remove(self.__stepdown_files.permitted)
+
+
 class _StepdownThread(threading.Thread):  # pylint: disable=too-many-instance-attributes
     def __init__(  # pylint: disable=too-many-arguments
             self, logger, mongos_fixtures, rs_fixtures, stepdown_interval_secs, terminate, kill,
-            stepdown_permitted_file, stepping_down_file, wait_for_mongos_retarget):
+            stepdown_lifecycle, wait_for_mongos_retarget, stepdown_via_heartbeats):
         """Initialize _StepdownThread."""
         threading.Thread.__init__(self, name="StepdownThread")
         self.daemon = True
@@ -155,16 +361,13 @@ class _StepdownThread(threading.Thread):  # pylint: disable=too-many-instance-at
         self._stepdown_duration_secs = 24 * 60 * 60  # 24 hours
         self._terminate = terminate
         self._kill = kill
-        self._stepdown_permitted_file = stepdown_permitted_file
-        self._stepping_down_file = stepping_down_file
+        self.__lifecycle = stepdown_lifecycle
         self._should_wait_for_mongos_retarget = wait_for_mongos_retarget
+        self._stepdown_via_heartbeats = stepdown_via_heartbeats
 
         self._last_exec = time.time()
         # Event set when the thread has been stopped using the 'stop()' method.
         self._is_stopped_evt = threading.Event()
-        # Event set when the thread is not paused.
-        self._is_resumed_evt = threading.Event()
-        self._is_resumed_evt.set()
         # Event set when the thread is not performing stepdowns.
         self._is_idle_evt = threading.Event()
         self._is_idle_evt.set()
@@ -179,9 +382,14 @@ class _StepdownThread(threading.Thread):  # pylint: disable=too-many-instance-at
 
         try:
             while True:
-                if self._is_stopped():
+                self._is_idle_evt.set()
+
+                permitted = self.__lifecycle.wait_for_stepdown_permitted()
+                if not permitted:
                     break
-                self._wait_for_permission_or_resume()
+
+                self._is_idle_evt.clear()
+
                 now = time.time()
                 if now - self._last_exec > self._stepdown_interval_secs:
                     self.logger.info("Starting stepdown of all primaries")
@@ -191,13 +399,17 @@ class _StepdownThread(threading.Thread):  # pylint: disable=too-many-instance-at
                     self._last_exec = time.time()
                     self.logger.info("Completed stepdown of all primaries in %0d ms",
                                      (self._last_exec - now) * 1000)
-                now = time.time()
-                if self._is_permitted():
-                    # The 'wait_secs' is used to wait 'self._stepdown_interval_secs' from the moment
-                    # the last stepdown command was sent.
-                    wait_secs = max(0, self._stepdown_interval_secs - (now - self._last_exec))
-                    self._wait(wait_secs)
 
+                found_idle_request = self.__lifecycle.poll_for_idle_request()
+                if found_idle_request:
+                    self.__lifecycle.send_idle_acknowledgement()
+                    continue
+
+                # The 'wait_secs' is used to wait 'self._stepdown_interval_secs' from the moment
+                # the last stepdown command was sent.
+                now = time.time()
+                wait_secs = max(0, self._stepdown_interval_secs - (now - self._last_exec))
+                self.__lifecycle.wait_for_stepdown_interval(wait_secs)
         except Exception:  # pylint: disable=W0703
             # Proactively log the exception when it happens so it will be
             # flushed immediately.
@@ -205,17 +417,16 @@ class _StepdownThread(threading.Thread):  # pylint: disable=too-many-instance-at
 
     def stop(self):
         """Stop the thread."""
+        self.__lifecycle.stop()
         self._is_stopped_evt.set()
         # Unpause to allow the thread to finish.
         self.resume()
         self.join()
 
-    def _is_stopped(self):
-        return self._is_stopped_evt.is_set()
-
     def pause(self):
         """Pause the thread."""
-        self._is_resumed_evt.clear()
+        self.__lifecycle.mark_test_finished()
+
         # Wait until we are no longer executing stepdowns.
         self._is_idle_evt.wait()
         # Wait until we all the replica sets have primaries.
@@ -225,20 +436,11 @@ class _StepdownThread(threading.Thread):  # pylint: disable=too-many-instance-at
 
     def resume(self):
         """Resume the thread."""
-        self._is_resumed_evt.set()
+        self.__lifecycle.mark_test_started()
 
         self.logger.info(
             "Current statistics about which nodes have been successfully stepped up: %s",
             self._step_up_stats)
-
-    def _wait_for_permission_or_resume(self):
-        # Wait until stop, _stepdown_permitted_file or resume.
-        if self._stepdown_permitted_file:
-            while not os.path.isfile(self._stepdown_permitted_file) and not self._is_stopped():
-                # Set a short sleep during busy wait time for self._stepdown_permitted_file.
-                self._wait(0.1)
-        else:
-            self._is_resumed_evt.wait()
 
     def _wait(self, timeout):
         # Wait until stop or timeout.
@@ -249,15 +451,8 @@ class _StepdownThread(threading.Thread):  # pylint: disable=too-many-instance-at
             fixture.get_primary()
 
     def _step_down_all(self):
-        self._is_idle_evt.clear()
-        self._stepdown_starting()
-        try:
-            if self._is_permitted():
-                for rs_fixture in self._rs_fixtures:
-                    self._step_down(rs_fixture)
-        finally:
-            self._stepdown_completed()
-            self._is_idle_evt.set()
+        for rs_fixture in self._rs_fixtures:
+            self._step_down(rs_fixture)
 
     # pylint: disable=R0912,R0915
     def _step_down(self, rs_fixture):
@@ -273,8 +468,9 @@ class _StepdownThread(threading.Thread):  # pylint: disable=too-many-instance-at
         # Check that the fixture is still running before stepping down or killing the primary.
         # This ensures we still detect some cases in which the fixture has already crashed.
         if not rs_fixture.is_running():
-            raise errors.ServerFailure("ReplicaSetFixture expected to be running in"
-                                       " ContinuousStepdown, but wasn't.")
+            raise errors.ServerFailure("ReplicaSetFixture {} expected to be running in"
+                                       " ContinuousStepdown, but wasn't.".format(
+                                           rs_fixture.replset_name))
 
         if self._terminate:
             should_kill = self._kill and random.choice([True, False])
@@ -286,7 +482,7 @@ class _StepdownThread(threading.Thread):  # pylint: disable=too-many-instance-at
             # exit because clean shutdown may take a while and we want to restore write availability
             # as quickly as possible.
             primary.mongod.stop(kill=should_kill)
-        else:
+        elif not self._stepdown_via_heartbeats:
             self.logger.info("Stepping down the primary on port %d of replica set '%s'.",
                              primary.port, rs_fixture.replset_name)
             try:
@@ -305,6 +501,11 @@ class _StepdownThread(threading.Thread):  # pylint: disable=too-many-instance-at
                     primary.port, rs_fixture.replset_name)
                 raise
 
+        # We have skipped stepping down the primary if we want to step up secondaries instead. Here,
+        # we simply need to pick an arbitrary secondary to run for election which will lead to
+        # unconditional stepdown on the primary.
+        #
+        # If we have terminated/killed/stepped down the primary above, write availability has lost.
         # We pick an arbitrary secondary to run for election immediately in order to avoid a long
         # period where the replica set doesn't have write availability. If none of the secondaries
         # are eligible, or their election attempt fails, then we'll run the replSetStepUp command on
@@ -347,11 +548,36 @@ class _StepdownThread(threading.Thread):  # pylint: disable=too-many-instance-at
                 primary.await_ready()
             finally:
                 primary.preserve_dbpath = original_preserve_dbpath
-        else:
-            # We always run the {replSetFreeze: 0} command to ensure the former primary is electable
-            # in the next round of _step_down().
+        elif not self._stepdown_via_heartbeats:
+            # If we chose to step up a secondary instead, the primary was never stepped down via the
+            # replSetStepDown command and thus will not have a stepdown period. So we can skip
+            # running {replSetFreeze: 0}. Otherwise, the replSetStepDown command run earlier
+            # introduced a stepdown period on the former primary and so we have to run the
+            # {replSetFreeze: 0} command to ensure the former primary is electable in the next
+            # round of _step_down().
             client = primary.mongo_client()
             client.admin.command({"replSetFreeze": 0})
+        elif secondaries:
+            # We successfully stepped up a secondary, wait for the former primary to step down via
+            # heartbeats. We need to wait for the former primary to step down to complete this step
+            # down round and to avoid races between the ContinuousStepdown hook and other test hooks
+            # that may depend on the health of the replica set.
+            self.logger.info(
+                "Successfully stepped up the secondary on port %d of replica set '%s'.",
+                chosen.port, rs_fixture.replset_name)
+            while True:
+                try:
+                    client = primary.mongo_client()
+                    is_secondary = client.admin.command("isMaster")["secondary"]
+                    if is_secondary:
+                        break
+                except pymongo.errors.AutoReconnect:
+                    pass
+                self.logger.info("Waiting for primary on port %d of replica set '%s' to step down.",
+                                 primary.port, rs_fixture.replset_name)
+                time.sleep(0.2)  # Wait a little bit before trying again.
+            self.logger.info("Primary on port %d of replica set '%s' stepped down.", primary.port,
+                             rs_fixture.replset_name)
 
         if not secondaries:
             # If we failed to step up one of the secondaries, then we run the replSetStepUp to try
@@ -426,30 +652,3 @@ class _StepdownThread(threading.Thread):  # pylint: disable=too-many-instance-at
                 retarget_time = time.time() - start_time
                 self.logger.info("Finished waiting for mongos: %s to retarget db: %s, in %d ms",
                                  mongos_conn_str, db, retarget_time * 1000)
-
-    def _is_permitted(self):
-        """Permit a stepdown if the permitted file is not specified or it exists.
-
-        The self._permitted_file is created by an external framework, i.e., JS tests.
-        """
-        if self._stepdown_permitted_file:
-            return os.path.isfile(self._stepdown_permitted_file)
-        return self._is_resumed_evt.is_set()
-
-    def _stepdown_starting(self):
-        """Create self._stepping_down_file, if specified."""
-        if self._stepping_down_file:
-            if os.path.isfile(self._stepping_down_file):
-                raise RuntimeError("Stepping down file {} already exists".format(
-                    self._stepping_down_file))
-            with open(self._stepping_down_file, "w") as fh:
-                fh.write("")
-
-    def _stepdown_completed(self):
-        """Delete self._stepping_down_file, if specified."""
-        utils.remove_if_exists(self._stepping_down_file)
-
-    def clean_stepdown_files(self):
-        """Remove the stepdown files."""
-        utils.remove_if_exists(self._stepdown_permitted_file)
-        utils.remove_if_exists(self._stepping_down_file)

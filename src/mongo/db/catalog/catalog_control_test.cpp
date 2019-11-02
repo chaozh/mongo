@@ -31,6 +31,7 @@
 
 #include "mongo/db/catalog/database_holder_mock.h"
 #include "mongo/db/client.h"
+#include "mongo/db/index_builds_coordinator_mongod.h"
 #include "mongo/db/operation_context_noop.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/storage_engine.h"
@@ -44,22 +45,33 @@ namespace {
  */
 class MockStorageEngine : public StorageEngine {
 public:
+    void finishInit() final {}
     RecoveryUnit* newRecoveryUnit() final {
         return nullptr;
     }
-    void listDatabases(std::vector<std::string>* out) const final {}
-    DatabaseCatalogEntry* getDatabaseCatalogEntry(OperationContext* opCtx, StringData db) final {
-        return nullptr;
+    std::vector<std::string> listDatabases() const final {
+        return {};
     }
     bool supportsDocLocking() const final {
+        return false;
+    }
+    bool supportsDBLocking() const final {
+        return true;
+    }
+    bool supportsCappedCollections() const final {
+        return true;
+    }
+    bool supportsCheckpoints() const final {
         return false;
     }
     bool isDurable() const final {
         return false;
     }
-    bool isEphemeral() const {
+    bool isEphemeral() const final {
         return true;
     }
+    void loadCatalog(OperationContext* opCtx) final {}
+    void closeCatalog(OperationContext* opCtx) final {}
     Status closeDatabase(OperationContext* opCtx, StringData db) final {
         return Status::OK();
     }
@@ -69,29 +81,115 @@ public:
     int flushAllFiles(OperationContext* opCtx, bool sync) final {
         return 0;
     }
-    Status repairRecordStore(OperationContext* opCtx, const std::string& ns) final {
+    Status beginBackup(OperationContext* opCtx) final {
+        return Status(ErrorCodes::CommandNotSupported,
+                      "The current storage engine doesn't support backup mode");
+    }
+    void endBackup(OperationContext* opCtx) final {}
+    StatusWith<std::vector<StorageEngine::BackupBlock>> beginNonBlockingBackup(
+        OperationContext* opCtx) final {
+        return Status(ErrorCodes::CommandNotSupported,
+                      "The current storage engine does not support a concurrent mode.");
+    }
+    void endNonBlockingBackup(OperationContext* opCtx) final {}
+    StatusWith<std::vector<std::string>> extendBackupCursor(OperationContext* opCtx) final {
+        return Status(ErrorCodes::CommandNotSupported,
+                      "The current storage engine does not support a concurrent mode.");
+    }
+    Status repairRecordStore(OperationContext* opCtx, const NamespaceString& ns) final {
         return Status::OK();
     }
     std::unique_ptr<TemporaryRecordStore> makeTemporaryRecordStore(OperationContext* opCtx) final {
         return {};
     }
     void cleanShutdown() final {}
+    SnapshotManager* getSnapshotManager() const final {
+        return nullptr;
+    }
     void setJournalListener(JournalListener* jl) final {}
+    bool supportsRecoverToStableTimestamp() const final {
+        return false;
+    }
+    bool supportsRecoveryTimestamp() const final {
+        return false;
+    }
+    bool supportsReadConcernSnapshot() const final {
+        return false;
+    }
+    bool supportsReadConcernMajority() const final {
+        return false;
+    }
+    bool supportsOplogStones() const final {
+        return false;
+    }
     bool supportsPendingDrops() const final {
         return false;
     }
     void clearDropPendingState() final {}
-    Timestamp getAllCommittedTimestamp() const final {
+    StatusWith<Timestamp> recoverToStableTimestamp(OperationContext* opCtx) final {
+        fassertFailed(40547);
+    }
+    boost::optional<Timestamp> getRecoveryTimestamp() const final {
+        MONGO_UNREACHABLE;
+    }
+    boost::optional<Timestamp> getLastStableRecoveryTimestamp() const final {
+        MONGO_UNREACHABLE;
+    }
+    void setStableTimestamp(Timestamp stableTimestamp, bool force = false) final {}
+    void setInitialDataTimestamp(Timestamp timestamp) final {}
+    void setOldestTimestampFromStable() final {}
+    void setOldestTimestamp(Timestamp timestamp) final {}
+    void setOldestActiveTransactionTimestampCallback(
+        OldestActiveTransactionTimestampCallback callback) final {}
+    bool isCacheUnderPressure(OperationContext* opCtx) const final {
+        return false;
+    }
+    void setCachePressureForTest(int pressure) final {}
+    void replicationBatchIsComplete() const final {}
+    StatusWith<std::vector<CollectionIndexNamePair>> reconcileCatalogAndIdents(
+        OperationContext* opCtx) final {
+        return std::vector<CollectionIndexNamePair>();
+    }
+    Timestamp getAllDurableTimestamp() const final {
         return {};
     }
     Timestamp getOldestOpenReadTimestamp() const final {
         return {};
+    }
+    boost::optional<Timestamp> getOplogNeededForCrashRecovery() const final {
+        return boost::none;
     }
     std::string getFilesystemPathForDb(const std::string& dbName) const final {
         return "";
     }
     std::set<std::string> getDropPendingIdents() const final {
         return {};
+    }
+    Status currentFilesCompatible(OperationContext* opCtx) const final {
+        return Status::OK();
+    }
+    int64_t sizeOnDiskForDb(OperationContext* opCtx, StringData dbName) final {
+        return 0;
+    }
+    KVEngine* getEngine() final {
+        return nullptr;
+    }
+    const KVEngine* getEngine() const final {
+        return nullptr;
+    }
+    DurableCatalog* getCatalog() final {
+        return nullptr;
+    }
+    const DurableCatalog* getCatalog() const final {
+        return nullptr;
+    }
+    std::unique_ptr<CheckpointLock> getCheckpointLock(OperationContext* opCtx) final {
+        return nullptr;
+    }
+    void addIndividuallyCheckpointedIndexToList(const std::string& ident) final {}
+    void clearIndividuallyCheckpointedIndexesList() final {}
+    bool isInIndividuallyCheckpointedIndexesList(const std::string& ident) const final {
+        return false;
     }
 };
 
@@ -112,6 +210,10 @@ void CatalogControlTest::setUp() {
         auto storageEngine = std::make_unique<MockStorageEngine>();
         serviceContext->setStorageEngine(std::move(storageEngine));
         DatabaseHolder::set(serviceContext.get(), std::make_unique<DatabaseHolderMock>());
+        // Only need the IndexBuildsCoordinator to call into and check whether there are any index
+        // builds in progress.
+        IndexBuildsCoordinator::set(serviceContext.get(),
+                                    std::make_unique<IndexBuildsCoordinatorMongod>());
         setGlobalServiceContext(std::move(serviceContext));
     }
 

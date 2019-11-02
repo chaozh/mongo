@@ -33,7 +33,9 @@
 
 #include "mongo/db/repl/reporter.h"
 
+#include "mongo/base/counter.h"
 #include "mongo/bson/util/bson_extract.h"
+#include "mongo/db/commands/server_status_metric.h"
 #include "mongo/db/repl/update_position_args.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/util/assert_util.h"
@@ -46,6 +48,11 @@ namespace repl {
 namespace {
 
 const char kConfigVersionFieldName[] = "configVersion";
+
+// The number of replSetUpdatePosition commands a node sent to its sync source.
+Counter64 numUpdatePosition;
+ServerStatusMetricField<Counter64> displayNumUpdatePosition(
+    "repl.network.replSetUpdatePosition.num", &numUpdatePosition);
 
 /**
  * Returns configuration version in update command object.
@@ -118,17 +125,17 @@ std::string Reporter::toString() const {
 }
 
 HostAndPort Reporter::getTarget() const {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     return _target;
 }
 
 Milliseconds Reporter::getKeepAliveInterval() const {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     return _keepAliveInterval;
 }
 
 void Reporter::shutdown() {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
 
     _status = Status(ErrorCodes::CallbackCanceled, "Reporter no longer valid");
 
@@ -152,13 +159,13 @@ void Reporter::shutdown() {
 }
 
 Status Reporter::join() {
-    stdx::unique_lock<stdx::mutex> lk(_mutex);
+    stdx::unique_lock<Latch> lk(_mutex);
     _condition.wait(lk, [this]() { return !_isActive_inlock(); });
     return _status;
 }
 
 Status Reporter::trigger() {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
 
     // If these was a previous error then the reporter is dead and return that error.
     if (!_status.isOK()) {
@@ -196,7 +203,7 @@ Status Reporter::trigger() {
 StatusWith<BSONObj> Reporter::_prepareCommand() {
     auto prepareResult = _prepareReplSetUpdatePositionCommandFn();
 
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
 
     // Reporter could have been canceled while preparing the command.
     if (!_status.isOK()) {
@@ -233,13 +240,15 @@ void Reporter::_sendCommand_inlock(BSONObj commandRequest, Milliseconds netTimeo
         return;
     }
 
+    numUpdatePosition.increment(1);
+
     _remoteCommandCallbackHandle = scheduleResult.getValue();
 }
 
 void Reporter::_processResponseCallback(
     const executor::TaskExecutor::RemoteCommandCallbackArgs& rcbd) {
     {
-        stdx::lock_guard<stdx::mutex> lk(_mutex);
+        stdx::lock_guard<Latch> lk(_mutex);
 
         // If the reporter was shut down before this callback is invoked,
         // return the canceled "_status".
@@ -299,7 +308,7 @@ void Reporter::_processResponseCallback(
     // Must call without holding the lock.
     auto prepareResult = _prepareCommand();
 
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     if (!_status.isOK()) {
         _onShutdown_inlock();
         return;
@@ -318,7 +327,7 @@ void Reporter::_processResponseCallback(
 void Reporter::_prepareAndSendCommandCallback(const executor::TaskExecutor::CallbackArgs& args,
                                               bool fromTrigger) {
     {
-        stdx::lock_guard<stdx::mutex> lk(_mutex);
+        stdx::lock_guard<Latch> lk(_mutex);
         if (!_status.isOK()) {
             _onShutdown_inlock();
             return;
@@ -341,7 +350,7 @@ void Reporter::_prepareAndSendCommandCallback(const executor::TaskExecutor::Call
     // Must call without holding the lock.
     auto prepareResult = _prepareCommand();
 
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     if (!_status.isOK()) {
         _onShutdown_inlock();
         return;
@@ -367,7 +376,7 @@ void Reporter::_onShutdown_inlock() {
 }
 
 bool Reporter::isActive() const {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     return _isActive_inlock();
 }
 
@@ -376,12 +385,12 @@ bool Reporter::_isActive_inlock() const {
 }
 
 bool Reporter::isWaitingToSendReport() const {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     return _isWaitingToSendReporter;
 }
 
 Date_t Reporter::getKeepAliveTimeoutWhen_forTest() const {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     return _keepAliveTimeoutWhen;
 }
 

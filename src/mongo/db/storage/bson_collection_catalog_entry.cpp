@@ -42,7 +42,6 @@ namespace {
 // We use that value to represent the largest number of path components we could ever possibly
 // expect to see in an indexed field.
 const size_t kMaxKeyPatternPathLength = 2048;
-char multikeyPathsEncodedAsBytes[kMaxKeyPatternPathLength];
 
 /**
  * Encodes 'multikeyPaths' as binary data and appends it to 'bob'.
@@ -54,6 +53,8 @@ char multikeyPathsEncodedAsBytes[kMaxKeyPatternPathLength];
 void appendMultikeyPathsAsBytes(BSONObj keyPattern,
                                 const MultikeyPaths& multikeyPaths,
                                 BSONObjBuilder* bob) {
+    char multikeyPathsEncodedAsBytes[kMaxKeyPatternPathLength];
+
     size_t i = 0;
     for (const auto keyElem : keyPattern) {
         StringData keyName = keyElem.fieldNameStringData();
@@ -102,119 +103,6 @@ void parseMultikeyPathsFromBytes(BSONObj multikeyPathsObj, MultikeyPaths* multik
 const StringData BSONCollectionCatalogEntry::kIndexBuildScanning = "scanning"_sd;
 const StringData BSONCollectionCatalogEntry::kIndexBuildDraining = "draining"_sd;
 
-BSONCollectionCatalogEntry::BSONCollectionCatalogEntry(StringData ns)
-    : CollectionCatalogEntry(ns) {}
-
-CollectionOptions BSONCollectionCatalogEntry::getCollectionOptions(OperationContext* opCtx) const {
-    MetaData md = _getMetaData(opCtx);
-    return md.options;
-}
-
-int BSONCollectionCatalogEntry::getTotalIndexCount(OperationContext* opCtx) const {
-    MetaData md = _getMetaData(opCtx);
-
-    return static_cast<int>(md.indexes.size());
-}
-
-int BSONCollectionCatalogEntry::getCompletedIndexCount(OperationContext* opCtx) const {
-    MetaData md = _getMetaData(opCtx);
-
-    int num = 0;
-    for (unsigned i = 0; i < md.indexes.size(); i++) {
-        if (md.indexes[i].ready)
-            num++;
-    }
-    return num;
-}
-
-BSONObj BSONCollectionCatalogEntry::getIndexSpec(OperationContext* opCtx,
-                                                 StringData indexName) const {
-    MetaData md = _getMetaData(opCtx);
-
-    int offset = md.findIndexOffset(indexName);
-    invariant(offset >= 0);
-    return md.indexes[offset].spec.getOwned();
-}
-
-
-void BSONCollectionCatalogEntry::getAllIndexes(OperationContext* opCtx,
-                                               std::vector<std::string>* names) const {
-    MetaData md = _getMetaData(opCtx);
-
-    for (unsigned i = 0; i < md.indexes.size(); i++) {
-        names->push_back(md.indexes[i].spec["name"].String());
-    }
-}
-
-void BSONCollectionCatalogEntry::getReadyIndexes(OperationContext* opCtx,
-                                                 std::vector<std::string>* names) const {
-    MetaData md = _getMetaData(opCtx);
-
-    for (unsigned i = 0; i < md.indexes.size(); i++) {
-        if (md.indexes[i].ready)
-            names->push_back(md.indexes[i].spec["name"].String());
-    }
-}
-
-void BSONCollectionCatalogEntry::getAllUniqueIndexes(OperationContext* opCtx,
-                                                     std::vector<std::string>* names) const {
-    MetaData md = _getMetaData(opCtx);
-
-    for (unsigned i = 0; i < md.indexes.size(); i++) {
-        if (md.indexes[i].spec["unique"]) {
-            std::string indexName = md.indexes[i].spec["name"].String();
-            names->push_back(indexName);
-        }
-    }
-}
-
-bool BSONCollectionCatalogEntry::isIndexMultikey(OperationContext* opCtx,
-                                                 StringData indexName,
-                                                 MultikeyPaths* multikeyPaths) const {
-    MetaData md = _getMetaData(opCtx);
-
-    int offset = md.findIndexOffset(indexName);
-    invariant(offset >= 0);
-
-    if (multikeyPaths && !md.indexes[offset].multikeyPaths.empty()) {
-        *multikeyPaths = md.indexes[offset].multikeyPaths;
-    }
-
-    return md.indexes[offset].multikey;
-}
-
-RecordId BSONCollectionCatalogEntry::getIndexHead(OperationContext* opCtx,
-                                                  StringData indexName) const {
-    MetaData md = _getMetaData(opCtx);
-
-    int offset = md.findIndexOffset(indexName);
-    invariant(offset >= 0);
-    return md.indexes[offset].head;
-}
-
-bool BSONCollectionCatalogEntry::isIndexPresent(OperationContext* opCtx,
-                                                StringData indexName) const {
-    MetaData md = _getMetaData(opCtx);
-    int offset = md.findIndexOffset(indexName);
-    return offset >= 0;
-}
-
-bool BSONCollectionCatalogEntry::isIndexReady(OperationContext* opCtx, StringData indexName) const {
-    MetaData md = _getMetaData(opCtx);
-
-    int offset = md.findIndexOffset(indexName);
-    invariant(offset >= 0);
-    return md.indexes[offset].ready;
-}
-
-KVPrefix BSONCollectionCatalogEntry::getIndexPrefix(OperationContext* opCtx,
-                                                    StringData indexName) const {
-    MetaData md = _getMetaData(opCtx);
-    int offset = md.findIndexOffset(indexName);
-    invariant(offset >= 0);
-    return md.indexes[offset].prefix;
-}
-
 // --------------------------
 
 void BSONCollectionCatalogEntry::IndexMetaData::updateTTLSetting(long long newExpireSeconds) {
@@ -253,19 +141,6 @@ bool BSONCollectionCatalogEntry::MetaData::eraseIndex(StringData name) {
 
 void BSONCollectionCatalogEntry::MetaData::rename(StringData toNS) {
     ns = toNS.toString();
-    for (size_t i = 0; i < indexes.size(); i++) {
-        BSONObj spec = indexes[i].spec;
-        BSONObjBuilder b;
-        // Add the fields in the same order they were in the original specification.
-        for (auto&& elem : spec) {
-            if (elem.fieldNameStringData() == "ns") {
-                b.append("ns", toNS);
-            } else {
-                b.append(elem);
-            }
-        }
-        indexes[i].spec = b.obj();
-    }
 }
 
 KVPrefix BSONCollectionCatalogEntry::MetaData::getMaxPrefix() const {
@@ -297,7 +172,7 @@ BSONObj BSONCollectionCatalogEntry::MetaData::toBSON() const {
                 subMultikeyPaths.doneFast();
             }
 
-            sub.append("head", static_cast<long long>(indexes[i].head.repr()));
+            sub.append("head", 0ll);  // For backward compatibility with 4.0
             sub.append("prefix", indexes[i].prefix.toBSONValue());
             sub.append("backgroundSecondary", indexes[i].isBackgroundSecondaryBuild);
 
@@ -324,8 +199,8 @@ void BSONCollectionCatalogEntry::MetaData::parse(const BSONObj& obj) {
     ns = obj["ns"].valuestrsafe();
 
     if (obj["options"].isABSONObj()) {
-        options.parse(obj["options"].Obj(), CollectionOptions::parseForStorage)
-            .transitional_ignore();
+        options = uassertStatusOK(
+            CollectionOptions::parse(obj["options"].Obj(), CollectionOptions::parseForStorage));
     }
 
     BSONElement indexList = obj["indexes"];
@@ -336,11 +211,6 @@ void BSONCollectionCatalogEntry::MetaData::parse(const BSONObj& obj) {
             IndexMetaData imd;
             imd.spec = idx["spec"].Obj().getOwned();
             imd.ready = idx["ready"].trueValue();
-            if (idx.hasField("head")) {
-                imd.head = RecordId(idx["head"].Long());
-            } else {
-                imd.head = RecordId(idx["head_a"].Int(), idx["head_b"].Int());
-            }
             imd.multikey = idx["multikey"].trueValue();
 
             if (auto multikeyPathsElem = idx["multikeyPaths"]) {
@@ -371,4 +241,4 @@ void BSONCollectionCatalogEntry::MetaData::parse(const BSONObj& obj) {
 
     prefix = KVPrefix::fromBSONElement(obj["prefix"]);
 }
-}
+}  // namespace mongo

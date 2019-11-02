@@ -44,8 +44,6 @@
 #include "mongo/db/matcher/expression_parser.h"
 #include "mongo/dbtests/dbtests.h"
 #include "mongo/util/fail_point.h"
-#include "mongo/util/fail_point_registry.h"
-#include "mongo/util/fail_point_service.h"
 
 namespace QueryStageCountScan {
 
@@ -92,7 +90,8 @@ public:
     }
 
     const IndexDescriptor* getIndex(Database* db, const BSONObj& obj) {
-        Collection* collection = db->getCollection(&_opCtx, ns());
+        Collection* collection =
+            CollectionCatalog::get(&_opCtx).lookupCollectionByNamespace(NamespaceString(ns()));
         std::vector<const IndexDescriptor*> indexes;
         collection->getIndexCatalog()->findIndexesByKeyPattern(&_opCtx, obj, false, &indexes);
         return indexes.empty() ? nullptr : indexes[0];
@@ -577,9 +576,9 @@ public:
     }
 };
 
-class All : public Suite {
+class All : public OldStyleSuiteSpecification {
 public:
-    All() : Suite("query_stage_count_scan") {}
+    All() : OldStyleSuiteSpecification("query_stage_count_scan") {}
 
     void setupTests() {
         add<QueryStageCountScanDups>();
@@ -595,6 +594,6 @@ public:
     }
 };
 
-SuiteInstance<All> queryStageCountScanAll;
+OldStyleSuiteInitializer<All> queryStageCountScanAll;
 
 }  // namespace QueryStageCountScan

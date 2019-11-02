@@ -36,10 +36,10 @@
 #include <boost/math/distributions/beta.hpp>
 
 #include "mongo/db/client.h"
-#include "mongo/db/pipeline/document.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/pipeline/expression.h"
 #include "mongo/db/pipeline/expression_context.h"
-#include "mongo/db/pipeline/value.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
@@ -50,14 +50,14 @@ DocumentSourceSampleFromRandomCursor::DocumentSourceSampleFromRandomCursor(
     long long size,
     std::string idField,
     long long nDocsInCollection)
-    : DocumentSource(pExpCtx),
+    : DocumentSource(kStageName, pExpCtx),
       _size(size),
       _idField(std::move(idField)),
       _seenDocs(pExpCtx->getValueComparator().makeUnorderedValueSet()),
       _nDocsInColl(nDocsInCollection) {}
 
 const char* DocumentSourceSampleFromRandomCursor::getSourceName() const {
-    return "$sampleFromRandomCursor";
+    return kStageName.rawData();
 }
 
 namespace {
@@ -75,9 +75,7 @@ double smallestFromSampleOfUniform(PseudoRandom* prng, size_t N) {
 }
 }  // namespace
 
-DocumentSource::GetNextResult DocumentSourceSampleFromRandomCursor::getNext() {
-    pExpCtx->checkForInterrupt();
-
+DocumentSource::GetNextResult DocumentSourceSampleFromRandomCursor::doGetNext() {
     if (_seenDocs.size() >= static_cast<size_t>(_size))
         return GetNextResult::makeEOF();
 
@@ -92,11 +90,12 @@ DocumentSource::GetNextResult DocumentSourceSampleFromRandomCursor::getNext() {
     _randMetaFieldVal -= smallestFromSampleOfUniform(&prng, _nDocsInColl);
 
     MutableDocument md(nextResult.releaseDocument());
-    md.setRandMetaField(_randMetaFieldVal);
+    md.metadata().setRandVal(_randMetaFieldVal);
     if (pExpCtx->needsMerge) {
         // This stage will be merged by sorting results according to this random metadata field, but
         // the merging logic expects to sort by the sort key metadata.
-        md.setSortKeyMetaField(BSON("" << _randMetaFieldVal));
+        const bool isSingleElementKey = true;
+        md.metadata().setSortKey(Value(_randMetaFieldVal), isSingleElementKey);
     }
     return md.freeze();
 }
@@ -116,9 +115,7 @@ DocumentSource::GetNextResult DocumentSourceSampleFromRandomCursor::getNextNonDu
                             << _idField
                             << " field in order to de-duplicate results, but encountered a "
                                "document without a "
-                            << _idField
-                            << " field: "
-                            << nextInput.getDocument().toString(),
+                            << _idField << " field: " << nextInput.getDocument().toString(),
                         !idField.missing());
 
                 if (_seenDocs.insert(std::move(idField)).second) {
@@ -163,4 +160,4 @@ intrusive_ptr<DocumentSourceSampleFromRandomCursor> DocumentSourceSampleFromRand
         new DocumentSourceSampleFromRandomCursor(expCtx, size, idField, nDocsInCollection));
     return source;
 }
-}  // mongo
+}  // namespace mongo

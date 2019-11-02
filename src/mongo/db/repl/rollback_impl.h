@@ -29,13 +29,14 @@
 
 #pragma once
 
+#include <functional>
+
 #include "mongo/base/status_with.h"
 #include "mongo/db/op_observer.h"
 #include "mongo/db/repl/oplog_entry.h"
 #include "mongo/db/repl/roll_back_local_operations.h"
 #include "mongo/db/repl/rollback.h"
 #include "mongo/db/repl/storage_interface.h"
-#include "mongo/stdx/functional.h"
 
 namespace mongo {
 
@@ -101,9 +102,9 @@ struct RollbackStats {
     boost::optional<Date_t> lastLocalWallClockTime;
 
     /**
-     * The wall clock time at the common point, if known.
+     * The wall clock time of the first operation after the common point, if known.
      */
-    boost::optional<Date_t> commonPointWallClockTime;
+    boost::optional<Date_t> firstOpWallClockTimeAfterCommonPoint;
 };
 
 /**
@@ -187,6 +188,11 @@ public:
         virtual void onCommonPointFound(Timestamp commonPoint) noexcept {}
 
         /**
+         * Function called after we have incremented the rollback ID.
+         */
+        virtual void onRollbackIDIncremented() noexcept {}
+
+        /**
          * Function called after a rollback file has been written for each namespace with inserts or
          * updates that are being rolled back.
          */
@@ -194,8 +200,9 @@ public:
 
         /**
          * Function called after we recover to the stable timestamp.
+         * NOTE: This may throw, for testing purposes.
          */
-        virtual void onRecoverToStableTimestamp(Timestamp stableTimestamp) noexcept {}
+        virtual void onRecoverToStableTimestamp(Timestamp stableTimestamp) {}
 
         /**
          * Function called after we set the oplog truncate after point.
@@ -206,6 +213,11 @@ public:
          * Function called after we recover from the oplog.
          */
         virtual void onRecoverFromOplog() noexcept {}
+
+        /**
+         * Function called after we reconstruct prepared transactions.
+         */
+        virtual void onPreparedTransactionsReconstructed() noexcept {}
 
         /**
          * Function called after we have triggered the 'onRollback' OpObserver method.
@@ -273,7 +285,7 @@ public:
     virtual const std::vector<BSONObj>& docsDeletedForNamespace_forTest(UUID uuid) const& {
         MONGO_UNREACHABLE;
     }
-    void docsDeletedForNamespace_forTest(UUID)&& = delete;
+    void docsDeletedForNamespace_forTest(UUID) && = delete;
 
 protected:
     /**
@@ -337,6 +349,12 @@ private:
         OperationContext* opCtx, RollBackLocalOperations::RollbackCommonPoint commonPoint) const;
 
     /**
+     * Kills all user operations currently being performed. Since this node is a secondary, these
+     * operations are all reads.
+     */
+    void _killAllUserOperations(OperationContext* opCtx);
+
+    /**
      * Uses the ReplicationCoordinator to transition the current member state to ROLLBACK.
      * If the transition to ROLLBACK fails, this could mean that we have been elected PRIMARY. In
      * this case, we return a NotSecondary error.
@@ -366,13 +384,26 @@ private:
      * info structures. This function assumes that oplog entries are processed in descending
      * timestamp order (that is, starting from the newest oplog entry, going backwards).
      */
-    Status _processRollbackOp(const OplogEntry& oplogEntry);
+    Status _processRollbackOp(OperationContext* opCtx, const OplogEntry& oplogEntry);
+
+    /**
+     * Process a single applyOps oplog entry that is getting rolled back.
+     * This function processes each sub-operation using _processRollbackOp().
+     */
+    Status _processRollbackOpForApplyOps(OperationContext* opCtx, const OplogEntry& oplogEntry);
 
     /**
      * Iterates through the _countDiff map and retrieves the count of the record store pointed to
      * by each UUID. It then saves the post-rollback counts to the _newCounts map.
      */
     Status _findRecordStoreCounts(OperationContext* opCtx);
+
+    /**
+     * Executes the phase of rollback between aborting and reconstructing prepared transactions. We
+     * cannot safely recover if we fail during this phase.
+     */
+    void _runPhaseFromAbortToReconstructPreparedTxns(
+        OperationContext* opCtx, RollBackLocalOperations::RollbackCommonPoint commonPoint) noexcept;
 
     /**
      * Sets the record store counts to be the values stored in _newCounts.
@@ -424,7 +455,7 @@ private:
     void _resetDropPendingState(OperationContext* opCtx);
 
     // Guards access to member variables.
-    mutable stdx::mutex _mutex;  // (S)
+    mutable Mutex _mutex = MONGO_MAKE_LATCH("RollbackImpl::_mutex");  // (S)
 
     // Set to true when RollbackImpl should shut down.
     bool _inShutdown = false;  // (M)

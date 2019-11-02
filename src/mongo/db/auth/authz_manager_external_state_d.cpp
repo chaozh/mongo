@@ -33,6 +33,8 @@
 
 #include "mongo/db/auth/authz_manager_external_state_d.h"
 
+#include <memory>
+
 #include "mongo/base/status.h"
 #include "mongo/db/auth/authz_session_external_state_d.h"
 #include "mongo/db/auth/user_name.h"
@@ -44,10 +46,9 @@
 #include "mongo/db/operation_context.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/storage_engine.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -56,47 +57,14 @@ AuthzManagerExternalStateMongod::~AuthzManagerExternalStateMongod() = default;
 
 std::unique_ptr<AuthzSessionExternalState>
 AuthzManagerExternalStateMongod::makeAuthzSessionExternalState(AuthorizationManager* authzManager) {
-    return stdx::make_unique<AuthzSessionExternalStateMongod>(authzManager);
+    return std::make_unique<AuthzSessionExternalStateMongod>(authzManager);
 }
-
-class AuthzLock : public AuthzManagerExternalState::StateLock {
-public:
-    // TODO When SERVER-39289 is done, we should fassert if we are in an active storage engine
-    // transaction when the AuthzLock is first acquired. We do not want to mix authz database
-    // operations with user database operations.
-    explicit AuthzLock(OperationContext* opCtx)
-        : _lock(opCtx,
-                AuthorizationManager::usersCollectionNamespace.db(),
-                MODE_S,
-                opCtx->getDeadline()) {}
-
-    static bool isLocked(OperationContext* opCtx);
-
-private:
-    Lock::DBLock _lock;
-};
-
-bool AuthzLock::isLocked(OperationContext* opCtx) {
-    return opCtx->lockState()->isDbLockedForMode(
-        AuthorizationManager::usersCollectionNamespace.db(), MODE_S);
-}
-
-std::unique_ptr<AuthzManagerExternalState::StateLock> AuthzManagerExternalStateMongod::lock(
-    OperationContext* opCtx) {
-    return std::make_unique<AuthzLock>(opCtx);
-}
-
-bool AuthzManagerExternalStateMongod::needsLockForUserName(OperationContext* opCtx,
-                                                           const UserName& name) {
-    return (shouldUseRolesFromConnection(opCtx, name) == false);
-}
-
 Status AuthzManagerExternalStateMongod::query(
     OperationContext* opCtx,
     const NamespaceString& collectionName,
     const BSONObj& query,
     const BSONObj& projection,
-    const stdx::function<void(const BSONObj&)>& resultProcessor) {
+    const std::function<void(const BSONObj&)>& resultProcessor) {
     try {
         DBDirectClient client(opCtx);
         client.query(resultProcessor, collectionName, query, &projection);
@@ -117,22 +85,9 @@ Status AuthzManagerExternalStateMongod::findOne(OperationContext* opCtx,
         *result = found.getOwned();
         return Status::OK();
     }
-
-    // Calling findOne starts a storage engine transaction/snapshot if one hasn't been started
-    // already. Since we are not holding a lock on the authz collections between calls to
-    // findOne(), the minimum valid timestamp may change between calls and trying to re-use the
-    // old snapshot may cause an invariant in the storage engine.
-    //
-    // See SERVER-38071
-    const auto recoveryUnit = opCtx->recoveryUnit();
-    if (recoveryUnit) {
-        recoveryUnit->abandonSnapshot();
-    }
-
     return Status(ErrorCodes::NoMatchingDocument,
-                  mongoutils::str::stream() << "No document in " << collectionName.ns()
-                                            << " matches "
-                                            << query);
+                  str::stream() << "No document in " << collectionName.ns() << " matches "
+                                << query);
 }
 
 MONGO_REGISTER_SHIM(AuthzManagerExternalState::create)

@@ -65,14 +65,14 @@ public:
                                                                   StringData ident) override;
 
     virtual Status createSortedDataInterface(OperationContext* opCtx,
+                                             const CollectionOptions& collOptions,
                                              StringData ident,
                                              const IndexDescriptor* desc) {
         return Status::OK();
     }
 
-    virtual SortedDataInterface* getSortedDataInterface(OperationContext* opCtx,
-                                                        StringData ident,
-                                                        const IndexDescriptor* desc);
+    virtual std::unique_ptr<SortedDataInterface> getSortedDataInterface(
+        OperationContext* opCtx, StringData ident, const IndexDescriptor* desc);
 
     virtual Status dropIdent(OperationContext* opCtx, StringData ident) {
         return Status::OK();
@@ -121,12 +121,16 @@ public:
 
     void setJournalListener(JournalListener* jl) final {}
 
-    virtual Timestamp getAllCommittedTimestamp() const override {
+    virtual Timestamp getAllDurableTimestamp() const override {
         return Timestamp();
     }
 
     virtual Timestamp getOldestOpenReadTimestamp() const override {
         return Timestamp();
+    }
+
+    boost::optional<Timestamp> getOplogNeededForCrashRecovery() const final {
+        return boost::none;
     }
 
     virtual Status beginBackup(OperationContext* opCtx) override {
@@ -135,7 +139,7 @@ public:
 
     virtual void endBackup(OperationContext* opCtx) {}
 
-    virtual StatusWith<std::vector<std::string>> beginNonBlockingBackup(
+    virtual StatusWith<std::vector<StorageEngine::BackupBlock>> beginNonBlockingBackup(
         OperationContext* opCtx) override;
 
     virtual void endNonBlockingBackup(OperationContext* opCtx) override {}
@@ -152,4 +156,4 @@ private:
 
     int _cachePressureForTest;
 };
-}
+}  // namespace mongo

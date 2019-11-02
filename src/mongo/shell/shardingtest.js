@@ -16,9 +16,6 @@
  *     mongos {number|Object|Array.<Object>}: number of mongos or mongos
  *       configuration object(s)(*). @see MongoRunner.runMongos
  *
- *     mongosWaitsForKeys {boolean}: if true, wait for mongos to discover keys from the config
- *       server and to start sending cluster times.
- *
  *     rs {Object|Array.<Object>}: replica set configuration object. Can
  *       contain:
  *       {
@@ -105,7 +102,6 @@
  * configRS - If the config servers are a replset, this will contain the config ReplSetTest object
  */
 var ShardingTest = function(params) {
-
     if (!(this instanceof ShardingTest)) {
         return new ShardingTest(params);
     }
@@ -220,8 +216,12 @@ var ShardingTest = function(params) {
         if (!otherParams.enableBalancer) {
             self.stopBalancer();
         }
+
         if (!otherParams.enableAutoSplit) {
             self.disableAutoSplit();
+        } else if (!otherParams.enableBalancer) {
+            // Turn on autoSplit since disabling balancer also turns auto split off.
+            self.enableAutoSplit();
         }
     }
 
@@ -291,16 +291,16 @@ var ShardingTest = function(params) {
             countDBsFound++;
             printjson(db);
         });
-        throw Error("couldn't find dbname: " + dbname + " in config.databases. Total DBs: " +
-                    countDBsFound);
+        throw Error("couldn't find dbname: " + dbname +
+                    " in config.databases. Total DBs: " + countDBsFound);
     };
 
     this.getNonPrimaries = function(dbname) {
         var x = this.config.databases.findOne({_id: dbname});
         if (!x) {
             this.config.databases.find().forEach(printjson);
-            throw Error("couldn't find dbname: " + dbname + " total: " +
-                        this.config.databases.count());
+            throw Error("couldn't find dbname: " + dbname +
+                        " total: " + this.config.databases.count());
         }
 
         return this.config.shards.find({_id: {$ne: x.primary}}).map(z => z._id);
@@ -333,8 +333,8 @@ var ShardingTest = function(params) {
             }
         }
 
-        throw Error("can't find server connection for db '" + dbname + "'s primary shard: " +
-                    tojson(primaryShard));
+        throw Error("can't find server connection for db '" + dbname +
+                    "'s primary shard: " + tojson(primaryShard));
     };
 
     this.normalize = function(x) {
@@ -391,6 +391,7 @@ var ShardingTest = function(params) {
 
         this.stopAllMongos(opts);
 
+        let startTime = new Date();  // Measure the execution time of shutting down shards.
         for (var i = 0; i < this._connections.length; i++) {
             if (this._rs[i]) {
                 this._rs[i].test.stopSet(15, undefined, opts);
@@ -398,6 +399,8 @@ var ShardingTest = function(params) {
                 this.stopMongod(i, opts);
             }
         }
+        print("ShardingTest stopped all shards, took " + (new Date() - startTime) + "ms for " +
+              this._connections.length + " shards.");
 
         if (this.configRS) {
             this.configRS.stopSet(undefined, undefined, opts);
@@ -858,9 +861,9 @@ var ShardingTest = function(params) {
         }
 
         if (arguments.length >= 3) {
-            if (typeof(beforeRestartCallback) !== "function") {
+            if (typeof (beforeRestartCallback) !== "function") {
                 throw new Error("beforeRestartCallback must be a function but was of type " +
-                                typeof(beforeRestartCallback));
+                                typeof (beforeRestartCallback));
             }
             beforeRestartCallback();
         }
@@ -1133,7 +1136,7 @@ var ShardingTest = function(params) {
     }
 
     var keyFile = otherParams.keyFile;
-    var hostName = getHostName();
+    var hostName = otherParams.host === undefined ? getHostName() : otherParams.host;
 
     this._testName = testName;
     this._otherParams = otherParams;
@@ -1195,7 +1198,18 @@ var ShardingTest = function(params) {
     otherParams.migrationLockAcquisitionMaxWaitMS =
         otherParams.migrationLockAcquisitionMaxWaitMS || 30000;
 
+    let randomSeedAlreadySet = false;
+
+    if (jsTest.options().randomBinVersions) {
+        // We avoid setting the random seed unequivocally to avoid unexpected behavior in tests
+        // that already make use of Random.setRandomSeed(). This conditional can be removed if
+        // it becomes the standard to always be generating the seed through ShardingTest.
+        Random.setRandomSeed(jsTest.options().seed);
+        randomSeedAlreadySet = true;
+    }
+
     // Start the MongoD servers (shards)
+    let startTime = new Date();  // Measure the execution time of startup and initiate.
     for (var i = 0; i < numShards; i++) {
         if (otherParams.rs || otherParams["rs" + i] || startShardsAsRS) {
             var setName = testName + "-rs" + i;
@@ -1265,21 +1279,25 @@ var ShardingTest = function(params) {
             var rs = new ReplSetTest({
                 name: setName,
                 nodes: numReplicas,
+                host: hostName,
                 useHostName: otherParams.useHostname,
                 useBridge: otherParams.useBridge,
                 bridgeOptions: otherParams.bridgeOptions,
                 keyFile: keyFile,
                 protocolVersion: protocolVersion,
                 waitForKeys: false,
-                settings: rsSettings
+                settings: rsSettings,
+                seedRandomNumberGenerator: !randomSeedAlreadySet,
             });
 
+            print("ShardingTest starting replica set for shard: " + setName);
             this._rs[i] =
                 {setName: setName, test: rs, nodes: rs.startSet(rsDefaults), url: rs.getURL()};
 
             // ReplSetTest.initiate() requires all nodes to be to be authorized to run
             // replSetGetStatus.
             // TODO(SERVER-14017): Remove this in favor of using initiate() everywhere.
+            print("ShardingTest initiating replica set for shard: " + setName);
             rs.initiateWithAnyNodeAsPrimary();
 
             this["rs" + i] = rs;
@@ -1389,16 +1407,22 @@ var ShardingTest = function(params) {
         rsConn.rs = rs;
     }
 
+    print("ShardingTest startup and initiation for all shards took " + (new Date() - startTime) +
+          "ms for " + numShards + " shards.");
+
     this._configServers = [];
 
     // Using replica set for config servers
     var rstOptions = {
         useHostName: otherParams.useHostname,
+        host: hostName,
         useBridge: otherParams.useBridge,
         bridgeOptions: otherParams.bridgeOptions,
         keyFile: keyFile,
         waitForKeys: false,
         name: testName + "-configRS",
+        seedRandomNumberGenerator: !randomSeedAlreadySet,
+        isConfigServer: true,
     };
 
     // when using CSRS, always use wiredTiger as the storage engine
@@ -1425,6 +1449,8 @@ var ShardingTest = function(params) {
 
     rstOptions.nodes = nodeOptions;
 
+    startTime = new Date();  // Measure the execution time of config server startup and initiate.
+
     // Start the config server's replica set
     this.configRS = new ReplSetTest(rstOptions);
     this.configRS.startSet(startOptions);
@@ -1439,6 +1465,9 @@ var ShardingTest = function(params) {
 
     // Wait for master to be elected before starting mongos
     var csrsPrimary = this.configRS.getPrimary();
+
+    print("ShardingTest startup and initiation for the config server took " +
+          (new Date() - startTime) + "ms with " + this.configRS.nodeList().length + " nodes.");
 
     // If 'otherParams.mongosOptions.binVersion' is an array value, then we'll end up constructing a
     // version iterator.
@@ -1467,7 +1496,8 @@ var ShardingTest = function(params) {
     const configRS = this.configRS;
     if (_hasNewFeatureCompatibilityVersion() && _isMixedVersionCluster()) {
         function setFeatureCompatibilityVersion() {
-            assert.commandWorked(csrsPrimary.adminCommand({setFeatureCompatibilityVersion: '4.0'}));
+            assert.commandWorked(
+                csrsPrimary.adminCommand({setFeatureCompatibilityVersion: lastStableFCV}));
 
             // Wait for the new featureCompatibilityVersion to propagate to all nodes in the CSRS
             // to ensure that older versions of mongos can successfully connect.
@@ -1484,7 +1514,7 @@ var ShardingTest = function(params) {
     // If chunkSize has been requested for this test, write the configuration
     if (otherParams.chunkSize) {
         function setChunkSize() {
-            assert.writeOK(csrsPrimary.getDB('config').settings.update(
+            assert.commandWorked(csrsPrimary.getDB('config').settings.update(
                 {_id: 'chunksize'},
                 {$set: {value: otherParams.chunkSize}},
                 {upsert: true, writeConcern: {w: 'majority', wtimeout: kDefaultWTimeoutMs}}));
@@ -1567,8 +1597,15 @@ var ShardingTest = function(params) {
     // the instances and then log them out again.
     if (keyFile) {
         authutil.asCluster(this._mongos, keyFile, _configureCluster);
+    } else if (mongosOptions[0] && mongosOptions[0].keyFile) {
+        authutil.asCluster(this._mongos, mongosOptions[0].keyFile, _configureCluster);
     } else {
         _configureCluster();
+        // Ensure that all config server nodes are up to date with any changes made to balancer
+        // settings before adding shards to the cluster. This prevents shards, which read
+        // config.settings with readPreference 'nearest', from accidentally fetching stale values
+        // from secondaries that aren't up-to-date.
+        this.configRS.awaitLastOpCommitted();
     }
 
     try {
@@ -1606,23 +1643,6 @@ var ShardingTest = function(params) {
         jsTest.authenticateNodes(this._mongos);
     }
 
-    // Mongos does not block for keys from the config servers at startup, so it may not initially
-    // return cluster times. If mongosWaitsForKeys is set, block until all mongos servers have found
-    // the keys and begun to send cluster times. Retry every 500 milliseconds and timeout after 60
-    // seconds.
-    if (params.mongosWaitsForKeys) {
-        assert.soon(function() {
-            for (let i = 0; i < numMongos; i++) {
-                const res = self._mongos[i].adminCommand({isMaster: 1});
-                if (!res.hasOwnProperty("$clusterTime")) {
-                    print("Waiting for mongos #" + i + " to start sending cluster times.");
-                    return false;
-                }
-            }
-            return true;
-        }, "waiting for all mongos servers to return cluster times", 60 * 1000, 500);
-    }
-
     // Ensure that the sessions collection exists so jstests can run things with
     // logical sessions and test them. We do this by forcing an immediate cache refresh
     // on the config server, which auto-shards the collection for the cluster.
@@ -1634,8 +1654,16 @@ var ShardingTest = function(params) {
              lastStableBinVersion,
              MongoRunner.getBinVersionFor(otherParams.configOptions.binVersion)))) {
         this.configRS.getPrimary().getDB("admin").runCommand({refreshLogicalSessionCacheNow: 1});
-    }
 
+        for (let i = 0; i < numShards; i++) {
+            if (otherParams.rs || otherParams["rs" + i] || startShardsAsRS) {
+                const rs = this._rs[i].test;
+                rs.getPrimary().getDB("admin").runCommand({_flushRoutingTableCacheUpdatesCmd: 1});
+            } else {
+                this["shard" + i].getDB("admin").runCommand({_flushRoutingTableCacheUpdatesCmd: 1});
+            }
+        }
+    }
 };
 
 // Stub for a hook to check that collection UUIDs are consistent across shards and the config

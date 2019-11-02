@@ -31,7 +31,6 @@
 
 #include <cstdint>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/base/string_data.h"
 #include "mongo/bson/mutable/const_element.h"
 #include "mongo/bson/mutable/damage_vector.h"
@@ -234,7 +233,8 @@ namespace mutablebson {
 class Document {
     // TODO: In principle there is nothing that prevents implementing a deep copy for
     // Document, but for now it is not permitted.
-    MONGO_DISALLOW_COPYING(Document);
+    Document(const Document&) = delete;
+    Document& operator=(const Document&) = delete;
 
 public:
     //
@@ -476,7 +476,7 @@ public:
      *  The destination offsets in the damage events are implicitly offsets into the
      *  BSONObj used to construct this Document.
      */
-    bool getInPlaceUpdates(DamageVector* damages, const char** source, size_t* size = NULL);
+    bool getInPlaceUpdates(DamageVector* damages, const char** source, size_t* size = nullptr);
 
     /** Drop the queue of in-place update damage events, and do not queue new operations
      *  that would otherwise have been in-place. Use this if you know that in-place updates
@@ -518,7 +518,54 @@ private:
     const Element _root;
 };
 
+inline int Document::compareWith(const Document& other,
+                                 const StringData::ComparatorInterface* comparator,
+                                 bool considerFieldName) const {
+    // We cheat and use Element::compareWithElement since we know that 'other' is a
+    // Document and has a 'hidden' fieldname that is always indentical across all Document
+    // instances.
+    return root().compareWithElement(other.root(), comparator, considerFieldName);
+}
+
+inline int Document::compareWithBSONObj(const BSONObj& other,
+                                        const StringData::ComparatorInterface* comparator,
+                                        bool considerFieldName) const {
+    return root().compareWithBSONObj(other, comparator, considerFieldName);
+}
+
+inline void Document::writeTo(BSONObjBuilder* builder) const {
+    return root().writeTo(builder);
+}
+
+inline BSONObj Document::getObject() const {
+    BSONObjBuilder builder;
+    writeTo(&builder);
+    return builder.obj();
+}
+
+inline Element Document::root() {
+    return _root;
+}
+
+inline ConstElement Document::root() const {
+    return _root;
+}
+
+inline Element Document::end() {
+    return Element(this, Element::kInvalidRepIdx);
+}
+
+inline ConstElement Document::end() const {
+    return const_cast<Document*>(this)->end();
+}
+
+inline std::string Document::toString() const {
+    return getObject().toString();
+}
+
+inline bool Document::isInPlaceModeEnabled() const {
+    return getCurrentInPlaceMode() == kInPlaceEnabled;
+}
+
 }  // namespace mutablebson
 }  // namespace mongo
-
-#include "mongo/bson/mutable/document-inl.h"

@@ -33,6 +33,8 @@
 
 #include "mongo/platform/basic.h"
 
+#include <memory>
+
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/client.h"
@@ -52,22 +54,21 @@
 #include "mongo/db/service_context.h"
 #include "mongo/db/update/update_driver.h"
 #include "mongo/dbtests/dbtests.h"
-#include "mongo/stdx/memory.h"
 
 #define ASSERT_DOES_NOT_THROW(EXPRESSION)                                          \
     try {                                                                          \
         EXPRESSION;                                                                \
     } catch (const AssertionException& e) {                                        \
-        ::mongoutils::str::stream err;                                             \
+        ::str::stream err;                                                         \
         err << "Threw an exception incorrectly: " << e.toString();                 \
         ::mongo::unittest::TestAssertionFailure(__FILE__, __LINE__, err).stream(); \
     }
 
 namespace QueryStageUpdate {
 
+using std::make_unique;
 using std::unique_ptr;
 using std::vector;
-using stdx::make_unique;
 
 static const NamespaceString nss("unittests.QueryStageUpdate");
 
@@ -93,11 +94,11 @@ public:
     }
 
     size_t count(const BSONObj& query) {
-        return _client.count(nss.ns(), query, 0, 0, 0);
+        return _client.count(nss, query, 0, 0, 0);
     }
 
     unique_ptr<CanonicalQuery> canonicalize(const BSONObj& query) {
-        auto qr = stdx::make_unique<QueryRequest>(nss);
+        auto qr = std::make_unique<QueryRequest>(nss);
         qr->setFilter(query);
         auto statusWithCQ = CanonicalQuery::canonicalize(&_opCtx, std::move(qr));
         ASSERT_OK(statusWithCQ.getStatus());
@@ -130,14 +131,15 @@ public:
         params.direction = CollectionScanParams::FORWARD;
         params.tailable = false;
 
-        unique_ptr<CollectionScan> scan(new CollectionScan(&_opCtx, collection, params, &ws, NULL));
+        unique_ptr<CollectionScan> scan(
+            new CollectionScan(&_opCtx, collection, params, &ws, nullptr));
         while (!scan->isEOF()) {
             WorkingSetID id = WorkingSet::INVALID_ID;
             PlanStage::StageState state = scan->work(&id);
             if (PlanStage::ADVANCED == state) {
                 WorkingSetMember* member = ws.get(id);
                 verify(member->hasObj());
-                out->push_back(member->obj.value().getOwned());
+                out->push_back(member->doc.value().toBson());
             }
         }
     }
@@ -151,7 +153,8 @@ public:
         params.direction = direction;
         params.tailable = false;
 
-        unique_ptr<CollectionScan> scan(new CollectionScan(&_opCtx, collection, params, &ws, NULL));
+        unique_ptr<CollectionScan> scan(
+            new CollectionScan(&_opCtx, collection, params, &ws, nullptr));
         while (!scan->isEOF()) {
             WorkingSetID id = WorkingSet::INVALID_ID;
             PlanStage::StageState state = scan->work(&id);
@@ -212,12 +215,13 @@ public:
 
             request.setUpsert();
             request.setQuery(query);
-            request.setUpdates(updates);
+            request.setUpdateModification(updates);
 
             const std::map<StringData, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+            const auto constants = boost::none;
 
-            ASSERT_DOES_NOT_THROW(
-                driver.parse(request.getUpdates(), arrayFilters, request.isMulti()));
+            ASSERT_DOES_NOT_THROW(driver.parse(
+                request.getUpdateModification(), arrayFilters, constants, request.isMulti()));
 
             // Setup update params.
             UpdateStageParams params(&request, &driver, opDebug);
@@ -268,8 +272,7 @@ public:
             OpDebug* opDebug = &curOp.debug();
             const CollatorInterface* collator = nullptr;
             UpdateDriver driver(new ExpressionContext(&_opCtx, collator));
-            Database* db = ctx.db();
-            Collection* coll = db->getCollection(&_opCtx, nss);
+            Collection* coll = CollectionCatalog::get(&_opCtx).lookupCollectionByNamespace(nss);
             ASSERT(coll);
 
             // Get the RecordIds that would be returned by an in-order scan.
@@ -285,12 +288,13 @@ public:
 
             request.setMulti();
             request.setQuery(query);
-            request.setUpdates(updates);
+            request.setUpdateModification(updates);
 
             const std::map<StringData, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+            const auto constants = boost::none;
 
-            ASSERT_DOES_NOT_THROW(
-                driver.parse(request.getUpdates(), arrayFilters, request.isMulti()));
+            ASSERT_DOES_NOT_THROW(driver.parse(
+                request.getUpdateModification(), arrayFilters, constants, request.isMulti()));
 
             // Configure the scan.
             CollectionScanParams collScanParams;
@@ -393,14 +397,16 @@ public:
 
         // Populate the request.
         request.setQuery(query);
-        request.setUpdates(fromjson("{$set: {x: 0}}"));
+        request.setUpdateModification(fromjson("{$set: {x: 0}}"));
         request.setSort(BSONObj());
         request.setMulti(false);
         request.setReturnDocs(UpdateRequest::RETURN_OLD);
 
         const std::map<StringData, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+        const auto constants = boost::none;
 
-        ASSERT_DOES_NOT_THROW(driver.parse(request.getUpdates(), arrayFilters, request.isMulti()));
+        ASSERT_DOES_NOT_THROW(driver.parse(
+            request.getUpdateModification(), arrayFilters, constants, request.isMulti()));
 
         // Configure a QueuedDataStage to pass the first object in the collection back in a
         // RID_AND_OBJ state.
@@ -409,7 +415,7 @@ public:
         WorkingSetMember* member = ws->get(id);
         member->recordId = recordIds[targetDocIndex];
         const BSONObj oldDoc = BSON("_id" << targetDocIndex << "foo" << targetDocIndex);
-        member->obj = Snapshotted<BSONObj>(SnapshotId(), oldDoc);
+        member->doc = {SnapshotId(), Document{oldDoc}};
         ws->transitionToRecordIdAndObj(id);
         qds->pushBack(id);
 
@@ -434,10 +440,10 @@ public:
         ASSERT_TRUE(resultMember->hasOwnedObj());
         ASSERT_FALSE(resultMember->hasRecordId());
         ASSERT_EQUALS(resultMember->getState(), WorkingSetMember::OWNED_OBJ);
-        ASSERT_TRUE(resultMember->obj.value().isOwned());
+        ASSERT_TRUE(resultMember->doc.value().isOwned());
 
         // Should be the old value.
-        ASSERT_BSONOBJ_EQ(resultMember->obj.value(), oldDoc);
+        ASSERT_BSONOBJ_EQ(resultMember->doc.value().toBson(), oldDoc);
 
         // Should have done the update.
         BSONObj newDoc = BSON("_id" << targetDocIndex << "foo" << targetDocIndex << "x" << 0);
@@ -483,14 +489,16 @@ public:
 
         // Populate the request.
         request.setQuery(query);
-        request.setUpdates(fromjson("{$set: {x: 0}}"));
+        request.setUpdateModification(fromjson("{$set: {x: 0}}"));
         request.setSort(BSONObj());
         request.setMulti(false);
         request.setReturnDocs(UpdateRequest::RETURN_NEW);
 
         const std::map<StringData, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+        const auto constants = boost::none;
 
-        ASSERT_DOES_NOT_THROW(driver.parse(request.getUpdates(), arrayFilters, request.isMulti()));
+        ASSERT_DOES_NOT_THROW(driver.parse(
+            request.getUpdateModification(), arrayFilters, constants, request.isMulti()));
 
         // Configure a QueuedDataStage to pass the first object in the collection back in a
         // RID_AND_OBJ state.
@@ -499,7 +507,7 @@ public:
         WorkingSetMember* member = ws->get(id);
         member->recordId = recordIds[targetDocIndex];
         const BSONObj oldDoc = BSON("_id" << targetDocIndex << "foo" << targetDocIndex);
-        member->obj = Snapshotted<BSONObj>(SnapshotId(), oldDoc);
+        member->doc = {SnapshotId(), Document{oldDoc}};
         ws->transitionToRecordIdAndObj(id);
         qds->pushBack(id);
 
@@ -524,11 +532,11 @@ public:
         ASSERT_TRUE(resultMember->hasOwnedObj());
         ASSERT_FALSE(resultMember->hasRecordId());
         ASSERT_EQUALS(resultMember->getState(), WorkingSetMember::OWNED_OBJ);
-        ASSERT_TRUE(resultMember->obj.value().isOwned());
+        ASSERT_TRUE(resultMember->doc.value().isOwned());
 
         // Should be the new value.
         BSONObj newDoc = BSON("_id" << targetDocIndex << "foo" << targetDocIndex << "x" << 0);
-        ASSERT_BSONOBJ_EQ(resultMember->obj.value(), newDoc);
+        ASSERT_BSONOBJ_EQ(resultMember->doc.value().toBson(), newDoc);
 
         // Should have done the update.
         vector<BSONObj> objs;
@@ -541,9 +549,9 @@ public:
     }
 };
 
-class All : public Suite {
+class All : public OldStyleSuiteSpecification {
 public:
-    All() : Suite("query_stage_update") {}
+    All() : OldStyleSuiteSpecification("query_stage_update") {}
 
     void setupTests() {
         // Stage-specific tests below.
@@ -554,6 +562,6 @@ public:
     }
 };
 
-SuiteInstance<All> all;
+OldStyleSuiteInitializer<All> all;
 
 }  // namespace QueryStageUpdate

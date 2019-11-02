@@ -52,12 +52,7 @@ public:
 
     std::set<std::string> getNamesWithConflictingCasing(StringData name) override;
 
-    std::unique_ptr<Collection> makeCollection(OperationContext* const opCtx,
-                                               const StringData fullNS,
-                                               OptionalCollectionUUID uuid,
-                                               CollectionCatalogEntry* const details,
-                                               RecordStore* const recordStore,
-                                               DatabaseCatalogEntry* const dbce) override;
+    std::vector<std::string> getNames() override;
 
 private:
     std::set<std::string> _getNamesWithConflictingCasing_inlock(StringData name);

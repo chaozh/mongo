@@ -47,22 +47,22 @@ const auto kIndexVersion = IndexDescriptor::IndexVersion::kV2;
 class IndexScanTest {
 public:
     IndexScanTest()
-        : _dbLock(&_opCtx, nsToDatabaseSubstring(ns()), MODE_X), _ctx(&_opCtx, ns()), _coll(NULL) {}
+        : _dbLock(&_opCtx, nsToDatabaseSubstring(ns()), MODE_X),
+          _ctx(&_opCtx, ns()),
+          _coll(nullptr) {}
 
     virtual ~IndexScanTest() {}
 
     virtual void setup() {
         WriteUnitOfWork wunit(&_opCtx);
 
-        _ctx.db()->dropCollection(&_opCtx, ns()).transitional_ignore();
-        _coll = _ctx.db()->createCollection(&_opCtx, ns());
+        _ctx.db()->dropCollection(&_opCtx, nss()).transitional_ignore();
+        _coll = _ctx.db()->createCollection(&_opCtx, nss());
 
         ASSERT_OK(_coll->getIndexCatalog()->createIndexOnEmptyCollection(
             &_opCtx,
-            BSON("ns" << ns() << "key" << BSON("x" << 1) << "name"
-                      << DBClientBase::genIndexName(BSON("x" << 1))
-                      << "v"
-                      << static_cast<int>(kIndexVersion))));
+            BSON("key" << BSON("x" << 1) << "name" << DBClientBase::genIndexName(BSON("x" << 1))
+                       << "v" << static_cast<int>(kIndexVersion))));
 
         wunit.commit();
     }
@@ -109,7 +109,7 @@ public:
         params.direction = 1;
 
         // This child stage gets owned and freed by the caller.
-        MatchExpression* filter = NULL;
+        MatchExpression* filter = nullptr;
         return new IndexScan(&_opCtx, params, &_ws, filter);
     }
 
@@ -133,12 +133,15 @@ public:
         oil.intervals.push_back(Interval(bob.obj(), startInclusive, endInclusive));
         params.bounds.fields.push_back(oil);
 
-        MatchExpression* filter = NULL;
+        MatchExpression* filter = nullptr;
         return new IndexScan(&_opCtx, params, &_ws, filter);
     }
 
     static const char* ns() {
         return "unittest.QueryStageIxscan";
+    }
+    static NamespaceString nss() {
+        return NamespaceString(ns());
     }
 
 protected:
@@ -311,9 +314,9 @@ public:
     }
 };
 
-class All : public Suite {
+class All : public OldStyleSuiteSpecification {
 public:
-    All() : Suite("query_stage_ixscan") {}
+    All() : OldStyleSuiteSpecification("query_stage_ixscan") {}
 
     void setupTests() {
         add<QueryStageIxscanInitializeStats>();
@@ -322,6 +325,8 @@ public:
         add<QueryStageIxscanInsertDuringSaveExclusive2>();
         add<QueryStageIxscanInsertDuringSaveReverse>();
     }
-} QueryStageIxscanAll;
+};
+
+OldStyleSuiteInitializer<All> aueryStageIxscanAll;
 
 }  // namespace QueryStageIxscan

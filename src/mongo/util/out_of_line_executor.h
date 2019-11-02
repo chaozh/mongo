@@ -29,8 +29,8 @@
 
 #pragma once
 
-#include "mongo/stdx/functional.h"
-#include "mongo/util/future.h"
+#include "mongo/base/status.h"
+#include "mongo/util/functional.h"
 
 namespace mongo {
 
@@ -38,43 +38,41 @@ namespace mongo {
  * Provides the minimal api for a simple out of line executor that can run non-cancellable
  * callbacks.
  *
- * Adds in a minimal amount of support for futures.
- *
  * The contract for scheduling work on an executor is that it never blocks the caller.  It doesn't
  * necessarily need to offer forward progress guarantees, but actual calls to schedule() should not
  * deadlock.
  *
- * As an explicit point of implementation: it will never invoke the passed callback from within the
- * scheduling call.
+ * If you manage the lifetime of your executor using a shared_ptr, you can begin a chain of
+ * execution like this:
+ *      ExecutorFuture(myExec)
+ *          .then([] { return doThing1(); })
+ *          .then([] { return doThing2(); })
+ *          ...
  */
 class OutOfLineExecutor {
 public:
-    using Task = unique_function<void()>;
+    using Task = unique_function<void(Status)>;
 
 public:
     /**
-     * Invokes the callback on the executor, as in schedule(), returning a future with its result.
-     * That future may be ready by the time the caller returns, which means that continuations
-     * chained on the returned future may be invoked on the caller of execute's stack.
-     */
-    template <typename Callback>
-    Future<FutureContinuationResult<Callback>> execute(Callback&& cb) {
-        auto pf = makePromiseFuture<FutureContinuationResult<Callback>>();
-
-        schedule([ cb = std::forward<Callback>(cb), p = std::move(pf.promise) ]() mutable {
-            p.setWith(std::move(cb));
-        });
-
-        return std::move(pf.future);
-    }
-
-    /**
-     * Invokes the callback on the executor.  This never happens immediately on the caller's stack.
+     * Delegates invocation of the Task to this executor
+     *
+     * Execution of the Task can happen in one of three contexts:
+     * * By default, on an execution context maintained by the OutOfLineExecutor (i.e. a thread).
+     * * During shutdown, on the execution context of shutdown/join/dtor for the OutOfLineExecutor.
+     * * Post-shutdown, on the execution context of the calling code.
+     *
+     * The Task will be passed a Status schedStatus that is either:
+     * * schedStatus.isOK() if the function is run in an out-of-line context
+     * * isCancelationError(schedStatus.code()) if the function is run in an inline context
+     *
+     * All of this is to say: CHECK YOUR STATUS.
      */
     virtual void schedule(Task func) = 0;
 
-protected:
-    ~OutOfLineExecutor() noexcept {}
+    virtual ~OutOfLineExecutor() = default;
 };
+
+using ExecutorPtr = std::shared_ptr<OutOfLineExecutor>;
 
 }  // namespace mongo

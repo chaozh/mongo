@@ -33,6 +33,8 @@
 
 #include "mongo/db/jsobj.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/ops/write_ops_parsers.h"
+#include "mongo/db/pipeline/runtime_constants_gen.h"
 #include "mongo/db/write_concern_options.h"
 
 namespace mongo {
@@ -50,12 +52,15 @@ class StatusWith;
  */
 class FindAndModifyRequest {
 public:
+    static constexpr auto kLegacyCommandName = "findandmodify"_sd;
+    static constexpr auto kCommandName = "findAndModify"_sd;
+
     /**
-     * Creates a new instance of an 'update' type findAndModify request.
+     * Creates a new instance of a 'update' type findAndModify request.
      */
     static FindAndModifyRequest makeUpdate(NamespaceString fullNs,
                                            BSONObj query,
-                                           BSONObj updateObj);
+                                           write_ops::UpdateModification update);
 
     /**
      * Creates a new instance of an 'remove' type findAndModify request.
@@ -87,20 +92,23 @@ public:
 
     /**
      * Serializes this object into a BSON representation. Fields that are not
-     * set will not be part of the the serialized object.
+     * set will not be part of the the serialized object. Passthrough fields
+     * are appended.
      */
-    BSONObj toBSON() const;
+    BSONObj toBSON(const BSONObj& commandPassthroughFields) const;
 
     const NamespaceString& getNamespaceString() const;
     BSONObj getQuery() const;
     BSONObj getFields() const;
-    BSONObj getUpdateObj() const;
+    const boost::optional<write_ops::UpdateModification>& getUpdate() const;
     BSONObj getSort() const;
+    BSONObj getHint() const;
     BSONObj getCollation() const;
     const std::vector<BSONObj>& getArrayFilters() const;
     bool shouldReturnNew() const;
     bool isUpsert() const;
     bool isRemove() const;
+    bool getBypassDocumentValidation() const;
 
     // Not implemented. Use extractWriteConcern() to get the setting instead.
     WriteConcernOptions getWriteConcern() const;
@@ -110,12 +118,25 @@ public:
     //
 
     /**
+     * Sets the filter to find a document.
+     */
+    void setQuery(BSONObj query);
+
+    /**
+     * Sets the update object that specifies how a document gets updated.
+     */
+    void setUpdateObj(BSONObj updateObj);
+
+    /**
      * If shouldReturnNew is new, the findAndModify response should return the document
      * after the modification was applied if the query matched a document. Otherwise,
      * it will return the matched document before the modification.
      */
     void setShouldReturnNew(bool shouldReturnNew);
 
+    /**
+     * Sets a flag whether the statement performs an upsert.
+     */
     void setUpsert(bool upsert);
 
     //
@@ -134,6 +155,11 @@ public:
     void setSort(BSONObj sort);
 
     /**
+     * Sets a hint on the query, which will force the planner to use the specified index.
+     */
+    void setHint(BSONObj hint);
+
+    /**
      * Sets the collation for the query, which is used for all string comparisons.
      */
     void setCollation(BSONObj collation);
@@ -145,32 +171,50 @@ public:
     void setArrayFilters(const std::vector<BSONObj>& arrayFilters);
 
     /**
+     * Sets any constant values which may be required by the query and/or update.
+     */
+    void setRuntimeConstants(RuntimeConstants runtimeConstants) {
+        _runtimeConstants = std::move(runtimeConstants);
+    }
+
+    /**
+     * Returns the runtime constants associated with this findAndModify request, if present.
+     */
+    const boost::optional<RuntimeConstants>& getRuntimeConstants() const {
+        return _runtimeConstants;
+    }
+
+    /**
      * Sets the write concern for this request.
      */
     void setWriteConcern(WriteConcernOptions writeConcern);
+
+    void setBypassDocumentValidation(bool bypassDocumentValidation);
 
 private:
     /**
      * Creates a new FindAndModifyRequest with the required fields.
      */
-    FindAndModifyRequest(NamespaceString fullNs, BSONObj query, BSONObj updateObj);
+    FindAndModifyRequest(NamespaceString fullNs,
+                         BSONObj query,
+                         boost::optional<write_ops::UpdateModification> update);
 
     // Required fields
     const NamespaceString _ns;
-    const BSONObj _query;
+    BSONObj _query;
 
-    // Required for updates
-    const BSONObj _updateObj;
-
-    boost::optional<bool> _isUpsert;
+    bool _isUpsert{false};
     boost::optional<BSONObj> _fieldProjection;
     boost::optional<BSONObj> _sort;
+    boost::optional<BSONObj> _hint;
     boost::optional<BSONObj> _collation;
     boost::optional<std::vector<BSONObj>> _arrayFilters;
-    boost::optional<bool> _shouldReturnNew;
+    boost::optional<RuntimeConstants> _runtimeConstants;
+    bool _shouldReturnNew{false};
     boost::optional<WriteConcernOptions> _writeConcern;
+    bool _bypassDocumentValidation{false};
 
-    // Flag used internally to differentiate whether this is an update or remove type request.
-    bool _isRemove;
+    // Holds value when performing an update request and none when a remove request.
+    boost::optional<write_ops::UpdateModification> _update;
 };
-}
+}  // namespace mongo

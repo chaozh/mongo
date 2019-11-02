@@ -45,9 +45,9 @@ protected:
     void setUp() override {
         resetApplyParams();
 
-        // Set up the logical clock needed by CurrentDateNode and ObjectReplaceNode.
+        // Set up the logical clock needed by CurrentDateNode and ObjectReplaceExecutor.
         auto service = mongo::getGlobalServiceContext();
-        auto logicalClock = mongo::stdx::make_unique<mongo::LogicalClock>(service);
+        auto logicalClock = std::make_unique<mongo::LogicalClock>(service);
         mongo::LogicalClock::set(service, std::move(logicalClock));
     }
 
@@ -62,14 +62,12 @@ protected:
         _validateForStorage = true;
         _indexData.reset();
         _logDoc.reset();
-        _logBuilder = stdx::make_unique<LogBuilder>(_logDoc.root());
+        _logBuilder = std::make_unique<LogBuilder>(_logDoc.root());
         _modifiedPaths.clear();
     }
 
-    UpdateNode::ApplyParams getApplyParams(mutablebson::Element element) {
-        UpdateNode::ApplyParams applyParams(element, _immutablePaths);
-        applyParams.pathToCreate = _pathToCreate;
-        applyParams.pathTaken = _pathTaken;
+    UpdateExecutor::ApplyParams getApplyParams(mutablebson::Element element) {
+        UpdateExecutor::ApplyParams applyParams(element, _immutablePaths);
         applyParams.matchedField = _matchedField;
         applyParams.insert = _insert;
         applyParams.fromOplogApplication = _fromOplogApplication;
@@ -80,8 +78,15 @@ protected:
         return applyParams;
     }
 
+    UpdateNode::UpdateNodeApplyParams getUpdateNodeApplyParams() {
+        UpdateNode::UpdateNodeApplyParams applyParams;
+        applyParams.pathToCreate = _pathToCreate;
+        applyParams.pathTaken = _pathTaken;
+        return applyParams;
+    }
+
     void addImmutablePath(StringData path) {
-        auto fieldRef = stdx::make_unique<FieldRef>(path);
+        auto fieldRef = std::make_unique<FieldRef>(path);
         _immutablePathsVector.push_back(std::move(fieldRef));
         _immutablePaths.insert(_immutablePathsVector.back().get());
     }
@@ -114,7 +119,7 @@ protected:
 
     void addIndexedPath(StringData path) {
         if (!_indexData) {
-            _indexData = stdx::make_unique<UpdateIndexData>();
+            _indexData = std::make_unique<UpdateIndexData>();
         }
         _indexData->addPath(FieldRef(path));
     }

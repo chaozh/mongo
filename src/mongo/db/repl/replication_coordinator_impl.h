@@ -29,6 +29,7 @@
 
 #pragma once
 
+#include <map>
 #include <memory>
 #include <utility>
 #include <vector>
@@ -36,6 +37,7 @@
 #include "mongo/base/status.h"
 #include "mongo/bson/timestamp.h"
 #include "mongo/db/concurrency/d_concurrency.h"
+#include "mongo/db/concurrency/replication_state_transition_lock_guard.h"
 #include "mongo/db/repl/initial_syncer.h"
 #include "mongo/db/repl/member_state.h"
 #include "mongo/db/repl/optime.h"
@@ -52,6 +54,7 @@
 #include "mongo/stdx/mutex.h"
 #include "mongo/stdx/unordered_set.h"
 #include "mongo/util/concurrency/with_lock.h"
+#include "mongo/util/future.h"
 #include "mongo/util/net/hostandport.h"
 
 namespace mongo {
@@ -82,7 +85,8 @@ class TopologyCoordinator;
 class VoteRequester;
 
 class ReplicationCoordinatorImpl : public ReplicationCoordinator {
-    MONGO_DISALLOW_COPYING(ReplicationCoordinatorImpl);
+    ReplicationCoordinatorImpl(const ReplicationCoordinatorImpl&) = delete;
+    ReplicationCoordinatorImpl& operator=(const ReplicationCoordinatorImpl&) = delete;
 
 public:
     ReplicationCoordinatorImpl(ServiceContext* serviceContext,
@@ -100,6 +104,8 @@ public:
 
     virtual void startup(OperationContext* opCtx) override;
 
+    virtual void enterTerminalShutdown() override;
+
     virtual void shutdown(OperationContext* opCtx) override;
 
     virtual const ReplSettings& getSettings() const override;
@@ -107,6 +113,10 @@ public:
     virtual Mode getReplicationMode() const override;
 
     virtual MemberState getMemberState() const override;
+
+    virtual std::vector<MemberData> getMemberData() const override;
+
+    virtual bool canAcceptNonLocalWrites() const override;
 
     virtual Status waitForMemberState(MemberState expectedState, Milliseconds timeout) override;
 
@@ -139,10 +149,6 @@ public:
     virtual Status checkIfCommitQuorumCanBeSatisfied(
         const CommitQuorumOptions& commitQuorum) const override;
 
-    virtual StatusWith<bool> checkIfCommitQuorumIsSatisfied(
-        const CommitQuorumOptions& commitQuorum,
-        const std::vector<HostAndPort>& commitReadyMembers) const override;
-
     virtual Status checkCanServeReadsFor(OperationContext* opCtx,
                                          const NamespaceString& ns,
                                          bool slaveOk);
@@ -152,18 +158,23 @@ public:
 
     virtual bool shouldRelaxIndexConstraints(OperationContext* opCtx, const NamespaceString& ns);
 
-    virtual void setMyLastAppliedOpTime(const OpTime& opTime);
-    virtual void setMyLastDurableOpTime(const OpTime& opTime);
+    virtual void setMyLastAppliedOpTimeAndWallTime(const OpTimeAndWallTime& opTimeAndWallTime);
+    virtual void setMyLastDurableOpTimeAndWallTime(const OpTimeAndWallTime& opTimeAndWallTime);
 
-    virtual void setMyLastAppliedOpTimeForward(const OpTime& opTime, DataConsistency consistency);
-    virtual void setMyLastDurableOpTimeForward(const OpTime& opTime);
+    virtual void setMyLastAppliedOpTimeAndWallTimeForward(
+        const OpTimeAndWallTime& opTimeAndWallTime, DataConsistency consistency);
+    virtual void setMyLastDurableOpTimeAndWallTimeForward(
+        const OpTimeAndWallTime& opTimeAndWallTime);
 
     virtual void resetMyLastOpTimes();
 
     virtual void setMyHeartbeatMessage(const std::string& msg);
 
     virtual OpTime getMyLastAppliedOpTime() const override;
+    virtual OpTimeAndWallTime getMyLastAppliedOpTimeAndWallTime() const override;
+
     virtual OpTime getMyLastDurableOpTime() const override;
+    virtual OpTimeAndWallTime getMyLastDurableOpTimeAndWallTime() const override;
 
     virtual Status waitUntilOpTimeForReadUntil(OperationContext* opCtx,
                                                const ReadConcernArgs& readConcern,
@@ -199,7 +210,8 @@ public:
     virtual Status processReplSetGetStatus(BSONObjBuilder* result,
                                            ReplSetGetStatusResponseStyle responseStyle) override;
 
-    virtual void fillIsMasterForReplSet(IsMasterResponse* result) override;
+    virtual void fillIsMasterForReplSet(IsMasterResponse* result,
+                                        const SplitHorizon::Parameters& horizonParams) override;
 
     virtual void appendSlaveInfoData(BSONObjBuilder* result) override;
 
@@ -209,7 +221,8 @@ public:
 
     virtual void processReplSetMetadata(const rpc::ReplSetMetadata& replMetadata) override;
 
-    virtual void advanceCommitPoint(const OpTime& committedOpTime) override;
+    virtual void advanceCommitPoint(const OpTimeAndWallTime& committedOpTimeAndWallTime,
+                                    bool fromSyncSource) override;
 
     virtual void cancelAndRescheduleElectionTimeout() override;
 
@@ -260,6 +273,7 @@ public:
         boost::optional<rpc::OplogQueryMetadata> oqMetadata) override;
 
     virtual OpTime getLastCommittedOpTime() const override;
+    virtual OpTimeAndWallTime getLastCommittedOpTimeAndWallTime() const override;
 
     virtual Status processReplSetRequestVotes(OperationContext* opCtx,
                                               const ReplSetRequestVotesArgs& args,
@@ -289,6 +303,8 @@ public:
 
     virtual OpTime getCurrentCommittedSnapshotOpTime() const override;
 
+    virtual OpTimeAndWallTime getCurrentCommittedSnapshotOpTimeAndWallTime() const override;
+
     virtual void waitUntilSnapshotCommitted(OperationContext* opCtx,
                                             const Timestamp& untilSnapshot) override;
 
@@ -296,14 +312,16 @@ public:
 
     virtual void appendConnectionStats(executor::ConnectionPoolStats* stats) const override;
 
-    virtual size_t getNumUncommittedSnapshots() override;
+    virtual void createWMajorityWriteAvailabilityDateWaiter(OpTime opTime) override;
 
     virtual WriteConcernOptions populateUnsetWriteConcernOptionsSyncMode(
         WriteConcernOptions wc) override;
 
     virtual Status stepUpIfEligible(bool skipDryRun) override;
 
-    virtual Status abortCatchupIfNeeded() override;
+    virtual Status abortCatchupIfNeeded(PrimaryCatchUpConclusionReason reason) override;
+
+    virtual void incrementNumCatchUpOpsIfCatchingUp(long numOps) override;
 
     void signalDropPendingCollectionsRemovedFromStorage() final;
 
@@ -312,6 +330,13 @@ public:
     virtual bool setContainsArbiter() const override;
 
     virtual void attemptToAdvanceStableTimestamp() override;
+
+    virtual void finishRecoveryIfEligible(OperationContext* opCtx) override;
+
+    virtual void updateAndLogStateTransitionMetrics(
+        const ReplicationCoordinator::OpsKillingStateTransitionEnum stateTransition,
+        const size_t numOpsKilled,
+        const size_t numOpsRunning) const override;
 
     // ================== Test support API ===================
 
@@ -358,16 +383,24 @@ public:
     /**
      * Simple wrappers around _setLastOptime to make it easier to test.
      */
-    Status setLastAppliedOptime_forTest(long long cfgVer, long long memberId, const OpTime& opTime);
-    Status setLastDurableOptime_forTest(long long cfgVer, long long memberId, const OpTime& opTime);
+    Status setLastAppliedOptime_forTest(long long cfgVer,
+                                        long long memberId,
+                                        const OpTime& opTime,
+                                        Date_t wallTime = Date_t());
+    Status setLastDurableOptime_forTest(long long cfgVer,
+                                        long long memberId,
+                                        const OpTime& opTime,
+                                        Date_t wallTime = Date_t());
 
     /**
      * Simple test wrappers that expose private methods.
      */
-    boost::optional<OpTime> chooseStableOpTimeFromCandidates_forTest(
-        const std::set<OpTime>& candidates, const OpTime& maximumStableOpTime);
-    void cleanupStableOpTimeCandidates_forTest(std::set<OpTime>* candidates, OpTime stableOpTime);
-    std::set<OpTime> getStableOpTimeCandidates_forTest();
+    boost::optional<OpTimeAndWallTime> chooseStableOpTimeFromCandidates_forTest(
+        const std::set<OpTimeAndWallTime>& candidates,
+        const OpTimeAndWallTime& maximumStableOpTime);
+    void cleanupStableOpTimeCandidates_forTest(std::set<OpTimeAndWallTime>* candidates,
+                                               OpTimeAndWallTime stableOpTime);
+    std::set<OpTimeAndWallTime> getStableOpTimeCandidates_forTest();
 
     /**
      * Non-blocking version of updateTerm.
@@ -404,7 +437,7 @@ private:
 
     using EventHandle = executor::TaskExecutor::EventHandle;
 
-    using ScheduleFn = stdx::function<StatusWith<executor::TaskExecutor::CallbackHandle>(
+    using ScheduleFn = std::function<StatusWith<executor::TaskExecutor::CallbackHandle>(
         const executor::TaskExecutor::CallbackFn& work)>;
 
     class LoseElectionGuardV1;
@@ -452,44 +485,40 @@ private:
         kActionStartSingleNodeElection
     };
 
-    // This object handles killing user operations and aborting stashed running
-    // transactions during step down.
-    class KillOpContainer {
+    // This object acquires RSTL in X mode to perform state transition to (step up)/from (step down)
+    // primary. In order to acquire RSTL, it also starts "RstlKillOpthread" which kills conflicting
+    // operations (user/system) and aborts stashed running transactions.
+    class AutoGetRstlForStepUpStepDown {
     public:
-        KillOpContainer(ReplicationCoordinatorImpl* repl, OperationContext* opCtx)
-            : _replCord(repl), _stepDownOpCtx(opCtx){};
+        AutoGetRstlForStepUpStepDown(
+            ReplicationCoordinatorImpl* repl,
+            OperationContext* opCtx,
+            ReplicationCoordinator::OpsKillingStateTransitionEnum stateTransition,
+            Date_t deadline = Date_t::max());
 
-        /**
-         * It will spawn a new thread killOpThread to kill user operations.
-         */
-        void startKillOpThread();
-
-        /**
-         * On stepdown, we need to kill all write operations and all transactional operations,
-         * so that unprepared and prepared transactions can release or yield their locks.
-         * The required ordering between stepdown steps is:
-         * 1) Enqueue RSTL in X mode.
-         * 2) Kill all write operations and operations with S locks
-         * 3) Abort unprepared transactions.
-         * 4) Repeat step 2) and 3) until the stepdown thread can acquire RSTL.
-         * 5) Yield locks of all prepared transactions.
-         *
-         * Since prepared transactions don't hold RSTL, step 1) to step 3) make sure all
-         * running transactions that may hold RSTL finish, get killed or yield their locks,
-         * so that we can acquire RSTL at step 4). Holding the locks of prepared transactions
-         * until step 5) guarantees if any conflict operations (e.g. DDL operations) failed
-         * to be killed for any reason, we will get a deadlock instead of a silent data corruption.
-         *
-         * Loops continuously to kill all user operations that have global lock except in IS mode.
-         * And, aborts all stashed (inactive) transactions.
-         * Terminates once killSignaled is set true.
-        */
-        void killOpThreadFn();
+        // Disallows copying.
+        AutoGetRstlForStepUpStepDown(const AutoGetRstlForStepUpStepDown&) = delete;
+        AutoGetRstlForStepUpStepDown& operator=(const AutoGetRstlForStepUpStepDown&) = delete;
 
         /*
-         * Signals killOpThread to stop killing user operations.
+         * Releases RSTL lock.
          */
-        void stopAndWaitForKillOpThread();
+        void rstlRelease();
+
+        /*
+         * Reacquires RSTL lock.
+         */
+        void rstlReacquire();
+
+        /*
+         * Returns _userOpsKilled value.
+         */
+        size_t getUserOpsKilled() const;
+
+        /*
+         * Increments _userOpsKilled by val.
+         */
+        void incrementUserOpsKilled(size_t val = 1);
 
         /*
          * Returns _userOpsRunning value.
@@ -499,91 +528,104 @@ private:
         /*
          * Increments _userOpsRunning by val.
          */
-        void incrUserOpsRunningBy(size_t val = 1);
+        void incrementUserOpsRunning(size_t val = 1);
+
+        /*
+         * Returns the step up/step down opCtx.
+         */
+        const OperationContext* getOpCtx() const;
 
     private:
+        /**
+         * It will spawn a new thread killOpThread to kill operations that conflict with state
+         * transitions (step up and step down).
+         */
+        void _startKillOpThread();
+
+        /**
+         * On state transition, we need to kill all write operations and all transactional
+         * operations, so that unprepared and prepared transactions can release or yield their
+         * locks. The required ordering between step up/step down steps are:
+         * 1) Enqueue RSTL in X mode.
+         * 2) Kill all conflicting operations.
+         *       - Write operation that takes global lock in IX and X mode.
+         *       - Read operations that takes global lock in S mode.
+         *       - Operations(read/write) that are blocked on prepare conflict.
+         * 3) Abort unprepared transactions.
+         * 4) Repeat step 2) and 3) until the step up/step down thread can acquire RSTL.
+         * 5) Yield locks of all prepared transactions. This applies only to step down as on
+         * secondary we currently yield locks for prepared transactions.
+         *
+         * Since prepared transactions don't hold RSTL, step 1) to step 3) make sure all
+         * running transactions that may hold RSTL finish, get killed or yield their locks,
+         * so that we can acquire RSTL at step 4). Holding the locks of prepared transactions
+         * until step 5) guarantees if any conflict operations (e.g. DDL operations) failed
+         * to be killed for any reason, we will get a deadlock instead of a silent data corruption.
+         *
+         * Loops continuously to kill all conflicting operations. And, aborts all stashed (inactive)
+         * transactions.
+         * Terminates once killSignaled is set true.
+         */
+        void _killOpThreadFn();
+
+        /*
+         * Signals killOpThread to stop killing operations.
+         */
+        void _stopAndWaitForKillOpThread();
+
         ReplicationCoordinatorImpl* const _replCord;  // not owned.
-        OperationContext* const _stepDownOpCtx;       // not owned.
+        // step up/step down opCtx.
+        OperationContext* const _opCtx;  // not owned.
+        // This field is optional because we need to start killOpThread to kill operations after
+        // RSTL enqueue.
+        boost::optional<ReplicationStateTransitionLockGuard> _rstlLock;
         // Thread that will run killOpThreadFn().
         std::unique_ptr<stdx::thread> _killOpThread;
+        // Tracks number of operations killed on step up / step down.
+        size_t _userOpsKilled = 0;
+        // Tracks number of operations left running on step up / step down.
+        size_t _userOpsRunning = 0;
         // Protects killSignaled and stopKillingOps cond. variable.
-        stdx::mutex _mutex;
+        Mutex _mutex = MONGO_MAKE_LATCH("AutoGetRstlForStepUpStepDown::_mutex");
         // Signals thread about the change of killSignaled value.
         stdx::condition_variable _stopKillingOps;
         // Once this is set to true, the killOpThreadFn method will terminate.
         bool _killSignaled = false;
-        // Tracks number of operations left running on step down.
-        size_t _userOpsRunning = 0;
+        // The state transition that is in progress. Should never be set to rollback within this
+        // class.
+        ReplicationCoordinator::OpsKillingStateTransitionEnum _stateTransition;
     };
 
-    // Abstract struct that holds information about clients waiting for replication.
-    // Subclasses need to define how to notify them.
     struct Waiter {
-        Waiter(OpTime _opTime, const WriteConcernOptions* _writeConcern);
-        virtual ~Waiter() = default;
-
-        BSONObj toBSON() const;
-        std::string toString() const;
-        // Controls whether or not this Waiter should stay on the WaiterList upon notification.
-        virtual bool runs_once() const = 0;
-
-        // It is invalid to call notify_inlock() unless holding ReplicationCoordinatorImpl::_mutex.
-        virtual void notify_inlock() = 0;
-
-        const OpTime opTime;
-        const WriteConcernOptions* writeConcern = nullptr;
+        Promise<void> promise;
+        boost::optional<WriteConcernOptions> writeConcern;
+        explicit Waiter(Promise<void> p, boost::optional<WriteConcernOptions> w = boost::none)
+            : promise(std::move(p)), writeConcern(w) {}
     };
 
-    // When ThreadWaiter gets notified, it will signal the conditional variable.
-    //
-    // This is used when a thread wants to block inline until the opTime is reached with the given
-    // writeConcern.
-    struct ThreadWaiter : public Waiter {
-        ThreadWaiter(OpTime _opTime,
-                     const WriteConcernOptions* _writeConcern,
-                     stdx::condition_variable* _condVar);
-        void notify_inlock() override;
-        bool runs_once() const override {
-            return false;
-        }
-
-        stdx::condition_variable* condVar = nullptr;
-    };
-
-    // When the waiter is notified, finishCallback will be called while holding replCoord _mutex
-    // since WaiterLists are protected by _mutex.
-    //
-    // This is used when we want to run a callback when the opTime is reached.
-    struct CallbackWaiter : public Waiter {
-        using FinishFunc = stdx::function<void()>;
-
-        CallbackWaiter(OpTime _opTime, FinishFunc _finishCallback);
-        void notify_inlock() override;
-        bool runs_once() const override {
-            return true;
-        }
-
-        // The callback that will be called when this waiter is notified.
-        FinishFunc finishCallback = nullptr;
-    };
-
-    class WaiterGuard;
+    using SharedWaiterHandle = std::shared_ptr<Waiter>;
 
     class WaiterList {
     public:
-        using WaiterType = Waiter*;
-
         // Adds waiter into the list.
-        void add_inlock(WaiterType waiter);
+        void add_inlock(const OpTime& opTime, SharedWaiterHandle waiter);
+        // Adds a waiter into the list and returns the future of the waiter's promise.
+        SharedSemiFuture<void> add_inlock(const OpTime& opTime,
+                                          boost::optional<WriteConcernOptions> w = boost::none);
         // Returns whether waiter is found and removed.
-        bool remove_inlock(WaiterType waiter);
-        // Signals all waiters that satisfy the condition.
-        void signalIf_inlock(stdx::function<bool(WaiterType)> fun);
-        // Signals all waiters from the list.
-        void signalAll_inlock();
+        bool remove_inlock(SharedWaiterHandle waiter);
+        // Signals all waiters whose opTime is <= the given opTime (if any) that satisfy the
+        // condition in func.
+        template <typename Func>
+        void setValueIf_inlock(Func&& func, boost::optional<OpTime> opTime = boost::none);
+        // Signals all waiters from the list and fulfills promises with OK status.
+        void setValueAll_inlock();
+        // Signals all waiters from the list and fulfills promises with Error status.
+        void setErrorAll_inlock(Status status);
 
     private:
-        std::vector<WaiterType> _list;
+        // Waiters sorted by OpTime.
+        std::multimap<OpTime, SharedWaiterHandle> _waiters;
     };
 
     typedef std::vector<executor::TaskExecutor::CallbackHandle> HeartbeatHandles;
@@ -591,8 +633,7 @@ private:
     // The state and logic of primary catchup.
     //
     // When start() is called, CatchupState will schedule the timeout callback. When we get
-    // responses of the latest heartbeats from all nodes, the target time (opTime of _waiter) is
-    // set.
+    // responses of the latest heartbeats from all nodes, the _targetOpTime is set.
     // The primary exits catchup mode when any of the following happens.
     //   1) My last applied optime reaches the target optime, if we've received a heartbeat from all
     //      nodes.
@@ -613,17 +654,22 @@ private:
         // start() can only be called once.
         void start_inlock();
         // Reset the state itself to destruct the state.
-        void abort_inlock();
+        void abort_inlock(PrimaryCatchUpConclusionReason reason);
         // Heartbeat calls this function to update the target optime.
         void signalHeartbeatUpdate_inlock();
+        // Increment the counter for the number of ops applied during catchup.
+        void incrementNumCatchUpOps_inlock(long numOps);
 
     private:
         ReplicationCoordinatorImpl* _repl;  // Not owned.
         // Callback handle used to cancel a scheduled catchup timeout callback.
         executor::TaskExecutor::CallbackHandle _timeoutCbh;
-        // Handle to a Waiter that contains the current target optime to reach after which
-        // we can exit catchup mode.
-        std::unique_ptr<CallbackWaiter> _waiter;
+        // Target optime to reach after which we can exit catchup mode.
+        OpTime _targetOpTime;
+        // Handle to a Waiter that waits for the _targetOpTime.
+        SharedWaiterHandle _waiter;
+        // Counter for the number of ops applied during catchup.
+        long _numCatchUpOps = 0;
     };
 
     // Inner class to manage the concurrency of _canAcceptNonLocalWrites and _canServeNonLocalReads.
@@ -657,7 +703,7 @@ private:
         // it, must have either the RSTL or the replication coordinator mutex. To set it, must have
         // both the RSTL in mode X and the replication coordinator mutex.
         // Always true for standalone nodes.
-        bool _canAcceptNonLocalWrites;
+        AtomicWord<bool> _canAcceptNonLocalWrites;
 
         // Flag that indicates whether reads from databases other than "local" are allowed. Unlike
         // _canAcceptNonLocalWrites, above, this question is about admission control on secondaries.
@@ -671,6 +717,13 @@ private:
     void _resetMyLastOpTimes(WithLock lk);
 
     /**
+     * Returns a new WriteConcernOptions based on "wc" but with UNSET syncMode reset to JOURNAL or
+     * NONE based on our rsConfig.
+     */
+    WriteConcernOptions _populateUnsetWriteConcernOptionsSyncMode(WithLock lk,
+                                                                  WriteConcernOptions wc);
+
+    /**
      * Returns the _writeConcernMajorityJournalDefault of our current _rsConfig.
      */
     bool getWriteConcernMajorityShouldJournal_inlock() const;
@@ -681,9 +734,10 @@ private:
     OpTime _getCurrentCommittedSnapshotOpTime_inlock() const;
 
     /**
-     * Returns the OpTime of the current committed snapshot converted to LogicalTime.
+     * Returns the OpTime and corresponding wall clock time of the current committed snapshot, if
+     * one exists.
      */
-    LogicalTime _getCurrentCommittedLogicalTime_inlock() const;
+    OpTimeAndWallTime _getCurrentCommittedSnapshotOpTimeAndWallTime_inlock() const;
 
     /**
      *  Verifies that ReadConcernArgs match node's readConcern.
@@ -703,9 +757,10 @@ private:
                                                     int myIndex);
 
     /**
-     * Helper to wake waiters in _replicationWaiterList that are doneWaitingForReplication.
+     * Helper to wake waiters in _replicationWaiterList waiting for opTime <= the opTime passed in
+     * (or all waiters if opTime passed in is boost::none) that are doneWaitingForReplication.
      */
-    void _wakeReadyWaiters_inlock();
+    void _wakeReadyWaiters(WithLock lk, boost::optional<OpTime> opTime = boost::none);
 
     /**
      * Scheduled to cause the ReplicationCoordinator to reconsider any state that might
@@ -720,13 +775,12 @@ private:
     void _performElectionHandoff();
 
     /**
-     * Helper method for _awaitReplication that takes an already locked unique_lock, but leaves
-     * operation timing to the caller.
+     * Helper method for awaitReplication to register a waiter in _replicationWaiterList with the
+     * given opTime and writeConcern. Called while holding _mutex.
      */
-    Status _awaitReplication_inlock(stdx::unique_lock<stdx::mutex>* lock,
-                                    OperationContext* opCtx,
-                                    const OpTime& opTime,
-                                    const WriteConcernOptions& writeConcern);
+    SharedSemiFuture<void> _startWaitingForReplication(WithLock lock,
+                                                       const OpTime& opTime,
+                                                       const WriteConcernOptions& writeConcern);
 
     /**
      * Returns an object with all of the information this node knows about the replica set's
@@ -748,12 +802,13 @@ private:
     Status _checkIfCommitQuorumCanBeSatisfied(WithLock,
                                               const CommitQuorumOptions& commitQuorum) const;
 
-    bool _canAcceptWritesFor_inlock(const NamespaceString& ns);
-
     int _getMyId_inlock() const;
 
     OpTime _getMyLastAppliedOpTime_inlock() const;
+    OpTimeAndWallTime _getMyLastAppliedOpTimeAndWallTime_inlock() const;
+
     OpTime _getMyLastDurableOpTime_inlock() const;
+    OpTimeAndWallTime _getMyLastDurableOpTimeAndWallTime_inlock() const;
 
     /**
      * Helper method for updating our tracking of the last optime applied by a given node.
@@ -772,16 +827,18 @@ private:
      *
      * Lock will be released after this method finishes.
      */
-    void _reportUpstream_inlock(stdx::unique_lock<stdx::mutex> lock);
+    void _reportUpstream_inlock(stdx::unique_lock<Latch> lock);
 
     /**
      * Helpers to set the last applied and durable OpTime.
      */
-    void _setMyLastAppliedOpTime(WithLock lk,
-                                 const OpTime& opTime,
-                                 bool isRollbackAllowed,
-                                 DataConsistency consistency);
-    void _setMyLastDurableOpTime(WithLock lk, const OpTime& opTime, bool isRollbackAllowed);
+    void _setMyLastAppliedOpTimeAndWallTime(WithLock lk,
+                                            const OpTimeAndWallTime& opTime,
+                                            bool isRollbackAllowed,
+                                            DataConsistency consistency);
+    void _setMyLastDurableOpTimeAndWallTime(WithLock lk,
+                                            const OpTimeAndWallTime& opTimeAndWallTime,
+                                            bool isRollbackAllowed);
 
     /**
      * Schedules a heartbeat to be sent to "target" at "when". "targetIndex" is the index
@@ -863,14 +920,14 @@ private:
      */
     void _finishLoadLocalConfig(const executor::TaskExecutor::CallbackArgs& cbData,
                                 const ReplSetConfig& localConfig,
-                                const StatusWith<OpTime>& lastOpTimeStatus,
+                                const StatusWith<OpTimeAndWallTime>& lastOpTimeAndWallTimeStatus,
                                 const StatusWith<LastVote>& lastVoteStatus);
 
     /**
      * Start replicating data, and does an initial sync if needed first.
      */
     void _startDataReplication(OperationContext* opCtx,
-                               stdx::function<void()> startCompleted = nullptr);
+                               std::function<void()> startCompleted = nullptr);
 
     /**
      * Stops replicating data by stopping the applier, fetcher and such.
@@ -888,11 +945,10 @@ private:
      * Finishes the work of processReplSetReconfig, in the event of
      * a successful quorum check.
      */
-    void _finishReplSetReconfig(const executor::TaskExecutor::CallbackArgs& cbData,
+    void _finishReplSetReconfig(OperationContext* opCtx,
                                 const ReplSetConfig& newConfig,
                                 bool isForceReconfig,
-                                int myIndex,
-                                const executor::TaskExecutor::EventHandle& finishedEvent);
+                                int myIndex);
 
     /**
      * Changes _rsConfigState to newState, and notify any waiters.
@@ -942,8 +998,8 @@ private:
      *      _startVoteRequester_inlock()
      *      _onVoteRequestComplete()
      */
-    void _startElectSelfV1_inlock(TopologyCoordinator::StartElectionReason reason);
-    void _startElectSelfV1(TopologyCoordinator::StartElectionReason reason);
+    void _startElectSelfV1_inlock(StartElectionReasonEnum reason);
+    void _startElectSelfV1(StartElectionReasonEnum reason);
 
     /**
      * Callback called when the dryRun VoteRequester has completed; checks the results and
@@ -951,25 +1007,26 @@ private:
      * "originalTerm" was the term during which the dry run began, if the term has since
      * changed, do not run for election.
      */
-    void _processDryRunResult(long long originalTerm);
+    void _processDryRunResult(long long originalTerm, StartElectionReasonEnum reason);
 
     /**
      * Begins executing a real election. This is called either a successful dry run, or when the
      * dry run was skipped (which may be specified for a ReplSetStepUp).
      */
-    void _startRealElection_inlock(long long originalTerm);
+    void _startRealElection_inlock(long long originalTerm, StartElectionReasonEnum reason);
 
     /**
      * Writes the last vote in persistent storage after completing dry run successfully.
      * This job will be scheduled to run in DB worker threads.
      */
     void _writeLastVoteForMyElection(LastVote lastVote,
-                                     const executor::TaskExecutor::CallbackArgs& cbData);
+                                     const executor::TaskExecutor::CallbackArgs& cbData,
+                                     StartElectionReasonEnum reason);
 
     /**
      * Starts VoteRequester to run the real election when last vote write has completed.
      */
-    void _startVoteRequester_inlock(long long newTerm);
+    void _startVoteRequester_inlock(long long newTerm, StartElectionReasonEnum reason);
 
     /**
      * Callback called when the VoteRequester has completed; checks the results and
@@ -977,7 +1034,7 @@ private:
      * "originalTerm" was the term during which the election began, if the term has since
      * changed, do not step up as primary.
      */
-    void _onVoteRequestComplete(long long originalTerm);
+    void _onVoteRequestComplete(long long originalTerm, StartElectionReasonEnum reason);
 
     /**
      * Removes 'host' from the sync source blacklist. If 'host' isn't found, it's simply
@@ -999,15 +1056,12 @@ private:
     executor::TaskExecutor::EventHandle _stepDownStart();
 
     /**
-     * Update the "repl.stepDown.userOperationsRunning" counter and log number of operations
-     * killed and left running on step down.
+     * kill all conflicting operations that are blocked either on prepare conflict or have taken
+     * global lock not in MODE_IS. The conflicting operations can be either user or system
+     * operations marked as killable.
      */
-    void _updateAndLogStatsOnStepDown(const KillOpContainer* koc) const;
-
-    /**
-     * kill all user operations that have taken a global lock except in IS mode.
-     */
-    void _killUserOperationsOnStepDown(const OperationContext* stepDownOpCtx, KillOpContainer* koc);
+    void _killConflictingOpsOnStepUpAndStepDown(AutoGetRstlForStepUpStepDown* arsc,
+                                                ErrorCodes::Error reason);
 
     /**
      * Completes a step-down of the current node.  Must be run with a global
@@ -1016,6 +1070,14 @@ private:
      */
     void _stepDownFinish(const executor::TaskExecutor::CallbackArgs& cbData,
                          const executor::TaskExecutor::EventHandle& finishedEvent);
+
+    /**
+     * Returns true if I am primary in the current configuration but not electable or removed in the
+     * new config.
+     */
+    bool _shouldStepDownOnReconfig(WithLock,
+                                   const ReplSetConfig& newConfig,
+                                   StatusWith<int> myIndex);
 
     /**
      * Schedules a replica set config change.
@@ -1042,27 +1104,32 @@ private:
      *
      * Requires "lock" to own _mutex, and returns the same unique_lock.
      */
-    stdx::unique_lock<stdx::mutex> _handleHeartbeatResponseAction_inlock(
+    stdx::unique_lock<Latch> _handleHeartbeatResponseAction_inlock(
         const HeartbeatResponseAction& action,
         const StatusWith<ReplSetHeartbeatResponse>& responseStatus,
-        stdx::unique_lock<stdx::mutex> lock);
+        stdx::unique_lock<Latch> lock);
 
     /**
-     * Updates the last committed OpTime to be "committedOpTime" if it is more recent than the
-     * current last committed OpTime.
+     * Updates the last committed OpTime to be 'committedOpTime' if it is more recent than the
+     * current last committed OpTime. We ignore 'committedOpTime' if it has a different term than
+     * our lastApplied, unless 'fromSyncSource'=true, which guarantees we are on the same branch of
+     * history as 'committedOpTime', so we update our commit point to min(committedOpTime,
+     * lastApplied).
+     * Also updates corresponding wall clock time.
      */
-    void _advanceCommitPoint(WithLock lk, const OpTime& committedOpTime);
+    void _advanceCommitPoint(WithLock lk,
+                             const OpTimeAndWallTime& committedOpTimeAndWallTime,
+                             bool fromSyncSource);
 
     /**
      * Scan the memberData and determine the highest last applied or last
      * durable optime present on a majority of servers; set _lastCommittedOpTime to this
-     * new entry.  Wake any threads waiting for replication that now have their
-     * write concern satisfied.
+     * new entry.
      *
      * Whether the last applied or last durable op time is used depends on whether
      * the config getWriteConcernMajorityShouldJournal is set.
      */
-    void _updateLastCommittedOpTime(WithLock lk);
+    void _updateLastCommittedOpTimeAndWallTime(WithLock lk);
 
     /**
      * Callback that attempts to set the current term in topology coordinator and
@@ -1101,13 +1168,13 @@ private:
      *
      * Returns true if the value was updated to `newCommittedSnapshot`.
      */
-    bool _updateCommittedSnapshot_inlock(const OpTime& newCommittedSnapshot);
+    bool _updateCommittedSnapshot(WithLock lk, const OpTimeAndWallTime& newCommittedSnapshot);
 
     /**
      * A helper method that returns the current stable optime based on the current commit point and
      * set of stable optime candidates.
      */
-    boost::optional<OpTime> _recalculateStableOpTime(WithLock lk);
+    boost::optional<OpTimeAndWallTime> _recalculateStableOpTime(WithLock lk);
 
     /**
      * Calculates the 'stable' replication optime given a set of optime candidates and a maximum
@@ -1116,15 +1183,17 @@ private:
      *
      * Returns boost::none if there is no satisfactory candidate.
      */
-    boost::optional<OpTime> _chooseStableOpTimeFromCandidates(WithLock lk,
-                                                              const std::set<OpTime>& candidates,
-                                                              OpTime maximumStableOpTime);
+    boost::optional<OpTimeAndWallTime> _chooseStableOpTimeFromCandidates(
+        WithLock lk,
+        const std::set<OpTimeAndWallTime>& candidates,
+        OpTimeAndWallTime maximumStableOpTime);
 
     /**
      * Removes any optimes from the optime set 'candidates' that are less than
      * 'stableOpTime'.
      */
-    void _cleanupStableOpTimeCandidates(std::set<OpTime>* candidates, OpTime stableOpTime);
+    void _cleanupStableOpTimeCandidates(std::set<OpTimeAndWallTime>* candidates,
+                                        OpTimeAndWallTime stableOpTime);
 
     /**
      * Calculates and sets the value of the 'stable' replication optime for the storage engine.  See
@@ -1176,7 +1245,8 @@ private:
     /**
      * Callback which starts an election if this node is electable and using protocolVersion 1.
      */
-    void _startElectSelfIfEligibleV1(TopologyCoordinator::StartElectionReason reason);
+    void _startElectSelfIfEligibleV1(StartElectionReasonEnum reason);
+    void _startElectSelfIfEligibleV1(WithLock, StartElectionReasonEnum reason);
 
     /**
      * Schedules work to be run no sooner than 'when' and returns handle to callback.
@@ -1197,7 +1267,7 @@ private:
      * Wrap a function into executor callback.
      * If the callback is cancelled, the given function won't run.
      */
-    executor::TaskExecutor::CallbackFn _wrapAsCallbackFn(const stdx::function<void()>& work);
+    executor::TaskExecutor::CallbackFn _wrapAsCallbackFn(const std::function<void()>& work);
 
     /**
      * Finish catch-up mode and start drain mode.
@@ -1259,7 +1329,7 @@ private:
     // (I)  Independently synchronized, see member variable comment.
 
     // Protects member data of this ReplicationCoordinator.
-    mutable stdx::mutex _mutex;  // (S)
+    mutable Mutex _mutex = MONGO_MAKE_LATCH("ReplicationCoordinatorImpl::_mutex");  // (S)
 
     // Handles to actively queued heartbeats.
     HeartbeatHandles _heartbeatHandles;  // (M)
@@ -1288,11 +1358,14 @@ private:
     // Pointer to the ReplicationCoordinatorExternalState owned by this ReplicationCoordinator.
     std::unique_ptr<ReplicationCoordinatorExternalState> _externalState;  // (PS)
 
-    // list of information about clients waiting on replication.  Does *not* own the WaiterInfos.
+    // list of information about clients waiting on replication or lastDurable opTime.
+    // Waiters in this list are checked and notified on remote nodes' opTime updates and self's
+    // lastDurable opTime updates. We do not check this list on self's lastApplied opTime updates to
+    // avoid checking all waiters in the list on every write.
     WaiterList _replicationWaiterList;  // (M)
 
-    // list of information about clients waiting for a particular opTime.
-    // Does *not* own the WaiterInfos.
+    // list of information about clients waiting for a particular lastApplied opTime.
+    // Waiters in this list are checked and notified on self's lastApplied opTime updates.
     WaiterList _opTimeWaiterList;  // (M)
 
     // Set to true when we are in the process of shutting down replication.
@@ -1352,27 +1425,16 @@ private:
     std::shared_ptr<InitialSyncer>
         _initialSyncer;  // (I) pointer set under mutex, copied by callers.
 
-    // Hands out the next snapshot name.
-    AtomicWord<unsigned long long> _snapshotNameGenerator;  // (S)
-
-    // The OpTimes and SnapshotNames for all snapshots newer than the current commit point, kept in
-    // sorted order. Any time this is changed, you must also update _uncommitedSnapshotsSize.
-    std::deque<OpTime> _uncommittedSnapshots;  // (M)
-
-    // A cache of the size of _uncommittedSnaphots that can be read without any locking.
-    // May only be written to while holding _mutex.
-    AtomicWord<unsigned long long> _uncommittedSnapshotsSize;  // (I)
-
-    // The non-null OpTime and SnapshotName of the current snapshot used for committed reads, if
-    // there is one.
-    // When engaged, this must be <= _lastCommittedOpTime and < _uncommittedSnapshots.front().
-    boost::optional<OpTime> _currentCommittedSnapshot;  // (M)
+    // The non-null OpTimeAndWallTime and SnapshotName of the current snapshot used for committed
+    // reads, if there is one.
+    // When engaged, this must be <= _lastCommittedOpTime.
+    boost::optional<OpTimeAndWallTime> _currentCommittedSnapshot;  // (M)
 
     // A set of optimes that are used for computing the replication system's current 'stable'
     // optime. Every time a node's applied optime is updated, it will be added to this set.
     // Optimes that are older than the current stable optime should get removed from this set.
     // This set should also be cleared if a rollback occurs.
-    std::set<OpTime> _stableOpTimeCandidates;  // (M)
+    std::set<OpTimeAndWallTime> _stableOpTimeCandidates;  // (M)
 
     // Used to signal threads that are waiting for new committed snapshots.
     stdx::condition_variable _currentCommittedSnapshotCond;  // (M)
@@ -1432,6 +1494,9 @@ private:
     // When we decide to step down due to hearing about a higher term, we remember the term we heard
     // here so we can update our term to match as part of finishing stepdown.
     boost::optional<long long> _pendingTermUpdateDuringStepDown;  // (M)
+
+    // If we're in terminal shutdown.  If true, we'll refuse to vote in elections.
+    bool _inTerminalShutdown = false;  // (M)
 };
 
 }  // namespace repl

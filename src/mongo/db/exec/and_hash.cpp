@@ -29,12 +29,13 @@
 
 #include "mongo/db/exec/and_hash.h"
 
-#include "mongo/db/exec/and_common-inl.h"
+#include <memory>
+
+#include "mongo/db/exec/and_common.h"
 #include "mongo/db/exec/scoped_timer.h"
 #include "mongo/db/exec/working_set.h"
 #include "mongo/db/exec/working_set_common.h"
-#include "mongo/stdx/memory.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace {
 
@@ -48,7 +49,6 @@ namespace mongo {
 
 using std::unique_ptr;
 using std::vector;
-using stdx::make_unique;
 
 const size_t AndHashStage::kLookAheadWorks = 10;
 
@@ -71,8 +71,8 @@ AndHashStage::AndHashStage(OperationContext* opCtx, WorkingSet* ws, size_t maxMe
       _memUsage(0),
       _maxMemUsage(maxMemUsage) {}
 
-void AndHashStage::addChild(PlanStage* child) {
-    _children.emplace_back(child);
+void AndHashStage::addChild(std::unique_ptr<PlanStage> child) {
+    _children.emplace_back(std::move(child));
 }
 
 size_t AndHashStage::getMemUsage() const {
@@ -165,7 +165,7 @@ PlanStage::StageState AndHashStage::doWork(WorkingSetID* out) {
     if (_hashingChildren) {
         // Check memory usage of previously hashed results.
         if (_memUsage > _maxMemUsage) {
-            mongoutils::str::stream ss;
+            str::stream ss;
             ss << "hashed AND stage buffered data usage of " << _memUsage
                << " bytes exceeds internal limit of " << kDefaultMaxMemUsageBytes << " bytes";
             Status status(ErrorCodes::Overflow, ss);
@@ -385,8 +385,8 @@ unique_ptr<PlanStageStats> AndHashStage::getStats() {
     _specificStats.memLimit = _maxMemUsage;
     _specificStats.memUsage = _memUsage;
 
-    unique_ptr<PlanStageStats> ret = make_unique<PlanStageStats>(_commonStats, STAGE_AND_HASH);
-    ret->specific = make_unique<AndHashStats>(_specificStats);
+    unique_ptr<PlanStageStats> ret = std::make_unique<PlanStageStats>(_commonStats, STAGE_AND_HASH);
+    ret->specific = std::make_unique<AndHashStats>(_specificStats);
     for (size_t i = 0; i < _children.size(); ++i) {
         ret->children.emplace_back(_children[i]->getStats());
     }

@@ -32,7 +32,6 @@
 #include <limits>
 #include <wiredtiger.h>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
 #include "mongo/bson/bsonobj.h"
@@ -47,16 +46,12 @@ class WiredTigerConfigParser;
 class WiredTigerKVEngine;
 class WiredTigerSession;
 
-inline bool wt_keeptxnopen() {
-    return false;
-}
-
 Status wtRCToStatus_slow(int retCode, const char* prefix);
 
 /**
  * converts wiredtiger return codes to mongodb statuses.
  */
-inline Status wtRCToStatus(int retCode, const char* prefix = NULL) {
+inline Status wtRCToStatus(int retCode, const char* prefix = nullptr) {
     if (MONGO_likely(retCode == 0))
         return Status::OK();
 
@@ -123,7 +118,8 @@ private:
 };
 
 class WiredTigerUtil {
-    MONGO_DISALLOW_COPYING(WiredTigerUtil);
+    WiredTigerUtil(const WiredTigerUtil&) = delete;
+    WiredTigerUtil& operator=(const WiredTigerUtil&) = delete;
 
 private:
     WiredTigerUtil();
@@ -140,12 +136,18 @@ public:
 
     /**
      * Reads contents of table using URI and exports all keys to BSON as string elements.
-     * Additional, adds 'uri' field to output document.
+     * Additional, adds 'uri' field to output document. A filter can be specified to skip desired
+     * fields.
      */
     static Status exportTableToBSON(WT_SESSION* s,
                                     const std::string& uri,
                                     const std::string& config,
                                     BSONObjBuilder* bob);
+    static Status exportTableToBSON(WT_SESSION* s,
+                                    const std::string& uri,
+                                    const std::string& config,
+                                    BSONObjBuilder* bob,
+                                    const std::vector<std::string>& filter);
 
     /**
      * Appends information about the storage engine's currently available snapshots and the settings
@@ -154,6 +156,7 @@ public:
      * "snapshot-window-settings" : {
      *      "cache pressure percentage threshold" : <num>,
      *      "current cache pressure percentage" : <num>,
+     *      "total number of SnapshotTooOld errors" : <num>,
      *      "max target available snapshots window size in seconds" : <num>,
      *      "target available snapshots window size in seconds" : <num>,
      *      "current available snapshots window size in seconds" : <num>,
@@ -166,14 +169,20 @@ public:
                                              BSONObjBuilder* bob);
 
     /**
-     * Gets entire metadata string for collection/index at URI with the provided session.
+     * Gets the creation metadata string for a collection or index at a given URI. Accepts an
+     * OperationContext or session.
+     *
+     * This returns more information, but is slower than getMetadata().
      */
-    static StatusWith<std::string> getMetadataRaw(WT_SESSION* session, StringData uri);
+    static StatusWith<std::string> getMetadataCreate(OperationContext* opCtx, StringData uri);
+    static StatusWith<std::string> getMetadataCreate(WT_SESSION* session, StringData uri);
 
     /**
-     * Gets entire metadata string for collection/index at URI.
+     * Gets the entire metadata string for collection or index at URI. Accepts an OperationContext
+     * or session.
      */
     static StatusWith<std::string> getMetadata(OperationContext* opCtx, StringData uri);
+    static StatusWith<std::string> getMetadata(WT_SESSION* session, StringData uri);
 
     /**
      * Reads app_metadata for collection/index at URI as a BSON document.
@@ -203,31 +212,10 @@ public:
      * Reads individual statistics using URI.
      * List of statistics keys WT_STAT_* can be found in wiredtiger.h.
      */
-    static StatusWith<uint64_t> getStatisticsValue(WT_SESSION* session,
-                                                   const std::string& uri,
-                                                   const std::string& config,
-                                                   int statisticsKey);
-
-    /**
-     * Reads individual statistics using URI and casts to type ResultType.
-     * Caps statistics value at max(ResultType) in case of overflow.
-     */
-    template <typename ResultType>
-    static StatusWith<ResultType> getStatisticsValueAs(WT_SESSION* session,
-                                                       const std::string& uri,
-                                                       const std::string& config,
-                                                       int statisticsKey);
-
-    /**
-     * Reads individual statistics using URI and casts to type ResultType.
-     * Caps statistics value at 'maximumResultType'.
-     */
-    template <typename ResultType>
-    static StatusWith<ResultType> getStatisticsValueAs(WT_SESSION* session,
-                                                       const std::string& uri,
-                                                       const std::string& config,
-                                                       int statisticsKey,
-                                                       ResultType maximumResultType);
+    static StatusWith<int64_t> getStatisticsValue(WT_SESSION* session,
+                                                  const std::string& uri,
+                                                  const std::string& config,
+                                                  int statisticsKey);
 
     static int64_t getIdentSize(WT_SESSION* s, const std::string& uri);
 
@@ -262,7 +250,7 @@ public:
      */
     static int verifyTable(OperationContext* opCtx,
                            const std::string& uri,
-                           std::vector<std::string>* errors = NULL);
+                           std::vector<std::string>* errors = nullptr);
 
     static bool useTableLogging(NamespaceString ns, bool replEnabled);
 
@@ -287,17 +275,18 @@ private:
 };
 
 class WiredTigerConfigParser {
-    MONGO_DISALLOW_COPYING(WiredTigerConfigParser);
+    WiredTigerConfigParser(const WiredTigerConfigParser&) = delete;
+    WiredTigerConfigParser& operator=(const WiredTigerConfigParser&) = delete;
 
 public:
     WiredTigerConfigParser(StringData config) {
         invariantWTOK(
-            wiredtiger_config_parser_open(NULL, config.rawData(), config.size(), &_parser));
+            wiredtiger_config_parser_open(nullptr, config.rawData(), config.size(), &_parser));
     }
 
     WiredTigerConfigParser(const WT_CONFIG_ITEM& nested) {
         invariant(nested.type == WT_CONFIG_ITEM::WT_CONFIG_ITEM_STRUCT);
-        invariantWTOK(wiredtiger_config_parser_open(NULL, nested.str, nested.len, &_parser));
+        invariantWTOK(wiredtiger_config_parser_open(nullptr, nested.str, nested.len, &_parser));
     }
 
     ~WiredTigerConfigParser() {
@@ -315,31 +304,6 @@ public:
 private:
     WT_CONFIG_PARSER* _parser;
 };
-
-// static
-template <typename ResultType>
-StatusWith<ResultType> WiredTigerUtil::getStatisticsValueAs(WT_SESSION* session,
-                                                            const std::string& uri,
-                                                            const std::string& config,
-                                                            int statisticsKey) {
-    return getStatisticsValueAs<ResultType>(
-        session, uri, config, statisticsKey, std::numeric_limits<ResultType>::max());
-}
-
-// static
-template <typename ResultType>
-StatusWith<ResultType> WiredTigerUtil::getStatisticsValueAs(WT_SESSION* session,
-                                                            const std::string& uri,
-                                                            const std::string& config,
-                                                            int statisticsKey,
-                                                            ResultType maximumResultType) {
-    StatusWith<uint64_t> result = getStatisticsValue(session, uri, config, statisticsKey);
-    if (!result.isOK()) {
-        return StatusWith<ResultType>(result.getStatus());
-    }
-    return StatusWith<ResultType>(
-        _castStatisticsValue<ResultType>(result.getValue(), maximumResultType));
-}
 
 // static
 template <typename ResultType>

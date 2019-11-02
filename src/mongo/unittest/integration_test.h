@@ -29,10 +29,9 @@
 
 #pragma once
 
+#include "mongo/client/connection_string.h"
+
 namespace mongo {
-
-class ConnectionString;
-
 namespace unittest {
 
 /**

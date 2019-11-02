@@ -29,6 +29,8 @@
 
 #include "mongo/platform/basic.h"
 
+#include <memory>
+
 #include "mongo/db/catalog/collection_options.h"
 #include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/client.h"
@@ -40,7 +42,6 @@
 #include "mongo/db/service_context_d_test_fixture.h"
 #include "mongo/logger/logger.h"
 #include "mongo/rpc/get_status_from_command_result.h"
-#include "mongo/stdx/memory.h"
 
 namespace mongo {
 namespace repl {
@@ -91,7 +92,7 @@ void ApplyOpsTest::setUp() {
     auto opCtx = cc().makeOperationContext();
 
     // Set up ReplicationCoordinator and create oplog.
-    ReplicationCoordinator::set(service, stdx::make_unique<ReplicationCoordinatorMock>(service));
+    ReplicationCoordinator::set(service, std::make_unique<ReplicationCoordinatorMock>(service));
     setOplogCollectionName(service);
     createOplog(opCtx.get());
 
@@ -100,13 +101,13 @@ void ApplyOpsTest::setUp() {
     ASSERT_OK(replCoord->setFollowerMode(MemberState::RS_PRIMARY));
 
     // Use OpObserverMock to track notifications for applyOps().
-    auto opObserver = stdx::make_unique<OpObserverMock>();
+    auto opObserver = std::make_unique<OpObserverMock>();
     _opObserver = opObserver.get();
     service->setOpObserver(std::move(opObserver));
 
     // This test uses StorageInterface to create collections and inspect documents inside
     // collections.
-    _storage = stdx::make_unique<StorageInterfaceImpl>();
+    _storage = std::make_unique<StorageInterfaceImpl>();
 }
 
 void ApplyOpsTest::tearDown() {
@@ -141,17 +142,13 @@ TEST_F(ApplyOpsTest, CommandInNestedApplyOpsReturnsSuccess) {
     auto mode = OplogApplication::Mode::kApplyOpsCmd;
     BSONObjBuilder resultBuilder;
     NamespaceString nss("test", "foo");
-    auto innerCmdObj = BSON("op"
-                            << "c"
-                            << "ns"
-                            << nss.getCommandNS().ns()
-                            << "o"
-                            << BSON("create" << nss.coll()));
+    auto innerCmdObj =
+        BSON("op"
+             << "c"
+             << "ns" << nss.getCommandNS().ns() << "o" << BSON("create" << nss.coll()));
     auto innerApplyOpsObj = BSON("op"
                                  << "c"
-                                 << "ns"
-                                 << nss.getCommandNS().ns()
-                                 << "o"
+                                 << "ns" << nss.getCommandNS().ns() << "o"
                                  << BSON("applyOps" << BSON_ARRAY(innerCmdObj)));
     auto cmdObj = BSON("applyOps" << BSON_ARRAY(innerApplyOpsObj));
 
@@ -169,18 +166,13 @@ TEST_F(ApplyOpsTest, InsertInNestedApplyOpsReturnsSuccess) {
     NamespaceString nss("test", "foo");
     auto innerCmdObj = BSON("op"
                             << "i"
-                            << "ns"
-                            << nss.ns()
-                            << "o"
+                            << "ns" << nss.ns() << "o"
                             << BSON("_id"
                                     << "a")
-                            << "ui"
-                            << options.uuid.get());
+                            << "ui" << options.uuid.get());
     auto innerApplyOpsObj = BSON("op"
                                  << "c"
-                                 << "ns"
-                                 << nss.getCommandNS().ns()
-                                 << "o"
+                                 << "ns" << nss.getCommandNS().ns() << "o"
                                  << BSON("applyOps" << BSON_ARRAY(innerCmdObj)));
     auto cmdObj = BSON("applyOps" << BSON_ARRAY(innerApplyOpsObj));
 
@@ -206,18 +198,10 @@ BSONObj makeApplyOpsWithInsertOperation(const NamespaceString& nss,
                                         const BSONObj& documentToInsert) {
     auto insertOp = uuid ? BSON("op"
                                 << "i"
-                                << "ns"
-                                << nss.ns()
-                                << "o"
-                                << documentToInsert
-                                << "ui"
-                                << *uuid)
+                                << "ns" << nss.ns() << "o" << documentToInsert << "ui" << *uuid)
                          : BSON("op"
                                 << "i"
-                                << "ns"
-                                << nss.ns()
-                                << "o"
-                                << documentToInsert);
+                                << "ns" << nss.ns() << "o" << documentToInsert);
     return BSON("applyOps" << BSON_ARRAY(insertOp));
 }
 
@@ -362,7 +346,7 @@ OplogEntry makeOplogEntry(OpTypeEnum opType, const BSONObj& oField) {
                       boost::none,                 // o2
                       {},                          // sessionInfo
                       boost::none,                 // upsert
-                      boost::none,                 // wall clock time
+                      Date_t(),                    // wall clock time
                       boost::none,                 // statement id
                       boost::none,   // optime of previous write within same transaction
                       boost::none,   // pre-image optime
@@ -395,53 +379,35 @@ TEST_F(ApplyOpsTest, ExtractOperationsReturnsOperationsWithSameOpTimeAsApplyOps)
     auto ui1 = UUID::gen();
     auto op1 = BSON("op"
                     << "i"
-                    << "ns"
-                    << ns1.ns()
-                    << "ui"
-                    << ui1
-                    << "o"
-                    << BSON("_id" << 1));
+                    << "ns" << ns1.ns() << "ui" << ui1 << "o" << BSON("_id" << 1));
 
     NamespaceString ns2("test.b");
     auto ui2 = UUID::gen();
     auto op2 = BSON("op"
                     << "i"
-                    << "ns"
-                    << ns2.ns()
-                    << "ui"
-                    << ui2
-                    << "o"
-                    << BSON("_id" << 2));
+                    << "ns" << ns2.ns() << "ui" << ui2 << "o" << BSON("_id" << 2));
 
     NamespaceString ns3("test.c");
     auto ui3 = UUID::gen();
     auto op3 = BSON("op"
                     << "u"
-                    << "ns"
-                    << ns3.ns()
-                    << "ui"
-                    << ui3
-                    << "b"
-                    << true
-                    << "o"
-                    << BSON("x" << 1)
-                    << "o2"
-                    << BSON("_id" << 3));
+                    << "ns" << ns3.ns() << "ui" << ui3 << "b" << true << "o" << BSON("x" << 1)
+                    << "o2" << BSON("_id" << 3));
 
     auto oplogEntry =
         makeOplogEntry(OpTypeEnum::kCommand, BSON("applyOps" << BSON_ARRAY(op1 << op2 << op3)));
 
     auto operations = ApplyOps::extractOperations(oplogEntry);
-    ASSERT_EQUALS(3U, operations.size()) << "Unexpected number of operations extracted: "
-                                         << oplogEntry.toBSON();
+    ASSERT_EQUALS(3U, operations.size())
+        << "Unexpected number of operations extracted: " << oplogEntry.toBSON();
 
     // Check extracted CRUD operations.
     auto it = operations.cbegin();
     {
         ASSERT(operations.cend() != it);
         const auto& operation1 = *(it++);
-        ASSERT(OpTypeEnum::kInsert == operation1.getOpType()) << "Unexpected op type: "
-                                                              << operation1.toBSON();
+        ASSERT(OpTypeEnum::kInsert == operation1.getOpType())
+            << "Unexpected op type: " << operation1.toBSON();
         ASSERT_EQUALS(ui1, *operation1.getUuid());
         ASSERT_EQUALS(ns1, operation1.getNss());
         ASSERT_BSONOBJ_EQ(BSON("_id" << 1), operation1.getOperationToApply());
@@ -453,8 +419,8 @@ TEST_F(ApplyOpsTest, ExtractOperationsReturnsOperationsWithSameOpTimeAsApplyOps)
     {
         ASSERT(operations.cend() != it);
         const auto& operation2 = *(it++);
-        ASSERT(OpTypeEnum::kInsert == operation2.getOpType()) << "Unexpected op type: "
-                                                              << operation2.toBSON();
+        ASSERT(OpTypeEnum::kInsert == operation2.getOpType())
+            << "Unexpected op type: " << operation2.toBSON();
         ASSERT_EQUALS(ui2, *operation2.getUuid());
         ASSERT_EQUALS(ns2, operation2.getNss());
         ASSERT_BSONOBJ_EQ(BSON("_id" << 2), operation2.getOperationToApply());
@@ -466,11 +432,11 @@ TEST_F(ApplyOpsTest, ExtractOperationsReturnsOperationsWithSameOpTimeAsApplyOps)
     {
         ASSERT(operations.cend() != it);
         const auto& operation3 = *(it++);
-        ASSERT(OpTypeEnum::kUpdate == operation3.getOpType()) << "Unexpected op type: "
-                                                              << operation3.toBSON();
+        ASSERT(OpTypeEnum::kUpdate == operation3.getOpType())
+            << "Unexpected op type: " << operation3.toBSON();
         ASSERT_EQUALS(ui3, *operation3.getUuid());
         ASSERT_EQUALS(ns3, operation3.getNss());
-        ASSERT_BSONOBJ_EQ(BSON("_id" << 3), operation3.getOperationToApply());
+        ASSERT_BSONOBJ_EQ(BSON("x" << 1), operation3.getOperationToApply());
 
         auto optionalUpsertBool = operation3.getUpsert();
         ASSERT(optionalUpsertBool);
@@ -495,9 +461,7 @@ TEST_F(ApplyOpsTest, ApplyOpsFailsToDropAdmin) {
 
     auto dropDatabaseOp = BSON("op"
                                << "c"
-                               << "ns"
-                               << nss.getCommandNS().ns()
-                               << "o"
+                               << "ns" << nss.getCommandNS().ns() << "o"
                                << BSON("dropDatabase" << 1));
 
     auto dropDatabaseCmdObj = BSON("applyOps" << BSON_ARRAY(dropDatabaseOp));

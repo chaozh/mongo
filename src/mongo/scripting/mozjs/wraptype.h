@@ -67,20 +67,22 @@
 
 #define MONGO_ATTACH_JS_FUNCTION(name) MONGO_ATTACH_JS_FUNCTION_WITH_FLAGS(name, 0)
 
-#define MONGO_ATTACH_JS_CONSTRAINED_METHOD(name, ...)                                              \
-    {                                                                                              \
-        #name, {smUtils::wrapConstrainedMethod < Functions::name, false, __VA_ARGS__ >, nullptr }, \
-                0,                                                                                 \
-                0,                                                                                 \
-                nullptr                                                                            \
+#define MONGO_ATTACH_JS_CONSTRAINED_METHOD(name, ...)                                          \
+    {                                                                                          \
+#name,                                                                                 \
+            {smUtils::wrapConstrainedMethod < Functions::name, false, __VA_ARGS__>, nullptr }, \
+             0,                                                                                \
+             0,                                                                                \
+             nullptr                                                                           \
     }
 
-#define MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(name, ...)                                    \
-    {                                                                                             \
-        #name, {smUtils::wrapConstrainedMethod < Functions::name, true, __VA_ARGS__ >, nullptr }, \
-                0,                                                                                \
-                0,                                                                                \
-                nullptr                                                                           \
+#define MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(name, ...)                                \
+    {                                                                                         \
+#name,                                                                                \
+            {smUtils::wrapConstrainedMethod < Functions::name, true, __VA_ARGS__>, nullptr }, \
+             0,                                                                               \
+             0,                                                                               \
+             nullptr                                                                          \
     }
 
 namespace mongo {
@@ -224,6 +226,15 @@ bool resolve(JSContext* cx, JS::HandleObject obj, JS::HandleId id, bool* resolve
     }
 };
 
+template <typename T>
+void trace(JSTracer* trc, JSObject* obj) {
+    try {
+        T::trace(trc, obj);
+    } catch (...) {
+        invariant(false);
+    }
+};
+
 }  // namespace smUtils
 
 template <typename T>
@@ -250,7 +261,7 @@ public:
                        T::call != BaseInfo::call ? smUtils::call<T> : nullptr,
                        T::hasInstance != BaseInfo::hasInstance ? smUtils::hasInstance<T> : nullptr,
                        T::construct != BaseInfo::construct ? smUtils::construct<T> : nullptr,
-                       nullptr}),  // trace
+                       T::trace != BaseInfo::trace ? smUtils::trace<T> : nullptr}),
           _jsoOps({
               nullptr,  // lookupProperty
               nullptr,  // defineProperty

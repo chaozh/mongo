@@ -50,7 +50,7 @@
 #include "mongo/db/query/planner_wildcard_helpers.h"
 #include "mongo/db/query/query_knobs_gen.h"
 #include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 #include "third_party/s2/s2cell.h"
 #include "third_party/s2/s2regioncoverer.h"
 
@@ -137,6 +137,20 @@ void makeNullEqualityBounds(const IndexEntry& index,
     // Just to be sure, make sure the bounds are in the right order if the hash values are opposite.
     IndexBoundsBuilder::unionize(oil);
 }
+
+bool isEqualityOrInNull(MatchExpression* me) {
+    if (MatchExpression::EQ == me->matchType()) {
+        return static_cast<ComparisonMatchExpression*>(me)->getData().type() == BSONType::jstNULL;
+    }
+
+    if (me->matchType() == MatchExpression::MATCH_IN) {
+        const InMatchExpression* in = static_cast<const InMatchExpression*>(me);
+        return in->hasNull();
+    }
+
+    return false;
+}
+
 }  // namespace
 
 string IndexBoundsBuilder::simpleRegex(const char* regex,
@@ -194,7 +208,7 @@ string IndexBoundsBuilder::simpleRegex(const char* regex,
         }
     }
 
-    mongoutils::str::stream ss;
+    str::stream ss;
 
     string r = "";
     while (*regex) {
@@ -261,6 +275,13 @@ void IndexBoundsBuilder::allValuesForField(const BSONElement& elt, OrderedInterv
     out->name = elt.fieldName();
     out->intervals.push_back(
         makeRangeInterval(bob.obj(), BoundInclusion::kIncludeBothStartAndEndKeys));
+}
+
+Interval IndexBoundsBuilder::allValuesRespectingInclusion(BoundInclusion bi) {
+    BSONObjBuilder bob;
+    bob.appendMinKey("");
+    bob.appendMaxKey("");
+    return makeRangeInterval(bob.obj(), bi);
 }
 
 Interval IndexBoundsBuilder::allValues() {
@@ -361,7 +382,7 @@ void IndexBoundsBuilder::_translatePredicate(const MatchExpression* expr,
     oilOut->name = elt.fieldName();
 
     bool isHashed = false;
-    if (mongoutils::str::equals("hashed", elt.valuestrsafe())) {
+    if (elt.valueStringDataSafe() == "hashed") {
         isHashed = true;
     }
 
@@ -421,11 +442,11 @@ void IndexBoundsBuilder::_translatePredicate(const MatchExpression* expr,
         // Until the index distinguishes between missing values and literal null values, we cannot
         // build exact bounds for equality predicates on the literal value null. However, we _can_
         // build exact bounds for the inverse, for example the query {a: {$ne: null}}.
-        if (MatchExpression::EQ == child->matchType() &&
-            static_cast<ComparisonMatchExpression*>(child)->getData().type() == BSONType::jstNULL) {
+        if (isEqualityOrInNull(child)) {
             *tightnessOut = IndexBoundsBuilder::EXACT;
         }
 
+        // If this invariant would fail, we would otherwise return incorrect query results.
         invariant(*tightnessOut == IndexBoundsBuilder::EXACT);
 
         // If the index is multikey on this path, it doesn't matter what the tightness of the child
@@ -512,9 +533,10 @@ void IndexBoundsBuilder::_translatePredicate(const MatchExpression* expr,
         const LTMatchExpression* node = static_cast<const LTMatchExpression*>(expr);
         BSONElement dataElt = node->getData();
 
-        // Everything is <= MaxKey.
+        // Everything is < MaxKey, except for MaxKey.
         if (MaxKey == dataElt.type()) {
-            oilOut->intervals.push_back(allValues());
+            oilOut->intervals.push_back(allValuesRespectingInclusion(
+                IndexBounds::makeBoundInclusionFromBoundBools(true, false)));
             *tightnessOut =
                 index.collator ? IndexBoundsBuilder::INEXACT_FETCH : IndexBoundsBuilder::EXACT;
             return;
@@ -550,9 +572,10 @@ void IndexBoundsBuilder::_translatePredicate(const MatchExpression* expr,
         const GTMatchExpression* node = static_cast<const GTMatchExpression*>(expr);
         BSONElement dataElt = node->getData();
 
-        // Everything is > MinKey.
+        // Everything is > MinKey, except MinKey.
         if (MinKey == dataElt.type()) {
-            oilOut->intervals.push_back(allValues());
+            oilOut->intervals.push_back(allValuesRespectingInclusion(
+                IndexBounds::makeBoundInclusionFromBoundBools(false, true)));
             *tightnessOut =
                 index.collator ? IndexBoundsBuilder::INEXACT_FETCH : IndexBoundsBuilder::EXACT;
             return;
@@ -716,15 +739,14 @@ void IndexBoundsBuilder::_translatePredicate(const MatchExpression* expr,
             unionize(oilOut);
     } else if (MatchExpression::GEO == expr->matchType()) {
         const GeoMatchExpression* gme = static_cast<const GeoMatchExpression*>(expr);
-
-        if (mongoutils::str::equals("2dsphere", elt.valuestrsafe())) {
+        if ("2dsphere" == elt.valueStringDataSafe()) {
             verify(gme->getGeoExpression().getGeometry().hasS2Region());
             const S2Region& region = gme->getGeoExpression().getGeometry().getS2Region();
             S2IndexingParams indexParams;
             ExpressionParams::initialize2dsphereParams(index.infoObj, index.collator, &indexParams);
             ExpressionMapping::cover2dsphere(region, indexParams, oilOut);
             *tightnessOut = IndexBoundsBuilder::INEXACT_FETCH;
-        } else if (mongoutils::str::equals("2d", elt.valuestrsafe())) {
+        } else if ("2d" == elt.valueStringDataSafe()) {
             verify(gme->getGeoExpression().getGeometry().hasR2Region());
             const R2Region& region = gme->getGeoExpression().getGeometry().getR2Region();
 
@@ -739,7 +761,7 @@ void IndexBoundsBuilder::_translatePredicate(const MatchExpression* expr,
         }
     } else {
         warning() << "Planner error, trying to build bounds for expression: "
-                  << redact(expr->toString());
+                  << redact(expr->debugString());
         verify(0);
     }
 }

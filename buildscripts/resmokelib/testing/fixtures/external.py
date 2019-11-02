@@ -1,12 +1,14 @@
 """External fixture for executing JSTests against."""
 
-from __future__ import absolute_import
-
 from . import interface
 
 
 class ExternalFixture(interface.Fixture):
     """Fixture which provides JSTests capability to connect to external (non-resmoke) cluster."""
+
+    def pids(self):
+        """:return: no pids are owned by this fixture."""
+        return []
 
     def __init__(self, logger, job_num, shell_conn_string=None):
         """Initialize ExternalFixture."""

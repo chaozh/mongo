@@ -29,9 +29,10 @@
 
 #pragma once
 
+#include <memory>
+
 #include "mongo/base/string_data.h"
 #include "mongo/db/update/modifier_node.h"
-#include "mongo/stdx/memory.h"
 
 namespace mongo {
 
@@ -45,10 +46,16 @@ public:
     Status init(BSONElement modExpr, const boost::intrusive_ptr<ExpressionContext>& expCtx) final;
 
     std::unique_ptr<UpdateNode> clone() const final {
-        return stdx::make_unique<SetNode>(*this);
+        return std::make_unique<SetNode>(*this);
     }
 
     void setCollator(const CollatorInterface* collator) final {}
+
+    void acceptVisitor(UpdateNodeVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    BSONElement val;
 
 protected:
     ModifyResult updateExistingElement(mutablebson::Element* element,
@@ -69,10 +76,8 @@ private:
     }
 
     BSONObj operatorValue() const final {
-        return BSON("" << _val);
+        return BSON("" << val);
     }
-
-    BSONElement _val;
 };
 
 }  // namespace mongo

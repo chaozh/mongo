@@ -43,14 +43,15 @@ namespace repl {
 
 class OplogInterfaceLocal : public OplogInterface {
 public:
-    OplogInterfaceLocal(OperationContext* opCtx, const std::string& collectionName);
+    OplogInterfaceLocal(OperationContext* opCtx);
     std::string toString() const override;
     std::unique_ptr<OplogInterface::Iterator> makeIterator() const override;
+    std::unique_ptr<TransactionHistoryIteratorBase> makeTransactionHistoryIterator(
+        const OpTime& startingOpTime, bool permitYield = false) const override;
     HostAndPort hostAndPort() const override;
 
 private:
     OperationContext* _opCtx;
-    std::string _collectionName;
 };
 
 }  // namespace repl

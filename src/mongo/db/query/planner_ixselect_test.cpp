@@ -51,8 +51,8 @@ namespace {
 
 constexpr CollatorInterface* kSimpleCollator = nullptr;
 
-using std::unique_ptr;
 using std::string;
+using std::unique_ptr;
 using std::vector;
 
 /**
@@ -70,7 +70,7 @@ unique_ptr<MatchExpression> parseMatchExpression(const BSONObj& obj) {
  */
 template <typename Iter>
 string toString(Iter begin, Iter end) {
-    mongoutils::str::stream ss;
+    str::stream ss;
     ss << "[";
     for (Iter i = begin; i != end; i++) {
         if (i != begin) {
@@ -100,7 +100,7 @@ void testGetFields(const char* query, const char* prefix, const char* expectedFi
     for (vector<string>::const_iterator i = expectedFields.begin(); i != expectedFields.end();
          i++) {
         if (fields.find(*i) == fields.end()) {
-            mongoutils::str::stream ss;
+            str::stream ss;
             ss << "getFields(query=" << query << ", prefix=" << prefix << "): unable to find " << *i
                << " in result: " << toString(fields.begin(), fields.end());
             FAIL(ss);
@@ -109,7 +109,7 @@ void testGetFields(const char* query, const char* prefix, const char* expectedFi
 
     // Next, confirm that results do not contain any unexpected fields.
     if (fields.size() != expectedFields.size()) {
-        mongoutils::str::stream ss;
+        str::stream ss;
         ss << "getFields(query=" << query << ", prefix=" << prefix
            << "): unexpected fields in result. expected: "
            << toString(expectedFields.begin(), expectedFields.end())
@@ -173,8 +173,8 @@ void findRelevantTaggedNodePathsAndIndices(MatchExpression* root,
         tag->debugString(&buf);
         RelevantTag* r = dynamic_cast<RelevantTag*>(tag);
         if (!r) {
-            mongoutils::str::stream ss;
-            ss << "tag is not instance of RelevantTag. tree: " << root->toString()
+            str::stream ss;
+            ss << "tag is not instance of RelevantTag. tree: " << root->debugString()
                << "; tag: " << buf.str();
             FAIL(ss);
         }
@@ -235,7 +235,7 @@ void testRateIndices(const char* query,
 
     // Compare the expected indices with the actual indices.
     if (actualIndices != expectedIndices) {
-        mongoutils::str::stream ss;
+        str::stream ss;
         ss << "rateIndices(query=" << query << ", prefix=" << prefix
            << "): expected indices did not match actual indices. expected: "
            << toString(expectedIndices.begin(), expectedIndices.end())
@@ -247,7 +247,7 @@ void testRateIndices(const char* query,
     // First verify number of paths retrieved.
     vector<string> expectedPaths = StringSplitter::split(expectedPathsStr, ",");
     if (paths.size() != expectedPaths.size()) {
-        mongoutils::str::stream ss;
+        str::stream ss;
         ss << "rateIndices(query=" << query << ", prefix=" << prefix
            << "): unexpected number of tagged nodes found. expected: "
            << toString(expectedPaths.begin(), expectedPaths.end())
@@ -262,7 +262,7 @@ void testRateIndices(const char* query,
         if (*i == *j) {
             continue;
         }
-        mongoutils::str::stream ss;
+        str::stream ss;
         ss << "rateIndices(query=" << query << ", prefix=" << prefix
            << "): unexpected path found. expected: " << *j << " "
            << toString(expectedPaths.begin(), expectedPaths.end()) << ". actual: " << *i << " "
@@ -1131,8 +1131,7 @@ TEST(QueryPlannerIXSelectTest, InternalExprEqCanUseHashedIndex) {
 TEST(QueryPlannerIXSelectTest, InternalExprEqCannotUseTextIndexPrefix) {
     auto entry = buildSimpleIndexEntry(BSON("a" << 1 << "_fts"
                                                 << "text"
-                                                << "_ftsx"
-                                                << 1));
+                                                << "_ftsx" << 1));
     std::vector<IndexEntry> indices;
     indices.push_back(entry);
     std::set<size_t> expectedIndices;
@@ -1143,10 +1142,7 @@ TEST(QueryPlannerIXSelectTest, InternalExprEqCannotUseTextIndexPrefix) {
 TEST(QueryPlannerIXSelectTest, InternalExprEqCanUseTextIndexSuffix) {
     auto entry = buildSimpleIndexEntry(BSON("_fts"
                                             << "text"
-                                            << "_ftsx"
-                                            << 1
-                                            << "a"
-                                            << 1));
+                                            << "_ftsx" << 1 << "a" << 1));
     std::vector<IndexEntry> indices;
     indices.push_back(entry);
     std::set<size_t> expectedIndices = {0};

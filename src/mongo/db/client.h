@@ -39,8 +39,6 @@
 
 #include <boost/optional.hpp>
 
-#include "mongo/base/disallow_copying.h"
-#include "mongo/db/client.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/service_context.h"
 #include "mongo/platform/random.h"
@@ -76,6 +74,11 @@ public:
     static void initThread(StringData desc,
                            ServiceContext* serviceContext,
                            transport::SessionHandle session);
+
+    /**
+     * Same as initThread, but also explicitly sets the client for this thread to be killable.
+     */
+    static void initKillableThread(StringData desc, ServiceContext* serviceContext);
 
     /**
      * Moves client into the thread_local for this thread. After this call, Client::getCurrent
@@ -123,6 +126,10 @@ public:
      */
     const transport::SessionHandle& session() const& {
         return _session;
+    }
+
+    boost::optional<std::string> getSniNameForSession() const {
+        return _session ? _session->getSniName() : boost::none;
     }
 
     transport::SessionHandle session() && {
@@ -193,6 +200,30 @@ public:
     bool isFromUserConnection() const {
         return _connectionId > 0;
     }
+    bool isFromSystemConnection() const {
+        return _connectionId == 0;
+    }
+
+    /**
+     * Used to set system operations as killable. This should only be called once per Client and
+     * only from system connections. The Client should be locked by the caller.
+     */
+    void setSystemOperationKillable(WithLock) {
+        // This can only be changed once for system operations.
+        invariant(isFromSystemConnection());
+        invariant(!_systemOperationKillable);
+        _systemOperationKillable = true;
+    }
+
+    /**
+     * Used to determine whether a system operation is killable that was started by a system
+     * connection. The Client should be locked by the caller.
+     */
+    bool shouldKillSystemOperation(WithLock) const {
+        // Should only be called on system operations.
+        invariant(isFromSystemConnection());
+        return _systemOperationKillable;
+    }
 
     PseudoRandom& getPrng() {
         return _prng;
@@ -222,6 +253,9 @@ private:
 
     // If != NULL, then contains the currently active OperationContext
     OperationContext* _opCtx = nullptr;
+
+    // If the active system client operation is allowed to be killed.
+    bool _systemOperationKillable = false;
 
     PseudoRandom _prng;
 };

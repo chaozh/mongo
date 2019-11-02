@@ -88,7 +88,7 @@
 #include "mongo/db/write_concern.h"
 #include "mongo/s/stale_exception.h"
 #include "mongo/scripting/engine.h"
-#include "mongo/util/fail_point_service.h"
+#include "mongo/util/fail_point.h"
 #include "mongo/util/log.h"
 #include "mongo/util/md5.hpp"
 #include "mongo/util/scopeguard.h"
@@ -108,7 +108,7 @@ namespace {
 /**
  * Sets the profiling level, logging/profiling threshold, and logging/profiling sample rate for the
  * given database.
-*/
+ */
 class CmdProfile : public ProfileCmdBase {
 public:
     CmdProfile() = default;
@@ -117,6 +117,11 @@ protected:
     int _applyProfilingLevel(OperationContext* opCtx,
                              const std::string& dbName,
                              int profilingLevel) const final {
+
+        // The system.profile collection is non-replicated, so writes to it do not cause
+        // replication lag. As such, they should be excluded from Flow Control.
+        opCtx->setShouldParticipateInFlowControl(false);
+
         const bool readOnly = (profilingLevel < 0 || profilingLevel > 2);
         const LockMode dbMode = readOnly ? MODE_S : MODE_X;
 
@@ -200,8 +205,7 @@ public:
                 uassert(50847,
                         str::stream() << "The element that calls binDataClean() must be type of "
                                          "BinData, but type of "
-                                      << typeName(stateElem.type())
-                                      << " found.",
+                                      << typeName(stateElem.type()) << " found.",
                         (stateElem.type() == BSONType::BinData));
 
                 int len;
@@ -216,7 +220,7 @@ public:
         BSONObj sort = BSON("files_id" << 1 << "n" << 1);
 
         return writeConflictRetry(opCtx, "filemd5", dbname, [&] {
-            auto qr = stdx::make_unique<QueryRequest>(nss);
+            auto qr = std::make_unique<QueryRequest>(nss);
             qr->setFilter(query);
             qr->setSort(sort);
 
@@ -259,13 +263,13 @@ public:
                 Lock::DBLock dbLock(opCtx, nss.db(), MODE_IS);
                 invariant(dbLock.isLocked(),
                           "Expected lock acquisition to succeed due to UninterruptibleLockGuard");
-                Lock::CollectionLock collLock(opCtx->lockState(), nss.ns(), MODE_IS);
+                Lock::CollectionLock collLock(opCtx, nss, MODE_IS);
                 exec.reset();
             });
 
             BSONObj obj;
             PlanExecutor::ExecState state;
-            while (PlanExecutor::ADVANCED == (state = exec->getNext(&obj, NULL))) {
+            while (PlanExecutor::ADVANCED == (state = exec->getNext(&obj, nullptr))) {
                 BSONElement ne = obj["n"];
                 verify(ne.isNumber());
                 int myn = ne.numberInt();
@@ -288,8 +292,7 @@ public:
                 uassert(50849,
                         str::stream() << "The element that calls binDataClean() must be type "
                                          "of BinData, but type of "
-                                      << owned["data"].type()
-                                      << " found.",
+                                      << owned["data"].type() << " found.",
                         owned["data"].type() == BSONType::BinData);
 
                 exec->saveState();

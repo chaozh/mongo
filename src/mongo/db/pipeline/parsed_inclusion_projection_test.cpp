@@ -36,19 +36,17 @@
 #include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/bson/json.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/document_value_test_util.h"
+#include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/pipeline/dependencies.h"
-#include "mongo/db/pipeline/document.h"
-#include "mongo/db/pipeline/document_value_test_util.h"
 #include "mongo/db/pipeline/expression_context_for_test.h"
-#include "mongo/db/pipeline/value.h"
 #include "mongo/unittest/death_test.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
 namespace parsed_aggregation_projection {
 namespace {
-
-using ProjectionPolicies = ParsedAggregationProjection::ProjectionPolicies;
 
 using std::vector;
 
@@ -60,24 +58,26 @@ BSONObj wrapInLiteral(const T& arg) {
 // Helper to simplify the creation of a ParsedInclusionProjection with default policies.
 ParsedInclusionProjection makeInclusionProjectionWithDefaultPolicies() {
     const boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    ParsedAggregationProjection::ProjectionPolicies defaultPolicies;
+    ProjectionPolicies defaultPolicies;
     return {expCtx, defaultPolicies};
 }
 
 // Helper to simplify the creation of a ParsedInclusionProjection which excludes _id by default.
 ParsedInclusionProjection makeInclusionProjectionWithDefaultIdExclusion() {
     const boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    ParsedAggregationProjection::ProjectionPolicies defaultExcludeId;
-    defaultExcludeId.idPolicy = ProjectionPolicies::DefaultIdPolicy::kExcludeId;
+    ProjectionPolicies defaultExcludeId{ProjectionPolicies::DefaultIdPolicy::kExcludeId,
+                                        ProjectionPolicies::kArrayRecursionPolicyDefault,
+                                        ProjectionPolicies::kComputedFieldsPolicyDefault};
     return {expCtx, defaultExcludeId};
 }
 
 // Helper to simplify the creation of a ParsedInclusionProjection which does not recurse arrays.
 ParsedInclusionProjection makeInclusionProjectionWithNoArrayRecursion() {
     const boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    ParsedAggregationProjection::ProjectionPolicies noArrayRecursion;
-    noArrayRecursion.arrayRecursionPolicy =
-        ProjectionPolicies::ArrayRecursionPolicy::kDoNotRecurseNestedArrays;
+    ProjectionPolicies noArrayRecursion{
+        ProjectionPolicies::kDefaultIdPolicyDefault,
+        ProjectionPolicies::ArrayRecursionPolicy::kDoNotRecurseNestedArrays,
+        ProjectionPolicies::kComputedFieldsPolicyDefault};
     return {expCtx, noArrayRecursion};
 }
 
@@ -240,10 +240,8 @@ TEST(InclusionProjectionExecutionTest, ShouldOptimizeNestedExpressions) {
 
 TEST(InclusionProjectionExecutionTest, ShouldReportThatAllExceptIncludedFieldsAreModified) {
     auto inclusion = makeInclusionProjectionWithDefaultPolicies();
-    inclusion.parse(BSON(
-        "a" << wrapInLiteral("computedVal") << "b.c" << wrapInLiteral("computedVal") << "d" << true
-            << "e.f"
-            << true));
+    inclusion.parse(BSON("a" << wrapInLiteral("computedVal") << "b.c"
+                             << wrapInLiteral("computedVal") << "d" << true << "e.f" << true));
 
     auto modifiedPaths = inclusion.getModifiedPaths();
     ASSERT(modifiedPaths.type == DocumentSource::GetModPathsReturn::Type::kAllExcept);
@@ -261,11 +259,7 @@ TEST(InclusionProjectionExecutionTest,
      ShouldReportThatAllExceptIncludedFieldsAreModifiedWithIdExclusion) {
     auto inclusion = makeInclusionProjectionWithDefaultPolicies();
     inclusion.parse(BSON("_id" << false << "a" << wrapInLiteral("computedVal") << "b.c"
-                               << wrapInLiteral("computedVal")
-                               << "d"
-                               << true
-                               << "e.f"
-                               << true));
+                               << wrapInLiteral("computedVal") << "d" << true << "e.f" << true));
 
     auto modifiedPaths = inclusion.getModifiedPaths();
     ASSERT(modifiedPaths.type == DocumentSource::GetModPathsReturn::Type::kAllExcept);
@@ -573,11 +567,10 @@ TEST(InclusionProjectionExecutionTest, ShouldAllowMixedNestedAndDottedFields) {
     auto inclusion = makeInclusionProjectionWithDefaultPolicies();
     // Include all of "a.b", "a.c", "a.d", and "a.e".
     // Add new computed fields "a.W", "a.X", "a.Y", and "a.Z".
-    inclusion.parse(BSON(
-        "a.b" << true << "a.c" << true << "a.W" << wrapInLiteral("W") << "a.X" << wrapInLiteral("X")
-              << "a"
-              << BSON("d" << true << "e" << true << "Y" << wrapInLiteral("Y") << "Z"
-                          << wrapInLiteral("Z"))));
+    inclusion.parse(BSON("a.b" << true << "a.c" << true << "a.W" << wrapInLiteral("W") << "a.X"
+                               << wrapInLiteral("X") << "a"
+                               << BSON("d" << true << "e" << true << "Y" << wrapInLiteral("Y")
+                                           << "Z" << wrapInLiteral("Z"))));
     auto result = inclusion.applyProjection(Document{
         {"a",
          Document{{"b", "b"_sd}, {"c", "c"_sd}, {"d", "d"_sd}, {"e", "e"_sd}, {"f", "f"_sd}}}});
@@ -640,8 +633,8 @@ TEST(InclusionProjectionExecutionTest, ShouldAlwaysKeepMetadataFromOriginalDoc) 
     inclusion.parse(BSON("a" << true));
 
     MutableDocument inputDocBuilder(Document{{"a", 1}});
-    inputDocBuilder.setRandMetaField(1.0);
-    inputDocBuilder.setTextScore(10.0);
+    inputDocBuilder.metadata().setRandVal(1.0);
+    inputDocBuilder.metadata().setTextScore(10.0);
     Document inputDoc = inputDocBuilder.freeze();
 
     auto result = inclusion.applyProjection(inputDoc);
@@ -837,96 +830,6 @@ TEST(InclusionProjectionExecutionTest, ComputedFieldShouldReplaceNestedArrayForN
     auto expectedResult = Document{{"a", expectedNestedValues}};
     ASSERT_DOCUMENT_EQ(result, expectedResult);
 }
-
-//
-// Detection of subset projection.
-//
-
-TEST(InclusionProjectionExecutionTest, ShouldDetectSubsetForIdenticalProjection) {
-    auto inclusion = makeInclusionProjectionWithDefaultPolicies();
-    inclusion.parse(BSON("a" << true << "b" << true));
-
-    auto proj = BSON("_id" << false << "a" << true << "b" << true);
-
-    ASSERT_TRUE(inclusion.isSubsetOfProjection(proj));
-}
-
-TEST(InclusionProjectionExecutionTest, ShouldDetectSubsetForSupersetProjection) {
-    auto inclusion = makeInclusionProjectionWithDefaultPolicies();
-    inclusion.parse(BSON("a" << true << "b" << true));
-
-    auto proj = BSON("_id" << false << "a" << true << "b" << true << "c" << true);
-
-    ASSERT_TRUE(inclusion.isSubsetOfProjection(proj));
-}
-
-TEST(InclusionProjectionExecutionTest, ShouldDetectSubsetForIdenticalNestedProjection) {
-    auto inclusion = makeInclusionProjectionWithDefaultPolicies();
-    inclusion.parse(BSON("a.b" << true));
-
-    auto proj = BSON("_id" << false << "a.b" << true);
-
-    ASSERT_TRUE(inclusion.isSubsetOfProjection(proj));
-}
-
-TEST(InclusionProjectionExecutionTest, ShouldDetectSubsetForSupersetProjectionWithNestedFields) {
-    auto inclusion = makeInclusionProjectionWithDefaultPolicies();
-    inclusion.parse(BSON("a" << true << "c" << BSON("d" << true)));
-
-    auto proj = BSON("_id" << false << "a" << true << "b" << true << "c.d" << true);
-
-    ASSERT_TRUE(inclusion.isSubsetOfProjection(proj));
-}
-
-TEST(InclusionProjectionExecutionTest, ShouldDetectNonSubsetForProjectionWithMissingFields) {
-    auto inclusion = makeInclusionProjectionWithDefaultPolicies();
-    inclusion.parse(BSON("a" << true << "b" << true));
-
-    auto proj = BSON("_id" << false << "a" << true);
-    ASSERT_FALSE(inclusion.isSubsetOfProjection(proj));
-
-    proj = BSON("_id" << false << "a" << true << "c" << true);
-    ASSERT_FALSE(inclusion.isSubsetOfProjection(proj));
-}
-
-TEST(InclusionProjectionExecutionTest,
-     ShouldDetectNonSubsetForSupersetProjectionWithoutComputedFields) {
-    auto inclusion = makeInclusionProjectionWithDefaultPolicies();
-    inclusion.parse(BSON("a" << true << "b" << true << "c" << BSON("$literal" << 1)));
-
-    auto proj = BSON("_id" << false << "a" << true << "b" << true);
-
-    ASSERT_FALSE(inclusion.isSubsetOfProjection(proj));
-}
-
-TEST(InclusionProjectionExecutionTest, ShouldDetectNonSubsetForProjectionWithMissingNestedFields) {
-    auto inclusion = makeInclusionProjectionWithDefaultPolicies();
-    inclusion.parse(BSON("a.b" << true << "a.c" << true));
-
-    auto proj = BSON("_id" << false << "a.b" << true);
-
-    ASSERT_FALSE(inclusion.isSubsetOfProjection(proj));
-}
-
-TEST(InclusionProjectionExecutionTest, ShouldDetectNonSubsetForProjectionWithRenamedFields) {
-    auto inclusion = makeInclusionProjectionWithDefaultPolicies();
-    inclusion.parse(BSON("a"
-                         << "$b"));
-
-    auto proj = BSON("_id" << false << "b" << true);
-
-    ASSERT_FALSE(inclusion.isSubsetOfProjection(proj));
-}
-
-TEST(InclusionProjectionExecutionTest, ShouldDetectNonSubsetForProjectionWithMissingIdField) {
-    auto inclusion = makeInclusionProjectionWithDefaultPolicies();
-    inclusion.parse(BSON("a" << true));
-
-    auto proj = BSON("a" << true);
-
-    ASSERT_FALSE(inclusion.isSubsetOfProjection(proj));
-}
-
 }  // namespace
 }  // namespace parsed_aggregation_projection
 }  // namespace mongo

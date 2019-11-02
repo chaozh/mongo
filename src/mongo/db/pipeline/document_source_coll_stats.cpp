@@ -46,7 +46,7 @@ REGISTER_DOCUMENT_SOURCE(collStats,
                          DocumentSourceCollStats::createFromBson);
 
 const char* DocumentSourceCollStats::getSourceName() const {
-    return "$collStats";
+    return kStageName.rawData();
 }
 
 intrusive_ptr<DocumentSource> DocumentSourceCollStats::createFromBson(
@@ -62,29 +62,33 @@ intrusive_ptr<DocumentSource> DocumentSourceCollStats::createFromBson(
         if ("latencyStats" == fieldName) {
             uassert(40167,
                     str::stream() << "latencyStats argument must be an object, but got " << elem
-                                  << " of type "
-                                  << typeName(elem.type()),
+                                  << " of type " << typeName(elem.type()),
                     elem.type() == BSONType::Object);
             if (!elem["histograms"].eoo()) {
                 uassert(40305,
                         str::stream() << "histograms option to latencyStats must be bool, got "
-                                      << elem
-                                      << "of type "
-                                      << typeName(elem.type()),
+                                      << elem << "of type " << typeName(elem.type()),
                         elem["histograms"].isBoolean());
             }
         } else if ("storageStats" == fieldName) {
             uassert(40279,
                     str::stream() << "storageStats argument must be an object, but got " << elem
-                                  << " of type "
-                                  << typeName(elem.type()),
+                                  << " of type " << typeName(elem.type()),
                     elem.type() == BSONType::Object);
         } else if ("count" == fieldName) {
             uassert(40480,
                     str::stream() << "count argument must be an object, but got " << elem
-                                  << " of type "
-                                  << typeName(elem.type()),
+                                  << " of type " << typeName(elem.type()),
                     elem.type() == BSONType::Object);
+        } else if ("queryExecStats" == fieldName) {
+            uassert(31141,
+                    str::stream() << "queryExecStats argument must be an empty object, but got "
+                                  << elem << " of type " << typeName(elem.type()),
+                    elem.type() == BSONType::Object);
+            uassert(31170,
+                    str::stream() << "queryExecStats argument must be an empty object, but got "
+                                  << elem,
+                    elem.embeddedObject().isEmpty());
         } else {
             uasserted(40168, str::stream() << "unrecognized option to $collStats: " << fieldName);
         }
@@ -94,9 +98,7 @@ intrusive_ptr<DocumentSource> DocumentSourceCollStats::createFromBson(
     return collStats;
 }
 
-DocumentSource::GetNextResult DocumentSourceCollStats::getNext() {
-    pExpCtx->checkForInterrupt();
-
+DocumentSource::GetNextResult DocumentSourceCollStats::doGetNext() {
     if (_finished) {
         return GetNextResult::makeEOF();
     }
@@ -144,7 +146,17 @@ DocumentSource::GetNextResult DocumentSourceCollStats::getNext() {
             pExpCtx->opCtx, pExpCtx->ns, &builder);
         if (!status.isOK()) {
             uasserted(40481,
-                      str::stream() << "Unable to retrieve count in $collStats stage: "
+                      str::stream()
+                          << "Unable to retrieve count in $collStats stage: " << status.reason());
+        }
+    }
+
+    if (_collStatsSpec.hasField("queryExecStats")) {
+        Status status = pExpCtx->mongoProcessInterface->appendQueryExecStats(
+            pExpCtx->opCtx, pExpCtx->ns, &builder);
+        if (!status.isOK()) {
+            uasserted(31142,
+                      str::stream() << "Unable to retrieve queryExecStats in $collStats stage: "
                                     << status.reason());
         }
     }

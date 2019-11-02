@@ -7,21 +7,30 @@
  * @tags: [requires_persistence]
  */
 (function() {
-    "use strict";
+"use strict";
 
-    // This test uses authentication and runs commands without authenticating, which is not
-    // compatible with implicit sessions.
-    TestData.disableImplicitSessions = true;
+// This test uses authentication and runs commands without authenticating, which is not
+// compatible with implicit sessions.
+TestData.disableImplicitSessions = true;
 
-    load("jstests/multiVersion/libs/multi_rs.js");
+load("jstests/multiVersion/libs/multi_rs.js");
 
-    // TODO SERVER-32672: remove this flag.
-    TestData.skipGossipingClusterTime = true;
-    const keyFile = 'jstests/libs/key1';
-    const adminUser = {db: "admin", username: "foo", password: "bar"};
-    const rUser = {db: "test", username: "r", password: "bar"};
+const keyFile = 'jstests/libs/key1';
+const adminUser = {
+    db: "admin",
+    username: "foo",
+    password: "bar"
+};
+const rUser = {
+    db: "test",
+    username: "r",
+    password: "bar"
+};
+const timeoutValidLogicalTimeMs = 20 * 1000;
 
-    function assertContainsValidLogicalTime(res) {
+function assertContainsValidLogicalTime(adminConn) {
+    try {
+        const res = adminConn.runCommand({isMaster: 1});
         assert.hasFields(res, ["$clusterTime"]);
         assert.hasFields(res.$clusterTime, ["signature", "clusterTime"]);
         // clusterTime must be greater than the uninitialzed value.
@@ -32,56 +41,64 @@
         assert.hasFields(res, ["operationTime"]);
         assert(Object.prototype.toString.call(res.operationTime) === "[object Timestamp]",
                "operationTime must be a timestamp");
+        return true;
+    } catch (error) {
+        return false;
     }
+}
 
-    let st = new ShardingTest({shards: {rs0: {nodes: 2}}, other: {keyFile: keyFile}});
+let st = new ShardingTest({shards: {rs0: {nodes: 2}}, other: {keyFile: keyFile}});
 
-    jsTestLog("Started ShardingTest");
+jsTestLog("Started ShardingTest");
 
-    var adminDB = st.s.getDB("admin");
-    adminDB.createUser({user: adminUser.username, pwd: adminUser.password, roles: ["__system"]});
+var adminDB = st.s.getDB("admin");
+adminDB.createUser({user: adminUser.username, pwd: adminUser.password, roles: ["__system"]});
 
-    adminDB.auth(adminUser.username, adminUser.password);
-    assert(st.s.getDB("admin").system.keys.count() >= 2);
+adminDB.auth(adminUser.username, adminUser.password);
+assert(st.s.getDB("admin").system.keys.count() >= 2);
 
-    let priRSConn = st.rs0.getPrimary().getDB("admin");
-    priRSConn.createUser({user: rUser.username, pwd: rUser.password, roles: ["root"]});
+let priRSConn = st.rs0.getPrimary().getDB("admin");
+priRSConn.createUser({user: rUser.username, pwd: rUser.password, roles: ["root"]});
+priRSConn.auth(rUser.username, rUser.password);
 
-    priRSConn.auth(rUser.username, rUser.password);
-    const resWithKeys = priRSConn.runCommand({isMaster: 1});
-    assertContainsValidLogicalTime(resWithKeys);
-    priRSConn.logout();
+// use assert.soon since it's possible the shard primary may not have refreshed
+// and loaded the keys into its KeyManager cache.
+assert.soon(function() {
+    return assertContainsValidLogicalTime(priRSConn);
+}, "Failed to assert valid logical time", timeoutValidLogicalTimeMs);
 
-    // Enable the failpoint, remove all keys, and restart the config servers with the failpoint
-    // still enabled to guarantee there are no keys.
-    for (let i = 0; i < st.configRS.nodes.length; i++) {
-        assert.commandWorked(st.configRS.nodes[i].adminCommand(
-            {"configureFailPoint": "disableKeyGeneration", "mode": "alwaysOn"}));
-    }
+priRSConn.logout();
 
-    var priCSConn = st.configRS.getPrimary();
-    authutil.asCluster(priCSConn, keyFile, function() {
-        priCSConn.getDB("admin").system.keys.remove({purpose: "HMAC"});
-    });
+// Enable the failpoint, remove all keys, and restart the config servers with the failpoint
+// still enabled to guarantee there are no keys.
+for (let i = 0; i < st.configRS.nodes.length; i++) {
+    assert.commandWorked(st.configRS.nodes[i].adminCommand(
+        {"configureFailPoint": "disableKeyGeneration", "mode": "alwaysOn"}));
+}
 
-    assert(adminDB.system.keys.count() == 0, "expected there to be no keys on the config server");
-    adminDB.logout();
+var priCSConn = st.configRS.getPrimary();
+authutil.asCluster(priCSConn, keyFile, function() {
+    priCSConn.getDB("admin").system.keys.remove({purpose: "HMAC"});
+});
 
-    st.configRS.stopSet(null /* signal */, true /* forRestart */);
-    st.configRS.startSet(
-        {restart: true, setParameter: {"failpoint.disableKeyGeneration": "{'mode':'alwaysOn'}"}});
+assert(adminDB.system.keys.count() == 0, "expected there to be no keys on the config server");
+adminDB.logout();
 
-    // bounce rs0 to clean the key cache
-    st.rs0.stopSet(null /* signal */, true /* forRestart */);
-    st.rs0.startSet({restart: true});
+st.configRS.stopSet(null /* signal */, true /* forRestart */);
+st.configRS.startSet(
+    {restart: true, setParameter: {"failpoint.disableKeyGeneration": "{'mode':'alwaysOn'}"}});
 
-    priRSConn = st.rs0.getPrimary().getDB("admin");
-    priRSConn.auth(rUser.username, rUser.password);
-    const resNoKeys = assert.commandWorked(priRSConn.runCommand({isMaster: 1}));
-    priRSConn.logout();
+// bounce rs0 to clean the key cache
+st.rs0.stopSet(null /* signal */, true /* forRestart */);
+st.rs0.startSet({restart: true});
 
-    assert.eq(resNoKeys.hasOwnProperty("$clusterTime"), false);
-    assert.eq(resNoKeys.hasOwnProperty("operationTime"), false);
+priRSConn = st.rs0.getPrimary().getDB("admin");
+priRSConn.auth(rUser.username, rUser.password);
+const resNoKeys = assert.commandWorked(priRSConn.runCommand({isMaster: 1}));
+priRSConn.logout();
 
-    st.stop();
+assert.eq(resNoKeys.hasOwnProperty("$clusterTime"), false);
+assert.eq(resNoKeys.hasOwnProperty("operationTime"), false);
+
+st.stop();
 })();

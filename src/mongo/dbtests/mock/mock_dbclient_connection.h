@@ -78,7 +78,7 @@ public:
                                                  mongo::Query query = mongo::Query(),
                                                  int nToReturn = 0,
                                                  int nToSkip = 0,
-                                                 const mongo::BSONObj* fieldsToReturn = 0,
+                                                 const mongo::BSONObj* fieldsToReturn = nullptr,
                                                  int queryOptions = 0,
                                                  int batchSize = 0) override;
 
@@ -104,10 +104,10 @@ public:
     // Unsupported methods (defined to get rid of virtual function was hidden error)
     //
 
-    unsigned long long query(stdx::function<void(mongo::DBClientCursorBatchIterator&)> f,
+    unsigned long long query(std::function<void(mongo::DBClientCursorBatchIterator&)> f,
                              const NamespaceStringOrUUID& nsOrUuid,
                              mongo::Query query,
-                             const mongo::BSONObj* fieldsToReturn = 0,
+                             const mongo::BSONObj* fieldsToReturn = nullptr,
                              int queryOptions = 0,
                              int batchSize = 0) override;
 
@@ -120,7 +120,9 @@ public:
               mongo::Message& response,
               bool assertOk,
               std::string* actualServer) override;
-    void say(mongo::Message& toSend, bool isRetry = false, std::string* actualServer = 0) override;
+    void say(mongo::Message& toSend,
+             bool isRetry = false,
+             std::string* actualServer = nullptr) override;
     bool lazySupported() const override;
 
 private:
@@ -132,4 +134,4 @@ private:
     uint64_t _sockCreationTime;
     bool _autoReconnect;
 };
-}
+}  // namespace mongo

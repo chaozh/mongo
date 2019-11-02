@@ -34,8 +34,7 @@
 #include "mongo/db/catalog/index_builds_manager.h"
 
 #include "mongo/db/catalog/collection.h"
-#include "mongo/db/catalog/collection_catalog_entry.h"
-#include "mongo/db/catalog/database_catalog_entry.h"
+#include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/catalog/index_timestamp_helper.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
@@ -43,7 +42,7 @@
 #include "mongo/db/storage/write_unit_of_work.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -87,8 +86,7 @@ Status IndexBuildsManager::setUpIndexBuild(OperationContext* opCtx,
     const auto& nss = collection->ns();
     invariant(opCtx->lockState()->isCollectionLockedForMode(nss, MODE_X),
               str::stream() << "Unable to set up index build " << buildUUID << ": collection "
-                            << nss.ns()
-                            << " is not locked in exclusive mode.");
+                            << nss.ns() << " is not locked in exclusive mode.");
 
     auto builder = _getBuilder(buildUUID);
 
@@ -99,23 +97,21 @@ Status IndexBuildsManager::setUpIndexBuild(OperationContext* opCtx,
         builder->ignoreUniqueConstraint();
     }
 
-    auto initResult = writeConflictRetry(opCtx,
-                                         "IndexBuildsManager::setUpIndexBuild",
-                                         nss.ns(),
-                                         [opCtx, collection, builder, &onInit, &specs] {
-                                             return builder->init(opCtx, collection, specs, onInit);
-                                         });
-
-    if (!initResult.isOK()) {
-        return initResult.getStatus();
+    std::vector<BSONObj> indexes;
+    try {
+        indexes = writeConflictRetry(opCtx, "IndexBuildsManager::setUpIndexBuild", nss.ns(), [&]() {
+            return uassertStatusOK(builder->init(opCtx, collection, specs, onInit));
+        });
+    } catch (const DBException& ex) {
+        return ex.toStatus();
     }
 
     if (options.forRecovery) {
         log() << "Index build initialized: " << buildUUID << ": " << nss
-              << ": indexes: " << initResult.getValue().size();
+              << ": indexes: " << indexes.size();
     } else {
         log() << "Index build initialized: " << buildUUID << ": " << nss << " ("
-              << *collection->uuid() << " ): indexes: " << initResult.getValue().size();
+              << collection->uuid() << " ): indexes: " << indexes.size();
     }
 
     return Status::OK();
@@ -141,9 +137,8 @@ StatusWith<std::pair<long long, long long>> IndexBuildsManager::startBuildingInd
     OperationContext* opCtx, NamespaceString ns, const UUID& buildUUID) {
     auto builder = _getBuilder(buildUUID);
 
-    auto const storageEngine = opCtx->getServiceContext()->getStorageEngine();
-    auto dbCatalogEntry = storageEngine->getDatabaseCatalogEntry(opCtx, ns.db());
-    auto rs = dbCatalogEntry->getRecordStore(ns.ns());
+    auto coll = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(ns);
+    auto rs = coll ? coll->getRecordStore() : nullptr;
 
     // Iterate all records in the collection. Delete them if they aren't valid BSON. Index them
     // if they are.
@@ -204,12 +199,14 @@ StatusWith<std::pair<long long, long long>> IndexBuildsManager::startBuildingInd
     return std::make_pair(numRecords, dataSize);
 }
 
-Status IndexBuildsManager::drainBackgroundWrites(OperationContext* opCtx,
-                                                 const UUID& buildUUID,
-                                                 RecoveryUnit::ReadSource readSource) {
+Status IndexBuildsManager::drainBackgroundWrites(
+    OperationContext* opCtx,
+    const UUID& buildUUID,
+    RecoveryUnit::ReadSource readSource,
+    IndexBuildInterceptor::DrainYieldPolicy drainYieldPolicy) {
     auto builder = _getBuilder(buildUUID);
 
-    return builder->drainBackgroundWrites(opCtx, readSource);
+    return builder->drainBackgroundWrites(opCtx, readSource, drainYieldPolicy);
 }
 
 Status IndexBuildsManager::finishBuildingPhase(const UUID& buildUUID) {
@@ -258,20 +255,24 @@ Status IndexBuildsManager::commitIndexBuild(OperationContext* opCtx,
 }
 
 bool IndexBuildsManager::abortIndexBuild(const UUID& buildUUID, const std::string& reason) {
-    stdx::unique_lock<stdx::mutex> lk(_mutex);
+    stdx::unique_lock<Latch> lk(_mutex);
 
     auto builderIt = _builders.find(buildUUID);
     if (builderIt == _builders.end()) {
         return false;
     }
-    builderIt->second->abort(reason);
+
+    std::shared_ptr<MultiIndexBlock> builder = builderIt->second;
+
+    lk.unlock();
+    builder->abort(reason);
     return true;
 }
 
 bool IndexBuildsManager::interruptIndexBuild(OperationContext* opCtx,
                                              const UUID& buildUUID,
                                              const std::string& reason) {
-    stdx::unique_lock<stdx::mutex> lk(_mutex);
+    stdx::unique_lock<Latch> lk(_mutex);
 
     auto builderIt = _builders.find(buildUUID);
     if (builderIt == _builders.end()) {
@@ -279,17 +280,21 @@ bool IndexBuildsManager::interruptIndexBuild(OperationContext* opCtx,
     }
 
     log() << "Index build interrupted: " << buildUUID << ": " << reason;
-    builderIt->second->abortWithoutCleanup(opCtx);
+    std::shared_ptr<MultiIndexBlock> builder = builderIt->second;
+
+    lk.unlock();
+    builder->abortWithoutCleanup(opCtx);
 
     return true;
 }
 
 void IndexBuildsManager::tearDownIndexBuild(OperationContext* opCtx,
                                             Collection* collection,
-                                            const UUID& buildUUID) {
+                                            const UUID& buildUUID,
+                                            OnCleanUpFn onCleanUpFn) {
     // TODO verify that the index builder is in a finished state before allowing its destruction.
     auto builder = _getBuilder(buildUUID);
-    builder->cleanUpAfterBuild(opCtx, collection);
+    builder->cleanUpAfterBuild(opCtx, collection, onCleanUpFn);
     _unregisterIndexBuild(buildUUID);
 }
 
@@ -303,14 +308,14 @@ void IndexBuildsManager::verifyNoIndexBuilds_forTestOnly() {
 }
 
 void IndexBuildsManager::_registerIndexBuild(UUID buildUUID) {
-    stdx::unique_lock<stdx::mutex> lk(_mutex);
+    stdx::unique_lock<Latch> lk(_mutex);
 
     std::shared_ptr<MultiIndexBlock> mib = std::make_shared<MultiIndexBlock>();
     invariant(_builders.insert(std::make_pair(buildUUID, mib)).second);
 }
 
 void IndexBuildsManager::_unregisterIndexBuild(const UUID& buildUUID) {
-    stdx::unique_lock<stdx::mutex> lk(_mutex);
+    stdx::unique_lock<Latch> lk(_mutex);
 
     auto builderIt = _builders.find(buildUUID);
     invariant(builderIt != _builders.end());
@@ -318,7 +323,7 @@ void IndexBuildsManager::_unregisterIndexBuild(const UUID& buildUUID) {
 }
 
 std::shared_ptr<MultiIndexBlock> IndexBuildsManager::_getBuilder(const UUID& buildUUID) {
-    stdx::unique_lock<stdx::mutex> lk(_mutex);
+    stdx::unique_lock<Latch> lk(_mutex);
     auto builderIt = _builders.find(buildUUID);
     invariant(builderIt != _builders.end());
     return builderIt->second;

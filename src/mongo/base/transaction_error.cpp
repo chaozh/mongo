@@ -57,7 +57,7 @@ bool isTransientTransactionError(ErrorCodes::Error code,
         // For commands other than "commitTransaction", we know there's no side-effect for these
         // errors, but it's not true for "commitTransaction" if a failover happens.
         isTransient |= ErrorCodes::isNotMasterError(code) || ErrorCodes::isShutdownError(code) ||
-            code == ErrorCodes::NoSuchTransaction;
+            ErrorCodes::isNetworkError(code) || code == ErrorCodes::NoSuchTransaction;
     }
 
     return isTransient;

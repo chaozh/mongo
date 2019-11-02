@@ -27,11 +27,14 @@
  *    it in the license file.
  */
 
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kIndex
+
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/collection_index_builds_tracker.h"
 
 #include "mongo/db/catalog/index_builds_manager.h"
+#include "mongo/util/log.h"
 
 namespace mongo {
 
@@ -48,11 +51,9 @@ void CollectionIndexBuildsTracker::addIndexBuild(
 
     invariant(replIndexBuildState->indexNames.size());
     for (auto& indexName : replIndexBuildState->indexNames) {
-        // Ensure that a new entry is added.
-        invariant(_buildStateByIndexName.emplace(indexName, replIndexBuildState).second,
-                  str::stream() << "index build state for " << indexName
-                                << " already exists. Collection: "
-                                << replIndexBuildState->collectionUUID);
+        // Duplicate index names within the same index build are ignored here because these will
+        // be caught during validation by the IndexCatalog.
+        _buildStateByIndexName.emplace(indexName, replIndexBuildState);
     }
 }
 
@@ -63,7 +64,6 @@ void CollectionIndexBuildsTracker::removeIndexBuild(
     _buildStateByBuildUUID.erase(replIndexBuildState->buildUUID);
 
     for (const auto& indexName : replIndexBuildState->indexNames) {
-        invariant(_buildStateByIndexName.find(indexName) != _buildStateByIndexName.end());
         _buildStateByIndexName.erase(indexName);
     }
 
@@ -104,9 +104,19 @@ int CollectionIndexBuildsTracker::getNumberOfIndexBuilds(WithLock) const {
     return _buildStateByBuildUUID.size();
 }
 
-void CollectionIndexBuildsTracker::waitUntilNoIndexBuildsRemain(
-    stdx::unique_lock<stdx::mutex>& lk) {
-    _noIndexBuildsRemainCondVar.wait(lk, [&] { return _buildStateByBuildUUID.empty(); });
+void CollectionIndexBuildsTracker::waitUntilNoIndexBuildsRemain(stdx::unique_lock<Latch>& lk) {
+    _noIndexBuildsRemainCondVar.wait(lk, [&] {
+        if (_buildStateByBuildUUID.empty()) {
+            return true;
+        }
+
+        log() << "Waiting until the following index builds are finished:";
+        for (const auto& indexBuild : _buildStateByBuildUUID) {
+            log() << "    Index build with UUID: " << indexBuild.first;
+        }
+
+        return false;
+    });
 }
 
 }  // namespace mongo

@@ -33,16 +33,15 @@
 #include <vector>
 
 #include "mongo/bson/bson_depth.h"
+#include "mongo/db/commands/feature_compatibility_version_parser.h"
 #include "mongo/db/logical_clock.h"
 #include "mongo/db/logical_time.h"
 #include "mongo/db/views/durable_view_catalog.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
 using std::string;
-
-using namespace mongoutils;
 
 namespace {
 /**
@@ -60,9 +59,9 @@ Status validateDepth(const BSONObj& obj) {
                 // We're exactly at the limit, so descending to the next level would exceed
                 // the maximum depth.
                 return {ErrorCodes::Overflow,
-                        str::stream() << "cannot insert document because it exceeds "
-                                      << BSONDepth::getMaxDepthForUserStorage()
-                                      << " levels of nesting"};
+                        str::stream()
+                            << "cannot insert document because it exceeds "
+                            << BSONDepth::getMaxDepthForUserStorage() << " levels of nesting"};
             }
             frames.emplace_back(elem.embeddedObject());
         }
@@ -80,10 +79,8 @@ StatusWith<BSONObj> fixDocumentForInsert(ServiceContext* service, const BSONObj&
     if (doc.objsize() > BSONObjMaxUserSize)
         return StatusWith<BSONObj>(ErrorCodes::BadValue,
                                    str::stream() << "object to insert too large"
-                                                 << ". size in bytes: "
-                                                 << doc.objsize()
-                                                 << ", max size: "
-                                                 << BSONObjMaxUserSize);
+                                                 << ". size in bytes: " << doc.objsize()
+                                                 << ", max size: " << BSONObjMaxUserSize);
 
     auto depthStatus = validateDepth(doc);
     if (!depthStatus.isOK()) {
@@ -157,7 +154,7 @@ StatusWith<BSONObj> fixDocumentForInsert(ServiceContext* service, const BSONObj&
         if (e.type()) {
             b.append(e);
         } else {
-            b.appendOID("_id", NULL, true);
+            b.appendOID("_id", nullptr, true);
         }
     }
 
@@ -206,15 +203,14 @@ Status userAllowedCreateNS(StringData db, StringData coll) {
     if (!NamespaceString::validCollectionName(coll))
         return Status(ErrorCodes::InvalidNamespace, "invalid collection name");
 
-    if (db.size() + 1 /* dot */ + coll.size() > NamespaceString::MaxNsCollectionLen)
-        return Status(ErrorCodes::InvalidNamespace,
-                      str::stream() << "fully qualified namespace " << db << '.' << coll
-                                    << " is too long "
-                                    << "(max is "
-                                    << NamespaceString::MaxNsCollectionLen
-                                    << " bytes)");
+    if (!NamespaceString(db, coll).checkLengthForFCV())
+        return Status(ErrorCodes::IncompatibleServerVersion,
+                      str::stream() << "Cannot create collection with a long name " << db << "."
+                                    << coll << " - upgrade to feature compatibility version "
+                                    << FeatureCompatibilityVersionParser::kVersion44
+                                    << " to be able to do so.");
 
-    // check spceial areas
+    // check special areas
 
     if (db == "system")
         return Status(ErrorCodes::InvalidNamespace, "cannot use 'system' database");
@@ -276,4 +272,4 @@ Status userAllowedCreateNS(StringData db, StringData coll) {
 
     return Status::OK();
 }
-}
+}  // namespace mongo

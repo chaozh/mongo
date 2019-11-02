@@ -32,6 +32,7 @@
 #include "mongo/platform/basic.h"
 
 #include <boost/optional.hpp>
+#include <memory>
 
 #include "mongo/base/init.h"
 #include "mongo/base/initializer.h"
@@ -55,13 +56,15 @@
 #include "mongo/db/lasterror.h"
 #include "mongo/db/log_process_details.h"
 #include "mongo/db/logical_clock.h"
-#include "mongo/db/logical_session_cache_factory_mongos.h"
+#include "mongo/db/logical_session_cache_impl.h"
 #include "mongo/db/logical_time_metadata_hook.h"
 #include "mongo/db/logical_time_validator.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/service_context.h"
+#include "mongo/db/service_liaison_mongos.h"
 #include "mongo/db/session_killer.h"
+#include "mongo/db/sessions_collection_sharded.h"
 #include "mongo/db/startup_warnings_common.h"
 #include "mongo/db/wire_version.h"
 #include "mongo/executor/task_executor_pool.h"
@@ -83,12 +86,12 @@
 #include "mongo/s/query/cluster_cursor_cleanup_job.h"
 #include "mongo/s/query/cluster_cursor_manager.h"
 #include "mongo/s/service_entry_point_mongos.h"
-#include "mongo/s/sharding_egress_metadata_hook_for_mongos.h"
+#include "mongo/s/session_catalog_router.h"
 #include "mongo/s/sharding_egress_metadata_hook_for_mongos.h"
 #include "mongo/s/sharding_initialization.h"
 #include "mongo/s/sharding_uptime_reporter.h"
+#include "mongo/s/transaction_router.h"
 #include "mongo/s/version_mongos.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/transport/transport_layer_manager.h"
 #include "mongo/util/admin_access.h"
@@ -110,7 +113,7 @@
 #include "mongo/util/quick_exit.h"
 #include "mongo/util/signal_handlers.h"
 #include "mongo/util/stacktrace.h"
-#include "mongo/util/stringutils.h"
+#include "mongo/util/str.h"
 #include "mongo/util/text.h"
 #include "mongo/util/version.h"
 
@@ -121,6 +124,9 @@ using logger::LogComponent;
 #if !defined(__has_feature)
 #define __has_feature(x) 0
 #endif
+
+// Failpoint for disabling replicaSetChangeConfigServerUpdateHook calls on signaled mongos.
+MONGO_FAIL_POINT_DEFINE(failReplicaSetChangeConfigServerUpdateHook);
 
 namespace {
 
@@ -144,8 +150,7 @@ Status waitForSigningKeys(OperationContext* opCtx) {
         auto rsm = ReplicaSetMonitor::get(configCS.getSetName());
         // mongod will set minWireVersion == maxWireVersion for isMaster requests from
         // internalClient.
-        if (rsm && (rsm->getMaxWireVersion() < WireVersion::SUPPORTS_OP_MSG ||
-                    rsm->getMaxWireVersion() != rsm->getMinWireVersion())) {
+        if (rsm && (rsm->getMaxWireVersion() < WireVersion::SUPPORTS_OP_MSG)) {
             log() << "Not waiting for signing keys, not supported by the config shard "
                   << configCS.getSetName();
             return Status::OK();
@@ -173,6 +178,66 @@ Status waitForSigningKeys(OperationContext* opCtx) {
     }
 }
 
+
+/**
+ * Abort all active transactions in the catalog that has not yet been committed.
+ *
+ * Outline:
+ * 1. Mark all sessions as killed and collect killTokens from each session.
+ * 2. Create a new Client in order not to pollute the current OperationContext.
+ * 3. Create new OperationContexts for each session to be killed and perform the necessary setup
+ *    to be able to abort transactions properly: like setting TxnNumber and attaching the session
+ *    to the OperationContext.
+ * 4. Send abortTransaction.
+ */
+void implicitlyAbortAllTransactions(OperationContext* opCtx) {
+    struct AbortTransactionDetails {
+    public:
+        AbortTransactionDetails(LogicalSessionId _lsid, SessionCatalog::KillToken _killToken)
+            : lsid(std::move(_lsid)), killToken(std::move(_killToken)) {}
+
+        LogicalSessionId lsid;
+        SessionCatalog::KillToken killToken;
+    };
+
+    const auto catalog = SessionCatalog::get(opCtx);
+
+    SessionKiller::Matcher matcherAllSessions(
+        KillAllSessionsByPatternSet{makeKillAllSessionsByPattern(opCtx)});
+
+    const auto abortDeadline =
+        opCtx->getServiceContext()->getFastClockSource()->now() + Seconds(15);
+
+    std::vector<AbortTransactionDetails> toKill;
+    catalog->scanSessions(matcherAllSessions, [&](const ObservableSession& session) {
+        toKill.emplace_back(session.getSessionId(),
+                            session.kill(ErrorCodes::InterruptedAtShutdown));
+    });
+
+    auto newClient = opCtx->getServiceContext()->makeClient("ImplicitlyAbortTxnAtShutdown");
+    AlternativeClientRegion acr(newClient);
+
+    Status shutDownStatus(ErrorCodes::InterruptedAtShutdown,
+                          "aborting transactions due to shutdown");
+
+    for (auto& killDetails : toKill) {
+        auto uniqueNewOpCtx = cc().makeOperationContext();
+        auto newOpCtx = uniqueNewOpCtx.get();
+
+        newOpCtx->setDeadlineByDate(abortDeadline, ErrorCodes::ExceededTimeLimit);
+
+        OperationContextSession sessionCtx(newOpCtx, std::move(killDetails.killToken));
+
+        auto session = OperationContextSession::get(newOpCtx);
+        newOpCtx->setLogicalSessionId(session->getSessionId());
+
+        auto txnRouter = TransactionRouter::get(newOpCtx);
+        if (txnRouter.isInitialized()) {
+            txnRouter.implicitlyAbortTransaction(newOpCtx, shutDownStatus);
+        }
+    }
+}
+
 /**
  * NOTE: This function may be called at any time after registerShutdownTask is called below. It must
  * not depend on the prior execution of mongo initializers or the existence of threads.
@@ -185,13 +250,6 @@ void cleanupTask(ServiceContext* serviceContext) {
             Client::initThread(getThreadName());
         Client& client = cc();
 
-        // Shutdown the TransportLayer so that new connections aren't accepted
-        if (auto tl = serviceContext->getTransportLayer()) {
-            log(LogComponent::kNetwork) << "shutdown: going to close all sockets...";
-
-            tl->shutdown();
-        }
-
         ServiceContext::UniqueOperationContext uniqueTxn;
         OperationContext* opCtx = client.getOperationContext();
         if (!opCtx) {
@@ -199,16 +257,31 @@ void cleanupTask(ServiceContext* serviceContext) {
             opCtx = uniqueTxn.get();
         }
 
+        // Shutdown the TransportLayer so that new connections aren't accepted
+        if (auto tl = serviceContext->getTransportLayer()) {
+            log(LogComponent::kNetwork) << "shutdown: going to close all sockets...";
+
+            tl->shutdown();
+        }
+
+        try {
+            // Abort transactions while we can still send remote commands.
+            implicitlyAbortAllTransactions(opCtx);
+        } catch (const DBException& excep) {
+            warning() << "encountered " << excep
+                      << " while trying to abort all active transactions";
+        }
+
+        if (auto lsc = LogicalSessionCache::get(serviceContext)) {
+            lsc->joinOnShutDown();
+        }
+
+        ReplicaSetMonitor::shutdown();
+
         opCtx->setIsExecutingShutdown();
 
         if (serviceContext) {
             serviceContext->setKillAllOperations();
-
-            // Shut down the background periodic task runner.
-            auto runner = serviceContext->getPeriodicRunner();
-            if (runner) {
-                runner->shutdown();
-            }
         }
 
         // Perform all shutdown operations after setKillAllOperations is called in order to ensure
@@ -228,6 +301,14 @@ void cleanupTask(ServiceContext* serviceContext) {
 
         if (auto catalog = Grid::get(opCtx)->catalogClient()) {
             catalog->shutDown(opCtx);
+        }
+
+        if (auto shardRegistry = Grid::get(opCtx)->shardRegistry()) {
+            shardRegistry->shutdown();
+        }
+
+        if (Grid::get(serviceContext)->isShardingInitialized()) {
+            CatalogCacheLoader::get(serviceContext).shutDown();
         }
 
 #if __has_feature(address_sanitizer)
@@ -264,20 +345,20 @@ void cleanupTask(ServiceContext* serviceContext) {
 }
 
 Status initializeSharding(OperationContext* opCtx) {
-    auto targeterFactory = stdx::make_unique<RemoteCommandTargeterFactoryImpl>();
+    auto targeterFactory = std::make_unique<RemoteCommandTargeterFactoryImpl>();
     auto targeterFactoryPtr = targeterFactory.get();
 
-    ShardFactory::BuilderCallable setBuilder =
-        [targeterFactoryPtr](const ShardId& shardId, const ConnectionString& connStr) {
-            return stdx::make_unique<ShardRemote>(
-                shardId, connStr, targeterFactoryPtr->create(connStr));
-        };
+    ShardFactory::BuilderCallable setBuilder = [targeterFactoryPtr](
+                                                   const ShardId& shardId,
+                                                   const ConnectionString& connStr) {
+        return std::make_unique<ShardRemote>(shardId, connStr, targeterFactoryPtr->create(connStr));
+    };
 
-    ShardFactory::BuilderCallable masterBuilder =
-        [targeterFactoryPtr](const ShardId& shardId, const ConnectionString& connStr) {
-            return stdx::make_unique<ShardRemote>(
-                shardId, connStr, targeterFactoryPtr->create(connStr));
-        };
+    ShardFactory::BuilderCallable masterBuilder = [targeterFactoryPtr](
+                                                      const ShardId& shardId,
+                                                      const ConnectionString& connStr) {
+        return std::make_unique<ShardRemote>(shardId, connStr, targeterFactoryPtr->create(connStr));
+    };
 
     ShardFactory::BuildersMap buildersMap{
         {ConnectionString::SET, std::move(setBuilder)},
@@ -285,24 +366,42 @@ Status initializeSharding(OperationContext* opCtx) {
     };
 
     auto shardFactory =
-        stdx::make_unique<ShardFactory>(std::move(buildersMap), std::move(targeterFactory));
+        std::make_unique<ShardFactory>(std::move(buildersMap), std::move(targeterFactory));
 
     CatalogCacheLoader::set(opCtx->getServiceContext(),
-                            stdx::make_unique<ConfigServerCatalogCacheLoader>());
+                            std::make_unique<ConfigServerCatalogCacheLoader>());
+
+    auto catalogCache = std::make_unique<CatalogCache>(CatalogCacheLoader::get(opCtx));
+
+    // List of hooks which will be called by the ShardRegistry when it discovers a shard has been
+    // removed.
+    std::vector<ShardRegistry::ShardRemovalHook> shardRemovalHooks = {
+        // Invalidate appropriate entries in the catalog cache when a shard is removed. It's safe to
+        // capture the catalog cache pointer since the Grid (and therefore CatalogCache and
+        // ShardRegistry) are never destroyed.
+        [catCache = catalogCache.get()](const ShardId& removedShard) {
+            catCache->invalidateEntriesThatReferenceShard(removedShard);
+        }};
+
+    if (mongosGlobalParams.configdbs.type() == ConnectionString::INVALID) {
+        return {ErrorCodes::BadValue, "Unrecognized connection string."};
+    }
+
+    auto shardRegistry = std::make_unique<ShardRegistry>(
+        std::move(shardFactory), mongosGlobalParams.configdbs, std::move(shardRemovalHooks));
 
     Status status = initializeGlobalShardingState(
         opCtx,
-        mongosGlobalParams.configdbs,
         generateDistLockProcessId(opCtx),
-        std::move(shardFactory),
-        stdx::make_unique<CatalogCache>(CatalogCacheLoader::get(opCtx)),
+        std::move(catalogCache),
+        std::move(shardRegistry),
         [opCtx]() {
-            auto hookList = stdx::make_unique<rpc::EgressMetadataHookList>();
+            auto hookList = std::make_unique<rpc::EgressMetadataHookList>();
             hookList->addHook(
-                stdx::make_unique<rpc::LogicalTimeMetadataHook>(opCtx->getServiceContext()));
+                std::make_unique<rpc::LogicalTimeMetadataHook>(opCtx->getServiceContext()));
             hookList->addHook(
-                stdx::make_unique<rpc::CommittedOpTimeMetadataHook>(opCtx->getServiceContext()));
-            hookList->addHook(stdx::make_unique<rpc::ShardingEgressMetadataHookForMongos>(
+                std::make_unique<rpc::CommittedOpTimeMetadataHook>(opCtx->getServiceContext()));
+            hookList->addHook(std::make_unique<rpc::ShardingEgressMetadataHookForMongos>(
                 opCtx->getServiceContext()));
             return hookList;
         },
@@ -318,6 +417,11 @@ Status initializeSharding(OperationContext* opCtx) {
     }
 
     status = waitForSigningKeys(opCtx);
+    if (!status.isOK()) {
+        return status;
+    }
+
+    status = preCacheMongosRoutingInfo(opCtx);
     if (!status.isOK()) {
         return status;
     }
@@ -338,14 +442,63 @@ void initWireSpec() {
     spec.isInternalClient = true;
 }
 
+class ShardingReplicaSetChangeListener final : public ReplicaSetChangeNotifier::Listener {
+public:
+    ShardingReplicaSetChangeListener(ServiceContext* serviceContext)
+        : _serviceContext(serviceContext) {}
+    ~ShardingReplicaSetChangeListener() final = default;
+
+    void onFoundSet(const Key& key) final {}
+
+    void onConfirmedSet(const State& state) final {
+        auto connStr = state.connStr;
+
+        auto fun = [serviceContext = _serviceContext, connStr](auto args) {
+            if (ErrorCodes::isCancelationError(args.status.code())) {
+                return;
+            }
+            invariant(args.status);
+
+            try {
+                LOG(0) << "Updating sharding state with confirmed set " << connStr;
+
+                Grid::get(serviceContext)->shardRegistry()->updateReplSetHosts(connStr);
+
+                if (MONGO_unlikely(failReplicaSetChangeConfigServerUpdateHook.shouldFail())) {
+                    return;
+                }
+                ShardRegistry::updateReplicaSetOnConfigServer(serviceContext, connStr);
+            } catch (const ExceptionForCat<ErrorCategory::ShutdownError>& e) {
+                LOG(0) << "Unable to update sharding state due to " << e;
+            }
+        };
+
+        auto executor = Grid::get(_serviceContext)->getExecutorPool()->getFixedExecutor();
+        auto schedStatus = executor->scheduleWork(std::move(fun)).getStatus();
+        if (ErrorCodes::isCancelationError(schedStatus.code())) {
+            LOG(2) << "Unable to schedule confirmed set update due to " << schedStatus;
+            return;
+        }
+        uassertStatusOK(schedStatus);
+    }
+
+    void onPossibleSet(const State& state) final {
+        Grid::get(_serviceContext)->shardRegistry()->updateReplSetHosts(state.connStr);
+    }
+
+    void onDroppedSet(const Key& key) final {}
+
+private:
+    ServiceContext* _serviceContext;
+};
+
 ExitCode runMongosServer(ServiceContext* serviceContext) {
-    Client::initThread("mongosMain");
+    ThreadClient tc("mongosMain", serviceContext);
     printShardingVersionInfo(false);
 
     initWireSpec();
 
-    serviceContext->setServiceEntryPoint(
-        stdx::make_unique<ServiceEntryPointMongos>(serviceContext));
+    serviceContext->setServiceEntryPoint(std::make_unique<ServiceEntryPointMongos>(serviceContext));
 
     auto tl =
         transport::TransportLayerManager::createWithConfig(&serverGlobalParams, serviceContext);
@@ -356,30 +509,31 @@ ExitCode runMongosServer(ServiceContext* serviceContext) {
     }
     serviceContext->setTransportLayer(std::move(tl));
 
-    auto unshardedHookList = stdx::make_unique<rpc::EgressMetadataHookList>();
-    unshardedHookList->addHook(stdx::make_unique<rpc::LogicalTimeMetadataHook>(serviceContext));
+    auto unshardedHookList = std::make_unique<rpc::EgressMetadataHookList>();
+    unshardedHookList->addHook(std::make_unique<rpc::LogicalTimeMetadataHook>(serviceContext));
     unshardedHookList->addHook(
-        stdx::make_unique<rpc::ShardingEgressMetadataHookForMongos>(serviceContext));
+        std::make_unique<rpc::ShardingEgressMetadataHookForMongos>(serviceContext));
     // TODO SERVER-33053: readReplyMetadata is not called on hooks added through
     // ShardingConnectionHook with _shardedConnections=false, so this hook will not run for
     // connections using globalConnPool.
-    unshardedHookList->addHook(stdx::make_unique<rpc::CommittedOpTimeMetadataHook>(serviceContext));
+    unshardedHookList->addHook(std::make_unique<rpc::CommittedOpTimeMetadataHook>(serviceContext));
 
     // Add sharding hooks to both connection pools - ShardingConnectionHook includes auth hooks
     globalConnPool.addHook(new ShardingConnectionHook(false, std::move(unshardedHookList)));
 
-    auto shardedHookList = stdx::make_unique<rpc::EgressMetadataHookList>();
-    shardedHookList->addHook(stdx::make_unique<rpc::LogicalTimeMetadataHook>(serviceContext));
+    auto shardedHookList = std::make_unique<rpc::EgressMetadataHookList>();
+    shardedHookList->addHook(std::make_unique<rpc::LogicalTimeMetadataHook>(serviceContext));
     shardedHookList->addHook(
-        stdx::make_unique<rpc::ShardingEgressMetadataHookForMongos>(serviceContext));
-    shardedHookList->addHook(stdx::make_unique<rpc::CommittedOpTimeMetadataHook>(serviceContext));
+        std::make_unique<rpc::ShardingEgressMetadataHookForMongos>(serviceContext));
+    shardedHookList->addHook(std::make_unique<rpc::CommittedOpTimeMetadataHook>(serviceContext));
 
     shardConnectionPool.addHook(new ShardingConnectionHook(true, std::move(shardedHookList)));
 
-    ReplicaSetMonitor::setAsynchronousConfigChangeHook(
-        &ShardRegistry::replicaSetChangeConfigServerUpdateHook);
-    ReplicaSetMonitor::setSynchronousConfigChangeHook(
-        &ShardRegistry::replicaSetChangeShardRegistryUpdateHook);
+    // Hook up a Listener for changes from the ReplicaSetMonitor
+    // This will last for the scope of this function. i.e. until shutdown finishes
+    auto shardingRSCL =
+        ReplicaSetMonitor::getNotifier().makeListener<ShardingReplicaSetChangeListener>(
+            serviceContext);
 
     // Mongos connection pools already takes care of authenticating new connections so the
     // replica set connection shouldn't need to.
@@ -389,13 +543,13 @@ ExitCode runMongosServer(ServiceContext* serviceContext) {
         quickExit(EXIT_BADOPTIONS);
     }
 
-    auto opCtx = cc().makeOperationContext();
+    LogicalClock::set(serviceContext, std::make_unique<LogicalClock>(serviceContext));
 
-    auto logicalClock = stdx::make_unique<LogicalClock>(opCtx->getServiceContext());
-    LogicalClock::set(opCtx->getServiceContext(), std::move(logicalClock));
+    auto opCtxHolder = tc->makeOperationContext();
+    auto const opCtx = opCtxHolder.get();
 
     {
-        Status status = initializeSharding(opCtx.get());
+        Status status = initializeSharding(opCtx);
         if (!status.isOK()) {
             if (status == ErrorCodes::CallbackCanceled) {
                 invariant(globalInShutdownDeprecated());
@@ -406,15 +560,15 @@ ExitCode runMongosServer(ServiceContext* serviceContext) {
             return EXIT_SHARDING_ERROR;
         }
 
-        Grid::get(opCtx.get())
+        Grid::get(serviceContext)
             ->getBalancerConfiguration()
-            ->refreshAndCheck(opCtx.get())
+            ->refreshAndCheck(opCtx)
             .transitional_ignore();
     }
 
     startMongoSFTDC();
 
-    Status status = AuthorizationManager::get(serviceContext)->initialize(opCtx.get());
+    Status status = AuthorizationManager::get(serviceContext)->initialize(opCtx);
     if (!status.isOK()) {
         error() << "Initializing authorization data failed: " << status;
         return EXIT_SHARDING_ERROR;
@@ -428,23 +582,25 @@ ExitCode runMongosServer(ServiceContext* serviceContext) {
     clusterCursorCleanupJob.go();
 
     UserCacheInvalidator cacheInvalidatorThread(AuthorizationManager::get(serviceContext));
-    {
-        cacheInvalidatorThread.initialize(opCtx.get());
-        cacheInvalidatorThread.go();
-    }
+    cacheInvalidatorThread.initialize(opCtx);
+    cacheInvalidatorThread.go();
 
     PeriodicTask::startRunningPeriodicTasks();
 
     // Set up the periodic runner for background job execution
-    auto runner = makePeriodicRunner(serviceContext);
-    runner->startup();
-    serviceContext->setPeriodicRunner(std::move(runner));
+    {
+        auto runner = makePeriodicRunner(serviceContext);
+        serviceContext->setPeriodicRunner(std::move(runner));
+    }
 
     SessionKiller::set(serviceContext,
                        std::make_shared<SessionKiller>(serviceContext, killSessionsRemote));
 
-    // Set up the logical session cache
-    LogicalSessionCache::set(serviceContext, makeLogicalSessionCacheS());
+    LogicalSessionCache::set(
+        serviceContext,
+        std::make_unique<LogicalSessionCacheImpl>(std::make_unique<ServiceLiaisonMongos>(),
+                                                  std::make_unique<SessionsCollectionSharded>(),
+                                                  RouterSessionCatalog::reapSessionsOlderThan));
 
     status = serviceContext->getServiceExecutor()->start();
     if (!status.isOK()) {
@@ -500,7 +656,7 @@ void startupConfigActions(const std::vector<std::string>& argv) {
 }
 
 std::unique_ptr<AuthzManagerExternalState> createAuthzManagerExternalStateMongos() {
-    return stdx::make_unique<AuthzManagerExternalStateMongos>();
+    return std::make_unique<AuthzManagerExternalStateMongos>();
 }
 
 ExitCode main(ServiceContext* serviceContext) {
@@ -548,10 +704,11 @@ MONGO_INITIALIZER_GENERAL(ForkServer, ("EndStartupOptionHandling"), ("default"))
 // to the latest version because there is no feature gating that currently occurs at the mongos
 // level. The shards are responsible for rejecting usages of new features if their
 // featureCompatibilityVersion is lower.
-MONGO_INITIALIZER_WITH_PREREQUISITES(SetFeatureCompatibilityVersion42, ("EndStartupOptionStorage"))
+MONGO_INITIALIZER_WITH_PREREQUISITES(SetFeatureCompatibilityVersionLatest,
+                                     ("EndStartupOptionStorage"))
 (InitializerContext* context) {
     serverGlobalParams.featureCompatibility.setVersion(
-        ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo42);
+        ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo44);
     return Status::OK();
 }
 

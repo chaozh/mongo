@@ -39,7 +39,8 @@ namespace mongo {
 namespace fts {
 
 class FTSMatcher {
-    MONGO_DISALLOW_COPYING(FTSMatcher);
+    FTSMatcher(const FTSMatcher&) = delete;
+    FTSMatcher& operator=(const FTSMatcher&) = delete;
 
 public:
     FTSMatcher(const FTSQueryImpl& query, const FTSSpec& spec);
@@ -111,5 +112,5 @@ private:
     const FTSQueryImpl _query;
     const FTSSpec _spec;
 };
-}
-}
+}  // namespace fts
+}  // namespace mongo

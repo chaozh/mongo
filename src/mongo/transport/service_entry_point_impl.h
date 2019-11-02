@@ -29,12 +29,11 @@
 
 #pragma once
 
+#include <list>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/platform/atomic_word.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/stdx/condition_variable.h"
-#include "mongo/stdx/list.h"
-#include "mongo/stdx/mutex.h"
 #include "mongo/stdx/variant.h"
 #include "mongo/transport/service_entry_point.h"
 #include "mongo/transport/service_executor_reserved.h"
@@ -56,7 +55,8 @@ class Session;
  * (transport::Session).
  */
 class ServiceEntryPointImpl : public ServiceEntryPoint {
-    MONGO_DISALLOW_COPYING(ServiceEntryPointImpl);
+    ServiceEntryPointImpl(const ServiceEntryPointImpl&) = delete;
+    ServiceEntryPointImpl& operator=(const ServiceEntryPointImpl&) = delete;
 
 public:
     explicit ServiceEntryPointImpl(ServiceContext* svcCtx);
@@ -75,13 +75,13 @@ public:
     }
 
 private:
-    using SSMList = stdx::list<std::shared_ptr<ServiceStateMachine>>;
+    using SSMList = std::list<std::shared_ptr<ServiceStateMachine>>;
     using SSMListIterator = SSMList::iterator;
 
     ServiceContext* const _svcCtx;
     AtomicWord<std::size_t> _nWorkers;
 
-    mutable stdx::mutex _sessionsMutex;
+    mutable Mutex _sessionsMutex = MONGO_MAKE_LATCH("ServiceEntryPointImpl::_sessionsMutex");
     stdx::condition_variable _shutdownCondition;
     SSMList _sessions;
 

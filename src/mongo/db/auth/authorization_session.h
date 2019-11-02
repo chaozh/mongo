@@ -43,6 +43,7 @@
 #include "mongo/db/auth/user_set.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/ops/write_ops_parsers.h"
 
 namespace mongo {
 
@@ -165,10 +166,6 @@ public:
     // Gets an iterator over the roles of all authenticated users stored in this manager.
     virtual RoleNameIterator getAuthenticatedRoleNames() = 0;
 
-    // Returns a std::string representing all logged-in users on the current session.
-    // WARNING: this std::string will contain NUL bytes so don't call c_str()!
-    virtual std::string getAuthenticatedUserNamesToken() = 0;
-
     // Removes any authenticated principals whose authorization credentials came from the given
     // database, and revokes any privileges that were granted via that principal. This function
     // modifies state. Synchronizes with the Client lock.
@@ -203,7 +200,7 @@ public:
     virtual Status checkAuthForUpdate(OperationContext* opCtx,
                                       const NamespaceString& ns,
                                       const BSONObj& query,
-                                      const BSONObj& update,
+                                      const write_ops::UpdateModification& update,
                                       bool upsert) = 0;
 
     // Checks if this connection has the privileges necessary to insert to the given namespace.

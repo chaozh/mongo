@@ -49,7 +49,7 @@
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/repl/is_master_response.h"
 #include "mongo/db/repl/oplog.h"
-#include "mongo/db/repl/oplogreader.h"
+#include "mongo/db/repl/replication_auth.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/replication_process.h"
 #include "mongo/db/repl/storage_interface.h"
@@ -58,22 +58,28 @@
 #include "mongo/executor/network_interface.h"
 #include "mongo/rpc/metadata/client_metadata.h"
 #include "mongo/rpc/metadata/client_metadata_ismaster.h"
+#include "mongo/util/decimal_counter.h"
+#include "mongo/util/fail_point.h"
+#include "mongo/util/log.h"
 #include "mongo/util/map_util.h"
 
 namespace mongo {
 
-using std::unique_ptr;
+MONGO_FAIL_POINT_DEFINE(waitInIsMaster);
+
 using std::list;
 using std::string;
 using std::stringstream;
+using std::unique_ptr;
 
 namespace repl {
-
+namespace {
 void appendReplicationInfo(OperationContext* opCtx, BSONObjBuilder& result, int level) {
     ReplicationCoordinator* replCoord = ReplicationCoordinator::get(opCtx);
     if (replCoord->getSettings().usingReplSets()) {
+        const auto& horizonParams = SplitHorizon::getParameters(opCtx->getClient());
         IsMasterResponse isMasterResponse;
-        replCoord->fillIsMasterForReplSet(&isMasterResponse);
+        replCoord->fillIsMasterForReplSet(&isMasterResponse, horizonParams);
         result.appendElements(isMasterResponse.toBSON());
         if (level) {
             replCoord->appendSlaveInfoData(&result);
@@ -87,7 +93,7 @@ void appendReplicationInfo(OperationContext* opCtx, BSONObjBuilder& result, int 
     if (level) {
         BSONObjBuilder sources(result.subarrayStart("sources"));
 
-        int n = 0;
+        DecimalCounter<unsigned> n;
         list<BSONObj> src;
         {
             const NamespaceString localSources{"local.sources"};
@@ -96,7 +102,7 @@ void appendReplicationInfo(OperationContext* opCtx, BSONObjBuilder& result, int 
                 opCtx, localSources.ns(), ctx.getCollection(), PlanExecutor::NO_YIELD);
             BSONObj obj;
             PlanExecutor::ExecState state;
-            while (PlanExecutor::ADVANCED == (state = exec->getNext(&obj, NULL))) {
+            while (PlanExecutor::ADVANCED == (state = exec->getNext(&obj, nullptr))) {
                 src.push_back(obj.getOwned());
             }
 
@@ -115,7 +121,7 @@ void appendReplicationInfo(OperationContext* opCtx, BSONObjBuilder& result, int 
                 BSONElement e = s["syncedTo"];
                 BSONObjBuilder t(bb.subobjStart("syncedTo"));
                 t.appendDate("time", e.timestampTime());
-                t.append("inc", e.timestampInc());
+                t.append("inc", static_cast<int>(e.timestampInc()));
                 t.done();
             }
 
@@ -139,7 +145,8 @@ void appendReplicationInfo(OperationContext* opCtx, BSONObjBuilder& result, int 
                 conn.done();
             }
 
-            sources.append(BSONObjBuilder::numStr(n++), bb.obj());
+            sources.append(StringData{n}, bb.obj());
+            ++n;
         }
 
         sources.done();
@@ -147,8 +154,6 @@ void appendReplicationInfo(OperationContext* opCtx, BSONObjBuilder& result, int 
         replCoord->appendSlaveInfoData(&result);
     }
 }
-
-namespace {
 
 class ReplicationInfoServerStatus : public ServerStatusSection {
 public:
@@ -237,6 +242,10 @@ public:
              const BSONObj& cmdObj,
              BSONObjBuilder& result) final {
         CommandHelpers::handleMarkKillOnClientDisconnect(opCtx);
+
+        // TODO Unwind after SERVER-41070
+        waitInIsMaster.pauseWhileSet(opCtx);
+
         /* currently request to arbiter is (somewhat arbitrarily) an ismaster request that is not
            authenticated.
         */
@@ -255,6 +264,7 @@ public:
 
         auto& clientMetadataIsMasterState = ClientMetadataIsMasterState::get(opCtx->getClient());
         bool seenIsMaster = clientMetadataIsMasterState.hasSeenIsMaster();
+
         if (!seenIsMaster) {
             clientMetadataIsMasterState.setSeenIsMaster();
         }
@@ -266,16 +276,19 @@ public:
                           "The client metadata document may only be sent in the first isMaster");
             }
 
-            auto swParseClientMetadata = ClientMetadata::parse(element);
+            auto parsedClientMetadata = uassertStatusOK(ClientMetadata::parse(element));
 
-            uassertStatusOK(swParseClientMetadata.getStatus());
+            invariant(parsedClientMetadata);
 
-            invariant(swParseClientMetadata.getValue());
+            parsedClientMetadata->logClientMetadata(opCtx->getClient());
 
-            swParseClientMetadata.getValue().get().logClientMetadata(opCtx->getClient());
+            clientMetadataIsMasterState.setClientMetadata(opCtx->getClient(),
+                                                          std::move(parsedClientMetadata));
+        }
 
-            clientMetadataIsMasterState.setClientMetadata(
-                opCtx->getClient(), std::move(swParseClientMetadata.getValue()));
+        if (!seenIsMaster) {
+            auto sniName = opCtx->getClient()->getSniNameForSession();
+            SplitHorizon::setParameters(opCtx->getClient(), std::move(sniName));
         }
 
         // Parse the optional 'internalClient' field. This is provided by incoming connections from
@@ -317,8 +330,7 @@ public:
                 } else {
                     uasserted(ErrorCodes::BadValue,
                               str::stream() << "Unrecognized field of 'internalClient': '"
-                                            << fieldName
-                                            << "'");
+                                            << fieldName << "'");
                 }
             }
 

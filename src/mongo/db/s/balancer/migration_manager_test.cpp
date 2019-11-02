@@ -29,10 +29,13 @@
 
 #include "mongo/platform/basic.h"
 
+#include <memory>
+
 #include "mongo/client/remote_command_targeter_mock.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/s/balancer/migration_manager.h"
 #include "mongo/db/s/balancer/type_migration.h"
+#include "mongo/db/s/config/sharding_catalog_manager.h"
 #include "mongo/db/write_concern_options.h"
 #include "mongo/s/catalog/dist_lock_manager_mock.h"
 #include "mongo/s/catalog/type_collection.h"
@@ -42,7 +45,6 @@
 #include "mongo/s/config_server_test_fixture.h"
 #include "mongo/s/database_version_helpers.h"
 #include "mongo/s/request_types/move_chunk_request.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/util/scopeguard.h"
 
 namespace mongo {
@@ -137,17 +139,17 @@ protected:
     // Random static initialization order can result in X constructor running before Y constructor
     // if X and Y are defined in different source files. Defining variables here to enforce order.
     const BSONObj kShard0 =
-        BSON(ShardType::name(kShardId0.toString()) << ShardType::host(kShardHost0.toString())
-                                                   << ShardType::maxSizeMB(kMaxSizeMB));
+        BSON(ShardType::name(kShardId0.toString())
+             << ShardType::host(kShardHost0.toString()) << ShardType::maxSizeMB(kMaxSizeMB));
     const BSONObj kShard1 =
-        BSON(ShardType::name(kShardId1.toString()) << ShardType::host(kShardHost1.toString())
-                                                   << ShardType::maxSizeMB(kMaxSizeMB));
+        BSON(ShardType::name(kShardId1.toString())
+             << ShardType::host(kShardHost1.toString()) << ShardType::maxSizeMB(kMaxSizeMB));
     const BSONObj kShard2 =
-        BSON(ShardType::name(kShardId2.toString()) << ShardType::host(kShardHost2.toString())
-                                                   << ShardType::maxSizeMB(kMaxSizeMB));
+        BSON(ShardType::name(kShardId2.toString())
+             << ShardType::host(kShardHost2.toString()) << ShardType::maxSizeMB(kMaxSizeMB));
     const BSONObj kShard3 =
-        BSON(ShardType::name(kShardId3.toString()) << ShardType::host(kShardHost3.toString())
-                                                   << ShardType::maxSizeMB(kMaxSizeMB));
+        BSON(ShardType::name(kShardId3.toString())
+             << ShardType::host(kShardHost3.toString()) << ShardType::maxSizeMB(kMaxSizeMB));
 
     const KeyPattern kKeyPattern = KeyPattern(BSON(kPattern << 1));
 
@@ -160,7 +162,9 @@ private:
 
 void MigrationManagerTest::setUp() {
     ConfigServerTestFixture::setUp();
-    _migrationManager = stdx::make_unique<MigrationManager>(getServiceContext());
+    ASSERT_OK(ShardingCatalogManager::get(operationContext())
+                  ->initializeConfigDatabaseIfNeeded(operationContext()));
+    _migrationManager = std::make_unique<MigrationManager>(getServiceContext());
     _migrationManager->startRecoveryAndAcquireDistLocks(operationContext());
     _migrationManager->finishRecovery(operationContext(), 0, kDefaultSecondaryThrottle);
 }
@@ -331,7 +335,7 @@ TEST_F(MigrationManagerTest, OneCollectionTwoMigrations) {
     expectMoveChunkCommand(chunk2, kShardId3, Status::OK());
 
     // Run the MigrationManager code.
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(MigrationManagerTest, TwoCollectionsTwoMigrationsEach) {
@@ -395,7 +399,7 @@ TEST_F(MigrationManagerTest, TwoCollectionsTwoMigrationsEach) {
     expectMoveChunkCommand(chunk2coll2, kShardId3, Status::OK());
 
     // Run the MigrationManager code.
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 // The MigrationManager should fail the migration if a host is not found for the source shard.
@@ -439,15 +443,16 @@ TEST_F(MigrationManagerTest, SourceShardNotFound) {
         MigrationStatuses migrationStatuses = _migrationManager->executeMigrationsForAutoBalance(
             opCtx.get(), migrationRequests, 0, kDefaultSecondaryThrottle, false);
 
-        ASSERT_OK(migrationStatuses.at(chunk1.getName()));
-        ASSERT_EQ(ErrorCodes::ReplicaSetNotFound, migrationStatuses.at(chunk2.getName()));
+        ASSERT_OK(migrationStatuses.at(migrationRequests.front().getName()));
+        ASSERT_EQ(ErrorCodes::ReplicaSetNotFound,
+                  migrationStatuses.at(migrationRequests.back().getName()));
     });
 
     // Expect only one moveChunk command to be called.
     expectMoveChunkCommand(chunk1, kShardId1, Status::OK());
 
     // Run the MigrationManager code.
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 // TODO: Delete in 3.8
@@ -482,14 +487,15 @@ TEST_F(MigrationManagerTest, JumboChunkResponseBackwardsCompatibility) {
         MigrationStatuses migrationStatuses = _migrationManager->executeMigrationsForAutoBalance(
             opCtx.get(), migrationRequests, 0, kDefaultSecondaryThrottle, false);
 
-        ASSERT_EQ(ErrorCodes::ChunkTooBig, migrationStatuses.at(chunk1.getName()));
+        ASSERT_EQ(ErrorCodes::ChunkTooBig,
+                  migrationStatuses.at(migrationRequests.front().getName()));
     });
 
     // Expect only one moveChunk command to be called.
     expectMoveChunkCommand(chunk1, kShardId1, BSON("ok" << 0 << "chunkTooBig" << true));
 
     // Run the MigrationManager code.
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(MigrationManagerTest, InterruptMigration) {
@@ -538,7 +544,7 @@ TEST_F(MigrationManagerTest, InterruptMigration) {
     network()->exitNetwork();
 
     // Ensure that the previously scheduled migration is cancelled
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 
     // Ensure that no new migrations can be scheduled
     ASSERT_EQ(ErrorCodes::BalancerInterrupted,
@@ -557,17 +563,18 @@ TEST_F(MigrationManagerTest, InterruptMigration) {
             ReadPreferenceSetting{ReadPreference::PrimaryOnly},
             repl::ReadConcernLevel::kMajorityReadConcern,
             MigrationType::ConfigNS,
-            BSON(MigrationType::name(chunk.getName())),
+            BSON(MigrationType::ns(collName.ns()) << MigrationType::min(chunk.getMin())),
             BSONObj(),
             boost::none);
     Shard::QueryResponse migrationsQueryResponse =
         uassertStatusOK(statusWithMigrationsQueryResponse);
     ASSERT_EQUALS(1U, migrationsQueryResponse.docs.size());
 
-    ASSERT_OK(catalogClient()->removeConfigDocuments(operationContext(),
-                                                     MigrationType::ConfigNS,
-                                                     BSON(MigrationType::name(chunk.getName())),
-                                                     kMajorityWriteConcern));
+    ASSERT_OK(catalogClient()->removeConfigDocuments(
+        operationContext(),
+        MigrationType::ConfigNS,
+        BSON(MigrationType::ns(collName.ns()) << MigrationType::min(chunk.getMin())),
+        kMajorityWriteConcern));
 
     // Restore the migration manager back to the started state, which is expected by tearDown
     _migrationManager->startRecoveryAndAcquireDistLocks(operationContext());
@@ -613,7 +620,7 @@ TEST_F(MigrationManagerTest, RestartMigrationManager) {
     expectMoveChunkCommand(chunk1, kShardId1, Status::OK());
 
     // Run the MigrationManager code.
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(MigrationManagerTest, MigrationRecovery) {
@@ -668,7 +675,7 @@ TEST_F(MigrationManagerTest, MigrationRecovery) {
     expectMoveChunkCommand(chunk2, kShardId3, Status::OK());
 
     // Run the MigrationManager code.
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(MigrationManagerTest, FailMigrationRecovery) {
@@ -752,6 +759,9 @@ TEST_F(MigrationManagerTest, RemoteCallErrorConversionToOperationFailed) {
     ChunkType chunk2 =
         setUpChunk(collName, BSON(kPattern << 49), kKeyPattern.globalMax(), kShardId2, version);
 
+    // Going to request that these two chunks get migrated.
+    const std::vector<MigrateInfo> migrationRequests{{kShardId1, chunk1}, {kShardId3, chunk2}};
+
     auto future = launchAsync([&] {
         ThreadClient tc("Test", getGlobalServiceContext());
         auto opCtx = cc().makeOperationContext();
@@ -762,14 +772,12 @@ TEST_F(MigrationManagerTest, RemoteCallErrorConversionToOperationFailed) {
         shardTargeterMock(opCtx.get(), kShardId2)->setFindHostReturnValue(kShardHost2);
 
         MigrationStatuses migrationStatuses = _migrationManager->executeMigrationsForAutoBalance(
-            opCtx.get(),
-            {{kShardId1, chunk1}, {kShardId3, chunk2}},
-            0,
-            kDefaultSecondaryThrottle,
-            false);
+            opCtx.get(), migrationRequests, 0, kDefaultSecondaryThrottle, false);
 
-        ASSERT_EQ(ErrorCodes::OperationFailed, migrationStatuses.at(chunk1.getName()));
-        ASSERT_EQ(ErrorCodes::OperationFailed, migrationStatuses.at(chunk2.getName()));
+        ASSERT_EQ(ErrorCodes::OperationFailed,
+                  migrationStatuses.at(migrationRequests.front().getName()));
+        ASSERT_EQ(ErrorCodes::OperationFailed,
+                  migrationStatuses.at(migrationRequests.back().getName()));
     });
 
     // Expect a moveChunk command that will fail with a retriable error.
@@ -787,7 +795,7 @@ TEST_F(MigrationManagerTest, RemoteCallErrorConversionToOperationFailed) {
                "RemoteCallErrorConversionToOperationFailedCheck generated error."));
 
     // Run the MigrationManager code.
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 }  // namespace

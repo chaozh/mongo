@@ -29,14 +29,14 @@
 
 #pragma once
 
-#include "mongo/base/disallow_copying.h"
+#include <functional>
+
 #include "mongo/base/status_with.h"
 #include "mongo/client/fetcher.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/repl/abstract_async_component.h"
 #include "mongo/db/repl/optime_with.h"
-#include "mongo/stdx/functional.h"
-#include "mongo/stdx/mutex.h"
+#include "mongo/platform/mutex.h"
 
 namespace mongo {
 namespace repl {
@@ -51,7 +51,8 @@ namespace repl {
  * fetcher. Subclasses also provide a callback to run on successful batches.
  */
 class AbstractOplogFetcher : public AbstractAsyncComponent {
-    MONGO_DISALLOW_COPYING(AbstractOplogFetcher);
+    AbstractOplogFetcher(const AbstractOplogFetcher&) = delete;
+    AbstractOplogFetcher& operator=(const AbstractOplogFetcher&) = delete;
 
 public:
     /**
@@ -64,7 +65,7 @@ public:
      * This function will be called 0 times if startup() fails and at most once after startup()
      * returns success.
      */
-    using OnShutdownCallbackFn = stdx::function<void(const Status& shutdownStatus)>;
+    using OnShutdownCallbackFn = std::function<void(const Status& shutdownStatus)>;
 
     /**
      * Invariants if validation fails on any of the provided arguments.
@@ -147,7 +148,7 @@ protected:
     virtual void _doShutdown_inlock() noexcept override;
 
 private:
-    stdx::mutex* _getMutex() noexcept override;
+    Mutex* _getMutex() noexcept override;
 
     /**
      * This function must be overriden by subclass oplog fetchers to specify what `find` command
@@ -213,7 +214,7 @@ private:
     const std::size_t _maxFetcherRestarts;
 
     // Protects member data of this AbstractOplogFetcher.
-    mutable stdx::mutex _mutex;
+    mutable Mutex _mutex = MONGO_MAKE_LATCH("AbstractOplogFetcher::_mutex");
 
     // Function to call when the oplog fetcher shuts down.
     OnShutdownCallbackFn _onShutdownCallbackFn;

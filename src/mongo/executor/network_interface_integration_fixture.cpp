@@ -31,6 +31,8 @@
 
 #include "mongo/platform/basic.h"
 
+#include <memory>
+
 #include "mongo/client/connection_string.h"
 #include "mongo/executor/network_interface_factory.h"
 #include "mongo/executor/network_interface_integration_fixture.h"
@@ -38,7 +40,6 @@
 #include "mongo/executor/task_executor.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/stdx/future.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/unittest/integration_test.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/log.h"
@@ -86,12 +87,21 @@ PseudoRandom* NetworkInterfaceIntegrationFixture::getRandomNumberGenerator() {
 void NetworkInterfaceIntegrationFixture::startCommand(const TaskExecutor::CallbackHandle& cbHandle,
                                                       RemoteCommandRequest& request,
                                                       StartCommandCB onFinish) {
-    net().startCommand(cbHandle, request, onFinish).transitional_ignore();
+    RemoteCommandRequestOnAny rcroa{request};
+
+    auto cb = [onFinish = std::move(onFinish)](const TaskExecutor::ResponseOnAnyStatus& rs) {
+        onFinish(rs);
+    };
+    invariant(net().startCommand(cbHandle, rcroa, std::move(cb)));
 }
 
 Future<RemoteCommandResponse> NetworkInterfaceIntegrationFixture::runCommand(
     const TaskExecutor::CallbackHandle& cbHandle, RemoteCommandRequest request) {
-    return net().startCommand(cbHandle, request);
+    RemoteCommandRequestOnAny rcroa{request};
+
+    return net().startCommand(cbHandle, rcroa).then([](TaskExecutor::ResponseOnAnyStatus roa) {
+        return RemoteCommandResponse(roa);
+    });
 }
 
 RemoteCommandResponse NetworkInterfaceIntegrationFixture::runCommandSync(

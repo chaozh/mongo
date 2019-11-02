@@ -40,8 +40,8 @@
 
 namespace ClientTests {
 
-using std::unique_ptr;
 using std::string;
+using std::unique_ptr;
 using std::vector;
 
 class Base {
@@ -62,6 +62,10 @@ public:
         db.dropCollection(_ns);
     }
 
+    const NamespaceString nss() {
+        return NamespaceString(_ns);
+    }
+
     const char* ns() {
         return _ns.c_str();
     }
@@ -79,19 +83,19 @@ public:
         DBDirectClient db(&opCtx);
 
         db.insert(ns(), BSON("x" << 2));
-        ASSERT_EQUALS(1u, db.getIndexSpecs(ns()).size());
+        ASSERT_EQUALS(1u, db.getIndexSpecs(nss()).size());
 
         ASSERT_OK(dbtests::createIndex(&opCtx, ns(), BSON("x" << 1)));
-        ASSERT_EQUALS(2u, db.getIndexSpecs(ns()).size());
+        ASSERT_EQUALS(2u, db.getIndexSpecs(nss()).size());
 
         db.dropIndex(ns(), BSON("x" << 1));
-        ASSERT_EQUALS(1u, db.getIndexSpecs(ns()).size());
+        ASSERT_EQUALS(1u, db.getIndexSpecs(nss()).size());
 
         ASSERT_OK(dbtests::createIndex(&opCtx, ns(), BSON("x" << 1)));
-        ASSERT_EQUALS(2u, db.getIndexSpecs(ns()).size());
+        ASSERT_EQUALS(2u, db.getIndexSpecs(nss()).size());
 
         db.dropIndexes(ns());
-        ASSERT_EQUALS(1u, db.getIndexSpecs(ns()).size());
+        ASSERT_EQUALS(1u, db.getIndexSpecs(nss()).size());
     }
 };
 
@@ -118,18 +122,18 @@ public:
 
         ASSERT_EQUALS(1, indexCatalog->numIndexesReady(&opCtx));
         // _id index
-        ASSERT_EQUALS(1U, db.getIndexSpecs(ns()).size());
+        ASSERT_EQUALS(1U, db.getIndexSpecs(nss()).size());
 
         ASSERT_EQUALS(ErrorCodes::DuplicateKey,
                       dbtests::createIndex(&opCtx, ns(), BSON("y" << 1), true));
 
         ASSERT_EQUALS(1, indexCatalog->numIndexesReady(&opCtx));
-        ASSERT_EQUALS(1U, db.getIndexSpecs(ns()).size());
+        ASSERT_EQUALS(1U, db.getIndexSpecs(nss()).size());
 
         ASSERT_OK(dbtests::createIndex(&opCtx, ns(), BSON("x" << 1), true));
 
         ASSERT_EQUALS(2, indexCatalog->numIndexesReady(&opCtx));
-        ASSERT_EQUALS(2U, db.getIndexSpecs(ns()).size());
+        ASSERT_EQUALS(2U, db.getIndexSpecs(nss()).size());
     }
 };
 
@@ -382,9 +386,9 @@ public:
     }
 };
 
-class All : public Suite {
+class All : public OldStyleSuiteSpecification {
 public:
-    All() : Suite("client") {}
+    All() : OldStyleSuiteSpecification("client") {}
 
     void setupTests() {
         add<DropIndex>();
@@ -406,5 +410,5 @@ public:
     }
 };
 
-SuiteInstance<All> all;
-}
+OldStyleSuiteInitializer<All> all;
+}  // namespace ClientTests

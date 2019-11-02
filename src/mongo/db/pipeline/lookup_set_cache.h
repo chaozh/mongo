@@ -36,21 +36,21 @@
 #include <boost/multi_index/sequenced_index.hpp>
 #include <boost/multi_index_container.hpp>
 #include <boost/optional.hpp>
+#include <functional>
 #include <vector>
 
 #include "mongo/base/string_data_comparator_interface.h"
-#include "mongo/db/pipeline/document.h"
-#include "mongo/db/pipeline/value.h"
-#include "mongo/db/pipeline/value_comparator.h"
-#include "mongo/stdx/functional.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/exec/document_value/value_comparator.h"
 
 namespace mongo {
 
 using boost::multi_index_container;
-using boost::multi_index::sequenced;
 using boost::multi_index::hashed_unique;
-using boost::multi_index::member;
 using boost::multi_index::indexed_by;
+using boost::multi_index::member;
+using boost::multi_index::sequenced;
 
 /**
  * A least-recently-used cache from key to a vector of values. It does not implement any default

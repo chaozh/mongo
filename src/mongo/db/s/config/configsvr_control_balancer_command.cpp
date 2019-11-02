@@ -36,9 +36,10 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/repl/read_concern_args.h"
 #include "mongo/db/s/balancer/balancer.h"
+#include "mongo/db/s/sharding_logging.h"
 #include "mongo/s/balancer_configuration.h"
 #include "mongo/s/grid.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 namespace {
@@ -102,9 +103,11 @@ public:
 
 private:
     void _run(OperationContext* opCtx, BSONObjBuilder* result) override {
-        uassertStatusOK(Grid::get(opCtx)->getBalancerConfiguration()->setBalancerMode(
-            opCtx, BalancerSettingsType::kFull));
+        auto balancerConfig = Grid::get(opCtx)->getBalancerConfiguration();
+        uassertStatusOK(balancerConfig->setBalancerMode(opCtx, BalancerSettingsType::kFull));
+        uassertStatusOK(balancerConfig->enableAutoSplit(opCtx, true));
         Balancer::get(opCtx)->notifyPersistedBalancerSettingsChanged();
+        ShardingLogging::get(opCtx)->logAction(opCtx, "balancer.start", "", BSONObj()).ignore();
     }
 };
 
@@ -119,10 +122,14 @@ private:
         repl::ReadConcernArgs::get(opCtx) =
             repl::ReadConcernArgs(repl::ReadConcernLevel::kLocalReadConcern);
 
-        uassertStatusOK(Grid::get(opCtx)->getBalancerConfiguration()->setBalancerMode(
-            opCtx, BalancerSettingsType::kOff));
+        auto balancerConfig = Grid::get(opCtx)->getBalancerConfiguration();
+        uassertStatusOK(balancerConfig->setBalancerMode(opCtx, BalancerSettingsType::kOff));
+        uassertStatusOK(balancerConfig->enableAutoSplit(opCtx, false));
+
         Balancer::get(opCtx)->notifyPersistedBalancerSettingsChanged();
         Balancer::get(opCtx)->joinCurrentRound(opCtx);
+
+        ShardingLogging::get(opCtx)->logAction(opCtx, "balancer.stop", "", BSONObj()).ignore();
     }
 };
 

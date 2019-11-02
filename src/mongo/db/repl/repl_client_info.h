@@ -46,11 +46,22 @@ class ReplClientInfo {
 public:
     static const Client::Decoration<ReplClientInfo> forClient;
 
-    void setLastOp(const OpTime& op);
+    /**
+     * Sets the LastOp to the provided op, which MUST be greater than or equal to the current value
+     * of the LastOp. This also marks that the LastOp was set explicitly on the client so we wait
+     * for write concern.
+     */
+    void setLastOp(OperationContext* opCtx, const OpTime& op);
 
     OpTime getLastOp() const {
         return _lastOp;
     }
+
+    /**
+     * Returns true when either setLastOp() or setLastOpToSystemLastOpTime() was called to set the
+     * opTime under the current OperationContext.
+     */
+    bool lastOpWasSetExplicitlyByClientForCurrentOperation(OperationContext* opCtx) const;
 
     // Resets the last op on this client; should only be used in testing.
     void clearLastOp_forTest() {

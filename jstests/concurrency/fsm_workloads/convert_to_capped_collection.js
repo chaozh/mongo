@@ -17,7 +17,6 @@ var $config = (function() {
     var data = {prefix: 'convert_to_capped_collection'};
 
     var states = (function() {
-
         function uniqueCollectionName(prefix, tid) {
             return prefix + '_' + tid;
         }
@@ -35,7 +34,7 @@ var $config = (function() {
             }
 
             var res = bulk.execute();
-            assertAlways.writeOK(res);
+            assertAlways.commandWorked(res);
             assertAlways.eq((this.tid + 1) * 200, res.nInserted);
 
             assertWhenOwnDB(!db[this.threadCollName].isCapped());
@@ -79,5 +78,4 @@ var $config = (function() {
         transitions: transitions,
         setup: setup,
     };
-
 })();

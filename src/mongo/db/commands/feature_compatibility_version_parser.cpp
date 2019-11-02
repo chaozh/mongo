@@ -38,10 +38,10 @@
 
 namespace mongo {
 
-constexpr StringData FeatureCompatibilityVersionParser::kVersion40;
 constexpr StringData FeatureCompatibilityVersionParser::kVersion42;
-constexpr StringData FeatureCompatibilityVersionParser::kVersionDowngradingTo40;
-constexpr StringData FeatureCompatibilityVersionParser::kVersionUpgradingTo42;
+constexpr StringData FeatureCompatibilityVersionParser::kVersion44;
+constexpr StringData FeatureCompatibilityVersionParser::kVersionDowngradingTo42;
+constexpr StringData FeatureCompatibilityVersionParser::kVersionUpgradingTo44;
 constexpr StringData FeatureCompatibilityVersionParser::kVersionUnset;
 
 constexpr StringData FeatureCompatibilityVersionParser::kParameterName;
@@ -51,7 +51,7 @@ constexpr StringData FeatureCompatibilityVersionParser::kTargetVersionField;
 StatusWith<ServerGlobalParams::FeatureCompatibility::Version>
 FeatureCompatibilityVersionParser::parse(const BSONObj& featureCompatibilityVersionDoc) {
     ServerGlobalParams::FeatureCompatibility::Version version =
-        ServerGlobalParams::FeatureCompatibility::Version::kUnsetDefault40Behavior;
+        ServerGlobalParams::FeatureCompatibility::Version::kUnsetDefault42Behavior;
     std::string versionString;
     std::string targetVersionString;
 
@@ -61,37 +61,26 @@ FeatureCompatibilityVersionParser::parse(const BSONObj& featureCompatibilityVers
             continue;
         } else if (fieldName == kVersionField || fieldName == kTargetVersionField) {
             if (elem.type() != BSONType::String) {
-                return Status(
-                    ErrorCodes::TypeMismatch,
-                    str::stream() << fieldName << " must be of type String, but was of type "
-                                  << typeName(elem.type())
-                                  << ". Contents of "
-                                  << kParameterName
+                return Status(ErrorCodes::TypeMismatch,
+                              str::stream()
+                                  << fieldName << " must be of type String, but was of type "
+                                  << typeName(elem.type()) << ". Contents of " << kParameterName
                                   << " document in "
                                   << NamespaceString::kServerConfigurationNamespace.toString()
-                                  << ": "
-                                  << featureCompatibilityVersionDoc
-                                  << ". See "
+                                  << ": " << featureCompatibilityVersionDoc << ". See "
                                   << feature_compatibility_version_documentation::kCompatibilityLink
                                   << ".");
             }
 
-            if (elem.String() != kVersion42 && elem.String() != kVersion40) {
-                return Status(
-                    ErrorCodes::BadValue,
-                    str::stream() << "Invalid value for " << fieldName << ", found "
-                                  << elem.String()
-                                  << ", expected '"
-                                  << kVersion42
-                                  << "' or '"
-                                  << kVersion40
-                                  << "'. Contents of "
-                                  << kParameterName
+            if (elem.String() != kVersion44 && elem.String() != kVersion42) {
+                return Status(ErrorCodes::BadValue,
+                              str::stream()
+                                  << "Invalid value for " << fieldName << ", found "
+                                  << elem.String() << ", expected '" << kVersion44 << "' or '"
+                                  << kVersion42 << "'. Contents of " << kParameterName
                                   << " document in "
                                   << NamespaceString::kServerConfigurationNamespace.toString()
-                                  << ": "
-                                  << featureCompatibilityVersionDoc
-                                  << ". See "
+                                  << ": " << featureCompatibilityVersionDoc << ". See "
                                   << feature_compatibility_version_documentation::kCompatibilityLink
                                   << ".");
             }
@@ -102,52 +91,44 @@ FeatureCompatibilityVersionParser::parse(const BSONObj& featureCompatibilityVers
                 targetVersionString = elem.String();
             }
         } else {
-            return Status(
-                ErrorCodes::BadValue,
-                str::stream() << "Unrecognized field '" << fieldName << "'. Contents of "
-                              << kParameterName
-                              << " document in "
-                              << NamespaceString::kServerConfigurationNamespace.toString()
-                              << ": "
-                              << featureCompatibilityVersionDoc
-                              << ". See "
+            return Status(ErrorCodes::BadValue,
+                          str::stream()
+                              << "Unrecognized field '" << fieldName << "'. Contents of "
+                              << kParameterName << " document in "
+                              << NamespaceString::kServerConfigurationNamespace.toString() << ": "
+                              << featureCompatibilityVersionDoc << ". See "
                               << feature_compatibility_version_documentation::kCompatibilityLink
                               << ".");
         }
     }
 
-    if (versionString == kVersion40) {
-        if (targetVersionString == kVersion42) {
-            version = ServerGlobalParams::FeatureCompatibility::Version::kUpgradingTo42;
-        } else if (targetVersionString == kVersion40) {
-            version = ServerGlobalParams::FeatureCompatibility::Version::kDowngradingTo40;
+    if (versionString == kVersion42) {
+        if (targetVersionString == kVersion44) {
+            version = ServerGlobalParams::FeatureCompatibility::Version::kUpgradingTo44;
+        } else if (targetVersionString == kVersion42) {
+            version = ServerGlobalParams::FeatureCompatibility::Version::kDowngradingTo42;
         } else {
-            version = ServerGlobalParams::FeatureCompatibility::Version::kFullyDowngradedTo40;
+            version = ServerGlobalParams::FeatureCompatibility::Version::kFullyDowngradedTo42;
         }
-    } else if (versionString == kVersion42) {
-        if (targetVersionString == kVersion42 || targetVersionString == kVersion40) {
-            return Status(
-                ErrorCodes::BadValue,
-                str::stream() << "Invalid state for " << kParameterName << " document in "
-                              << NamespaceString::kServerConfigurationNamespace.toString()
-                              << ": "
-                              << featureCompatibilityVersionDoc
-                              << ". See "
+    } else if (versionString == kVersion44) {
+        if (targetVersionString == kVersion44 || targetVersionString == kVersion42) {
+            return Status(ErrorCodes::BadValue,
+                          str::stream()
+                              << "Invalid state for " << kParameterName << " document in "
+                              << NamespaceString::kServerConfigurationNamespace.toString() << ": "
+                              << featureCompatibilityVersionDoc << ". See "
                               << feature_compatibility_version_documentation::kCompatibilityLink
                               << ".");
         } else {
-            version = ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo42;
+            version = ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo44;
         }
     } else {
-        return Status(
-            ErrorCodes::BadValue,
-            str::stream() << "Missing required field '" << kVersionField << "''. Contents of "
-                          << kParameterName
-                          << " document in "
-                          << NamespaceString::kServerConfigurationNamespace.toString()
-                          << ": "
-                          << featureCompatibilityVersionDoc
-                          << ". See "
+        return Status(ErrorCodes::BadValue,
+                      str::stream()
+                          << "Missing required field '" << kVersionField << "''. Contents of "
+                          << kParameterName << " document in "
+                          << NamespaceString::kServerConfigurationNamespace.toString() << ": "
+                          << featureCompatibilityVersionDoc << ". See "
                           << feature_compatibility_version_documentation::kCompatibilityLink
                           << ".");
     }

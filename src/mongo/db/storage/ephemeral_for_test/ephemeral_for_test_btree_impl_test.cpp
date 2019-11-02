@@ -29,28 +29,49 @@
 
 #include "mongo/db/storage/ephemeral_for_test/ephemeral_for_test_btree_impl.h"
 
+#include <memory>
 
 #include "mongo/base/init.h"
+#include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/storage/ephemeral_for_test/ephemeral_for_test_recovery_unit.h"
 #include "mongo/db/storage/sorted_data_interface_test_harness.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
 namespace {
 
-class EphemeralForBtreeImplTestHarnessHelper final
+class EphemeralForTestBtreeImplTestHarnessHelper final
     : public virtual SortedDataInterfaceHarnessHelper {
 public:
-    EphemeralForBtreeImplTestHarnessHelper() : _order(Ordering::make(BSONObj())) {}
+    EphemeralForTestBtreeImplTestHarnessHelper() : _order(Ordering::make(BSONObj())) {}
+
+    std::unique_ptr<SortedDataInterface> newIdIndexSortedDataInterface() final {
+        BSONObj spec = BSON("key" << BSON("_id" << 1) << "name"
+                                  << "_id_"
+                                  << "v" << static_cast<int>(IndexDescriptor::kLatestIndexVersion)
+                                  << "unique" << true);
+
+        return std::unique_ptr<SortedDataInterface>(
+            getEphemeralForTestBtreeImpl(_order,
+                                         true /* unique */,
+                                         NamespaceString("test.EphemeralForTest"),
+                                         "indexName",
+                                         spec,
+                                         &_data));
+    }
 
     std::unique_ptr<SortedDataInterface> newSortedDataInterface(bool unique, bool partial) final {
-        return std::unique_ptr<SortedDataInterface>(getEphemeralForTestBtreeImpl(
-            _order, unique, "test.EphemeralForTest", "indexName", BSONObj(), &_data));
+        return std::unique_ptr<SortedDataInterface>(
+            getEphemeralForTestBtreeImpl(_order,
+                                         unique,
+                                         NamespaceString("test.EphemeralForTest"),
+                                         "indexName",
+                                         BSONObj(),
+                                         &_data));
     }
 
     std::unique_ptr<RecoveryUnit> newRecoveryUnit() final {
-        return stdx::make_unique<EphemeralForTestRecoveryUnit>();
+        return std::make_unique<EphemeralForTestRecoveryUnit>();
     }
 
 private:
@@ -58,12 +79,12 @@ private:
     Ordering _order;
 };
 
-std::unique_ptr<HarnessHelper> makeHarnessHelper() {
-    return stdx::make_unique<EphemeralForBtreeImplTestHarnessHelper>();
+std::unique_ptr<SortedDataInterfaceHarnessHelper> makeEFTHarnessHelper() {
+    return std::make_unique<EphemeralForTestBtreeImplTestHarnessHelper>();
 }
 
-MONGO_INITIALIZER(RegisterHarnessFactory)(InitializerContext* const) {
-    mongo::registerHarnessHelperFactory(makeHarnessHelper);
+MONGO_INITIALIZER(RegisterSortedDataInterfaceHarnessFactory)(InitializerContext* const) {
+    mongo::registerSortedDataInterfaceHarnessHelperFactory(makeEFTHarnessHelper);
     return Status::OK();
 }
 }  // namespace

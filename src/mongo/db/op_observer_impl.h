@@ -34,7 +34,8 @@
 namespace mongo {
 
 class OpObserverImpl : public OpObserver {
-    MONGO_DISALLOW_COPYING(OpObserverImpl);
+    OpObserverImpl(const OpObserverImpl&) = delete;
+    OpObserverImpl& operator=(const OpObserverImpl&) = delete;
 
 public:
     OpObserverImpl() = default;
@@ -65,6 +66,7 @@ public:
                            CollectionUUID collUUID,
                            const UUID& indexBuildUUID,
                            const std::vector<BSONObj>& indexes,
+                           const Status& cause,
                            bool fromMigrate) final;
 
     void onInserts(OperationContext* opCtx,
@@ -145,8 +147,8 @@ public:
         Timestamp commitTimestamp,
         const std::vector<repl::ReplOperation>& statements) noexcept final;
     void onTransactionPrepare(OperationContext* opCtx,
-                              const OplogSlot& prepareOpTime,
-                              std::vector<repl::ReplOperation>& statments) final;
+                              const std::vector<OplogSlot>& reservedSlots,
+                              std::vector<repl::ReplOperation>& statements) final;
     void onTransactionAbort(OperationContext* opCtx,
                             boost::optional<OplogSlot> abortOplogEntryOpTime) final;
     void onReplicationRollback(OperationContext* opCtx, const RollbackObserverInfo& rbInfo) final;
@@ -168,7 +170,8 @@ private:
                                       const bool inMultiDocumentTransaction) {}
     virtual void shardObserveUpdateOp(OperationContext* opCtx,
                                       const NamespaceString nss,
-                                      const BSONObj& updatedDoc,
+                                      boost::optional<BSONObj> preImageDoc,
+                                      const BSONObj& postImageDoc,
                                       const repl::OpTime& opTime,
                                       const repl::OpTime& prePostImageOpTime,
                                       const bool inMultiDocumentTransaction) {}
@@ -181,7 +184,7 @@ private:
     virtual void shardObserveTransactionPrepareOrUnpreparedCommit(
         OperationContext* opCtx,
         const std::vector<repl::ReplOperation>& stmts,
-        const repl::OpTime& opTime) {}
+        const repl::OpTime& prepareOrCommitOptime) {}
 };
 
 }  // namespace mongo

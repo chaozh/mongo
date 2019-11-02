@@ -43,7 +43,7 @@ namespace repl {
 MemberData::MemberData() : _health(-1), _authIssue(false), _configIndex(-1), _isSelf(false) {
     _lastResponse.setState(MemberState::RS_UNKNOWN);
     _lastResponse.setElectionTime(Timestamp());
-    _lastResponse.setAppliedOpTime(OpTime());
+    _lastResponse.setAppliedOpTimeAndWallTime(OpTimeAndWallTime());
 }
 
 bool MemberData::setUpValues(Date_t now, ReplSetHeartbeatResponse&& hbResponse) {
@@ -65,7 +65,7 @@ bool MemberData::setUpValues(Date_t now, ReplSetHeartbeatResponse&& hbResponse) 
         hbResponse.setElectionTime(_lastResponse.getElectionTime());
     }
     if (!hbResponse.hasAppliedOpTime()) {
-        hbResponse.setAppliedOpTime(_lastResponse.getAppliedOpTime());
+        hbResponse.setAppliedOpTimeAndWallTime(_lastResponse.getAppliedOpTimeAndWallTime());
     }
     // Log if the state changes
     if (_lastResponse.getState() != hbResponse.getState()) {
@@ -73,9 +73,13 @@ bool MemberData::setUpValues(Date_t now, ReplSetHeartbeatResponse&& hbResponse) 
               << hbResponse.getState().toString() << rsLog;
     }
 
-    bool opTimeAdvanced = advanceLastAppliedOpTime(hbResponse.getAppliedOpTime(), now);
-    auto durableOpTime = hbResponse.hasDurableOpTime() ? hbResponse.getDurableOpTime() : OpTime();
-    opTimeAdvanced = advanceLastDurableOpTime(durableOpTime, now) || opTimeAdvanced;
+    bool opTimeAdvanced =
+        advanceLastAppliedOpTimeAndWallTime(hbResponse.getAppliedOpTimeAndWallTime(), now);
+    auto durableOpTimeAndWallTime = hbResponse.hasDurableOpTime()
+        ? hbResponse.getDurableOpTimeAndWallTime()
+        : OpTimeAndWallTime();
+    opTimeAdvanced =
+        advanceLastDurableOpTimeAndWallTime(durableOpTimeAndWallTime, now) || opTimeAdvanced;
     _lastResponse = std::move(hbResponse);
     return opTimeAdvanced;
 }
@@ -89,13 +93,14 @@ void MemberData::setDownValues(Date_t now, const std::string& heartbeatMessage) 
     _lastHeartbeatMessage = heartbeatMessage;
 
     if (_lastResponse.getState() != MemberState::RS_DOWN) {
-        log() << "Member " << _hostAndPort.toString() << " is now in state RS_DOWN" << rsLog;
+        log() << "Member " << _hostAndPort.toString() << " is now in state RS_DOWN - "
+              << redact(heartbeatMessage) << rsLog;
     }
 
     _lastResponse = ReplSetHeartbeatResponse();
     _lastResponse.setState(MemberState::RS_DOWN);
     _lastResponse.setElectionTime(Timestamp());
-    _lastResponse.setAppliedOpTime(OpTime());
+    _lastResponse.setAppliedOpTimeAndWallTime(OpTimeAndWallTime());
     _lastResponse.setSyncingTo(HostAndPort());
 
     // The _lastAppliedOpTime/_lastDurableOpTime fields don't get cleared merely by missing a
@@ -118,47 +123,55 @@ void MemberData::setAuthIssue(Date_t now) {
     _lastResponse = ReplSetHeartbeatResponse();
     _lastResponse.setState(MemberState::RS_UNKNOWN);
     _lastResponse.setElectionTime(Timestamp());
-    _lastResponse.setAppliedOpTime(OpTime());
+    _lastResponse.setAppliedOpTimeAndWallTime(OpTimeAndWallTime());
     _lastResponse.setSyncingTo(HostAndPort());
 }
 
-void MemberData::setLastAppliedOpTime(OpTime opTime, Date_t now) {
+void MemberData::setLastAppliedOpTimeAndWallTime(OpTimeAndWallTime opTime, Date_t now) {
+    invariant(opTime.opTime.isNull() || opTime.wallTime > Date_t());
     _lastUpdate = now;
     _lastUpdateStale = false;
-    _lastAppliedOpTime = opTime;
+    _lastAppliedOpTime = opTime.opTime;
+    _lastAppliedWallTime = opTime.wallTime;
 }
 
-void MemberData::setLastDurableOpTime(OpTime opTime, Date_t now) {
+void MemberData::setLastDurableOpTimeAndWallTime(OpTimeAndWallTime opTime, Date_t now) {
+    invariant(opTime.opTime.isNull() || opTime.wallTime > Date_t());
     _lastUpdate = now;
     _lastUpdateStale = false;
-    if (_lastAppliedOpTime < opTime) {
+    if (_lastAppliedOpTime < opTime.opTime) {
         // TODO(russotto): We think this should never happen, rollback or no rollback.  Make this an
         // invariant and see what happens.
-        log() << "Durable progress (" << opTime << ") is ahead of the applied progress ("
-              << _lastAppliedOpTime << ". This is likely due to a "
-                                       "rollback."
+        log() << "Durable progress (" << opTime.opTime << ") is ahead of the applied progress ("
+              << _lastAppliedOpTime
+              << ". This is likely due to a "
+                 "rollback."
               << " memberid: " << _memberId << _hostAndPort.toString()
               << " previous durable progress: " << _lastDurableOpTime;
     } else {
-        _lastDurableOpTime = opTime;
+        _lastDurableOpTime = opTime.opTime;
+        _lastDurableWallTime = opTime.wallTime;
     }
 }
 
-bool MemberData::advanceLastAppliedOpTime(OpTime opTime, Date_t now) {
+bool MemberData::advanceLastAppliedOpTimeAndWallTime(OpTimeAndWallTime opTime, Date_t now) {
+    invariant(opTime.opTime.isNull() || opTime.wallTime > Date_t());
     _lastUpdate = now;
     _lastUpdateStale = false;
-    if (_lastAppliedOpTime < opTime) {
-        setLastAppliedOpTime(opTime, now);
+    if (_lastAppliedOpTime < opTime.opTime) {
+        setLastAppliedOpTimeAndWallTime(opTime, now);
         return true;
     }
     return false;
 }
 
-bool MemberData::advanceLastDurableOpTime(OpTime opTime, Date_t now) {
+bool MemberData::advanceLastDurableOpTimeAndWallTime(OpTimeAndWallTime opTime, Date_t now) {
+    invariant(opTime.opTime.isNull() || opTime.wallTime > Date_t());
     _lastUpdate = now;
     _lastUpdateStale = false;
-    if (_lastDurableOpTime < opTime) {
-        setLastDurableOpTime(opTime, now);
+    if (_lastDurableOpTime < opTime.opTime) {
+        _lastDurableOpTime = opTime.opTime;
+        _lastDurableWallTime = opTime.wallTime;
         return true;
     }
     return false;

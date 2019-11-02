@@ -31,18 +31,19 @@
 
 #include "mongo/db/query/query_request.h"
 
+#include <memory>
+
 #include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
 #include "mongo/bson/simple_bsonobj_comparator.h"
-#include "mongo/db/catalog/uuid_catalog.h"
+#include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/command_generic_argument.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/dbmessage.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/repl/read_concern_args.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -57,10 +58,11 @@ const char QueryRequest::queryOptionMaxTimeMS[] = "$maxTimeMS";
 
 const string QueryRequest::metaGeoNearDistance("geoNearDistance");
 const string QueryRequest::metaGeoNearPoint("geoNearPoint");
-const string QueryRequest::metaIndexKey("indexKey");
 const string QueryRequest::metaRecordId("recordId");
 const string QueryRequest::metaSortKey("sortKey");
 const string QueryRequest::metaTextScore("textScore");
+
+const string QueryRequest::kAllowDiskUseField("allowDiskUse");
 
 const long long QueryRequest::kDefaultBatchSize = 101;
 
@@ -88,7 +90,6 @@ const char kLimitField[] = "limit";
 const char kBatchSizeField[] = "batchSize";
 const char kNToReturnField[] = "ntoreturn";
 const char kSingleBatchField[] = "singleBatch";
-const char kCommentField[] = "comment";
 const char kMaxField[] = "max";
 const char kMinField[] = "min";
 const char kReturnKeyField[] = "returnKey";
@@ -98,6 +99,7 @@ const char kOplogReplayField[] = "oplogReplay";
 const char kNoCursorTimeoutField[] = "noCursorTimeout";
 const char kAwaitDataField[] = "awaitData";
 const char kPartialResultsField[] = "allowPartialResults";
+const char kRuntimeConstantsField[] = "runtimeConstants";
 const char kTermField[] = "term";
 const char kOptionsField[] = "options";
 const char kReadOnceField[] = "readOnce";
@@ -117,7 +119,7 @@ QueryRequest::QueryRequest(NamespaceStringOrUUID nssOrUuid)
 
 void QueryRequest::refreshNSS(OperationContext* opCtx) {
     if (_uuid) {
-        const UUIDCatalog& catalog = UUIDCatalog::get(opCtx);
+        const CollectionCatalog& catalog = CollectionCatalog::get(opCtx);
         auto foundColl = catalog.lookupCollectionByUUID(_uuid.get());
         uassert(ErrorCodes::NamespaceNotFound,
                 str::stream() << "UUID " << _uuid.get() << " specified in query request not found",
@@ -260,13 +262,13 @@ StatusWith<unique_ptr<QueryRequest>> QueryRequest::parseFromFindCommand(unique_p
             }
 
             qr->_wantMore = !el.boolean();
-        } else if (fieldName == kCommentField) {
-            Status status = checkFieldType(el, String);
+        } else if (fieldName == kAllowDiskUseField) {
+            Status status = checkFieldType(el, Bool);
             if (!status.isOK()) {
                 return status;
             }
 
-            qr->_comment = el.str();
+            qr->_allowDiskUse = el.boolean();
         } else if (fieldName == cmdOptionMaxTimeMS) {
             StatusWith<int> maxTimeMS = parseMaxTimeMS(el);
             if (!maxTimeMS.isOK()) {
@@ -337,6 +339,14 @@ StatusWith<unique_ptr<QueryRequest>> QueryRequest::parseFromFindCommand(unique_p
             }
 
             qr->_allowPartialResults = el.boolean();
+        } else if (fieldName == kRuntimeConstantsField) {
+            Status status = checkFieldType(el, Object);
+            if (!status.isOK()) {
+                return status;
+            }
+            qr->_runtimeConstants =
+                RuntimeConstants::parse(IDLParserErrorContext(kRuntimeConstantsField),
+                                        cmdObj.getObjectField(kRuntimeConstantsField));
         } else if (fieldName == kOptionsField) {
             // 3.0.x versions of the shell may generate an explain of a find command with an
             // 'options' field. We accept this only if the 'options' field is empty so that
@@ -390,9 +400,7 @@ StatusWith<unique_ptr<QueryRequest>> QueryRequest::parseFromFindCommand(unique_p
         } else if (!isGenericArgument(fieldName)) {
             return Status(ErrorCodes::FailedToParse,
                           str::stream() << "Failed to parse: " << cmdObj.toString() << ". "
-                                        << "Unrecognized field '"
-                                        << fieldName
-                                        << "'.");
+                                        << "Unrecognized field '" << fieldName << "'.");
         }
     }
 
@@ -417,10 +425,10 @@ StatusWith<unique_ptr<QueryRequest>> QueryRequest::makeFromFindCommand(Namespace
     BSONElement first = cmdObj.firstElement();
     if (first.type() == BinData && first.binDataType() == BinDataType::newUUID) {
         auto uuid = uassertStatusOK(UUID::parse(first));
-        auto qr = stdx::make_unique<QueryRequest>(NamespaceStringOrUUID(nss.db().toString(), uuid));
+        auto qr = std::make_unique<QueryRequest>(NamespaceStringOrUUID(nss.db().toString(), uuid));
         return parseFromFindCommand(std::move(qr), cmdObj, isExplain);
     } else {
-        auto qr = stdx::make_unique<QueryRequest>(nss);
+        auto qr = std::make_unique<QueryRequest>(nss);
         return parseFromFindCommand(std::move(qr), cmdObj, isExplain);
     }
 }
@@ -485,16 +493,16 @@ void QueryRequest::asFindCommandInternal(BSONObjBuilder* cmdBuilder) const {
         cmdBuilder->append(kLimitField, *_limit);
     }
 
+    if (_allowDiskUse) {
+        cmdBuilder->append(kAllowDiskUseField, true);
+    }
+
     if (_batchSize) {
         cmdBuilder->append(kBatchSizeField, *_batchSize);
     }
 
     if (!_wantMore) {
         cmdBuilder->append(kSingleBatchField, true);
-    }
-
-    if (!_comment.empty()) {
-        cmdBuilder->append(kCommentField, _comment);
     }
 
     if (_maxTimeMS > 0) {
@@ -544,6 +552,12 @@ void QueryRequest::asFindCommandInternal(BSONObjBuilder* cmdBuilder) const {
         cmdBuilder->append(kPartialResultsField, true);
     }
 
+    if (_runtimeConstants) {
+        BSONObjBuilder rtcBuilder(cmdBuilder->subobjStart(kRuntimeConstantsField));
+        _runtimeConstants->serialize(&rtcBuilder);
+        rtcBuilder.doneFast();
+    }
+
     if (_replicationTerm) {
         cmdBuilder->append(kTermField, *_replicationTerm);
     }
@@ -561,17 +575,12 @@ void QueryRequest::asFindCommandInternal(BSONObjBuilder* cmdBuilder) const {
     }
 }
 
-void QueryRequest::addReturnKeyMetaProj() {
-    BSONObjBuilder projBob;
-    projBob.appendElements(_proj);
-    // We use $$ because it's never going to show up in a user's projection.
-    // The exact text doesn't matter.
-    BSONObj indexKey = BSON("$$" << BSON("$meta" << QueryRequest::metaIndexKey));
-    projBob.append(indexKey.firstElement());
-    _proj = projBob.obj();
-}
-
 void QueryRequest::addShowRecordIdMetaProj() {
+    if (_proj["$recordId"]) {
+        // There's already some projection on $recordId. Don't overwrite it.
+        return;
+    }
+
     BSONObjBuilder projBob;
     projBob.appendElements(_proj);
     BSONObj metaRecordId = BSON("$recordId" << BSON("$meta" << QueryRequest::metaRecordId));
@@ -583,7 +592,7 @@ Status QueryRequest::validate() const {
     // Min and Max objects must have the same fields.
     if (!_min.isEmpty() && !_max.isEmpty()) {
         if (!_min.isFieldNamePrefixOf(_max) || (_min.nFields() != _max.nFields())) {
-            return Status(ErrorCodes::BadValue, "min and max must have the same field names");
+            return Status(ErrorCodes::Error(51176), "min and max must have the same field names");
         }
     }
 
@@ -630,26 +639,26 @@ Status QueryRequest::validate() const {
 
     if (_limit && *_limit < 0) {
         return Status(ErrorCodes::BadValue,
-                      str::stream() << "Limit value must be non-negative, but received: "
-                                    << *_limit);
+                      str::stream()
+                          << "Limit value must be non-negative, but received: " << *_limit);
     }
 
     if (_batchSize && *_batchSize < 0) {
         return Status(ErrorCodes::BadValue,
-                      str::stream() << "BatchSize value must be non-negative, but received: "
-                                    << *_batchSize);
+                      str::stream()
+                          << "BatchSize value must be non-negative, but received: " << *_batchSize);
     }
 
     if (_ntoreturn && *_ntoreturn < 0) {
         return Status(ErrorCodes::BadValue,
-                      str::stream() << "NToReturn value must be non-negative, but received: "
-                                    << *_ntoreturn);
+                      str::stream()
+                          << "NToReturn value must be non-negative, but received: " << *_ntoreturn);
     }
 
     if (_maxTimeMS < 0) {
         return Status(ErrorCodes::BadValue,
-                      str::stream() << "MaxTimeMS value must be non-negative, but received: "
-                                    << _maxTimeMS);
+                      str::stream()
+                          << "MaxTimeMS value must be non-negative, but received: " << _maxTimeMS);
     }
 
     if (_tailableMode != TailableModeEnum::kNormal) {
@@ -707,7 +716,7 @@ bool QueryRequest::isTextScoreMeta(BSONElement elt) {
         return false;
     }
     BSONElement metaElt = metaIt.next();
-    if (!str::equals("$meta", metaElt.fieldName())) {
+    if (metaElt.fieldNameStringData() != "$meta") {
         return false;
     }
     if (mongo::String != metaElt.type()) {
@@ -750,7 +759,7 @@ bool QueryRequest::isValidSortOrder(const BSONObj& sortObj) {
 
 // static
 StatusWith<unique_ptr<QueryRequest>> QueryRequest::fromLegacyQueryMessage(const QueryMessage& qm) {
-    auto qr = stdx::make_unique<QueryRequest>(NamespaceString(qm.ns));
+    auto qr = std::make_unique<QueryRequest>(NamespaceString(qm.ns));
 
     Status status = qr->init(qm.ntoskip, qm.ntoreturn, qm.queryOptions, qm.query, qm.fields, true);
     if (!status.isOK()) {
@@ -766,7 +775,7 @@ StatusWith<unique_ptr<QueryRequest>> QueryRequest::fromLegacyQuery(NamespaceStri
                                                                    int ntoskip,
                                                                    int ntoreturn,
                                                                    int queryOptions) {
-    auto qr = stdx::make_unique<QueryRequest>(nsOrUuid);
+    auto qr = std::make_unique<QueryRequest>(nsOrUuid);
 
     Status status = qr->init(ntoskip, ntoreturn, queryOptions, queryObj, proj, true);
     if (!status.isOK()) {
@@ -838,9 +847,9 @@ Status QueryRequest::initFullQuery(const BSONObj& top) {
 
     while (i.more()) {
         BSONElement e = i.next();
-        const char* name = e.fieldName();
+        StringData name = e.fieldNameStringData();
 
-        if (0 == strcmp("$orderby", name) || 0 == strcmp("orderby", name)) {
+        if (name == "$orderby" || name == "orderby") {
             if (Object == e.type()) {
                 _sort = e.embeddedObject().getOwned();
             } else if (Array == e.type()) {
@@ -878,22 +887,22 @@ Status QueryRequest::initFullQuery(const BSONObj& top) {
             } else {
                 return Status(ErrorCodes::BadValue, "sort must be object or array");
             }
-        } else if ('$' == *name) {
-            name++;
-            if (str::equals("explain", name)) {
+        } else if (name.startsWith("$")) {
+            name = name.substr(1);  // chop first char
+            if (name == "explain") {
                 // Won't throw.
                 _explain = e.trueValue();
-            } else if (str::equals("min", name)) {
+            } else if (name == "min") {
                 if (!e.isABSONObj()) {
                     return Status(ErrorCodes::BadValue, "$min must be a BSONObj");
                 }
                 _min = e.embeddedObject().getOwned();
-            } else if (str::equals("max", name)) {
+            } else if (name == "max") {
                 if (!e.isABSONObj()) {
                     return Status(ErrorCodes::BadValue, "$max must be a BSONObj");
                 }
                 _max = e.embeddedObject().getOwned();
-            } else if (str::equals("hint", name)) {
+            } else if (name == "hint") {
                 if (e.isABSONObj()) {
                     _hint = e.embeddedObject().getOwned();
                 } else if (String == e.type()) {
@@ -902,32 +911,23 @@ Status QueryRequest::initFullQuery(const BSONObj& top) {
                     return Status(ErrorCodes::BadValue,
                                   "$hint must be either a string or nested object");
                 }
-            } else if (str::equals("returnKey", name)) {
+            } else if (name == "returnKey") {
                 // Won't throw.
                 if (e.trueValue()) {
                     _returnKey = true;
-                    addReturnKeyMetaProj();
                 }
-            } else if (str::equals("showDiskLoc", name)) {
+            } else if (name == "showDiskLoc") {
                 // Won't throw.
                 if (e.trueValue()) {
                     _showRecordId = true;
                     addShowRecordIdMetaProj();
                 }
-            } else if (str::equals("maxTimeMS", name)) {
+            } else if (name == "maxTimeMS") {
                 StatusWith<int> maxTimeMS = parseMaxTimeMS(e);
                 if (!maxTimeMS.isOK()) {
                     return maxTimeMS.getStatus();
                 }
                 _maxTimeMS = maxTimeMS.getValue();
-            } else if (str::equals("comment", name)) {
-                // Legacy $comment can be any BSON element. Convert to string if it isn't
-                // already.
-                if (e.type() == BSONType::String) {
-                    _comment = e.str();
-                } else {
-                    _comment = e.toString(false);
-                }
             }
         }
     }
@@ -973,11 +973,6 @@ void QueryRequest::initFromInt(int options) {
 }
 
 void QueryRequest::addMetaProjection() {
-    // We might need to update the projection object with a $meta projection.
-    if (returnKey()) {
-        addReturnKeyMetaProj();
-    }
-
     if (showRecordId()) {
         addShowRecordIdMetaProj();
     }
@@ -1107,14 +1102,19 @@ StatusWith<BSONObj> QueryRequest::asAggregationCommand() const {
     if (!_hint.isEmpty()) {
         aggregationBuilder.append("hint", _hint);
     }
-    if (!_comment.empty()) {
-        aggregationBuilder.append("comment", _comment);
-    }
     if (!_readConcern.isEmpty()) {
         aggregationBuilder.append("readConcern", _readConcern);
     }
     if (!_unwrappedReadPref.isEmpty()) {
         aggregationBuilder.append(QueryRequest::kUnwrappedReadPrefField, _unwrappedReadPref);
+    }
+    if (_allowDiskUse) {
+        aggregationBuilder.append(QueryRequest::kAllowDiskUseField, _allowDiskUse);
+    }
+    if (_runtimeConstants) {
+        BSONObjBuilder rtcBuilder(aggregationBuilder.subobjStart(kRuntimeConstantsField));
+        _runtimeConstants->serialize(&rtcBuilder);
+        rtcBuilder.doneFast();
     }
     return StatusWith<BSONObj>(aggregationBuilder.obj());
 }

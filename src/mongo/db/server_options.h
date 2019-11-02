@@ -30,6 +30,7 @@
 #pragma once
 
 #include "mongo/db/jsobj.h"
+#include "mongo/logv2/log_format.h"
 #include "mongo/platform/atomic_word.h"
 #include "mongo/platform/process_id.h"
 #include "mongo/stdx/variant.h"
@@ -47,10 +48,13 @@ struct ServerGlobalParams {
     std::string cwd;         // cwd of when process started
 
     int port = DefaultDBPort;  // --port
-    enum { DefaultDBPort = 27017, ConfigServerPort = 27019, ShardServerPort = 27018 };
-    bool isDefaultPort() const {
-        return port == DefaultDBPort;
-    }
+    enum {
+        ConfigServerPort = 27019,
+        CryptDServerPort = 27020,
+        DefaultDBPort = 27017,
+        ShardServerPort = 27018,
+    };
+
     static std::string getPortSettingHelpText();
 
     std::vector<std::string> bind_ips;  // --bind_ip
@@ -58,6 +62,8 @@ struct ServerGlobalParams {
     bool rest = false;  // --rest
 
     int listenBacklog = 0;  // --listenBacklog, real default is SOMAXCONN
+
+    bool indexBuildRetry = true;  // --noIndexBuildRetry
 
     AtomicWord<bool> quiet{false};  // --quiet
 
@@ -91,11 +97,13 @@ struct ServerGlobalParams {
     std::string pidFile;           // Path to pid file, or empty if none.
     std::string timeZoneInfoPath;  // Path to time zone info directory, or empty if none.
 
-    std::string logpath;            // Path to log file, if logging to a file; otherwise, empty.
+    std::string logpath;  // Path to log file, if logging to a file; otherwise, empty.
+    logv2::LogFormat logFormat = logv2::LogFormat::kDefault;  // Log format to output to
     bool logAppend = false;         // True if logging to a file in append mode.
     bool logRenameOnRotate = true;  // True if logging should rename log files on rotate
     bool logWithSyslog = false;     // True if logging to syslog; must not be set if logpath is set.
-    int syslogFacility;             // Facility used when appending messages to the syslog.
+    bool logV2 = false;  // True if logV1 logging statements should get plumbed through to logV2
+    int syslogFacility;  // Facility used when appending messages to the syslog.
 
 #ifndef _WIN32
     ProcessId parentProc;  // --fork pid of initial process
@@ -110,7 +118,7 @@ struct ServerGlobalParams {
         bool storageDetailsCmdEnabled;  // -- enableExperimentalStorageDetailsCmd
     } experimental;
 
-    time_t started = ::time(0);
+    time_t started = ::time(nullptr);
 
     BSONArray argvArray;
     BSONObj parsedOpts;
@@ -125,23 +133,23 @@ struct ServerGlobalParams {
     enum ClusterAuthModes {
         ClusterAuthMode_undefined,
         /**
-        * Authenticate using keyfile, accept only keyfiles
-        */
+         * Authenticate using keyfile, accept only keyfiles
+         */
         ClusterAuthMode_keyFile,
 
         /**
-        * Authenticate using keyfile, accept both keyfiles and X.509
-        */
+         * Authenticate using keyfile, accept both keyfiles and X.509
+         */
         ClusterAuthMode_sendKeyFile,
 
         /**
-        * Authenticate using X.509, accept both keyfiles and X.509
-        */
+         * Authenticate using X.509, accept both keyfiles and X.509
+         */
         ClusterAuthMode_sendX509,
 
         /**
-        * Authenticate using X.509, accept only X.509
-        */
+         * Authenticate using X.509, accept only X.509
+         */
         ClusterAuthMode_x509
     };
 
@@ -160,40 +168,40 @@ struct ServerGlobalParams {
          *
          * The legal enum (and featureCompatibilityVersion document) states are:
          *
-         * kFullyDowngradedTo40
-         * (4.0, Unset): Only 4.0 features are available, and new and existing storage
-         *               engine entries use the 4.0 format
-         *
-         * kUpgradingTo42
-         * (4.0, 4.2): Only 4.0 features are available, but new storage engine entries
-         *             use the 4.2 format, and existing entries may have either the
-         *             4.0 or 4.2 format
-         *
-         * kFullyUpgradedTo42
-         * (4.2, Unset): 4.2 features are available, and new and existing storage
+         * kFullyDowngradedTo42
+         * (4.2, Unset): Only 4.2 features are available, and new and existing storage
          *               engine entries use the 4.2 format
          *
-         * kDowngradingTo40
-         * (4.0, 4.0): Only 4.0 features are available and new storage engine
-         *             entries use the 4.0 format, but existing entries may have
-         *             either the 4.0 or 4.2 format
+         * kUpgradingTo44
+         * (4.2, 4.4): Only 4.2 features are available, but new storage engine entries
+         *             use the 4.4 format, and existing entries may have either the
+         *             4.2 or 4.4 format
          *
-         * kUnsetDefault40Behavior
+         * kFullyUpgradedTo44
+         * (4.4, Unset): 4.4 features are available, and new and existing storage
+         *               engine entries use the 4.4 format
+         *
+         * kDowngradingTo42
+         * (4.2, 4.2): Only 4.2 features are available and new storage engine
+         *             entries use the 4.2 format, but existing entries may have
+         *             either the 4.2 or 4.4 format
+         *
+         * kUnsetDefault42Behavior
          * (Unset, Unset): This is the case on startup before the fCV document is
          *                 loaded into memory. isVersionInitialized() will return
          *                 false, and getVersion() will return the default
-         *                 (kFullyDowngradedTo40).
+         *                 (kFullyDowngradedTo42).
          *
          */
         enum class Version {
             // The order of these enums matter, higher upgrades having higher values, so that
             // features can be active or inactive if the version is higher than some minimum or
             // lower than some maximum, respectively.
-            kUnsetDefault40Behavior = 0,
-            kFullyDowngradedTo40 = 1,
-            kDowngradingTo40 = 2,
-            kUpgradingTo42 = 3,
-            kFullyUpgradedTo42 = 4,
+            kUnsetDefault42Behavior = 0,
+            kFullyDowngradedTo42 = 1,
+            kDowngradingTo42 = 2,
+            kUpgradingTo44 = 3,
+            kFullyUpgradedTo44 = 4,
         };
 
         /**
@@ -201,7 +209,7 @@ struct ServerGlobalParams {
          * exposes the actual state of the featureCompatibilityVersion if it is uninitialized.
          */
         const bool isVersionInitialized() const {
-            return _version.load() != Version::kUnsetDefault40Behavior;
+            return _version.load() != Version::kUnsetDefault42Behavior;
         }
 
         /**
@@ -213,19 +221,8 @@ struct ServerGlobalParams {
             return _version.load();
         }
 
-        /**
-         * This unsafe getter for the featureCompatibilityVersion parameter returns the last-stable
-         * featureCompatibilityVersion value if the parameter has not yet been initialized with a
-         * meaningful value. This getter should only be used if the parameter is intentionally read
-         * prior to the creation/parsing of the featureCompatibilityVersion document.
-         */
-        const Version getVersionUnsafe() const {
-            Version v = _version.load();
-            return (v == Version::kUnsetDefault40Behavior) ? Version::kFullyDowngradedTo40 : v;
-        }
-
         void reset() {
-            _version.store(Version::kUnsetDefault40Behavior);
+            _version.store(Version::kUnsetDefault42Behavior);
         }
 
         void setVersion(Version version) {
@@ -233,12 +230,12 @@ struct ServerGlobalParams {
         }
 
         bool isVersionUpgradingOrUpgraded() {
-            return (getVersion() == Version::kUpgradingTo42 ||
-                    getVersion() == Version::kFullyUpgradedTo42);
+            return (getVersion() == Version::kUpgradingTo44 ||
+                    getVersion() == Version::kFullyUpgradedTo44);
         }
 
     private:
-        AtomicWord<Version> _version{Version::kUnsetDefault40Behavior};
+        AtomicWord<Version> _version{Version::kUnsetDefault42Behavior};
 
     } featureCompatibility;
 
@@ -266,4 +263,4 @@ struct TraitNamedDomain {
         return ret;
     }
 };
-}
+}  // namespace mongo

@@ -43,6 +43,7 @@
 #include "mongo/db/exec/working_set.h"
 #include "mongo/db/matcher/expression.h"
 #include "mongo/db/matcher/expression_parser.h"
+#include "mongo/db/query/count_command_gen.h"
 #include "mongo/dbtests/dbtests.h"
 
 namespace QueryStageCount {
@@ -56,7 +57,9 @@ const int kInterjections = kDocuments;
 class CountStageTest {
 public:
     CountStageTest()
-        : _dbLock(&_opCtx, nsToDatabaseSubstring(ns()), MODE_X), _ctx(&_opCtx, ns()), _coll(NULL) {}
+        : _dbLock(&_opCtx, nsToDatabaseSubstring(ns()), MODE_X),
+          _ctx(&_opCtx, ns()),
+          _coll(nullptr) {}
 
     virtual ~CountStageTest() {}
 
@@ -65,17 +68,14 @@ public:
     virtual void setup() {
         WriteUnitOfWork wunit(&_opCtx);
 
-        _ctx.db()->dropCollection(&_opCtx, ns()).transitional_ignore();
-        _coll = _ctx.db()->createCollection(&_opCtx, ns());
+        _ctx.db()->dropCollection(&_opCtx, nss()).transitional_ignore();
+        _coll = _ctx.db()->createCollection(&_opCtx, nss());
 
         _coll->getIndexCatalog()
             ->createIndexOnEmptyCollection(&_opCtx,
                                            BSON("key" << BSON("x" << 1) << "name"
                                                       << "x_1"
-                                                      << "ns"
-                                                      << ns()
-                                                      << "v"
-                                                      << 1))
+                                                      << "v" << 1))
             .status_with_transitional_ignore();
 
         for (int i = 0; i < kDocuments; i++) {
@@ -93,7 +93,7 @@ public:
         params.direction = CollectionScanParams::FORWARD;
         params.tailable = false;
 
-        unique_ptr<CollectionScan> scan(new CollectionScan(&_opCtx, _coll, params, &ws, NULL));
+        unique_ptr<CollectionScan> scan(new CollectionScan(&_opCtx, _coll, params, &ws, nullptr));
         while (!scan->isEOF()) {
             WorkingSetID id = WorkingSet::INVALID_ID;
             PlanStage::StageState state = scan->work(&id);
@@ -128,7 +128,7 @@ public:
                               Snapshotted<BSONObj>(_opCtx.recoveryUnit()->getSnapshotId(), oldDoc),
                               newDoc,
                               true,
-                              NULL,
+                              nullptr,
                               &args);
         wunit.commit();
     }
@@ -139,7 +139,7 @@ public:
     //  - asserts count is not trivial
     //  - asserts nCounted is equal to expected_n
     //  - asserts nSkipped is correct
-    void testCount(const CountRequest& request, int expected_n = kDocuments, bool indexed = false) {
+    void testCount(const CountCommand& request, int expected_n = kDocuments, bool indexed = false) {
         setup();
         getRecordIds();
 
@@ -160,13 +160,17 @@ public:
             scan = createCollScan(expression.get(), ws.get());
         }
 
-        CountStageParams params(request);
-        CountStage countStage(&_opCtx, _coll, std::move(params), ws.get(), scan);
+        CountStage countStage(&_opCtx,
+                              _coll,
+                              request.getLimit().value_or(0),
+                              request.getSkip().value_or(0),
+                              ws.get(),
+                              scan);
 
         const CountStats* stats = runCount(countStage);
 
         ASSERT_EQUALS(stats->nCounted, expected_n);
-        ASSERT_EQUALS(stats->nSkipped, request.getSkip());
+        ASSERT_EQUALS(stats->nSkipped, request.getSkip().value_or(0));
     }
 
     // Performs a test using a count stage whereby each unit of work is interjected
@@ -225,6 +229,10 @@ public:
         return "unittest.QueryStageCount";
     }
 
+    static NamespaceString nss() {
+        return NamespaceString(ns());
+    }
+
 protected:
     vector<RecordId> _recordIds;
     const ServiceContext::UniqueOperationContext _opCtxPtr = cc().makeOperationContext();
@@ -237,7 +245,8 @@ protected:
 class QueryStageCountNoChangeDuringYield : public CountStageTest {
 public:
     void run() {
-        CountRequest request(NamespaceString(ns()), BSON("x" << LT << kDocuments / 2));
+        CountCommand request((NamespaceString(ns())));
+        request.setQuery(BSON("x" << LT << kDocuments / 2));
 
         testCount(request, kDocuments / 2);
         testCount(request, kDocuments / 2, true);
@@ -247,7 +256,8 @@ public:
 class QueryStageCountYieldWithSkip : public CountStageTest {
 public:
     void run() {
-        CountRequest request(NamespaceString(ns()), BSON("x" << GTE << 0));
+        CountCommand request((NamespaceString(ns())));
+        request.setQuery(BSON("x" << GTE << 0));
         request.setSkip(2);
 
         testCount(request, kDocuments - 2);
@@ -258,7 +268,8 @@ public:
 class QueryStageCountYieldWithLimit : public CountStageTest {
 public:
     void run() {
-        CountRequest request(NamespaceString(ns()), BSON("x" << GTE << 0));
+        CountCommand request((NamespaceString(ns())));
+        request.setQuery(BSON("x" << GTE << 0));
         request.setSkip(0);
         request.setLimit(2);
 
@@ -271,7 +282,8 @@ public:
 class QueryStageCountInsertDuringYield : public CountStageTest {
 public:
     void run() {
-        CountRequest request(NamespaceString(ns()), BSON("x" << 1));
+        CountCommand request((NamespaceString(ns())));
+        request.setQuery(BSON("x" << 1));
 
         testCount(request, kInterjections + 1);
         testCount(request, kInterjections + 1, true);
@@ -288,7 +300,8 @@ public:
     void run() {
         // expected count would be 99 but we delete the second record
         // after doing the first unit of work
-        CountRequest request(NamespaceString(ns()), BSON("x" << GTE << 1));
+        CountCommand request((NamespaceString(ns())));
+        request.setQuery(BSON("x" << GTE << 1));
 
         testCount(request, kDocuments - 2);
         testCount(request, kDocuments - 2, true);
@@ -313,7 +326,8 @@ public:
     void run() {
         // expected count would be kDocuments-2 but we update the first and second records
         // after doing the first unit of work so they wind up getting counted later on
-        CountRequest request(NamespaceString(ns()), BSON("x" << GTE << 2));
+        CountCommand request((NamespaceString(ns())));
+        request.setQuery(BSON("x" << GTE << 2));
 
         testCount(request, kDocuments);
         testCount(request, kDocuments, true);
@@ -334,7 +348,8 @@ public:
 class QueryStageCountMultiKeyDuringYield : public CountStageTest {
 public:
     void run() {
-        CountRequest request(NamespaceString(ns()), BSON("x" << 1));
+        CountCommand request((NamespaceString(ns())));
+        request.setQuery(BSON("x" << 1));
         testCount(request, kDocuments + 1, true);  // only applies to indexed case
     }
 
@@ -344,9 +359,9 @@ public:
     }
 };
 
-class All : public Suite {
+class All : public OldStyleSuiteSpecification {
 public:
-    All() : Suite("query_stage_count") {}
+    All() : OldStyleSuiteSpecification("query_stage_count") {}
 
     void setupTests() {
         add<QueryStageCountNoChangeDuringYield>();
@@ -357,6 +372,8 @@ public:
         add<QueryStageCountUpdateDuringYield>();
         add<QueryStageCountMultiKeyDuringYield>();
     }
-} QueryStageCountAll;
+};
+
+OldStyleSuiteInitializer<All> queryStageCountAll;
 
 }  // namespace QueryStageCount

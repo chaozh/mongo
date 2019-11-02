@@ -37,17 +37,19 @@
 #include <boost/exception/exception.hpp>
 #include <csignal>
 #include <exception>
+#include <fmt/format.h>
 #include <iostream>
 #include <memory>
 #include <streambuf>
 #include <typeinfo>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/base/string_data.h"
 #include "mongo/logger/log_domain.h"
 #include "mongo/logger/logger.h"
 #include "mongo/platform/compiler.h"
+#include "mongo/stdx/exception.h"
 #include "mongo/stdx/thread.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/concurrency/thread_name.h"
 #include "mongo/util/debug_util.h"
 #include "mongo/util/debugger.h"
@@ -74,7 +76,7 @@ const char* strsignal(int signalNum) {
 }
 
 void endProcessWithSignal(int signalNum) {
-    RaiseException(EXIT_ABRUPT, EXCEPTION_NONCONTINUABLE, 0, NULL);
+    RaiseException(EXIT_ABRUPT, EXCEPTION_NONCONTINUABLE, 0, nullptr);
 }
 
 #else
@@ -94,7 +96,8 @@ void endProcessWithSignal(int signalNum) {
 
 // This should only be used with MallocFreeOSteam
 class MallocFreeStreambuf : public std::streambuf {
-    MONGO_DISALLOW_COPYING(MallocFreeStreambuf);
+    MallocFreeStreambuf(const MallocFreeStreambuf&) = delete;
+    MallocFreeStreambuf& operator=(const MallocFreeStreambuf&) = delete;
 
 public:
     MallocFreeStreambuf() {
@@ -114,7 +117,8 @@ private:
 };
 
 class MallocFreeOStream : public std::ostream {
-    MONGO_DISALLOW_COPYING(MallocFreeOStream);
+    MallocFreeOStream(const MallocFreeOStream&) = delete;
+    MallocFreeOStream& operator=(const MallocFreeOStream&) = delete;
 
 public:
     MallocFreeOStream() : std::ostream(&_buf) {}
@@ -155,12 +159,12 @@ public:
     }
 
 private:
-    static stdx::mutex _streamMutex;
+    static stdx::mutex _streamMutex;  // NOLINT
     static thread_local int terminateDepth;
     stdx::unique_lock<stdx::mutex> _lk;
 };
 
-stdx::mutex MallocFreeOStreamGuard::_streamMutex;
+stdx::mutex MallocFreeOStreamGuard::_streamMutex;  // NOLINT
 thread_local int MallocFreeOStreamGuard::terminateDepth = 0;
 
 // must hold MallocFreeOStreamGuard to call
@@ -178,7 +182,7 @@ void writeMallocFreeStreamToLog() {
 // must hold MallocFreeOStreamGuard to call
 void printSignalAndBacktrace(int signalNum) {
     mallocFreeOStream << "Got signal: " << signalNum << " (" << strsignal(signalNum) << ").\n";
-    printStackTrace(mallocFreeOStream);
+    printStackTraceFromSignal(mallocFreeOStream);
     writeMallocFreeStreamToLog();
 }
 
@@ -263,6 +267,10 @@ void myPureCallHandler() {
 
 #else
 
+void abruptQuitAction(int signalNum, siginfo_t*, void*) {
+    abruptQuit(signalNum);
+};
+
 void abruptQuitWithAddrSignal(int signalNum, siginfo_t* siginfo, void* ucontext_erased) {
     // For convenient debugger access.
     MONGO_COMPILER_VARIABLE_UNUSED auto ucontext = static_cast<const ucontext_t*>(ucontext_erased);
@@ -287,7 +295,7 @@ void abruptQuitWithAddrSignal(int signalNum, siginfo_t* siginfo, void* ucontext_
 }  // namespace
 
 void setupSynchronousSignalHandlers() {
-    std::set_terminate(myTerminate);
+    stdx::set_terminate(myTerminate);
     std::set_new_handler(reportOutOfMemoryErrorAndExit);
 
 #if defined(_WIN32)
@@ -296,38 +304,38 @@ void setupSynchronousSignalHandlers() {
     _set_invalid_parameter_handler(myInvalidParameterHandler);
     setWindowsUnhandledExceptionFilter();
 #else
-    {
-        struct sigaction ignoredSignals;
-        memset(&ignoredSignals, 0, sizeof(ignoredSignals));
-        ignoredSignals.sa_handler = SIG_IGN;
-        sigemptyset(&ignoredSignals.sa_mask);
-
-        invariant(sigaction(SIGHUP, &ignoredSignals, nullptr) == 0);
-        invariant(sigaction(SIGUSR2, &ignoredSignals, nullptr) == 0);
-        invariant(sigaction(SIGPIPE, &ignoredSignals, nullptr) == 0);
-    }
-    {
-        struct sigaction plainSignals;
-        memset(&plainSignals, 0, sizeof(plainSignals));
-        plainSignals.sa_handler = abruptQuit;
-        sigemptyset(&plainSignals.sa_mask);
-
-        // ^\ is the stronger ^C. Log and quit hard without waiting for cleanup.
-        invariant(sigaction(SIGQUIT, &plainSignals, nullptr) == 0);
-
-        invariant(sigaction(SIGABRT, &plainSignals, nullptr) == 0);
-    }
-    {
-        struct sigaction addrSignals;
-        memset(&addrSignals, 0, sizeof(addrSignals));
-        addrSignals.sa_sigaction = abruptQuitWithAddrSignal;
-        sigemptyset(&addrSignals.sa_mask);
-        addrSignals.sa_flags = SA_SIGINFO;
-
-        invariant(sigaction(SIGSEGV, &addrSignals, nullptr) == 0);
-        invariant(sigaction(SIGBUS, &addrSignals, nullptr) == 0);
-        invariant(sigaction(SIGILL, &addrSignals, nullptr) == 0);
-        invariant(sigaction(SIGFPE, &addrSignals, nullptr) == 0);
+    static constexpr struct {
+        int signal;
+        void (*function)(int, siginfo_t*, void*);  // signal ignored if nullptr
+    } kSignalSpecs[] = {
+        {SIGHUP, nullptr},
+        {SIGUSR2, nullptr},
+        {SIGPIPE, nullptr},
+        {SIGQUIT, &abruptQuitAction},  // sent by '^\'. Log and hard quit, no cleanup.
+        {SIGABRT, &abruptQuitAction},
+        {SIGSEGV, &abruptQuitWithAddrSignal},
+        {SIGBUS, &abruptQuitWithAddrSignal},
+        {SIGILL, &abruptQuitWithAddrSignal},
+        {SIGFPE, &abruptQuitWithAddrSignal},
+    };
+    for (const auto& spec : kSignalSpecs) {
+        struct sigaction sa;
+        memset(&sa, 0, sizeof(sa));
+        sigemptyset(&sa.sa_mask);
+        if (spec.function == nullptr) {
+            sa.sa_handler = SIG_IGN;
+        } else {
+            sa.sa_sigaction = spec.function;
+            sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+        }
+        if (sigaction(spec.signal, &sa, nullptr) != 0) {
+            int savedErr = errno;
+            severe() << format(
+                FMT_STRING("Failed to install signal handler for signal {} with sigaction: {}"),
+                spec.signal,
+                strerror(savedErr));
+            fassertFailed(31334);
+        }
     }
     setupSIGTRAPforGDB();
 #endif

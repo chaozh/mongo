@@ -308,7 +308,7 @@ void QueryPlannerTest::runQueryFull(const BSONObj& query,
                                     const BSONObj& maxObj) {
     clearState();
 
-    auto qr = stdx::make_unique<QueryRequest>(nss);
+    auto qr = std::make_unique<QueryRequest>(nss);
     qr->setFilter(query);
     qr->setSort(sort);
     qr->setProj(proj);
@@ -389,7 +389,7 @@ void QueryPlannerTest::runInvalidQueryFull(const BSONObj& query,
                                            const BSONObj& maxObj) {
     clearState();
 
-    auto qr = stdx::make_unique<QueryRequest>(nss);
+    auto qr = std::make_unique<QueryRequest>(nss);
     qr->setFilter(query);
     qr->setSort(sort);
     qr->setProj(proj);
@@ -473,12 +473,12 @@ size_t QueryPlannerTest::getNumSolutions() const {
 }
 
 void QueryPlannerTest::dumpSolutions() const {
-    mongoutils::str::stream ost;
+    str::stream ost;
     dumpSolutions(ost);
     log() << std::string(ost);
 }
 
-void QueryPlannerTest::dumpSolutions(mongoutils::str::stream& ost) const {
+void QueryPlannerTest::dumpSolutions(str::stream& ost) const {
     for (auto&& soln : solns) {
         ost << soln->toString() << '\n';
     }
@@ -488,7 +488,7 @@ void QueryPlannerTest::assertNumSolutions(size_t expectSolutions) const {
     if (getNumSolutions() == expectSolutions) {
         return;
     }
-    mongoutils::str::stream ss;
+    str::stream ss;
     ss << "expected " << expectSolutions << " solutions but got " << getNumSolutions()
        << " instead. solutions generated: " << '\n';
     dumpSolutions(ss);
@@ -512,7 +512,7 @@ void QueryPlannerTest::assertSolutionExists(const std::string& solnJson, size_t 
     if (numMatches == matches) {
         return;
     }
-    mongoutils::str::stream ss;
+    str::stream ss;
     ss << "expected " << numMatches << " matches for solution " << solnJson << " but got "
        << matches << " instead. all solutions generated: " << '\n';
     dumpSolutions(ss);
@@ -530,7 +530,7 @@ void QueryPlannerTest::assertHasOneSolutionOf(const std::vector<std::string>& so
     if (1U == matches) {
         return;
     }
-    mongoutils::str::stream ss;
+    str::stream ss;
     ss << "assertHasOneSolutionOf expected one matching solution"
        << " but got " << matches << " instead. all solutions generated: " << '\n';
     dumpSolutions(ss);
@@ -548,8 +548,8 @@ std::unique_ptr<MatchExpression> QueryPlannerTest::parseMatchExpression(
     expCtx->setCollator(collator);
     StatusWithMatchExpression status = MatchExpressionParser::parse(obj, std::move(expCtx));
     if (!status.isOK()) {
-        FAIL(str::stream() << "failed to parse query: " << obj.toString() << ". Reason: "
-                           << status.getStatus().toString());
+        FAIL(str::stream() << "failed to parse query: " << obj.toString()
+                           << ". Reason: " << status.getStatus().toString());
     }
     return std::move(status.getValue());
 }

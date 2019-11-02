@@ -52,7 +52,7 @@ public:
     std::vector<FieldPath> collectDocumentKeyFieldsActingAsRouter(
         OperationContext*, const NamespaceString&) const final {
         // We don't expect anyone to use this method on the shard itself (yet). This is currently
-        // only used for $out. For $out in a sharded cluster, the mongos is responsible for
+        // only used for $merge. For $out in a sharded cluster, the mongos is responsible for
         // collecting the document key fields before serializing them and sending them to the
         // shards. This is logically a MONGO_UNREACHABLE, but a malicious user could construct a
         // request to send directly to the shards which does not include the uniqueKey, so we must
@@ -64,27 +64,29 @@ public:
      * Inserts the documents 'objs' into the namespace 'ns' using the ClusterWriter for locking,
      * routing, stale config handling, etc.
      */
-    void insert(const boost::intrusive_ptr<ExpressionContext>& expCtx,
-                const NamespaceString& ns,
-                std::vector<BSONObj>&& objs,
-                const WriteConcernOptions& wc,
-                boost::optional<OID> targetEpoch) final;
+    Status insert(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                  const NamespaceString& ns,
+                  std::vector<BSONObj>&& objs,
+                  const WriteConcernOptions& wc,
+                  boost::optional<OID> targetEpoch) final;
 
     /**
      * Replaces the documents matching 'queries' with 'updates' using the ClusterWriter for locking,
      * routing, stale config handling, etc.
      */
-    void update(const boost::intrusive_ptr<ExpressionContext>& expCtx,
-                const NamespaceString& ns,
-                std::vector<BSONObj>&& queries,
-                std::vector<BSONObj>&& updates,
-                const WriteConcernOptions& wc,
-                bool upsert,
-                bool multi,
-                boost::optional<OID> targetEpoch) final;
+    StatusWith<UpdateResult> update(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                                    const NamespaceString& ns,
+                                    BatchedObjects&& batch,
+                                    const WriteConcernOptions& wc,
+                                    bool upsert,
+                                    bool multi,
+                                    boost::optional<OID> targetEpoch) final;
 
     std::unique_ptr<Pipeline, PipelineDeleter> attachCursorSourceToPipeline(
         const boost::intrusive_ptr<ExpressionContext>& expCtx, Pipeline* pipeline) final;
+
+    std::unique_ptr<ShardFilterer> getShardFilterer(
+        const boost::intrusive_ptr<ExpressionContext>& expCtx) const override final;
 };
 
 }  // namespace mongo

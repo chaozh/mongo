@@ -47,6 +47,8 @@ public:
 
     void startup(OperationContext* opCtx) override;
 
+    void enterTerminalShutdown() override;
+
     void shutdown(OperationContext* opCtx) override;
 
     // Returns the ServiceContext where this instance runs.
@@ -90,6 +92,10 @@ public:
 
     repl::MemberState getMemberState() const override;
 
+    bool canAcceptNonLocalWrites() const override;
+
+    std::vector<repl::MemberData> getMemberData() const override;
+
     Status waitForMemberState(repl::MemberState, Milliseconds) override;
 
     Seconds getSlaveDelaySecs() const override;
@@ -106,22 +112,25 @@ public:
     Status checkIfCommitQuorumCanBeSatisfied(
         const CommitQuorumOptions& commitQuorum) const override;
 
-    StatusWith<bool> checkIfCommitQuorumIsSatisfied(
-        const CommitQuorumOptions& commitQuorum,
-        const std::vector<HostAndPort>& commitReadyMembers) const override;
+    void setMyLastAppliedOpTimeAndWallTime(
+        const repl::OpTimeAndWallTime& opTimeAndWallTime) override;
+    void setMyLastDurableOpTimeAndWallTime(
+        const repl::OpTimeAndWallTime& opTimeAndWallTime) override;
+    void setMyLastAppliedOpTimeAndWallTimeForward(const repl::OpTimeAndWallTime& opTimeAndWallTime,
+                                                  DataConsistency consistency) override;
+    void setMyLastDurableOpTimeAndWallTimeForward(
+        const repl::OpTimeAndWallTime& opTimeAndWallTime) override;
 
-    void setMyLastAppliedOpTime(const repl::OpTime&) override;
-    void setMyLastDurableOpTime(const repl::OpTime&) override;
-
-    void setMyLastAppliedOpTimeForward(const repl::OpTime&, DataConsistency) override;
-    void setMyLastDurableOpTimeForward(const repl::OpTime&) override;
 
     void resetMyLastOpTimes() override;
 
     void setMyHeartbeatMessage(const std::string&) override;
 
     repl::OpTime getMyLastAppliedOpTime() const override;
+    repl::OpTimeAndWallTime getMyLastAppliedOpTimeAndWallTime() const override;
+
     repl::OpTime getMyLastDurableOpTime() const override;
+    repl::OpTimeAndWallTime getMyLastDurableOpTimeAndWallTime() const override;
 
     Status waitUntilOpTimeForReadUntil(OperationContext*,
                                        const repl::ReadConcernArgs&,
@@ -154,7 +163,8 @@ public:
 
     Status processReplSetGetStatus(BSONObjBuilder*, ReplSetGetStatusResponseStyle) override;
 
-    void fillIsMasterForReplSet(repl::IsMasterResponse*) override;
+    void fillIsMasterForReplSet(repl::IsMasterResponse*,
+                                const repl::SplitHorizon::Parameters& horizon) override;
 
     void appendSlaveInfoData(BSONObjBuilder*) override;
 
@@ -164,7 +174,8 @@ public:
 
     void processReplSetMetadata(const rpc::ReplSetMetadata&) override;
 
-    void advanceCommitPoint(const repl::OpTime& committedOpTime) override;
+    void advanceCommitPoint(const repl::OpTimeAndWallTime& committedOpTimeAndWallTime,
+                            bool fromSyncSource) override;
 
     void cancelAndRescheduleElectionTimeout() override;
 
@@ -201,6 +212,8 @@ public:
 
     repl::OpTime getLastCommittedOpTime() const override;
 
+    repl::OpTimeAndWallTime getLastCommittedOpTimeAndWallTime() const override;
+
     Status processReplSetRequestVotes(OperationContext*,
                                       const repl::ReplSetRequestVotesArgs&,
                                       repl::ReplSetRequestVotesResponse*) override;
@@ -220,17 +233,21 @@ public:
 
     repl::OpTime getCurrentCommittedSnapshotOpTime() const override;
 
+    repl::OpTimeAndWallTime getCurrentCommittedSnapshotOpTimeAndWallTime() const override;
+
     void waitUntilSnapshotCommitted(OperationContext*, const Timestamp&) override;
 
     void appendDiagnosticBSON(BSONObjBuilder*) override;
 
     void appendConnectionStats(executor::ConnectionPoolStats* stats) const override;
 
-    size_t getNumUncommittedSnapshots() override;
+    virtual void createWMajorityWriteAvailabilityDateWaiter(repl::OpTime opTime) override;
 
     Status stepUpIfEligible(bool skipDryRun) override;
 
-    Status abortCatchupIfNeeded() override;
+    Status abortCatchupIfNeeded(PrimaryCatchUpConclusionReason reason) override;
+
+    void incrementNumCatchUpOpsIfCatchingUp(long numOps) override;
 
     void signalDropPendingCollectionsRemovedFromStorage() final;
 
@@ -239,6 +256,13 @@ public:
     bool setContainsArbiter() const override;
 
     void attemptToAdvanceStableTimestamp() override;
+
+    void finishRecoveryIfEligible(OperationContext* opCtx) override;
+
+    void updateAndLogStateTransitionMetrics(
+        const ReplicationCoordinator::OpsKillingStateTransitionEnum stateTransition,
+        const size_t numOpsKilled,
+        const size_t numOpsRunning) const override;
 
 private:
     // Back pointer to the ServiceContext that has started the instance.

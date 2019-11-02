@@ -1,7 +1,5 @@
 """Holder for the (test kind, list of tests) pair with additional metadata their execution."""
 
-from __future__ import absolute_import
-
 import itertools
 import threading
 import time
@@ -33,7 +31,9 @@ EXIT_CODE_MAP = {
     -7: "Process Termination Error",
     249: "Process Termination Error",
     -1073741819: "Windows Access Violation",
+    3221225477: "Windows Access Violation",
     -1073741571: "Stack Overflow",
+    3221225725: "Stack Overflow",
 }
 
 
@@ -85,6 +85,10 @@ class Suite(object):  # pylint: disable=too-many-instance-attributes
         # We keep a reference to the TestReports from the currently running jobs so that we can
         # report intermediate results.
         self._partial_reports = None
+
+    def __repr__(self):
+        """Create a string representation of object for debugging."""
+        return f"{self.test_kind}:{self._suite_name}"
 
     def _get_tests_for_kind(self, test_kind):
         """Return the tests to run based on the 'test_kind'-specific filtering policy."""
@@ -269,7 +273,7 @@ class Suite(object):  # pylint: disable=too-many-instance-attributes
         sb.append("Executed %d times in %0.2f seconds:" % (num_iterations, total_time_taken))
 
         combined_summary = _summary.Summary(0, 0.0, 0, 0, 0, 0)
-        for iteration in xrange(num_iterations):
+        for iteration in range(num_iterations):
             # Summarize each execution as a bulleted list of results.
             bulleter_sb = []
             summary = self._summarize_report(reports[iteration], start_times[iteration],
@@ -341,8 +345,8 @@ class Suite(object):  # pylint: disable=too-many-instance-attributes
     def log_summaries(logger, suites, time_taken):
         """Log summary of all suites."""
         sb = []
-        sb.append("Summary of all suites: %d suites ran in %0.2f seconds" % (len(suites),
-                                                                             time_taken))
+        sb.append(
+            "Summary of all suites: %d suites ran in %0.2f seconds" % (len(suites), time_taken))
         for suite in suites:
             suite_sb = []
             suite.summarize(suite_sb)

@@ -29,7 +29,6 @@
 
 #pragma once
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/executor/task_executor.h"
 
 namespace mongo {
@@ -39,7 +38,8 @@ namespace unittest {
  * Proxy for the executor::TaskExecutor interface used for testing.
  */
 class TaskExecutorProxy : public executor::TaskExecutor {
-    MONGO_DISALLOW_COPYING(TaskExecutorProxy);
+    TaskExecutorProxy(const TaskExecutorProxy&) = delete;
+    TaskExecutorProxy& operator=(const TaskExecutorProxy&) = delete;
 
 public:
     /**
@@ -58,16 +58,17 @@ public:
     Date_t now() override;
     StatusWith<EventHandle> makeEvent() override;
     void signalEvent(const EventHandle& event) override;
-    StatusWith<CallbackHandle> onEvent(const EventHandle& event, CallbackFn work) override;
+    StatusWith<CallbackHandle> onEvent(const EventHandle& event, CallbackFn&& work) override;
     void waitForEvent(const EventHandle& event) override;
     StatusWith<stdx::cv_status> waitForEvent(OperationContext* opCtx,
                                              const EventHandle& event,
                                              Date_t deadline) override;
-    StatusWith<CallbackHandle> scheduleWork(CallbackFn work) override;
-    StatusWith<CallbackHandle> scheduleWorkAt(Date_t when, CallbackFn work) override;
-    StatusWith<CallbackHandle> scheduleRemoteCommand(const executor::RemoteCommandRequest& request,
-                                                     const RemoteCommandCallbackFn& cb,
-                                                     const BatonHandle& baton = nullptr) override;
+    StatusWith<CallbackHandle> scheduleWork(CallbackFn&& work) override;
+    StatusWith<CallbackHandle> scheduleWorkAt(Date_t when, CallbackFn&& work) override;
+    StatusWith<CallbackHandle> scheduleRemoteCommandOnAny(
+        const executor::RemoteCommandRequestOnAny& request,
+        const RemoteCommandOnAnyCallbackFn& cb,
+        const BatonHandle& baton = nullptr) override;
     void cancel(const CallbackHandle& cbHandle) override;
     void wait(const CallbackHandle& cbHandle,
               Interruptible* interruptible = Interruptible::notInterruptible()) override;

@@ -29,9 +29,10 @@
 
 #include "mongo/platform/basic.h"
 
+#include <memory>
+
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/auth/authorization_session.h"
-#include "mongo/db/catalog/collection_catalog_entry.h"
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
@@ -46,8 +47,8 @@
 #include "mongo/db/query/cursor_response.h"
 #include "mongo/db/query/find_common.h"
 #include "mongo/db/service_context.h"
+#include "mongo/db/storage/durable_catalog.h"
 #include "mongo/db/storage/storage_engine.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/util/uuid.h"
 
 namespace mongo {
@@ -56,7 +57,6 @@ using std::string;
 using std::stringstream;
 using std::unique_ptr;
 using std::vector;
-using stdx::make_unique;
 
 namespace {
 
@@ -119,16 +119,16 @@ public:
         }
 
         // Check for the listIndexes ActionType on the database.
-        const auto nss = AutoGetCollection::resolveNamespaceStringOrUUID(
-            opCtx, CommandHelpers::parseNsOrUUID(dbname, cmdObj));
+        const auto nss = CollectionCatalog::get(opCtx).resolveNamespaceStringOrUUID(
+            CommandHelpers::parseNsOrUUID(dbname, cmdObj));
         if (authzSession->isAuthorizedForActionsOnResource(ResourcePattern::forExactNamespace(nss),
                                                            ActionType::listIndexes)) {
             return Status::OK();
         }
 
         return Status(ErrorCodes::Unauthorized,
-                      str::stream() << "Not authorized to list indexes on collection: "
-                                    << nss.ns());
+                      str::stream()
+                          << "Not authorized to list indexes on collection: " << nss.ns());
     }
 
     bool run(OperationContext* opCtx,
@@ -154,8 +154,7 @@ public:
                     str::stream() << "ns does not exist: " << ctx.getNss().ns(),
                     collection);
 
-            const CollectionCatalogEntry* cce = collection->getCatalogEntry();
-            invariant(cce);
+            auto durableCatalog = DurableCatalog::get(opCtx);
 
             nss = ctx.getNss();
 
@@ -165,46 +164,49 @@ public:
             vector<string> indexNames;
             writeConflictRetry(opCtx, "listIndexes", nss.ns(), [&] {
                 indexNames.clear();
-                cce->getAllIndexes(opCtx, &indexNames);
+                durableCatalog->getAllIndexes(opCtx, nss, &indexNames);
             });
 
-            auto ws = make_unique<WorkingSet>();
-            auto root = make_unique<QueuedDataStage>(opCtx, ws.get());
+            auto ws = std::make_unique<WorkingSet>();
+            auto root = std::make_unique<QueuedDataStage>(opCtx, ws.get());
 
             for (size_t i = 0; i < indexNames.size(); i++) {
                 auto indexSpec = writeConflictRetry(opCtx, "listIndexes", nss.ns(), [&] {
-                    if (includeBuildUUIDs && !cce->isIndexReady(opCtx, indexNames[i])) {
+                    if (includeBuildUUIDs &&
+                        !durableCatalog->isIndexReady(opCtx, nss, indexNames[i])) {
                         BSONObjBuilder builder;
-                        builder.append("spec"_sd, cce->getIndexSpec(opCtx, indexNames[i]));
+                        builder.append("spec"_sd,
+                                       durableCatalog->getIndexSpec(opCtx, nss, indexNames[i]));
 
                         // TODO(SERVER-37980): Replace with index build UUID.
                         auto indexBuildUUID = UUID::gen();
                         indexBuildUUID.appendToBuilder(&builder, "buildUUID"_sd);
                         return builder.obj();
                     }
-                    return cce->getIndexSpec(opCtx, indexNames[i]);
+                    return durableCatalog->getIndexSpec(opCtx, nss, indexNames[i]);
                 });
 
                 WorkingSetID id = ws->allocate();
                 WorkingSetMember* member = ws->get(id);
                 member->keyData.clear();
                 member->recordId = RecordId();
-                member->obj = Snapshotted<BSONObj>(SnapshotId(), indexSpec.getOwned());
+                member->resetDocument(SnapshotId(), indexSpec.getOwned());
                 member->transitionToOwnedObj();
                 root->pushBack(id);
             }
 
             exec = uassertStatusOK(PlanExecutor::make(
-                opCtx, std::move(ws), std::move(root), nss, PlanExecutor::NO_YIELD));
+                opCtx, std::move(ws), std::move(root), nullptr, PlanExecutor::NO_YIELD, nss));
 
             for (long long objCount = 0; objCount < batchSize; objCount++) {
-                BSONObj next;
-                PlanExecutor::ExecState state = exec->getNext(&next, NULL);
+                Document nextDoc;
+                PlanExecutor::ExecState state = exec->getNext(&nextDoc, nullptr);
                 if (state == PlanExecutor::IS_EOF) {
                     break;
                 }
                 invariant(state == PlanExecutor::ADVANCED);
 
+                BSONObj next = nextDoc.toBson();
                 // If we can't fit this result inside the current batch, then we stash it for later.
                 if (!FindCommon::haveSpaceForNext(next, objCount, firstBatch.len())) {
                     exec->enqueue(next);
@@ -226,13 +228,17 @@ public:
 
         const auto pinnedCursor = CursorManager::get(opCtx)->registerCursor(
             opCtx,
-            {std::move(exec),
-             nss,
-             AuthorizationSession::get(opCtx->getClient())->getAuthenticatedUserNames(),
-             repl::ReadConcernArgs::get(opCtx),
-             cmdObj,
-             ClientCursorParams::LockPolicy::kLocksInternally,
-             {Privilege(ResourcePattern::forExactNamespace(nss), ActionType::listIndexes)}});
+            {
+                std::move(exec),
+                nss,
+                AuthorizationSession::get(opCtx->getClient())->getAuthenticatedUserNames(),
+                opCtx->getWriteConcern(),
+                repl::ReadConcernArgs::get(opCtx),
+                cmdObj,
+                ClientCursorParams::LockPolicy::kLocksInternally,
+                {Privilege(ResourcePattern::forExactNamespace(nss), ActionType::listIndexes)},
+                false  // needsMerge always 'false' for listIndexes.
+            });
 
         appendCursorResponseObject(
             pinnedCursor.getCursor()->cursorid(), nss.ns(), firstBatch.arr(), &result);

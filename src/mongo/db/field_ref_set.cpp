@@ -32,12 +32,12 @@
 #include "mongo/db/field_ref_set.h"
 
 #include "mongo/util/assert_util.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
-using std::vector;
 using std::string;
+using std::vector;
 
 namespace {
 
@@ -52,7 +52,7 @@ StringData safeFirstPart(const FieldRef* fieldRef) {
         return fieldRef->getPart(0);
     }
 }
-}
+}  // namespace
 
 bool FieldRefSet::FieldRefPtrLessThan::operator()(const FieldRef* l, const FieldRef* r) const {
     return *l < *r;
@@ -139,7 +139,7 @@ bool FieldRefSet::insert(const FieldRef* toInsert, const FieldRef** conflict) {
     }
 
     _fieldSet.insert(it, toInsert);
-    *conflict = NULL;
+    *conflict = nullptr;
     return true;
 }
 

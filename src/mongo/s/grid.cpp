@@ -96,12 +96,12 @@ void Grid::setShardingInitialized() {
 }
 
 Grid::CustomConnectionPoolStatsFn Grid::getCustomConnectionPoolStatsFn() const {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     return _customConnectionPoolStatsFn;
 }
 
 void Grid::setCustomConnectionPoolStatsFn(CustomConnectionPoolStatsFn statsFn) {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     invariant(!_customConnectionPoolStatsFn || !statsFn);
     _customConnectionPoolStatsFn = std::move(statsFn);
 }
@@ -117,17 +117,37 @@ void Grid::setAllowLocalHost(bool allow) {
 repl::OpTime Grid::configOpTime() const {
     invariant(serverGlobalParams.clusterRole != ClusterRole::ConfigServer);
 
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     return _configOpTime;
 }
 
-void Grid::advanceConfigOpTime(repl::OpTime opTime) {
+boost::optional<repl::OpTime> Grid::advanceConfigOpTime(OperationContext* opCtx,
+                                                        repl::OpTime opTime,
+                                                        StringData what) {
+    const auto prevOpTime = _advanceConfigOpTime(opTime);
+    if (prevOpTime && prevOpTime->getTerm() != opTime.getTerm()) {
+        std::string clientAddr = "(unknown)";
+        if (opCtx && opCtx->getClient()) {
+            clientAddr = opCtx->getClient()->clientAddress(true);
+        }
+        log() << "Received " << what << " " << clientAddr
+              << " indicating config server optime "
+                 "term has increased, previous optime "
+              << prevOpTime << ", now " << opTime;
+    }
+    return prevOpTime;
+}
+
+boost::optional<repl::OpTime> Grid::_advanceConfigOpTime(const repl::OpTime& opTime) {
     invariant(serverGlobalParams.clusterRole != ClusterRole::ConfigServer);
 
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     if (_configOpTime < opTime) {
+        repl::OpTime prev = _configOpTime;
         _configOpTime = opTime;
+        return prev;
     }
+    return boost::none;
 }
 
 void Grid::clearForUnitTests() {

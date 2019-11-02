@@ -29,7 +29,6 @@
 
 #pragma once
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
@@ -58,7 +57,8 @@ class OpTime;
  * kicks off the cloning as soon as possible by calling startClone.
  */
 class MigrationChunkClonerSource {
-    MONGO_DISALLOW_COPYING(MigrationChunkClonerSource);
+    MigrationChunkClonerSource(const MigrationChunkClonerSource&) = delete;
+    MigrationChunkClonerSource& operator=(const MigrationChunkClonerSource&) = delete;
 
 public:
     virtual ~MigrationChunkClonerSource();
@@ -139,7 +139,8 @@ public:
      * NOTE: Must be called with at least IX lock held on the collection.
      */
     virtual void onUpdateOp(OperationContext* opCtx,
-                            const BSONObj& updatedDoc,
+                            boost::optional<BSONObj> preImageDoc,
+                            const BSONObj& postImageDoc,
                             const repl::OpTime& opTime,
                             const repl::OpTime& prePostImageOpTime) = 0;
 

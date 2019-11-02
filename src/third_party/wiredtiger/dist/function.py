@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 
 # Check the style of WiredTiger C code.
+from __future__ import print_function
 import fnmatch, os, re, sys
 from dist import all_c_files, compare_srcfile, source_files
 
@@ -16,17 +17,24 @@ def missing_comment():
         for m in func_re.finditer(s):
             if not m.group(1) or \
                not m.group(1).startswith('/*\n * %s --\n' % m.group(2)):
-                   print "%s:%d: missing or malformed comment for %s" % \
-                           (f, s[:m.start(2)].count('\n'), m.group(2))
+                   print("%s:%d: missing or malformed comment for %s" % \
+                           (f, s[:m.start(2)].count('\n'), m.group(2)))
 
 # Sort helper function, discard * operators so a pointer doesn't necessarily
 # sort before non-pointers, ignore const/static/volatile keywords.
 def function_args_alpha(text):
         s = text.strip()
         s = re.sub("[*]","", s)
-        s = re.sub("^const ","", s)
-        s = re.sub("^static ","", s)
-        s = re.sub("^volatile ","", s)
+        s = s.split()
+        def merge_specifier(words, specifier):
+            if len(words) > 2 and words[0] == specifier:
+                words[1] += specifier
+                words = words[1:]
+            return words
+        s = merge_specifier(s, 'const')
+        s = merge_specifier(s, 'static')
+        s = merge_specifier(s, 'volatile')
+        s = ' '.join(s)
         return s
 
 # List of illegal types.
@@ -90,11 +98,14 @@ def function_args(name, line):
     line = re.sub("^static ", "", line)
     line = re.sub("^volatile ", "", line)
 
-    # Let WT_ASSERT and WT_UNUSED terminate the parse. The often appear at the
-    # beginning of the function and looks like a WT_XXX variable declaration.
+    # Let WT_ASSERT, WT_UNUSED and WT_RET terminate the parse. They often appear
+    # at the beginning of the function and looks like a WT_XXX variable
+    # declaration.
     if re.search('^WT_ASSERT', line):
         return False,0
     if re.search('^WT_UNUSED', line):
+        return False,0
+    if re.search('^WT_RET', line):
         return False,0
 
     # Let lines not terminated with a semicolon terminate the parse, it means
@@ -105,7 +116,7 @@ def function_args(name, line):
     # Check for illegal types.
     for m in illegal_types:
         if re.search('^' + m + "\s*[\w(*]", line):
-            print >>sys.stderr, name + ": illegal type: " + line.strip()
+            print(name + ": illegal type: " + line.strip(), file=sys.stderr)
             sys.exit(1)
 
     # Check for matching types.
@@ -143,7 +154,7 @@ def function_declaration():
                 found,n = function_args(name, line)
                 if found:
                     # List statics first.
-                    if re.search("^\sstatic", line):
+                    if re.search("^\s+static", line):
                         static_list[n].append(line)
                         continue
 
@@ -152,8 +163,8 @@ def function_declaration():
                     # initializers (and we've already skipped statics, which
                     # are also typically initialized in the declaration).
                     if re.search("\s=\s[-\w]", line):
-                        print >>sys.stderr, \
-                            name + ": assignment in string: " + line.strip()
+                        print(name + ": assignment in string: " + line.strip(),\
+                              file=sys.stderr)
                         sys.exit(1);
 
                     list[n].append(line)

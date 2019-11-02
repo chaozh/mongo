@@ -115,7 +115,7 @@ protected:
         boost::optional<BSONObj> findCmd = boost::none,
         boost::optional<std::int64_t> getMoreBatchSize = boost::none) {
 
-        return stdx::make_unique<AsyncResultsMerger>(
+        return std::make_unique<AsyncResultsMerger>(
             operationContext(),
             executor(),
             makeARMParamsFromExistingCursors(std::move(remoteCursors), findCmd, getMoreBatchSize));
@@ -221,7 +221,6 @@ protected:
     }
 
     void assertKillCusorsCmdHasCursorId(const BSONObj& killCmd, CursorId cursorId) {
-        std::cout << "CHARLIE: " << killCmd;
         ASSERT_TRUE(killCmd.hasElement("killCursors"));
         ASSERT_EQ(killCmd["cursors"].type(), BSONType::Array);
 

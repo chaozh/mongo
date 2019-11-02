@@ -41,7 +41,7 @@
 #include "mongo/bson/util/builder.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 #if defined(_WIN32)
 #include "mongo/util/concurrency/mutex.h"
@@ -63,8 +63,27 @@ extern "C" time_t timegm(struct tm* const tmp);
 
 namespace mongo {
 
+AtomicWord<long long> Date_t::lastNowVal;
+
 Date_t Date_t::now() {
-    return fromMillisSinceEpoch(curTimeMillis64());
+    decltype(lastNowVal)::WordType curTime = curTimeMillis64();
+    auto oldLastNow = lastNowVal.loadRelaxed();
+
+    // If curTime is different than old last now, unconditionally try to cas it to the new value.
+    // This is an optimization to avoid performing stores for multiple clock reads in the same
+    // millisecond.
+    //
+    // It's important that this is a non-equality (rather than a >), so that we avoid stalling time
+    // if someone moves the system clock backwards.
+    if (curTime != oldLastNow) {
+        // If we fail to comp exchange, it means someone else concurrently called Date_t::now(), in
+        // which case it's likely their time is also recent.  It's important that we don't loop so
+        // that we avoid forcing time backwards if we have multiple callers at a millisecond
+        // boundary.
+        lastNowVal.compareAndSwap(&oldLastNow, curTime);
+    }
+
+    return fromMillisSinceEpoch(curTime);
 }
 
 Date_t::Date_t(stdx::chrono::system_clock::time_point tp)
@@ -124,7 +143,7 @@ std::string time_t_to_String_short(time_t t) {
 // colonsOk should be false when creating filenames
 string terseCurrentTime(bool colonsOk) {
     struct tm t;
-    time_t_to_Struct(time(0), &t);
+    time_t_to_Struct(time(nullptr), &t);
 
     const char* fmt = (colonsOk ? "%Y-%m-%dT%H:%M:%S" : "%Y-%m-%dT%H-%M-%S");
     char buf[32];
@@ -330,10 +349,10 @@ Status parseTimeZoneFromToken(StringData tzStr, int* tzAdjSecs) {
             }
 
             // Parse the hours component of the time zone offset.  Note that
-            // parseNumberFromStringWithBase correctly handles the sign bit, so leave that in.
+            // NumberParser correctly handles the sign bit, so leave that in.
             StringData tzHoursStr = tzStr.substr(0, 3);
             int tzAdjHours = 0;
-            Status status = parseNumberFromStringWithBase(tzHoursStr, 10, &tzAdjHours);
+            Status status = NumberParser().base(10)(tzHoursStr, &tzAdjHours);
             if (!status.isOK()) {
                 return status;
             }
@@ -346,7 +365,7 @@ Status parseTimeZoneFromToken(StringData tzStr, int* tzAdjSecs) {
 
             StringData tzMinutesStr = tzStr.substr(3, 2);
             int tzAdjMinutes = 0;
-            status = parseNumberFromStringWithBase(tzMinutesStr, 10, &tzAdjMinutes);
+            status = NumberParser().base(10)(tzMinutesStr, &tzAdjMinutes);
             if (!status.isOK()) {
                 return status;
             }
@@ -357,7 +376,7 @@ Status parseTimeZoneFromToken(StringData tzStr, int* tzAdjSecs) {
                 return Status(ErrorCodes::BadValue, sb.str());
             }
 
-            // Use the sign that parseNumberFromStringWithBase found to determine if we need to
+            // Use the sign that NumberParser::parse found to determine if we need to
             // flip the sign of our minutes component.  Also, we need to flip the sign of our
             // final result, because the offset passed in by the user represents how far off the
             // time they are giving us is from UTC, which means that we have to go the opposite
@@ -392,7 +411,7 @@ Status parseMillisFromToken(StringData millisStr, int* resultMillis) {
             return Status(ErrorCodes::BadValue, sb.str());
         }
 
-        Status status = parseNumberFromStringWithBase(millisStr, 10, resultMillis);
+        Status status = NumberParser().base(10)(millisStr, resultMillis);
         if (!status.isOK()) {
             return status;
         }
@@ -434,7 +453,7 @@ Status parseTmFromTokens(StringData yearStr,
         return Status(ErrorCodes::BadValue, sb.str());
     }
 
-    Status status = parseNumberFromStringWithBase(yearStr, 10, &resultTm->tm_year);
+    Status status = NumberParser().base(10)(yearStr, &resultTm->tm_year);
     if (!status.isOK()) {
         return status;
     }
@@ -454,7 +473,7 @@ Status parseTmFromTokens(StringData yearStr,
         return Status(ErrorCodes::BadValue, sb.str());
     }
 
-    status = parseNumberFromStringWithBase(monthStr, 10, &resultTm->tm_mon);
+    status = NumberParser().base(10)(monthStr, &resultTm->tm_mon);
     if (!status.isOK()) {
         return status;
     }
@@ -474,7 +493,7 @@ Status parseTmFromTokens(StringData yearStr,
         return Status(ErrorCodes::BadValue, sb.str());
     }
 
-    status = parseNumberFromStringWithBase(dayStr, 10, &resultTm->tm_mday);
+    status = NumberParser().base(10)(dayStr, &resultTm->tm_mday);
     if (!status.isOK()) {
         return status;
     }
@@ -492,7 +511,7 @@ Status parseTmFromTokens(StringData yearStr,
         return Status(ErrorCodes::BadValue, sb.str());
     }
 
-    status = parseNumberFromStringWithBase(hourStr, 10, &resultTm->tm_hour);
+    status = NumberParser().base(10)(hourStr, &resultTm->tm_hour);
     if (!status.isOK()) {
         return status;
     }
@@ -510,7 +529,7 @@ Status parseTmFromTokens(StringData yearStr,
         return Status(ErrorCodes::BadValue, sb.str());
     }
 
-    status = parseNumberFromStringWithBase(minStr, 10, &resultTm->tm_min);
+    status = NumberParser().base(10)(minStr, &resultTm->tm_min);
     if (!status.isOK()) {
         return status;
     }
@@ -532,7 +551,7 @@ Status parseTmFromTokens(StringData yearStr,
         return Status(ErrorCodes::BadValue, sb.str());
     }
 
-    status = parseNumberFromStringWithBase(secStr, 10, &resultTm->tm_sec);
+    status = NumberParser().base(10)(secStr, &resultTm->tm_sec);
     if (!status.isOK()) {
         return status;
     }
@@ -720,30 +739,6 @@ time_t Date_t::toTimeT() const {
     return secs;
 }
 
-boost::gregorian::date currentDate() {
-    boost::posix_time::ptime now = boost::posix_time::second_clock::local_time();
-    return now.date();
-}
-
-// parses time of day in "hh:mm" format assuming 'hh' is 00-23
-bool toPointInTime(const string& str, boost::posix_time::ptime* timeOfDay) {
-    int hh = 0;
-    int mm = 0;
-    if (2 != sscanf(str.c_str(), "%d:%d", &hh, &mm)) {
-        return false;
-    }
-
-    // verify that time is well formed
-    if ((hh / 24) || (mm / 60)) {
-        return false;
-    }
-
-    boost::posix_time::ptime res(currentDate(),
-                                 boost::posix_time::hours(hh) + boost::posix_time::minutes(mm));
-    *timeOfDay = res;
-    return true;
-}
-
 void sleepsecs(int s) {
     stdx::this_thread::sleep_for(Seconds(s).toSystemDuration());
 }
@@ -879,7 +874,7 @@ static unsigned long long resyncTime() {
 
 unsigned long long curTimeMicros64() {
     // Windows 8/2012 & later support a <1us time function
-    if (GetSystemTimePreciseAsFileTimeFunc != NULL) {
+    if (GetSystemTimePreciseAsFileTimeFunc != nullptr) {
         FILETIME time;
         GetSystemTimePreciseAsFileTimeFunc(&time);
         return fileTimeToMicroseconds(time);
@@ -926,13 +921,13 @@ unsigned long long curTimeMicros64() {
 #include <sys/time.h>
 unsigned long long curTimeMillis64() {
     timeval tv;
-    gettimeofday(&tv, NULL);
+    gettimeofday(&tv, nullptr);
     return ((unsigned long long)tv.tv_sec) * 1000 + tv.tv_usec / 1000;
 }
 
 unsigned long long curTimeMicros64() {
     timeval tv;
-    gettimeofday(&tv, NULL);
+    gettimeofday(&tv, nullptr);
     return (((unsigned long long)tv.tv_sec) * 1000 * 1000) + tv.tv_usec;
 }
 #endif

@@ -67,12 +67,12 @@ public:
                                                                          StringData ident) override;
 
     virtual Status createSortedDataInterface(OperationContext* opCtx,
+                                             const CollectionOptions& collOptions,
                                              StringData ident,
                                              const IndexDescriptor* desc);
 
-    virtual mongo::SortedDataInterface* getSortedDataInterface(OperationContext* opCtx,
-                                                               StringData ident,
-                                                               const IndexDescriptor* desc);
+    virtual std::unique_ptr<mongo::SortedDataInterface> getSortedDataInterface(
+        OperationContext* opCtx, StringData ident, const IndexDescriptor* desc);
 
     virtual Status beginBackup(OperationContext* opCtx) {
         return Status::OK();
@@ -111,7 +111,6 @@ public:
 
     virtual void setCachePressureForTest(int pressure) override;
 
-    // only called by KVDatabaseCatalogEntryBase::sizeOnDisk so return 0
     virtual int64_t getIdentSize(OperationContext* opCtx, StringData ident) {
         return 0;
     }
@@ -136,7 +135,7 @@ public:
 
     void setJournalListener(mongo::JournalListener* jl) final {}
 
-    virtual Timestamp getAllCommittedTimestamp() const override {
+    virtual Timestamp getAllDurableTimestamp() const override {
         RecordId id = _visibilityManager->getAllCommittedRecord();
         return Timestamp(id.repr());
     }
@@ -145,13 +144,17 @@ public:
         return Timestamp();
     }
 
+    boost::optional<Timestamp> getOplogNeededForCrashRecovery() const final {
+        return boost::none;
+    }
+
     // Biggie Specific
 
     /**
      * Returns a pair of the current version and copy of tree of the master.
      */
     std::pair<uint64_t, StringStore> getMasterInfo() {
-        stdx::lock_guard<stdx::mutex> lock(_masterLock);
+        stdx::lock_guard<Latch> lock(_masterLock);
         return std::make_pair(_masterVersion, _master);
     }
 
@@ -167,7 +170,7 @@ private:
     std::map<std::string, bool> _idents;  // TODO : replace with a query to _master.
     std::unique_ptr<VisibilityManager> _visibilityManager;
 
-    mutable stdx::mutex _masterLock;
+    mutable Mutex _masterLock = MONGO_MAKE_LATCH("KVEngine::_masterLock");
     StringStore _master;
     uint64_t _masterVersion = 0;
 };

@@ -34,10 +34,10 @@
 #include <string>
 #include <vector>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/storage/mobile/mobile_options.h"
 #include "mongo/db/storage/mobile/mobile_session.h"
-#include "mongo/stdx/mutex.h"
+#include "mongo/platform/mutex.h"
 
 namespace mongo {
 class MobileSession;
@@ -46,7 +46,8 @@ class MobileSession;
  * This class manages a queue of operations delayed for some reason
  */
 class MobileDelayedOpQueue final {
-    MONGO_DISALLOW_COPYING(MobileDelayedOpQueue);
+    MobileDelayedOpQueue(const MobileDelayedOpQueue&) = delete;
+    MobileDelayedOpQueue& operator=(const MobileDelayedOpQueue&) = delete;
 
 public:
     MobileDelayedOpQueue();
@@ -57,7 +58,7 @@ public:
 
 private:
     AtomicWord<bool> _isEmpty;
-    stdx::mutex _queueMutex;
+    Mutex _queueMutex = MONGO_MAKE_LATCH("MobileDelayedOpQueue::_queueMutex");
     std::queue<std::string> _opQueryQueue;
 };
 
@@ -65,10 +66,13 @@ private:
  * This class manages a pool of open sqlite3* objects.
  */
 class MobileSessionPool final {
-    MONGO_DISALLOW_COPYING(MobileSessionPool);
+    MobileSessionPool(const MobileSessionPool&) = delete;
+    MobileSessionPool& operator=(const MobileSessionPool&) = delete;
 
 public:
-    MobileSessionPool(const std::string& path, std::uint64_t maxPoolSize = 80);
+    MobileSessionPool(const std::string& path,
+                      const embedded::MobileOptions& options,
+                      std::uint64_t maxPoolSize = 80);
 
     ~MobileSessionPool();
 
@@ -91,6 +95,11 @@ public:
     // Failed drops get queued here and get re-tried periodically
     MobileDelayedOpQueue failedDropsQueue;
 
+    // Returns the mobile options associated with this storage engine instance
+    const embedded::MobileOptions& getOptions() const {
+        return _options;
+    }
+
 private:
     /**
      * Gets the front element from _sessions and then pops it off the queue.
@@ -98,10 +107,11 @@ private:
     sqlite3* _popSession_inlock();
 
     // This is used to lock the _sessions vector.
-    stdx::mutex _mutex;
+    Mutex _mutex;
     stdx::condition_variable _releasedSessionNotifier;
 
     std::string _path;
+    const embedded::MobileOptions& _options;
 
     /**
      * PoolSize is the number of open sessions associated with the session pool.

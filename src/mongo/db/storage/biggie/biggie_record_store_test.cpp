@@ -29,13 +29,15 @@
 
 #include "mongo/platform/basic.h"
 
+#include "mongo/db/storage/biggie/biggie_record_store.h"
+
+#include <memory>
+
 #include "mongo/base/init.h"
 #include "mongo/db/storage/biggie/biggie_kv_engine.h"
-#include "mongo/db/storage/biggie/biggie_record_store.h"
 #include "mongo/db/storage/biggie/biggie_recovery_unit.h"
 #include "mongo/db/storage/biggie/store.h"
 #include "mongo/db/storage/record_store_test_harness.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
@@ -89,12 +91,12 @@ public:
     }
 };
 
-std::unique_ptr<mongo::HarnessHelper> makeHarnessHelper() {
+std::unique_ptr<mongo::RecordStoreHarnessHelper> makeBiggieRecordStoreHarnessHelper() {
     return std::make_unique<RecordStoreHarnessHelper>();
 }
 
-MONGO_INITIALIZER(RegisterHarnessFactory)(InitializerContext* const) {
-    mongo::registerHarnessHelperFactory(makeHarnessHelper);
+MONGO_INITIALIZER(RegisterRecordStoreHarnessFactory)(InitializerContext* const) {
+    mongo::registerRecordStoreHarnessHelperFactory(makeBiggieRecordStoreHarnessHelper);
     return Status::OK();
 }
 }  // namespace

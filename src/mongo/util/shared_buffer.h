@@ -29,9 +29,13 @@
 
 #pragma once
 
+#include <algorithm>
+#include <type_traits>
+
 #include <boost/intrusive_ptr.hpp>
 
 #include "mongo/platform/atomic_word.h"
+
 #include "mongo/util/allocator.h"
 #include "mongo/util/assert_util.h"
 
@@ -73,8 +77,25 @@ public:
         _holder = std::move(tmp._holder);
     }
 
+    /**
+     * Resizes the buffer, copying the current contents. If shared, an exclusive copy is made.
+     */
+    void reallocOrCopy(size_t size) {
+        if (isShared()) {
+            auto tmp = SharedBuffer::allocate(size);
+            memcpy(tmp._holder->data(),
+                   _holder->data(),
+                   std::min(size, static_cast<size_t>(_holder->_capacity)));
+            swap(tmp);
+        } else if (_holder) {
+            realloc(size);
+        } else {
+            *this = SharedBuffer::allocate(size);
+        }
+    }
+
     char* get() const {
-        return _holder ? _holder->data() : NULL;
+        return _holder ? _holder->data() : nullptr;
     }
 
     explicit operator bool() const {
@@ -158,6 +179,9 @@ private:
     boost::intrusive_ptr<Holder> _holder;
 };
 
+MONGO_STATIC_ASSERT(std::is_nothrow_move_constructible_v<SharedBuffer>);
+MONGO_STATIC_ASSERT(std::is_nothrow_move_assignable_v<SharedBuffer>);
+
 inline void swap(SharedBuffer& one, SharedBuffer& two) {
     one.swap(two);
 }
@@ -188,6 +212,10 @@ public:
         return _buffer.isShared();
     }
 
+    size_t capacity() const {
+        return _buffer.capacity();
+    }
+
     /**
      * Converts to a mutable SharedBuffer.
      * This is only legal to call if you have exclusive access to the underlying buffer.
@@ -204,4 +232,4 @@ private:
 inline void swap(ConstSharedBuffer& one, ConstSharedBuffer& two) {
     one.swap(two);
 }
-}
+}  // namespace mongo

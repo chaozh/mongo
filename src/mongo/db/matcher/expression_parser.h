@@ -29,6 +29,8 @@
 
 #pragma once
 
+#include <functional>
+
 #include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
 #include "mongo/db/matcher/expression.h"
@@ -41,7 +43,6 @@
 #include "mongo/db/matcher/schema/expression_internal_schema_allowed_properties.h"
 #include "mongo/db/pipeline/expression.h"
 #include "mongo/db/pipeline/expression_context.h"
-#include "mongo/stdx/functional.h"
 
 namespace mongo {
 
@@ -62,6 +63,7 @@ enum class PathAcceptingKeyword {
     GREATER_THAN_OR_EQUAL,
     INTERNAL_EXPR_EQ,
     INTERNAL_SCHEMA_ALL_ELEM_MATCH_FROM_INDEX,
+    INTERNAL_SCHEMA_BIN_DATA_ENCRYPTED_TYPE,
     INTERNAL_SCHEMA_BIN_DATA_SUBTYPE,
     INTERNAL_SCHEMA_EQ,
     INTERNAL_SCHEMA_FMOD,
@@ -122,35 +124,5 @@ public:
         const boost::intrusive_ptr<ExpressionContext>& expCtx,
         const ExtensionsCallback& extensionsCallback = ExtensionsCallbackNoop(),
         AllowedFeatureSet allowedFeatures = kDefaultSpecialFeatures);
-
-    /**
-     * Parses a BSONElement of any numeric type into a positive long long, failing if the value
-     * is any of the following:
-     *
-     * - NaN.
-     * - Negative.
-     * - A floating point number which is not integral.
-     * - Too large to fit within a 64-bit signed integer.
-     */
-    static StatusWith<long long> parseIntegerElementToNonNegativeLong(BSONElement elem);
-
-    /**
-     * Parses a BSONElement of any numeric type into a long long, failing if the value
-     * is any of the following:
-     *
-     * - NaN.
-     * - A floating point number which is not integral.
-     * - Too large in the positive or negative direction to fit within a 64-bit signed integer.
-     */
-    static StatusWith<long long> parseIntegerElementToLong(BSONElement elem);
-
-    /**
-     * Parses a BSONElement of any numeric type into an integer, failing if the value is:
-     *
-     * - NaN
-     * - a non-integral number
-     * - too large in the positive or negative direction to fit in an int
-     */
-    static StatusWith<int> parseIntegerElementToInt(BSONElement elem);
 };
 }  // namespace mongo

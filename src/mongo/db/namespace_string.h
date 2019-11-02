@@ -101,6 +101,9 @@ public:
     // Namespace for index build entries.
     static const NamespaceString kIndexBuildEntryNamespace;
 
+    // Namespace for pending range deletions.
+    static const NamespaceString kRangeDeletionNamespace;
+
     /**
      * Constructs an empty NamespaceString.
      */
@@ -155,23 +158,6 @@ public:
      * namespace is "<dbName>.$cmd.listCollections".
      */
     static NamespaceString makeListCollectionsNSS(StringData dbName);
-
-    /**
-     * Note that these values are derived from the mmap_v1 implementation and that is the only
-     * reason they are constrained as such.
-     */
-    enum MaxNsLenValue {
-        // Maximum possible length of name any namespace, including special ones like $extra.
-        // This includes rum for the NUL byte so it can be used when sizing buffers.
-        MaxNsLenWithNUL = 128,
-
-        // MaxNsLenWithNUL excluding the NUL byte. Use this when comparing std::string lengths.
-        MaxNsLen = MaxNsLenWithNUL - 1,
-
-        // Maximum allowed length of fully qualified namespace name of any real collection.
-        // Does not include NUL so it can be directly compared to std::string lengths.
-        MaxNsCollectionLen = MaxNsLen - 7 /*strlen(".$extra")*/,
-    };
 
     /**
      * NOTE: DollarInDbNameBehavior::allow is deprecated.
@@ -244,9 +230,6 @@ public:
     bool isOplog() const {
         return oplog(_ns);
     }
-    bool isSpecial() const {
-        return special(_ns);
-    }
     bool isOnInternalDb() const {
         if (db() == kAdminDb)
             return true;
@@ -256,25 +239,27 @@ public:
             return true;
         return false;
     }
-    bool isNormal() const {
-        return normal(_ns);
-    }
+
     bool isOrphanCollection() const {
         return db() == kOrphanCollectionDb && coll().startsWith(kOrphanCollectionPrefix);
     }
 
     /**
-     * Returns whether the NamespaceString references a special collection that cannot be used for
-     * generic data storage.
+     * Returns whether the specified namespace is used for internal purposes only and can
+     * never be marked as anything other than UNSHARDED.
      */
-    bool isVirtualized() const {
-        return virtualized(_ns);
-    }
+    bool isNamespaceAlwaysUnsharded() const;
 
     /**
      * Returns whether a namespace is replicated, based only on its string value. One notable
      * omission is that map reduce `tmp.mr` collections may or may not be replicated. Callers must
      * decide how to handle that case separately.
+     *
+     * Note: This function considers "replicated" to be any namespace that should be timestamped.
+     * Not all collections that are timestamped are replicated explicitly through the oplog.
+     * Drop-pending collections are a notable example. Please use
+     * ReplicationCoordinator::isOplogDisabledForNS to determine if a namespace gets logged in the
+     * oplog.
      */
     bool isReplicated() const;
 
@@ -302,13 +287,15 @@ public:
     bool isDropPendingNamespace() const;
 
     /**
+     * Returns true if the namespace length is valid based on the FCV setting.
+     */
+    bool checkLengthForFCV() const;
+
+    /**
      * Returns the drop-pending namespace name for this namespace, provided the given optime.
      *
      * Example:
      *     test.foo -> test.system.drop.<timestamp seconds>i<timestamp increment>t<term>.foo
-     *
-     * Original collection name may be truncated so that the generated namespace length does not
-     * exceed MaxNsCollectionLen.
      */
     NamespaceString makeDropPendingNamespace(const repl::OpTime& opTime) const;
 
@@ -317,12 +304,6 @@ public:
      * Returns an error if this namespace is not drop-pending.
      */
     StatusWith<repl::OpTime> getDropPendingNamespaceOpTime() const;
-
-    /**
-     * Checks if this namespace is valid as a target namespace for a rename operation, given
-     * the length of the longest index name in the source collection.
-     */
-    Status checkLengthForRename(const std::string::size_type longestIndexNameLength) const;
 
     /**
      * Returns true if the namespace is valid. Special namespaces for internal use are considered as
@@ -342,34 +323,10 @@ public:
     }
 
     /**
-     * Returns index namespace for an index in this collection namespace.
-     */
-    NamespaceString makeIndexNamespace(StringData indexName) const;
-
-    /**
-     * @return true if ns is 'normal'.  A "$" is used for namespaces holding index data,
-     * which do not contain BSON objects in their records. ("oplog.$main" is the exception)
-     */
-    static bool normal(StringData ns) {
-        return !virtualized(ns);
-    }
-
-    /**
      * @return true if the ns is an oplog one, otherwise false.
      */
     static bool oplog(StringData ns) {
         return ns.startsWith("local.oplog.");
-    }
-
-    static bool special(StringData ns) {
-        return !normal(ns) || ns.substr(ns.find('.')).startsWith(".system.");
-    }
-
-    /**
-     * Check if `ns` references a special collection that cannot be used for generic data storage.
-     */
-    static bool virtualized(StringData ns) {
-        return ns.find('$') != std::string::npos && ns != "local.oplog.$main";
     }
 
     /**

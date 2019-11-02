@@ -48,8 +48,7 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/stdx/unordered_set.h"
-#include "mongo/util/mongoutils/str.h"
-#include "mongo/util/stringutils.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 namespace auth {
@@ -65,9 +64,10 @@ Status _checkNoExtraFields(const BSONObj& cmdObj,
         StringData fieldName = (*iter).fieldNameStringData();
         if (!isGenericArgument(fieldName) && !validFieldNames.count(fieldName.toString())) {
             return Status(ErrorCodes::BadValue,
-                          mongoutils::str::stream() << "\"" << fieldName << "\" is not "
-                                                                            "a valid argument to "
-                                                    << cmdName);
+                          str::stream() << "\"" << fieldName
+                                        << "\" is not "
+                                           "a valid argument to "
+                                        << cmdName);
         }
     }
     return Status::OK();
@@ -176,8 +176,9 @@ Status parseRolePossessionManipulationCommands(const BSONObj& cmdObj,
 
     if (!parsedRoleNames->size()) {
         return Status(ErrorCodes::BadValue,
-                      mongoutils::str::stream() << cmdName << " command requires a non-empty "
-                                                              "\"roles\" array");
+                      str::stream() << cmdName
+                                    << " command requires a non-empty "
+                                       "\"roles\" array");
     }
     return Status::OK();
 }
@@ -513,7 +514,7 @@ Status parseAndValidatePrivilegeArray(const BSONArray& privileges,
         }
         if (unrecognizedActions.size()) {
             std::string unrecognizedActionsString;
-            joinStringDelim(unrecognizedActions, &unrecognizedActionsString, ',');
+            str::joinStringDelim(unrecognizedActions, &unrecognizedActionsString, ',');
             return Status(ErrorCodes::FailedToParse,
                           str::stream() << "Unrecognized action privilege strings: "
                                         << unrecognizedActionsString);
@@ -635,8 +636,9 @@ Status parseAndValidateRolePrivilegeManipulationCommands(const BSONObj& cmdObj,
     }
     if (!parsedPrivileges->size()) {
         return Status(ErrorCodes::BadValue,
-                      mongoutils::str::stream() << cmdName << " command requires a non-empty "
-                                                              "\"privileges\" array");
+                      str::stream() << cmdName
+                                    << " command requires a non-empty "
+                                       "\"privileges\" array");
     }
 
     return Status::OK();

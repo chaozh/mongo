@@ -34,12 +34,9 @@
 #include <memory>
 #include <string>
 
-#include "mongo/base/disallow_copying.h"
-
 #include "mongo/client/connection_string.h"
 #include "mongo/client/remote_command_targeter_factory.h"
 #include "mongo/s/client/shard.h"
-#include "mongo/stdx/functional.h"
 
 namespace mongo {
 
@@ -47,11 +44,12 @@ namespace mongo {
  * An object factory for creating Shard instances via calling registered builders.
  */
 class ShardFactory {
-    MONGO_DISALLOW_COPYING(ShardFactory);
+    ShardFactory(const ShardFactory&) = delete;
+    ShardFactory& operator=(const ShardFactory&) = delete;
 
 public:
     using BuilderCallable =
-        stdx::function<std::unique_ptr<Shard>(const ShardId&, const ConnectionString&)>;
+        std::function<std::unique_ptr<Shard>(const ShardId&, const ConnectionString&)>;
     using BuildersMap = std::map<ConnectionString::ConnectionType, BuilderCallable>;
 
     ShardFactory(BuildersMap&&, std::unique_ptr<RemoteCommandTargeterFactory>);

@@ -30,13 +30,13 @@
 
 #pragma once
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/cursor_id.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/server_options.h"
 #include "mongo/platform/atomic_word.h"
+#include "mongo/util/diagnostic_info.h"
 #include "mongo/util/progress_meter.h"
 #include "mongo/util/time_support.h"
 
@@ -56,6 +56,17 @@ public:
      */
     class AdditiveMetrics {
     public:
+        AdditiveMetrics() = default;
+        AdditiveMetrics(const AdditiveMetrics& other) {
+            this->add(other);
+        }
+
+        AdditiveMetrics& operator=(const AdditiveMetrics& other) {
+            reset();
+            add(other);
+            return *this;
+        }
+
         /**
          * Adds all the fields of another AdditiveMetrics object together with the fields of this
          * AdditiveMetrics instance.
@@ -63,10 +74,15 @@ public:
         void add(const AdditiveMetrics& otherMetrics);
 
         /**
+         * Resets all members to the default state.
+         */
+        void reset();
+
+        /**
          * Returns true if the AdditiveMetrics object we are comparing has the same field values as
          * this AdditiveMetrics instance.
          */
-        bool equals(const AdditiveMetrics& otherMetrics);
+        bool equals(const AdditiveMetrics& otherMetrics) const;
 
         /**
          * Increments writeConflicts by n.
@@ -114,16 +130,20 @@ public:
         boost::optional<long long> keysInserted;
         // Number of index keys removed.
         boost::optional<long long> keysDeleted;
+
+        // The following fields are atomic because they are reported by CurrentOp. This is an
+        // exception to the prescription that OpDebug only be used by the owning thread because
+        // these metrics are tracked over the course of a transaction by SingleTransactionStats,
+        // which is built on OpDebug.
+
         // Number of read conflicts caused by a prepared transaction.
-        boost::optional<long long> prepareReadConflicts;
-        boost::optional<long long> writeConflicts;
+        AtomicWord<long long> prepareReadConflicts{0};
+        AtomicWord<long long> writeConflicts{0};
     };
 
     OpDebug() = default;
 
-    std::string report(Client* client,
-                       const CurOp& curop,
-                       const SingleThreadedLockStats* lockStats) const;
+    std::string report(OperationContext* opCtx, const SingleThreadedLockStats* lockStats) const;
 
     /**
      * Appends information about the current operation to "builder"
@@ -131,14 +151,25 @@ public:
      * @param curop reference to the CurOp that owns this OpDebug
      * @param lockStats lockStats object containing locking information about the operation
      */
-    void append(const CurOp& curop,
+    void append(OperationContext* opCtx,
                 const SingleThreadedLockStats& lockStats,
+                FlowControlTicketholder::CurOp flowControlStats,
                 BSONObjBuilder& builder) const;
 
     /**
      * Copies relevant plan summary metrics to this OpDebug instance.
      */
     void setPlanSummaryMetrics(const PlanSummaryStats& planSummaryStats);
+
+    /**
+     * The resulting object has zeros omitted. As is typical in this file.
+     */
+    BSONObj makeFlowControlObject(FlowControlTicketholder::CurOp flowControlStats) const;
+
+    /**
+     * Make object from $searchBeta stats with non-populated values omitted.
+     */
+    BSONObj makeSearchBetaObject() const;
 
     // -------------------
 
@@ -157,6 +188,10 @@ public:
     long long ntoskip{-1};
     bool exhaust{false};
 
+    // For searchBeta.
+    boost::optional<long long> mongotCursorId{boost::none};
+    boost::optional<long long> msWaitingForMongot{boost::none};
+
     bool hasSortStage{false};  // true if the query plan involves an in-memory sort
 
     bool usedDisk{false};  // true if the given query used disk
@@ -168,8 +203,7 @@ public:
     // True if a replan was triggered during the execution of this operation.
     bool replanned{false};
 
-    bool fastmodinsert{false};  // upsert of an $operation. builds a default object
-    bool upsert{false};         // true if the update actually did an insert
+    bool upsert{false};  // true if the update actually did an insert
     bool cursorExhausted{
         false};  // true if the cursor has been closed at end a find/getMore operation
 
@@ -192,11 +226,20 @@ public:
     // Shard targeting info.
     int nShards{-1};
 
+    // Stores the duration of time spent blocked on prepare conflicts.
+    Milliseconds prepareConflictDurationMillis{0};
+
+    // Stores the amount of the data processed by the throttle cursors in MB/sec.
+    boost::optional<float> dataThroughputLastSecond;
+    boost::optional<float> dataThroughputAverage;
+
     // Stores additive metrics.
     AdditiveMetrics additiveMetrics;
 
     // Stores storage statistics.
     std::shared_ptr<StorageStats> storageStats;
+
+    bool waitingForFlowControl{false};
 };
 
 /**
@@ -221,7 +264,8 @@ public:
  * any synchronization.
  */
 class CurOp {
-    MONGO_DISALLOW_COPYING(CurOp);
+    CurOp(const CurOp&) = delete;
+    CurOp& operator=(const CurOp&) = delete;
 
 public:
     static CurOp* get(const OperationContext* opCtx);
@@ -236,6 +280,7 @@ public:
     static void reportCurrentOpForClient(OperationContext* opCtx,
                                          Client* client,
                                          bool truncateOps,
+                                         bool backtraceMode,
                                          BSONObjBuilder* infoBuilder);
 
     /**
@@ -509,7 +554,7 @@ public:
      * If called from a thread other than the one executing the operation associated with this
      * CurOp, it is necessary to lock the associated Client object before executing this method.
      */
-    void reportState(BSONObjBuilder* builder, bool truncateOps = false);
+    void reportState(OperationContext* opCtx, BSONObjBuilder* builder, bool truncateOps = false);
 
     /**
      * Sets the message for this CurOp.

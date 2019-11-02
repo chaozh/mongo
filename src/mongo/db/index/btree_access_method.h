@@ -45,13 +45,14 @@ class IndexDescriptor;
  */
 class BtreeAccessMethod : public AbstractIndexAccessMethod {
 public:
-    BtreeAccessMethod(IndexCatalogEntry* btreeState, SortedDataInterface* btree);
+    BtreeAccessMethod(IndexCatalogEntry* btreeState, std::unique_ptr<SortedDataInterface> btree);
 
 private:
     void doGetKeys(const BSONObj& obj,
-                   BSONObjSet* keys,
-                   BSONObjSet* multikeyMetadataKeys,
-                   MultikeyPaths* multikeyPaths) const final;
+                   KeyStringSet* keys,
+                   KeyStringSet* multikeyMetadataKeys,
+                   MultikeyPaths* multikeyPaths,
+                   boost::optional<RecordId> id) const final;
 
     // Our keys differ for V0 and V1.
     std::unique_ptr<BtreeKeyGenerator> _keyGenerator;

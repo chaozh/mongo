@@ -41,6 +41,7 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/db_raii.h"
+#include "mongo/db/index_builds_coordinator.h"
 #include "mongo/db/op_observer.h"
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/service_context.h"
@@ -88,9 +89,9 @@ public:
 
         WriteUnitOfWork wunit(opCtx);
         UnreplicatedWritesBlock unreplicatedWritesBlock(opCtx);
-        Collection* collection = db->getCollection(opCtx, nss);
+        Collection* collection = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(nss);
         if (!collection) {
-            collection = db->createCollection(opCtx, nss.ns());
+            collection = db->createCollection(opCtx, nss);
             if (!collection) {
                 errmsg = "could not create collection";
                 return false;
@@ -140,7 +141,7 @@ public:
         }
 
         // Lock the database in mode IX and lock the collection exclusively.
-        AutoGetCollection autoColl(opCtx, fullNs, MODE_IX, MODE_X);
+        AutoGetCollection autoColl(opCtx, fullNs, MODE_X);
         Collection* collection = autoColl.getCollection();
         if (!collection) {
             uasserted(ErrorCodes::NamespaceNotFound,
@@ -160,7 +161,7 @@ public:
                 opCtx, fullNs.ns(), collection, PlanExecutor::NO_YIELD, InternalPlanner::BACKWARD);
 
             for (int i = 0; i < n + 1; ++i) {
-                PlanExecutor::ExecState state = exec->getNext(nullptr, &end);
+                PlanExecutor::ExecState state = exec->getNext(static_cast<BSONObj*>(nullptr), &end);
                 if (PlanExecutor::ADVANCED != state) {
                     uasserted(ErrorCodes::IllegalOperation,
                               str::stream() << "invalid n, collection contains fewer than " << n
@@ -168,6 +169,10 @@ public:
                 }
             }
         }
+
+        BackgroundOperation::assertNoBgOpInProgForNs(fullNs.ns());
+        IndexBuildsCoordinator::get(opCtx)->assertNoIndexBuildInProgForCollection(
+            collection->uuid());
 
         collection->cappedTruncateAfter(opCtx, end, inc);
 
@@ -204,4 +209,4 @@ public:
 };
 
 MONGO_REGISTER_TEST_COMMAND(EmptyCapped);
-}
+}  // namespace mongo

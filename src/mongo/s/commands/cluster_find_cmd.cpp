@@ -49,11 +49,25 @@
 namespace mongo {
 namespace {
 
-using std::unique_ptr;
 using std::string;
+using std::unique_ptr;
 using std::vector;
 
 const char kTermField[] = "term";
+
+// Parses the command object to a QueryRequest, validates that no runtime constants were supplied
+// with the command, and sets the constant runtime values that will be forwarded to each shard.
+std::unique_ptr<QueryRequest> parseCmdObjectToQueryRequest(OperationContext* opCtx,
+                                                           NamespaceString nss,
+                                                           BSONObj cmdObj,
+                                                           bool isExplain) {
+    auto qr = uassertStatusOK(
+        QueryRequest::makeFromFindCommand(std::move(nss), std::move(cmdObj), isExplain));
+    uassert(
+        51202, "Cannot specify runtime constants option to a mongos", !qr->getRuntimeConstants());
+    qr->setRuntimeConstants(Variables::generateRuntimeConstants(opCtx));
+    return qr;
+}
 
 /**
  * Implements the find command on mongos.
@@ -98,8 +112,9 @@ public:
             return false;
         }
 
-        bool supportsReadConcern(repl::ReadConcernLevel level) const final {
-            return true;
+        ReadConcernSupportResult supportsReadConcern(repl::ReadConcernLevel level) const final {
+            return {ReadConcernSupportResult::ReadConcern::kSupported,
+                    ReadConcernSupportResult::DefaultReadConcern::kPermitted};
         }
 
         NamespaceString ns() const override {
@@ -122,12 +137,12 @@ public:
                      ExplainOptions::Verbosity verbosity,
                      rpc::ReplyBuilderInterface* result) override {
             // Parse the command BSON to a QueryRequest.
-            bool isExplain = true;
-            auto qr =
-                uassertStatusOK(QueryRequest::makeFromFindCommand(ns(), _request.body, isExplain));
+            const bool isExplain = true;
+            auto qr = parseCmdObjectToQueryRequest(opCtx, ns(), _request.body, isExplain);
 
             try {
-                const auto explainCmd = ClusterExplain::wrapAsExplain(_request.body, verbosity);
+                const auto explainCmd =
+                    ClusterExplain::wrapAsExplain(qr->asFindCommand(), verbosity);
 
                 long long millisElapsed;
                 std::vector<AsyncRequestsSender::Response> shardResponses;
@@ -185,8 +200,7 @@ public:
             globalOpCounters.gotQuery();
 
             const bool isExplain = false;
-            auto qr =
-                uassertStatusOK(QueryRequest::makeFromFindCommand(ns(), _request.body, isExplain));
+            auto qr = parseCmdObjectToQueryRequest(opCtx, ns(), _request.body, isExplain);
 
             const boost::intrusive_ptr<ExpressionContext> expCtx;
             auto cq = uassertStatusOK(

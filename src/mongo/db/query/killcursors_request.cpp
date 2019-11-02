@@ -37,7 +37,7 @@ namespace mongo {
 
 namespace {
 
-const char kCmdName[] = "killCursors";
+constexpr StringData kCmdName = "killCursors"_sd;
 const char kCursorsField[] = "cursors";
 
 }  // namespace
@@ -48,7 +48,7 @@ KillCursorsRequest::KillCursorsRequest(const NamespaceString& nsString,
 
 StatusWith<KillCursorsRequest> KillCursorsRequest::parseFromBSON(const std::string& dbname,
                                                                  const BSONObj& cmdObj) {
-    if (!str::equals(cmdObj.firstElement().fieldName(), kCmdName)) {
+    if (cmdObj.firstElement().fieldNameStringData() != kCmdName) {
         return {ErrorCodes::FailedToParse,
                 str::stream() << "First field name must be '" << kCmdName << "' in: " << cmdObj};
     }
@@ -67,8 +67,8 @@ StatusWith<KillCursorsRequest> KillCursorsRequest::parseFromBSON(const std::stri
 
     if (cmdObj[kCursorsField].type() != BSONType::Array) {
         return {ErrorCodes::FailedToParse,
-                str::stream() << "Field '" << kCursorsField << "' must be of type array in: "
-                              << cmdObj};
+                str::stream() << "Field '" << kCursorsField
+                              << "' must be of type array in: " << cmdObj};
     }
 
     std::vector<CursorId> cursorIds;

@@ -67,7 +67,7 @@ Status ServiceExecutorSynchronous::shutdown(Milliseconds timeout) {
 
     _stillRunning.store(false);
 
-    stdx::unique_lock<stdx::mutex> lock(_shutdownMutex);
+    stdx::unique_lock<Latch> lock(_shutdownMutex);
     bool result = _shutdownCondition.wait_for(lock, timeout.toSystemDuration(), [this]() {
         return _numRunningWorkerThreads.load() == 0;
     });
@@ -115,7 +115,7 @@ Status ServiceExecutorSynchronous::schedule(Task task,
     // into the thread local job queue.
     LOG(3) << "Starting new executor thread in passthrough mode";
 
-    Status status = launchServiceWorkerThread([ this, task = std::move(task) ] {
+    Status status = launchServiceWorkerThread([this, task = std::move(task)] {
         _numRunningWorkerThreads.addAndFetch(1);
 
         _localWorkQueue.emplace_back(std::move(task));

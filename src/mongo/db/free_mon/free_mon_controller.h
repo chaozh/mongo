@@ -157,33 +157,33 @@ private:
 
 private:
     /**
-    * Private enum to track state.
-    *
-    *   +-----------------------------------------------------------+
-    *   |                                                           v
-    * +-------------+     +----------+     +----------------+     +-------+
-    * | kNotStarted | --> | kStarted | --> | kStopRequested | --> | kDone |
-    * +-------------+     +----------+     +----------------+     +-------+
-    */
+     * Private enum to track state.
+     *
+     *   +-----------------------------------------------------------+
+     *   |                                                           v
+     * +-------------+     +----------+     +----------------+     +-------+
+     * | kNotStarted | --> | kStarted | --> | kStopRequested | --> | kDone |
+     * +-------------+     +----------+     +----------------+     +-------+
+     */
     enum class State {
         /**
-        * Initial state. Either start() or stop() can be called next.
-        */
+         * Initial state. Either start() or stop() can be called next.
+         */
         kNotStarted,
 
         /**
-        * start() has been called. stop() should be called next.
-        */
+         * start() has been called. stop() should be called next.
+         */
         kStarted,
 
         /**
-        * stop() has been called, and the background thread is in progress of shutting down
-        */
+         * stop() has been called, and the background thread is in progress of shutting down
+         */
         kStopRequested,
 
         /**
-        * Controller has been stopped.
-        */
+         * Controller has been stopped.
+         */
         kDone,
     };
 
@@ -191,7 +191,7 @@ private:
     State _state{State::kNotStarted};
 
     // Mutext to protect internal state
-    stdx::mutex _mutex;
+    Mutex _mutex = MONGO_MAKE_LATCH("FreeMonController::_mutex");
 
     // Set of registration collectors
     FreeMonCollectorCollection _registrationCollectors;

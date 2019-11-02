@@ -27,6 +27,10 @@
  *    it in the license file.
  */
 
+#include "mongo/platform/basic.h"
+
+#include <cctype>
+
 #include "mongo/db/fts/unicode/string.h"
 #include "mongo/shell/linenoise_utf8.h"
 #include "mongo/unittest/unittest.h"
@@ -62,7 +66,7 @@ auto kCaseSensitive = String::kCaseSensitive;
 
 auto kTurkish = CaseFoldMode::kTurkish;
 auto kNormal = CaseFoldMode::kNormal;
-}
+}  // namespace
 
 
 // Macro to preserve line numbers and arguments in error messages.

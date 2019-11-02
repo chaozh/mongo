@@ -60,8 +60,9 @@ StatusWith<bool> trySCRAM(const User::CredentialData& credentials, StringData pw
                                   reinterpret_cast<const std::uint8_t*>(decodedSalt.c_str()) +
                                       decodedSalt.size()),
         scram.iterationCount));
-    if (scram.storedKey != base64::encode(reinterpret_cast<const char*>(secrets.storedKey().data()),
-                                          secrets.storedKey().size())) {
+    if (scram.storedKey !=
+        base64::encode(reinterpret_cast<const char*>(secrets.storedKey().data()),
+                       secrets.storedKey().size())) {
         return Status(ErrorCodes::AuthenticationFailed,
                       str::stream() << "Incorrect user name or password");
     }
@@ -120,7 +121,7 @@ StatusWith<std::tuple<bool, std::string>> SASLPlainServerMechanism::stepImpl(
         }
     } catch (std::out_of_range&) {
         return Status(ErrorCodes::AuthenticationFailed,
-                      mongoutils::str::stream() << "Incorrectly formatted PLAIN client message");
+                      str::stream() << "Incorrectly formatted PLAIN client message");
     }
 
     // The authentication database is also the source database for the user.

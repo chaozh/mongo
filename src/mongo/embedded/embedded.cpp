@@ -35,28 +35,32 @@
 
 #include "mongo/base/initializer.h"
 #include "mongo/config.h"
+#include "mongo/db/catalog/collection_catalog.h"
+#include "mongo/db/catalog/collection_impl.h"
 #include "mongo/db/catalog/database_holder_impl.h"
 #include "mongo/db/catalog/health_log.h"
 #include "mongo/db/catalog/index_key_validate.h"
-#include "mongo/db/catalog/uuid_catalog.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands/feature_compatibility_version.h"
 #include "mongo/db/commands/fsync_locked.h"
 #include "mongo/db/concurrency/lock_state.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/global_settings.h"
+#include "mongo/db/index/index_access_method_factory_impl.h"
 #include "mongo/db/kill_sessions_local.h"
 #include "mongo/db/logical_clock.h"
+#include "mongo/db/logical_session_cache_impl.h"
 #include "mongo/db/op_observer_impl.h"
 #include "mongo/db/op_observer_registry.h"
 #include "mongo/db/repair_database_and_check_version.h"
 #include "mongo/db/repl/storage_interface_impl.h"
+#include "mongo/db/service_liaison_mongod.h"
 #include "mongo/db/session_killer.h"
+#include "mongo/db/sessions_collection_standalone.h"
 #include "mongo/db/storage/encryption_hooks.h"
 #include "mongo/db/storage/storage_engine_init.h"
 #include "mongo/db/ttl.h"
 #include "mongo/embedded/index_builds_coordinator_embedded.h"
-#include "mongo/embedded/logical_session_cache_factory_embedded.h"
 #include "mongo/embedded/periodic_runner_embedded.h"
 #include "mongo/embedded/replication_coordinator_embedded.h"
 #include "mongo/embedded/service_entry_point_embedded.h"
@@ -91,7 +95,7 @@ void initWireSpec() {
 }
 
 
-// Noop, to fulfull dependencies for other initializers
+// Noop, to fulfill dependencies for other initializers.
 MONGO_INITIALIZER_GENERAL(ForkServer, ("EndStartupOptionHandling"), ("default"))
 (InitializerContext* context) {
     return Status::OK();
@@ -99,17 +103,17 @@ MONGO_INITIALIZER_GENERAL(ForkServer, ("EndStartupOptionHandling"), ("default"))
 
 void setUpCatalog(ServiceContext* serviceContext) {
     DatabaseHolder::set(serviceContext, std::make_unique<DatabaseHolderImpl>());
+    IndexAccessMethodFactory::set(serviceContext, std::make_unique<IndexAccessMethodFactoryImpl>());
+    Collection::Factory::set(serviceContext, std::make_unique<CollectionImpl::FactoryImpl>());
 }
 
 // Create a minimalistic replication coordinator to provide a limited interface for users. Not
 // functional to provide any replication logic.
 ServiceContext::ConstructorActionRegisterer replicationManagerInitializer(
-    "CreateReplicationManager",
-    {"SSLManager", "default"},
-    [](ServiceContext* serviceContext) {
+    "CreateReplicationManager", {"SSLManager", "default"}, [](ServiceContext* serviceContext) {
         repl::StorageInterface::set(serviceContext, std::make_unique<repl::StorageInterfaceImpl>());
 
-        auto logicalClock = stdx::make_unique<LogicalClock>(serviceContext);
+        auto logicalClock = std::make_unique<LogicalClock>(serviceContext);
         LogicalClock::set(serviceContext, std::move(logicalClock));
 
         auto replCoord = std::make_unique<ReplicationCoordinatorEmbedded>(serviceContext);
@@ -127,8 +131,6 @@ MONGO_INITIALIZER(fsyncLockedForWriting)(InitializerContext* context) {
 
 GlobalInitializerRegisterer filterAllowedIndexFieldNamesEmbeddedInitializer(
     "FilterAllowedIndexFieldNamesEmbedded",
-    {},
-    {"FilterAllowedIndexFieldNames"},
     [](InitializerContext* service) {
         index_key_validate::filterAllowedIndexFieldNames =
             [](std::set<StringData>& allowedIndexFieldNames) {
@@ -136,7 +138,10 @@ GlobalInitializerRegisterer filterAllowedIndexFieldNamesEmbeddedInitializer(
                 allowedIndexFieldNames.erase(IndexDescriptor::kExpireAfterSecondsFieldName);
             };
         return Status::OK();
-    });
+    },
+    DeinitializerFunction(nullptr),
+    {},
+    {"FilterAllowedIndexFieldNames"});
 }  // namespace
 
 using logger::LogComponent;
@@ -161,11 +166,6 @@ void shutdown(ServiceContext* srvContext) {
             databaseHolder->closeAll(shutdownOpCtx.get());
 
             LogicalSessionCache::set(serviceContext, nullptr);
-
-            // Shut down the background periodic task runner, before the storage engine.
-            if (auto runner = serviceContext->getPeriodicRunner()) {
-                runner->shutdown();
-            }
 
             repl::ReplicationCoordinator::get(serviceContext)->shutdown(shutdownOpCtx.get());
             IndexBuildsCoordinator::get(serviceContext)->shutdown();
@@ -194,9 +194,12 @@ ServiceContext* initialize(const char* yaml_config) {
 
     Status status = mongo::runGlobalInitializers(yaml_config ? 1 : 0, argv, nullptr);
     uassertStatusOKWithContext(status, "Global initilization failed");
+    auto giGuard = makeGuard([] { mongo::runGlobalDeinitializers().ignore(); });
     setGlobalServiceContext(ServiceContext::make());
 
     Client::initThread("initandlisten");
+    // Make sure current thread have no client set in thread_local when we leave this function
+    auto clientGuard = makeGuard([] { Client::releaseCurrent(); });
 
     initWireSpec();
 
@@ -205,7 +208,6 @@ ServiceContext* initialize(const char* yaml_config) {
 
     auto opObserverRegistry = std::make_unique<OpObserverRegistry>();
     opObserverRegistry->addObserver(std::make_unique<OpObserverImpl>());
-    opObserverRegistry->addObserver(std::make_unique<UUIDCatalogObserver>());
     serviceContext->setOpObserver(std::move(opObserverRegistry));
 
     DBDirectClientFactory::get(serviceContext).registerImplementation([](OperationContext* opCtx) {
@@ -222,16 +224,16 @@ ServiceContext* initialize(const char* yaml_config) {
         l << (is32bit ? " 32" : " 64") << "-bit" << endl;
     }
 
-    DEV log(LogComponent::kControl) << "DEBUG build (which is slower)" << endl;
+    if (kDebugBuild)
+        log(LogComponent::kControl) << "DEBUG build (which is slower)" << endl;
 
     // The periodic runner is required by the storage engine to be running beforehand.
     auto periodicRunner = std::make_unique<PeriodicRunnerEmbedded>(
         serviceContext, serviceContext->getPreciseClockSource());
-    periodicRunner->startup();
     serviceContext->setPeriodicRunner(std::move(periodicRunner));
 
-    initializeStorageEngine(serviceContext, StorageEngineInitFlags::kAllowNoLockFile);
     setUpCatalog(serviceContext);
+    initializeStorageEngine(serviceContext, StorageEngineInitFlags::kAllowNoLockFile);
 
     // Warn if we detect configurations for multiple registered storage engines in the same
     // configuration file/environment.
@@ -278,30 +280,18 @@ ServiceContext* initialize(const char* yaml_config) {
                                                        repl::StorageInterface::get(serviceContext));
     }
 
-    auto swNonLocalDatabases = repairDatabasesAndCheckVersion(startupOpCtx.get());
-    if (!swNonLocalDatabases.isOK()) {
-        // SERVER-31611 introduced a return value to `repairDatabasesAndCheckVersion`. Previously,
-        // a failing condition would fassert. SERVER-31611 covers a case where the binary (3.6) is
-        // refusing to start up because it refuses acknowledgement of FCV 3.2 and requires the
-        // user to start up with an older binary. Thus shutting down the server must leave the
-        // datafiles in a state that the older binary can start up. This requires going through a
-        // clean shutdown.
-        //
-        // The invariant is *not* a statement that `repairDatabasesAndCheckVersion` must return
-        // `MustDowngrade`. Instead, it is meant as a guardrail to protect future developers from
-        // accidentally buying into this behavior. New errors that are returned from the method
-        // may or may not want to go through a clean shutdown, and they likely won't want the
-        // program to return an exit code of `EXIT_NEED_DOWNGRADE`.
-        severe(LogComponent::kControl) << "** IMPORTANT: "
-                                       << swNonLocalDatabases.getStatus().reason();
-        invariant(swNonLocalDatabases == ErrorCodes::MustDowngrade);
+    try {
+        repairDatabasesAndCheckVersion(startupOpCtx.get());
+    } catch (const ExceptionFor<ErrorCodes::MustDowngrade>& error) {
+        severe(LogComponent::kControl) << "** IMPORTANT: " << error.toStatus().reason();
         quickExit(EXIT_NEED_DOWNGRADE);
     }
 
-    // Assert that the in-memory featureCompatibilityVersion parameter has been explicitly set. If
-    // we are part of a replica set and are started up with no data files, we do not set the
-    // featureCompatibilityVersion until a primary is chosen. For this case, we expect the in-memory
-    // featureCompatibilityVersion parameter to still be uninitialized until after startup.
+    // Assert that the in-memory featureCompatibilityVersion parameter has been explicitly set.
+    // If we are part of a replica set and are started up with no data files, we do not set the
+    // featureCompatibilityVersion until a primary is chosen. For this case, we expect the
+    // in-memory featureCompatibilityVersion parameter to still be uninitialized until after
+    // startup.
     if (canCallFCVSetIfCleanStartup) {
         invariant(serverGlobalParams.featureCompatibility.isVersionInitialized());
     }
@@ -315,17 +305,22 @@ ServiceContext* initialize(const char* yaml_config) {
     srand((unsigned)(curTimeMicros64()) ^ (unsigned(uintptr_t(&startupOpCtx))));
 
     // Set up the logical session cache
-    auto sessionCache = makeLogicalSessionCacheEmbedded();
-    LogicalSessionCache::set(serviceContext, std::move(sessionCache));
+    LogicalSessionCache::set(serviceContext,
+                             std::make_unique<LogicalSessionCacheImpl>(
+                                 std::make_unique<ServiceLiaisonMongod>(),
+                                 std::make_shared<SessionsCollectionStandalone>(),
+                                 [](OperationContext*, SessionsCollection&, Date_t) {
+                                     return 0; /* No op */
+                                 }));
 
     // MessageServer::run will return when exit code closes its socket and we don't need the
     // operation context anymore
     startupOpCtx.reset();
 
-    // Make sure current thread have no client set in thread_local
-    Client::releaseCurrent();
-
     serviceContext->notifyStartupComplete();
+
+    // Init succeeded, no need for global deinit.
+    giGuard.dismiss();
 
     return serviceContext;
 }

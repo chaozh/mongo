@@ -29,12 +29,11 @@
 
 #pragma once
 
+#include <functional>
 #include <vector>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/executor/task_executor.h"
-#include "mongo/stdx/functional.h"
-#include "mongo/stdx/mutex.h"
+#include "mongo/platform/mutex.h"
 
 namespace mongo {
 
@@ -49,7 +48,8 @@ class ScatterGatherAlgorithm;
  * Interface of a scatter-gather behavior.
  */
 class ScatterGatherRunner {
-    MONGO_DISALLOW_COPYING(ScatterGatherRunner);
+    ScatterGatherRunner(const ScatterGatherRunner&) = delete;
+    ScatterGatherRunner& operator=(const ScatterGatherRunner&) = delete;
 
 public:
     /**
@@ -134,7 +134,7 @@ private:
         executor::TaskExecutor::EventHandle _sufficientResponsesReceived;
         std::vector<executor::TaskExecutor::CallbackHandle> _callbacks;
         bool _started = false;
-        stdx::mutex _mutex;
+        Mutex _mutex = MONGO_MAKE_LATCH("RunnerImpl::_mutex");
     };
 
     executor::TaskExecutor* _executor;  // Not owned here.

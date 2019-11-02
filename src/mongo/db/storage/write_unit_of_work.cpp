@@ -33,7 +33,6 @@
 
 #include "mongo/db/operation_context.h"
 #include "mongo/util/fail_point.h"
-#include "mongo/util/fail_point_service.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
@@ -102,7 +101,7 @@ void WriteUnitOfWork::commit() {
     invariant(!_released);
     invariant(_opCtx->_ruState == RecoveryUnitState::kActiveUnitOfWork);
     if (_toplevel) {
-        if (MONGO_FAIL_POINT(sleepBeforeCommit)) {
+        if (MONGO_unlikely(sleepBeforeCommit.shouldFail())) {
             sleepFor(Milliseconds(100));
         }
 

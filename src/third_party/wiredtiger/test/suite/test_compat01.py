@@ -53,6 +53,7 @@ class test_compat01(wttest.WiredTigerTestCase, suite_subprocess):
     # and without the patch number.  Test both.
     start_compat = [
         ('def', dict(compat1='none', logv1=3)),
+        ('32', dict(compat1='3.2', logv1=3)),
         ('31', dict(compat1="3.1", logv1=3)),
         ('30', dict(compat1="3.0", logv1=2)),
         ('30_patch', dict(compat1="3.0.0", logv1=2)),
@@ -62,6 +63,7 @@ class test_compat01(wttest.WiredTigerTestCase, suite_subprocess):
     ]
     restart_compat = [
         ('def2', dict(compat2='none', logv2=3)),
+        ('32_2', dict(compat2='3.2', logv2=3)),
         ('31_2', dict(compat2="3.1", logv2=3)),
         ('30_2', dict(compat2="3.0", logv2=2)),
         ('30_patch2', dict(compat2="3.0.0", logv2=2)),
@@ -189,11 +191,19 @@ class test_reconfig_fail(wttest.WiredTigerTestCase):
         ds = SimpleDataSet(self, uri, 100, key_format='S')
         ds.populate()
 
+        # Reconfigure to an older version.
+        compat_str = 'compatibility=(release="2.6")'
+        self.conn.reconfigure(compat_str)
+
         self.session.begin_transaction("isolation=snapshot")
         c = self.session.open_cursor(uri, None)
         c.set_key(ds.key(20))
         c.set_value("abcde")
         self.assertEquals(c.update(), 0)
+
+        # Make sure we can reconfigure unrelated things while downgraded
+        # and we have an active transaction.
+        self.conn.reconfigure("cache_size=100M")
 
         compat_str = 'compatibility=(release="3.0.0")'
         msg = '/system must be quiescent/'

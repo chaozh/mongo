@@ -33,6 +33,7 @@
 
 #include "mongo/db/commands/authentication_commands.h"
 
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -54,7 +55,6 @@
 #include "mongo/platform/random.h"
 #include "mongo/rpc/metadata/client_metadata.h"
 #include "mongo/rpc/metadata/client_metadata_ismaster.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/transport/session.h"
 #include "mongo/util/concurrency/mutex.h"
 #include "mongo/util/log.h"
@@ -66,9 +66,7 @@ namespace mongo {
 namespace {
 
 static bool _isX509AuthDisabled;
-static const char _nonceAuthenticationDisabledMessage[] =
-    "Challenge-response authentication using getnonce and authenticate commands is disabled.";
-static const char _x509AuthenticationDisabledMessage[] = "x.509 authentication is disabled.";
+static constexpr auto kX509AuthenticationDisabledMessage = "x.509 authentication is disabled."_sd;
 
 #ifdef MONGO_CONFIG_SSL
 Status _authenticateX509(OperationContext* opCtx, const UserName& user, const BSONObj& cmdObj) {
@@ -126,7 +124,7 @@ Status _authenticateX509(OperationContext* opCtx, const UserName& user, const BS
         // Handle normal client authentication, only applies to client-server connections
         else {
             if (_isX509AuthDisabled) {
-                return Status(ErrorCodes::BadValue, _x509AuthenticationDisabledMessage);
+                return Status(ErrorCodes::BadValue, kX509AuthenticationDisabledMessage);
             }
             Status status = authorizationSession->addAndAuthorizeUser(opCtx, user);
             if (!status.isOK()) {
@@ -203,7 +201,7 @@ private:
  */
 class CmdGetNonce : public BasicCommand {
 public:
-    CmdGetNonce() : BasicCommand("getnonce"), _random(SecureRandom::create()) {}
+    CmdGetNonce() : BasicCommand("getnonce") {}
 
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kAlways;
@@ -242,11 +240,11 @@ public:
 private:
     int64_t getNextNonce() {
         stdx::lock_guard<SimpleMutex> lk(_randMutex);
-        return _random->nextInt64();
+        return _random.nextInt64();
     }
 
     SimpleMutex _randMutex;  // Synchronizes accesses to _random.
-    std::unique_ptr<SecureRandom> _random;
+    SecureRandom _random;
 } cmdGetNonce;
 
 bool CmdAuthenticate::run(OperationContext* opCtx,
@@ -285,8 +283,7 @@ bool CmdAuthenticate::run(OperationContext* opCtx,
     if (!status.isOK()) {
         if (!serverGlobalParams.quiet.load()) {
             auto const client = opCtx->getClient();
-            log() << "Failed to authenticate " << user
-                  << (client->hasRemote() ? (" from client " + client->getRemote().toString()) : "")
+            log() << "Failed to authenticate " << user << " from client " << client->getRemote()
                   << " with mechanism " << mechanism << ": " << status;
         }
         sleepmillis(saslGlobalParams.authFailedDelay.load());
@@ -299,6 +296,12 @@ bool CmdAuthenticate::run(OperationContext* opCtx,
         }
         return false;
     }
+
+    if (!serverGlobalParams.quiet.load()) {
+        log() << "Successfully authenticated as principal " << user.getUser() << " on "
+              << user.getDB() << " from client " << opCtx->getClient()->session()->remote();
+    }
+
     result.append("dbname", user.getDB());
     result.append("user", user.getUser());
     return true;

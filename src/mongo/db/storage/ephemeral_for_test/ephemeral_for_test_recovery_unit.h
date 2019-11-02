@@ -29,11 +29,11 @@
 
 #pragma once
 
+#include <functional>
 #include <vector>
 
 #include "mongo/db/record_id.h"
 #include "mongo/db/storage/recovery_unit.h"
-#include "mongo/stdx/functional.h"
 
 namespace mongo {
 
@@ -41,31 +41,20 @@ class SortedDataInterface;
 
 class EphemeralForTestRecoveryUnit : public RecoveryUnit {
 public:
-    EphemeralForTestRecoveryUnit(stdx::function<void()> cb = nullptr)
+    EphemeralForTestRecoveryUnit(std::function<void()> cb = nullptr)
         : _waitUntilDurableCallback(cb) {}
 
-    void beginUnitOfWork(OperationContext* opCtx) final{};
-    void commitUnitOfWork() final;
-    void abortUnitOfWork() final;
+    virtual ~EphemeralForTestRecoveryUnit();
 
-    virtual bool waitUntilDurable() {
-        if (_waitUntilDurableCallback) {
-            _waitUntilDurableCallback();
-        }
-        return true;
-    }
+    void beginUnitOfWork(OperationContext* opCtx) final;
 
-    virtual void abandonSnapshot() {}
+    virtual bool waitUntilDurable(OperationContext* opCtx);
+
+    bool inActiveTxn() const;
 
     Status obtainMajorityCommittedSnapshot() final;
 
-    virtual void registerChange(Change* change) {
-        _changes.push_back(ChangePtr(change));
-    }
-
-    virtual SnapshotId getSnapshotId() const {
-        return SnapshotId();
-    }
+    virtual void registerChange(std::unique_ptr<Change> change);
 
     virtual void setOrderedCommit(bool orderedCommit) {}
 
@@ -92,11 +81,15 @@ public:
     }
 
 private:
-    typedef std::shared_ptr<Change> ChangePtr;
-    typedef std::vector<ChangePtr> Changes;
+    void doCommitUnitOfWork() final;
+    void doAbortUnitOfWork() final;
+
+    void doAbandonSnapshot() final;
+
+    typedef std::vector<std::shared_ptr<Change>> Changes;
 
     Changes _changes;
-    stdx::function<void()> _waitUntilDurableCallback;
+    std::function<void()> _waitUntilDurableCallback;
 
     Timestamp _prepareTimestamp = Timestamp::min();
     Timestamp _commitTimestamp = Timestamp::min();

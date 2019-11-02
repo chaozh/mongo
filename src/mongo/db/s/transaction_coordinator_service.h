@@ -29,13 +29,13 @@
 
 #pragma once
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/db/s/transaction_coordinator_catalog.h"
 
 namespace mongo {
 
 class TransactionCoordinatorService {
-    MONGO_DISALLOW_COPYING(TransactionCoordinatorService);
+    TransactionCoordinatorService(const TransactionCoordinatorService&) = delete;
+    TransactionCoordinatorService& operator=(const TransactionCoordinatorService&) = delete;
 
 public:
     TransactionCoordinatorService();
@@ -58,6 +58,12 @@ public:
                            Date_t commitDeadline);
 
     /**
+     * Outputs a vector of BSON documents to the ops out-param containing information about active
+     * and idle coordinators in the system.
+     */
+    void reportCoordinators(OperationContext* opCtx, bool includeIdle, std::vector<BSONObj>* ops);
+
+    /**
      * If a coordinator for the (lsid, txnNumber) exists, delivers the participant list to the
      * coordinator, which will cause the coordinator to start coordinating the commit if the
      * coordinator had not yet received a list, and returns a Future that will contain the decision
@@ -65,7 +71,7 @@ public:
      *
      * If no coordinator for the (lsid, txnNumber) exists, returns boost::none.
      */
-    boost::optional<Future<txn::CommitDecision>> coordinateCommit(
+    boost::optional<SharedSemiFuture<txn::CommitDecision>> coordinateCommit(
         OperationContext* opCtx,
         LogicalSessionId lsid,
         TxnNumber txnNumber,
@@ -77,9 +83,9 @@ public:
      *
      * If no coordinator for the (lsid, txnNumber) exists, returns boost::none.
      */
-    boost::optional<Future<txn::CommitDecision>> recoverCommit(OperationContext* opCtx,
-                                                               LogicalSessionId lsid,
-                                                               TxnNumber txnNumber);
+    boost::optional<SharedSemiFuture<txn::CommitDecision>> recoverCommit(OperationContext* opCtx,
+                                                                         LogicalSessionId lsid,
+                                                                         TxnNumber txnNumber);
 
     /**
      * Marks the coordinator catalog as stepping up, which blocks all incoming requests for
@@ -102,6 +108,19 @@ public:
      */
     void onShardingInitialization(OperationContext* opCtx, bool isPrimary);
 
+    /**
+     * Cancel commit on the coordinator for the given transaction only if it has not started yet.
+     */
+    void cancelIfCommitNotYetStarted(OperationContext* opCtx,
+                                     LogicalSessionId lsid,
+                                     TxnNumber txnNumber);
+
+    /**
+     * Blocking call which waits for the previous stepUp/stepDown round to join and ensures all
+     * tasks scheduled by that round have completed.
+     */
+    void joinPreviousRound();
+
 private:
     struct CatalogAndScheduler {
         CatalogAndScheduler(ServiceContext* service) : scheduler(service) {}
@@ -121,19 +140,13 @@ private:
      */
     std::shared_ptr<CatalogAndScheduler> _getCatalogAndScheduler(OperationContext* opCtx);
 
-    /**
-     * Blocking call which waits for the previous stepUp/stepDown round to join and ensures all
-     * tasks scheduled by that round have completed.
-     */
-    void _joinPreviousRound();
-
     // Contains the catalog + scheduler, which was active at the last step-down attempt (if any).
     // Set at onStepDown and destroyed at onStepUp, which are always invoked sequentially by the
     // replication machinery, so there is no need to explicitly synchronize it
     std::shared_ptr<CatalogAndScheduler> _catalogAndSchedulerToCleanup;
 
     // Protects the state below
-    mutable stdx::mutex _mutex;
+    mutable Mutex _mutex = MONGO_MAKE_LATCH("TransactionCoordinatorService::_mutex");
 
     // The catalog + scheduler instantiated at the last step-up attempt. When nullptr, it means
     // onStepUp has not been called yet after the last stepDown (or construction).

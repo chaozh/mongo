@@ -84,7 +84,7 @@ TEST_F(ResultsMergerTestFixture, ShouldBeAbleToBlockUntilDeadlineExpires) {
 
     getMockClockSource()->advance(Milliseconds{3000});
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 
     // Answer the getMore, so that there are no more outstanding requests.
     onCommand([&](const auto& request) {
@@ -123,7 +123,7 @@ TEST_F(ResultsMergerTestFixture, ShouldBeAbleToBlockUntilNextResultIsReady) {
             .toBSON(CursorResponse::ResponseType::SubsequentResponse);
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(ResultsMergerTestFixture, ShouldBeAbleToBlockUntilNextResultIsReadyWithDeadline) {
@@ -154,22 +154,21 @@ TEST_F(ResultsMergerTestFixture, ShouldBeAbleToBlockUntilNextResultIsReadyWithDe
     sleepsecs(1);
     getMockClockSource()->advance(Milliseconds{3000});
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 
     // Used for synchronizing the background thread with this thread.
-    stdx::mutex mutex;
-    stdx::unique_lock<stdx::mutex> lk(mutex);
+    auto mutex = MONGO_MAKE_LATCH();
+    stdx::unique_lock<Latch> lk(mutex);
 
     // Issue a blocking wait for the next result asynchronously on a different thread.
     future = launchAsync([&]() {
         // Block until the main thread has responded to the getMore.
-        stdx::unique_lock<stdx::mutex> lk(mutex);
+        stdx::unique_lock<Latch> lk(mutex);
 
         auto next = unittest::assertGet(blockingMerger.next(
             operationContext(), RouterExecStage::ExecContext::kGetMoreNoResultsYet));
         ASSERT_FALSE(next.isEOF());
         ASSERT_BSONOBJ_EQ(*next.getResult(), BSON("x" << 1));
-
     });
 
     // Schedule the response to the getMore which will return the next result and mark the cursor as
@@ -183,7 +182,7 @@ TEST_F(ResultsMergerTestFixture, ShouldBeAbleToBlockUntilNextResultIsReadyWithDe
     // Unblock the other thread, allowing it to call next() on the BlockingResultsMerger.
     lk.unlock();
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(ResultsMergerTestFixture, ShouldBeInterruptableDuringBlockingNext) {
@@ -207,7 +206,7 @@ TEST_F(ResultsMergerTestFixture, ShouldBeInterruptableDuringBlockingNext) {
         operationContext()->markKilled(ErrorCodes::Interrupted);
     }
     // Wait for the merger to be interrupted.
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 
     // Now that we've seen it interrupted, kill it. We have to do this in another thread because
     // killing a BlockingResultsMerger involves running a killCursors, and this main thread is in
@@ -222,7 +221,7 @@ TEST_F(ResultsMergerTestFixture, ShouldBeInterruptableDuringBlockingNext) {
     // Run the callback for the killCursors. We don't actually inspect the value so we don't have to
     // schedule a response.
     runReadyCallbacks();
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(ResultsMergerTestFixture, ShouldBeAbleToHandleExceptionWhenYielding) {
@@ -260,7 +259,7 @@ TEST_F(ResultsMergerTestFixture, ShouldBeAbleToHandleExceptionWhenYielding) {
             .toBSON(CursorResponse::ResponseType::SubsequentResponse);
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(ResultsMergerTestFixture, ShouldBeAbleToHandleExceptionWhenUnyielding) {
@@ -298,7 +297,7 @@ TEST_F(ResultsMergerTestFixture, ShouldBeAbleToHandleExceptionWhenUnyielding) {
             .toBSON(CursorResponse::ResponseType::SubsequentResponse);
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 }  // namespace

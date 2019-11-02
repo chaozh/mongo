@@ -31,6 +31,7 @@
 
 #include <tuple>
 
+#include "mongo/bson/bsonobj.h"
 #include "mongo/bson/timestamp.h"
 
 namespace mongo {
@@ -158,6 +159,30 @@ private:
     long long _term = kInitialTerm;
 };
 
+class OpTimeAndWallTime {
+public:
+    OpTime opTime = OpTime();
+    Date_t wallTime = Date_t();
+
+    static StatusWith<OpTimeAndWallTime> parseOpTimeAndWallTimeFromOplogEntry(
+        const BSONObj& bsonObject);
+
+    OpTimeAndWallTime() {}
+
+    OpTimeAndWallTime(OpTime optime, Date_t wall) : opTime(optime), wallTime(wall) {}
+
+    inline bool operator==(const OpTimeAndWallTime& rhs) const {
+        return opTime == rhs.opTime && wallTime == rhs.wallTime;
+    }
+    inline bool operator<(const OpTimeAndWallTime& rhs) const {
+        // Wall clock time ordering should not matter for calculations of the commit point.
+        return opTime < rhs.opTime;
+    }
+    std::string toString() const {
+        return opTime.toString() + ", " + wallTime.toString();
+    }
+};
+std::ostream& operator<<(std::ostream& out, const OpTimeAndWallTime& opTime);
 }  // namespace repl
 
 /**

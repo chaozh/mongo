@@ -31,7 +31,12 @@
 
 #include "mongo/db/matcher/expression_expr.h"
 
+#include "mongo/util/fail_point.h"
+
 namespace mongo {
+
+MONGO_FAIL_POINT_DEFINE(ExprMatchExpressionMatchesReturnsFalseOnException);
+
 ExprMatchExpression::ExprMatchExpression(boost::intrusive_ptr<Expression> expr,
                                          const boost::intrusive_ptr<ExpressionContext>& expCtx)
     : MatchExpression(MatchType::EXPRESSION), _expCtx(expCtx), _expression(expr) {}
@@ -48,8 +53,21 @@ bool ExprMatchExpression::matches(const MatchableDocument* doc, MatchDetails* de
     }
 
     Document document(doc->toBSON());
-    auto value = _expression->evaluate(document);
-    return value.coerceToBool();
+
+    // 'Variables' is not thread safe, and ExprMatchExpression may be used in a validator which
+    // processes documents from multiple threads simultaneously. Hence we make a copy of the
+    // 'Variables' object per-caller.
+    Variables variables = _expCtx->variables;
+    try {
+        auto value = _expression->evaluate(document, &variables);
+        return value.coerceToBool();
+    } catch (const DBException&) {
+        if (MONGO_unlikely(ExprMatchExpressionMatchesReturnsFalseOnException.shouldFail())) {
+            return false;
+        }
+
+        throw;
+    }
 }
 
 void ExprMatchExpression::serialize(BSONObjBuilder* out) const {
@@ -89,7 +107,7 @@ std::unique_ptr<MatchExpression> ExprMatchExpression::shallowClone() const {
     boost::intrusive_ptr<Expression> clonedExpr =
         Expression::parseOperand(_expCtx, bob.obj().firstElement(), _expCtx->variablesParseState);
 
-    auto clone = stdx::make_unique<ExprMatchExpression>(std::move(clonedExpr), _expCtx);
+    auto clone = std::make_unique<ExprMatchExpression>(std::move(clonedExpr), _expCtx);
     if (_rewriteResult) {
         clone->_rewriteResult = _rewriteResult->clone();
     }
@@ -113,7 +131,7 @@ MatchExpression::ExpressionOptimizerFunc ExprMatchExpression::getOptimizer() con
             RewriteExpr::rewrite(exprMatchExpr._expression, exprMatchExpr._expCtx->getCollator());
 
         if (exprMatchExpr._rewriteResult->matchExpression()) {
-            auto andMatch = stdx::make_unique<AndMatchExpression>();
+            auto andMatch = std::make_unique<AndMatchExpression>();
             andMatch->add(exprMatchExpr._rewriteResult->releaseMatchExpression().release());
             andMatch->add(expression.release());
             // Re-optimize the new AND in order to make sure that any AND children are absorbed.

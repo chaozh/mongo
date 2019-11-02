@@ -1,3 +1,5 @@
+// @tags: [requires_fast_memory]
+
 var col = db.memoryTest;
 
 var buildInfo = assert.commandWorked(db.adminCommand("buildInfo"));
@@ -32,12 +34,24 @@ function doWhereTest(count) {
     coll.findOne({$where: "var arr = []; for (var i = 0; i < " + count + "; ++i) {arr.push(0);}"});
 }
 
+function assertMemoryError(func) {
+    try {
+        func();
+    } catch (e) {
+        if (e.message.includes('"errmsg" : "Out of memory"')) {
+            return;
+        }
+        throw e;
+    }
+    throw new Error("did not throw exception");
+}
+
 doWhereTest(10);
-assert.throws(function() {
+assertMemoryError(function() {
     doWhereTest(1000000000);
 });
 doWhereTest(10);
-assert.throws(function() {
+assertMemoryError(function() {
     doWhereTest(1000000000);
 });
 
@@ -45,7 +59,7 @@ loopNum = reduceNumLoops ? 10000 : 1000000;
 doWhereTest(loopNum);
 doWhereTest(loopNum);
 doWhereTest(loopNum);
-assert.throws(function() {
+assertMemoryError(function() {
     doWhereTest(1000000000);
 });
 

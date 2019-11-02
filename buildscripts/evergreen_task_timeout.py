@@ -1,7 +1,5 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 """Determine the timeout value a task should use in evergreen."""
-
-from __future__ import absolute_import
 
 import argparse
 import sys

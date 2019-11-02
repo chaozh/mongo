@@ -32,6 +32,7 @@
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/commands.h"
+#include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/s/cluster_commands_helpers.h"
 #include "mongo/util/log.h"
 
@@ -70,14 +71,11 @@ public:
         const NamespaceString nss(CommandHelpers::parseNsCollectionRequired(dbName, cmdObj));
         LOG(1) << "createIndexes: " << nss << " cmd:" << redact(cmdObj);
 
-        uassertStatusOK(createShardDatabase(opCtx, dbName));
+        createShardDatabase(opCtx, dbName);
 
-        auto shardResponses = scatterGatherOnlyVersionIfUnsharded(
-            opCtx,
-            nss,
-            CommandHelpers::filterCommandRequestForPassthrough(cmdObj),
-            ReadPreferenceSetting::get(opCtx),
-            Shard::RetryPolicy::kNoRetry);
+        auto shardResponses =
+            dispatchCommandAssertCollectionExistsOnAtLeastOneShard(opCtx, nss, cmdObj);
+
         return appendRawResponses(opCtx,
                                   &errmsg,
                                   &output,

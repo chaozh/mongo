@@ -31,16 +31,17 @@
 
 #include "mongo/db/pipeline/document_source_lookup.h"
 
+#include <memory>
+
 #include "mongo/base/init.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/matcher/expression_algo.h"
-#include "mongo/db/pipeline/document.h"
 #include "mongo/db/pipeline/document_path_support.h"
 #include "mongo/db/pipeline/expression.h"
 #include "mongo/db/pipeline/expression_context.h"
-#include "mongo/db/pipeline/value.h"
 #include "mongo/db/query/query_knobs_gen.h"
-#include "mongo/stdx/memory.h"
 
 namespace mongo {
 
@@ -52,7 +53,7 @@ constexpr size_t DocumentSourceLookUp::kMaxSubPipelineDepth;
 DocumentSourceLookUp::DocumentSourceLookUp(NamespaceString fromNs,
                                            std::string as,
                                            const boost::intrusive_ptr<ExpressionContext>& expCtx)
-    : DocumentSource(expCtx),
+    : DocumentSource(kStageName, expCtx),
       _fromNs(std::move(fromNs)),
       _as(std::move(as)),
       _variables(expCtx->variables),
@@ -151,7 +152,7 @@ std::unique_ptr<DocumentSourceLookUp::LiteParsed> DocumentSourceLookUp::LitePars
 
     foreignNssSet.insert(fromNss);
 
-    return stdx::make_unique<DocumentSourceLookUp::LiteParsed>(
+    return std::make_unique<DocumentSourceLookUp::LiteParsed>(
         std::move(fromNss), std::move(foreignNssSet), std::move(liteParsedPipeline));
 }
 
@@ -160,7 +161,7 @@ REGISTER_DOCUMENT_SOURCE(lookup,
                          DocumentSourceLookUp::createFromBson);
 
 const char* DocumentSourceLookUp::getSourceName() const {
-    return "$lookup";
+    return kStageName.rawData();
 }
 
 StageConstraints DocumentSourceLookUp::constraints(Pipeline::SplitState) const {
@@ -196,7 +197,8 @@ StageConstraints DocumentSourceLookUp::constraints(Pipeline::SplitState) const {
                                  hostRequirement,
                                  diskRequirement,
                                  FacetRequirement::kAllowed,
-                                 txnRequirement);
+                                 txnRequirement,
+                                 LookupRequirement::kAllowed);
 
     constraints.canSwapWithMatch = true;
     return constraints;
@@ -225,9 +227,7 @@ BSONObj buildEqualityOrQuery(const std::string& fieldName, const BSONArray& valu
 
 }  // namespace
 
-DocumentSource::GetNextResult DocumentSourceLookUp::getNext() {
-    pExpCtx->checkForInterrupt();
-
+DocumentSource::GetNextResult DocumentSourceLookUp::doGetNext() {
     if (_unwindSrc) {
         return unwindResult();
     }
@@ -259,17 +259,13 @@ DocumentSource::GetNextResult DocumentSourceLookUp::getNext() {
         objsize += result->getApproximateSize();
         uassert(4568,
                 str::stream() << "Total size of documents in " << _fromNs.coll()
-                              << " matching pipeline's $lookup stage exceeds "
-                              << maxBytes
+                              << " matching pipeline's $lookup stage exceeds " << maxBytes
                               << " bytes",
 
                 objsize <= maxBytes);
         results.emplace_back(std::move(*result));
     }
-    for (auto&& source : pipeline->getSources()) {
-        if (source->usedDisk())
-            _usedDisk = true;
-    }
+    _usedDisk = _usedDisk || pipeline->usedDisk();
 
     MutableDocument output(std::move(inputDoc));
     output.setNestedField(_as, Value(std::move(results)));
@@ -336,6 +332,10 @@ DocumentSource::GetModPathsReturn DocumentSourceLookUp::getModifiedPaths() const
 Pipeline::SourceContainer::iterator DocumentSourceLookUp::doOptimizeAt(
     Pipeline::SourceContainer::iterator itr, Pipeline::SourceContainer* container) {
     invariant(*itr == this);
+
+    if (std::next(itr) == container->end()) {
+        return container->end();
+    }
 
     auto nextUnwind = dynamic_cast<DocumentSourceUnwind*>((*std::next(itr)).get());
 
@@ -623,7 +623,7 @@ void DocumentSourceLookUp::resolveLetVariables(const Document& localDoc, Variabl
     invariant(variables);
 
     for (auto& letVar : _letVariables) {
-        auto value = letVar.expression->evaluate(localDoc);
+        auto value = letVar.expression->evaluate(localDoc, &pExpCtx->variables);
         variables->setConstantValue(letVar.id, value);
     }
 }
@@ -635,17 +635,16 @@ void DocumentSourceLookUp::initializeResolvedIntrospectionPipeline() {
 
     auto& sources = _resolvedIntrospectionPipeline->getSources();
 
-    // Ensure that the pipeline does not contain a $changeStream stage. This check will be
-    // performed recursively on all sub-pipelines.
-    uassert(ErrorCodes::IllegalOperation,
-            "$changeStream is not allowed within a $lookup's pipeline",
-            sources.empty() || !sources.front()->constraints().isChangeStreamStage());
+    auto it = std::find_if(
+        sources.begin(), sources.end(), [](const boost::intrusive_ptr<DocumentSource>& src) {
+            return !src->constraints().isAllowedInLookupPipeline();
+        });
 
-    // Ensure that the pipeline does not contain a $out stage. Since $out must be the last stage
-    // of a pipeline, we only need to check the last DocumentSource.
+    // For other stages, use a generic error.
     uassert(51047,
-            "$out is not allowed within a $lookup's pipeline",
-            sources.empty() || !sources.back()->constraints().writesPersistentData());
+            str::stream() << (*it)->getSourceName()
+                          << " is not allowed within a $lookup's sub-pipeline",
+            it == sources.end());
 }
 
 void DocumentSourceLookUp::serializeToArray(
@@ -682,8 +681,7 @@ void DocumentSourceLookUp::serializeToArray(
             const boost::optional<FieldPath> indexPath = _unwindSrc->indexPath();
             output[getSourceName()]["unwinding"] =
                 Value(DOC("preserveNullAndEmptyArrays"
-                          << _unwindSrc->preserveNullAndEmptyArrays()
-                          << "includeArrayIndex"
+                          << _unwindSrc->preserveNullAndEmptyArrays() << "includeArrayIndex"
                           << (indexPath ? Value(indexPath->fullPath()) : Value())));
         }
 
@@ -723,7 +721,7 @@ DepsTracker::State DocumentSourceLookUp::getDependencies(DepsTracker* deps) cons
         // subpipeline for the top-level pipeline. So without knowledge of what metadata is in fact
         // available, we "lie" and say that all metadata is available to avoid tripping any
         // assertions.
-        DepsTracker subDeps(DepsTracker::kAllMetadataAvailable);
+        DepsTracker subDeps(DepsTracker::kAllMetadata);
 
         // Get the subpipeline dependencies. Subpipeline stages may reference both 'let' variables
         // declared by this $lookup and variables declared externally.
@@ -805,8 +803,7 @@ intrusive_ptr<DocumentSource> DocumentSourceLookUp::createFromBson(
         if (argName == "let") {
             uassert(ErrorCodes::FailedToParse,
                     str::stream() << "$lookup argument '" << argument
-                                  << "' must be an object, is type "
-                                  << argument.type(),
+                                  << "' must be an object, is type " << argument.type(),
                     argument.type() == BSONType::Object);
             letVariables = argument.Obj();
             hasLet = true;
@@ -815,9 +812,7 @@ intrusive_ptr<DocumentSource> DocumentSourceLookUp::createFromBson(
 
         uassert(ErrorCodes::FailedToParse,
                 str::stream() << "$lookup argument '" << argName << "' must be a string, found "
-                              << argument
-                              << ": "
-                              << argument.type(),
+                              << argument << ": " << argument.type(),
                 argument.type() == BSONType::String);
 
         if (argName == "from") {

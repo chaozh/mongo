@@ -36,15 +36,17 @@
 #include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/stdx/condition_variable.h"
-#include "mongo/stdx/mutex.h"
+#include "mongo/util/string_map.h"
 
 namespace mongo {
 
 class OperationContext;
 
 class NamespaceSerializer {
-    MONGO_DISALLOW_COPYING(NamespaceSerializer);
+    NamespaceSerializer(const NamespaceSerializer&) = delete;
+    NamespaceSerializer& operator=(const NamespaceSerializer&) = delete;
 
 public:
     class ScopedLock {
@@ -70,7 +72,7 @@ private:
         bool isInProgress = true;
     };
 
-    stdx::mutex _mutex;
+    Mutex _mutex = MONGO_MAKE_LATCH("NamespaceSerializer::_mutex");
     StringMap<std::shared_ptr<NSLock>> _inProgressMap;
 };
 

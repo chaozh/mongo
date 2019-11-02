@@ -78,9 +78,12 @@ public:
     }
 
     DataBuilder& operator=(DataBuilder&& other) {
+        size_t size = other.size();
         _buf = std::move(other._buf);
         _capacity = other._capacity;
-        _unwrittenSpaceCursor = {_buf.get(), _buf.get() + other.size()};
+        char* start = _buf.get() + size;
+        char* end = _buf.get() + _capacity;
+        _unwrittenSpaceCursor = {start, end};
 
         other._capacity = 0;
         other._unwrittenSpaceCursor = {nullptr, nullptr};
@@ -95,11 +98,11 @@ public:
     Status write(const T& value, std::size_t offset = 0) {
         _ensureStorage();
 
-        auto status = _unwrittenSpaceCursor.write(value, offset);
+        auto status = _unwrittenSpaceCursor.writeNoThrow(value, offset);
 
         if (!status.isOK()) {
             reserve(_getSerializedSize(value));
-            status = _unwrittenSpaceCursor.write(value, offset);
+            status = _unwrittenSpaceCursor.writeNoThrow(value, offset);
         }
 
         return status;
@@ -117,11 +120,11 @@ public:
         // 1. A way to check if the type has a constant size
         // 2. A way to perform a runtime write which can fail with "too little
         //    size" without status generation
-        auto status = _unwrittenSpaceCursor.writeAndAdvance(value);
+        auto status = _unwrittenSpaceCursor.writeAndAdvanceNoThrow(value);
 
         if (!status.isOK()) {
             reserve(_getSerializedSize(value));
-            status = _unwrittenSpaceCursor.writeAndAdvance(value);
+            status = _unwrittenSpaceCursor.writeAndAdvanceNoThrow(value);
         }
 
         return status;

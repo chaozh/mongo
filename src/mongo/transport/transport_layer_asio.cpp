@@ -183,11 +183,11 @@ public:
     }
 
     void schedule(Task task) override {
-        asio::post(_ioContext, std::move(task));
+        asio::post(_ioContext, [task = std::move(task)] { task(Status::OK()); });
     }
 
     void dispatch(Task task) override {
-        asio::dispatch(_ioContext, std::move(task));
+        asio::dispatch(_ioContext, [task = std::move(task)] { task(Status::OK()); });
     }
 
     bool onReactorThread() const override {
@@ -343,7 +343,7 @@ public:
 private:
     boost::optional<EndpointVector> _checkForUnixSocket(const HostAndPort& peer) {
 #ifndef _WIN32
-        if (mongoutils::str::contains(peer.host(), '/')) {
+        if (str::contains(peer.host(), '/')) {
             asio::local::stream_protocol::endpoint ep(peer.host());
             return EndpointVector{WrappedEndpoint(ep)};
         }
@@ -457,8 +457,9 @@ StatusWith<SessionHandle> TransportLayerASIO::connect(HostAndPort peer,
 #else
     auto globalSSLMode = _sslMode();
     if (sslMode == kEnableSSL ||
-        (sslMode == kGlobalSSLMode && ((globalSSLMode == SSLParams::SSLMode_preferSSL) ||
-                                       (globalSSLMode == SSLParams::SSLMode_requireSSL)))) {
+        (sslMode == kGlobalSSLMode &&
+         ((globalSSLMode == SSLParams::SSLMode_preferSSL) ||
+          (globalSSLMode == SSLParams::SSLMode_requireSSL)))) {
         auto sslStatus = session->handshakeSSLForEgress(peer).getNoThrow();
         if (!sslStatus.isOK()) {
             return sslStatus;
@@ -529,7 +530,7 @@ Future<SessionHandle> TransportLayerASIO::asyncConnect(HostAndPort peer,
         AtomicWord<bool> done{false};
         Promise<SessionHandle> promise;
 
-        stdx::mutex mutex;
+        Mutex mutex = MONGO_MAKE_LATCH("AsyncConnectState::mutex");
         GenericSocket socket;
         ASIOReactorTimer timeoutTimer;
         WrappedResolver resolver;
@@ -561,7 +562,7 @@ Future<SessionHandle> TransportLayerASIO::asyncConnect(HostAndPort peer,
                                      connector->resolvedEndpoint));
 
                 std::error_code ec;
-                stdx::lock_guard<stdx::mutex> lk(connector->mutex);
+                stdx::lock_guard<Latch> lk(connector->mutex);
                 connector->resolver.cancel();
                 if (connector->session) {
                     connector->session->end();
@@ -571,10 +572,18 @@ Future<SessionHandle> TransportLayerASIO::asyncConnect(HostAndPort peer,
             });
     }
 
+    Date_t timeBefore = Date_t::now();
+
     connector->resolver.asyncResolve(connector->peer, _listenerOptions.enableIPv6)
-        .then([connector](WrappedResolver::EndpointVector results) {
+        .then([connector, timeBefore](WrappedResolver::EndpointVector results) {
             try {
-                stdx::lock_guard<stdx::mutex> lk(connector->mutex);
+                Date_t timeAfter = Date_t::now();
+                if (timeAfter - timeBefore > Seconds(1)) {
+                    warning() << "DNS resolution while connecting to " << connector->peer
+                              << " took " << timeAfter - timeBefore;
+                }
+
+                stdx::lock_guard<Latch> lk(connector->mutex);
 
                 connector->resolvedEndpoint = results.front();
                 connector->socket.open(connector->resolvedEndpoint->protocol());
@@ -586,7 +595,7 @@ Future<SessionHandle> TransportLayerASIO::asyncConnect(HostAndPort peer,
             return connector->socket.async_connect(*connector->resolvedEndpoint, UseFuture{});
         })
         .then([this, connector, sslMode]() -> Future<void> {
-            stdx::unique_lock<stdx::mutex> lk(connector->mutex);
+            stdx::unique_lock<Latch> lk(connector->mutex);
             connector->session =
                 std::make_shared<ASIOSession>(this, std::move(connector->socket), false);
             connector->session->ensureAsync();
@@ -598,8 +607,9 @@ Future<SessionHandle> TransportLayerASIO::asyncConnect(HostAndPort peer,
 #else
             auto globalSSLMode = _sslMode();
             if (sslMode == kEnableSSL ||
-                (sslMode == kGlobalSSLMode && ((globalSSLMode == SSLParams::SSLMode_preferSSL) ||
-                                               (globalSSLMode == SSLParams::SSLMode_requireSSL)))) {
+                (sslMode == kGlobalSSLMode &&
+                 ((globalSSLMode == SSLParams::SSLMode_preferSSL) ||
+                  (globalSSLMode == SSLParams::SSLMode_requireSSL)))) {
                 return connector->session
                     ->handshakeSSLForEgressWithLock(std::move(lk), connector->peer)
                     .then([connector] { return Status::OK(); });
@@ -611,7 +621,7 @@ Future<SessionHandle> TransportLayerASIO::asyncConnect(HostAndPort peer,
             return makeConnectError(status, connector->peer, connector->resolvedEndpoint);
         })
         .getAsync([connector](Status connectResult) {
-            if (MONGO_FAIL_POINT(transportLayerASIOasyncConnectTimesOut)) {
+            if (MONGO_unlikely(transportLayerASIOasyncConnectTimesOut.shouldFail())) {
                 log() << "asyncConnectTimesOut fail point is active. simulating timeout.";
                 return;
             }
@@ -743,7 +753,7 @@ Status TransportLayerASIO::setup() {
     const auto& sslParams = getSSLGlobalParams();
 
     if (_sslMode() != SSLParams::SSLMode_disabled && _listenerOptions.isIngress()) {
-        _ingressSSLContext = stdx::make_unique<asio::ssl::context>(asio::ssl::context::sslv23);
+        _ingressSSLContext = std::make_unique<asio::ssl::context>(asio::ssl::context::sslv23);
 
         Status status =
             getSSLManager()->initSSLContext(_ingressSSLContext->native_handle(),
@@ -755,7 +765,7 @@ Status TransportLayerASIO::setup() {
     }
 
     if (_listenerOptions.isEgress() && getSSLManager()) {
-        _egressSSLContext = stdx::make_unique<asio::ssl::context>(asio::ssl::context::sslv23);
+        _egressSSLContext = std::make_unique<asio::ssl::context>(asio::ssl::context::sslv23);
         Status status =
             getSSLManager()->initSSLContext(_egressSSLContext->native_handle(),
                                             sslParams,
@@ -770,12 +780,19 @@ Status TransportLayerASIO::setup() {
 }
 
 Status TransportLayerASIO::start() {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     _running.store(true);
 
     if (_listenerOptions.isIngress()) {
         for (auto& acceptor : _acceptors) {
-            acceptor.second.listen(serverGlobalParams.listenBacklog);
+            asio::error_code ec;
+            acceptor.second.listen(serverGlobalParams.listenBacklog, ec);
+            if (ec) {
+                severe() << "Error listening for new connections on " << acceptor.first << ": "
+                         << ec.message();
+                fassertFailed(31339);
+            }
+
             _acceptConnection(acceptor.second);
             log() << "Listening on " << acceptor.first.getAddr();
         }
@@ -802,7 +819,7 @@ Status TransportLayerASIO::start() {
 }
 
 void TransportLayerASIO::shutdown() {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     _running.store(false);
 
     // Loop through the acceptors and cancel their calls to async_accept. This will prevent new
@@ -879,13 +896,10 @@ SSLParams::SSLModes TransportLayerASIO::_sslMode() const {
 
 #ifdef __linux__
 BatonHandle TransportLayerASIO::makeBaton(OperationContext* opCtx) const {
-    auto baton = std::make_shared<BatonASIO>(opCtx);
+    invariant(!opCtx->getBaton());
 
-    {
-        stdx::lock_guard<Client> lk(*opCtx->getClient());
-        invariant(!opCtx->getBaton());
-        opCtx->setBaton(baton);
-    }
+    auto baton = std::make_shared<BatonASIO>(opCtx);
+    opCtx->setBaton(baton);
 
     return baton;
 }

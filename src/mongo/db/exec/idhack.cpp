@@ -31,21 +31,20 @@
 
 #include "mongo/db/exec/idhack.h"
 
+#include <memory>
+
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/exec/index_scan.h"
 #include "mongo/db/exec/projection.h"
 #include "mongo/db/exec/scoped_timer.h"
 #include "mongo/db/exec/working_set_common.h"
-#include "mongo/db/exec/working_set_computed_data.h"
 #include "mongo/db/index/btree_access_method.h"
-#include "mongo/stdx/memory.h"
 
 namespace mongo {
 
 using std::unique_ptr;
 using std::vector;
-using stdx::make_unique;
 
 // static
 const char* IDHackStage::kStageType = "IDHACK";
@@ -54,20 +53,18 @@ IDHackStage::IDHackStage(OperationContext* opCtx,
                          CanonicalQuery* query,
                          WorkingSet* ws,
                          const IndexDescriptor* descriptor)
-    : RequiresIndexStage(kStageType, opCtx, descriptor),
+    : RequiresIndexStage(kStageType, opCtx, descriptor, ws),
       _workingSet(ws),
       _key(query->getQueryObj()["_id"].wrap()) {
     _specificStats.indexName = descriptor->indexName();
-    if (NULL != query->getProj()) {
-        _addKeyMetadata = query->getProj()->wantIndexKey();
-    }
+    _addKeyMetadata = query->getQueryRequest().returnKey();
 }
 
 IDHackStage::IDHackStage(OperationContext* opCtx,
                          const BSONObj& key,
                          WorkingSet* ws,
                          const IndexDescriptor* descriptor)
-    : RequiresIndexStage(kStageType, opCtx, descriptor), _workingSet(ws), _key(key) {
+    : RequiresIndexStage(kStageType, opCtx, descriptor, ws), _workingSet(ws), _key(key) {
     _specificStats.indexName = descriptor->indexName();
 }
 
@@ -132,9 +129,8 @@ PlanStage::StageState IDHackStage::advance(WorkingSetID id,
     invariant(member->hasObj());
 
     if (_addKeyMetadata) {
-        BSONObj ownedKeyObj = member->obj.value()["_id"].wrap().getOwned();
-        member->addComputed(
-            new IndexKeyComputedData(IndexKeyComputedData::rehydrateKey(_key, ownedKeyObj)));
+        BSONObj ownedKeyObj = member->doc.value().toBson()["_id"].wrap().getOwned();
+        member->metadata().setIndexKey(IndexKeyEntry::rehydrateKey(_key, ownedKeyObj));
     }
 
     _done = true;
@@ -165,6 +161,7 @@ void IDHackStage::doReattachToOperationContext() {
 // static
 bool IDHackStage::supportsQuery(Collection* collection, const CanonicalQuery& query) {
     return !query.getQueryRequest().showRecordId() && query.getQueryRequest().getHint().isEmpty() &&
+        query.getQueryRequest().getMin().isEmpty() && query.getQueryRequest().getMax().isEmpty() &&
         !query.getQueryRequest().getSkip() &&
         CanonicalQuery::isSimpleIdQuery(query.getQueryRequest().getFilter()) &&
         !query.getQueryRequest().isTailable() &&
@@ -173,8 +170,8 @@ bool IDHackStage::supportsQuery(Collection* collection, const CanonicalQuery& qu
 
 unique_ptr<PlanStageStats> IDHackStage::getStats() {
     _commonStats.isEOF = isEOF();
-    unique_ptr<PlanStageStats> ret = make_unique<PlanStageStats>(_commonStats, STAGE_IDHACK);
-    ret->specific = make_unique<IDHackStats>(_specificStats);
+    unique_ptr<PlanStageStats> ret = std::make_unique<PlanStageStats>(_commonStats, STAGE_IDHACK);
+    ret->specific = std::make_unique<IDHackStats>(_specificStats);
     return ret;
 }
 

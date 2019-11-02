@@ -48,7 +48,6 @@
 #include "mongo/db/session_catalog_mongod.h"
 #include "mongo/db/storage/ephemeral_for_test/ephemeral_for_test_recovery_unit.h"
 #include "mongo/db/transaction_participant.h"
-#include "mongo/s/config_server_test_fixture.h"
 #include "mongo/unittest/death_test.h"
 #include "mongo/util/clock_source_mock.h"
 
@@ -66,12 +65,12 @@ public:
 
         auto service = getServiceContext();
         auto opCtx = cc().makeOperationContext();
-        repl::StorageInterface::set(service, stdx::make_unique<repl::StorageInterfaceMock>());
+        repl::StorageInterface::set(service, std::make_unique<repl::StorageInterfaceMock>());
 
         // Set up ReplicationCoordinator and create oplog.
         repl::ReplicationCoordinator::set(
             service,
-            stdx::make_unique<repl::ReplicationCoordinatorMock>(service, createReplSettings()));
+            std::make_unique<repl::ReplicationCoordinatorMock>(service, createReplSettings()));
         repl::setOplogCollectionName(service);
         repl::createOplog(opCtx.get());
 
@@ -146,7 +145,7 @@ TEST_F(AuthOpObserverTest, MultipleAboutToDeleteAndOnDelete) {
 DEATH_TEST_F(AuthOpObserverTest, AboutToDeleteMustPreceedOnDelete, "invariant") {
     AuthOpObserver opObserver;
     auto opCtx = cc().makeOperationContext();
-    opCtx->swapLockState(stdx::make_unique<LockerNoop>());
+    opCtx->swapLockState(std::make_unique<LockerNoop>());
     NamespaceString nss = {"test", "coll"};
     opObserver.onDelete(opCtx.get(), nss, {}, {}, false, {});
 }
@@ -154,7 +153,7 @@ DEATH_TEST_F(AuthOpObserverTest, AboutToDeleteMustPreceedOnDelete, "invariant") 
 DEATH_TEST_F(AuthOpObserverTest, EachOnDeleteRequiresAboutToDelete, "invariant") {
     AuthOpObserver opObserver;
     auto opCtx = cc().makeOperationContext();
-    opCtx->swapLockState(stdx::make_unique<LockerNoop>());
+    opCtx->swapLockState(std::make_unique<LockerNoop>());
     NamespaceString nss = {"test", "coll"};
     opObserver.aboutToDelete(opCtx.get(), nss, {});
     opObserver.onDelete(opCtx.get(), nss, {}, {}, false, {});

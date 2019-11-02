@@ -1,7 +1,5 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 """Unit tests for the resmokelib.testing.hooks.combine_benchrun_embedded_results module."""
-
-from __future__ import absolute_import
 
 import datetime
 import os
@@ -25,46 +23,43 @@ _BM_REPORT_INSERT_1 = {
 }
 
 _BM_REPORT_INSERT_2 = {
-    "note": "values per second", "errCount": {"$numberLong": "0"},
-    "trapped": "error: not implemented", "insertLatencyAverageMicros": 2563.095938304905,
-    "totalOps": {"$numberLong": "7404"}, "totalOps/s": 2409.05, "findOne": 0, "insert": 2409.05,
-    "delete": 0, "update": 0, "query": 0, "command": 0, "findOnes": {"$numberLong": "0"},
-    "inserts": {"$numberLong": "7404"}, "deletes": {"$numberLong": "0"}, "updates": {
-        "$numberLong": "0"
-    }, "queries": {"$numberLong": "0"}, "commands": {"$numberLong": "0"}
+    "note": "values per second", "errCount": {"$numberLong": "0"}, "trapped":
+        "error: not implemented", "insertLatencyAverageMicros": 2563.095938304905, "totalOps": {
+            "$numberLong": "7404"
+        }, "totalOps/s": 2409.05, "findOne": 0, "insert": 2409.05, "delete": 0, "update": 0,
+    "query": 0, "command": 0, "findOnes": {"$numberLong": "0"}, "inserts": {"$numberLong": "7404"},
+    "deletes": {"$numberLong": "0"}, "updates": {"$numberLong": "0"},
+    "queries": {"$numberLong": "0"}, "commands": {"$numberLong": "0"}
 }
 
 _BM_REPORT_DELETE = {
     "note": "values per second", "errCount": {"$numberLong": "0"},
     "trapped": "error: not implemented", "insertLatencyAverageMicros": "1234.56", "totalOps": {
         "$numberLong": "2345"
-    }, "totalOps/s": 1234.56, "findOne": 0, "insert": 0, "delete": 1234.56, "update": 0, "query": 0,
-    "command": 0, "findOnes": {"$numberLong": "0"}, "inserts": {"$numberLong": "0"}, "deletes": {
-        "$numberLong": "2345"
-    }, "updates": {"$numberLong": "0"}, "queries": {"$numberLong": "0"},
-    "commands": {"$numberLong": "0"}
+    }, "totalOps/s": 1234.56, "findOne": 0, "insert": 0, "delete": 1234.56, "update": 0, "query":
+        0, "command": 0, "findOnes": {"$numberLong": "0"}, "inserts": {"$numberLong": "0"},
+    "deletes": {"$numberLong": "2345"}, "updates": {"$numberLong": "0"},
+    "queries": {"$numberLong": "0"}, "commands": {"$numberLong": "0"}
 }
 
 _BM_REPORT_UPDATE = {
     "note": "values per second", "errCount": {"$numberLong": "0"},
     "trapped": "error: not implemented", "insertLatencyAverageMicros": 654.321, "totalOps": {
         "$numberLong": "4521"
-    }, "totalOps/s": 4521.00, "findOne": 0, "insert": 0, "delete": 0, "update": 4521.00, "query": 0,
-    "command": 0, "findOnes": {"$numberLong": "0"}, "inserts": {"$numberLong": "0"}, "deletes": {
-        "$numberLong": "0"
-    }, "updates": {"$numberLong": "4521"}, "queries": {"$numberLong": "0"},
-    "commands": {"$numberLong": "0"}
+    }, "totalOps/s": 4521.00, "findOne": 0, "insert": 0, "delete": 0, "update": 4521.00, "query":
+        0, "command": 0, "findOnes": {"$numberLong": "0"}, "inserts": {"$numberLong": "0"},
+    "deletes": {"$numberLong": "0"}, "updates": {"$numberLong": "4521"},
+    "queries": {"$numberLong": "0"}, "commands": {"$numberLong": "0"}
 }
 
 _BM_REPORT_MULTI = {
-    "note": "values per second", "errCount": {"$numberLong": "0"},
-    "trapped": "error: not implemented", "insertLatencyAverageMicros": 111.111, "totalOps": {
-        "$numberLong": "11532"
-    }, "totalOps/s": 5766.00, "findOne": 0, "insert": 2490.00, "delete": 0, "update": 9042.00,
-    "query": 0, "command": 0, "findOnes": {"$numberLong": "0"}, "inserts": {
-        "$numberLong": "2490.00"
-    }, "deletes": {"$numberLong": "0"}, "updates": {"$numberLong": "9042"},
-    "queries": {"$numberLong": "0"}, "commands": {"$numberLong": "0"}
+    "note": "values per second", "errCount": {"$numberLong": "0"}, "trapped":
+        "error: not implemented", "insertLatencyAverageMicros": 111.111,
+    "totalOps": {"$numberLong": "11532"}, "totalOps/s": 5766.00, "findOne": 0, "insert": 2490.00,
+    "delete": 0, "update": 9042.00, "query": 0, "command": 0, "findOnes": {"$numberLong": "0"},
+    "inserts": {"$numberLong": "2490.00"}, "deletes": {"$numberLong": "0"}, "updates": {
+        "$numberLong": "9042"
+    }, "queries": {"$numberLong": "0"}, "commands": {"$numberLong": "0"}
 }
 
 _BM_ALL_REPORTS = [
@@ -112,7 +107,7 @@ class TestCombineBenchmarkResults(CombineBenchrunEmbeddedResultsFixture):
         test_name = "test_cber2"
         thread_num = "1"
         self._setup_reports(_BM_ALL_REPORTS, test_name, thread_num)
-        self.assertEqual(len(self.report.keys()), 4)
+        self.assertEqual(len(list(self.report.keys())), 4)
         report_0 = self.report["results"][0]
         self.assertEqual(report_0["name"], test_name)
         self.assertEqual(report_0["results"][thread_num]["ops_per_sec"], self.ops_per_sec)
@@ -135,13 +130,13 @@ class TestBenchrunEmbeddedThreadsReport(CombineBenchrunEmbeddedResultsFixture):
         thread_num = "1"
         thread_report.add_report(thread_num, _BM_REPORT_INSERT_1)
         perf_report = thread_report.generate_perf_plugin_dict()
-        self.assertEqual(len(perf_report.keys()), 1)
+        self.assertEqual(len(list(perf_report.keys())), 1)
         self.assertEqual(perf_report[thread_num]["ops_per_sec"], _BM_REPORT_INSERT_1["totalOps/s"])
         self.assertEqual(len(perf_report[thread_num]["ops_per_sec_values"]), 1)
 
         thread_report.add_report(thread_num, _BM_REPORT_INSERT_2)
         perf_report = thread_report.generate_perf_plugin_dict()
-        self.assertEqual(len(perf_report.keys()), 1)
+        self.assertEqual(len(list(perf_report.keys())), 1)
         ops_per_sec = (_BM_REPORT_INSERT_1["totalOps/s"] + _BM_REPORT_INSERT_2["totalOps/s"]) / 2
         self.assertEqual(perf_report[thread_num]["ops_per_sec"], ops_per_sec)
         self.assertEqual(len(perf_report[thread_num]["ops_per_sec_values"]), 2)
@@ -151,14 +146,14 @@ class TestBenchrunEmbeddedThreadsReport(CombineBenchrunEmbeddedResultsFixture):
         thread_num = "1"
         thread_report.add_report(thread_num, _BM_REPORT_INSERT_1)
         perf_report = thread_report.generate_perf_plugin_dict()
-        self.assertEqual(len(perf_report.keys()), 1)
+        self.assertEqual(len(list(perf_report.keys())), 1)
         self.assertEqual(perf_report[thread_num]["ops_per_sec"], _BM_REPORT_INSERT_1["totalOps/s"])
         self.assertEqual(len(perf_report[thread_num]["ops_per_sec_values"]), 1)
 
         thread_num = "2"
         thread_report.add_report(thread_num, _BM_REPORT_INSERT_2)
         perf_report = thread_report.generate_perf_plugin_dict()
-        self.assertEqual(len(perf_report.keys()), 2)
+        self.assertEqual(len(list(perf_report.keys())), 2)
         self.assertEqual(perf_report["1"]["ops_per_sec"], _BM_REPORT_INSERT_1["totalOps/s"])
         self.assertEqual(len(perf_report["1"]["ops_per_sec_values"]), 1)
         self.assertEqual(perf_report[thread_num]["ops_per_sec"], _BM_REPORT_INSERT_2["totalOps/s"])

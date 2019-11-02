@@ -33,6 +33,7 @@
 
 #include <algorithm>
 #include <iterator>
+#include <memory>
 
 #include "mongo/client/mongo_uri.h"
 #include "mongo/scripting/mozjs/implscope.h"
@@ -40,14 +41,14 @@
 #include "mongo/scripting/mozjs/valuereader.h"
 #include "mongo/scripting/mozjs/valuewriter.h"
 #include "mongo/scripting/mozjs/wrapconstrainedmethod.h"
-#include "mongo/stdx/memory.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 namespace mozjs {
 
 const JSFunctionSpec URIInfo::methods[2] = {
-    MONGO_ATTACH_JS_CONSTRAINED_METHOD(toString, URIInfo), JS_FS_END,
+    MONGO_ATTACH_JS_CONSTRAINED_METHOD(toString, URIInfo),
+    JS_FS_END,
 };
 
 const char* const URIInfo::className = "MongoURI";

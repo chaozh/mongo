@@ -42,8 +42,9 @@ namespace mongo {
 using std::vector;
 
 // Standard Btree implementation below.
-BtreeAccessMethod::BtreeAccessMethod(IndexCatalogEntry* btreeState, SortedDataInterface* btree)
-    : AbstractIndexAccessMethod(btreeState, btree) {
+BtreeAccessMethod::BtreeAccessMethod(IndexCatalogEntry* btreeState,
+                                     std::unique_ptr<SortedDataInterface> btree)
+    : AbstractIndexAccessMethod(btreeState, std::move(btree)) {
     // The key generation wants these values.
     vector<const char*> fieldNames;
     vector<BSONElement> fixed;
@@ -55,15 +56,21 @@ BtreeAccessMethod::BtreeAccessMethod(IndexCatalogEntry* btreeState, SortedDataIn
         fixed.push_back(BSONElement());
     }
 
-    _keyGenerator = std::make_unique<BtreeKeyGenerator>(
-        fieldNames, fixed, _descriptor->isSparse(), btreeState->getCollator());
+    _keyGenerator =
+        std::make_unique<BtreeKeyGenerator>(fieldNames,
+                                            fixed,
+                                            _descriptor->isSparse(),
+                                            btreeState->getCollator(),
+                                            getSortedDataInterface()->getKeyStringVersion(),
+                                            getSortedDataInterface()->getOrdering());
 }
 
 void BtreeAccessMethod::doGetKeys(const BSONObj& obj,
-                                  BSONObjSet* keys,
-                                  BSONObjSet* multikeyMetadataKeys,
-                                  MultikeyPaths* multikeyPaths) const {
-    _keyGenerator->getKeys(obj, keys, multikeyPaths);
+                                  KeyStringSet* keys,
+                                  KeyStringSet* multikeyMetadataKeys,
+                                  MultikeyPaths* multikeyPaths,
+                                  boost::optional<RecordId> id) const {
+    _keyGenerator->getKeys(obj, keys, multikeyPaths, id);
 }
 
 }  // namespace mongo

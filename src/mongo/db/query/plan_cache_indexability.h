@@ -29,11 +29,10 @@
 
 #pragma once
 
+#include <functional>
 #include <vector>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/db/exec/projection_exec_agg.h"
-#include "mongo/stdx/functional.h"
 #include "mongo/util/string_map.h"
 
 namespace mongo {
@@ -44,7 +43,7 @@ class CompositeIndexabilityDiscriminator;
 class MatchExpression;
 struct CoreIndexInfo;
 
-using IndexabilityDiscriminator = stdx::function<bool(const MatchExpression* me)>;
+using IndexabilityDiscriminator = std::function<bool(const MatchExpression* me)>;
 using IndexabilityDiscriminators = std::vector<IndexabilityDiscriminator>;
 using IndexToDiscriminatorMap = StringMap<CompositeIndexabilityDiscriminator>;
 
@@ -82,7 +81,8 @@ private:
  * expressions based on the data values in the expression.
  */
 class PlanCacheIndexabilityState {
-    MONGO_DISALLOW_COPYING(PlanCacheIndexabilityState);
+    PlanCacheIndexabilityState(const PlanCacheIndexabilityState&) = delete;
+    PlanCacheIndexabilityState& operator=(const PlanCacheIndexabilityState&) = delete;
 
 public:
     PlanCacheIndexabilityState() = default;

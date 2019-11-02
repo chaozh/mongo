@@ -57,17 +57,16 @@
 #include "mongo/db/auth/user_document_parser.h"
 #include "mongo/db/auth/user_management_commands_parser.h"
 #include "mongo/db/auth/user_name.h"
-
+#include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/global_settings.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/mongod_options.h"
 #include "mongo/platform/compiler.h"
-#include "mongo/stdx/memory.h"
-#include "mongo/stdx/mutex.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/stdx/unordered_map.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 namespace {
@@ -116,7 +115,8 @@ class PinnedUserSetParameter {
 public:
     void append(OperationContext* opCtx, BSONObjBuilder& b, const std::string& name) const {
         BSONArrayBuilder sub(b.subarrayStart(name));
-        for (const auto& username : _userNames) {
+        stdx::lock_guard<Latch> lk(_mutex);
+        for (const auto& username : _pinnedUsersList) {
             BSONObjBuilder nameObj(sub.subobjStart());
             nameObj << AuthorizationManager::USER_NAME_FIELD_NAME << username.getUser()
                     << AuthorizationManager::USER_DB_FIELD_NAME << username.getDB();
@@ -138,16 +138,14 @@ public:
                 return status;
             }
 
-            stdx::unique_lock<stdx::mutex> lk(_mutex);
-            _userNames = std::move(out);
+            stdx::lock_guard<Latch> lk(_mutex);
+            _pinnedUsersList = out;
             auto authzManager = _authzManager;
             if (!authzManager) {
                 return Status::OK();
             }
 
-            lk.unlock();
-
-            authzManager->invalidateUserCache(Client::getCurrent()->getOperationContext());
+            authzManager->updatePinnedUsersList(std::move(out));
             return Status::OK();
         } else {
             return {ErrorCodes::BadValue,
@@ -157,7 +155,7 @@ public:
 
     Status setFromString(const std::string& str) {
         std::vector<std::string> strList;
-        splitStringDelim(str, &strList, ',');
+        str::splitStringDelim(str, &strList, ',');
 
         std::vector<UserName> out;
         for (const auto& nameStr : strList) {
@@ -173,28 +171,21 @@ public:
             return status;
         }
 
+        stdx::lock_guard<Latch> lk(_mutex);
+        _pinnedUsersList = out;
         auto authzManager = _authzManager;
         if (!authzManager) {
             return Status::OK();
         }
 
-        {
-            stdx::lock_guard<stdx::mutex> lk(_mutex);
-            _userNames = std::move(out);
-        }
-
-        authzManager->invalidateUserCache(Client::getCurrent()->getOperationContext());
+        authzManager->updatePinnedUsersList(std::move(out));
         return Status::OK();
     }
 
     void setAuthzManager(AuthorizationManager* authzManager) {
-        stdx::lock_guard<stdx::mutex> lk(_mutex);
+        stdx::lock_guard<Latch> lk(_mutex);
         _authzManager = authzManager;
-    }
-
-    std::vector<UserName> getUserNames() {
-        stdx::lock_guard<stdx::mutex> lk(_mutex);
-        return _userNames;
+        _authzManager->updatePinnedUsersList(std::move(_pinnedUsersList));
     }
 
 private:
@@ -207,12 +198,11 @@ private:
         }
         return Status::OK();
     }
-    stdx::mutex _mutex;
-    std::vector<UserName> _userNames;
     AuthorizationManager* _authzManager = nullptr;
-} authorizationManagerPinnedUsers;
 
-const auto inUserManagementCommandsFlag = OperationContext::declareDecoration<bool>();
+    mutable Mutex _mutex = MONGO_MAKE_LATCH("PinnedUserSetParameter::_mutex");
+    std::vector<UserName> _pinnedUsersList;
+} authorizationManagerPinnedUsers;
 
 }  // namespace
 
@@ -263,7 +253,8 @@ MONGO_REGISTER_SHIM(AuthorizationManager::create)()->std::unique_ptr<Authorizati
  * into the cache, because some invalidation event occurred during the fetch phase.
  */
 class AuthorizationManagerImpl::CacheGuard {
-    MONGO_DISALLOW_COPYING(CacheGuard);
+    CacheGuard(const CacheGuard&) = delete;
+    CacheGuard& operator=(const CacheGuard&) = delete;
 
 public:
     /**
@@ -272,19 +263,18 @@ public:
     explicit CacheGuard(OperationContext* opCtx, AuthorizationManagerImpl* authzManager)
         : _isThisGuardInFetchPhase(false),
           _authzManager(authzManager),
-          _stateLock(_authzManager->_externalState->lock(opCtx)),
-          _lock(authzManager->_cacheWriteMutex) {}
+          _cacheLock(authzManager->_cacheWriteMutex) {}
 
     /**
      * Releases the mutex that synchronizes user cache access, if held, and notifies
      * any threads waiting for their own opportunity to update the user cache.
      */
     ~CacheGuard() {
-        if (!_lock.owns_lock()) {
-            _lock.lock();
+        if (!_cacheLock.owns_lock()) {
+            _cacheLock.lock();
         }
         if (_isThisGuardInFetchPhase) {
-            fassert(17190, _authzManager->_isFetchPhaseBusy);
+            fassert(17190, otherUpdateInFetchPhase());
             _authzManager->_isFetchPhaseBusy = false;
             _authzManager->_fetchPhaseIsReady.notify_all();
         }
@@ -302,7 +292,8 @@ public:
      */
     void wait() {
         fassert(17222, !_isThisGuardInFetchPhase);
-        _authzManager->_fetchPhaseIsReady.wait(_lock);
+        _authzManager->_fetchPhaseIsReady.wait(_cacheLock,
+                                               [&] { return !otherUpdateInFetchPhase(); });
     }
 
     /**
@@ -310,26 +301,18 @@ public:
      * cache generation.
      */
     void beginFetchPhase() {
-        beginFetchPhaseNoYield();
-        _lock.unlock();
-    }
-
-    /**
-     * Sets up the fetch phase without releasing _authzManager->_cacheMutex
-     */
-    void beginFetchPhaseNoYield() {
-        fassert(17191, !_authzManager->_isFetchPhaseBusy);
+        fassert(17191, !otherUpdateInFetchPhase());
         _isThisGuardInFetchPhase = true;
         _authzManager->_isFetchPhaseBusy = true;
         _startGeneration = _authzManager->_fetchGeneration;
+        _cacheLock.unlock();
     }
 
     /**
      * Exits the fetch phase, reacquiring the _authzManager->_cacheMutex.
      */
     void endFetchPhase() {
-        if (!_lock.owns_lock())
-            _lock.lock();
+        _cacheLock.lock();
         // We do not clear _authzManager->_isFetchPhaseBusy or notify waiters until
         // ~CacheGuard(), for two reasons.  First, there's no value to notifying the waiters
         // before you're ready to release the mutex, because they'll just go to sleep on the
@@ -347,7 +330,7 @@ public:
      */
     bool isSameCacheGeneration() const {
         fassert(17223, _isThisGuardInFetchPhase);
-        fassert(17231, _lock.owns_lock());
+        fassert(17231, _cacheLock.owns_lock());
         return _startGeneration == _authzManager->_fetchGeneration;
     }
 
@@ -355,8 +338,8 @@ private:
     OID _startGeneration;
     bool _isThisGuardInFetchPhase;
     AuthorizationManagerImpl* _authzManager;
-    std::unique_ptr<AuthzManagerExternalState::StateLock> _stateLock;
-    stdx::unique_lock<stdx::mutex> _lock;
+
+    stdx::unique_lock<Latch> _cacheLock;
 };
 
 AuthorizationManagerImpl::AuthorizationManagerImpl()
@@ -370,8 +353,7 @@ AuthorizationManagerImpl::AuthorizationManagerImpl(
       _externalState(std::move(externalState)),
       _version(schemaVersionInvalid),
       _userCache(authorizationManagerCacheSize, UserCacheInvalidator()),
-      _fetchGeneration(OID::gen()),
-      _isFetchPhaseBusy(false) {}
+      _fetchGeneration(OID::gen()) {}
 
 AuthorizationManagerImpl::~AuthorizationManagerImpl() {}
 
@@ -414,7 +396,7 @@ Status AuthorizationManagerImpl::getAuthorizationVersion(OperationContext* opCtx
 }
 
 OID AuthorizationManagerImpl::getCacheGeneration() {
-    stdx::lock_guard<stdx::mutex> lk(_cacheWriteMutex);
+    stdx::lock_guard<Latch> lk(_cacheWriteMutex);
     return _fetchGeneration;
 }
 
@@ -432,7 +414,6 @@ bool AuthorizationManagerImpl::hasAnyPrivilegeDocuments(OperationContext* opCtx)
         return true;
     }
 
-    auto stateLk = _externalState->lock(opCtx);
     bool privDocsExist = _externalState->hasAnyPrivilegeDocuments(opCtx);
 
     if (privDocsExist) {
@@ -448,11 +429,9 @@ Status AuthorizationManagerImpl::_initializeUserFromPrivilegeDocument(User* user
     std::string userName = parser.extractUserNameFromUserDocument(privDoc);
     if (userName != user->getName().getUser()) {
         return Status(ErrorCodes::BadValue,
-                      mongoutils::str::stream() << "User name from privilege document \""
-                                                << userName
-                                                << "\" doesn't match name of provided User \""
-                                                << user->getName().getUser()
-                                                << "\"");
+                      str::stream() << "User name from privilege document \"" << userName
+                                    << "\" doesn't match name of provided User \""
+                                    << user->getName().getUser() << "\"");
     }
 
     user->setID(parser.extractUserIDFromUserDocument(privDoc));
@@ -484,7 +463,6 @@ Status AuthorizationManagerImpl::_initializeUserFromPrivilegeDocument(User* user
 Status AuthorizationManagerImpl::getUserDescription(OperationContext* opCtx,
                                                     const UserName& userName,
                                                     BSONObj* result) {
-    auto lk = _externalState->lock(opCtx);
     return _externalState->getUserDescription(opCtx, userName, result);
 }
 
@@ -493,7 +471,6 @@ Status AuthorizationManagerImpl::getRoleDescription(OperationContext* opCtx,
                                                     PrivilegeFormat privileges,
                                                     AuthenticationRestrictionsFormat restrictions,
                                                     BSONObj* result) {
-    auto lk = _externalState->lock(opCtx);
     return _externalState->getRoleDescription(opCtx, roleName, privileges, restrictions, result);
 }
 
@@ -502,7 +479,6 @@ Status AuthorizationManagerImpl::getRolesDescription(OperationContext* opCtx,
                                                      PrivilegeFormat privileges,
                                                      AuthenticationRestrictionsFormat restrictions,
                                                      BSONObj* result) {
-    auto lk = _externalState->lock(opCtx);
     return _externalState->getRolesDescription(opCtx, roleName, privileges, restrictions, result);
 }
 
@@ -514,7 +490,6 @@ Status AuthorizationManagerImpl::getRoleDescriptionsForDB(
     AuthenticationRestrictionsFormat restrictions,
     bool showBuiltinRoles,
     vector<BSONObj>* result) {
-    auto lk = _externalState->lock(opCtx);
     return _externalState->getRoleDescriptionsForDB(
         opCtx, dbname, privileges, restrictions, showBuiltinRoles, result);
 }
@@ -534,7 +509,6 @@ StatusWith<UserHandle> AuthorizationManagerImpl::acquireUser(OperationContext* o
     auto returnUser = [&](boost::optional<UserHandle> cachedUser) {
         auto ret = *cachedUser;
         fassert(16914, ret.get());
-        fassert(17003, ret->isValid());
 
         LOG(1) << "Returning user " << userName << " from cache";
         return ret;
@@ -562,41 +536,7 @@ StatusWith<UserHandle> AuthorizationManagerImpl::acquireUser(OperationContext* o
     guard.beginFetchPhase();
     // If there's still no user in the cache, then we need to go to disk. Take the slow path.
     LOG(1) << "Getting user " << userName << " from disk";
-    auto ret = _acquireUserSlowPath(guard, opCtx, userName);
 
-    guard.endFetchPhase();
-    if (!ret.isOK()) {
-        return ret.getStatus();
-    }
-
-    auto user = std::move(ret.getValue());
-    if (user->isValid()) {
-        _updateCacheGeneration_inlock(guard);
-    }
-
-    return user;
-}
-
-StatusWith<UserHandle> AuthorizationManagerImpl::acquireUserForSessionRefresh(
-    OperationContext* opCtx, const UserName& userName, const User::UserId& uid) {
-    auto swUserHandle = acquireUser(opCtx, userName);
-    if (!swUserHandle.isOK()) {
-        return swUserHandle.getStatus();
-    }
-
-    auto ret = std::move(swUserHandle.getValue());
-    if (uid != ret->getID()) {
-        return {ErrorCodes::UserNotFound,
-                str::stream() << "User id from privilege document '" << userName.toString()
-                              << "' does not match user id in session."};
-    }
-
-    return ret;
-}
-
-StatusWith<UserHandle> AuthorizationManagerImpl::_acquireUserSlowPath(CacheGuard& guard,
-                                                                      OperationContext* opCtx,
-                                                                      const UserName& userName) {
     int authzVersion = _version;
 
     // Number of times to retry a user document that fetches due to transient
@@ -614,10 +554,10 @@ StatusWith<UserHandle> AuthorizationManagerImpl::_acquireUserSlowPath(CacheGuard
 
         switch (authzVersion) {
             default:
-                status = Status(ErrorCodes::BadValue,
-                                mongoutils::str::stream()
-                                    << "Illegal value for authorization data schema version, "
-                                    << authzVersion);
+                status =
+                    Status(ErrorCodes::BadValue,
+                           str::stream() << "Illegal value for authorization data schema version, "
+                                         << authzVersion);
                 break;
             case schemaVersion28SCRAM:
             case schemaVersion26Final:
@@ -625,11 +565,10 @@ StatusWith<UserHandle> AuthorizationManagerImpl::_acquireUserSlowPath(CacheGuard
                 status = _fetchUserV2(opCtx, userName, &user);
                 break;
             case schemaVersion24:
-                status = Status(ErrorCodes::AuthSchemaIncompatible,
-                                mongoutils::str::stream()
-                                    << "Authorization data schema version "
-                                    << schemaVersion24
-                                    << " not supported after MongoDB version 2.6.");
+                status =
+                    Status(ErrorCodes::AuthSchemaIncompatible,
+                           str::stream() << "Authorization data schema version " << schemaVersion24
+                                         << " not supported after MongoDB version 2.6.");
                 break;
         }
         if (status.isOK())
@@ -647,83 +586,38 @@ StatusWith<UserHandle> AuthorizationManagerImpl::_acquireUserSlowPath(CacheGuard
     // may also call endFetchPhase() after this returns.
     guard.endFetchPhase();
 
+    UserHandle ret;
     if (guard.isSameCacheGeneration()) {
         if (_version == schemaVersionInvalid)
             _version = authzVersion;
-        return _userCache.insertOrAssignAndGet(userName, std::move(user));
+        ret = _userCache.insertOrAssignAndGet(userName, std::move(user));
+        _updateCacheGeneration_inlock(guard);
     } else {
         // If the cache generation changed while this thread was in fetch mode, the data
         // associated with the user may now be invalid, so we must mark it as such.  The caller
         // may still opt to use the information for a short while, but not indefinitely.
         user->_invalidate();
-        return UserHandle(std::move(user));
+        ret = UserHandle(std::move(user));
     }
+
+    return ret;
 }
 
-void AuthorizationManagerImpl::_recachePinnedUsers(CacheGuard& guard, OperationContext* opCtx) {
-    const auto findPinnedUser = [&](const auto& userName) {
-        return std::find_if(_pinnedUsers.begin(), _pinnedUsers.end(), [&](const auto& userHandle) {
-            return (userHandle->getName() == userName);
-        });
-    };
-
-    // Get the list of users to pin
-    const auto usersToPin = authorizationManagerPinnedUsers.getUserNames();
-    if (usersToPin.empty()) {
-        // If there are pinned users, clear them all out so they fall out of the cache
-        if (!_pinnedUsers.empty()) {
-            _pinnedUsers.clear();
-        }
-        return;
+StatusWith<UserHandle> AuthorizationManagerImpl::acquireUserForSessionRefresh(
+    OperationContext* opCtx, const UserName& userName, const User::UserId& uid) {
+    auto swUserHandle = acquireUser(opCtx, userName);
+    if (!swUserHandle.isOK()) {
+        return swUserHandle.getStatus();
     }
 
-    // Remove any users that shouldn't be pinned anymore or that are invalid.
-    std::vector<UserHandle> newPinnedUsers;
-    std::copy_if(_pinnedUsers.begin(),
-                 _pinnedUsers.end(),
-                 std::back_inserter(newPinnedUsers),
-                 [&](const UserHandle& user) {
-                     if (!user->isValid())
-                         return false;
-                     return std::any_of(
-                         usersToPin.begin(), usersToPin.end(), [&](const UserName& userName) {
-                             return (user->getName() == userName);
-                         });
-                 });
-
-
-    while (guard.otherUpdateInFetchPhase()) {
-        guard.wait();
+    auto ret = std::move(swUserHandle.getValue());
+    if (uid != ret->getID()) {
+        return {ErrorCodes::UserNotFound,
+                str::stream() << "User id from privilege document '" << userName.toString()
+                              << "' does not match user id in session."};
     }
 
-    // Begin the fetch phase but don't yield any locks. We want re-pinning of users to block other
-    // operations until all the users are refreshed.
-    guard.beginFetchPhaseNoYield();
-
-    bool cacheUpdated = false;
-    for (const auto& userName : usersToPin) {
-        if (findPinnedUser(userName) != _pinnedUsers.end()) {
-            continue;
-        }
-
-        cacheUpdated = true;
-        auto swUser = _acquireUserSlowPath(guard, opCtx, userName);
-        if (swUser.isOK()) {
-            newPinnedUsers.emplace(newPinnedUsers.end(), std::move(swUser.getValue()));
-        } else {
-            const auto& status = swUser.getStatus();
-            // If the user is not found, then it might just not exist yet. Skip this user for now.
-            if (status != ErrorCodes::UserNotFound) {
-                warning() << "Unable to fetch pinned user " << userName.toString() << ": "
-                          << status;
-            }
-        }
-    }
-
-    if (cacheUpdated)
-        _updateCacheGeneration_inlock(guard);
-
-    _pinnedUsers = std::move(newPinnedUsers);
+    return ret;
 }
 
 Status AuthorizationManagerImpl::_fetchUserV2(OperationContext* opCtx,
@@ -746,29 +640,116 @@ Status AuthorizationManagerImpl::_fetchUserV2(OperationContext* opCtx,
     return Status::OK();
 }
 
+void AuthorizationManagerImpl::updatePinnedUsersList(std::vector<UserName> names) {
+    stdx::unique_lock<Latch> lk(_pinnedUsersMutex);
+    _usersToPin = std::move(names);
+    bool noUsersToPin = _usersToPin->empty();
+    _pinnedUsersCond.notify_one();
+    if (noUsersToPin) {
+        LOG(1) << "There were no users to pin, not starting tracker thread";
+        return;
+    }
+
+    std::call_once(_pinnedThreadTrackerStarted, [this] {
+        stdx::thread thread(&AuthorizationManagerImpl::_pinnedUsersThreadRoutine, this);
+        thread.detach();
+    });
+}
+
+void AuthorizationManagerImpl::_pinnedUsersThreadRoutine() noexcept try {
+    Client::initThread("PinnedUsersTracker");
+    std::list<UserHandle> pinnedUsers;
+    std::vector<UserName> usersToPin;
+    LOG(1) << "Starting pinned users tracking thread";
+    while (true) {
+        auto opCtx = cc().makeOperationContext();
+
+        stdx::unique_lock<Latch> lk(_pinnedUsersMutex);
+        const Milliseconds timeout(authorizationManagerPinnedUsersRefreshIntervalMillis.load());
+        auto waitRes = opCtx->waitForConditionOrInterruptFor(
+            _pinnedUsersCond, lk, timeout, [&] { return _usersToPin.has_value(); });
+
+        if (waitRes) {
+            usersToPin = std::move(_usersToPin.get());
+            _usersToPin = boost::none;
+        }
+        lk.unlock();
+        if (usersToPin.empty()) {
+            pinnedUsers.clear();
+            continue;
+        }
+
+        // Remove any users that shouldn't be pinned anymore or that are invalid.
+        for (auto it = pinnedUsers.begin(); it != pinnedUsers.end();) {
+            const auto& user = *it;
+            const auto shouldPin =
+                std::any_of(usersToPin.begin(), usersToPin.end(), [&](const UserName& userName) {
+                    return (user->getName() == userName);
+                });
+
+            if (!user->isValid() || !shouldPin) {
+                if (!shouldPin) {
+                    LOG(2) << "Unpinning user " << user->getName();
+                } else {
+                    LOG(2) << "Pinned user no longer valid, will re-pin " << user->getName();
+                }
+                it = pinnedUsers.erase(it);
+            } else {
+                LOG(3) << "Pinned user is still valid and pinned " << user->getName();
+                ++it;
+            }
+        }
+
+        for (const auto& userName : usersToPin) {
+            if (std::any_of(pinnedUsers.begin(), pinnedUsers.end(), [&](const auto& user) {
+                    return user->getName() == userName;
+                })) {
+                continue;
+            }
+
+            auto swUser = acquireUser(opCtx.get(), userName);
+
+            if (swUser.isOK()) {
+                LOG(2) << "Pinned user " << userName;
+                pinnedUsers.emplace_back(std::move(swUser.getValue()));
+            } else {
+                const auto& status = swUser.getStatus();
+                // If the user is not found, then it might just not exist yet. Skip this user for
+                // now.
+                if (status != ErrorCodes::UserNotFound) {
+                    warning() << "Unable to fetch pinned user " << userName.toString() << ": "
+                              << status;
+                } else {
+                    LOG(2) << "Pinned user not found: " << userName;
+                }
+            }
+        }
+    }
+} catch (const ExceptionFor<ErrorCodes::InterruptedAtShutdown>&) {
+    LOG(1) << "Ending pinned users tracking thread";
+    return;
+}
+
 void AuthorizationManagerImpl::invalidateUserByName(OperationContext* opCtx,
                                                     const UserName& userName) {
     CacheGuard guard(opCtx, this);
     _updateCacheGeneration_inlock(guard);
+    LOG(2) << "Invalidating user " << userName;
     _userCache.invalidate(userName);
-
-    _recachePinnedUsers(guard, opCtx);
 }
 
 void AuthorizationManagerImpl::invalidateUsersFromDB(OperationContext* opCtx, StringData dbname) {
     CacheGuard guard(opCtx, this);
     _updateCacheGeneration_inlock(guard);
+    LOG(2) << "Invalidating all users from database " << dbname;
     _userCache.invalidateIf(
         [&](const UserName& user, const User*) { return user.getDB() == dbname; });
-
-    _recachePinnedUsers(guard, opCtx);
 }
 
 void AuthorizationManagerImpl::invalidateUserCache(OperationContext* opCtx) {
     CacheGuard guard(opCtx, this);
+    LOG(2) << "Invalidating user cache";
     _invalidateUserCache_inlock(guard);
-
-    _recachePinnedUsers(guard, opCtx);
 }
 
 void AuthorizationManagerImpl::_invalidateUserCache_inlock(const CacheGuard& guard) {
@@ -811,8 +792,15 @@ bool loggedCommandOperatesOnAuthzData(const NamespaceString& nss, const BSONObj&
     } else if (cmdName == "dropDatabase") {
         return true;
     } else if (cmdName == "renameCollection") {
-        return isAuthzCollection(cmdObj.firstElement().str()) ||
-            isAuthzCollection(cmdObj["to"].str());
+        const NamespaceString fromNamespace(cmdObj.firstElement().str());
+        const NamespaceString toNamespace(cmdObj["to"].str());
+        if (fromNamespace.db() == "admin" || toNamespace.db() == "admin") {
+            return isAuthzCollection(fromNamespace.coll().toString()) ||
+                isAuthzCollection(toNamespace.coll().toString());
+        } else {
+            return false;
+        }
+
     } else if (cmdName == "dropIndexes" || cmdName == "deleteIndexes") {
         return false;
     } else if (cmdName == "create") {
@@ -840,66 +828,10 @@ bool appliesToAuthzData(const char* op, const NamespaceString& nss, const BSONOb
     }
 }
 
-// Updates to users in the oplog are done by matching on the _id, which will always have the
-// form "<dbname>.<username>".  This function extracts the UserName from that string.
-StatusWith<UserName> extractUserNameFromIdString(StringData idstr) {
-    size_t splitPoint = idstr.find('.');
-    if (splitPoint == string::npos) {
-        return StatusWith<UserName>(ErrorCodes::FailedToParse,
-                                    mongoutils::str::stream()
-                                        << "_id entries for user documents must be of "
-                                           "the form <dbname>.<username>.  Found: "
-                                        << idstr);
-    }
-    return StatusWith<UserName>(
-        UserName(idstr.substr(splitPoint + 1), idstr.substr(0, splitPoint)));
-}
-
 }  // namespace
 
 void AuthorizationManagerImpl::_updateCacheGeneration_inlock(const CacheGuard&) {
     _fetchGeneration = OID::gen();
-}
-
-void AuthorizationManagerImpl::_invalidateRelevantCacheData(OperationContext* opCtx,
-                                                            const char* op,
-                                                            const NamespaceString& ns,
-                                                            const BSONObj& o,
-                                                            const BSONObj* o2) {
-    // When we're doing a user management command we lock the admin DB for the duration
-    // of the command and invalidate the cache at the end of the command, so we don't need
-    // to invalidate it based on calls to logOp().
-    if (inUserManagementCommandsFlag(opCtx)) {
-        LOG(1) << "Skipping cache invalidation in opObserver because of active user command";
-        return;
-    }
-
-    if (ns == AuthorizationManager::rolesCollectionNamespace ||
-        ns == AuthorizationManager::versionCollectionNamespace) {
-        invalidateUserCache(opCtx);
-        return;
-    }
-
-    if (*op == 'i' || *op == 'd' || *op == 'u') {
-        // If you got into this function isAuthzNamespace() must have returned true, and we've
-        // already checked that it's not the roles or version collection.
-        invariant(ns == AuthorizationManager::usersCollectionNamespace);
-
-        StatusWith<UserName> userName = (*op == 'u')
-            ? extractUserNameFromIdString((*o2)["_id"].str())
-            : extractUserNameFromIdString(o["_id"].str());
-
-        if (!userName.isOK()) {
-            warning() << "Invalidating user cache based on user being updated failed, will "
-                         "invalidate the entire cache instead: "
-                      << userName.getStatus();
-            invalidateUserCache(opCtx);
-            return;
-        }
-        invalidateUserByName(opCtx, userName.getValue());
-    } else {
-        invalidateUserCache(opCtx);
-    }
 }
 
 void AuthorizationManagerImpl::logOp(OperationContext* opCtx,
@@ -908,13 +840,7 @@ void AuthorizationManagerImpl::logOp(OperationContext* opCtx,
                                      const BSONObj& o,
                                      const BSONObj* o2) {
     if (appliesToAuthzData(op, nss, o)) {
-        // AuthzManagerExternalState's logOp method registers a RecoveryUnit::Change
-        // and to do so we need to have begun a UnitOfWork
-        WriteUnitOfWork wuow(opCtx);
-        _externalState->logOp(opCtx, op, nss, o, o2);
-        wuow.commit();
-
-        _invalidateRelevantCacheData(opCtx, op, nss, o, o2);
+        _externalState->logOp(opCtx, this, op, nss, o, o2);
     }
 }
 
@@ -929,10 +855,6 @@ std::vector<AuthorizationManager::CachedUserInfo> AuthorizationManagerImpl::getU
         });
 
     return ret;
-}
-
-void AuthorizationManagerImpl::setInUserManagementCommand(OperationContext* opCtx, bool val) {
-    inUserManagementCommandsFlag(opCtx) = val;
 }
 
 }  // namespace mongo

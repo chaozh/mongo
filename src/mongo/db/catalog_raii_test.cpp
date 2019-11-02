@@ -33,12 +33,14 @@
 
 #include <string>
 
+#include "boost/optional/optional_io.hpp"
 #include "mongo/db/catalog/database_holder_mock.h"
 #include "mongo/db/catalog_raii.h"
 #include "mongo/db/client.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/lock_state.h"
 #include "mongo/db/service_context_test_fixture.h"
+#include "mongo/db/storage/recovery_unit_noop.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/log.h"
 #include "mongo/util/time_support.h"
@@ -54,7 +56,7 @@ public:
     ClientAndCtx makeClientWithLocker(const std::string& clientName) {
         auto client = getServiceContext()->makeClient(clientName);
         auto opCtx = client->makeOperationContext();
-        opCtx->swapLockState(stdx::make_unique<LockerImpl>());
+        opCtx->swapLockState(std::make_unique<LockerImpl>());
         return std::make_pair(std::move(client), std::move(opCtx));
     }
 
@@ -71,7 +73,7 @@ void CatalogRAIITestFixture::setUp() {
     DatabaseHolder::set(getServiceContext(), std::make_unique<DatabaseHolderMock>());
 }
 
-void failsWithLockTimeout(stdx::function<void()> func, Milliseconds timeoutMillis) {
+void failsWithLockTimeout(std::function<void()> func, Milliseconds timeoutMillis) {
     Date_t t1 = Date_t::now();
     try {
         func();
@@ -131,13 +133,12 @@ TEST_F(CatalogRAIITestFixture, AutoGetOrCreateDbDeadline) {
 TEST_F(CatalogRAIITestFixture, AutoGetCollectionCollLockDeadline) {
     Lock::DBLock dbLock1(client1.second.get(), nss.db(), MODE_IX);
     ASSERT(client1.second->lockState()->isDbLockedForMode(nss.db(), MODE_IX));
-    Lock::CollectionLock collLock1(client1.second.get()->lockState(), nss.toString(), MODE_X);
+    Lock::CollectionLock collLock1(client1.second.get(), nss, MODE_X);
     ASSERT(client1.second->lockState()->isCollectionLockedForMode(nss, MODE_X));
     failsWithLockTimeout(
         [&] {
             AutoGetCollection coll(client2.second.get(),
                                    nss,
-                                   MODE_IX,
                                    MODE_X,
                                    AutoGetCollection::ViewMode::kViewsForbidden,
                                    Date_t::now() + timeoutMs);
@@ -152,7 +153,6 @@ TEST_F(CatalogRAIITestFixture, AutoGetCollectionDBLockDeadline) {
         [&] {
             AutoGetCollection coll(client2.second.get(),
                                    nss,
-                                   MODE_X,
                                    MODE_X,
                                    AutoGetCollection::ViewMode::kViewsForbidden,
                                    Date_t::now() + timeoutMs);
@@ -169,7 +169,6 @@ TEST_F(CatalogRAIITestFixture, AutoGetCollectionGlobalLockDeadline) {
             AutoGetCollection coll(client2.second.get(),
                                    nss,
                                    MODE_X,
-                                   MODE_X,
                                    AutoGetCollection::ViewMode::kViewsForbidden,
                                    Date_t::now() + timeoutMs);
         },
@@ -179,14 +178,13 @@ TEST_F(CatalogRAIITestFixture, AutoGetCollectionGlobalLockDeadline) {
 TEST_F(CatalogRAIITestFixture, AutoGetCollectionDeadlineNow) {
     Lock::DBLock dbLock1(client1.second.get(), nss.db(), MODE_IX);
     ASSERT(client1.second->lockState()->isDbLockedForMode(nss.db(), MODE_IX));
-    Lock::CollectionLock collLock1(client1.second.get()->lockState(), nss.toString(), MODE_X);
+    Lock::CollectionLock collLock1(client1.second.get(), nss, MODE_X);
     ASSERT(client1.second->lockState()->isCollectionLockedForMode(nss, MODE_X));
 
     failsWithLockTimeout(
         [&] {
             AutoGetCollection coll(client2.second.get(),
                                    nss,
-                                   MODE_IX,
                                    MODE_X,
                                    AutoGetCollection::ViewMode::kViewsForbidden,
                                    Date_t::now());
@@ -197,19 +195,80 @@ TEST_F(CatalogRAIITestFixture, AutoGetCollectionDeadlineNow) {
 TEST_F(CatalogRAIITestFixture, AutoGetCollectionDeadlineMin) {
     Lock::DBLock dbLock1(client1.second.get(), nss.db(), MODE_IX);
     ASSERT(client1.second->lockState()->isDbLockedForMode(nss.db(), MODE_IX));
-    Lock::CollectionLock collLock1(client1.second.get()->lockState(), nss.toString(), MODE_X);
+    Lock::CollectionLock collLock1(client1.second.get(), nss, MODE_X);
     ASSERT(client1.second->lockState()->isCollectionLockedForMode(nss, MODE_X));
 
     failsWithLockTimeout(
         [&] {
             AutoGetCollection coll(client2.second.get(),
                                    nss,
-                                   MODE_IX,
                                    MODE_X,
                                    AutoGetCollection::ViewMode::kViewsForbidden,
                                    Date_t());
         },
         Milliseconds(0));
+}
+
+TEST_F(CatalogRAIITestFixture, AutoGetCollectionDBLockCompatibleX) {
+    Lock::DBLock dbLock1(client1.second.get(), nss.db(), MODE_IX);
+    ASSERT(client1.second->lockState()->isDbLockedForMode(nss.db(), MODE_IX));
+
+    AutoGetCollection coll(client2.second.get(), nss, MODE_X);
+}
+
+using ReadSource = RecoveryUnit::ReadSource;
+
+class RecoveryUnitMock : public RecoveryUnitNoop {
+public:
+    void setTimestampReadSource(ReadSource source,
+                                boost::optional<Timestamp> provided = boost::none) override {
+        _source = source;
+        _timestamp = provided;
+    }
+    ReadSource getTimestampReadSource() const override {
+        return _source;
+    };
+    boost::optional<Timestamp> getPointInTimeReadTimestamp() override {
+        return _timestamp;
+    }
+
+private:
+    ReadSource _source = ReadSource::kUnset;
+    boost::optional<Timestamp> _timestamp;
+};
+
+class ReadSourceScopeTest : public ServiceContextTest {
+public:
+    OperationContext* opCtx() {
+        return _opCtx.get();
+    }
+
+protected:
+    void setUp() override;
+
+    ServiceContext::UniqueOperationContext _opCtx;
+};
+
+void ReadSourceScopeTest::setUp() {
+    _opCtx = getClient()->makeOperationContext();
+    _opCtx->setRecoveryUnit(std::make_unique<RecoveryUnitMock>(),
+                            WriteUnitOfWork::RecoveryUnitState::kNotInUnitOfWork);
+}
+
+TEST_F(ReadSourceScopeTest, RestoreReadSource) {
+    opCtx()->recoveryUnit()->setTimestampReadSource(ReadSource::kProvided, Timestamp(1, 2));
+    ASSERT_EQ(opCtx()->recoveryUnit()->getTimestampReadSource(), ReadSource::kProvided);
+    ASSERT_EQ(opCtx()->recoveryUnit()->getPointInTimeReadTimestamp(), Timestamp(1, 2));
+    {
+        ReadSourceScope scope(opCtx());
+        ASSERT_EQ(opCtx()->recoveryUnit()->getTimestampReadSource(), ReadSource::kUnset);
+
+        opCtx()->recoveryUnit()->setTimestampReadSource(ReadSource::kLastApplied);
+        ASSERT_EQ(opCtx()->recoveryUnit()->getTimestampReadSource(), ReadSource::kLastApplied);
+        ASSERT_EQ(opCtx()->recoveryUnit()->getPointInTimeReadTimestamp(), boost::none);
+    }
+    ASSERT_EQ(opCtx()->recoveryUnit()->getTimestampReadSource(), ReadSource::kProvided);
+    ASSERT_EQ(opCtx()->recoveryUnit()->getPointInTimeReadTimestamp(), Timestamp(1, 2));
 }
 
 }  // namespace

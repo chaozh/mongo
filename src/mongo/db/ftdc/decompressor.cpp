@@ -46,7 +46,8 @@ StatusWith<std::vector<BSONObj>> FTDCDecompressor::uncompress(ConstDataRange buf
     ConstDataRangeCursor compressedDataRange(buf);
 
     // Read the length of the uncompressed buffer
-    auto swUncompressedLength = compressedDataRange.readAndAdvance<LittleEndian<std::uint32_t>>();
+    auto swUncompressedLength =
+        compressedDataRange.readAndAdvanceNoThrow<LittleEndian<std::uint32_t>>();
     if (!swUncompressedLength.isOK()) {
         return {swUncompressedLength.getStatus()};
     }
@@ -68,7 +69,7 @@ StatusWith<std::vector<BSONObj>> FTDCDecompressor::uncompress(ConstDataRange buf
     ConstDataRangeCursor cdc = statusUncompress.getValue();
 
     // The document is not part of any checksum so we must validate it is correct
-    auto swRef = cdc.readAndAdvance<Validated<BSONObj>>();
+    auto swRef = cdc.readAndAdvanceNoThrow<Validated<BSONObj>>();
     if (!swRef.isOK()) {
         return {swRef.getStatus()};
     }
@@ -76,7 +77,7 @@ StatusWith<std::vector<BSONObj>> FTDCDecompressor::uncompress(ConstDataRange buf
     BSONObj ref = swRef.getValue();
 
     // Read count of metrics
-    auto swMetricsCount = cdc.readAndAdvance<LittleEndian<std::uint32_t>>();
+    auto swMetricsCount = cdc.readAndAdvanceNoThrow<LittleEndian<std::uint32_t>>();
     if (!swMetricsCount.isOK()) {
         return {swMetricsCount.getStatus()};
     }
@@ -84,7 +85,7 @@ StatusWith<std::vector<BSONObj>> FTDCDecompressor::uncompress(ConstDataRange buf
     std::uint32_t metricsCount = swMetricsCount.getValue();
 
     // Read count of samples
-    auto swSampleCount = cdc.readAndAdvance<LittleEndian<std::uint32_t>>();
+    auto swSampleCount = cdc.readAndAdvanceNoThrow<LittleEndian<std::uint32_t>>();
     if (!swSampleCount.isOK()) {
         return {swSampleCount.getStatus()};
     }
@@ -138,17 +139,17 @@ StatusWith<std::vector<BSONObj>> FTDCDecompressor::uncompress(ConstDataRange buf
                 continue;
             }
 
-            auto swDelta = cdrc.readAndAdvance<FTDCVarInt>();
+            auto swDelta = cdrc.readAndAdvanceNoThrow<FTDCVarInt>();
 
             if (!swDelta.isOK()) {
                 return swDelta.getStatus();
             }
 
             if (swDelta.getValue() == 0) {
-                auto swZero = cdrc.readAndAdvance<FTDCVarInt>();
+                auto swZero = cdrc.readAndAdvanceNoThrow<FTDCVarInt>();
 
                 if (!swZero.isOK()) {
-                    return swDelta.getStatus();
+                    return swZero.getStatus();
                 }
 
                 zeroesCount = swZero.getValue();

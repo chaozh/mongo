@@ -33,11 +33,11 @@
 #include <list>
 #include <set>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
 #include "mongo/base/data_type.h"
-#include "mongo/base/disallow_copying.h"
 #include "mongo/base/string_data.h"
 #include "mongo/base/string_data_comparator_interface.h"
 #include "mongo/bson/bson_comparator_interface_base.h"
@@ -131,7 +131,7 @@ public:
 
     /** Construct a BSONObj from data in the proper format.
      *  Use this constructor when something else owns bsonData's buffer
-    */
+     */
     template <typename Traits = DefaultSizeTrait>
     explicit BSONObj(const char* bsonData, Traits t = Traits{}) {
         init<Traits>(bsonData);
@@ -142,8 +142,8 @@ public:
           _ownedBuffer(std::move(ownedBuffer)) {}
 
     /** Move construct a BSONObj */
-    BSONObj(BSONObj&& other) noexcept : _objdata(std::move(other._objdata)),
-                                        _ownedBuffer(std::move(other._ownedBuffer)) {
+    BSONObj(BSONObj&& other) noexcept
+        : _objdata(std::move(other._objdata)), _ownedBuffer(std::move(other._ownedBuffer)) {
         other._objdata = BSONObj()._objdata;  // To return to an empty state.
         dassert(!other.isOwned());
     }
@@ -239,6 +239,9 @@ public:
         Else return an owned copy.
     */
     BSONObj getOwned() const;
+
+    /** Returns an owned copy of the given BSON object. */
+    static BSONObj getOwned(const BSONObj& obj);
 
     /** @return a new full (and owned) copy of the object. */
     BSONObj copy() const;
@@ -364,7 +367,7 @@ public:
      *    this.extractFieldsUnDotted({a : 1 , c : 1}) -> {"" : 4 , "" : 6 }
      *    this.extractFieldsUnDotted({b : "blah"}) -> {"" : 5}
      *
-    */
+     */
     BSONObj extractFieldsUnDotted(const BSONObj& pattern) const;
 
     BSONObj filterFieldsUndotted(const BSONObj& filter, bool inFilter) const;
@@ -503,6 +506,10 @@ public:
         return *p == EOO ? "" : p + 1;
     }
 
+    StringData firstElementFieldNameStringData() const {
+        return StringData(firstElementFieldName());
+    }
+
     BSONType firstElementType() const {
         const char* p = objdata() + 4;
         return (BSONType)*p;
@@ -524,6 +531,10 @@ public:
     /** Return new object with the field names replaced by those in the
         passed object. */
     BSONObj replaceFieldNames(const BSONObj& obj) const;
+
+    static BSONObj stripFieldNames(const BSONObj& obj);
+
+    bool hasFieldNames() const;
 
     /**
      * Returns true if this object is valid according to the specified BSON version, and returns
@@ -587,6 +598,9 @@ private:
     const char* _objdata;
     ConstSharedBuffer _ownedBuffer;
 };
+
+MONGO_STATIC_ASSERT(std::is_nothrow_move_constructible_v<BSONObj>);
+MONGO_STATIC_ASSERT(std::is_nothrow_move_assignable_v<BSONObj>);
 
 std::ostream& operator<<(std::ostream& s, const BSONObj& o);
 std::ostream& operator<<(std::ostream& s, const BSONElement& e);
@@ -686,11 +700,11 @@ private:
 class BSONObjIterator {
 public:
     /** Create an iterator for a BSON object.
-    */
+     */
     explicit BSONObjIterator(const BSONObj& jso) {
         int sz = jso.objsize();
         if (MONGO_unlikely(sz == 0)) {
-            _pos = _theend = 0;
+            _pos = _theend = nullptr;
             return;
         }
         _pos = jso.objdata() + 4;
@@ -703,13 +717,13 @@ public:
     }
 
     /** @return true if more elements exist to be enumerated. */
-    bool more() {
+    bool more() const {
         return _pos < _theend;
     }
 
     /** @return true if more elements exist to be enumerated INCLUDING the EOO element which is
      * always at the end. */
-    bool moreWithEOO() {
+    bool moreWithEOO() const {
         return _pos <= _theend;
     }
 
@@ -754,7 +768,8 @@ private:
 
 /** Base class implementing ordered iteration through BSONElements. */
 class BSONIteratorSorted {
-    MONGO_DISALLOW_COPYING(BSONIteratorSorted);
+    BSONIteratorSorted(const BSONIteratorSorted&) = delete;
+    BSONIteratorSorted& operator=(const BSONIteratorSorted&) = delete;
 
 public:
     ~BSONIteratorSorted() {
@@ -778,7 +793,7 @@ protected:
 
 private:
     const int _nfields;
-    const std::unique_ptr<const char* []> _fields;
+    const std::unique_ptr<const char*[]> _fields;
     int _cur;
 };
 
@@ -818,7 +833,7 @@ struct DataType::Handler<BSONObj> {
                        const char* ptr,
                        size_t length,
                        size_t* advanced,
-                       std::ptrdiff_t debug_offset) {
+                       std::ptrdiff_t debug_offset) noexcept try {
         auto temp = BSONObj(ptr);
         auto len = temp.objsize();
         if (bson) {
@@ -828,13 +843,15 @@ struct DataType::Handler<BSONObj> {
             *advanced = len;
         }
         return Status::OK();
+    } catch (const DBException& e) {
+        return e.toStatus();
     }
 
     static Status store(const BSONObj& bson,
                         char* ptr,
                         size_t length,
                         size_t* advanced,
-                        std::ptrdiff_t debug_offset);
+                        std::ptrdiff_t debug_offset) noexcept;
 
     static BSONObj defaultConstruct() {
         return BSONObj();

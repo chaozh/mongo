@@ -35,7 +35,7 @@
 #include "mongo/base/string_data.h"
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/db/field_parser.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -67,15 +67,9 @@ constexpr int WriteConcernOptions::kNoWaiting;
 constexpr StringData WriteConcernOptions::kWriteConcernField;
 const char WriteConcernOptions::kMajority[] = "majority";
 
-// TODO (PM-1301): Remove once the stable Timestamp is allowed to advance past the oldest prepare
-// Timestamp.
-const char WriteConcernOptions::kInternalMajorityNoSnapshot[] = "internalMajorityNoSnapshot";
-
 const BSONObj WriteConcernOptions::Default = BSONObj();
 const BSONObj WriteConcernOptions::Acknowledged(BSON("w" << W_NORMAL));
 const BSONObj WriteConcernOptions::Unacknowledged(BSON("w" << W_NONE));
-const BSONObj WriteConcernOptions::InternalMajorityNoSnapshot(
-    BSON("w" << WriteConcernOptions::kInternalMajorityNoSnapshot));
 const BSONObj WriteConcernOptions::Majority(BSON("w" << WriteConcernOptions::kMajority));
 constexpr Seconds WriteConcernOptions::kWriteConcernTimeoutSystem;
 constexpr Seconds WriteConcernOptions::kWriteConcernTimeoutMigration;
@@ -98,7 +92,7 @@ WriteConcernOptions::WriteConcernOptions(const std::string& mode,
     : syncMode(sync), wNumNodes(0), wMode(mode), wTimeout(durationCount<Milliseconds>(timeout)) {}
 
 Status WriteConcernOptions::parse(const BSONObj& obj) {
-    reset();
+    *this = WriteConcernOptions();
     if (obj.isEmpty()) {
         return Status(ErrorCodes::FailedToParse, "write concern object cannot be empty");
     }
@@ -154,6 +148,7 @@ Status WriteConcernOptions::parse(const BSONObj& obj) {
         wNumNodes = wEl.numberInt();
         usedDefaultW = false;
     } else if (wEl.type() == String) {
+        wNumNodes = 0;
         wMode = wEl.valuestrsafe();
         usedDefaultW = false;
     } else if (wEl.eoo() || wEl.type() == jstNULL || wEl.type() == Undefined) {
@@ -166,19 +161,15 @@ Status WriteConcernOptions::parse(const BSONObj& obj) {
 }
 
 WriteConcernOptions WriteConcernOptions::deserializerForIDL(const BSONObj& obj) {
-    WriteConcernOptions writeConcernOptions;
-    uassertStatusOK(writeConcernOptions.parse(obj));
-    return writeConcernOptions;
+    WriteConcernOptions writeConcern;
+    if (!obj.isEmpty()) {
+        uassertStatusOK(writeConcern.parse(obj));
+    }
+    return writeConcern;
 }
 
-StatusWith<WriteConcernOptions> WriteConcernOptions::extractWCFromCommand(
-    const BSONObj& cmdObj, const WriteConcernOptions& defaultWC) {
-    WriteConcernOptions writeConcern = defaultWC;
-    writeConcern.usedDefault = true;
-    writeConcern.usedDefaultW = true;
-    if (writeConcern.wNumNodes == 0 && writeConcern.wMode.empty()) {
-        writeConcern.wNumNodes = 1;
-    }
+StatusWith<WriteConcernOptions> WriteConcernOptions::extractWCFromCommand(const BSONObj& cmdObj) {
+    WriteConcernOptions writeConcern;
 
     // Return the default write concern if no write concern is provided. We check for the existence
     // of the write concern field up front in order to avoid the expense of constructing an error
@@ -231,7 +222,7 @@ BSONObj WriteConcernOptions::toBSON() const {
     return builder.obj();
 }
 
-bool WriteConcernOptions::shouldWaitForOtherNodes() const {
+bool WriteConcernOptions::needToWaitForOtherNodes() const {
     return !wMode.empty() || wNumNodes > 1;
 }
 

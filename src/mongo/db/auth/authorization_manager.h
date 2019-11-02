@@ -29,12 +29,12 @@
 
 #pragma once
 
+#include <functional>
 #include <memory>
 #include <string>
 
 #include <boost/optional.hpp>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/base/secure_allocator.h"
 #include "mongo/base/shim.h"
 #include "mongo/base/status.h"
@@ -49,9 +49,8 @@
 #include "mongo/db/jsobj.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/server_options.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/stdx/condition_variable.h"
-#include "mongo/stdx/functional.h"
-#include "mongo/stdx/mutex.h"
 #include "mongo/stdx/unordered_map.h"
 
 namespace mongo {
@@ -108,7 +107,6 @@ public:
     static constexpr StringData V1_USER_NAME_FIELD_NAME = "user"_sd;
     static constexpr StringData V1_USER_SOURCE_FIELD_NAME = "userSource"_sd;
 
-
     static const NamespaceString adminCommandNamespace;
     static const NamespaceString rolesCollectionNamespace;
     static const NamespaceString usersAltCollectionNamespace;
@@ -117,6 +115,7 @@ public:
     static const NamespaceString versionCollectionNamespace;
     static const NamespaceString defaultTempUsersCollectionNamespace;  // for mongorestore
     static const NamespaceString defaultTempRolesCollectionNamespace;  // for mongorestore
+
 
     /**
      * Status to be returned when authentication fails. Being consistent about our returned Status
@@ -297,6 +296,13 @@ public:
     virtual void invalidateUserCache(OperationContext* opCtx) = 0;
 
     /**
+     * Sets the list of users that should be pinned in memory.
+     *
+     * This will start the PinnedUserTracker thread if it hasn't been started already.
+     */
+    virtual void updatePinnedUsersList(std::vector<UserName> names) = 0;
+
+    /**
      * Parses privDoc and fully initializes the user object (credentials, roles, and privileges)
      * with the information extracted from the privilege document.
      * This should never be called from outside the AuthorizationManager - the only reason it's
@@ -324,8 +330,6 @@ public:
     };
 
     virtual std::vector<CachedUserInfo> getUserCacheInfo() const = 0;
-
-    virtual void setInUserManagementCommand(OperationContext* opCtx, bool val) = 0;
 };
 
 }  // namespace mongo

@@ -30,18 +30,18 @@
 #pragma once
 
 #include <functional>
+#include <memory>
 #include <string>
 
 #include "mongo/base/status_with.h"
 #include "mongo/config.h"
 #include "mongo/db/server_options.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/stdx/condition_variable.h"
-#include "mongo/stdx/memory.h"
-#include "mongo/stdx/mutex.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/transport/transport_layer.h"
 #include "mongo/transport/transport_mode.h"
-#include "mongo/util/fail_point_service.h"
+#include "mongo/util/fail_point.h"
 #include "mongo/util/net/hostandport.h"
 #include "mongo/util/net/ssl_options.h"
 #include "mongo/util/net/ssl_types.h"
@@ -69,17 +69,18 @@ class ServiceEntryPoint;
 namespace transport {
 
 // This fail point simulates reads and writes that always return 1 byte and fail with EAGAIN
-MONGO_FAIL_POINT_DECLARE(transportLayerASIOshortOpportunisticReadWrite);
+extern FailPoint transportLayerASIOshortOpportunisticReadWrite;
 
 // This fail point will cause an asyncConnect to timeout after it's successfully connected
 // to the remote peer
-MONGO_FAIL_POINT_DECLARE(transportLayerASIOasyncConnectTimesOut);
+extern FailPoint transportLayerASIOasyncConnectTimesOut;
 
 /**
  * A TransportLayer implementation based on ASIO networking primitives.
  */
 class TransportLayerASIO final : public TransportLayer {
-    MONGO_DISALLOW_COPYING(TransportLayerASIO);
+    TransportLayerASIO(const TransportLayerASIO&) = delete;
+    TransportLayerASIO& operator=(const TransportLayerASIO&) = delete;
 
 public:
     struct Options {
@@ -159,7 +160,7 @@ private:
     SSLParams::SSLModes _sslMode() const;
 #endif
 
-    stdx::mutex _mutex;
+    Mutex _mutex = MONGO_MAKE_LATCH("TransportLayerASIO::_mutex");
 
     // There are three reactors that are used by TransportLayerASIO. The _ingressReactor contains
     // all the accepted sockets and all ingress networking activity. The _acceptorReactor contains

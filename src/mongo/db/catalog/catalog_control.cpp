@@ -27,17 +27,20 @@
  *    it in the license file.
  */
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
+#define LOG_FOR_RECOVERY(level) \
+    MONGO_LOG_COMPONENT(level, ::mongo::logger::LogComponent::kStorageRecovery)
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/catalog/catalog_control.h"
 
+#include "mongo/db/background.h"
 #include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/catalog/database.h"
-#include "mongo/db/catalog/database_catalog_entry.h"
 #include "mongo/db/catalog/database_holder.h"
-#include "mongo/db/catalog/uuid_catalog.h"
 #include "mongo/db/ftdc/ftdc_mongod.h"
+#include "mongo/db/index_builds_coordinator.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/repair_database.h"
 #include "mongo/util/log.h"
@@ -47,14 +50,22 @@ namespace catalog {
 MinVisibleTimestampMap closeCatalog(OperationContext* opCtx) {
     invariant(opCtx->lockState()->isW());
 
+    BackgroundOperation::assertNoBgOpInProg();
+    IndexBuildsCoordinator::get(opCtx)->assertNoIndexBuildInProgress();
+
     MinVisibleTimestampMap minVisibleTimestampMap;
-    std::vector<std::string> allDbs;
-    opCtx->getServiceContext()->getStorageEngine()->listDatabases(&allDbs);
+    std::vector<std::string> allDbs =
+        opCtx->getServiceContext()->getStorageEngine()->listDatabases();
 
     auto databaseHolder = DatabaseHolder::get(opCtx);
     for (auto&& dbName : allDbs) {
         const auto db = databaseHolder->getDb(opCtx, dbName);
-        for (Collection* coll : *db) {
+        for (auto collIt = db->begin(opCtx); collIt != db->end(opCtx); ++collIt) {
+            auto coll = *collIt;
+            if (!coll) {
+                break;
+            }
+
             OptionalCollectionUUID uuid = coll->uuid();
             boost::optional<Timestamp> minVisible = coll->getMinimumVisibleSnapshot();
 
@@ -68,14 +79,15 @@ MinVisibleTimestampMap closeCatalog(OperationContext* opCtx) {
         }
     }
 
-    // Need to mark the UUIDCatalog as open if we our closeAll fails, dismissed if successful.
-    auto reopenOnFailure = makeGuard([opCtx] { UUIDCatalog::get(opCtx).onOpenCatalog(opCtx); });
-    // Closing UUID Catalog: only lookupNSSByUUID will fall back to using pre-closing state to
+    // Need to mark the CollectionCatalog as open if we our closeAll fails, dismissed if successful.
+    auto reopenOnFailure =
+        makeGuard([opCtx] { CollectionCatalog::get(opCtx).onOpenCatalog(opCtx); });
+    // Closing CollectionCatalog: only lookupNSSByUUID will fall back to using pre-closing state to
     // allow authorization for currently unknown UUIDs. This is needed because authorization needs
     // to work before acquiring locks, and might otherwise spuriously regard a UUID as unknown
     // while reloading the catalog.
-    UUIDCatalog::get(opCtx).onCloseCatalog(opCtx);
-    LOG(1) << "closeCatalog: closing UUID catalog";
+    CollectionCatalog::get(opCtx).onCloseCatalog(opCtx);
+    LOG(1) << "closeCatalog: closing collection catalog";
 
     // Close all databases.
     log() << "closeCatalog: closing all databases";
@@ -107,26 +119,13 @@ void openCatalog(OperationContext* opCtx, const MinVisibleTimestampMap& minVisib
     for (auto indexNamespace : indexesToRebuild.getValue()) {
         NamespaceString collNss(indexNamespace.first);
         auto indexName = indexNamespace.second;
-
-        auto dbCatalogEntry = storageEngine->getDatabaseCatalogEntry(opCtx, collNss.db());
-        invariant(dbCatalogEntry,
-                  str::stream() << "couldn't get database catalog entry for database "
-                                << collNss.db());
-        auto collCatalogEntry = dbCatalogEntry->getCollectionCatalogEntry(collNss.toString());
-        invariant(collCatalogEntry,
-                  str::stream() << "couldn't get collection catalog entry for collection "
-                                << collNss.toString());
-
         auto indexSpecs = getIndexNameObjs(
-            opCtx, dbCatalogEntry, collCatalogEntry, [&indexName](const std::string& name) {
-                return name == indexName;
-            });
+            opCtx, collNss, [&indexName](const std::string& name) { return name == indexName; });
         if (!indexSpecs.isOK() || indexSpecs.getValue().first.empty()) {
             fassert(40689,
                     {ErrorCodes::InternalError,
                      str::stream() << "failed to get index spec for index " << indexName
-                                   << " in collection "
-                                   << collNss.toString()});
+                                   << " in collection " << collNss.toString()});
         }
         auto indexesToRebuild = indexSpecs.getValue();
         invariant(
@@ -146,14 +145,8 @@ void openCatalog(OperationContext* opCtx, const MinVisibleTimestampMap& minVisib
     for (const auto& entry : nsToIndexNameObjMap) {
         NamespaceString collNss(entry.first);
 
-        auto dbCatalogEntry = storageEngine->getDatabaseCatalogEntry(opCtx, collNss.db());
-        invariant(dbCatalogEntry,
-                  str::stream() << "couldn't get database catalog entry for database "
-                                << collNss.db());
-        auto collCatalogEntry = dbCatalogEntry->getCollectionCatalogEntry(collNss.toString());
-        invariant(collCatalogEntry,
-                  str::stream() << "couldn't get collection catalog entry for collection "
-                                << collNss.toString());
+        auto collection = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(collNss);
+        invariant(collection, str::stream() << "couldn't get collection " << collNss.toString());
 
         for (const auto& indexName : entry.second.first) {
             log() << "openCatalog: rebuilding index: collection: " << collNss.toString()
@@ -161,40 +154,28 @@ void openCatalog(OperationContext* opCtx, const MinVisibleTimestampMap& minVisib
         }
 
         std::vector<BSONObj> indexSpecs = entry.second.second;
-        fassert(40690,
-                rebuildIndexesOnCollection(opCtx, dbCatalogEntry, collCatalogEntry, indexSpecs));
+        fassert(40690, rebuildIndexesOnCollection(opCtx, collection, indexSpecs));
     }
 
-    // Open all databases and repopulate the UUID catalog.
+    // Open all databases and repopulate the CollectionCatalog.
     log() << "openCatalog: reopening all databases";
-    auto& uuidCatalog = UUIDCatalog::get(opCtx);
     auto databaseHolder = DatabaseHolder::get(opCtx);
-    std::vector<std::string> databasesToOpen;
-    storageEngine->listDatabases(&databasesToOpen);
+    std::vector<std::string> databasesToOpen = storageEngine->listDatabases();
     for (auto&& dbName : databasesToOpen) {
-        LOG(1) << "openCatalog: dbholder reopening database " << dbName;
+        LOG_FOR_RECOVERY(1) << "openCatalog: dbholder reopening database " << dbName;
         auto db = databaseHolder->openDb(opCtx, dbName);
         invariant(db, str::stream() << "failed to reopen database " << dbName);
-
-        std::list<std::string> collections;
-        db->getDatabaseCatalogEntry()->getCollectionNamespaces(&collections);
-        for (auto&& collName : collections) {
+        for (auto&& collNss :
+             CollectionCatalog::get(opCtx).getAllCollectionNamesFromDb(opCtx, dbName)) {
             // Note that the collection name already includes the database component.
-            NamespaceString collNss(collName);
-            auto collection = db->getCollection(opCtx, collName);
+            auto collection = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(collNss);
             invariant(collection,
-                      str::stream() << "failed to get valid collection pointer for namespace "
-                                    << collName);
+                      str::stream()
+                          << "failed to get valid collection pointer for namespace " << collNss);
 
-            auto uuid = collection->uuid();
-            invariant(uuid);
-
-            LOG(1) << "openCatalog: registering uuid " << uuid->toString() << " for collection "
-                   << collName;
-            uuidCatalog.registerUUIDCatalogEntry(*uuid, collection);
-
-            if (minVisibleTimestampMap.count(*uuid) > 0) {
-                collection->setMinimumVisibleSnapshot(minVisibleTimestampMap.find(*uuid)->second);
+            if (minVisibleTimestampMap.count(collection->uuid()) > 0) {
+                collection->setMinimumVisibleSnapshot(
+                    minVisibleTimestampMap.find(collection->uuid())->second);
             }
 
             // If this is the oplog collection, re-establish the replication system's cached pointer
@@ -205,10 +186,11 @@ void openCatalog(OperationContext* opCtx, const MinVisibleTimestampMap& minVisib
             }
         }
     }
-    // Opening UUID Catalog: The UUID catalog is now in sync with the storage engine catalog. Clear
-    // the pre-closing state.
-    UUIDCatalog::get(opCtx).onOpenCatalog(opCtx);
-    LOG(1) << "openCatalog: finished reloading UUID catalog";
+    // Opening CollectionCatalog: The collection catalog is now in sync with the storage engine
+    // catalog. Clear the pre-closing state.
+    CollectionCatalog::get(opCtx).onOpenCatalog(opCtx);
+    opCtx->getServiceContext()->incrementCatalogGeneration();
+    log() << "openCatalog: finished reloading collection catalog";
 }
 }  // namespace catalog
 }  // namespace mongo

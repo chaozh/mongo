@@ -29,11 +29,12 @@
 
 #pragma once
 
+#include <memory>
 #include <vector>
 
 #include "mongo/executor/remote_command_response.h"
 #include "mongo/executor/task_executor.h"
-#include "mongo/stdx/mutex.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/util/net/hostandport.h"
 
 namespace mongo {
@@ -54,7 +55,7 @@ public:
         size_t maxConcurrency = kMaxConcurrency;
     };
 
-    AsyncMulticaster(executor::TaskExecutor* executor, Options options);
+    AsyncMulticaster(std::shared_ptr<executor::TaskExecutor> executor, Options options);
 
     /**
      * Sends the cmd out to all passed servers (via the executor), observing the multicaster's
@@ -73,7 +74,7 @@ public:
 
 private:
     Options _options;
-    executor::TaskExecutor* _executor;
+    std::shared_ptr<executor::TaskExecutor> _executor;
 };
 
 }  // namespace executor

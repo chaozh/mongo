@@ -29,28 +29,35 @@
 
 #pragma once
 
-#include "mongo/db/concurrency/d_concurrency.h"
-#include "mongo/db/index/index_descriptor.h"
+#include "mongo/bson/simple_bsonobj_comparator.h"
+#include "mongo/db/catalog/validate_state.h"
 #include "mongo/db/storage/key_string.h"
-#include "mongo/db/storage/record_store.h"
-#include "mongo/db/storage/sorted_data_interface.h"
-#include "mongo/util/elapsed_tracker.h"
 
 namespace mongo {
 
-/**
- * The ValidationStage allows the IndexConsistency class to perform
- * the correct operations that depend on where we are in the validation.
- */
-enum class ValidationStage { DOCUMENT, INDEX, NONE };
+class IndexDescriptor;
 
 /**
- * The ValidationOperation is used by classes using the IndexObserver to let us know what operation
- * was associated with it.
- * The `UPDATE` operation can be seen as two independent operations (`REMOVE` operation followed
- * by an `INSERT` operation).
+ * Contains all the index information and stats throughout the validation.
  */
-enum class ValidationOperation { INSERT, REMOVE };
+struct IndexInfo {
+    IndexInfo(const IndexDescriptor* descriptor);
+    // Index name.
+    const std::string indexName;
+    // Contains the indexes key pattern.
+    const BSONObj keyPattern;
+    // Contains the pre-computed hash of the index name.
+    const uint32_t indexNameHash;
+    // More efficient representation of the ordering of the descriptor's key pattern.
+    const Ordering ord;
+    // The number of index entries belonging to the index.
+    int64_t numKeys = 0;
+    // The number of records that have a key in their document that referenced back to the this
+    // index.
+    int64_t numRecords = 0;
+    // A hashed set of indexed multikey paths (applies to $** indexes only).
+    std::set<uint32_t> hashedMultikeyMetadataPaths;
+};
 
 /**
  * The IndexConsistency class is used to keep track of the index consistency.
@@ -59,45 +66,32 @@ enum class ValidationOperation { INSERT, REMOVE };
  * In addition, an IndexObserver class can be hooked into the IndexAccessMethod to inform
  * this class about changes to the indexes during a validation and compensate for them.
  */
-
-/**
- * Contains all the index information and stats throughout the validation.
- */
-struct IndexInfo {
-    // Informs us if the index was ready or not for consumption during the start of validation.
-    bool isReady;
-    // Contains the pre-computed hashed of the index namespace.
-    uint32_t indexNsHash;
-    // True if the index has finished scanning from the index scan stage, otherwise false.
-    bool indexScanFinished;
-    // The number of index entries belonging to the index.
-    int64_t numKeys;
-    // The number of long keys that are not indexed for the index.
-    int64_t numLongKeys;
-    // The number of records that have a key in their document that referenced back to the
-    // this index.
-    int64_t numRecords;
-    // Keeps track of how many indexes were removed (-1) and added (+1) after the
-    // point of validity was set for this index.
-    int64_t numExtraIndexKeys;
-    // A hashed set of indexed multikey paths (applies to $** indexes only).
-    std::set<uint32_t> hashedMultikeyMetadataPaths;
-};
-
 class IndexConsistency final {
+    using IndexInfoMap = std::map<std::string, IndexInfo>;
+    using ValidateResultsMap = std::map<std::string, ValidateResults>;
+    using IndexKey = std::pair<std::string, std::string>;
+
 public:
-    IndexConsistency(OperationContext* opCtx,
-                     Collection* collection,
-                     NamespaceString nss,
-                     RecordStore* recordStore,
-                     std::unique_ptr<Lock::CollectionLock> collLk,
-                     const bool background);
+    IndexConsistency(OperationContext* opCtx, CollectionValidation::ValidateState* validateState);
 
     /**
-     * Helper functions for `_addDocKey` and `_addIndexKey` for concurrency control.
+     * During the first phase of validation, given the document's key KeyString, increment the
+     * corresponding `_indexKeyCount` by hashing it.
+     * For the second phase of validation, keep track of the document keys that hashed to
+     * inconsistent hash buckets during the first phase of validation.
      */
-    void addDocKey(const KeyString& ks, int indexNumber);
-    void addIndexKey(const KeyString& ks, int indexNumber);
+    void addDocKey(OperationContext* opCtx,
+                   const KeyString::Value& ks,
+                   IndexInfo* indexInfo,
+                   RecordId recordId);
+
+    /**
+     * During the first phase of validation, given the index entry's KeyString, decrement the
+     * corresponding `_indexKeyCount` by hashing it.
+     * For the second phase of validation, try to match the index entry keys that hashed to
+     * inconsistent hash buckets during the first phase of validation to document keys.
+     */
+    void addIndexKey(const KeyString::Value& ks, IndexInfo* indexInfo, RecordId recordId);
 
     /**
      * To validate $** multikey metadata paths, we first scan the collection and add a hash of all
@@ -105,31 +99,9 @@ public:
      * entries and remove any path encountered. As we expect the index to contain a super-set of
      * the collection paths, a non-empty set represents an invalid index.
      */
-    void addMultikeyMetadataPath(const KeyString& ks, int indexNumber);
-    void removeMultikeyMetadataPath(const KeyString& ks, int indexNumber);
-    size_t getMultikeyMetadataPathCount(int indexNumber);
-
-    /**
-     * Add one to the `_longKeys` count for the given `indexNs`.
-     * This is required because index keys > `KeyString::kMaxKeyBytes` are not indexed.
-     * TODO SERVER-36385: Completely remove the key size check in 4.4
-     */
-    void addLongIndexKey(int indexNumber);
-
-    /**
-     * Returns the number of index entries for the given `indexNs`.
-     */
-    int64_t getNumKeys(int indexNumber) const;
-
-    /**
-     * Returns the number of long keys that were not indexed for the given `indexNs`.
-     */
-    int64_t getNumLongKeys(int indexNumber) const;
-
-    /**
-     * Return the number of records with keys for the given `indexNs`.
-     */
-    int64_t getNumRecords(int indexNumber) const;
+    void addMultikeyMetadataPath(const KeyString::Value& ks, IndexInfo* indexInfo);
+    void removeMultikeyMetadataPath(const KeyString::Value& ks, IndexInfo* indexInfo);
+    size_t getMultikeyMetadataPathCount(IndexInfo* indexInfo);
 
     /**
      * Returns true if any value in the `_indexKeyCount` map is not equal to 0, otherwise
@@ -138,87 +110,84 @@ public:
     bool haveEntryMismatch() const;
 
     /**
-     * Index entries may be added or removed by concurrent writes during the index scan phase,
-     * after establishing the point of validity. We need to account for these additions and
-     * removals so that when we validate the index key count, we also have a pre-image of the
-     * index counts and won't get incorrect results because of the extra index entries we may or
-     * may not have scanned.
+     * Return info on all indexes tracked by this.
      */
-    int64_t getNumExtraIndexKeys(int indexNumber) const;
+    IndexInfoMap& getIndexInfo() {
+        return _indexesInfo;
+    }
+    IndexInfo& getIndexInfo(const std::string& indexName) {
+        return _indexesInfo.at(indexName);
+    }
 
     /**
-     * Moves the `_stage` variable to the next corresponding stage in the following order:
-     * `DOCUMENT` -> `INDEX`
-     * `INDEX` -> `NONE`
-     * `NONE` -> `NONE`
+     * Informs the IndexConsistency object that we're advancing to the second phase of index
+     * validation.
      */
-    void nextStage();
+    void setSecondPhase();
 
     /**
-     * Returns the `_stage` that the validation is on.
+     * Records the errors gathered from the second phase of index validation into the provided
+     * ValidateResultsMap and ValidateResults.
      */
-    ValidationStage getStage() const;
-
-    /**
-     * Returns the index number for the corresponding index namespace's.
-     */
-    int getIndexNumber(const std::string& indexNs);
+    void addIndexEntryErrors(ValidateResultsMap* indexNsResultsMap, ValidateResults* results);
 
 private:
-    OperationContext* _opCtx;
-    Collection* _collection;
-    const NamespaceString _nss;
-    const RecordStore* _recordStore;
-    std::unique_ptr<Lock::CollectionLock> _collLk;
-    ElapsedTracker _tracker;
+    IndexConsistency() = delete;
 
-    // We map the hashed KeyString values to a bucket which contain the count of how many
-    // index keys and document keys we've seen in each bucket.
+    CollectionValidation::ValidateState* _validateState;
+
+    // We map the hashed KeyString values to a bucket that contains the count of how many
+    // index keys and document keys we've seen in each bucket. This counter is unsigned to avoid
+    // undefined behavior in the (unlikely) case of overflow.
     // Count rules:
-    //     - If the count is 0 in the bucket, we have index consistency for
-    //       KeyStrings that mapped to it
-    //     - If the count is > 0 in the bucket at the end of the validation pass, then there
-    //       are too few index entries.
-    //     - If the count is < 0 in the bucket at the end of the validation pass, then there
-    //       are too many index entries.
-    std::map<uint32_t, uint32_t> _indexKeyCount;
+    //     - If the count is non-zero for a bucket after all documents and index entries have been
+    //       processed, one or more indexes are inconsistent for KeyStrings that map to it.
+    //       Otherwise, those keys are consistent for all indexes with a high degree of confidence.
+    //     - Absent overflow, if a count interpreted as twos complement integer ends up greater
+    //       than zero, there are too few index entries.
+    //     - Similarly, if that count ends up less than zero, there are too many index entries.
 
-    // Contains the corresponding index number for each index namespace
-    std::map<std::string, int> _indexNumber;
+    std::vector<uint32_t> _indexKeyCount;
 
-    // A mapping of index numbers to IndexInfo
-    std::map<int, IndexInfo> _indexesInfo;
+    // A vector of IndexInfo indexes by index number
+    IndexInfoMap _indexesInfo;
 
-    // The current index namespace being scanned in the index scan phase.
-    int _currentIndex = -1;
+    // Whether we're in the first or second phase of index validation.
+    bool _firstPhase;
 
-    // The stage that the validation is currently on.
-    ValidationStage _stage = ValidationStage::DOCUMENT;
+    // Populated during the second phase of validation, this map contains the index entries that
+    // were pointing at an invalid document key.
+    // The map contains a IndexKey pointing at a set of BSON objects as there may be multiple
+    // extra index entries for the same IndexKey.
+    std::map<IndexKey, SimpleBSONObjSet> _extraIndexEntries;
 
-    // Threshold for the number of errors to record before returning "There are too many errors".
-    static const int _kErrorThreshold = 100;
-
-    // The current number of errors that are recorded.
-    int _numErrorsRecorded = 0;
-
-    // Only one thread can use the class at a time
-    mutable stdx::mutex _classMutex;
+    // Populated during the second phase of validation, this map contains the index entries that
+    // were missing while the document key was in place.
+    // The map contains a IndexKey pointing to a BSON object as there can only be one missing index
+    // entry for a given IndexKey for each index.
+    std::map<IndexKey, BSONObj> _missingIndexEntries;
 
     /**
-     * Given the document's key KeyString, increment the corresponding `_indexKeyCount`
-     * by hashing it.
+     * Generates a key for the second phase of validation. The keys format is the following:
+     * {
+     *     indexName: <string>,
+     *     recordId: <number>,
+     *     idKey: <object>,  // Only available for missing index entries.
+     *     indexKey: {
+     *         <key>: <value>,
+     *         ...
+     *     }
+     * }
      */
-    void _addDocKey_inlock(const KeyString& ks, int indexNumber);
-
-    /**
-     * Given the index entry's KeyString, decrement the corresponding `_indexKeyCount`
-     * by hashing it.
-     */
-    void _addIndexKey_inlock(const KeyString& ks, int indexNumber);
+    BSONObj _generateInfo(const IndexInfo& indexInfo,
+                          RecordId recordId,
+                          const BSONObj& indexKey,
+                          boost::optional<BSONElement> idKey);
 
     /**
      * Returns a hashed value from the given KeyString and index namespace.
      */
-    uint32_t _hashKeyString(const KeyString& ks, int indexNumbers) const;
+    uint32_t _hashKeyString(const KeyString::Value& ks, uint32_t indexNameHash) const;
+
 };  // IndexConsistency
 }  // namespace mongo

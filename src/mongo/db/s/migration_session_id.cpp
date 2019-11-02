@@ -35,7 +35,7 @@
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/bson/oid.h"
 #include "mongo/bson/util/bson_extract.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -53,8 +53,8 @@ MigrationSessionId MigrationSessionId::generate(StringData donor, StringData rec
     invariant(!donor.empty());
     invariant(!recipient.empty());
 
-    return MigrationSessionId(str::stream() << donor << "_" << recipient << "_"
-                                            << OID::gen().toString());
+    return MigrationSessionId(str::stream()
+                              << donor << "_" << recipient << "_" << OID::gen().toString());
 }
 
 StatusWith<MigrationSessionId> MigrationSessionId::extractFromBSON(const BSONObj& obj) {

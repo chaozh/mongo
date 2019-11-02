@@ -31,25 +31,26 @@
 
 #include "mongo/db/pipeline/document_source_match.h"
 
+#include <memory>
+
+#include "mongo/db/exec/document_value/document.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/matcher/expression_algo.h"
 #include "mongo/db/matcher/expression_array.h"
 #include "mongo/db/matcher/expression_leaf.h"
 #include "mongo/db/matcher/expression_parser.h"
 #include "mongo/db/matcher/extensions_callback_noop.h"
-#include "mongo/db/pipeline/document.h"
 #include "mongo/db/pipeline/document_path_support.h"
 #include "mongo/db/pipeline/expression.h"
 #include "mongo/db/pipeline/lite_parsed_document_source.h"
-#include "mongo/stdx/memory.h"
-#include "mongo/util/stringutils.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
 using boost::intrusive_ptr;
 using std::pair;
-using std::unique_ptr;
 using std::string;
+using std::unique_ptr;
 using std::vector;
 
 REGISTER_DOCUMENT_SOURCE(match,
@@ -57,7 +58,7 @@ REGISTER_DOCUMENT_SOURCE(match,
                          DocumentSourceMatch::createFromBson);
 
 const char* DocumentSourceMatch::getSourceName() const {
-    return "$match";
+    return kStageName.rawData();
 }
 
 Value DocumentSourceMatch::serialize(boost::optional<ExplainOptions::Verbosity> explain) const {
@@ -79,9 +80,7 @@ intrusive_ptr<DocumentSource> DocumentSourceMatch::optimize() {
     return this;
 }
 
-DocumentSource::GetNextResult DocumentSourceMatch::getNext() {
-    pExpCtx->checkForInterrupt();
-
+DocumentSource::GetNextResult DocumentSourceMatch::doGetNext() {
     // The user facing error should have been generated earlier.
     massert(17309, "Should never call getNext on a $match stage with $text clause", !_isTextQuery);
 
@@ -112,6 +111,10 @@ DocumentSource::GetNextResult DocumentSourceMatch::getNext() {
 Pipeline::SourceContainer::iterator DocumentSourceMatch::doOptimizeAt(
     Pipeline::SourceContainer::iterator itr, Pipeline::SourceContainer* container) {
     invariant(*itr == this);
+
+    if (std::next(itr) == container->end()) {
+        return container->end();
+    }
 
     auto nextMatch = dynamic_cast<DocumentSourceMatch*>((*std::next(itr)).get());
 
@@ -271,6 +274,7 @@ Document redactSafePortionDollarOps(BSONObj expr) {
             case PathAcceptingKeyword::GEO_NEAR:
             case PathAcceptingKeyword::INTERNAL_EXPR_EQ:
             case PathAcceptingKeyword::INTERNAL_SCHEMA_ALL_ELEM_MATCH_FROM_INDEX:
+            case PathAcceptingKeyword::INTERNAL_SCHEMA_BIN_DATA_ENCRYPTED_TYPE:
             case PathAcceptingKeyword::INTERNAL_SCHEMA_BIN_DATA_SUBTYPE:
             case PathAcceptingKeyword::INTERNAL_SCHEMA_EQ:
             case PathAcceptingKeyword::INTERNAL_SCHEMA_FMOD:
@@ -297,9 +301,10 @@ Document redactSafePortionDollarOps(BSONObj expr) {
 // the expression can safely be promoted in front of a $redact.
 Document redactSafePortionTopLevel(BSONObj query) {
     MutableDocument output;
-    BSONForEach(field, query) {
-        if (field.fieldName()[0] == '$') {
-            if (str::equals(field.fieldName(), "$or")) {
+    for (BSONElement field : query) {
+        StringData fieldName = field.fieldNameStringData();
+        if (fieldName.startsWith("$")) {
+            if (fieldName == "$or") {
                 // $or must be all-or-nothing (line $in). Can't include subset of elements.
                 vector<Value> okClauses;
                 BSONForEach(elem, field.Obj()) {
@@ -313,7 +318,7 @@ Document redactSafePortionTopLevel(BSONObj query) {
 
                 if (!okClauses.empty())
                     output["$or"] = Value(std::move(okClauses));
-            } else if (str::equals(field.fieldName(), "$and")) {
+            } else if (fieldName == "$and") {
                 // $and can include subset of elements (like $all).
                 vector<Value> okClauses;
                 BSONForEach(elem, field.Obj()) {
@@ -355,7 +360,7 @@ Document redactSafePortionTopLevel(BSONObj query) {
     }
     return output.freeze();
 }
-}
+}  // namespace
 
 BSONObj DocumentSourceMatch::redactSafePortion() const {
     return redactSafePortionTopLevel(getQuery()).toBson();
@@ -374,13 +379,7 @@ bool DocumentSourceMatch::isTextQuery(const BSONObj& query) {
 }
 
 void DocumentSourceMatch::joinMatchWith(intrusive_ptr<DocumentSourceMatch> other) {
-    _predicate = BSON("$and" << BSON_ARRAY(_predicate << other->getQuery()));
-
-    StatusWithMatchExpression status = uassertStatusOK(MatchExpressionParser::parse(
-        _predicate, pExpCtx, ExtensionsCallbackNoop(), Pipeline::kAllowedMatcherFeatures));
-    _expression = std::move(status.getValue());
-    _dependencies = DepsTracker(_dependencies.getMetadataAvailable());
-    getDependencies(&_dependencies);
+    rebuild(BSON("$and" << BSON_ARRAY(_predicate << other->getQuery())));
 }
 
 pair<intrusive_ptr<DocumentSourceMatch>, intrusive_ptr<DocumentSourceMatch>>
@@ -487,7 +486,7 @@ DepsTracker::State DocumentSourceMatch::getDependencies(DepsTracker* deps) const
         // A $text aggregation field should return EXHAUSTIVE_FIELDS, since we don't necessarily
         // know what field it will be searching without examining indices.
         deps->needWholeDocument = true;
-        deps->setNeedsMetadata(DepsTracker::MetadataType::TEXT_SCORE, true);
+        deps->setNeedsMetadata(DocumentMetadataFields::kTextScore, true);
         return DepsTracker::State::EXHAUSTIVE_FIELDS;
     }
 
@@ -496,14 +495,18 @@ DepsTracker::State DocumentSourceMatch::getDependencies(DepsTracker* deps) const
 
 DocumentSourceMatch::DocumentSourceMatch(const BSONObj& query,
                                          const intrusive_ptr<ExpressionContext>& expCtx)
-    : DocumentSource(expCtx),
-      _predicate(query.getOwned()),
-      _isTextQuery(isTextQuery(query)),
-      _dependencies(_isTextQuery ? DepsTracker::MetadataAvailable::kTextScore
-                                 : DepsTracker::MetadataAvailable::kNoMetadata) {
-    StatusWithMatchExpression status = uassertStatusOK(MatchExpressionParser::parse(
-        _predicate, expCtx, ExtensionsCallbackNoop(), Pipeline::kAllowedMatcherFeatures));
-    _expression = std::move(status.getValue());
+    : DocumentSource(kStageName, expCtx) {
+    rebuild(query);
+}
+
+void DocumentSourceMatch::rebuild(BSONObj filter) {
+    _predicate = filter.getOwned();
+    _expression = uassertStatusOK(MatchExpressionParser::parse(
+        _predicate, pExpCtx, ExtensionsCallbackNoop(), Pipeline::kAllowedMatcherFeatures));
+    _isTextQuery = isTextQuery(_predicate);
+    _dependencies =
+        DepsTracker(_isTextQuery ? QueryMetadataBitSet().set(DocumentMetadataFields::kTextScore)
+                                 : DepsTracker::kNoMetadata);
     getDependencies(&_dependencies);
 }
 

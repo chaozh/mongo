@@ -5,11 +5,11 @@
 //   # failpoint. The former operations may be routed to a secondary in the replica set, whereas the
 //   # latter must be routed to the primary.
 //   assumes_read_preference_unchanged,
-//   requires_getmore,
 //   requires_fastcount,
-//
+//   requires_getmore,
 //   # Uses $where operator
 //   requires_scripting,
+//   uses_testing_only_commands,
 // ]
 
 var t = db.max_time_ms;
@@ -181,7 +181,11 @@ cursor = t.find({
 cursor.batchSize(3);
 cursor.maxTimeMS(20 * 1000);
 assert.doesNotThrow(function() {
+    // SERVER-40305: Add some additional logging here in case this fails to help us track down why
+    // it failed.
+    assert.commandWorked(db.adminCommand({setParameter: 1, traceExceptions: 1}));
     cursor.itcount();
+    assert.commandWorked(db.adminCommand({setParameter: 1, traceExceptions: 0}));
 }, [], "expected find() to not hit the time limit");
 
 //
@@ -189,7 +193,7 @@ assert.doesNotThrow(function() {
 //
 
 t.drop();
-res = t.getDB().adminCommand({sleep: 1, millis: 300, maxTimeMS: 100});
+res = t.getDB().adminCommand({sleep: 1, millis: 300, maxTimeMS: 100, lock: "none"});
 assert(res.ok == 0 && res.code == ErrorCodes.MaxTimeMSExpired,
        "expected sleep command to abort due to time limit, ok=" + res.ok + ", code=" + res.code);
 
@@ -199,7 +203,7 @@ assert(res.ok == 0 && res.code == ErrorCodes.MaxTimeMSExpired,
 //
 
 t.drop();
-res = t.getDB().adminCommand({sleep: 1, millis: 300, maxTimeMS: 10 * 1000});
+res = t.getDB().adminCommand({sleep: 1, millis: 300, maxTimeMS: 10 * 1000, lock: "none"});
 assert(res.ok == 1,
        "expected sleep command to not hit the time limit, ok=" + res.ok + ", code=" + res.code);
 
@@ -226,14 +230,14 @@ assert.eq(1, t.getDB().runCommand({ping: 1, maxTimeMS: NumberInt(0)}).ok);
 assert.eq(1, t.getDB().runCommand({ping: 1, maxTimeMS: NumberLong(0)}).ok);
 
 assert.throws.automsg(function() {
-    t.find().maxTimeMS(-1).itcount();
-});
+                 t.find().maxTimeMS(-1).itcount();
+             });
 assert.throws.automsg(function() {
-    t.find().maxTimeMS(NumberInt(-1)).itcount();
-});
+                 t.find().maxTimeMS(NumberInt(-1)).itcount();
+             });
 assert.throws.automsg(function() {
-    t.find().maxTimeMS(NumberLong(-1)).itcount();
-});
+                 t.find().maxTimeMS(NumberLong(-1)).itcount();
+             });
 assert.eq(0, t.getDB().runCommand({ping: 1, maxTimeMS: -1}).ok);
 assert.eq(0, t.getDB().runCommand({ping: 1, maxTimeMS: NumberInt(-1)}).ok);
 assert.eq(0, t.getDB().runCommand({ping: 1, maxTimeMS: NumberLong(-1)}).ok);
@@ -256,37 +260,37 @@ assert.eq(1, t.getDB().runCommand({ping: 1, maxTimeMS: NumberInt(maxValue)}).ok)
 assert.eq(1, t.getDB().runCommand({ping: 1, maxTimeMS: NumberLong(maxValue)}).ok);
 
 assert.throws.automsg(function() {
-    t.find().maxTimeMS(maxValue + 1).itcount();
-});
+                 t.find().maxTimeMS(maxValue + 1).itcount();
+             });
 assert.throws.automsg(function() {
-    t.find().maxTimeMS(NumberInt(maxValue + 1)).itcount();
-});
+                 t.find().maxTimeMS(NumberInt(maxValue + 1)).itcount();
+             });
 assert.throws.automsg(function() {
-    t.find().maxTimeMS(NumberLong(maxValue + 1)).itcount();
-});
+                 t.find().maxTimeMS(NumberLong(maxValue + 1)).itcount();
+             });
 assert.eq(0, t.getDB().runCommand({ping: 1, maxTimeMS: maxValue + 1}).ok);
 assert.eq(0, t.getDB().runCommand({ping: 1, maxTimeMS: NumberInt(maxValue + 1)}).ok);
 assert.eq(0, t.getDB().runCommand({ping: 1, maxTimeMS: NumberLong(maxValue + 1)}).ok);
 
 // Verify invalid values are rejected.
 assert.throws.automsg(function() {
-    t.find().maxTimeMS(0.1).itcount();
-});
+                 t.find().maxTimeMS(0.1).itcount();
+             });
 assert.throws.automsg(function() {
-    t.find().maxTimeMS(-0.1).itcount();
-});
+                 t.find().maxTimeMS(-0.1).itcount();
+             });
 assert.throws.automsg(function() {
-    t.find().maxTimeMS().itcount();
-});
+                 t.find().maxTimeMS().itcount();
+             });
 assert.throws.automsg(function() {
-    t.find().maxTimeMS("").itcount();
-});
+                 t.find().maxTimeMS("").itcount();
+             });
 assert.throws.automsg(function() {
-    t.find().maxTimeMS(true).itcount();
-});
+                 t.find().maxTimeMS(true).itcount();
+             });
 assert.throws.automsg(function() {
-    t.find().maxTimeMS({}).itcount();
-});
+                 t.find().maxTimeMS({}).itcount();
+             });
 assert.eq(0, t.getDB().runCommand({ping: 1, maxTimeMS: 0.1}).ok);
 assert.eq(0, t.getDB().runCommand({ping: 1, maxTimeMS: -0.1}).ok);
 assert.eq(0, t.getDB().runCommand({ping: 1, maxTimeMS: undefined}).ok);
@@ -315,49 +319,65 @@ assert.commandFailed(cursor.next());
 
 // maxTimeAlwaysTimeOut positive test for command.
 t.drop();
-assert.eq(
-    1, t.getDB().adminCommand({configureFailPoint: "maxTimeAlwaysTimeOut", mode: "alwaysOn"}).ok);
-res = t.getDB().runCommand({ping: 1, maxTimeMS: 10 * 1000});
-assert(res.ok == 0 && res.code == ErrorCodes.MaxTimeMSExpired,
-       "expected command to trigger maxTimeAlwaysTimeOut fail point, ok=" + res.ok + ", code=" +
-           res.code);
-assert.eq(1, t.getDB().adminCommand({configureFailPoint: "maxTimeAlwaysTimeOut", mode: "off"}).ok);
+try {
+    assert.commandWorked(
+        t.getDB().adminCommand({configureFailPoint: "maxTimeAlwaysTimeOut", mode: "alwaysOn"}));
+    res = t.getDB().runCommand({ping: 1, maxTimeMS: 10 * 1000});
+    assert(res.ok == 0 && res.code == ErrorCodes.MaxTimeMSExpired,
+           "expected command to trigger maxTimeAlwaysTimeOut fail point, ok=" + res.ok +
+               ", code=" + res.code);
+} finally {
+    assert.commandWorked(
+        t.getDB().adminCommand({configureFailPoint: "maxTimeAlwaysTimeOut", mode: "off"}));
+}
 
 // maxTimeNeverTimeOut positive test for command.
 t.drop();
-assert.eq(1,
-          t.getDB().adminCommand({configureFailPoint: "maxTimeNeverTimeOut", mode: "alwaysOn"}).ok);
-res = t.getDB().adminCommand({sleep: 1, millis: 300, maxTimeMS: 100});
-assert(res.ok == 1,
-       "expected command to trigger maxTimeNeverTimeOut fail point, ok=" + res.ok + ", code=" +
-           res.code);
-assert.eq(1, t.getDB().adminCommand({configureFailPoint: "maxTimeNeverTimeOut", mode: "off"}).ok);
+try {
+    assert.commandWorked(
+        t.getDB().adminCommand({configureFailPoint: "maxTimeNeverTimeOut", mode: "alwaysOn"}));
+    res = t.getDB().adminCommand({sleep: 1, millis: 300, maxTimeMS: 100, lock: "none"});
+    assert(res.ok == 1,
+           "expected command to trigger maxTimeNeverTimeOut fail point, ok=" + res.ok +
+               ", code=" + res.code);
+} finally {
+    assert.commandWorked(
+        t.getDB().adminCommand({configureFailPoint: "maxTimeNeverTimeOut", mode: "off"}));
+}
 
 // maxTimeAlwaysTimeOut positive test for query.
 t.drop();
-assert.eq(
-    1, t.getDB().adminCommand({configureFailPoint: "maxTimeAlwaysTimeOut", mode: "alwaysOn"}).ok);
-assert.throws(function() {
-    t.find().maxTimeMS(10 * 1000).itcount();
-}, [], "expected query to trigger maxTimeAlwaysTimeOut fail point");
-assert.eq(1, t.getDB().adminCommand({configureFailPoint: "maxTimeAlwaysTimeOut", mode: "off"}).ok);
+try {
+    assert.commandWorked(
+        t.getDB().adminCommand({configureFailPoint: "maxTimeAlwaysTimeOut", mode: "alwaysOn"}));
+    assert.throws(function() {
+        t.find().maxTimeMS(10 * 1000).itcount();
+    }, [], "expected query to trigger maxTimeAlwaysTimeOut fail point");
+} finally {
+    assert.commandWorked(
+        t.getDB().adminCommand({configureFailPoint: "maxTimeAlwaysTimeOut", mode: "off"}));
+}
 
 // maxTimeNeverTimeOut positive test for query.
-assert.eq(1,
-          t.getDB().adminCommand({configureFailPoint: "maxTimeNeverTimeOut", mode: "alwaysOn"}).ok);
-t.drop();
-assert.commandWorked(t.insert([{}, {}, {}]));
-cursor = t.find({
-    $where: function() {
-        sleep(100);
-        return true;
-    }
-});
-cursor.maxTimeMS(100);
-assert.doesNotThrow(function() {
-    cursor.itcount();
-}, [], "expected query to trigger maxTimeNeverTimeOut fail point");
-assert.eq(1, t.getDB().adminCommand({configureFailPoint: "maxTimeNeverTimeOut", mode: "off"}).ok);
+try {
+    assert.commandWorked(
+        t.getDB().adminCommand({configureFailPoint: "maxTimeNeverTimeOut", mode: "alwaysOn"}));
+    t.drop();
+    assert.commandWorked(t.insert([{}, {}, {}]));
+    cursor = t.find({
+        $where: function() {
+            sleep(100);
+            return true;
+        }
+    });
+    cursor.maxTimeMS(100);
+    assert.doesNotThrow(function() {
+        cursor.itcount();
+    }, [], "expected query to trigger maxTimeNeverTimeOut fail point");
+} finally {
+    assert.commandWorked(
+        t.getDB().adminCommand({configureFailPoint: "maxTimeNeverTimeOut", mode: "off"}));
+}
 
 // maxTimeAlwaysTimeOut positive test for getmore.
 t.drop();
@@ -367,12 +387,16 @@ assert.doesNotThrow.automsg(function() {
     cursor.next();
     cursor.next();
 });
-assert.eq(
-    1, t.getDB().adminCommand({configureFailPoint: "maxTimeAlwaysTimeOut", mode: "alwaysOn"}).ok);
-assert.throws(function() {
-    cursor.next();
-}, [], "expected getmore to trigger maxTimeAlwaysTimeOut fail point");
-assert.eq(1, t.getDB().adminCommand({configureFailPoint: "maxTimeAlwaysTimeOut", mode: "off"}).ok);
+try {
+    assert.commandWorked(
+        t.getDB().adminCommand({configureFailPoint: "maxTimeAlwaysTimeOut", mode: "alwaysOn"}));
+    assert.throws(function() {
+        cursor.next();
+    }, [], "expected getmore to trigger maxTimeAlwaysTimeOut fail point");
+} finally {
+    assert.commandWorked(
+        t.getDB().adminCommand({configureFailPoint: "maxTimeAlwaysTimeOut", mode: "off"}));
+}
 
 // maxTimeNeverTimeOut positive test for getmore.
 t.drop();
@@ -394,14 +418,18 @@ assert.doesNotThrow(function() {
     cursor.next();
     cursor.next();
 }, [], "expected batch 1 (query) to not hit the time limit");
-assert.eq(1,
-          t.getDB().adminCommand({configureFailPoint: "maxTimeNeverTimeOut", mode: "alwaysOn"}).ok);
-assert.doesNotThrow(function() {
-    cursor.next();
-    cursor.next();
-    cursor.next();
-}, [], "expected batch 2 (getmore) to trigger maxTimeNeverTimeOut fail point");
-assert.eq(1, t.getDB().adminCommand({configureFailPoint: "maxTimeNeverTimeOut", mode: "off"}).ok);
+try {
+    assert.commandWorked(
+        t.getDB().adminCommand({configureFailPoint: "maxTimeNeverTimeOut", mode: "alwaysOn"}));
+    assert.doesNotThrow(function() {
+        cursor.next();
+        cursor.next();
+        cursor.next();
+    }, [], "expected batch 2 (getmore) to trigger maxTimeNeverTimeOut fail point");
+} finally {
+    assert.commandWorked(
+        t.getDB().adminCommand({configureFailPoint: "maxTimeNeverTimeOut", mode: "off"}));
+}
 
 //
 // Test that maxTimeMS is accepted by commands that have an option whitelist.
@@ -413,7 +441,7 @@ assert(res.ok == 1,
        "expected aggregate with maxtime to succeed, ok=" + res.ok + ", code=" + res.code);
 
 // "collMod" command.
-res = t.runCommand("collMod", {usePowerOf2Sizes: true, maxTimeMS: 60 * 1000});
+res = t.runCommand("collMod", {maxTimeMS: 60 * 1000});
 assert(res.ok == 1,
        "expected collmod with maxtime to succeed, ok=" + res.ok + ", code=" + res.code);
 
@@ -425,9 +453,13 @@ assert.commandWorked(
 // test count shell helper SERVER-13334
 //
 t.drop();
-assert.eq(1,
-          t.getDB().adminCommand({configureFailPoint: "maxTimeNeverTimeOut", mode: "alwaysOn"}).ok);
-assert.doesNotThrow(function() {
-    t.find({}).maxTimeMS(1).count();
-});
-assert.eq(1, t.getDB().adminCommand({configureFailPoint: "maxTimeNeverTimeOut", mode: "off"}).ok);
+try {
+    assert.commandWorked(
+        t.getDB().adminCommand({configureFailPoint: "maxTimeNeverTimeOut", mode: "alwaysOn"}));
+    assert.doesNotThrow(function() {
+        t.find({}).maxTimeMS(1).count();
+    });
+} finally {
+    assert.commandWorked(
+        t.getDB().adminCommand({configureFailPoint: "maxTimeNeverTimeOut", mode: "off"}));
+}

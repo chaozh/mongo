@@ -41,20 +41,13 @@
 #include "mongo/db/server_options.h"
 #include "mongo/db/update/log_builder.h"
 #include "mongo/db/update/modifier_table.h"
-#include "mongo/db/update/object_replace_node.h"
+#include "mongo/db/update/object_replace_executor.h"
 #include "mongo/db/update/path_support.h"
 #include "mongo/db/update/storage_validation.h"
 #include "mongo/util/embedded_builder.h"
-#include "mongo/util/mongoutils/str.h"
-#include "mongo/util/stringutils.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
-
-namespace str = mongoutils::str;
-namespace mb = mongo::mutablebson;
-
-using std::unique_ptr;
-using std::vector;
 
 using pathsupport::EqualityMatches;
 
@@ -80,25 +73,24 @@ StatusWith<UpdateSemantics> updateSemanticsFromElement(BSONElement element) {
 modifiertable::ModifierType validateMod(BSONElement mod) {
     auto modType = modifiertable::getType(mod.fieldName());
 
-    uassert(ErrorCodes::FailedToParse,
-            str::stream() << "Unknown modifier: " << mod.fieldName(),
-            modType != modifiertable::MOD_UNKNOWN);
+    uassert(
+        ErrorCodes::FailedToParse,
+        str::stream()
+            << "Unknown modifier: " << mod.fieldName()
+            << ". Expected a valid update modifier or pipeline-style update specified as an array",
+        modType != modifiertable::MOD_UNKNOWN);
 
     uassert(ErrorCodes::FailedToParse,
             str::stream() << "Modifiers operate on fields but we found type "
-                          << typeName(mod.type())
-                          << " instead. For example: {$mod: {<field>: ...}}"
-                          << " not {"
-                          << mod
-                          << "}",
+                          << typeName(mod.type()) << " instead. For example: {$mod: {<field>: ...}}"
+                          << " not {" << mod << "}",
             mod.type() == BSONType::Object);
 
     uassert(ErrorCodes::FailedToParse,
             str::stream() << "'" << mod.fieldName()
                           << "' is empty. You must specify a field like so: "
                              "{"
-                          << mod.fieldName()
-                          << ": {<field>: ...}}",
+                          << mod.fieldName() << ": {<field>: ...}}",
             !mod.embeddedObject().isEmpty());
 
     return modType;
@@ -137,8 +129,7 @@ bool parseUpdateExpression(
     for (const auto& arrayFilter : arrayFilters) {
         uassert(ErrorCodes::FailedToParse,
                 str::stream() << "The array filter for identifier '" << arrayFilter.first
-                              << "' was not used in the update "
-                              << updateExpr,
+                              << "' was not used in the update " << updateExpr,
                 foundIdentifiers.find(arrayFilter.first.toString()) != foundIdentifiers.end());
     }
 
@@ -151,30 +142,44 @@ UpdateDriver::UpdateDriver(const boost::intrusive_ptr<ExpressionContext>& expCtx
     : _expCtx(expCtx) {}
 
 void UpdateDriver::parse(
-    const BSONObj& updateExpr,
+    const write_ops::UpdateModification& updateMod,
     const std::map<StringData, std::unique_ptr<ExpressionWithPlaceholder>>& arrayFilters,
+    boost::optional<BSONObj> constants,
     const bool multi) {
-    invariant(!_root && !_replacementMode, "Multiple calls to parse() on same UpdateDriver");
+    invariant(!_updateExecutor, "Multiple calls to parse() on same UpdateDriver");
 
-    // Check if the update expression is a full object replacement.
-    if (isDocReplacement(updateExpr)) {
-        uassert(ErrorCodes::FailedToParse, "multi update only works with $ operators", !multi);
-
-        _root = stdx::make_unique<ObjectReplaceNode>(updateExpr);
-
-        // Register the fact that this driver will only do full object replacements.
-        _replacementMode = true;
-
+    if (updateMod.type() == write_ops::UpdateModification::Type::kPipeline) {
+        uassert(ErrorCodes::FailedToParse,
+                "arrayFilters may not be specified for pipeline-syle updates",
+                arrayFilters.empty());
+        _updateExecutor =
+            std::make_unique<PipelineExecutor>(_expCtx, updateMod.getUpdatePipeline(), constants);
+        _updateType = UpdateType::kPipeline;
         return;
     }
 
-    // Register the fact that this driver is not doing a full object replacement.
-    _replacementMode = false;
+    uassert(51198, "Constant values may only be specified for pipeline updates", !constants);
+
+    // Check if the update expression is a full object replacement.
+    if (isDocReplacement(updateMod)) {
+        uassert(ErrorCodes::FailedToParse,
+                "multi update is not supported for replacement-style update",
+                !multi);
+
+        _updateExecutor = std::make_unique<ObjectReplaceExecutor>(updateMod.getUpdateClassic());
+
+        // Register the fact that this driver will only do full object replacements.
+        _updateType = UpdateType::kReplacement;
+        return;
+    }
+
+    invariant(_updateType == UpdateType::kOperator);
 
     // Some versions of mongod support more than one version of the update language and look for a
     // $v "UpdateSemantics" field when applying an oplog entry, in order to know which version of
     // the update language to apply with. We currently only support the 'kUpdateNode' version, but
     // we parse $v and check its value for compatibility.
+    auto updateExpr = updateMod.getUpdateClassic();
     BSONElement updateSemanticsElement = updateExpr[LogBuilder::kUpdateSemanticsFieldName];
     if (updateSemanticsElement) {
         uassert(ErrorCodes::FailedToParse,
@@ -184,9 +189,9 @@ void UpdateDriver::parse(
         uassertStatusOK(updateSemanticsFromElement(updateSemanticsElement));
     }
 
-    auto root = stdx::make_unique<UpdateObjectNode>();
+    auto root = std::make_unique<UpdateObjectNode>();
     _positional = parseUpdateExpression(updateExpr, root.get(), _expCtx, arrayFilters);
-    _root = std::move(root);
+    _updateExecutor = std::make_unique<UpdateTreeExecutor>(std::move(root));
 }
 
 Status UpdateDriver::populateDocumentWithQueryFields(OperationContext* opCtx,
@@ -196,7 +201,7 @@ Status UpdateDriver::populateDocumentWithQueryFields(OperationContext* opCtx,
     // We canonicalize the query to collapse $and/$or, and the namespace is not needed.  Also,
     // because this is for the upsert case, where we insert a new document if one was not found, the
     // $where/$text clauses do not make sense, hence empty ExtensionsCallback.
-    auto qr = stdx::make_unique<QueryRequest>(NamespaceString(""));
+    auto qr = std::make_unique<QueryRequest>(NamespaceString(""));
     qr->setFilter(query);
     const boost::intrusive_ptr<ExpressionContext> expCtx;
     // $expr is not allowed in the query for an upsert, since it is not clear what the equality
@@ -211,7 +216,7 @@ Status UpdateDriver::populateDocumentWithQueryFields(OperationContext* opCtx,
     if (!statusWithCQ.isOK()) {
         return statusWithCQ.getStatus();
     }
-    unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
+    std::unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
 
     return populateDocumentWithQueryFields(*cq, immutablePaths, doc);
 }
@@ -222,13 +227,12 @@ Status UpdateDriver::populateDocumentWithQueryFields(const CanonicalQuery& query
     EqualityMatches equalities;
     Status status = Status::OK();
 
-    if (isDocReplacement()) {
-
-        // Extract only immutable fields from replacement-style
+    if (_updateType == UpdateType::kReplacement) {
+        // Extract only immutable fields.
         status =
             pathsupport::extractFullEqualityMatches(*query.root(), immutablePaths, &equalities);
     } else {
-        // Extract all fields from op-style
+        // Extract all fields from op-style update.
         status = pathsupport::extractEqualityMatches(*query.root(), &equalities);
     }
 
@@ -249,12 +253,14 @@ Status UpdateDriver::update(StringData matchedField,
                             FieldRefSetWithStorage* modifiedPaths) {
     // TODO: assert that update() is called at most once in a !_multi case.
 
-    _affectIndices = (isDocReplacement() && (_indexedFields != NULL));
+    _affectIndices =
+        ((_updateType == UpdateType::kReplacement || _updateType == UpdateType::kPipeline) &&
+         (_indexedFields != nullptr));
 
     _logDoc.reset();
     LogBuilder logBuilder(_logDoc.root());
 
-    UpdateNode::ApplyParams applyParams(doc->root(), immutablePaths);
+    UpdateExecutor::ApplyParams applyParams(doc->root(), immutablePaths);
     applyParams.matchedField = matchedField;
     applyParams.insert = isInsert;
     applyParams.fromOplogApplication = _fromOplogApplication;
@@ -267,7 +273,9 @@ Status UpdateDriver::update(StringData matchedField,
     if (_logOp && logOpRec) {
         applyParams.logBuilder = &logBuilder;
     }
-    auto applyResult = _root->apply(applyParams);
+
+    invariant(_updateExecutor);
+    auto applyResult = _updateExecutor->applyUpdate(applyParams);
     if (applyResult.indexesAffected) {
         _affectIndices = true;
         doc->disableInPlaceUpdates();
@@ -275,7 +283,7 @@ Status UpdateDriver::update(StringData matchedField,
     if (docWasModified) {
         *docWasModified = !applyResult.noop;
     }
-    if (!_replacementMode && _logOp && logOpRec) {
+    if (_updateType == UpdateType::kOperator && _logOp && logOpRec) {
         // If there are binVersion=3.6 mongod nodes in the replica set, they need to be told that
         // this update is using the "kUpdateNode" version of the update semantics and not the older
         // update semantics that could be used by a featureCompatibilityVersion=3.4 node.
@@ -295,44 +303,18 @@ Status UpdateDriver::update(StringData matchedField,
     return Status::OK();
 }
 
-bool UpdateDriver::isDocReplacement() const {
-    return _replacementMode;
-}
-
-bool UpdateDriver::modsAffectIndices() const {
-    return _affectIndices;
-}
-
-void UpdateDriver::refreshIndexKeys(const UpdateIndexData* indexedFields) {
-    _indexedFields = indexedFields;
-}
-
-bool UpdateDriver::logOp() const {
-    return _logOp;
-}
-
-void UpdateDriver::setLogOp(bool logOp) {
-    _logOp = logOp;
-}
-
-bool UpdateDriver::fromOplogApplication() const {
-    return _fromOplogApplication;
-}
-
-void UpdateDriver::setFromOplogApplication(bool fromOplogApplication) {
-    _fromOplogApplication = fromOplogApplication;
-}
-
 void UpdateDriver::setCollator(const CollatorInterface* collator) {
-    if (_root) {
-        _root->setCollator(collator);
-    }
-
     _expCtx->setCollator(collator);
+
+    if (_updateExecutor) {
+        _updateExecutor->setCollator(collator);
+    }
 }
 
-bool UpdateDriver::isDocReplacement(const BSONObj& updateExpr) {
-    return *updateExpr.firstElementFieldName() != '$';
+bool UpdateDriver::isDocReplacement(const write_ops::UpdateModification& updateMod) {
+    return (updateMod.type() == write_ops::UpdateModification::Type::kClassic &&
+            *updateMod.getUpdateClassic().firstElementFieldName() != '$') ||
+        updateMod.type() == write_ops::UpdateModification::Type::kPipeline;
 }
 
 }  // namespace mongo

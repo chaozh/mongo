@@ -29,7 +29,6 @@
 
 #pragma once
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/base/status.h"
 #include "mongo/db/matcher/expression_with_placeholder.h"
 #include "mongo/db/query/collation/collator_interface.h"
@@ -57,7 +56,8 @@ class UpdateRequest;
  * using the UpdateDriver.
  */
 class ParsedUpdate {
-    MONGO_DISALLOW_COPYING(ParsedUpdate);
+    ParsedUpdate(const ParsedUpdate&) = delete;
+    ParsedUpdate& operator=(const ParsedUpdate&) = delete;
 
 public:
     /**
@@ -71,10 +71,12 @@ public:
     /**
      * Constructs a parsed update.
      *
-     * The object pointed to by "request" must stay in scope for the life of the constructed
-     * ParsedUpdate.
+     * The objects pointed to by "request" and "extensionsCallback" must stay in scope for the life
+     * of the constructed ParsedUpdate.
      */
-    ParsedUpdate(OperationContext* opCtx, const UpdateRequest* request);
+    ParsedUpdate(OperationContext* opCtx,
+                 const UpdateRequest* request,
+                 const ExtensionsCallback& extensionsCallback);
 
     /**
      * Parses the update request to a canonical query and an update driver. On success, the
@@ -167,6 +169,9 @@ private:
 
     // Parsed query object, or NULL if the query proves to be an id hack query.
     std::unique_ptr<CanonicalQuery> _canonicalQuery;
+
+    // Reference to an extensions callback used when parsing to a canonical query.
+    const ExtensionsCallback& _extensionsCallback;
 };
 
 }  // namespace mongo

@@ -47,9 +47,9 @@
 #include "mongo/util/hex.h"
 #include "mongo/util/icu.h"
 #include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
 #include "mongo/util/net/ssl_options.h"
 #include "mongo/util/net/ssl_parameters_gen.h"
+#include "mongo/util/str.h"
 #include "mongo/util/synchronized_value.h"
 #include "mongo/util/text.h"
 
@@ -158,7 +158,7 @@ std::string RFC4514Parser::extractAttributeName() {
     StringBuilder sb;
 
     auto ch = _cur();
-    stdx::function<bool(char ch)> characterCheck;
+    std::function<bool(char ch)> characterCheck;
     // If the first character is a digit, then this is an OID and can only contain
     // numbers and '.'
     if (isDigit(ch)) {
@@ -171,9 +171,7 @@ std::string RFC4514Parser::extractAttributeName() {
     } else {
         uasserted(ErrorCodes::BadValue,
                   str::stream() << "DN attribute names must begin with either a digit or an alpha"
-                                << " not \'"
-                                << ch
-                                << "\'");
+                                << " not \'" << ch << "\'");
     }
 
     for (; ch != '=' && !done(); ch = _advance()) {
@@ -218,8 +216,7 @@ std::pair<std::string, RFC4514Parser::ValueTerminator> RFC4514Parser::extractVal
 
                 uassert(ErrorCodes::BadValue,
                         str::stream() << "Escaped hex value contains invalid character \'"
-                                      << hexValStr[1]
-                                      << "\'",
+                                      << hexValStr[1] << "\'",
                         isHex(hexValStr[1]));
                 const char hexVal = uassertStatusOK(fromHex(StringData(hexValStr.data(), 2)));
                 sb << hexVal;
@@ -247,8 +244,8 @@ std::pair<std::string, RFC4514Parser::ValueTerminator> RFC4514Parser::extractVal
             }
         } else if (isEscaped(ch)) {
             uasserted(ErrorCodes::BadValue,
-                      str::stream() << "Found unescaped character that should be escaped: \'" << ch
-                                    << "\'");
+                      str::stream()
+                          << "Found unescaped character that should be escaped: \'" << ch << "\'");
         } else {
             if (ch != ' ') {
                 trailingSpaces = 0;
@@ -285,22 +282,15 @@ std::pair<std::string, RFC4514Parser::ValueTerminator> RFC4514Parser::extractVal
 
 const auto getTLSVersionCounts = ServiceContext::declareDecoration<TLSVersionCounts>();
 
-// These represent the ASN.1 type bytes for strings used in an X509 DirectoryString
-constexpr int kASN1UTF8String = 12;
-constexpr int kASN1PrintableString = 19;
-constexpr int kASN1TeletexString = 20;
-constexpr int kASN1UniversalString = 28;
-constexpr int kASN1BMPString = 30;
-constexpr int kASN1OctetString = 4;
 
 void canonicalizeClusterDN(std::vector<std::string>* dn) {
     // remove all RDNs we don't care about
     for (size_t i = 0; i < dn->size(); i++) {
         std::string& comp = dn->at(i);
         boost::algorithm::trim(comp);
-        if (!mongoutils::str::startsWith(comp.c_str(), "DC=") &&
-            !mongoutils::str::startsWith(comp.c_str(), "O=") &&
-            !mongoutils::str::startsWith(comp.c_str(), "OU=")) {
+        if (!str::startsWith(comp.c_str(), "DC=") &&  //
+            !str::startsWith(comp.c_str(), "O=") &&   //
+            !str::startsWith(comp.c_str(), "OU=")) {
             dn->erase(dn->begin() + i);
             i--;
         }
@@ -584,6 +574,7 @@ Status SSLX509Name::normalizeStrings() {
                 case kASN1TeletexString:
                 case kASN1UniversalString:
                 case kASN1BMPString:
+                case kASN1IA5String:
                 case kASN1OctetString: {
                     // Technically https://tools.ietf.org/html/rfc5280#section-4.1.2.4 requires
                     // that DN component values must be at least 1 code point long, but we've
@@ -602,6 +593,10 @@ Status SSLX509Name::normalizeStrings() {
                     entry.type = kASN1UTF8String;
                     break;
                 }
+                default:
+                    LOG(1) << "Certificate subject name contains unknown string type: "
+                           << entry.type << " (string value is \"" << entry.value << "\")";
+                    break;
             }
         }
     }
@@ -825,7 +820,7 @@ struct DataType::Handler<DERToken> {
 namespace {
 
 StatusWith<std::string> readDERString(ConstDataRangeCursor& cdc) {
-    auto swString = cdc.readAndAdvance<DERToken>();
+    auto swString = cdc.readAndAdvanceNoThrow<DERToken>();
     if (!swString.isOK()) {
         return swString.getStatus();
     }
@@ -834,9 +829,9 @@ StatusWith<std::string> readDERString(ConstDataRangeCursor& cdc) {
 
     if (derString.getType() != DERType::UTF8String) {
         return Status(ErrorCodes::InvalidSSLConfiguration,
-                      str::stream() << "Unexpected DER Tag, Got "
-                                    << static_cast<char>(derString.getType())
-                                    << ", Expected UTF8String");
+                      str::stream()
+                          << "Unexpected DER Tag, Got " << static_cast<char>(derString.getType())
+                          << ", Expected UTF8String");
     }
 
     return derString.readUtf8String();
@@ -849,7 +844,7 @@ StatusWith<DERToken> DERToken::parse(ConstDataRange cdr, size_t* outLength) {
 
     ConstDataRangeCursor cdrc(cdr);
 
-    auto swTagByte = cdrc.readAndAdvance<char>();
+    auto swTagByte = cdrc.readAndAdvanceNoThrow<char>();
     if (!swTagByte.getStatus().isOK()) {
         return swTagByte.getStatus();
     }
@@ -893,7 +888,7 @@ StatusWith<DERToken> DERToken::parse(ConstDataRange cdr, size_t* outLength) {
 
     // Read length
     // Depending on the high bit, either read 1 byte or N bytes
-    auto swInitialLengthByte = cdrc.readAndAdvance<char>();
+    auto swInitialLengthByte = cdrc.readAndAdvanceNoThrow<char>();
     if (!swInitialLengthByte.getStatus().isOK()) {
         return swInitialLengthByte.getStatus();
     }
@@ -918,7 +913,7 @@ StatusWith<DERToken> DERToken::parse(ConstDataRange cdr, size_t* outLength) {
         // Ensure we have enough data for the length bytes
         const char* lengthLongFormPtr = cdrc.data();
 
-        Status statusLength = cdrc.advance(lengthBytesCount);
+        Status statusLength = cdrc.advanceNoThrow(lengthBytesCount);
         if (!statusLength.isOK()) {
             return statusLength;
         }
@@ -943,8 +938,7 @@ StatusWith<DERToken> DERToken::parse(ConstDataRange cdr, size_t* outLength) {
     const uint64_t tagAndLengthByteCount = kTagLength + encodedLengthBytesCount;
 
     // This may overflow since derLength is from user data so check our arithmetic carefully.
-    if (mongoUnsignedAddOverflow64(tagAndLengthByteCount, derLength, outLength) ||
-        *outLength > cdr.length()) {
+    if (overflow::add(tagAndLengthByteCount, derLength, outLength) || *outLength > cdr.length()) {
         return Status(ErrorCodes::InvalidSSLConfiguration, "Invalid DER length");
     }
 
@@ -965,16 +959,16 @@ StatusWith<stdx::unordered_set<RoleName>> parsePeerRoles(ConstDataRange cdrExten
      *  ...!UTF8String:"Unrecognized entity in MongoDBAuthorizationGrant"
      * }
      */
-    auto swSet = cdcExtension.readAndAdvance<DERToken>();
+    auto swSet = cdcExtension.readAndAdvanceNoThrow<DERToken>();
     if (!swSet.isOK()) {
         return swSet.getStatus();
     }
 
     if (swSet.getValue().getType() != DERType::SET) {
         return Status(ErrorCodes::InvalidSSLConfiguration,
-                      str::stream() << "Unexpected DER Tag, Got "
-                                    << static_cast<char>(swSet.getValue().getType())
-                                    << ", Expected SET");
+                      str::stream()
+                          << "Unexpected DER Tag, Got "
+                          << static_cast<char>(swSet.getValue().getType()) << ", Expected SET");
     }
 
     ConstDataRangeCursor cdcSet(swSet.getValue().getSetRange());
@@ -986,7 +980,7 @@ StatusWith<stdx::unordered_set<RoleName>> parsePeerRoles(ConstDataRange cdrExten
          *  database UTF8String
          * }
          */
-        auto swSequence = cdcSet.readAndAdvance<DERToken>();
+        auto swSequence = cdcSet.readAndAdvanceNoThrow<DERToken>();
         if (!swSequence.isOK()) {
             return swSequence.getStatus();
         }
@@ -1073,37 +1067,6 @@ std::string escapeRfc2253(StringData str) {
     return ret;
 }
 
-namespace {
-/**
- * Status section of which tls versions connected to MongoDB and completed an SSL handshake.
- * Note: Clients are only not counted if they try to connect to the server with a unsupported TLS
- * version. They are still counted if the server rejects them for certificate issues in
- * parseAndValidatePeerCertificate.
- */
-class TLSVersionSatus : public ServerStatusSection {
-public:
-    TLSVersionSatus() : ServerStatusSection("transportSecurity") {}
-
-    bool includeByDefault() const override {
-        return true;
-    }
-
-    BSONObj generateSection(OperationContext* opCtx,
-                            const BSONElement& configElement) const override {
-        auto& counts = TLSVersionCounts::get(opCtx->getServiceContext());
-
-        BSONObjBuilder builder;
-        builder.append("1.0", counts.tls10.load());
-        builder.append("1.1", counts.tls11.load());
-        builder.append("1.2", counts.tls12.load());
-        builder.append("1.3", counts.tls13.load());
-        builder.append("unknown", counts.tlsUnknown.load());
-        return builder.obj();
-    }
-} tlsVersionStatus;
-
-}  // namespace
-
 void recordTLSVersion(TLSVersion version, const HostAndPort& hostForLogging) {
     StringData versionString;
     auto& counts = mongo::TLSVersionCounts::get(getGlobalServiceContext());
@@ -1158,10 +1121,8 @@ SSLManagerInterface* getSSLManager() {
     return theSSLManager;
 }
 
-}  // namespace mongo
-
 // TODO SERVER-11601 Use NFC Unicode canonicalization
-bool mongo::hostNameMatchForX509Certificates(std::string nameToMatch, std::string certHostName) {
+bool hostNameMatchForX509Certificates(std::string nameToMatch, std::string certHostName) {
     nameToMatch = removeFQDNRoot(std::move(nameToMatch));
     certHostName = removeFQDNRoot(std::move(certHostName));
 
@@ -1173,8 +1134,18 @@ bool mongo::hostNameMatchForX509Certificates(std::string nameToMatch, std::strin
     if (certHostName[0] == '*' && certHostName[1] == '.') {
         // allow name.example.com if the cert is *.example.com, '*' does not match '.'
         const char* subName = strchr(nameToMatch.c_str(), '.');
-        return subName && !strcasecmp(certHostName.c_str() + 1, subName);
+        return subName && !str::caseInsensitiveCompare(certHostName.c_str() + 1, subName);
     } else {
-        return !strcasecmp(nameToMatch.c_str(), certHostName.c_str());
+        return !str::caseInsensitiveCompare(nameToMatch.c_str(), certHostName.c_str());
     }
 }
+
+void tlsEmitWarningExpiringClientCertificate(const SSLX509Name& peer) {
+    warning() << "Peer certificate '" << peer << "' expires soon";
+}
+
+void tlsEmitWarningExpiringClientCertificate(const SSLX509Name& peer, Days days) {
+    warning() << "Peer certificate '" << peer << "' expires in " << days;
+}
+
+}  // namespace mongo

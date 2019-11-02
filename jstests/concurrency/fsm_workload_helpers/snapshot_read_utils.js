@@ -3,6 +3,8 @@
  * spans a getmore.
  */
 load('jstests/concurrency/fsm_workload_helpers/cleanup_txns.js');
+load('jstests/libs/transactions_util.js');
+
 /**
  * Parses a cursor from cmdResult, if possible.
  */
@@ -19,13 +21,7 @@ function parseCursor(cmdResult) {
  */
 function doSnapshotFind(sortByAscending, collName, data, findErrorCodes) {
     // Reset txnNumber and stmtId for this transaction.
-    const abortErrorCodes = [
-        ErrorCodes.NoSuchTransaction,
-        ErrorCodes.TransactionCommitted,
-        ErrorCodes.TransactionTooOld,
-        ErrorCodes.Interrupted
-    ];
-    abortTransaction(data.sessionDb, data.txnNumber, abortErrorCodes);
+    abortTransaction(data.sessionDb, data.txnNumber);
     data.txnNumber++;
     data.stmtId = 0;
 
@@ -41,9 +37,14 @@ function doSnapshotFind(sortByAscending, collName, data, findErrorCodes) {
         autocommit: false
     };
 
-    // Establish a snapshot batchSize:0 cursor.
     let res = data.sessionDb.runCommand(findCmd);
-    assert.commandWorkedOrFailedWithCode(res, findErrorCodes, () => `cmd: ${tojson(findCmd)}`);
+
+    // A transaction request can always fail with a transient transaction error, so only check the
+    // specific error code if it is not labeled as transient.
+    if (!TransactionsUtil.isTransientTransactionError(res)) {
+        assert.commandWorkedOrFailedWithCode(res, findErrorCodes, () => `cmd: ${tojson(findCmd)}`);
+    }
+
     const cursor = parseCursor(res);
 
     if (!cursor) {
@@ -77,13 +78,17 @@ function doSnapshotGetMore(collName, data, getMoreErrorCodes, commitTransactionE
         autocommit: false
     };
     let res = data.sessionDb.runCommand(getMoreCmd);
-    assert.commandWorkedOrFailedWithCode(
-        res, getMoreErrorCodes, () => `cmd: ${tojson(getMoreCmd)}`);
+
+    // A transaction request can always fail with a transient transaction error, so only check the
+    // specific error code if it is not labeled as transient.
+    if (!TransactionsUtil.isTransientTransactionError(res)) {
+        assert.commandWorkedOrFailedWithCode(
+            res, getMoreErrorCodes, () => `cmd: ${tojson(getMoreCmd)}`);
+    }
 
     const commitCmd = {
         commitTransaction: 1,
         txnNumber: NumberLong(data.txnNumber),
-        stmtId: NumberInt(data.stmtId++),
         autocommit: false
     };
     res = data.sessionDb.adminCommand(commitCmd);
@@ -97,7 +102,7 @@ function doSnapshotGetMore(collName, data, getMoreErrorCodes, commitTransactionE
 function insertSessionDoc(db, collName, tid, sessionId) {
     const sessionDoc = {"_id": "sessionDoc" + tid, "id": sessionId};
     const res = db[collName].insert(sessionDoc);
-    assert.writeOK(res);
+    assert.commandWorked(res);
     assert.eq(1, res.nInserted);
 }
 

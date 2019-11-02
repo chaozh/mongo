@@ -48,7 +48,6 @@ const char kBatchField[] = "nextBatch";
 const char kBatchFieldInitial[] = "firstBatch";
 const char kBatchDocSequenceField[] = "cursor.nextBatch";
 const char kBatchDocSequenceFieldInitial[] = "cursor.firstBatch";
-const char kInternalLatestOplogTimestampField[] = "$_internalLatestOplogTimestamp";
 const char kPostBatchResumeTokenField[] = "postBatchResumeToken";
 
 }  // namespace
@@ -83,9 +82,6 @@ void CursorResponseBuilder::done(CursorId cursorId, StringData cursorNamespace) 
     _cursorObject->append(kNsField, cursorNamespace);
     _cursorObject.reset();
 
-    if (!_latestOplogTimestamp.isNull()) {
-        _bodyBuilder->append(kInternalLatestOplogTimestampField, _latestOplogTimestamp);
-    }
     _bodyBuilder.reset();
     _active = false;
 }
@@ -126,14 +122,12 @@ CursorResponse::CursorResponse(NamespaceString nss,
                                CursorId cursorId,
                                std::vector<BSONObj> batch,
                                boost::optional<long long> numReturnedSoFar,
-                               boost::optional<Timestamp> latestOplogTimestamp,
                                boost::optional<BSONObj> postBatchResumeToken,
                                boost::optional<BSONObj> writeConcernError)
     : _nss(std::move(nss)),
       _cursorId(cursorId),
       _batch(std::move(batch)),
       _numReturnedSoFar(numReturnedSoFar),
-      _latestOplogTimestamp(latestOplogTimestamp),
       _postBatchResumeToken(std::move(postBatchResumeToken)),
       _writeConcernError(std::move(writeConcernError)) {}
 
@@ -175,24 +169,24 @@ StatusWith<CursorResponse> CursorResponse::parseFromBSON(const BSONObj& cmdRespo
     BSONElement cursorElt = cmdResponse[kCursorField];
     if (cursorElt.type() != BSONType::Object) {
         return {ErrorCodes::TypeMismatch,
-                str::stream() << "Field '" << kCursorField << "' must be a nested object in: "
-                              << cmdResponse};
+                str::stream() << "Field '" << kCursorField
+                              << "' must be a nested object in: " << cmdResponse};
     }
     BSONObj cursorObj = cursorElt.Obj();
 
     BSONElement idElt = cursorObj[kIdField];
     if (idElt.type() != BSONType::NumberLong) {
-        return {
-            ErrorCodes::TypeMismatch,
-            str::stream() << "Field '" << kIdField << "' must be of type long in: " << cmdResponse};
+        return {ErrorCodes::TypeMismatch,
+                str::stream() << "Field '" << kIdField
+                              << "' must be of type long in: " << cmdResponse};
     }
     cursorId = idElt.Long();
 
     BSONElement nsElt = cursorObj[kNsField];
     if (nsElt.type() != BSONType::String) {
         return {ErrorCodes::TypeMismatch,
-                str::stream() << "Field '" << kNsField << "' must be of type string in: "
-                              << cmdResponse};
+                str::stream() << "Field '" << kNsField
+                              << "' must be of type string in: " << cmdResponse};
     }
     fullns = nsElt.String();
 
@@ -204,9 +198,7 @@ StatusWith<CursorResponse> CursorResponse::parseFromBSON(const BSONObj& cmdRespo
     if (batchElt.type() != BSONType::Array) {
         return {ErrorCodes::TypeMismatch,
                 str::stream() << "Must have array field '" << kBatchFieldInitial << "' or '"
-                              << kBatchField
-                              << "' in: "
-                              << cmdResponse};
+                              << kBatchField << "' in: " << cmdResponse};
     }
     batchObj = batchElt.Obj();
 
@@ -233,15 +225,6 @@ StatusWith<CursorResponse> CursorResponse::parseFromBSON(const BSONObj& cmdRespo
                               << postBatchResumeTokenElem.type()};
     }
 
-    auto latestOplogTimestampElem = cmdResponse[kInternalLatestOplogTimestampField];
-    if (latestOplogTimestampElem && latestOplogTimestampElem.type() != BSONType::bsonTimestamp) {
-        return {
-            ErrorCodes::BadValue,
-            str::stream()
-                << "invalid _internalLatestOplogTimestamp format; expected timestamp but found: "
-                << latestOplogTimestampElem.type()};
-    }
-
     auto writeConcernError = cmdResponse["writeConcernError"];
 
     if (writeConcernError && writeConcernError.type() != BSONType::Object) {
@@ -254,8 +237,6 @@ StatusWith<CursorResponse> CursorResponse::parseFromBSON(const BSONObj& cmdRespo
              cursorId,
              std::move(batch),
              boost::none,
-             latestOplogTimestampElem ? latestOplogTimestampElem.timestamp()
-                                      : boost::optional<Timestamp>{},
              postBatchResumeTokenElem ? postBatchResumeTokenElem.Obj().getOwned()
                                       : boost::optional<BSONObj>{},
              writeConcernError ? writeConcernError.Obj().getOwned() : boost::optional<BSONObj>{}}};
@@ -282,9 +263,6 @@ void CursorResponse::addToBSON(CursorResponse::ResponseType responseType,
 
     cursorBuilder.doneFast();
 
-    if (_latestOplogTimestamp) {
-        builder->append(kInternalLatestOplogTimestampField, *_latestOplogTimestamp);
-    }
     builder->append("ok", 1.0);
 
     if (_writeConcernError) {

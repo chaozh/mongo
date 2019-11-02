@@ -30,8 +30,7 @@
 #include <string>
 
 #include "mongo/db/fts/tokenizer.h"
-#include "mongo/util/mongoutils/str.h"
-#include "mongo/util/stringutils.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -133,5 +132,5 @@ Token::Type Tokenizer::_type(char c) const {
             return Token::TEXT;
     }
 }
-}
-}
+}  // namespace fts
+}  // namespace mongo

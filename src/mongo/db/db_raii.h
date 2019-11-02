@@ -43,7 +43,8 @@ namespace mongo {
  * desired.
  */
 class AutoStatsTracker {
-    MONGO_DISALLOW_COPYING(AutoStatsTracker);
+    AutoStatsTracker(const AutoStatsTracker&) = delete;
+    AutoStatsTracker& operator=(const AutoStatsTracker&) = delete;
 
 public:
     /**
@@ -94,7 +95,8 @@ private:
  * snapshot to become available.
  */
 class AutoGetCollectionForRead {
-    MONGO_DISALLOW_COPYING(AutoGetCollectionForRead);
+    AutoGetCollectionForRead(const AutoGetCollectionForRead&) = delete;
+    AutoGetCollectionForRead& operator=(const AutoGetCollectionForRead&) = delete;
 
 public:
     AutoGetCollectionForRead(
@@ -149,7 +151,8 @@ private:
  * ensure the CurrentOp object has the right namespace and has started its timer.
  */
 class AutoGetCollectionForReadCommand {
-    MONGO_DISALLOW_COPYING(AutoGetCollectionForReadCommand);
+    AutoGetCollectionForReadCommand(const AutoGetCollectionForReadCommand&) = delete;
+    AutoGetCollectionForReadCommand& operator=(const AutoGetCollectionForReadCommand&) = delete;
 
 public:
     AutoGetCollectionForReadCommand(
@@ -185,7 +188,8 @@ private:
  * current operation.
  */
 class OldClientContext {
-    MONGO_DISALLOW_COPYING(OldClientContext);
+    OldClientContext(const OldClientContext&) = delete;
+    OldClientContext& operator=(const OldClientContext&) = delete;
 
 public:
     OldClientContext(OperationContext* opCtx, const std::string& ns, bool doVersion = true);
@@ -217,5 +221,57 @@ private:
  * Throws an exception if 'system.views' is being queried within a transaction.
  */
 LockMode getLockModeForQuery(OperationContext* opCtx, const boost::optional<NamespaceString>& nss);
+
+/**
+ * When in scope, enforces prepare conflicts in the storage engine. Reads and writes in this scope
+ * will block on accessing an already updated document which is in prepared state. And they will
+ * unblock after the prepared transaction that performed the update commits/aborts.
+ */
+class EnforcePrepareConflictsBlock {
+public:
+    explicit EnforcePrepareConflictsBlock(OperationContext* opCtx)
+        : _opCtx(opCtx), _originalValue(opCtx->recoveryUnit()->getPrepareConflictBehavior()) {
+        // It is illegal to call setPrepareConflictBehavior() while any storage transaction is
+        // active. setPrepareConflictBehavior() invariants that there is no active storage
+        // transaction.
+        _opCtx->recoveryUnit()->setPrepareConflictBehavior(PrepareConflictBehavior::kEnforce);
+    }
+
+    ~EnforcePrepareConflictsBlock() {
+        // If we are still holding locks, we might still have open storage transactions. However, we
+        // did not start with any active transactions when we first entered the scope. And
+        // transactions started within this scope cannot be reused outside of the scope. So we need
+        // to call abandonSnapshot() to close any open transactions on destruction. Any reads or
+        // writes should have already completed as we are exiting the scope. Therefore, this call is
+        // safe.
+        if (_opCtx->lockState()->isLocked()) {
+            _opCtx->recoveryUnit()->abandonSnapshot();
+        }
+        // It is illegal to call setPrepareConflictBehavior() while any storage transaction is
+        // active. There should not be any active transaction if we are not holding locks. If locks
+        // are still being held, the above abandonSnapshot() call should have already closed all
+        // storage transactions.
+        _opCtx->recoveryUnit()->setPrepareConflictBehavior(_originalValue);
+    }
+
+private:
+    OperationContext* _opCtx;
+    PrepareConflictBehavior _originalValue;
+};
+
+/**
+ * TODO: SERVER-44105 remove
+ * RAII type for letting secondary reads to block behind the PBW lock.
+ * Note: Do not add additional usage. This is only temporary for ease of backport.
+ */
+struct BlockSecondaryReadsDuringBatchApplication_DONT_USE {
+public:
+    BlockSecondaryReadsDuringBatchApplication_DONT_USE(OperationContext* opCtx);
+    ~BlockSecondaryReadsDuringBatchApplication_DONT_USE();
+
+private:
+    OperationContext* _opCtx{nullptr};
+    boost::optional<bool> _originalSettings;
+};
 
 }  // namespace mongo

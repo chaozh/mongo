@@ -31,6 +31,8 @@
 
 #include "mongo/db/logical_session_cache_impl.h"
 
+#include <memory>
+
 #include "mongo/bson/oid.h"
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/authorization_session_for_test.h"
@@ -46,7 +48,6 @@
 #include "mongo/db/service_liaison_mock.h"
 #include "mongo/db/sessions_collection_mock.h"
 #include "mongo/stdx/future.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/unittest/ensure_fcv.h"
 #include "mongo/unittest/unittest.h"
 
@@ -54,7 +55,7 @@ namespace mongo {
 namespace {
 
 const Milliseconds kSessionTimeout = duration_cast<Milliseconds>(kLogicalSessionDefaultTimeout);
-const Milliseconds kForceRefresh = LogicalSessionCacheImpl::kLogicalSessionDefaultRefresh;
+const Milliseconds kForceRefresh{kLogicalSessionRefreshMillisDefault};
 
 using SessionList = std::list<LogicalSessionId>;
 using unittest::EnsureFCV;
@@ -76,10 +77,15 @@ public:
         Client::releaseCurrent();
         Client::initThread(getThreadName());
         _opCtx = makeOperationContext();
-        auto mockService = stdx::make_unique<MockServiceLiaison>(_service);
-        auto mockSessions = stdx::make_unique<MockSessionsCollection>(_sessions);
-        _cache = stdx::make_unique<LogicalSessionCacheImpl>(
-            std::move(mockService), std::move(mockSessions), nullptr);
+
+        auto mockService = std::make_unique<MockServiceLiaison>(_service);
+        auto mockSessions = std::make_unique<MockSessionsCollection>(_sessions);
+        _cache = std::make_unique<LogicalSessionCacheImpl>(
+            std::move(mockService),
+            std::move(mockSessions),
+            [](OperationContext*, SessionsCollection&, Date_t) {
+                return 0; /* No op*/
+            });
     }
 
     void waitUntilRefreshScheduled() {
@@ -100,14 +106,6 @@ public:
         return _sessions;
     }
 
-    void setOpCtx() {
-        _opCtx = getClient()->makeOperationContext();
-    }
-
-    void clearOpCtx() {
-        _opCtx.reset();
-    }
-
     OperationContext* opCtx() {
         return _opCtx.get();
     }
@@ -121,22 +119,8 @@ private:
     std::unique_ptr<LogicalSessionCache> _cache;
 };
 
-// Test that the getFromCache method does not make calls to the sessions collection
-TEST_F(LogicalSessionCacheTest, TestCacheHitsOnly) {
-    auto lsid = makeLogicalSessionIdForTest();
-
-    // When the record is not present (and not in the sessions collection), returns an error
-    auto res = cache()->promote(lsid);
-    ASSERT(!res.isOK());
-
-    // When the record is not present (but is in the sessions collection), returns an error
-    sessions()->add(makeLogicalSessionRecord(lsid, service()->now()));
-    res = cache()->promote(lsid);
-    ASSERT(!res.isOK());
-}
-
 // Test that promoting from the cache updates the lastUse date of records
-TEST_F(LogicalSessionCacheTest, PromoteUpdatesLastUse) {
+TEST_F(LogicalSessionCacheTest, VivifyUpdatesLastUse) {
     auto lsid = makeLogicalSessionIdForTest();
 
     auto start = service()->now();
@@ -146,34 +130,23 @@ TEST_F(LogicalSessionCacheTest, PromoteUpdatesLastUse) {
 
     // Fast forward time and promote
     service()->fastForward(Milliseconds(500));
-    ASSERT(start != service()->now());
-    auto res = cache()->promote(lsid);
-    ASSERT(res.isOK());
+    ASSERT_OK(cache()->vivify(opCtx(), lsid));
 
     // Now that we promoted, lifetime of session should be extended
     service()->fastForward(kSessionTimeout - Milliseconds(500));
-    res = cache()->promote(lsid);
-    ASSERT(res.isOK());
+    ASSERT_OK(cache()->vivify(opCtx(), lsid));
 
     // We promoted again, so lifetime extended again
-    service()->fastForward(kSessionTimeout - Milliseconds(10));
-    res = cache()->promote(lsid);
-    ASSERT(res.isOK());
+    service()->fastForward(kSessionTimeout - Milliseconds(500));
+    ASSERT_OK(cache()->vivify(opCtx(), lsid));
 
     // Fast forward and promote
     service()->fastForward(kSessionTimeout - Milliseconds(10));
-    res = cache()->promote(lsid);
-    ASSERT(res.isOK());
+    ASSERT_OK(cache()->vivify(opCtx(), lsid));
 
     // Lifetime extended again
     service()->fastForward(Milliseconds(11));
-    res = cache()->promote(lsid);
-    ASSERT(res.isOK());
-
-    // Let record expire, we should still be able to get it, since cache didn't get cleared
-    service()->fastForward(kSessionTimeout + Milliseconds(1));
-    res = cache()->promote(lsid);
-    ASSERT(res.isOK());
+    ASSERT_OK(cache()->vivify(opCtx(), lsid));
 }
 
 // Test the startSession method
@@ -188,8 +161,7 @@ TEST_F(LogicalSessionCacheTest, StartSession) {
     ASSERT(!sessions()->has(lsid));
 
     // Do refresh, cached records should get flushed to collection.
-    clearOpCtx();
-    ASSERT(cache()->refreshNow(getClient()).isOK());
+    ASSERT(cache()->refreshNow(opCtx()).isOK());
     ASSERT(sessions()->has(lsid));
 
     // Try to start the same session again, should succeed.
@@ -214,17 +186,14 @@ TEST_F(LogicalSessionCacheTest, BasicSessionExpiration) {
     // Insert a lsid
     auto record = makeLogicalSessionRecordForTest();
     ASSERT_OK(cache()->startSession(opCtx(), record));
-    auto res = cache()->promote(record.getId());
-    ASSERT(res.isOK());
+    ASSERT_EQ(1UL, cache()->size());
 
     // Force it to expire
     service()->fastForward(Milliseconds(kSessionTimeout.count() + 5));
 
     // Check that it is no longer in the cache
-    ASSERT(cache()->refreshNow(getClient()).isOK());
-    res = cache()->promote(record.getId());
-    // TODO SERVER-29709
-    // ASSERT(!res.isOK());
+    ASSERT_OK(cache()->refreshNow(opCtx()));
+    ASSERT_EQ(0UL, cache()->size());
 }
 
 // Test large sets of cache-only session lsids
@@ -242,9 +211,8 @@ TEST_F(LogicalSessionCacheTest, ManySignedLsidsInCacheRefresh) {
     });
 
     // Force a refresh
-    clearOpCtx();
     service()->fastForward(kForceRefresh);
-    ASSERT(cache()->refreshNow(getClient()).isOK());
+    ASSERT_OK(cache()->refreshNow(opCtx()));
 }
 
 //
@@ -360,9 +328,8 @@ TEST_F(LogicalSessionCacheTest, RefreshMatrixSessionState) {
     }
 
     // Force a refresh
-    clearOpCtx();
     service()->fastForward(kForceRefresh);
-    ASSERT(cache()->refreshNow(getClient()).isOK());
+    ASSERT_OK(cache()->refreshNow(opCtx()));
 
     for (int i = 0; i < 32; i++) {
         std::stringstream failText;
@@ -373,8 +340,9 @@ TEST_F(LogicalSessionCacheTest, RefreshMatrixSessionState) {
         failText << " session case failed: ";
 
         ASSERT(sessions()->has(ids[i]) == testCases[i].inCollection)
-            << failText.str() << (testCases[i].inCollection ? "session wasn't in collection"
-                                                            : "session was in collection");
+            << failText.str()
+            << (testCases[i].inCollection ? "session wasn't in collection"
+                                          : "session was in collection");
         ASSERT((service()->matchKilled(ids[i]) != nullptr) == testCases[i].killed)
             << failText.str()
             << (testCases[i].killed ? "session wasn't killed" : "session was killed");

@@ -49,6 +49,7 @@
 #include "mongo/db/matcher/expression_parser.h"
 #include "mongo/db/matcher/extensions_callback_real.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/query/collection_query_info.h"
 #include "mongo/stdx/unordered_set.h"
 #include "mongo/util/log.h"
 
@@ -67,21 +68,18 @@ static Status getQuerySettingsAndPlanCache(OperationContext* opCtx,
                                            const string& ns,
                                            QuerySettings** querySettingsOut,
                                            PlanCache** planCacheOut) {
-    *querySettingsOut = NULL;
-    *planCacheOut = NULL;
-    if (NULL == collection) {
+    *querySettingsOut = nullptr;
+    *planCacheOut = nullptr;
+    if (nullptr == collection) {
         return Status(ErrorCodes::BadValue, "no such collection");
     }
 
-    CollectionInfoCache* infoCache = collection->infoCache();
-    invariant(infoCache);
-
-    QuerySettings* querySettings = infoCache->getQuerySettings();
+    QuerySettings* querySettings = CollectionQueryInfo::get(collection).getQuerySettings();
     invariant(querySettings);
 
     *querySettingsOut = querySettings;
 
-    PlanCache* planCache = infoCache->getPlanCache();
+    PlanCache* planCache = CollectionQueryInfo::get(collection).getPlanCache();
     invariant(planCache);
 
     *planCacheOut = planCache;
@@ -110,8 +108,8 @@ namespace mongo {
 
 using std::string;
 using std::stringstream;
-using std::vector;
 using std::unique_ptr;
+using std::vector;
 
 IndexFilterCommand::IndexFilterCommand(const string& name, const string& helpText)
     : BasicCommand(name), helpText(helpText) {}
@@ -266,7 +264,7 @@ Status ClearFilters::clear(OperationContext* opCtx,
         // Remove entry from plan cache
         planCache->remove(*cq).transitional_ignore();
 
-        LOG(0) << "Removed index filter on " << ns << " " << redact(cq->toStringShort());
+        LOG(0) << "Removed index filter on " << redact(cq->toStringShort());
 
         return Status::OK();
     }
@@ -303,7 +301,7 @@ Status ClearFilters::clear(OperationContext* opCtx,
         AllowedIndexEntry entry = *i;
 
         // Create canonical query.
-        auto qr = stdx::make_unique<QueryRequest>(nss);
+        auto qr = std::make_unique<QueryRequest>(nss);
         qr->setFilter(entry.query);
         qr->setSort(entry.sort);
         qr->setProj(entry.projection);
@@ -399,8 +397,7 @@ Status SetFilter::set(OperationContext* opCtx,
     // Remove entry from plan cache.
     planCache->remove(*cq).transitional_ignore();
 
-    LOG(0) << "Index filter set on " << ns << " " << redact(cq->toStringShort()) << " "
-           << indexesElt;
+    LOG(0) << "Index filter set on " << redact(cq->toStringShort()) << " " << indexesElt;
 
     return Status::OK();
 }

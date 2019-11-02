@@ -40,11 +40,11 @@ namespace mongo {
  */
 class DocumentSourceCheckInvalidate final : public DocumentSource {
 public:
-    GetNextResult getNext() final;
+    static constexpr StringData kStageName = "$_checkInvalidate"_sd;
 
     const char* getSourceName() const final {
         // This is used in error reporting.
-        return "$_checkInvalidate";
+        return DocumentSourceCheckInvalidate::kStageName.rawData();
     }
 
     StageConstraints constraints(Pipeline::SplitState pipeState) const final {
@@ -54,10 +54,11 @@ public:
                 DiskUseRequirement::kNoDiskUse,
                 FacetRequirement::kNotAllowed,
                 TransactionRequirement::kNotAllowed,
+                LookupRequirement::kNotAllowed,
                 ChangeStreamRequirement::kChangeStreamStage};
     }
 
-    boost::optional<MergingLogic> mergingLogic() final {
+    boost::optional<DistributedPlanLogic> distributedPlanLogic() final {
         return boost::none;
     }
 
@@ -68,8 +69,9 @@ public:
     }
 
     static boost::intrusive_ptr<DocumentSourceCheckInvalidate> create(
-        const boost::intrusive_ptr<ExpressionContext>& expCtx, bool ignoreFirstInvalidate) {
-        return new DocumentSourceCheckInvalidate(expCtx, ignoreFirstInvalidate);
+        const boost::intrusive_ptr<ExpressionContext>& expCtx,
+        boost::optional<ResumeTokenData> startAfterInvalidate) {
+        return new DocumentSourceCheckInvalidate(expCtx, std::move(startAfterInvalidate));
     }
 
 private:
@@ -77,11 +79,17 @@ private:
      * Use the create static method to create a DocumentSourceCheckInvalidate.
      */
     DocumentSourceCheckInvalidate(const boost::intrusive_ptr<ExpressionContext>& expCtx,
-                                  bool ignoreFirstInvalidate)
-        : DocumentSource(expCtx), _ignoreFirstInvalidate(ignoreFirstInvalidate) {}
+                                  boost::optional<ResumeTokenData> startAfterInvalidate)
+        : DocumentSource(kStageName, expCtx),
+          _startAfterInvalidate(std::move(startAfterInvalidate)) {
+        invariant(!_startAfterInvalidate ||
+                  _startAfterInvalidate->fromInvalidate == ResumeTokenData::kFromInvalidate);
+    }
 
+    GetNextResult doGetNext() final;
+
+    boost::optional<ResumeTokenData> _startAfterInvalidate;
     boost::optional<Document> _queuedInvalidate;
-    bool _ignoreFirstInvalidate;
 };
 
 }  // namespace mongo

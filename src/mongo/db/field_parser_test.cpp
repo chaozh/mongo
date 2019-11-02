@@ -79,9 +79,7 @@ protected:
         valLong = 1LL;
 
         doc = BSON(aBool(valBool) << anArray(valArray) << anObj(valObj) << aDate(valDate)
-                                  << aString(valString)
-                                  << anOID(valOID)
-                                  << aLong(valLong));
+                                  << aString(valString) << anOID(valOID) << aLong(valLong));
     }
 
     void tearDown() {}
@@ -180,31 +178,33 @@ TEST_F(ExtractionFixture, GetLong) {
 TEST_F(ExtractionFixture, IsFound) {
     bool bool_val;
     BSONField<bool> aBoolMissing("aBoolMissing");
-    ASSERT_EQUALS(FieldParser::extract(doc, aBool, &bool_val, NULL), FieldParser::FIELD_SET);
-    ASSERT_EQUALS(FieldParser::extract(doc, aBoolMissing, &bool_val, NULL),
+    ASSERT_EQUALS(FieldParser::extract(doc, aBool, &bool_val, nullptr), FieldParser::FIELD_SET);
+    ASSERT_EQUALS(FieldParser::extract(doc, aBoolMissing, &bool_val, nullptr),
                   FieldParser::FIELD_NONE);
 
     Date_t Date_t_val;
     BSONField<Date_t> aDateMissing("aDateMissing");
-    ASSERT_EQUALS(FieldParser::extract(doc, aDate, &Date_t_val, NULL), FieldParser::FIELD_SET);
-    ASSERT_EQUALS(FieldParser::extract(doc, aDateMissing, &Date_t_val, NULL),
+    ASSERT_EQUALS(FieldParser::extract(doc, aDate, &Date_t_val, nullptr), FieldParser::FIELD_SET);
+    ASSERT_EQUALS(FieldParser::extract(doc, aDateMissing, &Date_t_val, nullptr),
                   FieldParser::FIELD_NONE);
 
     string string_val;
     BSONField<string> aStringMissing("aStringMissing");
-    ASSERT_EQUALS(FieldParser::extract(doc, aString, &string_val, NULL), FieldParser::FIELD_SET);
-    ASSERT_EQUALS(FieldParser::extract(doc, aStringMissing, &string_val, NULL),
+    ASSERT_EQUALS(FieldParser::extract(doc, aString, &string_val, nullptr), FieldParser::FIELD_SET);
+    ASSERT_EQUALS(FieldParser::extract(doc, aStringMissing, &string_val, nullptr),
                   FieldParser::FIELD_NONE);
 
     OID OID_val;
     BSONField<OID> anOIDMissing("anOIDMissing");
-    ASSERT_EQUALS(FieldParser::extract(doc, anOID, &OID_val, NULL), FieldParser::FIELD_SET);
-    ASSERT_EQUALS(FieldParser::extract(doc, anOIDMissing, &OID_val, NULL), FieldParser::FIELD_NONE);
+    ASSERT_EQUALS(FieldParser::extract(doc, anOID, &OID_val, nullptr), FieldParser::FIELD_SET);
+    ASSERT_EQUALS(FieldParser::extract(doc, anOIDMissing, &OID_val, nullptr),
+                  FieldParser::FIELD_NONE);
 
     long long long_long_val;
     BSONField<long long> aLongMissing("aLongMissing");
-    ASSERT_EQUALS(FieldParser::extract(doc, aLong, &long_long_val, NULL), FieldParser::FIELD_SET);
-    ASSERT_EQUALS(FieldParser::extract(doc, aLongMissing, &long_long_val, NULL),
+    ASSERT_EQUALS(FieldParser::extract(doc, aLong, &long_long_val, nullptr),
+                  FieldParser::FIELD_SET);
+    ASSERT_EQUALS(FieldParser::extract(doc, aLongMissing, &long_long_val, nullptr),
                   FieldParser::FIELD_NONE);
 }
 
@@ -213,9 +213,10 @@ TEST(ComplexExtraction, GetStringVector) {
     BSONField<vector<string>> vectorField("testVector");
 
     BSONObjBuilder bob;
-    bob << vectorField() << BSON_ARRAY("a"
-                                       << "b"
-                                       << "c");
+    bob << vectorField()
+        << BSON_ARRAY("a"
+                      << "b"
+                      << "c");
     BSONObj obj = bob.obj();
 
     vector<string> parsedVector;
@@ -266,9 +267,10 @@ TEST(ComplexExtraction, RoundTripVector) {
     BSONObj obj;
     {
         BSONObjBuilder bob;
-        bob << vectorField() << BSON_ARRAY("a"
-                                           << "b"
-                                           << "c");
+        bob << vectorField()
+            << BSON_ARRAY("a"
+                          << "b"
+                          << "c");
         obj = bob.obj();
     }
 
@@ -295,12 +297,13 @@ TEST(ComplexExtraction, GetStringMap) {
     BSONField<map<string, string>> mapField("testMap");
 
     BSONObjBuilder bob;
-    bob << mapField() << BSON("a"
-                              << "a"
-                              << "b"
-                              << "b"
-                              << "c"
-                              << "c");
+    bob << mapField()
+        << BSON("a"
+                << "a"
+                << "b"
+                << "b"
+                << "c"
+                << "c");
     BSONObj obj = bob.obj();
 
     map<string, string> parsedMap;
@@ -317,14 +320,15 @@ TEST(ComplexExtraction, GetObjectMap) {
     BSONField<map<string, BSONObj>> mapField("testMap");
 
     BSONObjBuilder bob;
-    bob << mapField() << BSON("a" << BSON("a"
-                                          << "a")
-                                  << "b"
-                                  << BSON("b"
-                                          << "b")
-                                  << "c"
-                                  << BSON("c"
-                                          << "c"));
+    bob << mapField()
+        << BSON("a" << BSON("a"
+                            << "a")
+                    << "b"
+                    << BSON("b"
+                            << "b")
+                    << "c"
+                    << BSON("c"
+                            << "c"));
     BSONObj obj = bob.obj();
 
     map<string, BSONObj> parsedMap;
@@ -347,12 +351,11 @@ TEST(ComplexExtraction, GetBadMap) {
     BSONField<map<string, string>> mapField("testMap");
 
     BSONObjBuilder bob;
-    bob << mapField() << BSON("a"
-                              << "a"
-                              << "b"
-                              << 123
-                              << "c"
-                              << "c");
+    bob << mapField()
+        << BSON("a"
+                << "a"
+                << "b" << 123 << "c"
+                << "c");
     BSONObj obj = bob.obj();
 
     map<string, string> parsedMap;
@@ -369,12 +372,13 @@ TEST(ComplexExtraction, RoundTripMap) {
     BSONObj obj;
     {
         BSONObjBuilder bob;
-        bob << mapField() << BSON("a"
-                                  << "a"
-                                  << "b"
-                                  << "b"
-                                  << "c"
-                                  << "c");
+        bob << mapField()
+            << BSON("a"
+                    << "a"
+                    << "b"
+                    << "b"
+                    << "c"
+                    << "c");
         obj = bob.obj();
     }
 
@@ -430,9 +434,7 @@ TEST(ComplexExtraction, GetBadNestedMap) {
 
     BSONObj nestedMapObj = BSON("a"
                                 << "a"
-                                << "b"
-                                << 123
-                                << "c"
+                                << "b" << 123 << "c"
                                 << "c");
 
     BSONObjBuilder bob;

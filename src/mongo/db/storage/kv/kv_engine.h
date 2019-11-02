@@ -39,6 +39,8 @@
 #include "mongo/db/catalog/collection_options.h"
 #include "mongo/db/storage/kv/kv_prefix.h"
 #include "mongo/db/storage/record_store.h"
+#include "mongo/db/storage/sorted_data_interface.h"
+#include "mongo/db/storage/storage_engine.h"
 
 namespace mongo {
 
@@ -46,14 +48,23 @@ class IndexDescriptor;
 class JournalListener;
 class OperationContext;
 class RecoveryUnit;
-class SortedDataInterface;
 class SnapshotManager;
 
 class KVEngine {
 public:
-    virtual RecoveryUnit* newRecoveryUnit() = 0;
+    /**
+     * This function should only be called after the StorageEngine is set on the ServiceContext.
+     *
+     * Starts asycnhronous threads for a storage engine's integration layer. Any such thread
+     * generating an OperationContext should be initialized here.
+     *
+     * In order for OperationContexts to be generated with real Locker objects, the generation must
+     * occur after the StorageEngine is instantiated and set on the ServiceContext. Otherwise,
+     * OperationContexts are created with LockerNoops.
+     */
+    virtual void startAsyncThreads() {}
 
-    // ---------
+    virtual RecoveryUnit* newRecoveryUnit() = 0;
 
     /**
      * Requesting multiple copies for the same ns/ident is a rules violation; Calling on a
@@ -86,9 +97,8 @@ public:
         return getRecordStore(opCtx, ns, ident, options);
     }
 
-    virtual SortedDataInterface* getSortedDataInterface(OperationContext* opCtx,
-                                                        StringData ident,
-                                                        const IndexDescriptor* desc) = 0;
+    virtual std::unique_ptr<SortedDataInterface> getSortedDataInterface(
+        OperationContext* opCtx, StringData ident, const IndexDescriptor* desc) = 0;
 
     /**
      * Get a SortedDataInterface that may share an underlying table with other
@@ -99,17 +109,15 @@ public:
      *        between indexes sharing an underlying table. A value of `KVPrefix::kNotPrefixed`
      *        guarantees the index is the sole resident of the table.
      */
-    virtual SortedDataInterface* getGroupedSortedDataInterface(OperationContext* opCtx,
-                                                               StringData ident,
-                                                               const IndexDescriptor* desc,
-                                                               KVPrefix prefix) {
+    virtual std::unique_ptr<SortedDataInterface> getGroupedSortedDataInterface(
+        OperationContext* opCtx, StringData ident, const IndexDescriptor* desc, KVPrefix prefix) {
         invariant(prefix == KVPrefix::kNotPrefixed);
         return getSortedDataInterface(opCtx, ident, desc);
     }
 
     /**
      * The create and drop methods on KVEngine are not transactional. Transactional semantics
-     * are provided by the KVStorageEngine code that calls these. For example, drop will be
+     * are provided by the StorageEngine code that calls these. For example, drop will be
      * called if a create is rolled back. A higher-level drop operation will only propagate to a
      * drop call on the KVEngine once the WUOW commits. Therefore drops will never be rolled
      * back and it is safe to immediately reclaim storage.
@@ -143,6 +151,7 @@ public:
     }
 
     virtual Status createSortedDataInterface(OperationContext* opCtx,
+                                             const CollectionOptions& collOptions,
                                              StringData ident,
                                              const IndexDescriptor* desc) = 0;
 
@@ -157,11 +166,12 @@ public:
      *        share a table. Sharing indexes belonging to different databases is forbidden.
      */
     virtual Status createGroupedSortedDataInterface(OperationContext* opCtx,
+                                                    const CollectionOptions& collOptions,
                                                     StringData ident,
                                                     const IndexDescriptor* desc,
                                                     KVPrefix prefix) {
         invariant(prefix == KVPrefix::kNotPrefixed);
-        return createSortedDataInterface(opCtx, ident, desc);
+        return createSortedDataInterface(opCtx, collOptions, ident, desc);
     }
 
     virtual int64_t getIdentSize(OperationContext* opCtx, StringData ident) = 0;
@@ -185,20 +195,15 @@ public:
      * it still exists when recovered.
      */
     virtual Status recoverOrphanedIdent(OperationContext* opCtx,
-                                        StringData ns,
+                                        const NamespaceString& nss,
                                         StringData ident,
                                         const CollectionOptions& options) {
-        auto status = createRecordStore(opCtx, ns, ident, options);
+        auto status = createRecordStore(opCtx, nss.ns(), ident, options);
         if (status.isOK()) {
             return {ErrorCodes::DataModifiedByRepair, "Orphan recovery created a new record store"};
         }
         return status;
     }
-
-
-    virtual void alterIdentMetadata(OperationContext* opCtx,
-                                    StringData ident,
-                                    const IndexDescriptor* desc){};
 
     // optional
     virtual int flushAllFiles(OperationContext* opCtx, bool sync) {
@@ -220,7 +225,8 @@ public:
         MONGO_UNREACHABLE;
     }
 
-    virtual StatusWith<std::vector<std::string>> beginNonBlockingBackup(OperationContext* opCtx) {
+    virtual StatusWith<std::vector<StorageEngine::BackupBlock>> beginNonBlockingBackup(
+        OperationContext* opCtx) {
         return Status(ErrorCodes::CommandNotSupported,
                       "The current storage engine doesn't support backup mode");
     }
@@ -232,6 +238,37 @@ public:
     virtual StatusWith<std::vector<std::string>> extendBackupCursor(OperationContext* opCtx) {
         return Status(ErrorCodes::CommandNotSupported,
                       "The current storage engine doesn't support backup mode");
+    }
+
+    /**
+     * See StorageEngine::getCheckpointLock for details.
+     */
+    virtual std::unique_ptr<StorageEngine::CheckpointLock> getCheckpointLock(
+        OperationContext* opCtx) {
+        uasserted(ErrorCodes::CommandNotSupported,
+                  "The current storage engine does not support checkpoints");
+    }
+
+    virtual void addIndividuallyCheckpointedIndexToList(const std::string& ident) {
+        uasserted(ErrorCodes::CommandNotSupported,
+                  "The current storage engine does not support checkpoints");
+    }
+
+    virtual void clearIndividuallyCheckpointedIndexesList() {
+        uasserted(ErrorCodes::CommandNotSupported,
+                  "The current storage engine does not support checkpoints");
+    }
+
+    virtual bool isInIndividuallyCheckpointedIndexesList(const std::string& ident) const {
+        uasserted(ErrorCodes::CommandNotSupported,
+                  "The current storage engine does not support checkpoints");
+    }
+
+    /**
+     * Returns whether the KVEngine supports checkpoints.
+     */
+    virtual bool supportsCheckpoints() const {
+        return false;
     }
 
     virtual bool isDurable() const = 0;
@@ -307,9 +344,7 @@ public:
     /**
      * See `StorageEngine::setStableTimestamp`
      */
-    virtual void setStableTimestamp(Timestamp stableTimestamp,
-                                    boost::optional<Timestamp> maximumTruncationTimestamp,
-                                    bool force) {}
+    virtual void setStableTimestamp(Timestamp stableTimestamp, bool force) {}
 
     /**
      * See `StorageEngine::setInitialDataTimestamp`
@@ -320,6 +355,12 @@ public:
      * See `StorageEngine::setOldestTimestampFromStable`
      */
     virtual void setOldestTimestampFromStable() {}
+
+    /**
+     * See `StorageEngine::setOldestActiveTransactionTimestampCallback`
+     */
+    virtual void setOldestActiveTransactionTimestampCallback(
+        StorageEngine::OldestActiveTransactionTimestampCallback callback){};
 
     /**
      * See `StorageEngine::setOldestTimestamp`
@@ -374,14 +415,19 @@ public:
     }
 
     /**
-     * See `StorageEngine::getAllCommittedTimestamp`
+     * See `StorageEngine::getAllDurableTimestamp`
      */
-    virtual Timestamp getAllCommittedTimestamp() const = 0;
+    virtual Timestamp getAllDurableTimestamp() const = 0;
 
     /**
      * See `StorageEngine::getOldestOpenReadTimestamp`
      */
     virtual Timestamp getOldestOpenReadTimestamp() const = 0;
+
+    /**
+     * See `StorageEngine::getOplogNeededForCrashRecovery`
+     */
+    virtual boost::optional<Timestamp> getOplogNeededForCrashRecovery() const = 0;
 
     /**
      * See `StorageEngine::supportsReadConcernSnapshot`
@@ -391,6 +437,13 @@ public:
     }
 
     virtual bool supportsReadConcernMajority() const {
+        return false;
+    }
+
+    /**
+     * See `StorageEngine::supportsOplogStones`
+     */
+    virtual bool supportsOplogStones() const {
         return false;
     }
 
@@ -427,4 +480,4 @@ protected:
      */
     const int64_t kDefaultCappedSizeBytes = 4096;
 };
-}
+}  // namespace mongo

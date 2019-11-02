@@ -39,6 +39,8 @@
 #include "mongo/db/curop_failpoint_helpers.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/exec/count.h"
+#include "mongo/db/query/collection_query_info.h"
+#include "mongo/db/query/count_command_as_aggregation_command.h"
 #include "mongo/db/query/explain.h"
 #include "mongo/db/query/get_executor.h"
 #include "mongo/db/query/plan_summary_stats.h"
@@ -50,9 +52,9 @@
 namespace mongo {
 namespace {
 
-using std::unique_ptr;
 using std::string;
 using std::stringstream;
+using std::unique_ptr;
 
 // Failpoint which causes to hang "count" cmd after acquiring the DB lock.
 MONGO_FAIL_POINT_DEFINE(hangBeforeCollectionCount);
@@ -72,6 +74,10 @@ public:
         return false;
     }
 
+    bool canIgnorePrepareConflicts() const override {
+        return true;
+    }
+
     AllowedOnSecondary secondaryAllowed(ServiceContext* serviceContext) const override {
         return Command::AllowedOnSecondary::kOptIn;
     }
@@ -84,10 +90,11 @@ public:
         return false;
     }
 
-    bool supportsReadConcern(const std::string& dbName,
-                             const BSONObj& cmdObj,
-                             repl::ReadConcernLevel level) const override {
-        return level != repl::ReadConcernLevel::kSnapshotReadConcern;
+    ReadConcernSupportResult supportsReadConcern(const std::string& dbName,
+                                                 const BSONObj& cmdObj,
+                                                 repl::ReadConcernLevel level) const override {
+        return {ReadConcernSupportResult::ReadConcern::kSupported,
+                ReadConcernSupportResult::DefaultReadConcern::kPermitted};
     }
 
     ReadWriteType getReadWriteType() const override {
@@ -105,8 +112,8 @@ public:
 
         const auto hasTerm = false;
         return authSession->checkAuthForFind(
-            AutoGetCollection::resolveNamespaceStringOrUUID(
-                opCtx, CommandHelpers::parseNsOrUUID(dbname, cmdObj)),
+            CollectionCatalog::get(opCtx).resolveNamespaceStringOrUUID(
+                CommandHelpers::parseNsOrUUID(dbname, cmdObj)),
             hasTerm);
     }
 
@@ -124,23 +131,24 @@ public:
                     AutoGetCollection::ViewMode::kViewsPermitted);
         const auto nss = ctx->getNss();
 
-        const bool isExplain = true;
-        auto request = CountRequest::parseFromBSON(nss, cmdObj, isExplain);
-        if (!request.isOK()) {
-            return request.getStatus();
+        CountCommand request(NamespaceStringOrUUID(NamespaceString{}));
+        try {
+            request = CountCommand::parse(IDLParserErrorContext("count"), opMsgRequest);
+        } catch (...) {
+            return exceptionToStatus();
         }
 
         if (ctx->getView()) {
             // Relinquish locks. The aggregation command will re-acquire them.
             ctx.reset();
 
-            auto viewAggregation = request.getValue().asAggregationCommand();
+            auto viewAggregation = countCommandAsAggregationCommand(request, nss);
             if (!viewAggregation.isOK()) {
                 return viewAggregation.getStatus();
             }
 
-            auto viewAggRequest = AggregationRequest::parseFromBSON(
-                request.getValue().getNs(), viewAggregation.getValue(), verbosity);
+            auto viewAggRequest =
+                AggregationRequest::parseFromBSON(nss, viewAggregation.getValue(), verbosity);
             if (!viewAggRequest.isOK()) {
                 return viewAggRequest.getStatus();
             }
@@ -162,7 +170,7 @@ public:
         auto rangePreserver = CollectionShardingState::get(opCtx, nss)->getCurrentMetadata();
 
         auto statusWithPlanExecutor =
-            getExecutorCount(opCtx, collection, request.getValue(), true /*explain*/);
+            getExecutorCount(opCtx, collection, request, true /*explain*/, nss);
         if (!statusWithPlanExecutor.isOK()) {
             return statusWithPlanExecutor.getStatus();
         }
@@ -170,7 +178,7 @@ public:
         auto exec = std::move(statusWithPlanExecutor.getValue());
 
         auto bodyBuilder = result->getBodyBuilder();
-        Explain::explainStages(exec.get(), collection, verbosity, &bodyBuilder);
+        Explain::explainStages(exec.get(), collection, verbosity, BSONObj(), &bodyBuilder);
         return Status::OK();
     }
 
@@ -185,14 +193,12 @@ public:
         ctx.emplace(opCtx,
                     CommandHelpers::parseNsOrUUID(dbname, cmdObj),
                     AutoGetCollection::ViewMode::kViewsPermitted);
-        const auto nss = ctx->getNss();
+        const auto& nss = ctx->getNss();
 
         CurOpFailpointHelpers::waitWhileFailPointEnabled(
             &hangBeforeCollectionCount, opCtx, "hangBeforeCollectionCount", []() {}, false, nss);
 
-        const bool isExplain = false;
-        auto request = CountRequest::parseFromBSON(nss, cmdObj, isExplain);
-        uassertStatusOK(request.getStatus());
+        auto request = CountCommand::parse(IDLParserErrorContext("count"), cmdObj);
 
         // Check whether we are allowed to read from this node after acquiring our locks.
         auto replCoord = repl::ReplicationCoordinator::get(opCtx);
@@ -200,10 +206,11 @@ public:
             opCtx, nss, ReadPreferenceSetting::get(opCtx).canRunOnSecondary()));
 
         if (ctx->getView()) {
+            auto viewAggregation = countCommandAsAggregationCommand(request, nss);
+
             // Relinquish locks. The aggregation command will re-acquire them.
             ctx.reset();
 
-            auto viewAggregation = request.getValue().asAggregationCommand();
             uassertStatusOK(viewAggregation.getStatus());
 
             BSONObj aggResult = CommandHelpers::runCommandDirectly(
@@ -220,7 +227,7 @@ public:
         auto rangePreserver = CollectionShardingState::get(opCtx, nss)->getCurrentMetadata();
 
         auto statusWithPlanExecutor =
-            getExecutorCount(opCtx, collection, request.getValue(), false /*explain*/);
+            getExecutorCount(opCtx, collection, request, false /*explain*/, nss);
         uassertStatusOK(statusWithPlanExecutor.getStatus());
 
         auto exec = std::move(statusWithPlanExecutor.getValue());
@@ -238,7 +245,7 @@ public:
         PlanSummaryStats summaryStats;
         Explain::getSummaryStats(*exec, &summaryStats);
         if (collection) {
-            collection->infoCache()->notifyOfQuery(opCtx, summaryStats.indexesUsed);
+            CollectionQueryInfo::get(collection).notifyOfQuery(opCtx, summaryStats);
         }
         curOp->debug().setPlanSummaryMetrics(summaryStats);
 

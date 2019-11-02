@@ -38,18 +38,17 @@ namespace mongo {
 namespace {
 
 MONGO_INIT_REGISTER_ERROR_EXTRA_INFO(WouldChangeOwningShardInfo);
-constexpr StringData kOriginalQueryPredicate = "originalQueryPredicate"_sd;
-constexpr StringData kOriginalUpdate = "originalUpdate"_sd;
+
+constexpr StringData kPreImage = "preImage"_sd;
 constexpr StringData kPostImage = "postImage"_sd;
+constexpr StringData kShouldUpsert = "shouldUpsert"_sd;
 
 }  // namespace
 
 void WouldChangeOwningShardInfo::serialize(BSONObjBuilder* bob) const {
-    bob->append(kOriginalQueryPredicate, _originalQueryPredicate);
-    if (_originalUpdate)
-        bob->append(kOriginalUpdate, _originalUpdate.get());
-    if (_postImage)
-        bob->append(kPostImage, _postImage.get());
+    bob->append(kPreImage, _preImage);
+    bob->append(kPostImage, _postImage);
+    bob->append(kShouldUpsert, _shouldUpsert);
 }
 
 std::shared_ptr<const ErrorExtraInfo> WouldChangeOwningShardInfo::parse(const BSONObj& obj) {
@@ -57,15 +56,9 @@ std::shared_ptr<const ErrorExtraInfo> WouldChangeOwningShardInfo::parse(const BS
 }
 
 WouldChangeOwningShardInfo WouldChangeOwningShardInfo::parseFromCommandError(const BSONObj& obj) {
-    boost::optional<BSONObj> originalUpdate = boost::none;
-    boost::optional<BSONObj> postImage = boost::none;
-    if (obj[kOriginalUpdate])
-        originalUpdate = obj[kOriginalUpdate].Obj().getOwned();
-    if (obj[kPostImage])
-        postImage = obj[kPostImage].Obj().getOwned();
-
-    return WouldChangeOwningShardInfo(
-        obj[kOriginalQueryPredicate].Obj().getOwned(), originalUpdate, postImage);
+    return WouldChangeOwningShardInfo(obj[kPreImage].Obj().getOwned(),
+                                      obj[kPostImage].Obj().getOwned(),
+                                      obj[kShouldUpsert].Bool());
 }
 
 }  // namespace mongo

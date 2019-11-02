@@ -1,5 +1,5 @@
 //
-// @tags: [SERVER-32709]
+// @tags: [SERVER-40561]
 //
 
 t = db.geo_polygon4;
@@ -13,7 +13,7 @@ for (x = -180; x < 180; x += .5) {
         bulk.insert(o);
     }
 }
-assert.writeOK(bulk.execute());
+assert.commandWorked(bulk.execute());
 
 var numTests = 31;
 for (var n = 0; n < numTests; n++) {
@@ -51,14 +51,13 @@ for (var n = 0; n < numTests; n++) {
             341,
             "Square Missing Chunk Test",
             true);
-        assert.between(
-            21 - 2,
-            t.find({
-                 loc: {"$within": {"$polygon": [[0, 0], [0, 2], [2, 2], [2, 0], [1, 1]]}}
-             }).count(),
-            21,
-            "Square Missing Chunk Test 2",
-            true);
+        assert.between(21 - 2,
+                       t.find({
+                            loc: {"$within": {"$polygon": [[0, 0], [0, 2], [2, 2], [2, 0], [1, 1]]}}
+                        }).count(),
+                       21,
+                       "Square Missing Chunk Test 2",
+                       true);
     }
 
     assert.eq(1,

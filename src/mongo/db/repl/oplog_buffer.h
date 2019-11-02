@@ -34,7 +34,6 @@
 #include <vector>
 
 #include "mongo/base/counter.h"
-#include "mongo/base/disallow_copying.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/util/time_support.h"
 
@@ -51,7 +50,8 @@ namespace repl {
  * Implementations are only required to support one pusher and one popper.
  */
 class OplogBuffer {
-    MONGO_DISALLOW_COPYING(OplogBuffer);
+    OplogBuffer(const OplogBuffer&) = delete;
+    OplogBuffer& operator=(const OplogBuffer&) = delete;
 
 public:
     /**
@@ -89,26 +89,11 @@ public:
     virtual void shutdown(OperationContext* opCtx) = 0;
 
     /**
-     * Pushes operation into oplog buffer, ignoring any size constraints. Does not block.
-     * If the oplog buffer is already full, this will cause the size of the oplog buffer to exceed
-     * the limit returned by getMaxSize() but should not otherwise adversely affect normal
-     * functionality such as pushing and popping operations from the oplog buffer.
-     */
-    virtual void pushEvenIfFull(OperationContext* opCtx, const Value& value) = 0;
-
-    /**
-     * Pushes operation into oplog buffer.
-     * If there are size constraints on the oplog buffer, this may block until sufficient space
-     * is made available (by popping) to complete this operation.
-     */
-    virtual void push(OperationContext* opCtx, const Value& value) = 0;
-
-    /**
      * Pushes operations in the iterator range [begin, end) into the oplog buffer without blocking.
      */
-    virtual void pushAllNonBlocking(OperationContext* opCtx,
-                                    Batch::const_iterator begin,
-                                    Batch::const_iterator end) = 0;
+    virtual void push(OperationContext* opCtx,
+                      Batch::const_iterator begin,
+                      Batch::const_iterator end) = 0;
 
     /**
      * Returns when enough space is available.

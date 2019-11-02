@@ -44,7 +44,8 @@ namespace mongo {
  * variable, which can be waited on.
  */
 class CondVarLockGrantNotification : public LockGrantNotification {
-    MONGO_DISALLOW_COPYING(CondVarLockGrantNotification);
+    CondVarLockGrantNotification(const CondVarLockGrantNotification&) = delete;
+    CondVarLockGrantNotification& operator=(const CondVarLockGrantNotification&) = delete;
 
 public:
     CondVarLockGrantNotification();
@@ -74,7 +75,7 @@ private:
     virtual void notify(ResourceId resId, LockResult result);
 
     // These two go together to implement the conditional variable pattern.
-    stdx::mutex _mutex;
+    Mutex _mutex = MONGO_MAKE_LATCH("CondVarLockGrantNotification::_mutex");
     stdx::condition_variable _cond;
 
     // Result from the last call to notify
@@ -128,19 +129,14 @@ public:
         _maxLockTimeout = boost::none;
     }
 
-    virtual void lockGlobal(OperationContext* opCtx, LockMode mode);
-    virtual void lockGlobal(LockMode mode) {
-        return lockGlobal(nullptr, mode);
-    }
-    virtual LockResult lockGlobalBegin(OperationContext* opCtx, LockMode mode, Date_t deadline) {
-        return _lockGlobalBegin(opCtx, mode, deadline);
-    }
-    virtual LockResult lockGlobalBegin(LockMode mode, Date_t deadline) {
-        return _lockGlobalBegin(nullptr, mode, deadline);
-    }
-    virtual void lockGlobalComplete(OperationContext* opCtx, Date_t deadline);
-    virtual void lockGlobalComplete(Date_t deadline) {
-        lockGlobalComplete(nullptr, deadline);
+    /**
+     * Acquires the ticket within the deadline (or _maxLockTimeout) and tries to grab the lock.
+     */
+    virtual void lockGlobal(OperationContext* opCtx,
+                            LockMode mode,
+                            Date_t deadline = Date_t::max());
+    virtual void lockGlobal(LockMode mode, Date_t deadline = Date_t::max()) {
+        return lockGlobal(nullptr, mode, deadline);
     }
 
     virtual bool unlockGlobal();
@@ -156,6 +152,14 @@ public:
     virtual bool inAWriteUnitOfWork() const {
         return _wuowNestingLevel > 0;
     }
+
+    bool wasGlobalLockTakenForWrite() const override;
+
+    bool wasGlobalLockTakenInModeConflictingWithWrites() const override;
+
+    bool wasGlobalLockTaken() const override;
+
+    void setGlobalLockTakenInMode(LockMode mode) override;
 
     /**
      * Requests a lock for resource 'resId' with mode 'mode'. An OperationContext 'opCtx' must be
@@ -195,79 +199,90 @@ public:
         restoreLockState(nullptr, stateToRestore);
     }
 
-    bool releaseWriteUnitOfWork(LockSnapshot* stateOut) override;
-    void restoreWriteUnitOfWork(OperationContext* opCtx,
-                                const LockSnapshot& stateToRestore) override;
+    bool releaseWriteUnitOfWorkAndUnlock(LockSnapshot* stateOut) override;
+    void restoreWriteUnitOfWorkAndLock(OperationContext* opCtx,
+                                       const LockSnapshot& stateToRestore) override;
+
+    void releaseWriteUnitOfWork(WUOWLockSnapshot* stateOut) override;
+    void restoreWriteUnitOfWork(const WUOWLockSnapshot& stateToRestore) override;
 
     virtual void releaseTicket();
     virtual void reacquireTicket(OperationContext* opCtx);
 
-    /**
-     * Allows for lock requests to be requested in a non-blocking way. There can be only one
-     * outstanding pending lock request per locker object.
-     *
-     * lockBegin posts a request to the lock manager for the specified lock to be acquired,
-     * which either immediately grants the lock, or puts the requestor on the conflict queue
-     * and returns immediately with the result of the acquisition. The result can be one of:
-     *
-     * LOCK_OK - Nothing more needs to be done. The lock is granted.
-     * LOCK_WAITING - The request has been queued up and will be granted as soon as the lock
-     *      is free. If this result is returned, typically lockComplete needs to be called in
-     *      order to wait for the actual grant to occur. If the caller no longer needs to wait
-     *      for the grant to happen, unlock needs to be called with the same resource passed
-     *      to lockBegin.
-     *
-     * In other words for each call to lockBegin, which does not return LOCK_OK, there needs to
-     * be a corresponding call to either lockComplete or unlock.
-     *
-     * If an operation context is provided that represents an interrupted operation, lockBegin will
-     * throw an exception whenever it would have been possible to grant the lock with LOCK_OK. This
-     * behavior can be disabled with an UninterruptibleLockGuard.
-     *
-     * NOTE: These methods are not public and should only be used inside the class
-     * implementation and for unit-tests and not called directly.
-     */
-    LockResult lockBegin(OperationContext* opCtx, ResourceId resId, LockMode mode);
+    void getFlowControlTicket(OperationContext* opCtx, LockMode lockMode) override;
 
-    /**
-     * Waits for the completion of a lock, previously requested through lockBegin or
-     * lockGlobalBegin. Must only be called, if lockBegin returned LOCK_WAITING.
-     *
-     * @param opCtx Operation context that, if not null, will be used to allow interruptible lock
-     * acquisition.
-     * @param resId Resource id which was passed to an earlier lockBegin call. Must match.
-     * @param mode Mode which was passed to an earlier lockBegin call. Must match.
-     * @param deadline The absolute time point when this lock acquisition will time out, if not yet
-     * granted.
-     *
-     * Throws an exception if it is interrupted.
-     */
-    void lockComplete(OperationContext* opCtx, ResourceId resId, LockMode mode, Date_t deadline);
-
-    void lockComplete(ResourceId resId, LockMode mode, Date_t deadline) {
-        lockComplete(nullptr, resId, mode, deadline);
+    FlowControlTicketholder::CurOp getFlowControlStats() const override {
+        return _flowControlStats;
     }
 
-    /**
-     * This function is for unit testing only.
-     */
+    //
+    // Below functions are for testing only.
+    //
+
     FastMapNoAlloc<ResourceId, LockRequest> getRequestsForTest() const {
         scoped_spinlock scopedLock(_lock);
         return _requests;
+    }
+
+    LockResult lockBeginForTest(OperationContext* opCtx, ResourceId resId, LockMode mode) {
+        return _lockBegin(opCtx, resId, mode);
+    }
+
+    void lockCompleteForTest(OperationContext* opCtx,
+                             ResourceId resId,
+                             LockMode mode,
+                             Date_t deadline) {
+        _lockComplete(opCtx, resId, mode, deadline);
     }
 
 private:
     typedef FastMapNoAlloc<ResourceId, LockRequest> LockRequestsMap;
 
     /**
-     * Acquires the ticket within the deadline (or _maxLockTimeout) and tries to grab the lock.
+     * Allows for lock requests to be requested in a non-blocking way. There can be only one
+     * outstanding pending lock request per locker object.
      *
-     * Returns LOCK_OK if successfully acquired the global lock,
-     *      or LOCK_WAITING if the global lock is currently held by someone else.
+     * _lockBegin posts a request to the lock manager for the specified lock to be acquired,
+     * which either immediately grants the lock, or puts the requestor on the conflict queue
+     * and returns immediately with the result of the acquisition. The result can be one of:
      *
-     * The ticket acquisition can be interrupted (by killOp/timeout), thus throwing an exception.
+     * LOCK_OK - Nothing more needs to be done. The lock is granted.
+     * LOCK_WAITING - The request has been queued up and will be granted as soon as the lock
+     *      is free. If this result is returned, typically _lockComplete needs to be called in
+     *      order to wait for the actual grant to occur. If the caller no longer needs to wait
+     *      for the grant to happen, unlock needs to be called with the same resource passed
+     *      to _lockBegin.
+     *
+     * In other words for each call to _lockBegin, which does not return LOCK_OK, there needs to
+     * be a corresponding call to either _lockComplete or unlock.
+     *
+     * If an operation context is provided that represents an interrupted operation, _lockBegin will
+     * throw an exception whenever it would have been possible to grant the lock with LOCK_OK. This
+     * behavior can be disabled with an UninterruptibleLockGuard.
+     *
+     * NOTE: These methods are not public and should only be used inside the class
+     * implementation and for unit-tests and not called directly.
      */
-    LockResult _lockGlobalBegin(OperationContext* opCtx, LockMode, Date_t deadline);
+    LockResult _lockBegin(OperationContext* opCtx, ResourceId resId, LockMode mode);
+
+    /**
+     * Waits for the completion of a lock, previously requested through _lockBegin/
+     * Must only be called, if _lockBegin returned LOCK_WAITING.
+     *
+     * @param opCtx Operation context that, if not null, will be used to allow interruptible lock
+     * acquisition.
+     * @param resId Resource id which was passed to an earlier _lockBegin call. Must match.
+     * @param mode Mode which was passed to an earlier _lockBegin call. Must match.
+     * @param deadline The absolute time point when this lock acquisition will time out, if not yet
+     * granted.
+     *
+     * Throws an exception if it is interrupted.
+     */
+    void _lockComplete(OperationContext* opCtx, ResourceId resId, LockMode mode, Date_t deadline);
+
+    void _lockComplete(ResourceId resId, LockMode mode, Date_t deadline) {
+        _lockComplete(nullptr, resId, mode, deadline);
+    }
 
     /**
      * The main functionality of the unlock method, except accepts iterator in order to avoid
@@ -346,6 +361,16 @@ private:
     // for example, lock attempts will time out immediately if the lock is not immediately
     // available. Note this will be ineffective if uninterruptible lock guard is set.
     boost::optional<Milliseconds> _maxLockTimeout;
+
+    // A structure for accumulating time spent getting flow control tickets.
+    FlowControlTicketholder::CurOp _flowControlStats;
+
+    // Tracks the global lock modes ever acquired in this Locker's life. This value should only ever
+    // be accessed from the thread that owns the Locker.
+    unsigned char _globalLockMode = (1 << MODE_NONE);
+
+    // Tracks whether this operation should be killed on step down.
+    AtomicWord<bool> _wasGlobalLockTakenInModeConflictingWithWrites{false};
 
     //////////////////////////////////////////////////////////////////////////////////////////
     //

@@ -78,6 +78,28 @@ public:
     }
 
     /**
+     * Get the subpath including path elements [0, n].
+     */
+    StringData getSubpath(size_t n) const {
+        invariant(n + 1 < _fieldPathDotPosition.size());
+        return StringData(_fieldPath.c_str(), _fieldPathDotPosition[n + 1]);
+    }
+
+    /**
+     * Return the first path component.
+     */
+    StringData front() const {
+        return getFieldName(0);
+    }
+
+    /**
+     * Return the last path component.
+     */
+    StringData back() const {
+        return getFieldName(getPathLength() - 1);
+    }
+
+    /**
      * Return the ith field name from this path using zero-based indexes.
      */
     StringData getFieldName(size_t i) const {
@@ -109,7 +131,19 @@ public:
         return {_fieldPath.substr(_fieldPathDotPosition[1] + 1)};
     }
 
+    /**
+     * Returns a FieldPath like this, but missing the last element.
+     */
+    FieldPath withoutLastElement() const {
+        return FieldPath(getSubpath(getPathLength() - 2));
+    }
+
+    FieldPath concat(const FieldPath& tail) const;
+
 private:
+    FieldPath(std::string string, std::vector<size_t> dots)
+        : _fieldPath(std::move(string)), _fieldPathDotPosition(std::move(dots)) {}
+
     static const char prefix = '$';
 
     // Contains the full field path, with each field delimited by a '.' character.
@@ -128,4 +162,4 @@ inline bool operator<(const FieldPath& lhs, const FieldPath& rhs) {
 inline bool operator==(const FieldPath& lhs, const FieldPath& rhs) {
     return lhs.fullPath() == rhs.fullPath();
 }
-}
+}  // namespace mongo

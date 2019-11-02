@@ -55,7 +55,7 @@ constexpr auto OptionParserTest = moe::OptionSection::OptionParserUsageType::Opt
 
 class OptionsParserTester : public moe::OptionsParser {
 public:
-    Status readConfigFile(const std::string& filename, std::string* config) {
+    Status readConfigFile(const std::string& filename, std::string* config, ConfigExpand) {
         if (filename != _filename) {
             ::mongo::StringBuilder sb;
             sb << "Parser using filename: " << filename
@@ -3473,7 +3473,6 @@ TEST(Constraints, MutuallyExclusiveConstraint) {
 
     ASSERT_OK(parser.run(testOpts, argv, env_map, &environment));
     ASSERT_NOT_OK(environment.validate());
-    ;
 
     environment = moe::Environment();
     argv.clear();
@@ -3482,7 +3481,6 @@ TEST(Constraints, MutuallyExclusiveConstraint) {
 
     ASSERT_OK(parser.run(testOpts, argv, env_map, &environment));
     ASSERT_OK(environment.validate());
-    ;
     ASSERT_OK(environment.get(moe::Key("option1"), &value));
 
     environment = moe::Environment();
@@ -3492,7 +3490,6 @@ TEST(Constraints, MutuallyExclusiveConstraint) {
 
     ASSERT_OK(parser.run(testOpts, argv, env_map, &environment));
     ASSERT_OK(environment.validate());
-    ;
     ASSERT_OK(environment.get(moe::Key("section.option2"), &value));
 }
 
@@ -3506,7 +3503,7 @@ TEST(Constraints, RequiresOtherConstraint) {
     moe::OptionSection testOpts;
     testOpts
         .addOptionChaining("option1", "option1", moe::Switch, "Option1", {}, {}, OptionParserTest)
-        .requires("section.option2");
+        .requiresOption("section.option2");
     testOpts.addOptionChaining(
         "section.option2", "option2", moe::Switch, "Option2", {}, {}, OptionParserTest);
 
@@ -3517,7 +3514,6 @@ TEST(Constraints, RequiresOtherConstraint) {
 
     ASSERT_OK(parser.run(testOpts, argv, env_map, &environment));
     ASSERT_NOT_OK(environment.validate());
-    ;
 
     environment = moe::Environment();
     argv.clear();
@@ -3527,7 +3523,6 @@ TEST(Constraints, RequiresOtherConstraint) {
 
     ASSERT_OK(parser.run(testOpts, argv, env_map, &environment));
     ASSERT_OK(environment.validate());
-    ;
     ASSERT_OK(environment.get(moe::Key("option1"), &value));
     ASSERT_OK(environment.get(moe::Key("section.option2"), &value));
 
@@ -3538,7 +3533,6 @@ TEST(Constraints, RequiresOtherConstraint) {
 
     ASSERT_OK(parser.run(testOpts, argv, env_map, &environment));
     ASSERT_OK(environment.validate());
-    ;
     ASSERT_OK(environment.get(moe::Key("section.option2"), &value));
 }
 
@@ -5096,7 +5090,8 @@ TEST(YAMLConfigFile, canonicalize) {
     moe::OptionsParser parser;
     moe::Environment env;
     std::vector<std::string> argv = {
-        "binary", "--bind_ip_all",
+        "binary",
+        "--bind_ip_all",
     };
     std::map<std::string, std::string> env_map;
     ASSERT_OK(parser.run(opts, argv, env_map, &env));

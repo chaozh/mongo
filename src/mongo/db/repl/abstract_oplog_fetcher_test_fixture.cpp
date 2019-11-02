@@ -58,7 +58,7 @@ repl::OplogEntry makeOplogEntry(repl::OpTime opTime,
                             boost::none,                      // o2
                             {},                               // sessionInfo
                             boost::none,                      // upsert
-                            boost::none,                      // wall clock time
+                            Date_t(),                         // wall clock time
                             boost::none,                      // statement id
                             boost::none,   // optime of previous write within same transaction
                             boost::none,   // pre-image optime
@@ -111,6 +111,7 @@ void AbstractOplogFetcherTest::setUp() {
     launchExecutorThread();
 
     lastFetched = {{123, 0}, 1};
+    lastFetchedWall = Date_t() + Seconds(lastFetched.getSecs());
 }
 
 executor::RemoteCommandRequest AbstractOplogFetcherTest::processNetworkResponse(
@@ -134,4 +135,4 @@ executor::RemoteCommandRequest AbstractOplogFetcherTest::processNetworkResponse(
 }
 
 }  // namespace repl
-}  // namespace mango
+}  // namespace mongo

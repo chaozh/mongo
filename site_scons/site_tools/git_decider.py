@@ -12,8 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
 # If available, uses Git metadata to decide whether files are out of date.
+
 
 def generate(env, **kwargs):
 
@@ -47,18 +47,19 @@ def generate(env, **kwargs):
             dependency.get_ninfo().csig = gitInfoForDep
             return False
 
-        if not(hasattr(prev_ni, 'csig')):
+        if not (hasattr(prev_ni, 'csig')):
             prev_ni.csig = gitInfoForDep
 
         result = gitInfoForDep == prev_ni.csig
         return result
 
-    def MongoGitDecider(dependency, target, prev_ni):
+    def MongoGitDecider(dependency, target, prev_ni, node):
         if not is_known_to_git(dependency):
-            return base_decider(dependency, target, prev_ni)
+            return base_decider(dependency, target, prev_ni, node)
         return not git_says_file_is_up_to_date(dependency, prev_ni)
 
     env.Decider(MongoGitDecider)
+
 
 def exists(env):
     try:

@@ -52,16 +52,17 @@
 #include "mongo/db/curop.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/read_write_concern_defaults.h"
 #include "mongo/rpc/factory.h"
 #include "mongo/rpc/metadata/client_metadata_ismaster.h"
 #include "mongo/rpc/op_msg_rpc_impls.h"
 #include "mongo/rpc/protocol.h"
 #include "mongo/rpc/write_concern_error_detail.h"
 #include "mongo/s/stale_exception.h"
-#include "mongo/util/fail_point_service.h"
+#include "mongo/util/fail_point.h"
 #include "mongo/util/invariant.h"
 #include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -114,7 +115,6 @@ const StringMap<int> txnCmdWhitelist = {{"abortTransaction", 1},
                                         {"coordinateCommitTransaction", 1},
                                         {"delete", 1},
                                         {"distinct", 1},
-                                        {"doTxn", 1},
                                         {"find", 1},
                                         {"findandmodify", 1},
                                         {"findAndModify", 1},
@@ -129,7 +129,6 @@ const StringMap<int> txnCmdWhitelist = {{"abortTransaction", 1},
 const StringMap<int> txnAdminCommands = {{"abortTransaction", 1},
                                          {"commitTransaction", 1},
                                          {"coordinateCommitTransaction", 1},
-                                         {"doTxn", 1},
                                          {"prepareTransaction", 1}};
 
 }  // namespace
@@ -257,8 +256,8 @@ NamespaceStringOrUUID CommandHelpers::parseNsOrUUID(StringData dbname, const BSO
         // Ensure collection identifier is not a Command
         const NamespaceString nss(parseNsCollectionRequired(dbname, cmdObj));
         uassert(ErrorCodes::InvalidNamespace,
-                str::stream() << "Invalid collection name specified '" << nss.ns() << "'",
-                nss.isNormal());
+                str::stream() << "Invalid collection name specified '" << nss.ns(),
+                !(nss.ns().find('$') != std::string::npos && nss.ns() != "local.oplog.$main"));
         return nss;
     }
 }
@@ -433,26 +432,38 @@ bool CommandHelpers::uassertShouldAttemptParse(OperationContext* opCtx,
 }
 
 
-Status CommandHelpers::canUseTransactions(StringData dbName, StringData cmdName) {
-    if (cmdName == "count"_sd) {
-        return {ErrorCodes::OperationNotSupportedInTransaction,
-                "Cannot run 'count' in a multi-document transaction. Please see "
-                "http://dochub.mongodb.org/core/transaction-count for a recommended alternative."};
-    }
+void CommandHelpers::canUseTransactions(const NamespaceString& nss,
+                                        StringData cmdName,
+                                        bool allowTransactionsOnConfigDatabase) {
 
-    if (txnCmdWhitelist.find(cmdName) == txnCmdWhitelist.cend()) {
-        return {ErrorCodes::OperationNotSupportedInTransaction,
-                str::stream() << "Cannot run '" << cmdName << "' in a multi-document transaction."};
-    }
+    uassert(ErrorCodes::OperationNotSupportedInTransaction,
+            "Cannot run 'count' in a multi-document transaction. Please see "
+            "http://dochub.mongodb.org/core/transaction-count for a recommended alternative.",
+            cmdName != "count"_sd);
 
-    if (dbName == "config"_sd || dbName == "local"_sd ||
-        (dbName == "admin"_sd && txnAdminCommands.find(cmdName) == txnAdminCommands.cend())) {
-        return {ErrorCodes::OperationNotSupportedInTransaction,
-                str::stream() << "Cannot run command against the '" << dbName
-                              << "' database in a transaction"};
-    }
+    uassert(ErrorCodes::OperationNotSupportedInTransaction,
+            str::stream() << "Cannot run '" << cmdName << "' in a multi-document transaction.",
+            txnCmdWhitelist.find(cmdName) != txnCmdWhitelist.cend());
 
-    return Status::OK();
+    const auto dbName = nss.db();
+
+    uassert(ErrorCodes::OperationNotSupportedInTransaction,
+            str::stream() << "Cannot run command against the '" << dbName
+                          << "' database in a transaction.",
+            dbName != NamespaceString::kLocalDb &&
+                (dbName != NamespaceString::kAdminDb ||
+                 txnAdminCommands.find(cmdName) != txnAdminCommands.cend()));
+
+    if (allowTransactionsOnConfigDatabase) {
+        uassert(ErrorCodes::OperationNotSupportedInTransaction,
+                "Cannot run command against the config.transactions namespace in a transaction"
+                "on a sharded cluster.",
+                nss != NamespaceString::kSessionTransactionsTableNamespace);
+    } else {
+        uassert(ErrorCodes::OperationNotSupportedInTransaction,
+                "Cannot run command against the config database in a transaction.",
+                dbName != "config"_sd);
+    }
 }
 
 constexpr StringData CommandHelpers::kHelpFieldName;
@@ -462,7 +473,8 @@ MONGO_FAIL_POINT_DEFINE(waitInCommandMarkKillOnClientDisconnect);
 
 bool CommandHelpers::shouldActivateFailCommandFailPoint(const BSONObj& data,
                                                         StringData cmdName,
-                                                        Client* client) {
+                                                        Client* client,
+                                                        const NamespaceString& nss) {
     if (cmdName == "configureFailPoint"_sd)  // Banned even if in failCommands.
         return false;
 
@@ -479,6 +491,14 @@ bool CommandHelpers::shouldActivateFailCommandFailPoint(const BSONObj& data,
         }
     }
 
+    if (!client->session()) {
+        return false;
+    }
+
+    if (data.hasField("namespace") && nss != NamespaceString(data.getStringField("namespace"))) {
+        return false;
+    }
+
     for (auto&& failCommand : data.getObjectField("failCommands")) {
         if (failCommand.type() == String && failCommand.valueStringData() == cmdName) {
             return true;
@@ -488,35 +508,38 @@ bool CommandHelpers::shouldActivateFailCommandFailPoint(const BSONObj& data,
     return false;
 }
 
-void CommandHelpers::evaluateFailCommandFailPoint(OperationContext* opCtx, StringData commandName) {
-    bool closeConnection, hasErrorCode;
+void CommandHelpers::evaluateFailCommandFailPoint(OperationContext* opCtx,
+                                                  StringData commandName,
+                                                  const NamespaceString& nss) {
+    bool closeConnection;
+    bool hasErrorCode;
     long long errorCode;
+    failCommand.executeIf(
+        [&](const BSONObj&) {
+            if (closeConnection) {
+                opCtx->getClient()->session()->end();
+                log() << "Failing command '" << commandName
+                      << "' via 'failCommand' failpoint. Action: closing connection.";
+                uasserted(50985, "Failing command due to 'failCommand' failpoint");
+            }
 
-    MONGO_FAIL_POINT_BLOCK_IF(failCommand, data, [&](const BSONObj& data) {
-        closeConnection = data.hasField("closeConnection") &&
-            bsonExtractBooleanField(data, "closeConnection", &closeConnection).isOK() &&
-            closeConnection;
-        hasErrorCode = data.hasField("errorCode") &&
-            bsonExtractIntegerField(data, "errorCode", &errorCode).isOK();
-
-        return shouldActivateFailCommandFailPoint(data, commandName, opCtx->getClient()) &&
-            (closeConnection || hasErrorCode);
-    }) {
-        if (closeConnection) {
-            opCtx->getClient()->session()->end();
-            log() << "Failing command '" << commandName
-                  << "' via 'failCommand' failpoint. Action: closing connection.";
-            uasserted(50985, "Failing command due to 'failCommand' failpoint");
-        }
-
-        if (hasErrorCode) {
-            log() << "Failing command '" << commandName
-                  << "' via 'failCommand' failpoint. Action: returning error code " << errorCode
-                  << ".";
-            uasserted(ErrorCodes::Error(errorCode),
-                      "Failing command due to 'failCommand' failpoint");
-        }
-    }
+            if (hasErrorCode) {
+                log() << "Failing command '" << commandName
+                      << "' via 'failCommand' failpoint. Action: returning error code " << errorCode
+                      << ".";
+                uasserted(ErrorCodes::Error(errorCode),
+                          "Failing command due to 'failCommand' failpoint");
+            }
+        },
+        [&](const BSONObj& data) {
+            closeConnection = data.hasField("closeConnection") &&
+                bsonExtractBooleanField(data, "closeConnection", &closeConnection).isOK() &&
+                closeConnection;
+            hasErrorCode = data.hasField("errorCode") &&
+                bsonExtractIntegerField(data, "errorCode", &errorCode).isOK();
+            return shouldActivateFailCommandFailPoint(data, commandName, opCtx->getClient(), nss) &&
+                (closeConnection || hasErrorCode);
+        });
 }
 
 void CommandHelpers::handleMarkKillOnClientDisconnect(OperationContext* opCtx,
@@ -529,16 +552,13 @@ void CommandHelpers::handleMarkKillOnClientDisconnect(OperationContext* opCtx,
         opCtx->markKillOnClientDisconnect();
     }
 
-    MONGO_FAIL_POINT_BLOCK_IF(
-        waitInCommandMarkKillOnClientDisconnect, options, [&](const BSONObj& obj) {
-            const auto& clientMetadata =
+    waitInCommandMarkKillOnClientDisconnect.executeIf(
+        [&](const BSONObj&) { waitInCommandMarkKillOnClientDisconnect.pauseWhileSet(opCtx); },
+        [&](const BSONObj& obj) {
+            const auto& md =
                 ClientMetadataIsMasterState::get(opCtx->getClient()).getClientMetadata();
-
-            return clientMetadata && (clientMetadata->getApplicationName() == obj["appName"].str());
-        }) {
-        MONGO_FAIL_POINT_PAUSE_WHILE_SET_OR_INTERRUPTED(opCtx,
-                                                        waitInCommandMarkKillOnClientDisconnect);
-    }
+            return md && (md->getApplicationName() == obj["appName"].str());
+        });
 }
 
 //////////////////////////////////////////////////////////////
@@ -588,6 +608,7 @@ public:
 
 private:
     void run(OperationContext* opCtx, rpc::ReplyBuilderInterface* result) override {
+        opCtx->lockState()->setDebugInfo(redact(_request->body));
         BSONObjBuilder bob = result->getBodyBuilder();
         bool ok = _command->run(opCtx, _dbName, _request->body, bob);
         if (!ok)
@@ -608,12 +629,16 @@ private:
         return _command->supportsWriteConcern(cmdObj());
     }
 
-    bool supportsReadConcern(repl::ReadConcernLevel level) const override {
+    ReadConcernSupportResult supportsReadConcern(repl::ReadConcernLevel level) const override {
         return _command->supportsReadConcern(_dbName, cmdObj(), level);
     }
 
     bool allowsAfterClusterTime() const override {
         return _command->allowsAfterClusterTime(cmdObj());
+    }
+
+    bool canIgnorePrepareConflicts() const override {
+        return _command->canIgnorePrepareConflicts();
     }
 
     void doCheckAuthorization(OperationContext* opCtx) const override {
@@ -650,7 +675,7 @@ void Command::snipForLogging(mutablebson::Document* cmdObj) const {
 std::unique_ptr<CommandInvocation> BasicCommand::parse(OperationContext* opCtx,
                                                        const OpMsgRequest& request) {
     CommandHelpers::uassertNoDocumentSequences(getName(), request);
-    return stdx::make_unique<Invocation>(opCtx, request, this);
+    return std::make_unique<Invocation>(opCtx, request, this);
 }
 
 Command::Command(StringData name, StringData oldName)

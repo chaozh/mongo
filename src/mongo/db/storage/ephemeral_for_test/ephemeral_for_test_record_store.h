@@ -35,7 +35,9 @@
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/storage/capped_callback.h"
 #include "mongo/db/storage/record_store.h"
-#include "mongo/stdx/mutex.h"
+#include "mongo/platform/mutex.h"
+#include "mongo/util/concurrency/with_lock.h"
+
 
 namespace mongo {
 
@@ -69,12 +71,6 @@ public:
                                  std::vector<Record>* inOutRecords,
                                  const std::vector<Timestamp>& timestamps);
 
-    virtual Status insertRecordsWithDocWriter(OperationContext* opCtx,
-                                              const DocWriter* const* docs,
-                                              const Timestamp*,
-                                              size_t nDocs,
-                                              RecordId* idsOut);
-
     virtual Status updateRecord(OperationContext* opCtx,
                                 const RecordId& oldLocation,
                                 const char* data,
@@ -99,10 +95,8 @@ public:
                                    BSONObjBuilder* result,
                                    double scale) const;
 
-    virtual Status touch(OperationContext* opCtx, BSONObjBuilder* output) const;
-
     virtual int64_t storageSize(OperationContext* opCtx,
-                                BSONObjBuilder* extraInfo = NULL,
+                                BSONObjBuilder* extraInfo = nullptr,
                                 int infoLevel = 0) const;
 
     virtual long long dataSize(OperationContext* opCtx) const {
@@ -121,6 +115,7 @@ public:
     virtual void updateStatsAfterRepair(OperationContext* opCtx,
                                         long long numRecords,
                                         long long dataSize) {
+        stdx::lock_guard<stdx::recursive_mutex> lock(_data->recordsMutex);
         invariant(_data->records.size() == size_t(numRecords));
         _data->dataSize = dataSize;
     }
@@ -138,8 +133,8 @@ protected:
         boost::shared_array<char> data;
     };
 
-    virtual const EphemeralForTestRecord* recordFor(const RecordId& loc) const;
-    virtual EphemeralForTestRecord* recordFor(const RecordId& loc);
+    virtual const EphemeralForTestRecord* recordFor(WithLock, const RecordId& loc) const;
+    virtual EphemeralForTestRecord* recordFor(WithLock, const RecordId& loc);
 
 public:
     //
@@ -163,12 +158,12 @@ private:
     class Cursor;
     class ReverseCursor;
 
-    StatusWith<RecordId> extractAndCheckLocForOplog(const char* data, int len) const;
+    StatusWith<RecordId> extractAndCheckLocForOplog(WithLock, const char* data, int len) const;
 
-    RecordId allocateLoc();
-    bool cappedAndNeedDelete_inlock(OperationContext* opCtx) const;
-    void cappedDeleteAsNeeded_inlock(OperationContext* opCtx);
-    void deleteRecord_inlock(OperationContext* opCtx, const RecordId& dl);
+    RecordId allocateLoc(WithLock);
+    bool cappedAndNeedDelete(WithLock, OperationContext* opCtx) const;
+    void cappedDeleteAsNeeded(WithLock lk, OperationContext* opCtx);
+    void deleteRecord(WithLock lk, OperationContext* opCtx, const RecordId& dl);
 
     // TODO figure out a proper solution to metadata
     const bool _isCapped;

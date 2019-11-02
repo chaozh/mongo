@@ -10,15 +10,13 @@ env = env.Clone()
 
 if get_option('install-mode') == 'hygienic':
     env.AutoInstall(
-        'share/doc/mongo_embedded',
+        '$PREFIX_DOCDIR/mongo_embedded',
         source=[
             '#/LICENSE-Community.txt',
-            '#/distsrc/THIRD-PARTY-NOTICES',
             '../LICENSE-Embedded.txt',
         ],
-        INSTALL_ALIAS=[
-            'embedded-dev',
-        ],
+        AIB_COMPONENT='embedded',
+        AIB_ROLE='base',
     )
 
 mongoEmbeddedEnv = env.Clone()
@@ -73,18 +71,15 @@ mongoEmbeddedTargets = mongoEmbeddedEnv.Library(
         '$BUILD_DIR/mongo/transport/transport_layer_mock',
         '$BUILD_DIR/mongo/embedded/embedded',
     ],
-    INSTALL_ALIAS=[
-        'embedded-dev',
-    ],
+    AIB_COMPONENT='embedded',
 )
 
 if get_option('install-mode') == 'hygienic':
     env.AutoInstall(
-        'include/mongo_embedded/v1/mongo_embedded',
+        '$PREFIX_INCLUDEDIR/mongo_embedded/v1/mongo_embedded',
         source=['mongo_embedded.h'],
-        INSTALL_ALIAS=[
-            'embedded-dev',
-        ],
+        AIB_COMPONENT='embedded',
+        AIB_ROLE='dev',
     )
 
 yamlEnv = env.Clone()
@@ -101,14 +96,16 @@ if get_option('link-model') != 'dynamic-sdk':
             '$BUILD_DIR/mongo/base',
             '$BUILD_DIR/mongo/db/commands/test_commands_enabled',
             '$BUILD_DIR/mongo/db/server_options_core',
+            '$BUILD_DIR/mongo/db/storage/mobile/storage_mobile_core',
             '$BUILD_DIR/mongo/rpc/protocol',
             '$BUILD_DIR/mongo/unittest/unittest',
             '$BUILD_DIR/mongo/util/net/network',
             '$BUILD_DIR/mongo/util/options_parser/options_parser',
             'mongo_embedded',
         ],
-        INSTALL_ALIAS=[
-            'embedded-test',
+        AIB_COMPONENT='embedded-test',
+        AIB_COMPONENTS_EXTRA=[
+            'tests',
         ],
     )
 
@@ -125,24 +122,12 @@ if get_option('link-model') != 'dynamic-sdk':
 if get_option('link-model') != 'dynamic-sdk' or get_option('install-mode') != 'hygienic' or not env.TargetOSIs('darwin') or env.TargetOSIs('macOS'):
     Return()
 
-frameworkDir = env.Dir('$INSTALL_DIR/Frameworks/mongo_embedded.framework')
+frameworkDir = env.Dir('$DESTDIR/Frameworks/mongo_embedded.framework')
 env.Alias('install-embedded-dev', frameworkDir)
 
 resourceDir = frameworkDir
 if env.TargetOSIs('macOS'):
     resourceDir = resourceDir.Dir('Resources')
-
-env.Install(
-    target=resourceDir,
-    source=env.File(
-        name=[
-            'LICENSE-Community.txt',
-            'LICENSE-Embedded.txt',
-            'THIRD-PARTY-NOTICES',
-        ],
-        directory=env.Dir('$INSTALL_DIR/share/doc/mongo_embedded'),
-    ),
-)
 
 env.Install(
     target=frameworkDir.Dir('Headers'),
@@ -186,7 +171,7 @@ env.AddPostAction(
 
 mongoEmbeddedDSYM = getattr(mongoEmbeddedTargets[0].attributes, "separate_debug_file", None)
 if mongoEmbeddedDSYM:
-    frameworkDSYMDir = '$INSTALL_DIR/Frameworks/mongo_embedded.framework.dSYM'
+    frameworkDSYMDir = '$DESTDIR/Frameworks/mongo_embedded.framework.dSYM'
     env.Alias('install-embedded-dev', frameworkDSYMDir)
 
     env.InstallAs(

@@ -37,7 +37,8 @@ namespace repl {
 TaskExecutorMock::TaskExecutorMock(executor::TaskExecutor* executor)
     : unittest::TaskExecutorProxy(executor) {}
 
-StatusWith<executor::TaskExecutor::CallbackHandle> TaskExecutorMock::scheduleWork(CallbackFn work) {
+StatusWith<executor::TaskExecutor::CallbackHandle> TaskExecutorMock::scheduleWork(
+    CallbackFn&& work) {
     if (shouldFailScheduleWorkRequest()) {
         return Status(ErrorCodes::OperationFailed, "failed to schedule work");
     }
@@ -49,7 +50,7 @@ StatusWith<executor::TaskExecutor::CallbackHandle> TaskExecutorMock::scheduleWor
 }
 
 StatusWith<executor::TaskExecutor::CallbackHandle> TaskExecutorMock::scheduleWorkAt(
-    Date_t when, CallbackFn work) {
+    Date_t when, CallbackFn&& work) {
     if (shouldFailScheduleWorkAtRequest()) {
         return Status(ErrorCodes::OperationFailed,
                       str::stream() << "failed to schedule work at " << when.toString());
@@ -57,14 +58,14 @@ StatusWith<executor::TaskExecutor::CallbackHandle> TaskExecutorMock::scheduleWor
     return getExecutor()->scheduleWorkAt(when, std::move(work));
 }
 
-StatusWith<executor::TaskExecutor::CallbackHandle> TaskExecutorMock::scheduleRemoteCommand(
-    const executor::RemoteCommandRequest& request,
-    const RemoteCommandCallbackFn& cb,
+StatusWith<executor::TaskExecutor::CallbackHandle> TaskExecutorMock::scheduleRemoteCommandOnAny(
+    const executor::RemoteCommandRequestOnAny& request,
+    const RemoteCommandOnAnyCallbackFn& cb,
     const BatonHandle& baton) {
     if (shouldFailScheduleRemoteCommandRequest(request)) {
         return Status(ErrorCodes::OperationFailed, "failed to schedule remote command");
     }
-    return getExecutor()->scheduleRemoteCommand(request, cb, baton);
+    return getExecutor()->scheduleRemoteCommandOnAny(request, cb, baton);
 }
 
 }  // namespace repl

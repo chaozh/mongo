@@ -15,13 +15,13 @@ conn.getDB('admin').dropAllUsers();
 conn.getDB('admin').logout();
 MongoRunner.stopMongod(conn);
 
-var SERVER_CERT = "jstests/libs/server.pem";
-var CA_CERT = "jstests/libs/ca.pem";
+const SERVER_CERT = "jstests/libs/server.pem";
+const CA_CERT = "jstests/libs/ca.pem";
 
-var SERVER_USER = "C=US,ST=New York,L=New York City,O=MongoDB,OU=Kernel,CN=server";
-var INTERNAL_USER = "C=US,ST=New York,L=New York City,O=MongoDB,OU=Kernel,CN=internal";
-var CLIENT_USER = "C=US,ST=New York,L=New York City,O=MongoDB,OU=KernelUser,CN=client";
-var INVALID_CLIENT_USER = "C=US,ST=New York,L=New York City,O=MongoDB,OU=KernelUser,CN=invalid";
+const SERVER_USER = "C=US,ST=New York,L=New York City,O=MongoDB,OU=Kernel,CN=server";
+const INTERNAL_USER = "C=US,ST=New York,L=New York City,O=MongoDB,OU=Kernel,CN=internal";
+const CLIENT_USER = "CN=client,OU=KernelUser,O=MongoDB,L=New York City,ST=New York,C=US";
+const INVALID_CLIENT_USER = "C=US,ST=New York,L=New York City,O=MongoDB,OU=KernelUser,CN=invalid";
 
 function authAndTest(mongo) {
     external = mongo.getDB("$external");
@@ -44,7 +44,8 @@ function authAndTest(mongo) {
         user: CLIENT_USER,
         roles: [
             {'role': 'userAdminAnyDatabase', 'db': 'admin'},
-            {'role': 'readWriteAnyDatabase', 'db': 'admin'}
+            {'role': 'readWriteAnyDatabase', 'db': 'admin'},
+            {'role': 'clusterMonitor', 'db': 'admin'},
         ]
     });
 
@@ -70,6 +71,14 @@ function authAndTest(mongo) {
     assert(external.runCommand({authenticate: 1, mechanism: 'MONGODB-X509'}).ok,
            "runCommand authentication with valid client cert and no user field failed");
 
+    // Check that there's a "Successfully authenticated" message that includes the client IP
+    const log =
+        assert.commandWorked(external.getSiblingDB("admin").runCommand({getLog: "global"})).log;
+    const successRegex = new RegExp(`Successfully authenticated as principal ${CLIENT_USER} on ` +
+                                    `\\$external from client (?:\\d{1,3}\\.){3}\\d{1,3}:\\d+`);
+
+    assert(log.some((line) => successRegex.test(line)));
+
     // Check that we can add a user and read data
     test.createUser(
         {user: "test", pwd: "test", roles: [{'role': 'readWriteAnyDatabase', 'db': 'admin'}]});
@@ -91,7 +100,6 @@ MongoRunner.stopMongod(mongo);
 
 print("2. Testing x.509 auth to mongos");
 
-// TODO: Remove 'shardAsReplicaSet: false' when SERVER-32672 is fixed.
 var st = new ShardingTest({
     shards: 1,
     mongos: 1,
@@ -100,8 +108,7 @@ var st = new ShardingTest({
         configOptions: x509_options,
         mongosOptions: x509_options,
         shardOptions: x509_options,
-        useHostname: false,
-        shardAsReplicaSet: false
+        useHostname: false
     }
 });
 

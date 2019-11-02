@@ -188,7 +188,8 @@ extern Labeler::Label BSIZE;
 
 // Utility class to implement BSON( key << val ) as described above.
 class BSONObjBuilderValueStream {
-    MONGO_DISALLOW_COPYING(BSONObjBuilderValueStream);
+    BSONObjBuilderValueStream(const BSONObjBuilderValueStream&) = delete;
+    BSONObjBuilderValueStream& operator=(const BSONObjBuilderValueStream&) = delete;
 
 public:
     friend class Labeler;
@@ -211,7 +212,7 @@ public:
 
     void endField(StringData nextFieldName = StringData());
     bool subobjStarted() const {
-        return _fieldName != 0;
+        return _fieldName != nullptr;
     }
 
     // The following methods provide API compatibility with BSONArrayBuilder
@@ -235,7 +236,7 @@ private:
     BSONObjBuilder* _builder;
 
     bool haveSubobj() const {
-        return _subobj.get() != 0;
+        return _subobj.get() != nullptr;
     }
     BSONObjBuilder* subobj();
     std::unique_ptr<BSONObjBuilder> _subobj;
@@ -280,4 +281,4 @@ private:
 
 // considers order
 bool fieldsMatch(const BSONObj& lhs, const BSONObj& rhs);
-}
+}  // namespace mongo

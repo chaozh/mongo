@@ -179,7 +179,7 @@ function arrayShallowCopy(a) {
  * the same documents, although the order need not match and the _id values need not match.
  *
  * Are non-scalar values references?
-*/
+ */
 function resultsEq(rl, rr, verbose = false) {
     const debug = msg => verbose ? print(msg) : null;  // Helper to log 'msg' iff 'verbose' is true.
 
@@ -269,11 +269,98 @@ function assertErrorCode(coll, pipe, code, errmsg, options = {}) {
  * Assert that an aggregation fails with a specific code and the error message contains the given
  * string.
  */
-function assertErrMsgContains(coll, pipe, code, expectedMessage) {
+function assertErrCodeAndErrMsgContains(coll, pipe, code, expectedMessage) {
     const response = assert.commandFailedWithCode(
         coll.getDB().runCommand({aggregate: coll.getName(), pipeline: pipe, cursor: {}}), code);
     assert.neq(
         -1,
         response.errmsg.indexOf(expectedMessage),
         "Error message did not contain '" + expectedMessage + "', found:\n" + tojson(response));
+}
+
+/**
+ * Assert that an aggregation fails with any code and the error message contains the given
+ * string.
+ */
+function assertErrMsgContains(coll, pipe, expectedMessage) {
+    const response = assert.commandFailed(
+        coll.getDB().runCommand({aggregate: coll.getName(), pipeline: pipe, cursor: {}}));
+    assert.neq(
+        -1,
+        response.errmsg.indexOf(expectedMessage),
+        "Error message did not contain '" + expectedMessage + "', found:\n" + tojson(response));
+}
+
+/**
+ * Assert that an aggregation fails with any code and the error message does not contain the given
+ * string.
+ */
+function assertErrMsgDoesNotContain(coll, pipe, expectedMessage) {
+    const response = assert.commandFailed(
+        coll.getDB().runCommand({aggregate: coll.getName(), pipeline: pipe, cursor: {}}));
+    assert.eq(-1,
+              response.errmsg.indexOf(expectedMessage),
+              "Error message contained '" + expectedMessage + "'");
+}
+
+/**
+ * Asserts that two arrays are equal - that is, if their sizes are equal and each element in
+ * the 'actual' array has a matching element in the 'expected' array, without honoring elements
+ * order.
+ */
+function assertArrayEq({actual = [], expected = []} = {}) {
+    assert(arrayEq(actual, expected), `actual=${tojson(actual)}, expected=${tojson(expected)}`);
+}
+
+/**
+ * Generates the 'numDocs' number of documents each of 'docSize' size and inserts them into the
+ * collecton 'coll'. Each document is generated from the 'template' function, which, by default,
+ * returns a document in the form of {_id: i}, where 'i' is the iteration index, starting from 0.
+ * The 'template' function is called on each iteration and can take three arguments and return
+ * any JSON document which will be used as a document template:
+ *   - 'itNum' - the current iteration number in the range [0, numDocs)
+ *   - 'docSize' - is the 'docSize' parameter passed to 'generateCollection'
+ *   - 'numDocs' - is the 'numDocs' parameter passed to 'generateCollection'
+ *
+ * After a document is generated from the template, it will be assigned a new field called 'padding'
+ * holding a repeating string of 'x' characters, so that the total size of the generated object
+ * equals to 'docSize'.
+ */
+function generateCollection({
+    coll = null,
+    numDocs = 0,
+    docSize = 0,
+    template =
+        (itNum) => {
+            return {_id: itNum};
+        }
+} = {}) {
+    assert(coll, "Collection not provided");
+
+    const bulk = coll.initializeUnorderedBulkOp();
+    for (let i = 0; i < numDocs; ++i) {
+        const doc = Object.assign({padding: ""}, template(i, docSize, numDocs));
+        const len = docSize - Object.bsonsize(doc);
+        assert.lte(0, len, `Document is already bigger than ${docSize} bytes: ${tojson(doc)}`);
+
+        doc.padding = "x".repeat(len);
+        assert.eq(
+            docSize,
+            Object.bsonsize(doc),
+            `Generated document's size doesn't match requested document's size: ${tojson(doc)}`);
+
+        bulk.insert(doc);
+    }
+
+    const res = bulk.execute();
+    assert.commandWorked(res);
+    assert.eq(numDocs, res.nInserted);
+    assert.eq(numDocs, coll.find().itcount());
+}
+
+/**
+ * Returns true if 'coll' exists or false otherwise.
+ */
+function collectionExists(coll) {
+    return Array.contains(coll.getDB().getCollectionNames(), coll.getName());
 }

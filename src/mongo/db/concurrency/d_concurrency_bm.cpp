@@ -34,7 +34,7 @@
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/lock_manager_test_help.h"
 #include "mongo/db/storage/recovery_unit_noop.h"
-#include "mongo/stdx/mutex.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
@@ -52,8 +52,8 @@ public:
     void makeKClientsWithLockers(int k) {
         clients.reserve(k);
         for (int i = 0; i < k; ++i) {
-            auto client = getGlobalServiceContext()->makeClient(
-                str::stream() << "test client for thread " << i);
+            auto client = getGlobalServiceContext()->makeClient(str::stream()
+                                                                << "test client for thread " << i);
             auto opCtx = client->makeOperationContext();
             opCtx->swapLockState(std::make_unique<LockerImpl>());
             clients.emplace_back(std::move(client), std::move(opCtx));
@@ -67,10 +67,10 @@ protected:
 };
 
 BENCHMARK_DEFINE_F(DConcurrencyTest, BM_StdMutex)(benchmark::State& state) {
-    static stdx::mutex mtx;
+    static auto mtx = MONGO_MAKE_LATCH();
 
     for (auto keepRunning : state) {
-        stdx::unique_lock<stdx::mutex> lk(mtx);
+        stdx::unique_lock<Latch> lk(mtx);
     }
 }
 
@@ -101,7 +101,7 @@ BENCHMARK_DEFINE_F(DConcurrencyTest, BM_CollectionIntentSharedLock)(benchmark::S
     for (auto keepRunning : state) {
         Lock::DBLock dlk(clients[state.thread_index].second.get(), "test", MODE_IS);
         Lock::CollectionLock clk(
-            clients[state.thread_index].second->lockState(), "test.coll", MODE_IS);
+            clients[state.thread_index].second.get(), NamespaceString("test.coll"), MODE_IS);
     }
 
     if (state.thread_index == 0) {
@@ -120,7 +120,7 @@ BENCHMARK_DEFINE_F(DConcurrencyTest, BM_CollectionIntentExclusiveLock)(benchmark
     for (auto keepRunning : state) {
         Lock::DBLock dlk(clients[state.thread_index].second.get(), "test", MODE_IX);
         Lock::CollectionLock clk(
-            clients[state.thread_index].second->lockState(), "test.coll", MODE_IX);
+            clients[state.thread_index].second.get(), NamespaceString("test.coll"), MODE_IX);
     }
 
     if (state.thread_index == 0) {
@@ -139,7 +139,7 @@ BENCHMARK_DEFINE_F(DConcurrencyTest, BM_MMAPv1CollectionSharedLock)(benchmark::S
     for (auto keepRunning : state) {
         Lock::DBLock dlk(clients[state.thread_index].second.get(), "test", MODE_IS);
         Lock::CollectionLock clk(
-            clients[state.thread_index].second->lockState(), "test.coll", MODE_S);
+            clients[state.thread_index].second.get(), NamespaceString("test.coll"), MODE_S);
     }
 
     if (state.thread_index == 0) {
@@ -158,7 +158,7 @@ BENCHMARK_DEFINE_F(DConcurrencyTest, BM_MMAPv1CollectionExclusiveLock)(benchmark
     for (auto keepRunning : state) {
         Lock::DBLock dlk(clients[state.thread_index].second.get(), "test", MODE_IX);
         Lock::CollectionLock clk(
-            clients[state.thread_index].second->lockState(), "test.coll", MODE_X);
+            clients[state.thread_index].second.get(), NamespaceString("test.coll"), MODE_X);
     }
 
     if (state.thread_index == 0) {

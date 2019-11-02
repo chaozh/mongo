@@ -31,10 +31,8 @@
 // Setting kDefault to preserve previous behavior in (defunct) getStacktraceLogger().
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
 
-#include "mongo/platform/basic.h"
-
 #include "mongo/util/stacktrace.h"
-
+#include "mongo/platform/basic.h"
 #include "mongo/util/log.h"
 
 namespace mongo {

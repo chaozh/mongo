@@ -40,12 +40,16 @@ namespace mongo {
 
 namespace atomic_word_detail {
 
-enum class Category { kBasic, kArithmetic };
+enum class Category { kBasic, kArithmetic, kUnsigned };
 
 template <typename T>
 constexpr Category getCategory() {
-    if (std::is_integral<T>() && !std::is_same<T, bool>())
+    if (std::is_integral<T>() && !std::is_same<T, bool>()) {
+        if (std::is_unsigned<T>() && !std::is_same<T, char>()) {
+            return Category::kUnsigned;
+        }
         return Category::kArithmetic;
+    }
     return Category::kBasic;
 }
 
@@ -110,13 +114,14 @@ public:
     /**
      * Atomic compare and swap.
      *
-     * If this value equals "expected", sets this to "newValue".
-     * Always returns the original of this.
+     * If this value equals the value at "expected", sets this value to "newValue".
+     * Otherwise, sets the storage at "expected" to this value.
+     *
+     * Returns true if swap successful, false otherwise
      */
-    WordType compareAndSwap(WordType expected, WordType newValue) {
+    bool compareAndSwap(WordType* expected, WordType newValue) {
         // NOTE: Subtle: compare_exchange mutates its first argument.
-        _value.compare_exchange_strong(expected, newValue);
-        return expected;
+        return _value.compare_exchange_strong(*expected, newValue);
     }
 
 protected:
@@ -129,7 +134,7 @@ protected:
  */
 template <typename T>
 class Base<T, Category::kArithmetic> : public Base<T, Category::kBasic> {
-private:
+protected:
     using Parent = Base<T, Category::kBasic>;
     using Parent::_value;
 
@@ -176,6 +181,44 @@ public:
      */
     WordType subtractAndFetch(WordType decrement) {
         return fetchAndSubtract(decrement) - decrement;
+    }
+};
+
+template <typename T>
+class Base<T, Category::kUnsigned> : public Base<T, Category::kArithmetic> {
+private:
+    using Parent = Base<T, Category::kArithmetic>;
+    using Parent::_value;
+
+public:
+    using WordType = typename Parent::WordType;
+    using Parent::Parent;
+
+    /**
+     * Atomically compute and store 'load() & bits'
+     *
+     * Returns the value of this before bitand-ing.
+     */
+    WordType fetchAndBitAnd(WordType bits) {
+        return _value.fetch_and(bits);
+    }
+
+    /**
+     * Atomically compute and store 'load() | bits'
+     *
+     * Returns the value of this before bitor-ing.
+     */
+    WordType fetchAndBitOr(WordType bits) {
+        return _value.fetch_or(bits);
+    }
+
+    /**
+     * Atomically compute and store 'load() ^ bits'
+     *
+     * Returns the value of this before bitxor-ing.
+     */
+    WordType fetchAndBitXor(WordType bits) {
+        return _value.fetch_xor(bits);
     }
 };
 

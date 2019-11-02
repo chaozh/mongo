@@ -30,12 +30,12 @@
 #pragma once
 
 #include <map>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
 
 #include "mongo/db/update/update_leaf_node.h"
-#include "mongo/stdx/memory.h"
 
 namespace mongo {
 
@@ -55,12 +55,13 @@ public:
     }
 
     std::unique_ptr<UpdateNode> clone() const final {
-        return stdx::make_unique<ConflictPlaceholderNode>(*this);
+        return std::make_unique<ConflictPlaceholderNode>(*this);
     }
 
     void setCollator(const CollatorInterface* collator) final {}
 
-    ApplyResult apply(ApplyParams applyParams) const final {
+    ApplyResult apply(ApplyParams applyParams,
+                      UpdateNodeApplyParams updateNodeApplyParams) const final {
         return ApplyResult::noopResult();
     }
 
@@ -71,6 +72,10 @@ public:
         FieldRef* currentPath,
         std::map<std::string, std::vector<std::pair<std::string, BSONObj>>>*
             operatorOrientedUpdates) const final {}
+
+    void acceptVisitor(UpdateNodeVisitor* visitor) final {
+        visitor->visit(this);
+    }
 };
 
 }  // namespace mongo

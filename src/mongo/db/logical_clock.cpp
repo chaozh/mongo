@@ -50,7 +50,7 @@ bool lessThanOrEqualToMaxPossibleTime(LogicalTime time, uint64_t nTicks) {
     return time.asTimestamp().getSecs() <= LogicalClock::kMaxSignedInt &&
         time.asTimestamp().getInc() <= (LogicalClock::kMaxSignedInt - nTicks);
 }
-}
+}  // namespace
 
 LogicalTime LogicalClock::getClusterTimeForReplicaSet(OperationContext* opCtx) {
     if (getGlobalReplSettings().usingReplSets()) {
@@ -76,12 +76,12 @@ void LogicalClock::set(ServiceContext* service, std::unique_ptr<LogicalClock> cl
 LogicalClock::LogicalClock(ServiceContext* service) : _service(service) {}
 
 LogicalTime LogicalClock::getClusterTime() {
-    stdx::lock_guard<stdx::mutex> lock(_mutex);
+    stdx::lock_guard<Latch> lock(_mutex);
     return _clusterTime;
 }
 
 Status LogicalClock::advanceClusterTime(const LogicalTime newTime) {
-    stdx::lock_guard<stdx::mutex> lock(_mutex);
+    stdx::lock_guard<Latch> lock(_mutex);
 
     auto rateLimitStatus = _passesRateLimiter_inlock(newTime);
     if (!rateLimitStatus.isOK()) {
@@ -99,7 +99,7 @@ LogicalTime LogicalClock::reserveTicks(uint64_t nTicks) {
 
     invariant(nTicks > 0 && nTicks <= kMaxSignedInt);
 
-    stdx::lock_guard<stdx::mutex> lock(_mutex);
+    stdx::lock_guard<Latch> lock(_mutex);
 
     LogicalTime clusterTime = _clusterTime;
 
@@ -142,7 +142,7 @@ LogicalTime LogicalClock::reserveTicks(uint64_t nTicks) {
 }
 
 void LogicalClock::setClusterTimeFromTrustedSource(LogicalTime newTime) {
-    stdx::lock_guard<stdx::mutex> lock(_mutex);
+    stdx::lock_guard<Latch> lock(_mutex);
     // Rate limit checks are skipped here so a server with no activity for longer than
     // maxAcceptableLogicalClockDriftSecs seconds can still have its cluster time initialized.
 
@@ -166,8 +166,7 @@ Status LogicalClock::_passesRateLimiter_inlock(LogicalTime newTime) {
         return Status(ErrorCodes::ClusterTimeFailsRateLimiter,
                       str::stream() << "New cluster time, " << newTimeSecs
                                     << ", is too far from this node's wall clock time, "
-                                    << wallClockSecs
-                                    << ".");
+                                    << wallClockSecs << ".");
     }
 
     uassert(40484,
@@ -178,12 +177,12 @@ Status LogicalClock::_passesRateLimiter_inlock(LogicalTime newTime) {
 }
 
 bool LogicalClock::isEnabled() const {
-    stdx::lock_guard<stdx::mutex> lock(_mutex);
+    stdx::lock_guard<Latch> lock(_mutex);
     return _isEnabled;
 }
 
 void LogicalClock::disable() {
-    stdx::lock_guard<stdx::mutex> lock(_mutex);
+    stdx::lock_guard<Latch> lock(_mutex);
     _isEnabled = false;
 }
 

@@ -50,7 +50,7 @@
 #include "mongo/util/allocator.h"
 #include "mongo/util/embedded_builder.h"
 #include "mongo/util/log.h"
-#include "mongo/util/stringutils.h"
+#include "mongo/util/str.h"
 #include "mongo/util/timer.h"
 
 namespace mongo {
@@ -126,7 +126,9 @@ BSONObj nested2dotted(const BSONObj& obj) {
     return b.obj();
 }
 
-FieldCompareResult compareDottedFieldNames(const string& l, const string& r, const LexNumCmp& cmp) {
+FieldCompareResult compareDottedFieldNames(const string& l,
+                                           const string& r,
+                                           const str::LexNumCmp& cmp) {
     static int maxLoops = 1024 * 1024;
 
     size_t lstart = 0;
@@ -783,7 +785,7 @@ public:
 
         BSONObj obj = BSON("str" << input);
         const string output = obj.firstElement().String();
-        ASSERT_EQUALS(escape(output), escape(input));  // for better failure output
+        ASSERT_EQUALS(str::escape(output), str::escape(input));  // for better failure output
         ASSERT_EQUALS(output, input);
     }
 };
@@ -1070,9 +1072,9 @@ class append {
 public:
     void run() {
         BSONObjBuilder b;
-        b.appendOID("a", 0);
-        b.appendOID("b", 0, false);
-        b.appendOID("c", 0, true);
+        b.appendOID("a", nullptr);
+        b.appendOID("b", nullptr, false);
+        b.appendOID("c", nullptr, true);
         BSONObj o = b.obj();
         ASSERT(o["a"].__oid().toString() == "000000000000000000000000");
         ASSERT(o["b"].__oid().toString() == "000000000000000000000000");
@@ -1084,7 +1086,7 @@ class increasing {
 public:
     BSONObj g() {
         BSONObjBuilder b;
-        b.appendOID("_id", 0, true);
+        b.appendOID("_id", nullptr, true);
         return b.obj();
     }
     void run() {
@@ -1161,18 +1163,13 @@ class LabelShares : public LabelBase {
     BSONObj expected() {
         return BSON("z"
                     << "q"
-                    << "a"
-                    << (BSON("$gt" << 1))
-                    << "x"
+                    << "a" << (BSON("$gt" << 1)) << "x"
                     << "p");
     }
     BSONObj actual() {
         return BSON("z"
                     << "q"
-                    << "a"
-                    << GT
-                    << 1
-                    << "x"
+                    << "a" << GT << 1 << "x"
                     << "p");
     }
 };
@@ -1200,11 +1197,7 @@ class LabelDoubleShares : public LabelBase {
     BSONObj actual() {
         return BSON("z"
                     << "q"
-                    << "a"
-                    << GT
-                    << 1
-                    << LTE
-                    << "x"
+                    << "a" << GT << 1 << LTE << "x"
                     << "x"
                     << "p");
     }
@@ -1229,27 +1222,15 @@ class LabelMulti : public LabelBase {
                     << "b"
                     << BSON("$ne" << 1 << "$ne"
                                   << "f"
-                                  << "$ne"
-                                  << 22.3)
+                                  << "$ne" << 22.3)
                     << "x"
                     << "p");
     }
     BSONObj actual() {
         return BSON("z"
                     << "q"
-                    << "a"
-                    << GT
-                    << 1
-                    << LTE
-                    << "x"
-                    << "b"
-                    << NE
-                    << 1
-                    << NE
-                    << "f"
-                    << NE
-                    << 22.3
-                    << "x"
+                    << "a" << GT << 1 << LTE << "x"
+                    << "b" << NE << 1 << NE << "f" << NE << 22.3 << "x"
                     << "p");
     }
 };
@@ -1259,8 +1240,7 @@ class LabelishOr : public LabelBase {
                                                                << "x"))
                                         << BSON("b" << BSON("$ne" << 1 << "$ne"
                                                                   << "f"
-                                                                  << "$ne"
-                                                                  << 22.3))
+                                                                  << "$ne" << 22.3))
                                         << BSON("x"
                                                 << "p")));
     }
@@ -1550,7 +1530,7 @@ public:
 class CompareDottedFieldNamesTest {
 public:
     void t(FieldCompareResult res, const string& l, const string& r) {
-        LexNumCmp cmp(true);
+        str::LexNumCmp cmp(true);
         ASSERT_EQUALS(res, compareDottedFieldNames(l, r, cmp));
         ASSERT_EQUALS(-1 * res, compareDottedFieldNames(r, l, cmp));
     }
@@ -1571,7 +1551,7 @@ public:
 class CompareDottedArrayFieldNamesTest {
 public:
     void t(FieldCompareResult res, const string& l, const string& r) {
-        LexNumCmp cmp(false);  // Specify numeric comparison for array field names.
+        str::LexNumCmp cmp(false);  // Specify numeric comparison for array field names.
         ASSERT_EQUALS(res, compareDottedFieldNames(l, r, cmp));
         ASSERT_EQUALS(-1 * res, compareDottedFieldNames(r, l, cmp));
     }
@@ -1609,59 +1589,61 @@ struct NestedDottedConversions {
 
 struct BSONArrayBuilderTest {
     void run() {
-        int i = 0;
         BSONObjBuilder objb;
         BSONArrayBuilder arrb;
 
-        objb << objb.numStr(i++) << 100;
+        auto fieldNameGenerator = [i = 0]() mutable { return std::to_string(i++); };
+
+        objb << fieldNameGenerator() << 100;
         arrb << 100;
 
-        objb << objb.numStr(i++) << 1.0;
+        objb << fieldNameGenerator() << 1.0;
         arrb << 1.0;
 
-        objb << objb.numStr(i++) << "Hello";
+        objb << fieldNameGenerator() << "Hello";
         arrb << "Hello";
 
-        objb << objb.numStr(i++) << string("World");
+        objb << fieldNameGenerator() << string("World");
         arrb << string("World");
 
-        objb << objb.numStr(i++) << BSON("a" << 1 << "b"
-                                             << "foo");
+        objb << fieldNameGenerator()
+             << BSON("a" << 1 << "b"
+                         << "foo");
         arrb << BSON("a" << 1 << "b"
                          << "foo");
 
-        objb << objb.numStr(i++) << BSON("a" << 1)["a"];
+        objb << fieldNameGenerator() << BSON("a" << 1)["a"];
         arrb << BSON("a" << 1)["a"];
 
         OID oid;
         oid.init();
-        objb << objb.numStr(i++) << oid;
+        objb << fieldNameGenerator() << oid;
         arrb << oid;
 
-        objb.appendUndefined(objb.numStr(i++));
+        objb.appendUndefined(fieldNameGenerator());
         arrb.appendUndefined();
 
-        objb.appendRegex(objb.numStr(i++), "test", "imx");
+        objb.appendRegex(fieldNameGenerator(), "test", "imx");
         arrb.appendRegex("test", "imx");
 
-        objb.appendBinData(objb.numStr(i++), 4, BinDataGeneral, "wow");
+        objb.appendBinData(fieldNameGenerator(), 4, BinDataGeneral, "wow");
         arrb.appendBinData(4, BinDataGeneral, "wow");
 
-        objb.appendCode(objb.numStr(i++), "function(){ return 1; }");
+        objb.appendCode(fieldNameGenerator(), "function(){ return 1; }");
         arrb.appendCode("function(){ return 1; }");
 
-        objb.appendCodeWScope(objb.numStr(i++), "function(){ return a; }", BSON("a" << 1));
+        objb.appendCodeWScope(fieldNameGenerator(), "function(){ return a; }", BSON("a" << 1));
         arrb.appendCodeWScope("function(){ return a; }", BSON("a" << 1));
 
         time_t dt(0);
-        objb.appendTimeT(objb.numStr(i++), dt);
+        objb.appendTimeT(fieldNameGenerator(), dt);
         arrb.appendTimeT(dt);
 
         Date_t date{};
-        objb.appendDate(objb.numStr(i++), date);
+        objb.appendDate(fieldNameGenerator(), date);
         arrb.appendDate(date);
 
-        objb.append(objb.numStr(i++), BSONRegEx("test2", "s"));
+        objb.append(fieldNameGenerator(), BSONRegEx("test2", "s"));
         arrb.append(BSONRegEx("test2", "s"));
 
         BSONObj obj = objb.obj();
@@ -1680,14 +1662,13 @@ struct BSONArrayBuilderTest {
 
 struct ArrayMacroTest {
     void run() {
-        BSONArray arr = BSON_ARRAY("hello" << 1 << BSON("foo" << BSON_ARRAY("bar"
-                                                                            << "baz"
-                                                                            << "qux")));
+        BSONArray arr = BSON_ARRAY("hello" << 1
+                                           << BSON("foo" << BSON_ARRAY("bar"
+                                                                       << "baz"
+                                                                       << "qux")));
         BSONObj obj = BSON("0"
                            << "hello"
-                           << "1"
-                           << 1
-                           << "2"
+                           << "1" << 1 << "2"
                            << BSON("foo" << BSON_ARRAY("bar"
                                                        << "baz"
                                                        << "qux")));
@@ -1794,38 +1775,26 @@ public:
         // DBRef stuff -- json parser can't handle this yet
         good(BSON("a" << BSON("$ref"
                               << "coll"
-                              << "$id"
-                              << 1)));
+                              << "$id" << 1)));
         good(BSON("a" << BSON("$ref"
                               << "coll"
-                              << "$id"
-                              << 1
-                              << "$db"
+                              << "$id" << 1 << "$db"
                               << "a")));
         good(BSON("a" << BSON("$ref"
                               << "coll"
-                              << "$id"
-                              << 1
-                              << "stuff"
-                              << 1)));
+                              << "$id" << 1 << "stuff" << 1)));
         good(BSON("a" << BSON("$ref"
                               << "coll"
-                              << "$id"
-                              << 1
-                              << "$db"
+                              << "$id" << 1 << "$db"
                               << "a"
-                              << "stuff"
-                              << 1)));
+                              << "stuff" << 1)));
 
         bad(BSON("a" << BSON("$ref" << 1 << "$id" << 1)));
         bad(BSON("a" << BSON("$ref" << 1 << "$id" << 1 << "$db"
                                     << "a")));
         bad(BSON("a" << BSON("$ref"
                              << "coll"
-                             << "$id"
-                             << 1
-                             << "$db"
-                             << 1)));
+                             << "$id" << 1 << "$db" << 1)));
         bad(BSON("a" << BSON("$ref"
                              << "coll")));
         bad(BSON("a" << BSON("$ref"
@@ -1837,10 +1806,7 @@ public:
                                    << "coll")));
         bad(BSON("a" << BSON("$ref"
                              << "coll"
-                             << "$id"
-                             << 1
-                             << "$hater"
-                             << 1)));
+                             << "$id" << 1 << "$hater" << 1)));
     }
 };
 
@@ -1867,7 +1833,7 @@ public:
                 state = 1;
             } catch (std::exception& e) {
                 state = 2;
-                ASSERT(strstr(e.what(), "_id: 5") != NULL);
+                ASSERT(strstr(e.what(), "_id: 5") != nullptr);
             }
             free(crap);
             ASSERT_EQUALS(2, state);
@@ -2019,9 +1985,9 @@ public:
     }
 };
 
-class All : public Suite {
+class All : public OldStyleSuiteSpecification {
 public:
-    All() : Suite("jsobj") {}
+    All() : OldStyleSuiteSpecification("jsobj") {}
 
     void setupTests() {
         add<BufBuilderBasic>();
@@ -2115,6 +2081,6 @@ public:
     }
 };
 
-SuiteInstance<All> myall;
+OldStyleSuiteInitializer<All> myall;
 
 }  // namespace JsobjTests

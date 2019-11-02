@@ -39,6 +39,7 @@
 #include "mongo/db/db_raii.h"
 #include "mongo/db/json.h"
 #include "mongo/db/lasterror.h"
+#include "mongo/db/matcher/extensions_callback_real.h"
 #include "mongo/db/ops/delete_request.h"
 #include "mongo/db/ops/parsed_delete.h"
 #include "mongo/db/ops/parsed_update.h"
@@ -50,7 +51,6 @@
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/stats/counters.h"
 #include "mongo/db/storage/duplicate_key_error_info.h"
-#include "mongo/db/transaction_participant.h"
 #include "mongo/db/write_concern.h"
 #include "mongo/s/stale_exception.h"
 
@@ -93,7 +93,8 @@ void serializeReply(OperationContext* opCtx,
     if (continueOnError && !result.results.empty()) {
         const auto& lastResult = result.results.back();
         if (lastResult == ErrorCodes::StaleConfig ||
-            lastResult == ErrorCodes::CannotImplicitlyCreateCollection) {
+            lastResult == ErrorCodes::CannotImplicitlyCreateCollection ||
+            lastResult == ErrorCodes::StaleDbVersion) {
             // For ordered:false commands we need to duplicate these error results for all ops
             // after we stopped. See handleError() in write_ops_exec.cpp for more info.
             auto err = result.results.back();
@@ -110,7 +111,7 @@ void serializeReply(OperationContext* opCtx,
     BSONSizeTracker upsertInfoSizeTracker;
     BSONSizeTracker errorsSizeTracker;
 
-    auto errorMessage = [&, errorSize = size_t(0) ](StringData rawMessage) mutable {
+    auto errorMessage = [&, errorSize = size_t(0)](StringData rawMessage) mutable {
         // Start truncating error messages once both of these limits are exceeded.
         constexpr size_t kErrorSizeTruncationMin = 1024 * 1024;
         constexpr size_t kErrorCountTruncationMin = 2;
@@ -241,11 +242,6 @@ private:
         }
     }
 
-    bool supportsReadConcern(repl::ReadConcernLevel level) const final {
-        return level == repl::ReadConcernLevel::kLocalReadConcern ||
-            level == repl::ReadConcernLevel::kSnapshotReadConcern;
-    }
-
     bool supportsWriteConcern() const final {
         return true;
     }
@@ -260,8 +256,7 @@ private:
     }
 
     void _transactionChecks(OperationContext* opCtx) const {
-        auto txnParticipant = TransactionParticipant::get(opCtx);
-        if (!txnParticipant || !txnParticipant.inMultiDocumentTransaction())
+        if (!opCtx->inMultiDocumentTransaction())
             return;
         uassert(50791,
                 str::stream() << "Cannot write to system collection " << ns().toString()
@@ -311,7 +306,7 @@ private:
 
     std::unique_ptr<CommandInvocation> parse(OperationContext*,
                                              const OpMsgRequest& request) override {
-        return stdx::make_unique<Invocation>(this, request);
+        return std::make_unique<Invocation>(this, request);
     }
 
     void snipForLogging(mutablebson::Document* cmdObj) const final {
@@ -361,15 +356,21 @@ private:
 
             UpdateRequest updateRequest(_batch.getNamespace());
             updateRequest.setQuery(_batch.getUpdates()[0].getQ());
-            updateRequest.setUpdates(_batch.getUpdates()[0].getU());
+            updateRequest.setUpdateModification(_batch.getUpdates()[0].getU());
+            updateRequest.setUpdateConstants(_batch.getUpdates()[0].getC());
+            updateRequest.setRuntimeConstants(
+                _batch.getRuntimeConstants().value_or(Variables::generateRuntimeConstants(opCtx)));
             updateRequest.setCollation(write_ops::collationOf(_batch.getUpdates()[0]));
             updateRequest.setArrayFilters(write_ops::arrayFiltersOf(_batch.getUpdates()[0]));
             updateRequest.setMulti(_batch.getUpdates()[0].getMulti());
             updateRequest.setUpsert(_batch.getUpdates()[0].getUpsert());
             updateRequest.setYieldPolicy(PlanExecutor::YIELD_AUTO);
+            updateRequest.setHint(_batch.getUpdates()[0].getHint());
             updateRequest.setExplain();
 
-            ParsedUpdate parsedUpdate(opCtx, &updateRequest);
+            const ExtensionsCallbackReal extensionsCallback(opCtx,
+                                                            &updateRequest.getNamespaceString());
+            ParsedUpdate parsedUpdate(opCtx, &updateRequest, extensionsCallback);
             uassertStatusOK(parsedUpdate.parseRequest());
 
             // Explains of write commands are read-only, but we take write locks so that timing
@@ -379,14 +380,15 @@ private:
             auto exec = uassertStatusOK(getExecutorUpdate(
                 opCtx, &CurOp::get(opCtx)->debug(), collection.getCollection(), &parsedUpdate));
             auto bodyBuilder = result->getBodyBuilder();
-            Explain::explainStages(exec.get(), collection.getCollection(), verbosity, &bodyBuilder);
+            Explain::explainStages(
+                exec.get(), collection.getCollection(), verbosity, BSONObj(), &bodyBuilder);
         }
 
         write_ops::Update _batch;
     };
 
     std::unique_ptr<CommandInvocation> parse(OperationContext*, const OpMsgRequest& request) {
-        return stdx::make_unique<Invocation>(this, request);
+        return std::make_unique<Invocation>(this, request);
     }
 
     void snipForLogging(mutablebson::Document* cmdObj) const final {
@@ -452,7 +454,8 @@ private:
             auto exec = uassertStatusOK(getExecutorDelete(
                 opCtx, &CurOp::get(opCtx)->debug(), collection.getCollection(), &parsedDelete));
             auto bodyBuilder = result->getBodyBuilder();
-            Explain::explainStages(exec.get(), collection.getCollection(), verbosity, &bodyBuilder);
+            Explain::explainStages(
+                exec.get(), collection.getCollection(), verbosity, BSONObj(), &bodyBuilder);
         }
 
         write_ops::Delete _batch;
@@ -460,7 +463,7 @@ private:
 
     std::unique_ptr<CommandInvocation> parse(OperationContext*,
                                              const OpMsgRequest& request) override {
-        return stdx::make_unique<Invocation>(this, request);
+        return std::make_unique<Invocation>(this, request);
     }
 
     void snipForLogging(mutablebson::Document* cmdObj) const final {

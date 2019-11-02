@@ -44,6 +44,7 @@
 #include "mongo/db/repl/oplog_buffer.h"
 #include "mongo/db/repl/replication_consistency_markers_impl.h"
 #include "mongo/db/repl/storage_interface.h"
+#include "mongo/db/repl/transaction_oplog_application.h"
 #include "mongo/db/server_recovery.h"
 #include "mongo/db/session.h"
 #include "mongo/db/transaction_history_iterator.h"
@@ -80,18 +81,16 @@ public:
                 i++;
                 LOG_FOR_RECOVERY(kRecoveryOperationLogLevel)
                     << "Applying op " << i << " of " << batch.size() << " (in batch " << _numBatches
-                    << ") during replication recovery: " << redact(entry.raw);
+                    << ") during replication recovery: " << redact(entry.getRaw());
             }
         }
     }
 
     void onBatchEnd(const StatusWith<OpTime>&, const OplogApplier::Operations&) final {}
-    void onMissingDocumentsFetchedAndInserted(const std::vector<FetchInfo>&) final {}
 
     void complete(const OpTime& applyThroughOpTime) const {
-        LOG_FOR_RECOVERY(kRecoveryBatchLogLevel)
-            << "Applied " << _numOpsApplied << " operations in " << _numBatches
-            << " batches. Last operation applied with optime: " << applyThroughOpTime;
+        log() << "Applied " << _numOpsApplied << " operations in " << _numBatches
+              << " batches. Last operation applied with optime: " << applyThroughOpTime;
     }
 
 private:
@@ -154,13 +153,7 @@ public:
         return _peekOrPop(value, Mode::kPeek);
     }
 
-    void pushEvenIfFull(OperationContext*, const Value&) final {
-        MONGO_UNREACHABLE;
-    }
-    void push(OperationContext*, const Value&) final {
-        MONGO_UNREACHABLE;
-    }
-    void pushAllNonBlocking(OperationContext*, Batch::const_iterator, Batch::const_iterator) final {
+    void push(OperationContext*, Batch::const_iterator, Batch::const_iterator) final {
         MONGO_UNREACHABLE;
     }
     void waitForSpace(OperationContext*, std::size_t) final {
@@ -223,28 +216,6 @@ void ReplicationRecoveryImpl::recoverFromOplog(OperationContext* opCtx,
         inReplicationRecovery(serviceCtx) = false;
     });
 
-    const auto truncateAfterPoint = _consistencyMarkers->getOplogTruncateAfterPoint(opCtx);
-    if (!truncateAfterPoint.isNull()) {
-        log() << "Removing unapplied entries starting at: " << truncateAfterPoint.toBSON();
-        _truncateOplogTo(opCtx, truncateAfterPoint);
-
-        // Clear the truncateAfterPoint so that we don't truncate the next batch of oplog entries
-        // erroneously.
-        _consistencyMarkers->setOplogTruncateAfterPoint(opCtx, {});
-        opCtx->recoveryUnit()->waitUntilDurable();
-    }
-
-    auto topOfOplogSW = _getTopOfOplog(opCtx);
-    if (topOfOplogSW.getStatus() == ErrorCodes::CollectionIsEmpty ||
-        topOfOplogSW.getStatus() == ErrorCodes::NamespaceNotFound) {
-        // Oplog is empty. There are no oplog entries to apply, so we exit recovery and go into
-        // initial sync.
-        log() << "No oplog entries to apply for recovery. Oplog is empty.";
-        return;
-    }
-    fassert(40290, topOfOplogSW);
-    const auto topOfOplog = topOfOplogSW.getValue();
-
     // If we were passed in a stable timestamp, we are in rollback recovery and should recover from
     // that stable timestamp. Otherwise, we're recovering at startup. If this storage engine
     // supports recover to stable timestamp or enableMajorityReadConcern=false, we ask it for the
@@ -264,56 +235,29 @@ void ReplicationRecoveryImpl::recoverFromOplog(OperationContext* opCtx,
                             << " does not equal appliedThrough timestamp "
                             << appliedThrough.toString());
 
+    // This may take an IS lock on the oplog collection.
+    _truncateOplogIfNeededAndThenClearOplogTruncateAfterPoint(opCtx, stableTimestamp);
+
+    auto topOfOplogSW = _getTopOfOplog(opCtx);
+    if (topOfOplogSW.getStatus() == ErrorCodes::CollectionIsEmpty ||
+        topOfOplogSW.getStatus() == ErrorCodes::NamespaceNotFound) {
+        // Oplog is empty. There are no oplog entries to apply, so we exit recovery and go into
+        // initial sync.
+        log() << "No oplog entries to apply for recovery. Oplog is empty.";
+        return;
+    }
+    fassert(40290, topOfOplogSW);
+    const auto topOfOplog = topOfOplogSW.getValue();
+
     if (stableTimestamp) {
         invariant(supportsRecoveryTimestamp);
         _recoverFromStableTimestamp(opCtx, *stableTimestamp, appliedThrough, topOfOplog);
     } else {
         _recoverFromUnstableCheckpoint(opCtx, appliedThrough, topOfOplog);
     }
-
-    _reconstructPreparedTransactions(opCtx);
 } catch (...) {
     severe() << "Caught exception during replication recovery: " << exceptionToStatus();
     std::terminate();
-}
-
-void ReplicationRecoveryImpl::_reconstructPreparedTransactions(OperationContext* opCtx) {
-    DBDirectClient client(opCtx);
-    const auto cursor = client.query(NamespaceString::kSessionTransactionsTableNamespace,
-                                     {BSON("state"
-                                           << "prepared")});
-
-    // Iterate over each entry in the transactions table that has a prepared transaction.
-    while (cursor->more()) {
-        const auto txnRecordObj = cursor->next();
-        const auto txnRecord = SessionTxnRecord::parse(
-            IDLParserErrorContext("recovering prepared transaction"), txnRecordObj);
-
-        invariant(txnRecord.getState() == DurableTxnStateEnum::kPrepared);
-
-        // Get the prepareTransaction oplog entry corresponding to this transactions table entry.
-        invariant(!opCtx->recoveryUnit()->getPointInTimeReadTimestamp());
-        const auto prepareOpTime = txnRecord.getLastWriteOpTime();
-        invariant(!prepareOpTime.isNull());
-        TransactionHistoryIterator iter(prepareOpTime);
-        invariant(iter.hasNext());
-        const auto prepareOplogEntry = iter.next(opCtx);
-
-        {
-            // Make a new opCtx so that we can set the lsid when applying the prepare transaction
-            // oplog entry.
-            auto newClient =
-                opCtx->getServiceContext()->makeClient("reconstruct-prepared-transactions");
-            AlternativeClientRegion acr(newClient);
-            const auto newOpCtx = cc().makeOperationContext();
-
-            // Snapshot transaction can never conflict with the PBWM lock.
-            newOpCtx->lockState()->setShouldConflictWithSecondaryBatchApplication(false);
-
-            // Checks out the session, applies the operations and prepares the transactions.
-            uassertStatusOK(applyRecoveredPrepareTransaction(newOpCtx.get(), prepareOplogEntry));
-        }
-    }
 }
 
 void ReplicationRecoveryImpl::_recoverFromStableTimestamp(OperationContext* opCtx,
@@ -380,11 +324,11 @@ void ReplicationRecoveryImpl::_recoverFromUnstableCheckpoint(OperationContext* o
     //
     // Not waiting for checkpoint durability here can result in a scenario where the node takes
     // writes and persists them to the oplog, but crashes before a stable checkpoint persists a
-    // "recovery timestamp". The typical startup path for data-bearing nodes with 4.0 is to use
-    // the recovery timestamp to determine where to play oplog forward from. As this method shows,
-    // when a recovery timestamp does not exist, the applied through is used to determine where to
-    // start playing oplog entries from.
-    opCtx->recoveryUnit()->waitUntilUnjournaledWritesDurable();
+    // "recovery timestamp". The typical startup path for data-bearing nodes is to use the recovery
+    // timestamp to determine where to play oplog forward from. As this method shows, when a
+    // recovery timestamp does not exist, the applied through is used to determine where to start
+    // playing oplog entries from.
+    opCtx->recoveryUnit()->waitUntilUnjournaledWritesDurable(opCtx);
 }
 
 void ReplicationRecoveryImpl::_applyToEndOfOplog(OperationContext* opCtx,
@@ -412,37 +356,25 @@ void ReplicationRecoveryImpl::_applyToEndOfOplog(OperationContext* opCtx,
 
     RecoveryOplogApplierStats stats;
 
-    auto writerPool = OplogApplier::makeWriterPool();
-    OplogApplier::Options options;
-    options.allowNamespaceNotFoundErrorsOnCrudOps = true;
-    options.skipWritesToOplog = true;
-    // During replication recovery, the stableTimestampForRecovery refers to the stable timestamp
-    // from which we replay the oplog.
-    // For startup recovery, this will be the recovery timestamp, which is the stable timestamp that
-    // the storage engine recovered to on startup. For rollback recovery, this will be the last
-    // stable timestamp, returned when we call recoverToStableTimestamp.
-    // We keep track of this for prepared transactions so that when we apply a commitTransaction
-    // oplog entry, we can check if it occurs before or after the stable timestamp and decide
-    // whether the operations would have already been reflected in the data.
-    options.stableTimestampForRecovery = oplogApplicationStartPoint;
+    auto writerPool = makeReplWriterPool();
     OplogApplierImpl oplogApplier(nullptr,
                                   &oplogBuffer,
                                   &stats,
-                                  nullptr,
+                                  ReplicationCoordinator::get(opCtx),
                                   _consistencyMarkers,
                                   _storageInterface,
-                                  options,
+                                  OplogApplier::Options(OplogApplication::Mode::kRecovering),
                                   writerPool.get());
 
     OplogApplier::BatchLimits batchLimits;
-    batchLimits.bytes = OplogApplier::calculateBatchLimitBytes(opCtx, _storageInterface);
-    batchLimits.ops = OplogApplier::getBatchLimitOperations();
+    batchLimits.bytes = getBatchLimitOplogBytes(opCtx, _storageInterface);
+    batchLimits.ops = getBatchLimitOplogEntries();
 
     OpTime applyThroughOpTime;
     OplogApplier::Operations batch;
     while (
         !(batch = fassert(50763, oplogApplier.getNextApplierBatch(opCtx, batchLimits))).empty()) {
-        applyThroughOpTime = uassertStatusOK(oplogApplier.multiApply(opCtx, std::move(batch)));
+        applyThroughOpTime = uassertStatusOK(oplogApplier.applyOplogBatch(opCtx, std::move(batch)));
     }
     stats.complete(applyThroughOpTime);
     invariant(oplogBuffer.isEmpty(),
@@ -452,8 +384,7 @@ void ReplicationRecoveryImpl::_applyToEndOfOplog(OperationContext* opCtx,
     invariant(applyThroughOpTime.getTimestamp() == topOfOplog,
               str::stream() << "Did not apply to top of oplog. Applied through: "
                             << applyThroughOpTime.toString()
-                            << ". Top of oplog: "
-                            << topOfOplog.toString());
+                            << ". Top of oplog: " << topOfOplog.toString());
     oplogBuffer.shutdown(opCtx);
 
     // We may crash before setting appliedThrough. If we have a stable checkpoint, we will recover
@@ -486,12 +417,14 @@ StatusWith<OpTime> ReplicationRecoveryImpl::_getTopOfOplog(OperationContext* opC
 }
 
 void ReplicationRecoveryImpl::_truncateOplogTo(OperationContext* opCtx,
-                                               Timestamp truncateTimestamp) {
+                                               Timestamp truncateTimestamp,
+                                               bool inclusive) {
     Timer timer;
     const NamespaceString oplogNss(NamespaceString::kRsOplogNamespace);
     AutoGetDb autoDb(opCtx, oplogNss.db(), MODE_IX);
-    Lock::CollectionLock oplogCollectionLoc(opCtx->lockState(), oplogNss.ns(), MODE_X);
-    Collection* oplogCollection = autoDb.getDb()->getCollection(opCtx, oplogNss);
+    Lock::CollectionLock oplogCollectionLoc(opCtx, oplogNss, MODE_X);
+    Collection* oplogCollection =
+        CollectionCatalog::get(opCtx).lookupCollectionByNamespace(oplogNss);
     if (!oplogCollection) {
         fassertFailedWithStatusNoTrace(
             34418,
@@ -522,7 +455,7 @@ void ReplicationRecoveryImpl::_truncateOplogTo(OperationContext* opCtx,
             // oplog is < truncateTimestamp.
             if (count != 1) {
                 invariant(!oldestIDToDelete.isNull());
-                oplogCollection->cappedTruncateAfter(opCtx, oldestIDToDelete, /*inclusive=*/true);
+                oplogCollection->cappedTruncateAfter(opCtx, oldestIDToDelete, inclusive);
             }
             log() << "Replication recovery oplog truncation finished in: " << timer.millis()
                   << "ms";
@@ -535,6 +468,41 @@ void ReplicationRecoveryImpl::_truncateOplogTo(OperationContext* opCtx,
     severe() << "Reached end of oplog looking for oplog entry before " << truncateTimestamp.toBSON()
              << " but couldn't find any after looking through " << count << " entries.";
     fassertFailedNoTrace(40296);
+}
+
+void ReplicationRecoveryImpl::_truncateOplogIfNeededAndThenClearOplogTruncateAfterPoint(
+    OperationContext* opCtx, boost::optional<Timestamp> stableTimestamp) {
+
+    Timestamp truncatePoint = _consistencyMarkers->getOplogTruncateAfterPoint(opCtx);
+    if (truncatePoint.isNull()) {
+        // There are no holes in the oplog that necessitate truncation.
+        return;
+    }
+
+    // We want to delete oplog inclusive of the 'oplogTruncateAfterPoint', but not inclusive of the
+    // stable timestamp if we end up using that value instead.
+    bool inclusive = true;
+
+    if (stableTimestamp && !stableTimestamp->isNull() && truncatePoint <= stableTimestamp) {
+        AutoGetCollectionForRead oplog(opCtx, NamespaceString::kRsOplogNamespace);
+        invariant(oplog.getCollection());
+
+        log() << "The oplog truncation point (" << truncatePoint
+              << ") is equal to or earlier than the stable timestamp (" << stableTimestamp.get()
+              << "), so truncating after the stable timestamp instead";
+
+        inclusive = false;
+        truncatePoint = stableTimestamp.get();
+    }
+
+    log() << "Removing unapplied oplog entries starting at: " << truncatePoint.toBSON() << ", "
+          << (inclusive ? "inclusive" : "not inclusive");
+    _truncateOplogTo(opCtx, truncatePoint, inclusive);
+
+    // Clear the oplogTruncateAfterPoint now that we have removed any holes that might exist in the
+    // oplog -- and so that we do not truncate future entries erroneously.
+    _consistencyMarkers->setOplogTruncateAfterPoint(opCtx, {});
+    opCtx->recoveryUnit()->waitUntilDurable(opCtx);
 }
 
 }  // namespace repl

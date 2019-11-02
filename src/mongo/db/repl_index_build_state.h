@@ -35,7 +35,7 @@
 #include <vector>
 
 #include "mongo/bson/bsonobj.h"
-#include "mongo/db/catalog/collection_catalog_entry.h"
+#include "mongo/bson/timestamp.h"
 #include "mongo/db/catalog/commit_quorum_options.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/namespace_string.h"
@@ -46,23 +46,19 @@
 
 namespace mongo {
 
-namespace {
-
-std::vector<std::string> extractIndexNames(const std::vector<BSONObj>& specs) {
-    std::vector<std::string> indexNames;
-    for (const auto& spec : specs) {
-        std::string name = spec.getStringField(IndexDescriptor::kIndexNameFieldName);
-        invariant(!name.empty(),
-                  str::stream() << "Bad spec passed into ReplIndexBuildState constructor, missing '"
-                                << IndexDescriptor::kIndexNameFieldName
-                                << "' field: "
-                                << spec);
-        indexNames.push_back(name);
-    }
-    return indexNames;
-}
-
-}  // namespace
+// Indicates which protocol an index build is using.
+enum class IndexBuildProtocol {
+    /**
+     * Refers to the legacy index build protocol for building indexes in replica sets. Index builds
+     * must complete on the primary before replicating, and are not resumable in any scenario.
+     */
+    kSinglePhase,
+    /**
+     * Refers to the two-phase index build protocol for building indexes in replica sets. Indexes
+     * are built simultaneously on all nodes and are resumable during the draining phase.
+     */
+    kTwoPhase
+};
 
 /**
  * Tracks the cross replica set progress of a particular index build identified by a build UUID.
@@ -109,7 +105,7 @@ struct ReplIndexBuildState {
     IndexBuildProtocol protocol;
 
     // Protects the state below.
-    mutable stdx::mutex mutex;
+    mutable Mutex mutex = MONGO_MAKE_LATCH("ReplIndexBuildState::mutex");
 
     // Secondaries do not set this information, so it is only set on primaries or on
     // transition to primary.
@@ -131,15 +127,34 @@ struct ReplIndexBuildState {
     // SharedSemiFuture(s).
     SharedPromise<IndexCatalogStats> sharedPromise;
 
+    // Set to true on a secondary on receipt of a commitIndexBuild oplog entry.
+    bool isCommitReady = false;
+    Timestamp commitTimestamp;
+
     // There is a period of time where the index build is registered on the coordinator, but an
     // index builder does not yet exist. Since a signal cannot be set on the index builder at that
     // time, it must be saved here.
     bool aborted = false;
+    Timestamp abortTimestamp;
     std::string abortReason = "";
 
     // The coordinator for the index build will wait upon this when awaiting an external signal,
     // such as commit or commit readiness signals.
     stdx::condition_variable condVar;
+
+private:
+    std::vector<std::string> extractIndexNames(const std::vector<BSONObj>& specs) {
+        std::vector<std::string> indexNames;
+        for (const auto& spec : specs) {
+            std::string name = spec.getStringField(IndexDescriptor::kIndexNameFieldName);
+            invariant(!name.empty(),
+                      str::stream()
+                          << "Bad spec passed into ReplIndexBuildState constructor, missing '"
+                          << IndexDescriptor::kIndexNameFieldName << "' field: " << spec);
+            indexNames.push_back(name);
+        }
+        return indexNames;
+    }
 };
 
 }  // namespace mongo

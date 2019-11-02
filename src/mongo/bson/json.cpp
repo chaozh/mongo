@@ -32,22 +32,25 @@
 #include "mongo/bson/json.h"
 
 #include <cstdint>
+#include <fmt/format.h>
 
 #include "mongo/base/parse_number.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/platform/decimal128.h"
 #include "mongo/platform/strtoll.h"
 #include "mongo/util/base64.h"
+#include "mongo/util/decimal_counter.h"
 #include "mongo/util/hex.h"
 #include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
 
-using std::unique_ptr;
 using std::ostringstream;
 using std::string;
+using std::unique_ptr;
+using namespace fmt::literals;
 
 #if 0
 #define MONGO_JSON_DEBUG(message)                                                          \
@@ -414,8 +417,6 @@ Status JParse::dateObject(StringData fieldName, BSONObjBuilder& builder) {
     if (!readToken(COLON)) {
         return parseError("Expected ':'");
     }
-    errno = 0;
-    char* endptr;
     Date_t date;
 
     if (peekToken(DOUBLEQUOTE)) {
@@ -454,32 +455,17 @@ Status JParse::dateObject(StringData fieldName, BSONObjBuilder& builder) {
         }
 
         long long numberLong;
-        ret = parseNumberFromString(numberLongString, &numberLong);
+        ret = NumberParser{}(numberLongString, &numberLong);
         if (!ret.isOK()) {
             return ret;
         }
         date = Date_t::fromMillisSinceEpoch(numberLong);
     } else {
-        // SERVER-11920: We should use parseNumberFromString here, but that function requires
-        // that we know ahead of time where the number ends, which is not currently the case.
-        date = Date_t::fromMillisSinceEpoch(strtoll(_input, &endptr, 10));
-        if (_input == endptr) {
-            return parseError("Date expecting integer milliseconds");
+        StatusWith<Date_t> parsedDate = parseDate();
+        if (!parsedDate.isOK()) {
+            return parsedDate.getStatus();
         }
-        if (errno == ERANGE) {
-            /* Need to handle this because jsonString outputs the value of Date_t as unsigned.
-            * See SERVER-8330 and SERVER-8573 */
-            errno = 0;
-            // SERVER-11920: We should use parseNumberFromString here, but that function
-            // requires that we know ahead of time where the number ends, which is not currently
-            // the case.
-            date =
-                Date_t::fromMillisSinceEpoch(static_cast<long long>(strtoull(_input, &endptr, 10)));
-            if (errno == ERANGE) {
-                return parseError("Date milliseconds overflow");
-            }
-        }
-        _input = endptr;
+        date = std::move(parsedDate).getValue();
     }
     builder.appendDate(fieldName, date);
     return Status::OK();
@@ -503,15 +489,14 @@ Status JParse::timestampObject(StringData fieldName, BSONObjBuilder& builder) {
     if (readToken("-")) {
         return parseError("Negative seconds in \"$timestamp\"");
     }
-    errno = 0;
     char* endptr;
-    // SERVER-11920: We should use parseNumberFromString here, but that function requires that
-    // we know ahead of time where the number ends, which is not currently the case.
-    uint32_t seconds = strtoul(_input, &endptr, 10);
-    if (errno == ERANGE) {
+    uint32_t seconds;
+    NumberParser parser = NumberParser::strToAny(10);
+    Status parsedStatus = parser(_input, &seconds, &endptr);
+    if (parsedStatus == ErrorCodes::Overflow) {
         return parseError("Timestamp seconds overflow");
     }
-    if (_input == endptr) {
+    if (!parsedStatus.isOK()) {
         return parseError("Expecting unsigned integer seconds in \"$timestamp\"");
     }
     _input = endptr;
@@ -528,14 +513,12 @@ Status JParse::timestampObject(StringData fieldName, BSONObjBuilder& builder) {
     if (readToken("-")) {
         return parseError("Negative increment in \"$timestamp\"");
     }
-    errno = 0;
-    // SERVER-11920: We should use parseNumberFromString here, but that function requires that
-    // we know ahead of time where the number ends, which is not currently the case.
-    uint32_t count = strtoul(_input, &endptr, 10);
-    if (errno == ERANGE) {
+    uint32_t count;
+    parsedStatus = parser(_input, &count, &endptr);
+    if (parsedStatus == ErrorCodes::Overflow) {
         return parseError("Timestamp increment overflow");
     }
-    if (_input == endptr) {
+    if (!parsedStatus.isOK()) {
         return parseError("Expecting unsigned integer increment in \"$timestamp\"");
     }
     _input = endptr;
@@ -656,7 +639,7 @@ Status JParse::numberLongObject(StringData fieldName, BSONObjBuilder& builder) {
     }
 
     long long numberLong;
-    ret = parseNumberFromString(numberLongString, &numberLong);
+    ret = NumberParser{}(numberLongString, &numberLong);
     if (!ret.isOK()) {
         return ret;
     }
@@ -708,7 +691,6 @@ Status JParse::maxKeyObject(StringData fieldName, BSONObjBuilder& builder) {
 
 Status JParse::array(StringData fieldName, BSONObjBuilder& builder, bool subObject) {
     MONGO_JSON_DEBUG("fieldName: " << fieldName);
-    uint32_t index(0);
     if (!readToken(LBRACKET)) {
         return parseError("Expecting '['");
     }
@@ -721,12 +703,13 @@ Status JParse::array(StringData fieldName, BSONObjBuilder& builder, bool subObje
     }
 
     if (!peekToken(RBRACKET)) {
+        DecimalCounter<uint32_t> index;
         do {
-            Status ret = value(builder.numStr(index), *arrayBuilder);
-            if (ret != Status::OK()) {
+            Status ret = value(StringData{index}, *arrayBuilder);
+            if (!ret.isOK()) {
                 return ret;
             }
-            index++;
+            ++index;
         } while (readToken(COMMA));
     }
     arrayBuilder->done();
@@ -753,26 +736,11 @@ Status JParse::date(StringData fieldName, BSONObjBuilder& builder) {
     if (!readToken(LPAREN)) {
         return parseError("Expecting '('");
     }
-    errno = 0;
-    char* endptr;
-    // SERVER-11920: We should use parseNumberFromString here, but that function requires that
-    // we know ahead of time where the number ends, which is not currently the case.
-    Date_t date = Date_t::fromMillisSinceEpoch(strtoll(_input, &endptr, 10));
-    if (_input == endptr) {
-        return parseError("Date expecting integer milliseconds");
+    StatusWith<Date_t> parsedDate = parseDate();
+    if (!parsedDate.isOK()) {
+        return parsedDate.getStatus();
     }
-    if (errno == ERANGE) {
-        /* Need to handle this because jsonString outputs the value of Date_t as unsigned.
-        * See SERVER-8330 and SERVER-8573 */
-        errno = 0;
-        // SERVER-11920: We should use parseNumberFromString here, but that function requires
-        // that we know ahead of time where the number ends, which is not currently the case.
-        date = Date_t::fromMillisSinceEpoch(static_cast<long long>(strtoull(_input, &endptr, 10)));
-        if (errno == ERANGE) {
-            return parseError("Date milliseconds overflow");
-        }
-    }
-    _input = endptr;
+    Date_t date = parsedDate.getValue();
     if (!readToken(RPAREN)) {
         return parseError("Expecting ')'");
     }
@@ -787,15 +755,14 @@ Status JParse::timestamp(StringData fieldName, BSONObjBuilder& builder) {
     if (readToken("-")) {
         return parseError("Negative seconds in \"$timestamp\"");
     }
-    errno = 0;
     char* endptr;
-    // SERVER-11920: We should use parseNumberFromString here, but that function requires that
-    // we know ahead of time where the number ends, which is not currently the case.
-    uint32_t seconds = strtoul(_input, &endptr, 10);
-    if (errno == ERANGE) {
+    NumberParser parser = NumberParser::strToAny(10);
+    uint32_t seconds;
+    Status parsedStatus = parser(_input, &seconds, &endptr);
+    if (parsedStatus == ErrorCodes::Overflow) {
         return parseError("Timestamp seconds overflow");
     }
-    if (_input == endptr) {
+    if (!parsedStatus.isOK()) {
         return parseError("Expecting unsigned integer seconds in \"$timestamp\"");
     }
     _input = endptr;
@@ -805,14 +772,12 @@ Status JParse::timestamp(StringData fieldName, BSONObjBuilder& builder) {
     if (readToken("-")) {
         return parseError("Negative seconds in \"$timestamp\"");
     }
-    errno = 0;
-    // SERVER-11920: We should use parseNumberFromString here, but that function requires that
-    // we know ahead of time where the number ends, which is not currently the case.
-    uint32_t count = strtoul(_input, &endptr, 10);
-    if (errno == ERANGE) {
+    uint32_t count;
+    parsedStatus = parser(_input, &count, &endptr);
+    if (parsedStatus == ErrorCodes::Overflow) {
         return parseError("Timestamp increment overflow");
     }
-    if (_input == endptr) {
+    if (!parsedStatus.isOK()) {
         return parseError("Expecting unsigned integer increment in \"$timestamp\"");
     }
     _input = endptr;
@@ -850,15 +815,13 @@ Status JParse::numberLong(StringData fieldName, BSONObjBuilder& builder) {
     if (!readToken(LPAREN)) {
         return parseError("Expecting '('");
     }
-    errno = 0;
     char* endptr;
-    // SERVER-11920: We should use parseNumberFromString here, but that function requires that
-    // we know ahead of time where the number ends, which is not currently the case.
-    int64_t val = strtoll(_input, &endptr, 10);
-    if (errno == ERANGE) {
+    int64_t val;
+    Status parsedStatus = NumberParser::strToAny(10)(_input, &val, &endptr);
+    if (parsedStatus == ErrorCodes::Overflow) {
         return parseError("NumberLong out of range");
     }
-    if (_input == endptr) {
+    if (!parsedStatus.isOK()) {
         return parseError("Expecting number in NumberLong");
     }
     _input = endptr;
@@ -880,7 +843,15 @@ Status JParse::numberDecimal(StringData fieldName, BSONObjBuilder& builder) {
     if (ret != Status::OK()) {
         return ret;
     }
-    Decimal128 val(decString);
+    Decimal128 val;
+    Status parsedStatus = NumberParser().setDecimal128RoundingMode(
+        Decimal128::RoundingMode::kRoundTiesToEven)(decString, &val);
+    if (parsedStatus == ErrorCodes::Overflow) {
+        return parseError("numberDecimal out of range");
+    }
+    if (!parsedStatus.isOK()) {
+        return parseError("Expecting decimal in numberDecimal");
+    }
 
     if (!readToken(RPAREN)) {
         return parseError("Expecting ')'");
@@ -893,15 +864,13 @@ Status JParse::numberInt(StringData fieldName, BSONObjBuilder& builder) {
     if (!readToken(LPAREN)) {
         return parseError("Expecting '('");
     }
-    errno = 0;
     char* endptr;
-    // SERVER-11920: We should use parseNumberFromString here, but that function requires that
-    // we know ahead of time where the number ends, which is not currently the case.
-    int32_t val = strtol(_input, &endptr, 10);
-    if (errno == ERANGE) {
+    int32_t val;
+    Status parsedStatus = NumberParser::strToAny(10)(_input, &val, &endptr);
+    if (parsedStatus == ErrorCodes::Overflow) {
         return parseError("NumberInt out of range");
     }
-    if (_input == endptr) {
+    if (!parsedStatus.isOK()) {
         return parseError("Expecting unsigned number in NumberInt");
     }
     _input = endptr;
@@ -993,10 +962,13 @@ Status JParse::regexOpt(std::string* result) {
 Status JParse::regexOptCheck(StringData opt) {
     MONGO_JSON_DEBUG("opt: " << opt);
     std::size_t i;
+    std::string availableOptions = JOPTIONS;
     for (i = 0; i < opt.size(); i++) {
-        if (!match(opt[i], JOPTIONS)) {
+        std::size_t availIndex = availableOptions.find(opt[i]);
+        if (availIndex == std::string::npos) {
             return parseError(string("Bad regex option: ") + opt[i]);
         }
+        availableOptions.erase(availIndex, 1);
     }
     return Status::OK();
 }
@@ -1007,24 +979,15 @@ Status JParse::number(StringData fieldName, BSONObjBuilder& builder) {
     long long retll;
     double retd;
 
-    // reset errno to make sure that we are getting it from strtod
-    errno = 0;
-    // SERVER-11920: We should use parseNumberFromString here, but that function requires that
-    // we know ahead of time where the number ends, which is not currently the case.
-    retd = strtod(_input, &endptrd);
-    // if pointer does not move, we found no digits
-    if (_input == endptrd) {
-        return parseError("Bad characters in value");
-    }
-    if (errno == ERANGE) {
+    Status parsedStatus = NumberParser::strToAny()(_input, &retd, &endptrd);
+    if (parsedStatus == ErrorCodes::Overflow) {
         return parseError("Value cannot fit in double");
     }
-    // reset errno to make sure that we are getting it from strtoll
-    errno = 0;
-    // SERVER-11920: We should use parseNumberFromString here, but that function requires that
-    // we know ahead of time where the number ends, which is not currently the case.
-    retll = strtoll(_input, &endptrll, 10);
-    if (endptrll < endptrd || errno == ERANGE) {
+    if (!parsedStatus.isOK()) {
+        return parseError("Bad characters in value");
+    }
+    parsedStatus = NumberParser::strToAny(10)(_input, &retll, &endptrll);
+    if (endptrll < endptrd || parsedStatus == ErrorCodes::Overflow) {
         // The number either had characters only meaningful for a double or
         // could not fit in a 64 bit int
         MONGO_JSON_DEBUG("Type: double");
@@ -1105,7 +1068,7 @@ Status JParse::chars(std::string* result, const char* terminalSet, const char* a
     const char* q = _input;
     while (q < _input_end && !match(*q, terminalSet)) {
         MONGO_JSON_DEBUG("q: " << q);
-        if (allowedSet != NULL) {
+        if (allowedSet != nullptr) {
             if (!match(*q, allowedSet)) {
                 _input = q;
                 return Status::OK();
@@ -1223,7 +1186,7 @@ inline bool JParse::readToken(const char* token) {
 bool JParse::readTokenImpl(const char* token, bool advance) {
     MONGO_JSON_DEBUG("token: " << token);
     const char* check = _input;
-    if (token == NULL) {
+    if (token == nullptr) {
         return false;
     }
     // 'isspace()' takes an 'int' (signed), so (default signed) 'char's get sign-extended
@@ -1261,13 +1224,13 @@ bool JParse::readField(StringData expectedField) {
 }
 
 inline bool JParse::match(char matchChar, const char* matchSet) const {
-    if (matchSet == NULL) {
+    if (matchSet == nullptr) {
         return true;
     }
     if (*matchSet == '\0') {
         return false;
     }
-    return (strchr(matchSet, matchChar) != NULL);
+    return (strchr(matchSet, matchChar) != nullptr);
 }
 
 bool JParse::isHexString(StringData str) const {
@@ -1290,6 +1253,28 @@ bool JParse::isArray() {
     return peekToken(LBRACKET);
 }
 
+StatusWith<Date_t> JParse::parseDate() {
+    long long msSinceEpoch;
+    char* endptr;
+    Status parsedStatus = NumberParser::strToAny(10)(_input, &msSinceEpoch, &endptr);
+    if (parsedStatus == ErrorCodes::Overflow) {
+        /* Need to handle this because jsonString outputs the value of Date_t as unsigned.
+         * See SERVER-8330 and SERVER-8573 */
+        unsigned long long oldDate;  // Date_t used to be stored as unsigned long longs
+        parsedStatus = NumberParser::strToAny(10)(_input, &oldDate, &endptr);
+        if (parsedStatus == ErrorCodes::Overflow) {
+            return parseError("Date milliseconds overflow");
+        }
+        msSinceEpoch = static_cast<long long>(oldDate);
+    } else if (!parsedStatus.isOK()) {
+        return parseError("Date expecting integer milliseconds");
+    }
+    invariant(endptr != _input);
+    Date_t date = Date_t::fromMillisSinceEpoch(msSinceEpoch);
+    _input = endptr;
+    return date;
+}
+
 BSONObj fromjson(const char* jsonString, int* len) {
     MONGO_JSON_DEBUG("jsonString: " << jsonString);
     if (jsonString[0] == '\0') {
@@ -1309,9 +1294,7 @@ BSONObj fromjson(const char* jsonString, int* len) {
     }
 
     if (ret != Status::OK()) {
-        ostringstream message;
-        message << "code " << ret.code() << ": " << ret.codeString() << ": " << ret.reason();
-        uasserted(16619, message.str());
+        uasserted(16619, "code {}: {}: {}"_format(ret.code(), ret.codeString(), ret.reason()));
     }
     if (len)
         *len = jparse.offset();

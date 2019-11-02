@@ -50,11 +50,11 @@
 #include <utility>
 #include <vector>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/config.h"
 #include "mongo/logger/log_severity.h"
 #include "mongo/platform/compiler.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/duration.h"
 #include "mongo/util/net/sockaddr.h"
 
 namespace mongo {
@@ -79,16 +79,17 @@ typedef int SOCKET;
 #endif  // _WIN32
 
 /**
- * thin wrapped around file descriptor and system calls
+ * thin wrapper around file descriptor and system calls
  * todo: ssl
  */
 class Socket {
-    MONGO_DISALLOW_COPYING(Socket);
+    Socket(const Socket&) = delete;
+    Socket& operator=(const Socket&) = delete;
 
 public:
     static const int errorPollIntervalSecs;
 
-    Socket(int sock, const SockAddr& farEnd);
+    Socket(int sock, const SockAddr& remote);
 
     /** In some cases the timeout will actually be 2x this value - eg we do a partial send,
         then the timeout fires, then we try to send again, then the timeout fires again with
@@ -108,7 +109,12 @@ public:
      *  an error, or due to a timeout on connection, or due to the system socket deciding the
      *  socket is invalid.
      */
-    bool connect(SockAddr& farEnd);
+    bool connect(SockAddr& remote, Milliseconds connectTimeoutMillis);
+
+    /**
+     * Connect using a default connect timeout of min(_timeout * 1000, kMaxConnectTimeoutMS)
+     */
+    bool connect(SockAddr& remote);
 
     void close();
     void send(const char* data, int len, const char* context);
@@ -196,7 +202,7 @@ public:
      *
      * This function may throw SocketException.
      */
-    SSLPeerInfo doSSLHandshake(const char* firstBytes = NULL, int len = 0);
+    SSLPeerInfo doSSLHandshake(const char* firstBytes = nullptr, int len = 0);
 
     /**
      * @return the time when the socket was opened.
@@ -207,8 +213,6 @@ public:
 
     void handleRecvError(int ret, int len);
     void handleSendError(int ret, const char* context);
-
-    std::string getSNIServerName() const;
 
 private:
     void _init();

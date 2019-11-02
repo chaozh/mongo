@@ -32,9 +32,9 @@
 #include "vm/PosixNSPR.h"
 
 #include "mongo/client/dbclient_cursor.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/scripting/mozjs/engine.h"
 #include "mongo/stdx/condition_variable.h"
-#include "mongo/stdx/mutex.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/util/functional.h"
 
@@ -63,7 +63,8 @@ class MozJSImplScope;
  *
  */
 class MozJSProxyScope final : public Scope {
-    MONGO_DISALLOW_COPYING(MozJSProxyScope);
+    MozJSProxyScope(const MozJSProxyScope&) = delete;
+    MozJSProxyScope& operator=(const MozJSProxyScope&) = delete;
 
     /**
      * The FSM is fairly tight:
@@ -169,7 +170,7 @@ public:
               bool assertOnError,
               int timeoutMs) override;
 
-    void injectNative(const char* field, NativeFunction func, void* data = 0) override;
+    void injectNative(const char* field, NativeFunction func, void* data = nullptr) override;
 
     ScriptingFunction _createFunction(const char* code) override;
 
@@ -185,7 +186,7 @@ private:
     void runOnImplThread(unique_function<void()> f);
 
     void shutdownThread();
-    static void implThread(void* proxy);
+    static void implThread(MozJSProxyScope* proxy);
 
     MozJSScriptEngine* const _engine;
     MozJSImplScope* _implScope;
@@ -194,7 +195,7 @@ private:
      * This mutex protects _function, _state and _status as channels for
      * function invocation and exception handling
      */
-    stdx::mutex _mutex;
+    Mutex _mutex = MONGO_MAKE_LATCH("MozJSProxyScope::_mutex");
     unique_function<void()> _function;
     State _state;
     Status _status;
@@ -202,7 +203,7 @@ private:
 
     stdx::condition_variable _proxyCondvar;
     stdx::condition_variable _implCondvar;
-    PRThread* _thread;
+    stdx::thread _thread;
 };
 
 }  // namespace mozjs

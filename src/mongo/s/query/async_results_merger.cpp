@@ -82,10 +82,10 @@ int compareSortKeys(BSONObj leftSortKey, BSONObj rightSortKey, BSONObj sortKeyPa
 }  // namespace
 
 AsyncResultsMerger::AsyncResultsMerger(OperationContext* opCtx,
-                                       executor::TaskExecutor* executor,
+                                       std::shared_ptr<executor::TaskExecutor> executor,
                                        AsyncResultsMergerParams params)
     : _opCtx(opCtx),
-      _executor(executor),
+      _executor(std::move(executor)),
       // This strange initialization is to work around the fact that the IDL does not currently
       // support a default value for an enum. The default tailable mode should be 'kNormal', but
       // since that is not supported we treat boost::none (unspecified) to mean 'kNormal'.
@@ -115,12 +115,12 @@ AsyncResultsMerger::AsyncResultsMerger(OperationContext* opCtx,
 }
 
 AsyncResultsMerger::~AsyncResultsMerger() {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     invariant(_remotesExhausted(lk) || _lifecycleState == kKillComplete);
 }
 
 bool AsyncResultsMerger::remotesExhausted() const {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     return _remotesExhausted(lk);
 }
 
@@ -135,7 +135,7 @@ bool AsyncResultsMerger::_remotesExhausted(WithLock) const {
 }
 
 Status AsyncResultsMerger::setAwaitDataTimeout(Milliseconds awaitDataTimeout) {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
 
     if (_tailableMode != TailableModeEnum::kTailableAndAwaitData) {
         return Status(ErrorCodes::BadValue,
@@ -155,12 +155,12 @@ Status AsyncResultsMerger::setAwaitDataTimeout(Milliseconds awaitDataTimeout) {
 }
 
 bool AsyncResultsMerger::ready() {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     return _ready(lk);
 }
 
 void AsyncResultsMerger::detachFromOperationContext() {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     _opCtx = nullptr;
     // If we were about ready to return a boost::none because a tailable cursor reached the end of
     // the batch, that should no longer apply to the next use - when we are reattached to a
@@ -170,13 +170,13 @@ void AsyncResultsMerger::detachFromOperationContext() {
 }
 
 void AsyncResultsMerger::reattachToOperationContext(OperationContext* opCtx) {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     invariant(!_opCtx);
     _opCtx = opCtx;
 }
 
 void AsyncResultsMerger::addNewShardCursors(std::vector<RemoteCursor>&& newCursors) {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     // Create a new entry in the '_remotes' list for each new shard, and add the first cursor batch
     // to its buffer. This ensures the shard's initial high water mark is respected, if it exists.
     for (auto&& remote : newCursors) {
@@ -189,10 +189,13 @@ void AsyncResultsMerger::addNewShardCursors(std::vector<RemoteCursor>&& newCurso
 }
 
 BSONObj AsyncResultsMerger::getHighWaterMark() {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     auto minPromisedSortKey = _getMinPromisedSortKey(lk);
     if (!minPromisedSortKey.isEmpty() && !_ready(lk)) {
-        _highWaterMark = minPromisedSortKey;
+        // When 'minPromisedSortKey' contains the "high watermark" resume token, it's stored in
+        // sort-key format: {"": <high watermark>}. We copy the <high watermark> part of of the
+        // sort key, which looks like {_data: ..., _typeBits: ...}, and return that.
+        _highWaterMark = minPromisedSortKey.firstElement().Obj().getOwned();
     }
     return _highWaterMark;
 }
@@ -272,7 +275,7 @@ bool AsyncResultsMerger::_readyUnsorted(WithLock) {
 }
 
 StatusWith<ClusterQueryResult> AsyncResultsMerger::nextReady() {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     dassert(_ready(lk));
     if (_lifecycleState != kAlive) {
         return Status(ErrorCodes::IllegalOperation, "AsyncResultsMerger killed");
@@ -396,11 +399,11 @@ Status AsyncResultsMerger::_askForNextBatch(WithLock, size_t remoteIndex) {
     }
 
     executor::RemoteCommandRequest request(
-        remote.getTargetHost(), _params.getNss().db().toString(), cmdObj, _opCtx);
+        remote.getTargetHost(), remote.cursorNss.db().toString(), cmdObj, _opCtx);
 
     auto callbackStatus =
         _executor->scheduleRemoteCommand(request, [this, remoteIndex](auto const& cbData) {
-            stdx::lock_guard<stdx::mutex> lk(this->_mutex);
+            stdx::lock_guard<Latch> lk(this->_mutex);
             this->_handleBatchResponse(lk, cbData, remoteIndex);
         });
 
@@ -413,7 +416,7 @@ Status AsyncResultsMerger::_askForNextBatch(WithLock, size_t remoteIndex) {
 }
 
 Status AsyncResultsMerger::scheduleGetMores() {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     return _scheduleGetMores(lk);
 }
 
@@ -447,7 +450,7 @@ Status AsyncResultsMerger::_scheduleGetMores(WithLock lk) {
  * 3. Remotes that reached maximum retries will be in 'exhausted' state.
  */
 StatusWith<executor::TaskExecutor::EventHandle> AsyncResultsMerger::nextEvent() {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
 
     if (_lifecycleState != kAlive) {
         // Can't schedule further network operations if the ARM is being killed.
@@ -519,8 +522,10 @@ void AsyncResultsMerger::_updateRemoteMetadata(WithLock,
         invariant(!response.getPostBatchResumeToken()->isEmpty());
 
         // The most recent minimum sort key should never be smaller than the previous promised
-        // minimum sort key for this remote, if one exists.
-        auto newMinSortKey = *response.getPostBatchResumeToken();
+        // minimum sort key for this remote, if one exists. Note that the post-batch resume token is
+        // an object (with format {_data: ..., _typeBits: ...}) that we must wrap in a sort key so
+        // that it can compare correctly with sort keys from other streams.
+        auto newMinSortKey = BSON("" << *response.getPostBatchResumeToken());
         if (auto& oldMinSortKey = remote.promisedMinSortKey) {
             invariant(compareSortKeys(newMinSortKey, *oldMinSortKey, *_params.getSort()) >= 0);
             invariant(_promisedMinSortKeys.size() <= _remotes.size());
@@ -528,16 +533,6 @@ void AsyncResultsMerger::_updateRemoteMetadata(WithLock,
         }
         _promisedMinSortKeys.insert({newMinSortKey, remoteIndex});
         remote.promisedMinSortKey = newMinSortKey;
-    } else {
-        // If we don't have a postBatchResumeToken, then we should never have an oplog timestamp.
-        // TODO SERVER-38539: remove this validation when $internalLatestOplogTimestamp is removed.
-        if (response.getLastOplogTimestamp()) {
-            severe() << "Host " << remote.shardHostAndPort
-                     << " returned a cursor which has an oplog timestamp but does not have a "
-                        "postBatchResumeToken, suggesting that one or more shards are running an "
-                        "older version of MongoDB. This configuration is not supported.";
-            fassertFailedNoTrace(51062);
-        }
     }
 }
 
@@ -654,15 +649,13 @@ bool AsyncResultsMerger::_addBatchToBuffer(WithLock lk,
                 remote.status =
                     Status(ErrorCodes::InternalError,
                            str::stream() << "Missing field '" << AsyncResultsMerger::kSortKeyField
-                                         << "' in document: "
-                                         << obj);
+                                         << "' in document: " << obj);
                 return false;
             } else if (!_params.getCompareWholeSortKey() && key.type() != BSONType::Object) {
                 remote.status =
                     Status(ErrorCodes::InternalError,
                            str::stream() << "Field '" << AsyncResultsMerger::kSortKeyField
-                                         << "' was not of type Object in document: "
-                                         << obj);
+                                         << "' was not of type Object in document: " << obj);
                 return false;
             }
         }
@@ -716,7 +709,7 @@ void AsyncResultsMerger::_scheduleKillCursors(WithLock, OperationContext* opCtx)
 }
 
 executor::TaskExecutor::EventHandle AsyncResultsMerger::kill(OperationContext* opCtx) {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
 
     if (_killCompleteEvent.isValid()) {
         invariant(_lifecycleState != kAlive);

@@ -29,12 +29,13 @@
 
 #pragma once
 
+#include <functional>
+
 #include "mongo/base/status.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/record_id.h"
 #include "mongo/db/repl/optime.h"
-#include "mongo/stdx/functional.h"
 #include "mongo/util/time_support.h"
 #include "mongo/util/uuid.h"
 
@@ -148,7 +149,7 @@ void rollback(OperationContext* opCtx,
               int requiredRBID,
               ReplicationCoordinator* replCoord,
               ReplicationProcess* replicationProcess,
-              stdx::function<void(int)> sleepSecsFn = [](int secs) { sleepsecs(secs); });
+              std::function<void(int)> sleepSecsFn = [](int secs) { sleepsecs(secs); });
 
 /**
  * Initiates the rollback process after transition to ROLLBACK.
@@ -285,6 +286,9 @@ struct FixUpInfo {
     // after rollback the in-memory transaction table is cleared.
     bool refetchTransactionDocs = false;
 
+    // The local node's top of oplog prior to entering rollback.
+    OpTime localTopOfOplog;
+
     OpTime commonPoint;
     RecordId commonPointOurDiskloc;
 
@@ -357,7 +361,9 @@ private:
  * rolling back node from after the common point. "ourObj" is the oplog document that needs
  * to be reverted.
  */
-Status updateFixUpInfoFromLocalOplogEntry(FixUpInfo& fixUpInfo,
+Status updateFixUpInfoFromLocalOplogEntry(OperationContext* opCtx,
+                                          const OplogInterface& localOplog,
+                                          FixUpInfo& fixUpInfo,
                                           const BSONObj& ourObj,
                                           bool isNestedApplyOpsCommand);
 

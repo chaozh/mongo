@@ -29,7 +29,6 @@
 
 #pragma once
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/db/logical_time.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/s/scoped_collection_metadata.h"
@@ -53,7 +52,8 @@ namespace mongo {
  * lock on the respective collection.
  */
 class CollectionShardingState {
-    MONGO_DISALLOW_COPYING(CollectionShardingState);
+    CollectionShardingState(const CollectionShardingState&) = delete;
+    CollectionShardingState& operator=(const CollectionShardingState&) = delete;
 
 public:
     using CSRLock = ShardingStateLock<CollectionShardingState>;
@@ -68,6 +68,12 @@ public:
      * returned pointer must not be stored.
      */
     static CollectionShardingState* get(OperationContext* opCtx, const NamespaceString& nss);
+
+    /**
+     * It is the caller's responsibility to ensure that the collection locks for this namespace are
+     * held when this is called. The returned pointer should never be stored.
+     */
+    static CollectionShardingState* get_UNSAFE(ServiceContext* svcCtx, const NamespaceString& nss);
 
     /**
      * Reports all collections which have filtering information associated.
@@ -85,12 +91,13 @@ public:
      * metadata object.
      *
      * The intended users of this method are callers which need to perform orphan filtering. Use
-     * 'getCurrentMetadata' for all other cases, where just sharding-related properties of the
-     * collection are necessary (e.g., isSharded or the shard key).
+     * 'getCurrentMetadata' for other cases, like obtaining information about sharding-related
+     * properties of the collection are necessary that won't change under collection IX/IS lock
+     * (e.g., isSharded or the shard key).
      *
      * The returned object is safe to access even after the collection lock has been dropped.
      */
-    ScopedCollectionMetadata getOrphansFilter(OperationContext* opCtx);
+    ScopedCollectionMetadata getOrphansFilter(OperationContext* opCtx, bool isCollection);
 
     /**
      * See the comments for 'getOrphansFilter' above for more information on this method.
@@ -113,7 +120,7 @@ public:
      * version of the collection and if not, throws StaleConfigException populated with the received
      * and wanted versions.
      */
-    void checkShardVersionOrThrow(OperationContext* opCtx);
+    void checkShardVersionOrThrow(OperationContext* opCtx, bool isCollection);
 
     /**
      * Methods to control the collection's critical section. Methods listed below must be called
@@ -149,6 +156,15 @@ protected:
 private:
     friend CSRLock;
 
+    /**
+     * Returns the latest version of collection metadata with filtering configured for
+     * atClusterTime if specified.
+     */
+    boost::optional<ScopedCollectionMetadata> _getMetadataWithVersionCheckAt(
+        OperationContext* opCtx,
+        const boost::optional<mongo::LogicalTime>& atClusterTime,
+        bool isCollection);
+
     // Object-wide ResourceMutex to protect changes to the CollectionShardingRuntime or objects
     // held within. Use only the CollectionShardingRuntimeLock to lock this mutex.
     Lock::ResourceMutex _stateChangeMutex;
@@ -172,7 +188,8 @@ private:
  * which is running.
  */
 class CollectionShardingStateFactory {
-    MONGO_DISALLOW_COPYING(CollectionShardingStateFactory);
+    CollectionShardingStateFactory(const CollectionShardingStateFactory&) = delete;
+    CollectionShardingStateFactory& operator=(const CollectionShardingStateFactory&) = delete;
 
 public:
     static void set(ServiceContext* service,

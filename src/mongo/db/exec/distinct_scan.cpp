@@ -29,26 +29,25 @@
 
 #include "mongo/db/exec/distinct_scan.h"
 
+#include <memory>
+
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/exec/filter.h"
 #include "mongo/db/exec/scoped_timer.h"
-#include "mongo/db/exec/working_set_computed_data.h"
 #include "mongo/db/index/index_access_method.h"
 #include "mongo/db/index/index_descriptor.h"
-#include "mongo/stdx/memory.h"
 
 namespace mongo {
 
 using std::unique_ptr;
 using std::vector;
-using stdx::make_unique;
 
 // static
 const char* DistinctScan::kStageType = "DISTINCT_SCAN";
 
 DistinctScan::DistinctScan(OperationContext* opCtx, DistinctParams params, WorkingSet* workingSet)
-    : RequiresIndexStage(kStageType, opCtx, params.indexDescriptor),
+    : RequiresIndexStage(kStageType, opCtx, params.indexDescriptor, workingSet),
       _workingSet(workingSet),
       _keyPattern(std::move(params.keyPattern)),
       _scanDirection(params.scanDirection),
@@ -80,7 +79,12 @@ PlanStage::StageState DistinctScan::doWork(WorkingSetID* out) {
     try {
         if (!_cursor)
             _cursor = indexAccessMethod()->newCursor(getOpCtx(), _scanDirection == 1);
-        kv = _cursor->seek(_seekPoint);
+        kv = _cursor->seek(IndexEntryComparison::makeKeyStringFromSeekPointForSeek(
+            _seekPoint,
+            indexAccessMethod()->getSortedDataInterface()->getKeyStringVersion(),
+            indexAccessMethod()->getSortedDataInterface()->getOrdering(),
+            _scanDirection == 1));
+
     } catch (const WriteConflictException&) {
         *out = WorkingSet::INVALID_ID;
         return PlanStage::NEED_YIELD;
@@ -118,7 +122,10 @@ PlanStage::StageState DistinctScan::doWork(WorkingSetID* out) {
             WorkingSetID id = _workingSet->allocate();
             WorkingSetMember* member = _workingSet->get(id);
             member->recordId = kv->loc;
-            member->keyData.push_back(IndexKeyDatum(_keyPattern, kv->key, indexAccessMethod()));
+            member->keyData.push_back(IndexKeyDatum(_keyPattern,
+                                                    kv->key,
+                                                    workingSetIndexId(),
+                                                    getOpCtx()->recoveryUnit()->getSnapshotId()));
             _workingSet->transitionToRecordIdAndIdx(id);
 
             *out = id;
@@ -160,8 +167,9 @@ unique_ptr<PlanStageStats> DistinctScan::getStats() {
         _specificStats.indexBounds = _bounds.toBSON();
     }
 
-    unique_ptr<PlanStageStats> ret = make_unique<PlanStageStats>(_commonStats, STAGE_DISTINCT_SCAN);
-    ret->specific = make_unique<DistinctScanStats>(_specificStats);
+    unique_ptr<PlanStageStats> ret =
+        std::make_unique<PlanStageStats>(_commonStats, STAGE_DISTINCT_SCAN);
+    ret->specific = std::make_unique<DistinctScanStats>(_specificStats);
     return ret;
 }
 

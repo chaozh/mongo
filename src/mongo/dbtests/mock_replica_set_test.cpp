@@ -68,7 +68,7 @@ TEST(MockReplicaSetTest, GetNode) {
     ASSERT_EQUALS("$n0:27017", replSet.getNode("$n0:27017")->getServerAddress());
     ASSERT_EQUALS("$n1:27017", replSet.getNode("$n1:27017")->getServerAddress());
     ASSERT_EQUALS("$n2:27017", replSet.getNode("$n2:27017")->getServerAddress());
-    ASSERT(replSet.getNode("$n3:27017") == NULL);
+    ASSERT(replSet.getNode("$n3:27017") == nullptr);
 }
 
 TEST(MockReplicaSetTest, IsMasterNode0) {
@@ -279,8 +279,8 @@ ReplSetConfig _getConfigWithMemberRemoved(const ReplSetConfig& oldConfig,
             continue;
         }
 
-        membersBuilder.append(
-            BSON("_id" << member->getId() << "host" << member->getHostAndPort().toString()));
+        membersBuilder.append(BSON("_id" << member->getId().getData() << "host"
+                                         << member->getHostAndPort().toString()));
     }
 
     membersBuilder.done();
@@ -424,4 +424,4 @@ TEST(MockReplicaSetTest, KillMultipleNode) {
     const string priHostName(replSet.getPrimary());
     ASSERT(replSet.getNode(priHostName)->isRunning());
 }
-}
+}  // namespace mongo_test

@@ -31,6 +31,8 @@
 
 #include "mongo/platform/basic.h"
 
+#include <functional>
+
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/concurrency/d_concurrency.h"
@@ -41,7 +43,6 @@
 #include "mongo/db/repl/noop_writer.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/repl_server_parameters_gen.h"
-#include "mongo/stdx/functional.h"
 #include "mongo/util/concurrency/idle_thread_block.h"
 #include "mongo/util/log.h"
 
@@ -60,16 +61,17 @@ const auto kMsgObj = BSON("msg"
  *  Runs the noopWrite argument with waitTime period until its destroyed.
  */
 class NoopWriter::PeriodicNoopRunner {
-    MONGO_DISALLOW_COPYING(PeriodicNoopRunner);
+    PeriodicNoopRunner(const PeriodicNoopRunner&) = delete;
+    PeriodicNoopRunner& operator=(const PeriodicNoopRunner&) = delete;
 
-    using NoopWriteFn = stdx::function<void(OperationContext*)>;
+    using NoopWriteFn = std::function<void(OperationContext*)>;
 
 public:
     PeriodicNoopRunner(Seconds waitTime, NoopWriteFn noopWrite)
         : _thread([this, noopWrite, waitTime] { run(waitTime, std::move(noopWrite)); }) {}
 
     ~PeriodicNoopRunner() {
-        stdx::unique_lock<stdx::mutex> lk(_mutex);
+        stdx::unique_lock<Latch> lk(_mutex);
         _inShutdown = true;
         _cv.notify_all();
         lk.unlock();
@@ -83,7 +85,7 @@ private:
             const ServiceContext::UniqueOperationContext opCtxPtr = cc().makeOperationContext();
             OperationContext& opCtx = *opCtxPtr;
             {
-                stdx::unique_lock<stdx::mutex> lk(_mutex);
+                stdx::unique_lock<Latch> lk(_mutex);
                 MONGO_IDLE_THREAD_BLOCK;
                 _cv.wait_for(lk, waitTime.toSystemDuration(), [&] { return _inShutdown; });
 
@@ -102,7 +104,7 @@ private:
     /**
      *  Mutex for the CV
      */
-    stdx::mutex _mutex;
+    Mutex _mutex = MONGO_MAKE_LATCH("PeriodicNoopRunner::_mutex");
 
     /**
      * CV to wait for.
@@ -125,17 +127,20 @@ NoopWriter::~NoopWriter() {
 }
 
 Status NoopWriter::startWritingPeriodicNoops(OpTime lastKnownOpTime) {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     _lastKnownOpTime = lastKnownOpTime;
 
     invariant(!_noopRunner);
-    _noopRunner = stdx::make_unique<PeriodicNoopRunner>(
-        _writeInterval, [this](OperationContext* opCtx) { _writeNoop(opCtx); });
+    _noopRunner =
+        std::make_unique<PeriodicNoopRunner>(_writeInterval, [this](OperationContext* opCtx) {
+            opCtx->setShouldParticipateInFlowControl(false);
+            _writeNoop(opCtx);
+        });
     return Status::OK();
 }
 
 void NoopWriter::stopWritingPeriodicNoops() {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     _noopRunner.reset();
 }
 

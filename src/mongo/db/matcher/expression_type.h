@@ -34,6 +34,20 @@
 
 namespace mongo {
 
+/**
+ * Types of the encryption payload.
+ */
+enum FleBlobSubtype { IntentToEncrypt = 0, Deterministic = 1, Random = 2 };
+
+/**
+ * The structure represents how data is laid out in an encrypted payload.
+ */
+struct FleBlobHeader {
+    int8_t fleBlobSubtype;
+    int8_t keyUUID[16];
+    int8_t originalBsonType;
+};
+
 template <class T>
 class TypeMatchExpressionBase : public LeafMatchExpression {
 public:
@@ -53,20 +67,19 @@ public:
     virtual StringData name() const = 0;
 
     std::unique_ptr<MatchExpression> shallowClone() const final {
-        auto expr = stdx::make_unique<T>(path(), _typeSet);
+        auto expr = std::make_unique<T>(path(), _typeSet);
         if (getTag()) {
             expr->setTag(getTag()->clone());
         }
         return std::move(expr);
     }
 
-    bool matchesSingleElement(const BSONElement& elem,
-                              MatchDetails* details = nullptr) const final {
+    bool matchesSingleElement(const BSONElement& elem, MatchDetails* details = nullptr) const {
         return _typeSet.hasType(elem.type());
     }
 
-    void debugString(StringBuilder& debug, int level) const final {
-        _debugAddSpace(debug, level);
+    void debugString(StringBuilder& debug, int indentationLevel) const final {
+        _debugAddSpace(debug, indentationLevel);
         debug << path() << " " << name() << ": " << _typeSet.toBSONArray().toString();
 
         MatchExpression::TagData* td = getTag();
@@ -165,8 +178,6 @@ public:
                               ElementPath::NonLeafArrayBehavior::kTraverse),
           _binDataSubType(binDataSubType) {}
 
-    virtual ~InternalSchemaBinDataSubTypeExpression() = default;
-
     StringData name() const {
         return kName;
     }
@@ -178,15 +189,15 @@ public:
 
     std::unique_ptr<MatchExpression> shallowClone() const final {
         auto expr =
-            stdx::make_unique<InternalSchemaBinDataSubTypeExpression>(path(), _binDataSubType);
+            std::make_unique<InternalSchemaBinDataSubTypeExpression>(path(), _binDataSubType);
         if (getTag()) {
             expr->setTag(getTag()->clone());
         }
         return std::move(expr);
     }
 
-    void debugString(StringBuilder& debug, int level) const final {
-        _debugAddSpace(debug, level);
+    void debugString(StringBuilder& debug, int indentationLevel) const final {
+        _debugAddSpace(debug, indentationLevel);
         debug << path() << " " << name() << ": " << typeName(_binDataSubType);
 
         MatchExpression::TagData* td = getTag();
@@ -222,5 +233,59 @@ private:
     }
 
     BinDataType _binDataSubType;
+};
+
+/**
+ * Implements matching semantics for the JSON Schema keyword encrypt.bsonType. A document
+ * matches successfully if a field is encrypted and the encrypted payload indicates the
+ * original BSON element belongs to the specified type set.
+ */
+class InternalSchemaBinDataEncryptedTypeExpression final
+    : public TypeMatchExpressionBase<InternalSchemaBinDataEncryptedTypeExpression> {
+public:
+    static constexpr StringData kName = "$_internalSchemaBinDataEncryptedType"_sd;
+
+    InternalSchemaBinDataEncryptedTypeExpression(StringData path, MatcherTypeSet typeSet)
+        : TypeMatchExpressionBase(MatchExpression::INTERNAL_SCHEMA_BIN_DATA_ENCRYPTED_TYPE,
+                                  path,
+                                  ElementPath::LeafArrayBehavior::kNoTraversal,
+                                  typeSet) {}
+
+    StringData name() const {
+        return kName;
+    }
+
+    MatchCategory getCategory() const final {
+        return MatchCategory::kOther;
+    }
+
+    bool matchesSingleElement(const BSONElement& elem,
+                              MatchDetails* details = nullptr) const final {
+        if (elem.type() != BSONType::BinData)
+            return false;
+        if (elem.binDataType() != BinDataType::Encrypt)
+            return false;
+
+        int binDataLen;
+        auto binData = elem.binData(binDataLen);
+        if (!binDataLen)
+            return false;
+
+        auto fleBlobSubType = binData[0];
+        switch (fleBlobSubType) {
+            case FleBlobSubtype::IntentToEncrypt:
+                return false;
+            case FleBlobSubtype::Deterministic:
+            case FleBlobSubtype::Random: {
+                // Verify the type of the encrypted data.
+                auto fleBlob = reinterpret_cast<const FleBlobHeader*>(binData);
+                return typeSet().hasType(static_cast<BSONType>(fleBlob->originalBsonType));
+            }
+            default:
+                uasserted(33118,
+                          str::stream() << "unexpected subtype " << static_cast<int>(fleBlobSubType)
+                                        << " of encrypted binary data (0, 1 and 2 are allowed)");
+        }
+    }
 };
 }  // namespace mongo

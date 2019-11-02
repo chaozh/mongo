@@ -32,6 +32,7 @@
 #include <set>
 
 #include "mongo/executor/connection_pool.h"
+#include "mongo/util/functional.h"
 
 namespace mongo {
 namespace executor {
@@ -45,7 +46,7 @@ class PoolImpl;
  */
 class TimerImpl final : public ConnectionPool::TimerInterface {
 public:
-    TimerImpl(PoolImpl* global);
+    explicit TimerImpl(PoolImpl* global);
     ~TimerImpl() override;
 
     void setTimeout(Milliseconds timeout, TimeoutCallback cb) override;
@@ -77,8 +78,8 @@ private:
  */
 class ConnectionImpl final : public ConnectionPool::ConnectionInterface {
 public:
-    using PushSetupCallback = stdx::function<Status()>;
-    using PushRefreshCallback = stdx::function<Status()>;
+    using PushSetupCallback = unique_function<Status()>;
+    using PushRefreshCallback = unique_function<Status()>;
 
     ConnectionImpl(const HostAndPort& hostAndPort, size_t generation, PoolImpl* global);
 
@@ -115,6 +116,9 @@ private:
 
     void refresh(Milliseconds timeout, RefreshCallback cb) override;
 
+    static void processSetup();
+    static void processRefresh();
+
     HostAndPort _hostAndPort;
     SetupCallback _setupCallback;
     RefreshCallback _refreshCallback;
@@ -134,18 +138,51 @@ private:
 };
 
 /**
+ * An "OutOfLineExecutor" that actually runs on the same thread of execution
+ */
+class InlineOutOfLineExecutor : public OutOfLineExecutor {
+public:
+    void schedule(Task task) override {
+        // Add the task to our queue
+        _taskQueue.emplace_back(std::move(task));
+
+        // Make sure we're not already inline executing
+        if (std::exchange(_inSchedule, true)) {
+            return;
+        }
+
+        // Clear out our queue
+        while (!_taskQueue.empty()) {
+            auto task = std::move(_taskQueue.front());
+            std::move(task)(Status::OK());
+            _taskQueue.pop_front();
+        }
+
+        // Admit we're not working on the queue anymore
+        _inSchedule = false;
+    }
+
+    bool _inSchedule;
+    std::deque<Task> _taskQueue;
+};
+
+/**
  * Mock for the pool implementation
  */
 class PoolImpl final : public ConnectionPool::DependentTypeFactoryInterface {
     friend class ConnectionImpl;
+    friend class TimerImpl;
 
 public:
+    explicit PoolImpl(const std::shared_ptr<OutOfLineExecutor>& executor) : _executor(executor) {}
     std::shared_ptr<ConnectionPool::ConnectionInterface> makeConnection(
         const HostAndPort& hostAndPort,
         transport::ConnectSSLMode sslMode,
         size_t generation) override;
 
     std::shared_ptr<ConnectionPool::TimerInterface> makeTimer() override;
+
+    const std::shared_ptr<OutOfLineExecutor>& getExecutor() override;
 
     Date_t now() override;
 
@@ -160,6 +197,7 @@ public:
 
 private:
     ConnectionPool* _pool = nullptr;
+    std::shared_ptr<OutOfLineExecutor> _executor;
 
     static boost::optional<Date_t> _now;
 };

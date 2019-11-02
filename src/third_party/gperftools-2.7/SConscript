@@ -2,9 +2,22 @@
 
 Import("env")
 Import("has_option")
+Import("use_libunwind")
 Import("debugBuild")
 
 env = env.Clone()
+
+if use_libunwind:
+    env.Append(
+        CPPDEFINES=[
+            "NO_FRAME_POINTER",
+            ("HAVE_LIBUNWIND_H", "1"),
+            'HAVE_UCONTEXT_H'
+        ],
+    )
+    env.InjectThirdParty(libraries=['unwind'])
+elif has_option('use-cpu-profiler'):
+    env.FatalError("Compiling with --use-cpu-profiler requires --use-libunwind")
 
 files = [
     'src/base/dynamic_annotations.c',
@@ -50,7 +63,7 @@ else:
         ]
 
     if not debugBuild:
-        files += ['src/tcmalloc.cc'],
+        files += ['src/tcmalloc.cc']
     else:
         files += ['src/debugallocation.cc']
 
@@ -60,21 +73,6 @@ if has_option( 'use-cpu-profiler' ):
         'src/profiledata.cc',
         'src/profiler.cc',
         ]
-
-
-conf = Configure(env.Clone())
-
-if has_option('use-cpu-profiler'):
-    if not conf.CheckLib('unwind', autoadd=False):
-        env.ConfError("Compiling with --use-cpu-profiler requires having libunwind installed")
-    conf.env.Append(
-        CPPDEFINES=["NO_FRAME_POINTER", ("HAVE_LIBUNWIND_H", "1"), 'HAVE_UCONTEXT_H'],
-        SYSLIBDEPS=['unwind']
-    )
-
-env = conf.Finish()
-
-env.Append(CPPPATH=["build_" + env["TARGET_OS"] + "_" + env["TARGET_ARCH"]])
 
 env.Append(
     CPPDEFINES=["NO_HEAP_CHECK"],
@@ -97,7 +95,14 @@ if not debugBuild:
 if (not debugBuild) or (not env['TARGET_ARCH'] in ['x86_64', 'i386']):
     env.Append(CPPDEFINES=["NO_TCMALLOC_SAMPLES"])
 
-env.Prepend( CPPPATH=["src/"] )
+gperftools_root = env.Dir("#/src/third_party/gperftools-2.7")
+gperftools_platform = gperftools_root.Dir("platform/${TARGET_OS}_${TARGET_ARCH}")
+
+env.Append(CPPPATH=[gperftools_platform.Dir("internal/src"),
+                    gperftools_root.Dir("dist/src")])
+
+# propagates to consumers that Inject (depend on) gperftools.
+env.RegisterConsumerModifications(CPPPATH=[gperftools_platform.Dir("include")])
 
 def removeIfPresent(lst, item):
     try:
@@ -114,5 +119,11 @@ if env['TARGET_ARCH'] == 'ppc64le':
 
 env.Library(
     target='tcmalloc_minimal',
-    source=files,
+    source=[
+        env.Dir('dist').File(f) for f in files
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/third_party/shim_unwind' if use_libunwind else [],
+
+    ]
 )

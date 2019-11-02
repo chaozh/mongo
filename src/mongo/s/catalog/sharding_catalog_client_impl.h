@@ -31,9 +31,9 @@
 
 #include "mongo/client/connection_string.h"
 #include "mongo/db/repl/optime.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/s/catalog/sharding_catalog_client.h"
 #include "mongo/s/client/shard_registry.h"
-#include "mongo/stdx/mutex.h"
 
 namespace mongo {
 
@@ -143,6 +143,11 @@ public:
                                 const BSONObj& doc,
                                 const WriteConcernOptions& writeConcern) override;
 
+    void insertConfigDocumentsAsRetryableWrite(OperationContext* opCtx,
+                                               const NamespaceString& nss,
+                                               std::vector<BSONObj> docs,
+                                               const WriteConcernOptions& writeConcern) override;
+
     StatusWith<bool> updateConfigDocument(OperationContext* opCtx,
                                           const NamespaceString& nss,
                                           const BSONObj& query,
@@ -165,8 +170,9 @@ public:
 
 private:
     /**
-     * Updates a single document in the specified namespace on the config server. The document must
-     * have an _id index. Must only be used for updates to the 'config' database.
+     * Updates a single document (if useMultiUpdate is false) or multiple documents (if
+     * useMultiUpdate is true) in the specified namespace on the config server. Must only be used
+     * for updates to the 'config' database.
      *
      * This method retries the operation on NotMaster or network errors, so it should only be used
      * with modifications which are idempotent.
@@ -210,7 +216,7 @@ private:
     // (R) Read only, can only be written during initialization.
     //
 
-    stdx::mutex _mutex;
+    Mutex _mutex = MONGO_MAKE_LATCH("ShardingCatalogClientImpl::_mutex");
 
     // Distributed lock manager singleton.
     std::unique_ptr<DistLockManager> _distLockManager;  // (R)

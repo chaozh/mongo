@@ -29,14 +29,13 @@
 
 #pragma once
 
+#include <functional>
 #include <string>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/base/status.h"
 #include "mongo/db/auth/authz_manager_external_state_local.h"
 #include "mongo/db/auth/role_graph.h"
 #include "mongo/db/auth/user_name.h"
-#include "mongo/stdx/functional.h"
 
 namespace mongo {
 
@@ -44,7 +43,8 @@ namespace mongo {
  * The implementation of AuthzManagerExternalState functionality for mongod.
  */
 class AuthzManagerExternalStateMongod : public AuthzManagerExternalStateLocal {
-    MONGO_DISALLOW_COPYING(AuthzManagerExternalStateMongod);
+    AuthzManagerExternalStateMongod(const AuthzManagerExternalStateMongod&) = delete;
+    AuthzManagerExternalStateMongod& operator=(const AuthzManagerExternalStateMongod&) = delete;
 
 public:
     AuthzManagerExternalStateMongod();
@@ -52,10 +52,6 @@ public:
 
     std::unique_ptr<AuthzSessionExternalState> makeAuthzSessionExternalState(
         AuthorizationManager* authzManager) override;
-
-    std::unique_ptr<StateLock> lock(OperationContext* opCtx) final;
-
-    bool needsLockForUserName(OperationContext* opCtx, const UserName& name) final;
 
     virtual Status findOne(OperationContext* opCtx,
                            const NamespaceString& collectionName,
@@ -65,7 +61,7 @@ public:
                          const NamespaceString& collectionName,
                          const BSONObj& query,
                          const BSONObj& projection,
-                         const stdx::function<void(const BSONObj&)>& resultProcessor);
+                         const std::function<void(const BSONObj&)>& resultProcessor);
 };
 
 }  // namespace mongo

@@ -34,6 +34,7 @@
 #include "mongo/db/storage/storage_engine_init.h"
 
 #include <map>
+#include <memory>
 
 #include "mongo/base/init.h"
 #include "mongo/bson/bsonobjbuilder.h"
@@ -44,10 +45,9 @@
 #include "mongo/db/storage/storage_options.h"
 #include "mongo/db/storage/storage_repair_observer.h"
 #include "mongo/db/unclean_shutdown.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -87,18 +87,6 @@ void initializeStorageEngine(ServiceContext* service, const StorageEngineInitFla
     }
 
     if (auto existingStorageEngine = StorageEngineMetadata::getStorageEngineForPath(dbpath)) {
-        if (*existingStorageEngine == "mmapv1" ||
-            (storageGlobalParams.engineSetByUser && storageGlobalParams.engine == "mmapv1")) {
-            log() << startupWarningsLog;
-            log() << "** WARNING: Support for MMAPV1 storage engine has been deprecated and will be"
-                  << startupWarningsLog;
-            log() << "**          removed in version 4.2. Please plan to migrate to the wiredTiger"
-                  << startupWarningsLog;
-            log() << "**          storage engine." << startupWarningsLog;
-            log() << "**          See http://dochub.mongodb.org/core/deprecated-mmapv1";
-            log() << startupWarningsLog;
-        }
-
         if (storageGlobalParams.engineSetByUser) {
             // Verify that the name of the user-supplied storage engine matches the contents of
             // the metadata file.
@@ -106,14 +94,12 @@ void initializeStorageEngine(ServiceContext* service, const StorageEngineInitFla
                 getFactoryForStorageEngine(service, storageGlobalParams.engine);
             if (factory) {
                 uassert(28662,
-                        str::stream() << "Cannot start server. Detected data files in " << dbpath
-                                      << " created by"
-                                      << " the '"
-                                      << *existingStorageEngine
-                                      << "' storage engine, but the"
-                                      << " specified storage engine was '"
-                                      << factory->getCanonicalName()
-                                      << "'.",
+                        str::stream()
+                            << "Cannot start server. Detected data files in " << dbpath
+                            << " created by"
+                            << " the '" << *existingStorageEngine << "' storage engine, but the"
+                            << " specified storage engine was '" << factory->getCanonicalName()
+                            << "'.",
                         factory->getCanonicalName() == *existingStorageEngine);
             }
         } else {
@@ -123,25 +109,6 @@ void initializeStorageEngine(ServiceContext* service, const StorageEngineInitFla
                   << " storage engine to '" << *existingStorageEngine << "'.";
             storageGlobalParams.engine = *existingStorageEngine;
         }
-    } else if (!storageGlobalParams.engineSetByUser) {
-        // Ensure the default storage engine is available with this build of mongod.
-        uassert(28663,
-                str::stream()
-                    << "Cannot start server. The default storage engine '"
-                    << storageGlobalParams.engine
-                    << "' is not available with this build of mongod. Please specify a different"
-                    << " storage engine explicitly, e.g. --storageEngine=mmapv1.",
-                isRegisteredStorageEngine(service, storageGlobalParams.engine));
-    } else if (storageGlobalParams.engineSetByUser && storageGlobalParams.engine == "mmapv1") {
-        log() << startupWarningsLog;
-        log() << "** WARNING: You have explicitly specified 'MMAPV1' storage engine in your"
-              << startupWarningsLog;
-        log() << "**          config file or as a command line option.  Support for the MMAPV1"
-              << startupWarningsLog;
-        log() << "**          storage engine has been deprecated and will be removed in"
-              << startupWarningsLog;
-        log() << "**          version 4.2. See http://dochub.mongodb.org/core/deprecated-mmapv1";
-        log() << startupWarningsLog;
     }
 
     const StorageEngine::Factory* factory =
@@ -156,8 +123,7 @@ void initializeStorageEngine(ServiceContext* service, const StorageEngineInitFla
         uassert(34368,
                 str::stream()
                     << "Server was started in read-only mode, but the configured storage engine, "
-                    << storageGlobalParams.engine
-                    << ", does not support read-only operation",
+                    << storageGlobalParams.engine << ", does not support read-only operation",
                 factory->supportsReadOnly());
     }
 
@@ -223,9 +189,7 @@ void createLockFile(ServiceContext* service) {
     } catch (const std::exception& ex) {
         uassert(28596,
                 str::stream() << "Unable to determine status of lock file in the data directory "
-                              << storageGlobalParams.dbpath
-                              << ": "
-                              << ex.what(),
+                              << storageGlobalParams.dbpath << ": " << ex.what(),
                 false);
     }
     const bool wasUnclean = lockFile->createdByUncleanShutdown();
@@ -283,7 +247,7 @@ StorageEngine::Factory* getFactoryForStorageEngine(ServiceContext* service, Stri
 Status validateStorageOptions(
     ServiceContext* service,
     const BSONObj& storageEngineOptions,
-    stdx::function<Status(const StorageEngine::Factory* const, const BSONObj&)> validateFunc) {
+    std::function<Status(const StorageEngine::Factory* const, const BSONObj&)> validateFunc) {
 
     BSONObjIterator storageIt(storageEngineOptions);
     while (storageIt.more()) {
@@ -347,7 +311,7 @@ public:
         if (!storageEngine) {
             return;
         }
-        opCtx->setLockState(stdx::make_unique<LockerImpl>());
+        opCtx->setLockState(std::make_unique<LockerImpl>());
         opCtx->setRecoveryUnit(std::unique_ptr<RecoveryUnit>(storageEngine->newRecoveryUnit()),
                                WriteUnitOfWork::RecoveryUnitState::kNotInUnitOfWork);
     }

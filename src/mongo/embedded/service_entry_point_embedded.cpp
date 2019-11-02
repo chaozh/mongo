@@ -47,6 +47,12 @@ public:
         return false;
     }
 
+    void setPrepareConflictBehaviorForReadConcern(
+        OperationContext* opCtx, const CommandInvocation* invocation) const override {
+        mongo::setPrepareConflictBehaviorForReadConcern(
+            opCtx, repl::ReadConcernArgs::get(opCtx), PrepareConflictBehavior::kEnforce);
+    }
+
     void waitForReadConcern(OperationContext* opCtx,
                             const CommandInvocation* invocation,
                             const OpMsgRequest& request) const override {
@@ -89,7 +95,7 @@ public:
 
     void handleException(const DBException& e, OperationContext* opCtx) const override {}
 
-    void advanceConfigOptimeFromRequestMetadata(OperationContext* opCtx) const override {}
+    void advanceConfigOpTimeFromRequestMetadata(OperationContext* opCtx) const override {}
 
     std::unique_ptr<PolymorphicScoped> scopedOperationCompletionShardingActions(
         OperationContext* opCtx) const override {

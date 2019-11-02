@@ -50,6 +50,9 @@
 
 #define MONGO_COMPILER_API_EXPORT __declspec(dllexport)
 #define MONGO_COMPILER_API_IMPORT __declspec(dllimport)
+#define MONGO_COMPILER_API_HIDDEN_FUNCTION
+
+#define MONGO_COMPILER_NOINLINE __declspec(noinline)
 
 #define MONGO_WARN_UNUSED_RESULT_CLASS
 #define MONGO_WARN_UNUSED_RESULT_FUNCTION

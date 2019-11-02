@@ -60,7 +60,7 @@ ActiveMigrationsRegistry& ActiveMigrationsRegistry::get(OperationContext* opCtx)
 
 StatusWith<ScopedDonateChunk> ActiveMigrationsRegistry::registerDonateChunk(
     const MoveChunkRequest& args) {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     if (_activeReceiveChunkState) {
         return _activeReceiveChunkState->constructErrorStatus();
     }
@@ -80,7 +80,7 @@ StatusWith<ScopedDonateChunk> ActiveMigrationsRegistry::registerDonateChunk(
 
 StatusWith<ScopedReceiveChunk> ActiveMigrationsRegistry::registerReceiveChunk(
     const NamespaceString& nss, const ChunkRange& chunkRange, const ShardId& fromShardId) {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     if (_activeReceiveChunkState) {
         return _activeReceiveChunkState->constructErrorStatus();
     }
@@ -95,7 +95,7 @@ StatusWith<ScopedReceiveChunk> ActiveMigrationsRegistry::registerReceiveChunk(
 }
 
 boost::optional<NamespaceString> ActiveMigrationsRegistry::getActiveDonateChunkNss() {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     if (_activeMoveChunkState) {
         return _activeMoveChunkState->args.getNss();
     }
@@ -106,7 +106,7 @@ boost::optional<NamespaceString> ActiveMigrationsRegistry::getActiveDonateChunkN
 BSONObj ActiveMigrationsRegistry::getActiveMigrationStatusReport(OperationContext* opCtx) {
     boost::optional<NamespaceString> nss;
     {
-        stdx::lock_guard<stdx::mutex> lk(_mutex);
+        stdx::lock_guard<Latch> lk(_mutex);
 
         if (_activeMoveChunkState) {
             nss = _activeMoveChunkState->args.getNss();
@@ -121,7 +121,7 @@ BSONObj ActiveMigrationsRegistry::getActiveMigrationStatusReport(OperationContex
         // Lock the collection so nothing changes while we're getting the migration report.
         AutoGetCollection autoColl(opCtx, nss.get(), MODE_IS);
         auto csr = CollectionShardingRuntime::get(opCtx, nss.get());
-        auto csrLock = CollectionShardingRuntime::CSRLock::lock(opCtx, csr);
+        auto csrLock = CollectionShardingRuntime::CSRLock::lockShared(opCtx, csr);
 
         if (auto msm = MigrationSourceManager::get(csr, csrLock)) {
             return msm->getMigrationStatusReport();
@@ -132,13 +132,13 @@ BSONObj ActiveMigrationsRegistry::getActiveMigrationStatusReport(OperationContex
 }
 
 void ActiveMigrationsRegistry::_clearDonateChunk() {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     invariant(_activeMoveChunkState);
     _activeMoveChunkState.reset();
 }
 
 void ActiveMigrationsRegistry::_clearReceiveChunk() {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     invariant(_activeReceiveChunkState);
     _activeReceiveChunkState.reset();
 }
@@ -148,9 +148,7 @@ Status ActiveMigrationsRegistry::ActiveMoveChunkState::constructErrorStatus() co
             str::stream() << "Unable to start new migration because this shard is currently "
                              "donating chunk "
                           << ChunkRange(args.getMinKey(), args.getMaxKey()).toString()
-                          << " for namespace "
-                          << args.getNss().ns()
-                          << " to "
+                          << " for namespace " << args.getNss().ns() << " to "
                           << args.getToShardId()};
 }
 
@@ -158,10 +156,7 @@ Status ActiveMigrationsRegistry::ActiveReceiveChunkState::constructErrorStatus()
     return {ErrorCodes::ConflictingOperationInProgress,
             str::stream() << "Unable to start new migration because this shard is currently "
                              "receiving chunk "
-                          << range.toString()
-                          << " for namespace "
-                          << nss.ns()
-                          << " from "
+                          << range.toString() << " for namespace " << nss.ns() << " from "
                           << fromShardId};
 }
 

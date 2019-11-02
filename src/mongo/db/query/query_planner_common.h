@@ -31,6 +31,7 @@
 
 #include "mongo/db/jsobj.h"
 #include "mongo/db/matcher/expression.h"
+#include "mongo/db/query/projection.h"
 #include "mongo/db/query/query_solution.h"
 
 namespace mongo {
@@ -47,9 +48,9 @@ public:
      */
     static bool hasNode(const MatchExpression* root,
                         MatchExpression::MatchType type,
-                        const MatchExpression** out = NULL) {
+                        const MatchExpression** out = nullptr) {
         if (type == root->matchType()) {
-            if (NULL != out) {
+            if (nullptr != out) {
                 *out = root;
             }
             return true;
@@ -82,6 +83,15 @@ public:
      * the scan direction and index bounds.
      */
     static void reverseScans(QuerySolutionNode* node);
+
+    /**
+     * Extracts all field names for the sortKey meta-projection and stores them in the returned
+     * array. Returns an empty array if there were no sortKey meta-projection specified in the
+     * given projection 'proj'. For example, given a projection {a:1, b: {$meta: "sortKey"},
+     * c: {$meta: "sortKey"}}, the returned vector will contain two elements ["b", "c"].
+     */
+    static std::vector<FieldPath> extractSortKeyMetaFieldsFromProjection(
+        const projection_ast::Projection& proj);
 };
 
 }  // namespace mongo

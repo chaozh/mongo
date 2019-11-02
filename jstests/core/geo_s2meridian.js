@@ -12,7 +12,7 @@ meridianCrossingLine = {
     geo: {type: "LineString", coordinates: [[-178.0, 10.0], [178.0, 10.0]]}
 };
 
-assert.writeOK(t.insert(meridianCrossingLine));
+assert.commandWorked(t.insert(meridianCrossingLine));
 
 lineAlongMeridian = {
     type: "LineString",
@@ -45,8 +45,7 @@ t.insert(pointOnPositiveSideOfMeridian);
 
 meridianCrossingPoly = {
     type: "Polygon",
-    coordinates:
-        [[[-178.0, 10.0], [178.0, 10.0], [178.0, -10.0], [-178.0, -10.0], [-178.0, 10.0]]]
+    coordinates: [[[-178.0, 10.0], [178.0, 10.0], [178.0, -10.0], [-178.0, -10.0], [-178.0, 10.0]]]
 };
 
 result = t.find({geo: {$geoWithin: {$geometry: meridianCrossingPoly}}});

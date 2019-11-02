@@ -75,11 +75,12 @@ public:
         auto txnRouter = TransactionRouter::get(opCtx);
         uassert(ErrorCodes::InvalidOptions,
                 "commitTransaction can only be run within a session",
-                txnRouter != nullptr);
+                txnRouter);
 
-        auto commitCmd = CommitTransaction::parse(IDLParserErrorContext("commit cmd"), cmdObj);
-        auto cmdResponse = txnRouter->commitTransaction(opCtx, commitCmd.getRecoveryToken());
-        CommandHelpers::filterCommandReplyForPassthrough(cmdResponse.response, &result);
+        const auto commitCmd =
+            CommitTransaction::parse(IDLParserErrorContext("commit cmd"), cmdObj);
+        auto commitRes = txnRouter.commitTransaction(opCtx, commitCmd.getRecoveryToken());
+        CommandHelpers::filterCommandReplyForPassthrough(commitRes, &result);
         return true;
     }
 

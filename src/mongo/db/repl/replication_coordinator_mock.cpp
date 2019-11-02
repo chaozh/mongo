@@ -76,6 +76,10 @@ void ReplicationCoordinatorMock::startup(OperationContext* opCtx) {
     // TODO
 }
 
+void ReplicationCoordinatorMock::enterTerminalShutdown() {
+    // TODO
+}
+
 void ReplicationCoordinatorMock::shutdown(OperationContext*) {
     // TODO
 }
@@ -97,6 +101,19 @@ ReplicationCoordinator::Mode ReplicationCoordinatorMock::getReplicationMode() co
 
 MemberState ReplicationCoordinatorMock::getMemberState() const {
     return _memberState;
+}
+
+std::vector<MemberData> ReplicationCoordinatorMock::getMemberData() const {
+    MONGO_UNREACHABLE;
+    return {};
+}
+
+bool ReplicationCoordinatorMock::canAcceptNonLocalWrites() const {
+    return _canAcceptNonLocalWrites;
+}
+
+void ReplicationCoordinatorMock::setCanAcceptNonLocalWrites(bool canAcceptNonLocalWrites) {
+    _canAcceptNonLocalWrites = canAcceptNonLocalWrites;
 }
 
 Status ReplicationCoordinatorMock::waitForMemberState(MemberState expectedState,
@@ -121,7 +138,7 @@ void ReplicationCoordinatorMock::clearSyncSourceBlacklist() {}
 
 ReplicationCoordinator::StatusAndDuration ReplicationCoordinatorMock::awaitReplication(
     OperationContext* opCtx, const OpTime& opTime, const WriteConcernOptions& writeConcern) {
-    return _awaitReplicationReturnValueFunction(opTime);
+    return _awaitReplicationReturnValueFunction(opCtx, opTime);
 }
 
 void ReplicationCoordinatorMock::setAwaitReplicationReturnValueFunction(
@@ -188,33 +205,49 @@ void ReplicationCoordinatorMock::setMyHeartbeatMessage(const std::string& msg) {
     // TODO
 }
 
-void ReplicationCoordinatorMock::setMyLastAppliedOpTime(const OpTime& opTime) {
-    _myLastAppliedOpTime = opTime;
+void ReplicationCoordinatorMock::setMyLastAppliedOpTimeAndWallTime(
+    const OpTimeAndWallTime& opTimeAndWallTime) {
+    _myLastAppliedOpTime = opTimeAndWallTime.opTime;
+    _myLastAppliedWallTime = opTimeAndWallTime.wallTime;
 }
 
-void ReplicationCoordinatorMock::setMyLastDurableOpTime(const OpTime& opTime) {
-    _myLastDurableOpTime = opTime;
+void ReplicationCoordinatorMock::setMyLastDurableOpTimeAndWallTime(
+    const OpTimeAndWallTime& opTimeAndWallTime) {
+    _myLastDurableOpTime = opTimeAndWallTime.opTime;
+    _myLastDurableWallTime = opTimeAndWallTime.wallTime;
 }
 
-void ReplicationCoordinatorMock::setMyLastAppliedOpTimeForward(const OpTime& opTime,
-                                                               DataConsistency consistency) {
-    if (opTime > _myLastAppliedOpTime) {
-        _myLastAppliedOpTime = opTime;
+void ReplicationCoordinatorMock::setMyLastAppliedOpTimeAndWallTimeForward(
+    const OpTimeAndWallTime& opTimeAndWallTime, DataConsistency consistency) {
+    if (opTimeAndWallTime.opTime > _myLastAppliedOpTime) {
+        _myLastAppliedOpTime = opTimeAndWallTime.opTime;
+        _myLastAppliedWallTime = opTimeAndWallTime.wallTime;
     }
 }
 
-void ReplicationCoordinatorMock::setMyLastDurableOpTimeForward(const OpTime& opTime) {
-    if (opTime > _myLastDurableOpTime) {
-        _myLastDurableOpTime = opTime;
+void ReplicationCoordinatorMock::setMyLastDurableOpTimeAndWallTimeForward(
+    const OpTimeAndWallTime& opTimeAndWallTime) {
+    if (opTimeAndWallTime.opTime > _myLastDurableOpTime) {
+        _myLastDurableOpTime = opTimeAndWallTime.opTime;
+        _myLastDurableWallTime = opTimeAndWallTime.wallTime;
     }
 }
 
 void ReplicationCoordinatorMock::resetMyLastOpTimes() {
     _myLastDurableOpTime = OpTime();
+    _myLastDurableWallTime = Date_t();
+}
+
+OpTimeAndWallTime ReplicationCoordinatorMock::getMyLastAppliedOpTimeAndWallTime() const {
+    return {_myLastAppliedOpTime, _myLastAppliedWallTime};
 }
 
 OpTime ReplicationCoordinatorMock::getMyLastAppliedOpTime() const {
     return _myLastAppliedOpTime;
+}
+
+OpTimeAndWallTime ReplicationCoordinatorMock::getMyLastDurableOpTimeAndWallTime() const {
+    return {_myLastDurableOpTime, _myLastDurableWallTime};
 }
 
 OpTime ReplicationCoordinatorMock::getMyLastDurableOpTime() const {
@@ -300,7 +333,8 @@ void ReplicationCoordinatorMock::processReplSetGetConfig(BSONObjBuilder* result)
 
 void ReplicationCoordinatorMock::processReplSetMetadata(const rpc::ReplSetMetadata& replMetadata) {}
 
-void ReplicationCoordinatorMock::advanceCommitPoint(const OpTime& committedOptime) {}
+void ReplicationCoordinatorMock::advanceCommitPoint(
+    const OpTimeAndWallTime& committedOptimeAndWallTime, bool fromSyncSource) {}
 
 void ReplicationCoordinatorMock::cancelAndRescheduleElectionTimeout() {}
 
@@ -309,7 +343,8 @@ Status ReplicationCoordinatorMock::processReplSetGetStatus(BSONObjBuilder*,
     return Status::OK();
 }
 
-void ReplicationCoordinatorMock::fillIsMasterForReplSet(IsMasterResponse* result) {
+void ReplicationCoordinatorMock::fillIsMasterForReplSet(IsMasterResponse* result,
+                                                        const SplitHorizon::Parameters&) {
     result->setReplSetVersion(_getConfigReturnValue.getConfigVersion());
     result->setIsMaster(true);
     result->setIsSecondary(false);
@@ -384,12 +419,6 @@ Status ReplicationCoordinatorMock::checkIfCommitQuorumCanBeSatisfied(
     return Status::OK();
 }
 
-StatusWith<bool> ReplicationCoordinatorMock::checkIfCommitQuorumIsSatisfied(
-    const CommitQuorumOptions& commitQuorum,
-    const std::vector<HostAndPort>& commitReadyMembers) const {
-    return true;
-}
-
 WriteConcernOptions ReplicationCoordinatorMock::getGetLastErrorDefault() {
     return WriteConcernOptions();
 }
@@ -423,6 +452,10 @@ bool ReplicationCoordinatorMock::shouldChangeSyncSource(
 
 OpTime ReplicationCoordinatorMock::getLastCommittedOpTime() const {
     return OpTime();
+}
+
+OpTimeAndWallTime ReplicationCoordinatorMock::getLastCommittedOpTimeAndWallTime() const {
+    return {OpTime(), Date_t()};
 }
 
 Status ReplicationCoordinatorMock::processReplSetRequestVotes(
@@ -460,11 +493,14 @@ OpTime ReplicationCoordinatorMock::getCurrentCommittedSnapshotOpTime() const {
     return OpTime();
 }
 
+OpTimeAndWallTime ReplicationCoordinatorMock::getCurrentCommittedSnapshotOpTimeAndWallTime() const {
+    return OpTimeAndWallTime();
+}
 void ReplicationCoordinatorMock::waitUntilSnapshotCommitted(OperationContext* opCtx,
                                                             const Timestamp& untilSnapshot) {}
 
-size_t ReplicationCoordinatorMock::getNumUncommittedSnapshots() {
-    return 0;
+void ReplicationCoordinatorMock::createWMajorityWriteAvailabilityDateWaiter(OpTime opTime) {
+    return;
 }
 
 WriteConcernOptions ReplicationCoordinatorMock::populateUnsetWriteConcernOptionsSyncMode(
@@ -487,8 +523,12 @@ void ReplicationCoordinatorMock::alwaysAllowWrites(bool allowWrites) {
     _alwaysAllowWrites = allowWrites;
 }
 
-Status ReplicationCoordinatorMock::abortCatchupIfNeeded() {
+Status ReplicationCoordinatorMock::abortCatchupIfNeeded(PrimaryCatchUpConclusionReason reason) {
     return Status::OK();
+}
+
+void ReplicationCoordinatorMock::incrementNumCatchUpOpsIfCatchingUp(long numOps) {
+    return;
 }
 
 void ReplicationCoordinatorMock::signalDropPendingCollectionsRemovedFromStorage() {}
@@ -505,6 +545,17 @@ bool ReplicationCoordinatorMock::setContainsArbiter() const {
 }
 
 void ReplicationCoordinatorMock::attemptToAdvanceStableTimestamp() {
+    return;
+}
+
+void ReplicationCoordinatorMock::finishRecoveryIfEligible(OperationContext* opCtx) {
+    return;
+}
+
+void ReplicationCoordinatorMock::updateAndLogStateTransitionMetrics(
+    const ReplicationCoordinator::OpsKillingStateTransitionEnum stateTransition,
+    const size_t numOpsKilled,
+    const size_t numOpsRunning) const {
     return;
 }
 

@@ -29,12 +29,12 @@
 
 #pragma once
 
+#include <functional>
 #include <map>
 #include <string>
 #include <vector>
 
 #include "mongo/base/status.h"
-#include "mongo/stdx/functional.h"
 #include "mongo/util/duration.h"
 
 namespace mongo {
@@ -95,7 +95,7 @@ public:
      *  true - unknown config options will generate an error during parsing.
      *  false - unknow config options will be ignored during parsing.
      */
-    static stdx::function<bool()> useStrict;
+    static std::function<bool()> useStrict;
 
     OptionsParser() {}
     virtual ~OptionsParser() {}
@@ -156,7 +156,9 @@ private:
 
     /** Reads the given config file into the output string.  This function is virtual for
      *  testing purposes only. */
-    virtual Status readConfigFile(const std::string& filename, std::string*);
+    virtual Status readConfigFile(const std::string& filename,
+                                  std::string*,
+                                  ConfigExpand configExpand);
 };
 
 }  // namespace optionenvironment

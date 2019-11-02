@@ -31,6 +31,7 @@
 
 #include "mongo/base/status_with.h"
 #include "mongo/db/jsobj.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
 
@@ -86,6 +87,16 @@ public:
     }
 
     /**
+     * NOTE: This format should not be used. Use fromBSONThrowing instead.
+     *
+     * A throwing version of 'parseLegacyWithField' to resolve a compatibility issue with the
+     * ShardCollectionType IDL type.
+     */
+    static ChunkVersion legacyFromBSONThrowing(const BSONElement& element) {
+        return uassertStatusOK(parseLegacyWithField(element.wrap(), element.fieldNameStringData()));
+    }
+
+    /**
      * NOTE: This format is being phased out. Use parseWithField instead.
      *
      * Parses the BSON formatted by appendLegacyWithField. If the field is missing, returns
@@ -124,10 +135,21 @@ public:
     }
 
     void incMajor() {
+        uassert(
+            31180,
+            "The chunk major version has reached its maximum value. Manual intervention will be "
+            "required before more chunk move, split, or merge operations are allowed.",
+            majorVersion() != std::numeric_limits<uint32_t>::max());
         _combined = static_cast<uint64_t>(majorVersion() + 1) << 32;
     }
 
     void incMinor() {
+        uassert(
+            31181,
+            "The chunk minor version has reached its maximum value. Manual intervention will be "
+            "required before more chunk split or merge operations are allowed.",
+            minorVersion() != std::numeric_limits<uint32_t>::max());
+
         _combined++;
     }
 
@@ -218,6 +240,12 @@ public:
     void appendLegacyWithField(BSONObjBuilder* out, StringData field) const;
 
     BSONObj toBSON() const;
+
+    /**
+     * NOTE: This format serializes chunk version as a timestamp (without the epoch) for
+     * legacy reasons.
+     */
+    void legacyToBSON(StringData field, BSONObjBuilder* builder) const;
     std::string toString() const;
 
 private:

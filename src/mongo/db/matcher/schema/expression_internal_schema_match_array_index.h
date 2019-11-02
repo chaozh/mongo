@@ -29,9 +29,10 @@
 
 #pragma once
 
+#include <memory>
+
 #include "mongo/db/matcher/expression_array.h"
 #include "mongo/db/matcher/expression_with_placeholder.h"
-#include "mongo/stdx/memory.h"
 
 namespace mongo {
 
@@ -45,7 +46,7 @@ public:
     InternalSchemaMatchArrayIndexMatchExpression(
         StringData path, long long index, std::unique_ptr<ExpressionWithPlaceholder> expression);
 
-    void debugString(StringBuilder& debug, int level) const final;
+    void debugString(StringBuilder& debug, int indentationLevel) const final;
 
     bool equivalent(const MatchExpression* expr) const final;
 

@@ -13,27 +13,27 @@ function getCoordinatorFailpoints() {
     const coordinatorFailpointDataArr = [
         {failpoint: "hangBeforeWritingParticipantList", numTimesShouldBeHit: 1},
         {
-          // Test targeting remote nodes for prepare
-          failpoint: "hangWhileTargetingRemoteHost",
-          numTimesShouldBeHit: 2 /* once per remote participant */
+            // Test targeting remote nodes for prepare
+            failpoint: "hangWhileTargetingRemoteHost",
+            numTimesShouldBeHit: 2 /* once per remote participant */
         },
         {
-          // Test targeting local node for prepare
-          failpoint: "hangWhileTargetingLocalHost",
-          numTimesShouldBeHit: 1
+            // Test targeting local node for prepare
+            failpoint: "hangWhileTargetingLocalHost",
+            numTimesShouldBeHit: 1
         },
         {failpoint: "hangBeforeWritingDecision", numTimesShouldBeHit: 1},
         {
-          // Test targeting remote nodes for decision
-          failpoint: "hangWhileTargetingRemoteHost",
-          numTimesShouldBeHit: 2, /* once per remote participant */
-          skip: 2                 /* to skip when the failpoint is hit for prepare */
+            // Test targeting remote nodes for decision
+            failpoint: "hangWhileTargetingRemoteHost",
+            numTimesShouldBeHit: 2, /* once per remote participant */
+            skip: 2                 /* to skip when the failpoint is hit for prepare */
         },
         {
-          // Test targeting local node for decision
-          failpoint: "hangWhileTargetingLocalHost",
-          numTimesShouldBeHit: 1,
-          skip: 1 /* to skip when the failpoint is hit for prepare */
+            // Test targeting local node for decision
+            failpoint: "hangWhileTargetingLocalHost",
+            numTimesShouldBeHit: 1,
+            skip: 1 /* to skip when the failpoint is hit for prepare */
         },
         {failpoint: "hangBeforeDeletingCoordinatorDoc", numTimesShouldBeHit: 1},
     ];
@@ -42,16 +42,29 @@ function getCoordinatorFailpoints() {
     return coordinatorFailpointDataArr.map(failpoint => Object.assign({}, failpoint));
 }
 
-function setFailCommandOnShards(st, mode, commands, code, numShards) {
+function setFailCommandOnShards(st, mode, commands, code, numShards, ns) {
     for (let i = 0; i < numShards; i++) {
         const shardConn = st["rs" + i].getPrimary();
         // Sharding tests require failInternalCommands: true, since the mongos appears to mongod to
         // be an internal client.
-        assert.commandWorked(shardConn.adminCommand({
-            configureFailPoint: "failCommand",
-            mode: mode,
-            data: {errorCode: code, failCommands: commands, failInternalCommands: true}
-        }));
+        if (ns) {
+            assert.commandWorked(shardConn.adminCommand({
+                configureFailPoint: "failCommand",
+                mode: mode,
+                data: {
+                    namespace: ns,
+                    errorCode: code,
+                    failCommands: commands,
+                    failInternalCommands: true
+                }
+            }));
+        } else {
+            assert.commandWorked(shardConn.adminCommand({
+                configureFailPoint: "failCommand",
+                mode: mode,
+                data: {errorCode: code, failCommands: commands, failInternalCommands: true}
+            }));
+        }
     }
 }
 
@@ -70,23 +83,29 @@ function assertNoSuchTransactionOnAllShards(st, lsid, txnNumber) {
 }
 
 function assertNoSuchTransactionOnConn(conn, lsid, txnNumber) {
-    assert.commandFailedWithCode(conn.getDB("foo").runCommand({
-        find: "bar",
-        lsid: lsid,
-        txnNumber: NumberLong(txnNumber),
-        autocommit: false,
-    }),
-                                 ErrorCodes.NoSuchTransaction,
-                                 "expected there to be no active transaction on shard, lsid: " +
-                                     tojson(lsid) + ", txnNumber: " + tojson(txnNumber) +
-                                     ", connection: " + tojson(conn));
+    assert.commandFailedWithCode(
+        conn.getDB("foo").runCommand({
+            find: "bar",
+            lsid: lsid,
+            txnNumber: NumberLong(txnNumber),
+            autocommit: false,
+        }),
+        ErrorCodes.NoSuchTransaction,
+        "expected there to be no active transaction on shard, lsid: " + tojson(lsid) +
+            ", txnNumber: " + tojson(txnNumber) + ", connection: " + tojson(conn));
 }
 
-function waitForFailpoint(hitFailpointStr, numTimes) {
-    assert.soon(function() {
-        const re = new RegExp(hitFailpointStr, 'g' /* find all occurrences */);
-        return (rawMongoProgramOutput().match(re) || []).length == numTimes;
-    }, 'Failed to find "' + hitFailpointStr + '" logged ' + numTimes + ' times');
+function waitForFailpoint(hitFailpointStr, numTimes, timeout) {
+    // Don't run the hang analyzer because we don't expect waitForFailpoint() to always succeed.
+    assert.soon(
+        function() {
+            const re = new RegExp(hitFailpointStr, 'g' /* find all occurrences */);
+            return (rawMongoProgramOutput().match(re) || []).length == numTimes;
+        },
+        'Failed to find "' + hitFailpointStr + '" logged ' + numTimes + ' times',
+        timeout,
+        undefined,
+        {runHangAnalyzer: false});
 }
 
 // Enables the transaction router to retry on stale version (db or shard version) and snapshot
@@ -98,6 +117,13 @@ function enableStaleVersionAndSnapshotRetriesWithinTransactions(st) {
         configureFailPoint: "enableStaleVersionAndSnapshotRetriesWithinTransactions",
         mode: "alwaysOn"
     }));
+
+    st._rs.forEach(function(replTest) {
+        replTest.nodes.forEach(function(node) {
+            assert.commandWorked(node.getDB('admin').runCommand(
+                {configureFailPoint: "dontRemoveTxnCoordinatorOnAbort", mode: "alwaysOn"}));
+        });
+    });
 }
 
 // TODO SERVER-39704: Remove this function.
@@ -106,6 +132,13 @@ function disableStaleVersionAndSnapshotRetriesWithinTransactions(st) {
         configureFailPoint: "enableStaleVersionAndSnapshotRetriesWithinTransactions",
         mode: "off"
     }));
+
+    st._rs.forEach(function(replTest) {
+        replTest.nodes.forEach(function(node) {
+            assert.commandWorked(node.getDB('admin').runCommand(
+                {configureFailPoint: "dontRemoveTxnCoordinatorOnAbort", mode: "off"}));
+        });
+    });
 }
 
 // Flush each router's metadata and force refreshes on each shard for the given namespace and/or

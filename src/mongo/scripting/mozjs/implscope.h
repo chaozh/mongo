@@ -84,7 +84,8 @@ namespace mozjs {
  * For more information about overriden fields, see mongo::Scope
  */
 class MozJSImplScope final : public Scope {
-    MONGO_DISALLOW_COPYING(MozJSImplScope);
+    MozJSImplScope(const MozJSImplScope&) = delete;
+    MozJSImplScope& operator=(const MozJSImplScope&) = delete;
 
 public:
     explicit MozJSImplScope(MozJSScriptEngine* engine);
@@ -152,7 +153,7 @@ public:
               bool assertOnError,
               int timeoutMs) override;
 
-    void injectNative(const char* field, NativeFunction func, void* data = 0) override;
+    void injectNative(const char* field, NativeFunction func, void* data = nullptr) override;
 
     ScriptingFunction _createFunction(const char* code) override;
 
@@ -378,7 +379,7 @@ private:
     public:
         MozRuntime(const MozJSScriptEngine* engine);
 
-        std::unique_ptr<PRThread, std::function<void(PRThread*)>> _thread;
+        std::thread _thread;  // NOLINT
         std::unique_ptr<JSRuntime, std::function<void(JSRuntime*)>> _runtime;
         std::unique_ptr<JSContext, std::function<void(JSContext*)>> _context;
     };
@@ -413,13 +414,13 @@ private:
     std::vector<JS::PersistentRootedValue> _funcs;
     InternedStringTable _internedStrings;
     Status _killStatus;
-    mutable std::mutex _mutex;
+    mutable Mutex _mutex = MONGO_MAKE_LATCH("MozJSImplScope::_mutex");
     stdx::condition_variable _sleepCondition;
     std::string _error;
     unsigned int _opId;        // op id for this scope
     OperationContext* _opCtx;  // Op context for DbEval
     std::size_t _inOp;
-    std::atomic<bool> _pendingGC;
+    std::atomic<bool> _pendingGC;  // NOLINT
     ConnectState _connectState;
     Status _status;
     std::string _parentStack;

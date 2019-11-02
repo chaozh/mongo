@@ -45,6 +45,7 @@ public:
     void initializeReplicaSetRole(bool isPrimary) override;
     void onStepDown() override;
     void onStepUp() override;
+    void shutDown() override;
     void notifyOfCollectionVersionUpdate(const NamespaceString& nss) override;
     void waitForCollectionFlush(OperationContext* opCtx, const NamespaceString& nss) override;
     void waitForDatabaseFlush(OperationContext* opCtx, StringData dbName) override;
@@ -56,11 +57,17 @@ public:
 
     void getDatabase(
         StringData dbName,
-        stdx::function<void(OperationContext*, StatusWith<DatabaseType>)> callbackFn) override;
+        std::function<void(OperationContext*, StatusWith<DatabaseType>)> callbackFn) override;
 
 private:
     // Thread pool to be used to perform metadata load
     ThreadPool _threadPool;
+
+    // Protects the class state below
+    Mutex _mutex = MONGO_MAKE_LATCH("ConfigServerCatalogCacheLoader::_mutex");
+
+    // True if shutDown was called.
+    bool _inShutdown{false};
 };
 
 }  // namespace mongo

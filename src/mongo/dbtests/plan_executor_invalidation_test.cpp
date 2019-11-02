@@ -76,21 +76,22 @@ public:
         params.direction = CollectionScanParams::FORWARD;
         params.tailable = false;
         unique_ptr<CollectionScan> scan(
-            new CollectionScan(&_opCtx, collection(), params, ws.get(), NULL));
+            new CollectionScan(&_opCtx, collection(), params, ws.get(), nullptr));
 
         // Create a plan executor to hold it
-        auto qr = stdx::make_unique<QueryRequest>(nss);
+        auto qr = std::make_unique<QueryRequest>(nss);
         auto statusWithCQ = CanonicalQuery::canonicalize(&_opCtx, std::move(qr));
         ASSERT_OK(statusWithCQ.getStatus());
         std::unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
 
         // Takes ownership of 'ws', 'scan', and 'cq'.
-        auto statusWithPlanExecutor = PlanExecutor::make(&_opCtx,
-                                                         std::move(ws),
-                                                         std::move(scan),
-                                                         std::move(cq),
-                                                         _ctx->db()->getCollection(&_opCtx, nss),
-                                                         PlanExecutor::YIELD_MANUAL);
+        auto statusWithPlanExecutor =
+            PlanExecutor::make(std::move(cq),
+                               std::move(ws),
+                               std::move(scan),
+                               CollectionCatalog::get(&_opCtx).lookupCollectionByNamespace(nss),
+                               PlanExecutor::YIELD_MANUAL);
+
         ASSERT_OK(statusWithPlanExecutor.getStatus());
         return std::move(statusWithPlanExecutor.getValue());
     }
@@ -116,7 +117,7 @@ public:
     }
 
     Collection* collection() {
-        return _ctx->db()->getCollection(&_opCtx, nss);
+        return CollectionCatalog::get(&_opCtx).lookupCollectionByNamespace(nss);
     }
 
     void truncateCollection(Collection* collection) const {
@@ -138,7 +139,7 @@ TEST_F(PlanExecutorInvalidationTest, ExecutorToleratesDeletedDocumentsDuringYiel
 
     // Read some of it.
     for (int i = 0; i < 10; ++i) {
-        ASSERT_EQUALS(PlanExecutor::ADVANCED, exec->getNext(&obj, NULL));
+        ASSERT_EQUALS(PlanExecutor::ADVANCED, exec->getNext(&obj, nullptr));
         ASSERT_EQUALS(i, obj["foo"].numberInt());
     }
 
@@ -153,11 +154,11 @@ TEST_F(PlanExecutorInvalidationTest, ExecutorToleratesDeletedDocumentsDuringYiel
     // Make sure that the PlanExecutor moved forward over the deleted data.  We don't see foo==10 or
     // foo==11.
     for (int i = 12; i < N(); ++i) {
-        ASSERT_EQUALS(PlanExecutor::ADVANCED, exec->getNext(&obj, NULL));
+        ASSERT_EQUALS(PlanExecutor::ADVANCED, exec->getNext(&obj, nullptr));
         ASSERT_EQUALS(i, obj["foo"].numberInt());
     }
 
-    ASSERT_EQUALS(PlanExecutor::IS_EOF, exec->getNext(&obj, NULL));
+    ASSERT_EQUALS(PlanExecutor::IS_EOF, exec->getNext(&obj, nullptr));
 }
 
 TEST_F(PlanExecutorInvalidationTest, PlanExecutorThrowsOnRestoreWhenCollectionIsDropped) {
@@ -166,7 +167,7 @@ TEST_F(PlanExecutorInvalidationTest, PlanExecutorThrowsOnRestoreWhenCollectionIs
 
     // Read some of it.
     for (int i = 0; i < 10; ++i) {
-        ASSERT_EQUALS(PlanExecutor::ADVANCED, exec->getNext(&obj, NULL));
+        ASSERT_EQUALS(PlanExecutor::ADVANCED, exec->getNext(&obj, nullptr));
         ASSERT_EQUALS(i, obj["foo"].numberInt());
     }
 
@@ -177,7 +178,7 @@ TEST_F(PlanExecutorInvalidationTest, PlanExecutorThrowsOnRestoreWhenCollectionIs
 
     exec->restoreState();
 
-    ASSERT_EQUALS(PlanExecutor::ADVANCED, exec->getNext(&obj, NULL));
+    ASSERT_EQUALS(PlanExecutor::ADVANCED, exec->getNext(&obj, nullptr));
     ASSERT_EQUALS(10, obj["foo"].numberInt());
 
     exec->saveState();
@@ -195,7 +196,7 @@ TEST_F(PlanExecutorInvalidationTest, CollScanExecutorDoesNotDieWhenAllIndicesDro
 
     // Read some of it.
     for (int i = 0; i < 10; ++i) {
-        ASSERT_EQUALS(PlanExecutor::ADVANCED, exec->getNext(&obj, NULL));
+        ASSERT_EQUALS(PlanExecutor::ADVANCED, exec->getNext(&obj, nullptr));
         ASSERT_EQUALS(i, obj["foo"].numberInt());
     }
 
@@ -205,7 +206,7 @@ TEST_F(PlanExecutorInvalidationTest, CollScanExecutorDoesNotDieWhenAllIndicesDro
 
     // Read the rest of the collection.
     for (int i = 10; i < N(); ++i) {
-        ASSERT_EQUALS(PlanExecutor::ADVANCED, exec->getNext(&obj, NULL));
+        ASSERT_EQUALS(PlanExecutor::ADVANCED, exec->getNext(&obj, nullptr));
         ASSERT_EQUALS(i, obj["foo"].numberInt());
     }
 }
@@ -218,7 +219,7 @@ TEST_F(PlanExecutorInvalidationTest, CollScanExecutorDoesNotDieWhenOneIndexDropp
 
     // Read some of it.
     for (int i = 0; i < 10; ++i) {
-        ASSERT_EQUALS(PlanExecutor::ADVANCED, exec->getNext(&obj, NULL));
+        ASSERT_EQUALS(PlanExecutor::ADVANCED, exec->getNext(&obj, nullptr));
         ASSERT_EQUALS(i, obj["foo"].numberInt());
     }
 
@@ -228,7 +229,7 @@ TEST_F(PlanExecutorInvalidationTest, CollScanExecutorDoesNotDieWhenOneIndexDropp
 
     // Read the rest of the collection.
     for (int i = 10; i < N(); ++i) {
-        ASSERT_EQUALS(PlanExecutor::ADVANCED, exec->getNext(&obj, NULL));
+        ASSERT_EQUALS(PlanExecutor::ADVANCED, exec->getNext(&obj, nullptr));
         ASSERT_EQUALS(i, obj["foo"].numberInt());
     }
 }
@@ -245,7 +246,7 @@ TEST_F(PlanExecutorInvalidationTest, IxscanExecutorDiesWhenAllIndexesDropped) {
     // Start scanning the index.
     BSONObj obj;
     for (int i = 0; i < 10; ++i) {
-        ASSERT_EQUALS(PlanExecutor::ADVANCED, exec->getNext(&obj, NULL));
+        ASSERT_EQUALS(PlanExecutor::ADVANCED, exec->getNext(&obj, nullptr));
         ASSERT_EQUALS(i, obj.firstElement().numberInt());
     }
 
@@ -266,7 +267,7 @@ TEST_F(PlanExecutorInvalidationTest, IxscanExecutorDiesWhenIndexBeingScannedIsDr
     // Start scanning the index.
     BSONObj obj;
     for (int i = 0; i < 10; ++i) {
-        ASSERT_EQUALS(PlanExecutor::ADVANCED, exec->getNext(&obj, NULL));
+        ASSERT_EQUALS(PlanExecutor::ADVANCED, exec->getNext(&obj, nullptr));
         ASSERT_EQUALS(i, obj.firstElement().numberInt());
     }
 
@@ -289,7 +290,7 @@ TEST_F(PlanExecutorInvalidationTest, IxscanExecutorSurvivesWhenUnrelatedIndexIsD
     // Start scanning the index.
     BSONObj obj;
     for (int i = 0; i < 10; ++i) {
-        ASSERT_EQUALS(PlanExecutor::ADVANCED, exec->getNext(&obj, NULL));
+        ASSERT_EQUALS(PlanExecutor::ADVANCED, exec->getNext(&obj, nullptr));
         ASSERT_EQUALS(i, obj.firstElement().numberInt());
     }
 
@@ -301,7 +302,7 @@ TEST_F(PlanExecutorInvalidationTest, IxscanExecutorSurvivesWhenUnrelatedIndexIsD
 
     // Scan the rest of the index.
     for (int i = 10; i < N(); ++i) {
-        ASSERT_EQUALS(PlanExecutor::ADVANCED, exec->getNext(&obj, NULL));
+        ASSERT_EQUALS(PlanExecutor::ADVANCED, exec->getNext(&obj, nullptr));
         ASSERT_EQUALS(i, obj.firstElement().numberInt());
     }
 }
@@ -312,7 +313,7 @@ TEST_F(PlanExecutorInvalidationTest, ExecutorThrowsOnRestoreWhenDatabaseIsDroppe
 
     // Read some of it.
     for (int i = 0; i < 10; ++i) {
-        ASSERT_EQUALS(PlanExecutor::ADVANCED, exec->getNext(&obj, NULL));
+        ASSERT_EQUALS(PlanExecutor::ADVANCED, exec->getNext(&obj, nullptr));
         ASSERT_EQUALS(i, obj["foo"].numberInt());
     }
 
@@ -325,7 +326,7 @@ TEST_F(PlanExecutorInvalidationTest, ExecutorThrowsOnRestoreWhenDatabaseIsDroppe
     _ctx.reset(new dbtests::WriteContextForTests(&_opCtx, nss.ns()));
     exec->restoreState();
 
-    ASSERT_EQUALS(PlanExecutor::ADVANCED, exec->getNext(&obj, NULL));
+    ASSERT_EQUALS(PlanExecutor::ADVANCED, exec->getNext(&obj, nullptr));
     ASSERT_EQUALS(10, obj["foo"].numberInt());
 
     exec->saveState();
@@ -344,7 +345,7 @@ TEST_F(PlanExecutorInvalidationTest, CollScanDiesOnCollectionRenameWithinDatabas
     // Partially scan the collection.
     BSONObj obj;
     for (int i = 0; i < 10; ++i) {
-        ASSERT_EQUALS(PlanExecutor::ADVANCED, exec->getNext(&obj, NULL));
+        ASSERT_EQUALS(PlanExecutor::ADVANCED, exec->getNext(&obj, nullptr));
         ASSERT_EQUALS(i, obj["foo"].numberInt());
     }
 
@@ -354,8 +355,7 @@ TEST_F(PlanExecutorInvalidationTest, CollScanDiesOnCollectionRenameWithinDatabas
     ASSERT_TRUE(_client.runCommand("admin",
                                    BSON("renameCollection" << nss.ns() << "to"
                                                            << "unittests.new_collection_name"
-                                                           << "dropTarget"
-                                                           << true),
+                                                           << "dropTarget" << true),
                                    info));
 
     ASSERT_THROWS_CODE(exec->restoreState(), DBException, ErrorCodes::QueryPlanKilled);
@@ -371,7 +371,7 @@ TEST_F(PlanExecutorInvalidationTest, IxscanDiesOnCollectionRenameWithinDatabase)
     // Partially scan the index.
     BSONObj obj;
     for (int i = 0; i < 10; ++i) {
-        ASSERT_EQUALS(PlanExecutor::ADVANCED, exec->getNext(&obj, NULL));
+        ASSERT_EQUALS(PlanExecutor::ADVANCED, exec->getNext(&obj, nullptr));
         ASSERT_EQUALS(i, obj.firstElement().numberInt());
     }
 
@@ -381,20 +381,25 @@ TEST_F(PlanExecutorInvalidationTest, IxscanDiesOnCollectionRenameWithinDatabase)
     ASSERT_TRUE(_client.runCommand("admin",
                                    BSON("renameCollection" << nss.ns() << "to"
                                                            << "unittests.new_collection_name"
-                                                           << "dropTarget"
-                                                           << true),
+                                                           << "dropTarget" << true),
                                    info));
 
     ASSERT_THROWS_CODE(exec->restoreState(), DBException, ErrorCodes::QueryPlanKilled);
 }
 
 TEST_F(PlanExecutorInvalidationTest, CollScanDiesOnRestartCatalog) {
+    // TODO: SERVER-40588. Avoid restarting the catalog on the Biggie storage engine as it
+    // currently does not support this feature.
+    if (storageGlobalParams.engine == "biggie") {
+        return;
+    }
+
     auto exec = getCollscan();
 
     // Partially scan the collection.
     BSONObj obj;
     for (int i = 0; i < 10; ++i) {
-        ASSERT_EQUALS(PlanExecutor::ADVANCED, exec->getNext(&obj, NULL));
+        ASSERT_EQUALS(PlanExecutor::ADVANCED, exec->getNext(&obj, nullptr));
         ASSERT_EQUALS(i, obj["foo"].numberInt());
     }
 
@@ -415,7 +420,7 @@ TEST_F(PlanExecutorInvalidationTest, IxscanDiesWhenTruncateCollectionDropsAllInd
     // Partially scan the index.
     BSONObj obj;
     for (int i = 0; i < 10; ++i) {
-        ASSERT_EQUALS(PlanExecutor::ADVANCED, exec->getNext(&obj, NULL));
+        ASSERT_EQUALS(PlanExecutor::ADVANCED, exec->getNext(&obj, nullptr));
         ASSERT_EQUALS(i, obj.firstElement().numberInt());
     }
 
@@ -432,7 +437,7 @@ TEST_F(PlanExecutorInvalidationTest, CollScanExecutorSurvivesCollectionTruncate)
     // Partially scan the collection.
     BSONObj obj;
     for (int i = 0; i < 10; ++i) {
-        ASSERT_EQUALS(PlanExecutor::ADVANCED, exec->getNext(&obj, NULL));
+        ASSERT_EQUALS(PlanExecutor::ADVANCED, exec->getNext(&obj, nullptr));
         ASSERT_EQUALS(i, obj["foo"].numberInt());
     }
 
@@ -443,7 +448,7 @@ TEST_F(PlanExecutorInvalidationTest, CollScanExecutorSurvivesCollectionTruncate)
     exec->restoreState();
 
     // Since all documents in the collection have been deleted, the PlanExecutor should issue EOF.
-    ASSERT_EQUALS(PlanExecutor::IS_EOF, exec->getNext(&obj, NULL));
+    ASSERT_EQUALS(PlanExecutor::IS_EOF, exec->getNext(&obj, nullptr));
 }
 
 }  // namespace mongo

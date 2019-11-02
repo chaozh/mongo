@@ -38,14 +38,13 @@
 
 #include "mongo/client/dbclient_rs.h"
 #include "mongo/client/mongo_uri.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
 
-stdx::mutex ConnectionString::_connectHookMutex;
-ConnectionString::ConnectionHook* ConnectionString::_connectHook = NULL;
+Mutex ConnectionString::_connectHookMutex = MONGO_MAKE_LATCH();
+ConnectionString::ConnectionHook* ConnectionString::_connectHook = nullptr;
 
 std::unique_ptr<DBClientBase> ConnectionString::connect(StringData applicationName,
                                                         std::string& errmsg,
@@ -59,7 +58,7 @@ std::unique_ptr<DBClientBase> ConnectionString::connect(StringData applicationNa
     switch (_type) {
         case MASTER: {
             for (const auto& server : _servers) {
-                auto c = stdx::make_unique<DBClientConnection>(true, 0, newURI);
+                auto c = std::make_unique<DBClientConnection>(true, 0, newURI);
 
                 c->setSoTimeout(socketTimeout);
                 LOG(1) << "creating new connection to:" << server;
@@ -73,7 +72,7 @@ std::unique_ptr<DBClientBase> ConnectionString::connect(StringData applicationNa
         }
 
         case SET: {
-            auto set = stdx::make_unique<DBClientReplicaSet>(
+            auto set = std::make_unique<DBClientReplicaSet>(
                 _setName, _servers, applicationName, socketTimeout, std::move(newURI));
             if (!set->connect()) {
                 errmsg = "connect failed to replica set ";
@@ -85,7 +84,7 @@ std::unique_ptr<DBClientBase> ConnectionString::connect(StringData applicationNa
 
         case CUSTOM: {
             // Lock in case other things are modifying this at the same time
-            stdx::lock_guard<stdx::mutex> lk(_connectHookMutex);
+            stdx::lock_guard<Latch> lk(_connectHookMutex);
 
             // Allow the replacement of connections with other connections - useful for testing.
 
@@ -111,4 +110,4 @@ std::unique_ptr<DBClientBase> ConnectionString::connect(StringData applicationNa
     MONGO_UNREACHABLE;
 }
 
-}  // namepspace mongo
+}  // namespace mongo

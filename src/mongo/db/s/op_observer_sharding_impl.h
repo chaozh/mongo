@@ -54,6 +54,7 @@ protected:
                               const bool inMultiDocumentTransaction) override;
     void shardObserveUpdateOp(OperationContext* opCtx,
                               const NamespaceString nss,
+                              boost::optional<BSONObj> preImageDoc,
                               const BSONObj& updatedDoc,
                               const repl::OpTime& opTime,
                               const repl::OpTime& prePostImageOpTime,
@@ -67,7 +68,7 @@ protected:
     void shardObserveTransactionPrepareOrUnpreparedCommit(
         OperationContext* opCtx,
         const std::vector<repl::ReplOperation>& stmts,
-        const repl::OpTime& opTime) override;
+        const repl::OpTime& prepareOrCommitOptime) override;
 };
 
 }  // namespace mongo

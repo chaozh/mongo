@@ -63,12 +63,6 @@ public:
                          std::vector<Record>* inOutRecords,
                          const std::vector<Timestamp>& timestamps) override;
 
-    Status insertRecordsWithDocWriter(OperationContext* opCtx,
-                                      const DocWriter* const* docs,
-                                      const Timestamp* timestamps,
-                                      size_t nDocs,
-                                      RecordId* idsOut) override;
-
     Status updateRecord(OperationContext* opCtx,
                         const RecordId& oldLocation,
                         const char* data,
@@ -91,16 +85,10 @@ public:
         // Capped Collections are not supported, do nothing
     }
 
-    bool compactSupported() const override {
-        return false;
-    }
-
-    bool compactsInPlace() const override {
-        return false;
-    }
-
+    /**
+     * Validates the entire database file, not just the table used by this record store.
+     */
     void validate(OperationContext* opCtx,
-                  ValidateCmdLevel level,
                   ValidateResults* results,
                   BSONObjBuilder* output) override;
 
@@ -110,10 +98,8 @@ public:
         // No custom stats to add
     }
 
-    Status touch(OperationContext* opCtx, BSONObjBuilder* output) const override;
-
     int64_t storageSize(OperationContext* opCtx,
-                        BSONObjBuilder* extraInfo = NULL,
+                        BSONObjBuilder* extraInfo = nullptr,
                         int infoLevel = 0) const override;
 
     long long dataSize(OperationContext* opCtx) const override;
@@ -179,7 +165,7 @@ private:
     bool _resetNumRecsIfNeeded(OperationContext* opCtx, int64_t newNumRecs);
 
     mutable int64_t _numRecs;
-    mutable stdx::mutex _numRecsMutex;
+    mutable Mutex _numRecsMutex = MONGO_MAKE_LATCH("MobileRecordStore::_numRecsMutex");
     mutable bool _isNumRecsInitialized = false;
 
     /**
@@ -200,7 +186,7 @@ private:
     bool _resetDataSizeIfNeeded(OperationContext* opCtx, int64_t newDataSize);
 
     mutable int64_t _dataSize;
-    mutable stdx::mutex _dataSizeMutex;
+    mutable Mutex _dataSizeMutex = MONGO_MAKE_LATCH("MobileRecordStore::_dataSizeMutex");
     mutable bool _isDataSizeInitialized = false;
 };
 

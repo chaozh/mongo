@@ -32,7 +32,7 @@
 #include "mongo/rpc/write_concern_error_detail.h"
 
 #include "mongo/db/field_parser.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -137,8 +137,8 @@ Status WriteConcernErrorDetail::toStatus() const {
         return _status;
     }
 
-    return _status.withReason(
-        str::stream() << _status.reason() << "; Error details: " << _errInfo.toString());
+    return _status.withReason(str::stream()
+                              << _status.reason() << "; Error details: " << _errInfo.toString());
 }
 
 void WriteConcernErrorDetail::setErrInfo(const BSONObj& errInfo) {

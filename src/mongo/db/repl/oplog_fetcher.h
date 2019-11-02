@@ -30,8 +30,8 @@
 #pragma once
 
 #include <cstddef>
+#include <functional>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/base/status_with.h"
 #include "mongo/bson/timestamp.h"
 #include "mongo/client/fetcher.h"
@@ -39,13 +39,12 @@
 #include "mongo/db/repl/abstract_oplog_fetcher.h"
 #include "mongo/db/repl/data_replicator_external_state.h"
 #include "mongo/db/repl/repl_set_config.h"
-#include "mongo/stdx/functional.h"
-#include "mongo/util/fail_point_service.h"
+#include "mongo/util/fail_point.h"
 
 namespace mongo {
 namespace repl {
 
-MONGO_FAIL_POINT_DECLARE(stopReplProducer);
+extern FailPoint stopReplProducer;
 
 /**
  * The oplog fetcher, once started, reads operations from a remote oplog using a tailable cursor.
@@ -72,7 +71,8 @@ MONGO_FAIL_POINT_DECLARE(stopReplProducer);
  * `getMore` commands, and handles restarting on errors.
  */
 class OplogFetcher : public AbstractOplogFetcher {
-    MONGO_DISALLOW_COPYING(OplogFetcher);
+    OplogFetcher(const OplogFetcher&) = delete;
+    OplogFetcher& operator=(const OplogFetcher&) = delete;
 
 public:
     static Seconds kDefaultProtocolZeroAwaitDataTimeout;
@@ -91,7 +91,8 @@ public:
     /**
      * An enum that indicates if we want to skip the first document during oplog fetching or not.
      * Currently, the only time we don't want to skip the first document is during initial sync
-     * if there was an oldest active transaction timestamp.
+     * if the sync source has a valid oldest active transaction optime, as we need to include
+     * the corresponding oplog entry when applying.
      */
     enum class StartingPoint { kSkipFirstDoc, kEnqueueFirstDoc };
 
@@ -103,9 +104,9 @@ public:
      * Additional information on the operations is provided in a DocumentsInfo
      * struct.
      */
-    using EnqueueDocumentsFn = stdx::function<Status(Fetcher::Documents::const_iterator begin,
-                                                     Fetcher::Documents::const_iterator end,
-                                                     const DocumentsInfo& info)>;
+    using EnqueueDocumentsFn = std::function<Status(Fetcher::Documents::const_iterator begin,
+                                                    Fetcher::Documents::const_iterator end,
+                                                    const DocumentsInfo& info)>;
 
     /**
      * Validates documents in current batch of results returned from tailing the remote oplog.
@@ -113,9 +114,11 @@ public:
      * query.
      * On success, returns statistics on operations.
      */
-    static StatusWith<DocumentsInfo> validateDocuments(const Fetcher::Documents& documents,
-                                                       bool first,
-                                                       Timestamp lastTS);
+    static StatusWith<DocumentsInfo> validateDocuments(
+        const Fetcher::Documents& documents,
+        bool first,
+        Timestamp lastTS,
+        StartingPoint startingPoint = StartingPoint::kSkipFirstDoc);
 
     /**
      * Invariants if validation fails on any of the provided arguments.

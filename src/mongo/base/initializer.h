@@ -32,7 +32,6 @@
 #include <string>
 #include <vector>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/base/initializer_context.h"
 #include "mongo/base/initializer_dependency_graph.h"
 #include "mongo/base/status.h"
@@ -48,7 +47,8 @@ namespace mongo {
  * execute in an order that respects the programmer-established prerequistes.
  */
 class Initializer {
-    MONGO_DISALLOW_COPYING(Initializer);
+    Initializer(const Initializer&) = delete;
+    Initializer& operator=(const Initializer&) = delete;
 
 public:
     Initializer();
@@ -97,14 +97,14 @@ Status runGlobalInitializers(int argc, const char* const* argv, const char* cons
 void runGlobalInitializersOrDie(int argc, const char* const* argv, const char* const* envp);
 
 /**
-* Run the global deinitializers. They will execute in reverse order from initialization.
-*
-* It's a programming error for this to fail, but if it does it will return a status other
-* than Status::OK.
-*
-* This means that the few initializers that might want to terminate the program by failing
-* should probably arrange to terminate the process themselves.
-*/
+ * Run the global deinitializers. They will execute in reverse order from initialization.
+ *
+ * It's a programming error for this to fail, but if it does it will return a status other
+ * than Status::OK.
+ *
+ * This means that the few initializers that might want to terminate the program by failing
+ * should probably arrange to terminate the process themselves.
+ */
 Status runGlobalDeinitializers();
 
 }  // namespace mongo

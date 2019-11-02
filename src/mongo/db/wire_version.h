@@ -29,7 +29,6 @@
 
 #pragma once
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/bson/bsonobjbuilder.h"
 
 namespace mongo {
@@ -77,9 +76,12 @@ enum WireVersion {
     // Supports sharded transactions (4.2+).
     SHARDED_TRANSACTIONS = 8,
 
+    // TODO SERVER-42985: Supports some upcoming feature (4.4+).
+    PLACEHOLDER_FOR_44 = 9,
+
     // Set this to the highest value in this enum - it will be the default maxWireVersion for
     // the WireSpec values.
-    LATEST_WIRE_VERSION = SHARDED_TRANSACTIONS,
+    LATEST_WIRE_VERSION = PLACEHOLDER_FOR_44,
 };
 
 /**
@@ -91,7 +93,8 @@ struct WireVersionInfo {
 };
 
 struct WireSpec {
-    MONGO_DISALLOW_COPYING(WireSpec);
+    WireSpec(const WireSpec&) = delete;
+    WireSpec& operator=(const WireSpec&) = delete;
 
     static WireSpec& instance();
 

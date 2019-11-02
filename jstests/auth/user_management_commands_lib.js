@@ -61,7 +61,7 @@ function runAllUserManagementCommandsTests(conn, writeConcern) {
         var user = testUserAdmin.getUser('spencer');
         assert.eq(10028, user.customData.zipCode);
         assert(db.auth('spencer', 'pwd'));
-        assert.writeOK(db.foo.insert({a: 1}));
+        assert.commandWorked(db.foo.insert({a: 1}));
         assert.eq(1, db.foo.findOne().a);
         assert.doesNotThrow(function() {
             db.getRole('testRole');
@@ -102,7 +102,7 @@ function runAllUserManagementCommandsTests(conn, writeConcern) {
 
         testUserAdmin.updateUser(
             'spencer', {roles: ["readWrite", {role: 'adminRole', db: 'admin'}]}, writeConcern);
-        assert.writeOK(db.foo.update({}, {$inc: {a: 1}}));
+        assert.commandWorked(db.foo.update({}, {$inc: {a: 1}}));
         assert.eq(2, db.foo.findOne().a);
         assert.eq(1, db.foo.count());
         assert.throws(function() {
@@ -114,21 +114,20 @@ function runAllUserManagementCommandsTests(conn, writeConcern) {
     (function testGrantRolesToUser() {
         jsTestLog("Testing grantRolesToUser");
 
-        assert.commandFailedWithCode(db.runCommand({collMod: 'foo', usePowerOf2Sizes: true}),
-                                     ErrorCodes.Unauthorized);
+        assert.commandFailedWithCode(db.runCommand({collMod: 'foo'}), ErrorCodes.Unauthorized);
 
         testUserAdmin.grantRolesToUser('spencer',
                                        [
-                                         'readWrite',
-                                         'dbAdmin',
-                                         {role: 'readWrite', db: 'test'},
-                                         {role: 'testRole', db: 'test'},
-                                         'readWrite'
+                                           'readWrite',
+                                           'dbAdmin',
+                                           {role: 'readWrite', db: 'test'},
+                                           {role: 'testRole', db: 'test'},
+                                           'readWrite'
                                        ],
                                        writeConcern);
 
-        assert.commandWorked(db.runCommand({collMod: 'foo', usePowerOf2Sizes: true}));
-        assert.writeOK(db.foo.update({}, {$inc: {a: 1}}));
+        assert.commandWorked(db.runCommand({collMod: 'foo'}));
+        assert.commandWorked(db.foo.update({}, {$inc: {a: 1}}));
         assert.eq(3, db.foo.findOne().a);
         assert.eq(1, db.foo.count());
         assert.doesNotThrow(function() {
@@ -143,13 +142,13 @@ function runAllUserManagementCommandsTests(conn, writeConcern) {
         testUserAdmin.revokeRolesFromUser(
             'spencer',
             [
-              'readWrite',
-              {role: 'dbAdmin', db: 'test2'},  // role user doesnt have
-              "testRole"
+                'readWrite',
+                {role: 'dbAdmin', db: 'test2'},  // role user doesnt have
+                "testRole"
             ],
             writeConcern);
 
-        assert.commandWorked(db.runCommand({collMod: 'foo', usePowerOf2Sizes: true}));
+        assert.commandWorked(db.runCommand({collMod: 'foo'}));
         hasAuthzError(db.foo.update({}, {$inc: {a: 1}}));
         assert.throws(function() {
             db.foo.findOne();
@@ -170,7 +169,6 @@ function runAllUserManagementCommandsTests(conn, writeConcern) {
             db.getRole('testRole');
         });
         assert.commandFailedWithCode(db.adminCommand('connPoolSync'), ErrorCodes.Unauthorized);
-
     })();
 
     (function testUsersInfo() {

@@ -35,19 +35,20 @@
 
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/catalog/document_validation.h"
-#include "mongo/db/catalog/uuid_catalog.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/db_raii.h"
+#include "mongo/db/exec/shard_filterer_impl.h"
 #include "mongo/db/ops/write_ops_exec.h"
 #include "mongo/db/ops/write_ops_gen.h"
+#include "mongo/db/pipeline/document_source_internal_shard_filter.h"
 #include "mongo/db/pipeline/sharded_agg_helpers.h"
 #include "mongo/db/query/query_knobs_gen.h"
 #include "mongo/db/s/collection_sharding_state.h"
 #include "mongo/db/s/sharding_state.h"
-#include "mongo/db/transaction_participant.h"
 #include "mongo/s/catalog_cache.h"
 #include "mongo/s/cluster_commands_helpers.h"
 #include "mongo/s/grid.h"
@@ -93,7 +94,7 @@ MongoInterfaceShardServer::collectDocumentKeyFieldsForHostedCollection(Operation
 
     const auto metadata = [opCtx, &nss]() -> ScopedCollectionMetadata {
         Lock::DBLock dbLock(opCtx, nss.db(), MODE_IS);
-        Lock::CollectionLock collLock(opCtx->lockState(), nss.ns(), MODE_IS);
+        Lock::CollectionLock collLock(opCtx, nss, MODE_IS);
         return CollectionShardingState::get(opCtx, nss)->getCurrentMetadata();
     }();
 
@@ -110,11 +111,11 @@ MongoInterfaceShardServer::collectDocumentKeyFieldsForHostedCollection(Operation
     return {_shardKeyToDocumentKeyFields(metadata->getKeyPatternFields()), true};
 }
 
-void MongoInterfaceShardServer::insert(const boost::intrusive_ptr<ExpressionContext>& expCtx,
-                                       const NamespaceString& ns,
-                                       std::vector<BSONObj>&& objs,
-                                       const WriteConcernOptions& wc,
-                                       boost::optional<OID> targetEpoch) {
+Status MongoInterfaceShardServer::insert(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                                         const NamespaceString& ns,
+                                         std::vector<BSONObj>&& objs,
+                                         const WriteConcernOptions& wc,
+                                         boost::optional<OID> targetEpoch) {
     BatchedCommandResponse response;
     BatchWriteExecStats stats;
 
@@ -126,35 +127,31 @@ void MongoInterfaceShardServer::insert(const boost::intrusive_ptr<ExpressionCont
 
     ClusterWriter::write(expCtx->opCtx, insertCommand, &stats, &response, targetEpoch);
 
-    // TODO SERVER-35403: Add more context for which shard produced the error.
-    uassertStatusOKWithContext(response.toStatus(), "Insert failed: ");
+    return response.toStatus();
 }
 
-void MongoInterfaceShardServer::update(const boost::intrusive_ptr<ExpressionContext>& expCtx,
-                                       const NamespaceString& ns,
-                                       std::vector<BSONObj>&& queries,
-                                       std::vector<BSONObj>&& updates,
-                                       const WriteConcernOptions& wc,
-                                       bool upsert,
-                                       bool multi,
-                                       boost::optional<OID> targetEpoch) {
+StatusWith<MongoProcessInterface::UpdateResult> MongoInterfaceShardServer::update(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx,
+    const NamespaceString& ns,
+    BatchedObjects&& batch,
+    const WriteConcernOptions& wc,
+    bool upsert,
+    bool multi,
+    boost::optional<OID> targetEpoch) {
     BatchedCommandResponse response;
     BatchWriteExecStats stats;
 
-    BatchedCommandRequest updateCommand(buildUpdateOp(ns,
-                                                      std::move(queries),
-                                                      std::move(updates),
-                                                      upsert,
-                                                      multi,
-                                                      expCtx->bypassDocumentValidation));
+    BatchedCommandRequest updateCommand(buildUpdateOp(expCtx, ns, std::move(batch), upsert, multi));
 
     // If applicable, attach a write concern to the batched command request.
     attachWriteConcern(&updateCommand, wc);
 
     ClusterWriter::write(expCtx->opCtx, updateCommand, &stats, &response, targetEpoch);
 
-    // TODO SERVER-35403: Add more context for which shard produced the error.
-    uassertStatusOKWithContext(response.toStatus(), "Update failed: ");
+    if (auto status = response.toStatus(); status != Status::OK()) {
+        return status;
+    }
+    return {{response.getN(), response.getNModified()}};
 }
 
 unique_ptr<Pipeline, PipelineDeleter> MongoInterfaceShardServer::attachCursorSourceToPipeline(
@@ -169,8 +166,7 @@ unique_ptr<Pipeline, PipelineDeleter> MongoInterfaceShardServer::attachCursorSou
     // a transaction, the foreign collection is unsharded. Otherwise, we may access the catalog
     // cache, and attempt to do a network request while holding locks.
     // TODO: SERVER-39162 allow $lookup in sharded transactions.
-    auto txnParticipant = TransactionParticipant::get(expCtx->opCtx);
-    const bool inTxn = txnParticipant && txnParticipant.inMultiDocumentTransaction();
+    const bool inTxn = expCtx->opCtx->inMultiDocumentTransaction();
 
     const bool isSharded = [&]() {
         if (inTxn || !ShardingState::get(expCtx->opCtx)->enabled()) {
@@ -203,7 +199,15 @@ unique_ptr<Pipeline, PipelineDeleter> MongoInterfaceShardServer::attachCursorSou
     // this function, to be sure the collection didn't become sharded between the time we checked
     // whether it's sharded and the time we took the lock.
 
-    return MongoInterfaceStandalone::attachCursorSourceToPipeline(expCtx, pipeline.release());
+    return attachCursorSourceToPipelineForLocalRead(expCtx, pipeline.release());
+}
+
+std::unique_ptr<ShardFilterer> MongoInterfaceShardServer::getShardFilterer(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx) const {
+    const bool aggNsIsCollection = expCtx->uuid != boost::none;
+    auto shardingMetadata = CollectionShardingState::get(expCtx->opCtx, expCtx->ns)
+                                ->getOrphansFilter(expCtx->opCtx, aggNsIsCollection);
+    return std::make_unique<ShardFiltererImpl>(std::move(shardingMetadata));
 }
 
 }  // namespace mongo

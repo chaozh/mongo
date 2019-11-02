@@ -29,6 +29,8 @@
 
 #include "mongo/platform/basic.h"
 
+#include <memory>
+
 #include "mongo/db/client.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/namespace_string.h"
@@ -36,6 +38,7 @@
 #include "mongo/db/op_observer_registry.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/drop_pending_collection_reaper.h"
+#include "mongo/db/repl/oplog_applier_impl_test_fixture.h"
 #include "mongo/db/repl/oplog_entry.h"
 #include "mongo/db/repl/oplog_interface_local.h"
 #include "mongo/db/repl/replication_consistency_markers_mock.h"
@@ -45,11 +48,10 @@
 #include "mongo/db/service_context_d_test_fixture.h"
 #include "mongo/db/session_catalog_mongod.h"
 #include "mongo/db/session_txn_record_gen.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/unittest/death_test.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace {
 
@@ -62,47 +64,47 @@ const NamespaceString testNs("a.a");
 class StorageInterfaceRecovery : public StorageInterfaceImpl {
 public:
     boost::optional<Timestamp> getRecoveryTimestamp(ServiceContext* serviceCtx) const override {
-        stdx::lock_guard<stdx::mutex> lock(_mutex);
+        stdx::lock_guard<Latch> lock(_mutex);
         return _recoveryTimestamp;
     }
 
     void setRecoveryTimestamp(Timestamp recoveryTimestamp) {
-        stdx::lock_guard<stdx::mutex> lock(_mutex);
+        stdx::lock_guard<Latch> lock(_mutex);
         _recoveryTimestamp = recoveryTimestamp;
     }
 
     bool supportsRecoverToStableTimestamp(ServiceContext* serviceCtx) const override {
-        stdx::lock_guard<stdx::mutex> lock(_mutex);
+        stdx::lock_guard<Latch> lock(_mutex);
         return _supportsRecoverToStableTimestamp;
     }
 
     void setSupportsRecoverToStableTimestamp(bool supports) {
-        stdx::lock_guard<stdx::mutex> lock(_mutex);
+        stdx::lock_guard<Latch> lock(_mutex);
         _supportsRecoverToStableTimestamp = supports;
     }
 
     bool supportsRecoveryTimestamp(ServiceContext* serviceCtx) const override {
-        stdx::lock_guard<stdx::mutex> lock(_mutex);
+        stdx::lock_guard<Latch> lock(_mutex);
         return _supportsRecoveryTimestamp;
     }
 
     void setSupportsRecoveryTimestamp(bool supports) {
-        stdx::lock_guard<stdx::mutex> lock(_mutex);
+        stdx::lock_guard<Latch> lock(_mutex);
         _supportsRecoveryTimestamp = supports;
     }
 
     void setPointInTimeReadTimestamp(Timestamp pointInTimeReadTimestamp) {
-        stdx::lock_guard<stdx::mutex> lock(_mutex);
+        stdx::lock_guard<Latch> lock(_mutex);
         _pointInTimeReadTimestamp = pointInTimeReadTimestamp;
     }
 
     Timestamp getPointInTimeReadTimestamp(OperationContext* opCtx) const override {
-        stdx::lock_guard<stdx::mutex> lock(_mutex);
+        stdx::lock_guard<Latch> lock(_mutex);
         return _pointInTimeReadTimestamp;
     }
 
 private:
-    mutable stdx::mutex _mutex;
+    mutable Mutex _mutex = MONGO_MAKE_LATCH("StorageInterfaceRecovery::_mutex");
     Timestamp _initialDataTimestamp = Timestamp::min();
     boost::optional<Timestamp> _recoveryTimestamp = boost::none;
     Timestamp _pointInTimeReadTimestamp = {};
@@ -167,15 +169,15 @@ private:
         ServiceContextMongoDTest::setUp();
 
         auto service = getServiceContext();
-        StorageInterface::set(service, stdx::make_unique<StorageInterfaceRecovery>());
+        StorageInterface::set(service, std::make_unique<StorageInterfaceRecovery>());
         _storageInterface = static_cast<StorageInterfaceRecovery*>(StorageInterface::get(service));
 
         _createOpCtx();
-        _consistencyMarkers = stdx::make_unique<ReplicationConsistencyMarkersMock>();
+        _consistencyMarkers = std::make_unique<ReplicationConsistencyMarkersMock>();
 
 
         ReplicationCoordinator::set(
-            service, stdx::make_unique<ReplicationCoordinatorMock>(service, getStorageInterface()));
+            service, std::make_unique<ReplicationCoordinatorMock>(service, getStorageInterface()));
 
         ASSERT_OK(
             ReplicationCoordinator::get(_opCtx.get())->setFollowerMode(MemberState::RS_PRIMARY));
@@ -189,7 +191,9 @@ private:
         observerRegistry->addObserver(std::make_unique<ReplicationRecoveryTestObObserver>());
 
         repl::DropPendingCollectionReaper::set(
-            service, stdx::make_unique<repl::DropPendingCollectionReaper>(_storageInterface));
+            service, std::make_unique<repl::DropPendingCollectionReaper>(_storageInterface));
+
+        setOplogCollectionName(service);
     }
 
     void tearDown() override {
@@ -223,7 +227,7 @@ repl::OplogEntry _makeOplogEntry(repl::OpTime opTime,
                                  BSONObj object,
                                  boost::optional<BSONObj> object2 = boost::none,
                                  OperationSessionInfo sessionInfo = {},
-                                 boost::optional<Date_t> wallTime = boost::none) {
+                                 Date_t wallTime = Date_t()) {
     return repl::OplogEntry(opTime,                           // optime
                             boost::none,                      // hash
                             opType,                           // opType
@@ -243,13 +247,12 @@ repl::OplogEntry _makeOplogEntry(repl::OpTime opTime,
 }
 
 /**
- * Creates a prepareTransaction, commitTransaction or abortTransaction OplogEntry.
+ * Creates a transaction oplog entry.
  */
 repl::OplogEntry _makeTransactionOplogEntry(repl::OpTime opTime,
                                             repl::OpTypeEnum opType,
                                             BSONObj object,
                                             repl::OpTime prevOpTime,
-                                            bool prepare,
                                             StmtId stmtId,
                                             OperationSessionInfo sessionInfo,
                                             Date_t wallTime) {
@@ -264,9 +267,6 @@ repl::OplogEntry _makeTransactionOplogEntry(repl::OpTime opTime,
     builder.append("wall", wallTime);
     builder.append("stmtId", stmtId);
     builder.append("prevOpTime", prevOpTime.toBSON());
-    if (prepare) {
-        builder.append("prepare", prepare);
-    }
 
     return uassertStatusOK(repl::OplogEntry::parse(builder.obj()));
 }
@@ -326,6 +326,9 @@ void _setUpOplog(OperationContext* opCtx, StorageInterface* storage, std::vector
         ASSERT_OK(storage->insertDocument(
             opCtx, oplogNs, _makeInsertOplogEntry(ts), OpTime::kUninitializedTerm));
     }
+
+    // Initialize the cached pointer to the oplog collection.
+    acquireOplogCollectionForLogging(opCtx);
 }
 
 /**
@@ -334,14 +337,11 @@ void _setUpOplog(OperationContext* opCtx, StorageInterface* storage, std::vector
 void _assertDocumentsInCollectionEquals(OperationContext* opCtx,
                                         const NamespaceString& nss,
                                         const std::vector<BSONObj>& docs) {
-    std::vector<BSONObj> reversedDocs(docs);
-    std::reverse(reversedDocs.begin(), reversedDocs.end());
-    OplogInterfaceLocal oplog(opCtx, nss.ns());
-    auto iter = oplog.makeIterator();
-    for (const auto& doc : reversedDocs) {
-        ASSERT_BSONOBJ_EQ(doc, unittest::assertGet(iter->next()).first);
+    CollectionReader reader(opCtx, nss);
+    for (const auto& doc : docs) {
+        ASSERT_BSONOBJ_EQ(doc, unittest::assertGet(reader.next()));
     }
-    ASSERT_EQUALS(ErrorCodes::CollectionIsEmpty, iter->next().getStatus());
+    ASSERT_EQUALS(ErrorCodes::CollectionIsEmpty, reader.next().getStatus());
 }
 
 /**
@@ -473,6 +473,79 @@ TEST_F(ReplicationRecoveryTest, RecoveryTruncatesOplogAtOplogTruncateAfterPoint)
     _assertDocsInTestCollection(opCtx, {});
     ASSERT_EQ(getConsistencyMarkers()->getOplogTruncateAfterPoint(opCtx), Timestamp());
     ASSERT_EQ(getConsistencyMarkers()->getAppliedThrough(opCtx), OpTime(Timestamp(3, 3), 1));
+}
+
+TEST_F(ReplicationRecoveryTest, RecoveryDoesNotTruncateOplogAtOrBeforeStableTimestamp) {
+    ReplicationRecoveryImpl recovery(getStorageInterface(), getConsistencyMarkers());
+    auto opCtx = getOperationContext();
+
+    getConsistencyMarkers()->setOplogTruncateAfterPoint(opCtx, Timestamp(2, 2));
+    getStorageInterfaceRecovery()->setRecoveryTimestamp(Timestamp(4, 4));
+    getConsistencyMarkers()->setAppliedThrough(opCtx, OpTime(Timestamp(4, 4), 1));
+    _setUpOplog(opCtx, getStorageInterface(), {1, 2, 3, 4, 5, 6});
+
+    recovery.recoverFromOplog(opCtx, boost::none);
+
+    _assertDocsInOplog(opCtx, {1, 2, 3, 4});
+    _assertDocsInTestCollection(opCtx, {});
+
+    ASSERT_EQ(getConsistencyMarkers()->getOplogTruncateAfterPoint(opCtx), Timestamp());
+    ASSERT_EQ(getConsistencyMarkers()->getAppliedThrough(opCtx), OpTime(Timestamp(4, 4), 1));
+}
+
+TEST_F(ReplicationRecoveryTest, RecoveryTruncatesNothingIfNothingIsAfterStableTimestamp) {
+    ReplicationRecoveryImpl recovery(getStorageInterface(), getConsistencyMarkers());
+    auto opCtx = getOperationContext();
+
+    getConsistencyMarkers()->setOplogTruncateAfterPoint(opCtx, Timestamp(2, 2));
+    getStorageInterfaceRecovery()->setRecoveryTimestamp(Timestamp(4, 4));
+    getConsistencyMarkers()->setAppliedThrough(opCtx, OpTime(Timestamp(4, 4), 1));
+    _setUpOplog(opCtx, getStorageInterface(), {1, 2, 3, 4});
+
+    recovery.recoverFromOplog(opCtx, boost::none);
+
+    _assertDocsInOplog(opCtx, {1, 2, 3, 4});
+    _assertDocsInTestCollection(opCtx, {});
+
+    ASSERT_EQ(getConsistencyMarkers()->getOplogTruncateAfterPoint(opCtx), Timestamp());
+    ASSERT_EQ(getConsistencyMarkers()->getAppliedThrough(opCtx), OpTime(Timestamp(4, 4), 1));
+}
+
+TEST_F(ReplicationRecoveryTest,
+       RecoveryTruncatesNothingIfTruncatePointEqualsStableWithNoLaterEntries) {
+    ReplicationRecoveryImpl recovery(getStorageInterface(), getConsistencyMarkers());
+    auto opCtx = getOperationContext();
+
+    getConsistencyMarkers()->setOplogTruncateAfterPoint(opCtx, Timestamp(4, 4));
+    getStorageInterfaceRecovery()->setRecoveryTimestamp(Timestamp(4, 4));
+    getConsistencyMarkers()->setAppliedThrough(opCtx, OpTime(Timestamp(4, 4), 1));
+    _setUpOplog(opCtx, getStorageInterface(), {1, 2, 3, 4});
+
+    recovery.recoverFromOplog(opCtx, boost::none);
+
+    _assertDocsInOplog(opCtx, {1, 2, 3, 4});
+    _assertDocsInTestCollection(opCtx, {});
+
+    ASSERT_EQ(getConsistencyMarkers()->getOplogTruncateAfterPoint(opCtx), Timestamp());
+    ASSERT_EQ(getConsistencyMarkers()->getAppliedThrough(opCtx), OpTime(Timestamp(4, 4), 1));
+}
+
+TEST_F(ReplicationRecoveryTest, RecoveryTruncatesAfterStableIfTruncatePointEqualsStable) {
+    ReplicationRecoveryImpl recovery(getStorageInterface(), getConsistencyMarkers());
+    auto opCtx = getOperationContext();
+
+    getConsistencyMarkers()->setOplogTruncateAfterPoint(opCtx, Timestamp(4, 4));
+    getStorageInterfaceRecovery()->setRecoveryTimestamp(Timestamp(4, 4));
+    getConsistencyMarkers()->setAppliedThrough(opCtx, OpTime(Timestamp(4, 4), 1));
+    _setUpOplog(opCtx, getStorageInterface(), {1, 2, 3, 4, 5, 6});
+
+    recovery.recoverFromOplog(opCtx, boost::none);
+
+    _assertDocsInOplog(opCtx, {1, 2, 3, 4});
+    _assertDocsInTestCollection(opCtx, {});
+
+    ASSERT_EQ(getConsistencyMarkers()->getOplogTruncateAfterPoint(opCtx), Timestamp());
+    ASSERT_EQ(getConsistencyMarkers()->getAppliedThrough(opCtx), OpTime(Timestamp(4, 4), 1));
 }
 
 TEST_F(ReplicationRecoveryTest, RecoverySucceedsWithOplogTruncatePointTooHigh) {
@@ -745,8 +818,7 @@ TEST_F(ReplicationRecoveryTest, RecoveryDoesNotApplyOperationsIfAppliedThroughIs
     _assertDocsInOplog(opCtx, {5});
     _assertDocsInTestCollection(opCtx, {});
     ASSERT(getConsistencyMarkers()->getOplogTruncateAfterPoint(opCtx).isNull());
-    // In 4.0 with RTT, recovering without a `recoverTimestamp` will set `appliedThrough` to the
-    // top of oplog.
+    // Recovering without a `recoverTimestamp` will set `appliedThrough` to the top of oplog.
     ASSERT_EQ(OpTime(Timestamp(5, 5), 1), getConsistencyMarkers()->getAppliedThrough(opCtx));
 }
 
@@ -912,7 +984,6 @@ TEST_F(ReplicationRecoveryTest, PrepareTransactionOplogEntryCorrectlyUpdatesConf
                                    repl::OpTypeEnum::kCommand,
                                    BSON("applyOps" << BSONArray() << "prepare" << true),
                                    OpTime(Timestamp(0, 0), -1),
-                                   true,  // prepare
                                    0,
                                    sessionInfo,
                                    lastDate);
@@ -927,7 +998,7 @@ TEST_F(ReplicationRecoveryTest, PrepareTransactionOplogEntryCorrectlyUpdatesConf
     expectedTxnRecord.setTxnNum(*sessionInfo.getTxnNumber());
     expectedTxnRecord.setLastWriteOpTime({Timestamp(2, 0), 1});
     expectedTxnRecord.setLastWriteDate(lastDate);
-    expectedTxnRecord.setStartTimestamp(Timestamp(2, 0));
+    expectedTxnRecord.setStartOpTime({{Timestamp(2, 0), 1}});
     expectedTxnRecord.setState(DurableTxnStateEnum::kPrepared);
 
     std::vector<BSONObj> expectedTxnColl{expectedTxnRecord.toBSON()};
@@ -961,7 +1032,6 @@ TEST_F(ReplicationRecoveryTest, AbortTransactionOplogEntryCorrectlyUpdatesConfig
                                    repl::OpTypeEnum::kCommand,
                                    BSON("applyOps" << BSONArray() << "prepare" << true),
                                    OpTime(Timestamp(0, 0), -1),
-                                   true,  // prepare
                                    0,
                                    sessionInfo,
                                    prepareDate);
@@ -974,7 +1044,6 @@ TEST_F(ReplicationRecoveryTest, AbortTransactionOplogEntryCorrectlyUpdatesConfig
                                                     repl::OpTypeEnum::kCommand,
                                                     BSON("abortTransaction" << 1),
                                                     OpTime(Timestamp(2, 0), 1),
-                                                    false,  // prepare
                                                     1,
                                                     sessionInfo,
                                                     abortDate);
@@ -1005,7 +1074,7 @@ TEST_F(ReplicationRecoveryTest, AbortTransactionOplogEntryCorrectlyUpdatesConfig
 
 DEATH_TEST_F(ReplicationRecoveryTest,
              RecoveryFailsWithPrepareAndEnableReadConcernMajorityFalse,
-             "Fatal Assertion 50964") {
+             "Fatal Assertion 51146") {
     ReplicationRecoveryImpl recovery(getStorageInterface(), getConsistencyMarkers());
     auto opCtx = getOperationContext();
 
@@ -1026,7 +1095,6 @@ DEATH_TEST_F(ReplicationRecoveryTest,
                                    repl::OpTypeEnum::kCommand,
                                    BSON("applyOps" << BSONArray() << "prepare" << true),
                                    OpTime(Timestamp(0, 0), -1),
-                                   true,  // prepare
                                    0,
                                    sessionInfo,
                                    lastDate);
@@ -1056,9 +1124,7 @@ TEST_F(ReplicationRecoveryTest, CommitTransactionOplogEntryCorrectlyUpdatesConfi
 
     const auto txnOperations = BSON_ARRAY(BSON("op"
                                                << "i"
-                                               << "ns"
-                                               << testNs.toString()
-                                               << "o"
+                                               << "ns" << testNs.toString() << "o"
                                                << BSON("_id" << 1)));
     const auto prepareDate = Date_t::now();
     const auto prepareOp =
@@ -1066,7 +1132,6 @@ TEST_F(ReplicationRecoveryTest, CommitTransactionOplogEntryCorrectlyUpdatesConfi
                                    repl::OpTypeEnum::kCommand,
                                    BSON("applyOps" << txnOperations << "prepare" << true),
                                    OpTime(Timestamp(0, 0), -1),
-                                   true,  // prepare
                                    0,
                                    sessionInfo,
                                    prepareDate);
@@ -1080,7 +1145,6 @@ TEST_F(ReplicationRecoveryTest, CommitTransactionOplogEntryCorrectlyUpdatesConfi
         repl::OpTypeEnum::kCommand,
         BSON("commitTransaction" << 1 << "commitTimestamp" << Timestamp(2, 1)),
         OpTime(Timestamp(2, 0), 1),
-        false,  // prepare
         1,
         sessionInfo,
         commitDate);
@@ -1135,9 +1199,7 @@ TEST_F(ReplicationRecoveryTest,
 
     const auto txnOperations = BSON_ARRAY(BSON("op"
                                                << "i"
-                                               << "ns"
-                                               << testNs.toString()
-                                               << "o"
+                                               << "ns" << testNs.toString() << "o"
                                                << BSON("_id" << 1)));
     const auto prepareDate = Date_t::now();
     const auto prepareOp =
@@ -1145,7 +1207,6 @@ TEST_F(ReplicationRecoveryTest,
                                    repl::OpTypeEnum::kCommand,
                                    BSON("applyOps" << txnOperations << "prepare" << true),
                                    OpTime(Timestamp(0, 0), -1),
-                                   true,  // prepare
                                    0,
                                    sessionInfo,
                                    prepareDate);
@@ -1171,7 +1232,6 @@ TEST_F(ReplicationRecoveryTest,
         repl::OpTypeEnum::kCommand,
         BSON("commitTransaction" << 1 << "commitTimestamp" << Timestamp(2, 1)),
         OpTime(Timestamp(2, 0), 1),
-        false,  // prepare
         1,
         sessionInfo,
         commitDate);

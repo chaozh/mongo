@@ -31,15 +31,15 @@
 
 #include <boost/filesystem/operations.hpp>
 
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
 Status validateTrafficRecordDestination(const std::string& path) {
     if (!path.empty() && !boost::filesystem::is_directory(path)) {
         return Status(ErrorCodes::FileNotOpen,
-                      str::stream() << "traffic recording directory \"" << path
-                                    << "\" is not a directory.");
+                      str::stream()
+                          << "traffic recording directory \"" << path << "\" is not a directory.");
     }
 
     return Status::OK();

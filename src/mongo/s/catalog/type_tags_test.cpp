@@ -58,8 +58,8 @@ TEST(TagsType, Valid) {
 }
 
 TEST(TagsType, MissingNsField) {
-    BSONObj obj = BSON(TagsType::tag("tag") << TagsType::min(BSON("a" << 10))
-                                            << TagsType::max(BSON("a" << 20)));
+    BSONObj obj = BSON(TagsType::tag("tag")
+                       << TagsType::min(BSON("a" << 10)) << TagsType::max(BSON("a" << 20)));
 
     StatusWith<TagsType> status = TagsType::fromBSON(obj);
     ASSERT_FALSE(status.isOK());
@@ -67,8 +67,8 @@ TEST(TagsType, MissingNsField) {
 }
 
 TEST(TagsType, MissingTagField) {
-    BSONObj obj = BSON(TagsType::ns("test.mycol") << TagsType::min(BSON("a" << 10))
-                                                  << TagsType::max(BSON("a" << 20)));
+    BSONObj obj = BSON(TagsType::ns("test.mycol")
+                       << TagsType::min(BSON("a" << 10)) << TagsType::max(BSON("a" << 20)));
 
     StatusWith<TagsType> status = TagsType::fromBSON(obj);
     ASSERT_FALSE(status.isOK());
@@ -94,9 +94,9 @@ TEST(TagsType, MissingMaxKey) {
 }
 
 TEST(TagsType, KeysWithDifferentNumberOfColumns) {
-    BSONObj obj = BSON(TagsType::ns("test.mycol") << TagsType::tag("tag")
-                                                  << TagsType::min(BSON("a" << 10 << "b" << 10))
-                                                  << TagsType::max(BSON("a" << 20)));
+    BSONObj obj = BSON(TagsType::ns("test.mycol")
+                       << TagsType::tag("tag") << TagsType::min(BSON("a" << 10 << "b" << 10))
+                       << TagsType::max(BSON("a" << 20)));
 
     StatusWith<TagsType> status = TagsType::fromBSON(obj);
     const TagsType& tag = status.getValue();
@@ -127,6 +127,20 @@ TEST(TagsType, BadType) {
 
     StatusWith<TagsType> status = TagsType::fromBSON(obj);
     ASSERT_EQUALS(ErrorCodes::NoSuchKey, status.getStatus());
+}
+
+TEST(TagsType, ToBSONLegacyID) {
+    BSONObj obj =
+        BSON(TagsType::ns("test.mycol") << TagsType::tag("tag") << TagsType::min(BSON("a" << 10))
+                                        << TagsType::max(BSON("a" << 20)));
+
+    auto tag = uassertStatusOK(TagsType::fromBSON(obj));
+
+    ASSERT_BSONOBJ_EQ(tag.toBSONLegacyID(),
+                      BSON(TagsType::ns("test.mycol")
+                           << TagsType::tag("tag") << TagsType::min(BSON("a" << 10))
+                           << TagsType::max(BSON("a" << 20)) << "_id"
+                           << BSON(TagsType::ns("test.mycol") << TagsType::min(BSON("a" << 10)))));
 }
 
 }  // namespace

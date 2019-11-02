@@ -31,6 +31,7 @@
 
 #include <boost/optional.hpp>
 
+#include "mongo/db/exec/document_value/value_comparator.h"
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/document_source_match.h"
 #include "mongo/db/pipeline/document_source_sequential_document_cache.h"
@@ -38,7 +39,6 @@
 #include "mongo/db/pipeline/expression.h"
 #include "mongo/db/pipeline/lite_parsed_pipeline.h"
 #include "mongo/db/pipeline/lookup_set_cache.h"
-#include "mongo/db/pipeline/value_comparator.h"
 
 namespace mongo {
 
@@ -49,6 +49,16 @@ namespace mongo {
 class DocumentSourceLookUp final : public DocumentSource {
 public:
     static constexpr size_t kMaxSubPipelineDepth = 20;
+    static constexpr StringData kStageName = "$lookup"_sd;
+
+    struct LetVariable {
+        LetVariable(std::string name, boost::intrusive_ptr<Expression> expression, Variables::Id id)
+            : name(std::move(name)), expression(std::move(expression)), id(id) {}
+
+        std::string name;
+        boost::intrusive_ptr<Expression> expression;
+        Variables::Id id;
+    };
 
     class LiteParsed final : public LiteParsedDocumentSource {
     public:
@@ -92,13 +102,17 @@ public:
             return (_foreignNssSet.find(nss) == _foreignNssSet.end());
         }
 
+        bool allowedToPassthroughFromMongos() const {
+            // If a sub-pipeline exists, check that all its stages are allowed to pass through.
+            return !_liteParsedPipeline || _liteParsedPipeline->allowedToPassthroughFromMongos();
+        }
+
     private:
         const NamespaceString _fromNss;
         const stdx::unordered_set<NamespaceString> _foreignNssSet;
         const boost::optional<LiteParsedPipeline> _liteParsedPipeline;
     };
 
-    GetNextResult getNext() final;
     const char* getSourceName() const final;
     void serializeToArray(
         std::vector<Value>& array,
@@ -117,13 +131,9 @@ public:
 
     DepsTracker::State getDependencies(DepsTracker* deps) const final;
 
-    BSONObjSet getOutputSorts() final {
-        return DocumentSource::truncateSortSet(pSource->getOutputSorts(), {_as.fullPath()});
-    }
-
-    boost::optional<MergingLogic> mergingLogic() final {
+    boost::optional<DistributedPlanLogic> distributedPlanLogic() final {
         // {shardsStage, mergingStage, sortPattern}
-        return MergingLogic{nullptr, this, boost::none};
+        return DistributedPlanLogic{nullptr, this, boost::none};
     }
 
     void addInvolvedCollections(stdx::unordered_set<NamespaceString>* collectionNames) const final;
@@ -170,6 +180,33 @@ public:
         return !static_cast<bool>(_localField);
     }
 
+    boost::optional<FieldPath> getForeignField() const {
+        return _foreignField;
+    }
+
+    boost::optional<FieldPath> getLocalField() const {
+        return _localField;
+    }
+
+    const std::vector<LetVariable>& getLetVariables() const {
+        return _letVariables;
+    }
+
+    /**
+     * Returns a non-executable pipeline which can be useful for introspection. In this pipeline,
+     * all view definitions are resolved. This pipeline is present in both the sub-pipeline version
+     * of $lookup and the simpler 'localField/foreignField' version, but because it is not tied to
+     * any document to look up it is missing variable definitions for the former type and the $match
+     * stage which will be added to enforce the join criteria for the latter.
+     */
+    const auto& getResolvedIntrospectionPipeline() const {
+        return *_resolvedIntrospectionPipeline;
+    }
+
+    auto& getResolvedIntrospectionPipeline() {
+        return *_resolvedIntrospectionPipeline;
+    }
+
     const Variables& getVariables_forTest() {
         return _variables;
     }
@@ -183,6 +220,7 @@ public:
     }
 
 protected:
+    GetNextResult doGetNext() final;
     void doDispose() final;
 
     /**
@@ -193,15 +231,6 @@ protected:
                                                      Pipeline::SourceContainer* container) final;
 
 private:
-    struct LetVariable {
-        LetVariable(std::string name, boost::intrusive_ptr<Expression> expression, Variables::Id id)
-            : name(std::move(name)), expression(std::move(expression)), id(id) {}
-
-        std::string name;
-        boost::intrusive_ptr<Expression> expression;
-        Variables::Id id;
-    };
-
     /**
      * Target constructor. Handles common-field initialization for the syntax-specific delegating
      * constructors.

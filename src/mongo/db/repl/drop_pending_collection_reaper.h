@@ -34,10 +34,9 @@
 #include <map>
 #include <memory>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/repl/optime.h"
-#include "mongo/stdx/mutex.h"
+#include "mongo/platform/mutex.h"
 
 namespace mongo {
 
@@ -60,7 +59,8 @@ class StorageInterface;
  * dropCollectionsOlderThan() for this purpose.
  */
 class DropPendingCollectionReaper {
-    MONGO_DISALLOW_COPYING(DropPendingCollectionReaper);
+    DropPendingCollectionReaper(const DropPendingCollectionReaper&) = delete;
+    DropPendingCollectionReaper& operator=(const DropPendingCollectionReaper&) = delete;
 
 public:
     // Operation Context binding.
@@ -82,7 +82,8 @@ public:
     /**
      * Adds a new drop-pending namespace, with its drop optime, to be managed by this class.
      */
-    void addDropPendingNamespace(const OpTime& dropOpTime,
+    void addDropPendingNamespace(OperationContext* opCtx,
+                                 const OpTime& dropOpTime,
                                  const NamespaceString& dropPendingNamespace);
 
     /**
@@ -100,7 +101,7 @@ public:
     void dropCollectionsOlderThan(OperationContext* opCtx, const OpTime& opTime);
 
     void clearDropPendingState() {
-        stdx::lock_guard<stdx::mutex> lock(_mutex);
+        stdx::lock_guard<Latch> lock(_mutex);
         _dropPendingNamespaces.clear();
     }
 
@@ -126,7 +127,7 @@ private:
     // (M)  Reads and writes guarded by _mutex.
 
     // Guards access to member variables.
-    stdx::mutex _mutex;
+    Mutex _mutex = MONGO_MAKE_LATCH("DropPendingCollectionReaper::_mutex");
 
     // Used to access the storage layer.
     StorageInterface* const _storageInterface;  // (R)

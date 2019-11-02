@@ -31,15 +31,16 @@
 
 #include <string>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/pipeline/runtime_constants_gen.h"
 #include "mongo/db/query/plan_executor.h"
 
 namespace mongo {
 
 class DeleteRequest {
-    MONGO_DISALLOW_COPYING(DeleteRequest);
+    DeleteRequest(const DeleteRequest&) = delete;
+    DeleteRequest& operator=(const DeleteRequest&) = delete;
 
 public:
     explicit DeleteRequest(const NamespaceString& nsString)
@@ -59,6 +60,9 @@ public:
     }
     void setSort(const BSONObj& sort) {
         _sort = sort;
+    }
+    void setRuntimeConstants(RuntimeConstants runtimeConstants) {
+        _runtimeConstants = std::move(runtimeConstants);
     }
     void setCollation(const BSONObj& collation) {
         _collation = collation;
@@ -93,6 +97,9 @@ public:
     }
     const BSONObj& getSort() const {
         return _sort;
+    }
+    const boost::optional<RuntimeConstants>& getRuntimeConstants() const {
+        return _runtimeConstants;
     }
     const BSONObj& getCollation() const {
         return _collation;
@@ -130,6 +137,7 @@ private:
     BSONObj _proj;
     BSONObj _sort;
     BSONObj _collation;
+    boost::optional<RuntimeConstants> _runtimeConstants;
     // The statement id of this request.
     StmtId _stmtId = kUninitializedStmtId;
     bool _multi;

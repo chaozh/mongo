@@ -1,7 +1,14 @@
 // Cannot implicitly shard accessed collections because the "command" field in the currentOp()
 // output is reported as {"mapreduce.shardedfinish": { mapreduce: "jstests_mr_killop", ... }, ... }
 // when the "finalize" option to the "mapReduce" command is used on a sharded collection.
-// @tags: [assumes_unsharded_collection, does_not_support_stepdowns]
+// @tags: [
+//   assumes_unsharded_collection,
+//   # mapReduce does not support afterClusterTime.
+//   does_not_support_causal_consistency,
+//   does_not_support_stepdowns,
+//   uses_multiple_connections,
+//   uses_map_reduce_with_temp_collections,
+// ]
 
 // Test killop applied to m/r operations and child ops of m/r operations.
 
@@ -54,17 +61,17 @@ function op(childLoop) {
 }
 
 /**
-* Run one map reduce with the specified parameters in a parallel shell, kill the
-* map reduce op or its child op with killOp, and wait for the map reduce op to
-* terminate.
-* @param childLoop - if true, a distinct $where op is killed rather than the map reduce op.
-* This is necessay for a child distinct $where of a map reduce op because child
-* ops currently mask parent ops in currentOp.
-*/
+ * Run one map reduce with the specified parameters in a parallel shell, kill the
+ * map reduce op or its child op with killOp, and wait for the map reduce op to
+ * terminate.
+ * @param childLoop - if true, a distinct $where op is killed rather than the map reduce op.
+ * This is necessay for a child distinct $where of a map reduce op because child
+ * ops currently mask parent ops in currentOp.
+ */
 function testOne(map, reduce, finalize, scope, childLoop, wait) {
-    debug("testOne - map = " + tojson(map) + "; reduce = " + tojson(reduce) + "; finalize = " +
-          tojson(finalize) + "; scope = " + tojson(scope) + "; childLoop = " + childLoop +
-          "; wait = " + wait);
+    debug("testOne - map = " + tojson(map) + "; reduce = " + tojson(reduce) +
+          "; finalize = " + tojson(finalize) + "; scope = " + tojson(scope) +
+          "; childLoop = " + childLoop + "; wait = " + wait);
 
     t.drop();
     t2.drop();

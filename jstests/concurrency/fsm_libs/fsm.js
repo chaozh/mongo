@@ -18,6 +18,7 @@ var fsm = (function() {
             let overridePath = "jstests/libs/override_methods/";
             load(overridePath + "check_for_operation_not_supported_in_transaction.js");
             load("jstests/concurrency/fsm_workload_helpers/auto_retry_transaction.js");
+            load("jstests/libs/transactions_util.js");
         }
         var currentState = args.startState;
 
@@ -30,7 +31,11 @@ var fsm = (function() {
             // same session, we override the "_defaultSession" property of the connections in the
             // cache to be the same as the session underlying 'args.db'.
             const makeNewConnWithExistingSession = function(connStr) {
-                const conn = new Mongo(connStr);
+                // We may fail to connect if the continuous stepdown thread had just terminated
+                // or killed a primary. We therefore use the connect() function defined in
+                // network_error_and_transaction_override.js to add automatic retries to
+                // connections. The override is loaded in worker_thread.js.
+                const conn = connect(connStr).getMongo();
                 conn._defaultSession = new _DelegatingDriverSession(conn, args.db.getSession());
                 return conn;
             };
@@ -57,7 +62,7 @@ var fsm = (function() {
                     // modified the thread-local state.
                     let data;
                     withTxnAndAutoRetry(args.db.getSession(), () => {
-                        data = deepCopyObject({}, args.data);
+                        data = TransactionsUtil.deepCopyObject({}, args.data);
                         fn.call(data, args.db, args.collName, connCache);
                     });
                     args.data = data;
@@ -85,31 +90,6 @@ var fsm = (function() {
             connCache = null;
             gc();
         }
-    }
-
-    // Make a deep copy of an object for retrying transactions. We make deep copies of object and
-    // array literals but not custom types like DB and DBCollection because they could have been
-    // modified before a transaction aborts. This function is adapted from the implementation of
-    // Object.extend() in src/mongo/shell/types.js.
-    function deepCopyObject(dst, src) {
-        for (var k in src) {
-            var v = src[k];
-            if (typeof(v) == "object" && v !== null) {
-                if (v.constructor === ObjectId) {  // convert ObjectId properly
-                    eval("v = " + tojson(v));
-                } else if (v instanceof NumberLong) {  // convert NumberLong properly
-                    eval("v = " + tojson(v));
-                } else if (Object.getPrototypeOf(v) === Object.prototype) {
-                    v = deepCopyObject({}, v);
-                } else if (Array.isArray(v)) {
-                    v = deepCopyObject([], v);
-                }
-            }
-            var desc = Object.getOwnPropertyDescriptor(src, k);
-            desc.value = v;
-            Object.defineProperty(dst, k, desc);
-        }
-        return dst;
     }
 
     // doc = document of the form

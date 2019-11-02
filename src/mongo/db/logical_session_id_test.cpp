@@ -88,11 +88,15 @@ public:
 
         auto localServiceLiaison =
             std::make_unique<MockServiceLiaison>(std::make_shared<MockServiceLiaisonImpl>());
-        auto localSessionsCollection = stdx::make_unique<MockSessionsCollection>(
+        auto localSessionsCollection = std::make_unique<MockSessionsCollection>(
             std::make_shared<MockSessionsCollectionImpl>());
 
         auto localLogicalSessionCache = std::make_unique<LogicalSessionCacheImpl>(
-            std::move(localServiceLiaison), std::move(localSessionsCollection), nullptr);
+            std::move(localServiceLiaison),
+            std::move(localSessionsCollection),
+            [](OperationContext*, SessionsCollection&, Date_t) {
+                return 0; /* No op*/
+            });
 
         LogicalSessionCache::set(getServiceContext(), std::move(localLogicalSessionCache));
     }
@@ -280,14 +284,14 @@ TEST_F(LogicalSessionIdTest, InitializeOperationSessionInfo_SessionIdAndTransact
     LogicalSessionFromClient lsid;
     lsid.setId(UUID::gen());
 
-    initializeOperationSessionInfo(
-        _opCtx.get(),
-        BSON("TestCmd" << 1 << "lsid" << lsid.toBSON() << "txnNumber" << 100LL << "OtherField"
-                       << "TestField"),
-        true,
-        true,
-        true,
-        true);
+    initializeOperationSessionInfo(_opCtx.get(),
+                                   BSON("TestCmd" << 1 << "lsid" << lsid.toBSON() << "txnNumber"
+                                                  << 100LL << "OtherField"
+                                                  << "TestField"),
+                                   true,
+                                   true,
+                                   true,
+                                   true);
 
     ASSERT(_opCtx->getLogicalSessionId());
     ASSERT_EQ(lsid.getId(), _opCtx->getLogicalSessionId()->getId());
@@ -302,14 +306,14 @@ TEST_F(LogicalSessionIdTest, InitializeOperationSessionInfo_IsReplSetMemberOrMon
     lsid.setId(UUID::gen());
 
     ASSERT_THROWS_CODE(
-        initializeOperationSessionInfo(
-            _opCtx.get(),
-            BSON("TestCmd" << 1 << "lsid" << lsid.toBSON() << "txnNumber" << 100LL << "OtherField"
-                           << "TestField"),
-            true,
-            true,
-            false,
-            true),
+        initializeOperationSessionInfo(_opCtx.get(),
+                                       BSON("TestCmd" << 1 << "lsid" << lsid.toBSON() << "txnNumber"
+                                                      << 100LL << "OtherField"
+                                                      << "TestField"),
+                                       true,
+                                       true,
+                                       false,
+                                       true),
         AssertionException,
         ErrorCodes::IllegalOperation);
 }
@@ -320,14 +324,14 @@ TEST_F(LogicalSessionIdTest, InitializeOperationSessionInfo_SupportsDocLockingFa
     lsid.setId(UUID::gen());
 
     ASSERT_THROWS_CODE(
-        initializeOperationSessionInfo(
-            _opCtx.get(),
-            BSON("TestCmd" << 1 << "lsid" << lsid.toBSON() << "txnNumber" << 100LL << "OtherField"
-                           << "TestField"),
-            true,
-            true,
-            true,
-            false),
+        initializeOperationSessionInfo(_opCtx.get(),
+                                       BSON("TestCmd" << 1 << "lsid" << lsid.toBSON() << "txnNumber"
+                                                      << 100LL << "OtherField"
+                                                      << "TestField"),
+                                       true,
+                                       true,
+                                       true,
+                                       false),
         AssertionException,
         ErrorCodes::IllegalOperation);
 }
@@ -381,7 +385,7 @@ TEST_F(LogicalSessionIdTest, InitializeOperationSessionInfo_VerifyUIDEvenIfDoNot
     LogicalSessionFromClient lsid;
     lsid.setId(UUID::gen());
 
-    auto invalidDigest = SHA256Block::computeHash({ConstDataRange("hacker", 6)});
+    auto invalidDigest = SHA256Block::computeHash({ConstDataRange("hacker")});
     lsid.setUid(invalidDigest);
 
     ASSERT_THROWS_CODE(initializeOperationSessionInfo(

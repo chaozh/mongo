@@ -30,6 +30,7 @@
 #include "mongo/db/exec/text_or.h"
 
 #include <map>
+#include <memory>
 #include <vector>
 
 #include "mongo/db/concurrency/write_conflict_exception.h"
@@ -38,17 +39,14 @@
 #include "mongo/db/exec/scoped_timer.h"
 #include "mongo/db/exec/working_set.h"
 #include "mongo/db/exec/working_set_common.h"
-#include "mongo/db/exec/working_set_computed_data.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/record_id.h"
-#include "mongo/stdx/memory.h"
 
 namespace mongo {
 
+using std::string;
 using std::unique_ptr;
 using std::vector;
-using std::string;
-using stdx::make_unique;
 
 using fts::FTSSpec;
 
@@ -111,8 +109,8 @@ std::unique_ptr<PlanStageStats> TextOrStage::getStats() {
         _commonStats.filter = bob.obj();
     }
 
-    unique_ptr<PlanStageStats> ret = make_unique<PlanStageStats>(_commonStats, STAGE_TEXT_OR);
-    ret->specific = make_unique<TextOrStats>(_specificStats);
+    unique_ptr<PlanStageStats> ret = std::make_unique<PlanStageStats>(_commonStats, STAGE_TEXT_OR);
+    ret->specific = std::make_unique<TextOrStats>(_specificStats);
 
     for (auto&& child : _children) {
         ret->children.emplace_back(child->getStats());
@@ -204,7 +202,7 @@ PlanStage::StageState TextOrStage::readFromChildren(WorkingSetID* out) {
         // failed, in which case 'id' is valid.  If ID is invalid, we
         // create our own error message.
         if (WorkingSet::INVALID_ID == id) {
-            mongoutils::str::stream ss;
+            str::stream ss;
             ss << "TEXT_OR stage failed to read in results from child";
             Status status(ErrorCodes::InternalError, ss);
             *out = WorkingSetCommon::allocateStatusMember(_ws, status);
@@ -237,8 +235,8 @@ PlanStage::StageState TextOrStage::returnResults(WorkingSetID* out) {
 
     WorkingSetMember* wsm = _ws->get(textRecordData.wsid);
 
-    // Populate the working set member with the text score and return it.
-    wsm->addComputed(new TextScoreComputedData(textRecordData.score));
+    // Populate the working set member with the text score metadata and return it.
+    wsm->metadata().setTextScore(textRecordData.score);
     *out = textRecordData.wsid;
     return PlanStage::ADVANCED;
 }

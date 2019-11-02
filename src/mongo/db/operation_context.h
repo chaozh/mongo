@@ -32,7 +32,6 @@
 #include <boost/optional.hpp>
 #include <memory>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/base/status.h"
 #include "mongo/db/client.h"
 #include "mongo/db/concurrency/locker.h"
@@ -42,11 +41,12 @@
 #include "mongo/db/storage/write_unit_of_work.h"
 #include "mongo/db/write_concern_options.h"
 #include "mongo/platform/atomic_word.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/stdx/condition_variable.h"
-#include "mongo/stdx/mutex.h"
 #include "mongo/transport/session.h"
 #include "mongo/util/decorable.h"
 #include "mongo/util/interruptible.h"
+#include "mongo/util/lockable_adapter.h"
 #include "mongo/util/time_support.h"
 #include "mongo/util/timer.h"
 
@@ -74,11 +74,20 @@ class UnreplicatedWritesBlock;
  * RecoveryUnit and to allow better invariant checking.
  */
 class OperationContext : public Interruptible, public Decorable<OperationContext> {
-    MONGO_DISALLOW_COPYING(OperationContext);
+    OperationContext(const OperationContext&) = delete;
+    OperationContext& operator=(const OperationContext&) = delete;
 
 public:
     OperationContext(Client* client, unsigned int opId);
     virtual ~OperationContext();
+
+    bool shouldParticipateInFlowControl() const {
+        return _shouldParticipateInFlowControl;
+    }
+
+    void setShouldParticipateInFlowControl(bool target) {
+        _shouldParticipateInFlowControl = target;
+    }
 
     /**
      * Interface for durability.  Caller DOES NOT own pointer.
@@ -343,12 +352,37 @@ public:
      */
     Microseconds getRemainingMaxTimeMicros() const;
 
-    StatusWith<stdx::cv_status> waitForConditionOrInterruptNoAssertUntil(
-        stdx::condition_variable& cv,
-        stdx::unique_lock<stdx::mutex>& m,
-        Date_t deadline) noexcept override;
+    bool isIgnoringInterrupts() const;
+
+    /**
+     * Returns whether this operation is part of a multi-document transaction. Specifically, it
+     * indicates whether the user asked for a multi-document transaction.
+     */
+    bool inMultiDocumentTransaction() const {
+        return _inMultiDocumentTransaction;
+    }
+
+    /**
+     * Sets that this operation is part of a multi-document transaction. Once this is set, it cannot
+     * be unset.
+     */
+    void setInMultiDocumentTransaction() {
+        _inMultiDocumentTransaction = true;
+    }
+
+    void setComment(const BSONObj& comment) {
+        _comment = comment.getOwned();
+    }
+
+    boost::optional<BSONElement> getComment() {
+        // The '_comment' object, if present, will only ever have one field.
+        return _comment ? boost::optional<BSONElement>(_comment->firstElement()) : boost::none;
+    }
 
 private:
+    StatusWith<stdx::cv_status> waitForConditionOrInterruptNoAssertUntil(
+        stdx::condition_variable& cv, BasicLockableAdapter m, Date_t deadline) noexcept override;
+
     IgnoreInterruptsState pushIgnoreInterrupts() override {
         IgnoreInterruptsState iis{_ignoreInterrupts,
                                   {_deadline, _timeoutError, _hasArtificialDeadline}};
@@ -446,26 +480,7 @@ private:
     // once from OK to some kill code.
     AtomicWord<ErrorCodes::Error> _killCode{ErrorCodes::OK};
 
-    // A transport Baton associated with the operation. The presence of this object implies that a
-    // client thread is doing it's own async networking by blocking on it's own thread.
     BatonHandle _baton;
-
-    // If non-null, _waitMutex and _waitCV are the (mutex, condition variable) pair that the
-    // operation is currently waiting on inside a call to waitForConditionOrInterrupt...().
-    //
-    // _waitThread is the calling thread's thread id.
-    //
-    // All access guarded by the Client's lock.
-    stdx::mutex* _waitMutex = nullptr;
-    stdx::condition_variable* _waitCV = nullptr;
-    stdx::thread::id _waitThread;
-
-    // If _waitMutex and _waitCV are non-null, this is the number of threads in a call to markKilled
-    // actively attempting to kill the operation. If this value is non-zero, the operation is inside
-    // waitForConditionOrInterrupt...() and must stay there until _numKillers reaches 0.
-    //
-    // All access guarded by the Client's lock.
-    int _numKillers = 0;
 
     WriteConcernOptions _writeConcern;
 
@@ -490,6 +505,12 @@ private:
     Timer _elapsedTime;
 
     bool _writesAreReplicated = true;
+    bool _shouldParticipateInFlowControl = true;
+    bool _inMultiDocumentTransaction = false;
+
+    // If populated, this is an owned singleton BSONObj whose only field, 'comment', is a copy of
+    // the 'comment' field from the input command object.
+    boost::optional<BSONObj> _comment;
 };
 
 namespace repl {
@@ -498,7 +519,8 @@ namespace repl {
  * object is in scope.
  */
 class UnreplicatedWritesBlock {
-    MONGO_DISALLOW_COPYING(UnreplicatedWritesBlock);
+    UnreplicatedWritesBlock(const UnreplicatedWritesBlock&) = delete;
+    UnreplicatedWritesBlock& operator=(const UnreplicatedWritesBlock&) = delete;
 
 public:
     UnreplicatedWritesBlock(OperationContext* opCtx)

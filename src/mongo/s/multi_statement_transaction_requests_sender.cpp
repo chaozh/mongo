@@ -49,32 +49,52 @@ std::vector<AsyncRequestsSender::Request> attachTxnDetails(
 
     for (auto request : requests) {
         newRequests.emplace_back(
-            request.shardId, txnRouter->attachTxnFieldsIfNeeded(request.shardId, request.cmdObj));
+            request.shardId,
+            txnRouter.attachTxnFieldsIfNeeded(opCtx, request.shardId, request.cmdObj));
     }
 
     return newRequests;
+}
+
+void processReplyMetadata(OperationContext* opCtx, const AsyncRequestsSender::Response& response) {
+    auto txnRouter = TransactionRouter::get(opCtx);
+    if (!txnRouter) {
+        return;
+    }
+
+    if (!response.swResponse.isOK()) {
+        return;
+    }
+
+    txnRouter.processParticipantResponse(
+        opCtx, response.shardId, response.swResponse.getValue().data);
 }
 
 }  // unnamed namespace
 
 MultiStatementTransactionRequestsSender::MultiStatementTransactionRequestsSender(
     OperationContext* opCtx,
-    executor::TaskExecutor* executor,
+    std::shared_ptr<executor::TaskExecutor> executor,
     StringData dbName,
     const std::vector<AsyncRequestsSender::Request>& requests,
     const ReadPreferenceSetting& readPreference,
     Shard::RetryPolicy retryPolicy)
     : _opCtx(opCtx),
-      _ars(
-          opCtx, executor, dbName, attachTxnDetails(opCtx, requests), readPreference, retryPolicy) {
-}
+      _ars(opCtx,
+           std::move(executor),
+           dbName,
+           attachTxnDetails(opCtx, requests),
+           readPreference,
+           retryPolicy) {}
 
 bool MultiStatementTransactionRequestsSender::done() {
     return _ars.done();
 }
 
 AsyncRequestsSender::Response MultiStatementTransactionRequestsSender::next() {
-    return _ars.next();
+    const auto response = _ars.next();
+    processReplyMetadata(_opCtx, response);
+    return response;
 }
 
 void MultiStatementTransactionRequestsSender::stopRetrying() {

@@ -27,11 +27,11 @@
  *    it in the license file.
  */
 
-#include "mongo/db/auth/sasl_mechanism_registry.h"
 #include "mongo/crypto/mechanism_scram.h"
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/authorization_manager_impl.h"
 #include "mongo/db/auth/authz_manager_external_state_mock.h"
+#include "mongo/db/auth/sasl_mechanism_registry.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/service_context_test_fixture.h"
 #include "mongo/unittest/unittest.h"
@@ -79,6 +79,7 @@ protected:
 template <typename Policy, bool argIsInternal>
 class BaseMockMechanismFactory : public MakeServerFactory<Policy> {
 public:
+    using MakeServerFactory<Policy>::MakeServerFactory;
     static constexpr bool isInternal = argIsInternal;
     bool canMakeMechanismForUser(const User* user) const final {
         return true;
@@ -111,7 +112,10 @@ public:
 };
 
 template <bool argIsInternal>
-class FooMechanismFactory : public BaseMockMechanismFactory<FooMechanism, argIsInternal> {};
+class FooMechanismFactory : public BaseMockMechanismFactory<FooMechanism, argIsInternal> {
+public:
+    using BaseMockMechanismFactory<FooMechanism, argIsInternal>::BaseMockMechanismFactory;
+};
 
 // Policy for a hypothetical "BAR" SASL mechanism.
 struct BarPolicy {
@@ -138,7 +142,10 @@ public:
 };
 
 template <bool argIsInternal>
-class BarMechanismFactory : public BaseMockMechanismFactory<BarMechanism, argIsInternal> {};
+class BarMechanismFactory : public BaseMockMechanismFactory<BarMechanism, argIsInternal> {
+public:
+    using BaseMockMechanismFactory<BarMechanism, argIsInternal>::BaseMockMechanismFactory;
+};
 
 // Policy for a hypothetical "InternalAuth" SASL mechanism.
 struct InternalAuthPolicy {
@@ -165,6 +172,8 @@ public:
 };
 
 class InternalAuthMechanismFactory : public BaseMockMechanismFactory<InternalAuthMechanism, true> {
+public:
+    using BaseMockMechanismFactory<InternalAuthMechanism, true>::BaseMockMechanismFactory;
 };
 
 class MechanismRegistryTest : public ServiceContextTest {
@@ -176,7 +185,7 @@ public:
               std::unique_ptr<AuthzManagerExternalStateMock>(authManagerExternalState),
               AuthorizationManagerImpl::InstallMockForTestingOrAuthImpl{})),
           // By default the registry is initialized with all mechanisms enabled.
-          registry({"FOO", "BAR", "InternalAuth"}) {
+          registry(opCtx->getServiceContext(), {"FOO", "BAR", "InternalAuth"}) {
         AuthorizationManager::set(getServiceContext(),
                                   std::unique_ptr<AuthorizationManager>(authManager));
 
@@ -201,8 +210,7 @@ public:
                  << "credentials"
                  << BSON("SCRAM-SHA-256"
                          << scram::Secrets<SHA256Block>::generateCredentials("sajack‍", 15000))
-                 << "roles"
-                 << BSONArray()),
+                 << "roles" << BSONArray()),
             BSONObj()));
 
 
@@ -214,10 +222,8 @@ public:
                                                         << "sajack"
                                                         << "db"
                                                         << "$external"
-                                                        << "credentials"
-                                                        << BSON("external" << true)
-                                                        << "roles"
-                                                        << BSONArray()),
+                                                        << "credentials" << BSON("external" << true)
+                                                        << "roles" << BSONArray()),
                                                    BSONObj()));
 
         internalSecurity.user = std::make_shared<User>(UserName("__system", "local"));

@@ -37,11 +37,13 @@
 
 #include "mongo/base/checked_cast.h"
 #include "mongo/base/status.h"
+#include "mongo/db/catalog/collection_catalog.h"
+#include "mongo/db/catalog/collection_impl.h"
 #include "mongo/db/catalog/database_holder_impl.h"
-#include "mongo/db/catalog/uuid_catalog.h"
 #include "mongo/db/client.h"
 #include "mongo/db/concurrency/lock_state.h"
 #include "mongo/db/dbdirectclient.h"
+#include "mongo/db/index/index_access_method_factory_impl.h"
 #include "mongo/db/index_builds_coordinator_mongod.h"
 #include "mongo/db/op_observer_registry.h"
 #include "mongo/db/s/sharding_state.h"
@@ -49,9 +51,9 @@
 #include "mongo/db/storage/storage_engine_init.h"
 #include "mongo/dbtests/dbtests.h"
 #include "mongo/dbtests/framework_options.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/scripting/dbdirectclient_factory.h"
 #include "mongo/scripting/engine.h"
-#include "mongo/stdx/mutex.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/exit.h"
 #include "mongo/util/log.h"
@@ -64,7 +66,7 @@ namespace dbtests {
 
 int runDbTests(int argc, char** argv) {
     frameworkGlobalParams.perfHist = 1;
-    frameworkGlobalParams.seed = time(0);
+    frameworkGlobalParams.seed = time(nullptr);
     frameworkGlobalParams.runsPerTest = 1;
 
     registerShutdownTask([] {
@@ -72,11 +74,6 @@ int runDbTests(int argc, char** argv) {
         // thread we use for proxying MozJS requests. Dropping the cache cleans up
         // the memory and makes leak sanitizer happy.
         ScriptEngine::dropScopeCache();
-
-        // Shut down the background periodic task runner, before the storage engine.
-        if (auto runner = getGlobalServiceContext()->getPeriodicRunner()) {
-            runner->shutdown();
-        }
 
         // We may be shut down before we have a global storage
         // engine.
@@ -101,15 +98,16 @@ int runDbTests(int argc, char** argv) {
     // Set up the periodic runner for background job execution, which is required by the storage
     // engine to be running beforehand.
     auto runner = makePeriodicRunner(globalServiceContext);
-    runner->startup();
     globalServiceContext->setPeriodicRunner(std::move(runner));
 
     initializeStorageEngine(globalServiceContext, StorageEngineInitFlags::kNone);
     DatabaseHolder::set(globalServiceContext, std::make_unique<DatabaseHolderImpl>());
+    IndexAccessMethodFactory::set(globalServiceContext,
+                                  std::make_unique<IndexAccessMethodFactoryImpl>());
+    Collection::Factory::set(globalServiceContext, std::make_unique<CollectionImpl::FactoryImpl>());
     IndexBuildsCoordinator::set(globalServiceContext,
                                 std::make_unique<IndexBuildsCoordinatorMongod>());
-    auto registry = stdx::make_unique<OpObserverRegistry>();
-    registry->addObserver(stdx::make_unique<UUIDCatalogObserver>());
+    auto registry = std::make_unique<OpObserverRegistry>();
     globalServiceContext->setOpObserver(std::move(registry));
 
     int ret = unittest::Suite::run(frameworkGlobalParams.suites,

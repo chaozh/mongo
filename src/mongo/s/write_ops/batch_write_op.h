@@ -33,7 +33,6 @@
 #include <set>
 #include <vector>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/base/owned_pointer_vector.h"
 #include "mongo/base/status.h"
 #include "mongo/db/logical_session_id.h"
@@ -50,6 +49,11 @@ namespace mongo {
 class OperationContext;
 class TargetedWriteBatch;
 class TrackedErrors;
+
+// Conservative overhead per element contained in the write batch. This value was calculated as 1
+// byte (element type) + 5 bytes (max string encoding of the array index encoded as string and the
+// maximum key is 99999) + 1 byte (zero terminator) = 7 bytes
+const int kWriteCommandBSONArrayPerElementOverheadBytes = 7;
 
 /**
  * Simple struct for storing an error with an endpoint.
@@ -116,11 +120,12 @@ using TargetedBatchMap = std::map<const ShardEndpoint*, TargetedWriteBatch*, End
  *
  */
 class BatchWriteOp {
-    MONGO_DISALLOW_COPYING(BatchWriteOp);
+    BatchWriteOp(const BatchWriteOp&) = delete;
+    BatchWriteOp& operator=(const BatchWriteOp&) = delete;
 
 public:
     BatchWriteOp(OperationContext* opCtx, const BatchedCommandRequest& clientRequest);
-    ~BatchWriteOp();
+    ~BatchWriteOp() = default;
 
     /**
      * Targets one or more of the next write ops in this batch op using a NSTargeter.  The
@@ -234,6 +239,9 @@ private:
     int _numMatched{0};
     int _numModified{0};
     int _numDeleted{0};
+
+    // Set to true if this write is part of a transaction.
+    const bool _inTransaction{false};
 };
 
 /**
@@ -244,7 +252,8 @@ private:
  * efficiently be registered for reporting.
  */
 class TargetedWriteBatch {
-    MONGO_DISALLOW_COPYING(TargetedWriteBatch);
+    TargetedWriteBatch(const TargetedWriteBatch&) = delete;
+    TargetedWriteBatch& operator=(const TargetedWriteBatch&) = delete;
 
 public:
     TargetedWriteBatch(const ShardEndpoint& endpoint) : _endpoint(endpoint) {}

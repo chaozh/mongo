@@ -82,6 +82,8 @@ void CatalogCacheLoaderMock::onStepUp() {
     MONGO_UNREACHABLE;
 }
 
+void CatalogCacheLoaderMock::shutDown() {}
+
 void CatalogCacheLoaderMock::notifyOfCollectionVersionUpdate(const NamespaceString& nss) {
     MONGO_UNREACHABLE;
 }
@@ -99,7 +101,9 @@ std::shared_ptr<Notification<void>> CatalogCacheLoaderMock::getChunksSince(
     const NamespaceString& nss, ChunkVersion version, GetChunksSinceCallbackFn callbackFn) {
     auto notify = std::make_shared<Notification<void>>();
 
-    uassertStatusOK(_threadPool.schedule([ this, notify, callbackFn ]() noexcept {
+    _threadPool.schedule([ this, notify, callbackFn ](auto status) noexcept {
+        invariant(status);
+
         auto opCtx = Client::getCurrent()->makeOperationContext();
 
         auto swCollAndChunks = [&]() -> StatusWith<CollectionAndChangedChunks> {
@@ -121,14 +125,14 @@ std::shared_ptr<Notification<void>> CatalogCacheLoaderMock::getChunksSince(
 
         callbackFn(opCtx.get(), std::move(swCollAndChunks));
         notify->set();
-    }));
+    });
 
     return notify;
 }
 
 void CatalogCacheLoaderMock::getDatabase(
     StringData dbName,
-    stdx::function<void(OperationContext*, StatusWith<DatabaseType>)> callbackFn) {
+    std::function<void(OperationContext*, StatusWith<DatabaseType>)> callbackFn) {
     // Not implemented
 }
 

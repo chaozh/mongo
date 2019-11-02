@@ -29,19 +29,19 @@
 
 #pragma once
 
+#include <functional>
 #include <string>
 #include <vector>
 
-#include "mongo/base/shim.h"
 #include "mongo/base/status.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/timestamp.h"
 #include "mongo/db/catalog/collection_options.h"
 #include "mongo/db/logical_session_id.h"
 #include "mongo/db/repl/oplog_entry.h"
+#include "mongo/db/repl/oplog_entry_or_grouped_inserts.h"
 #include "mongo/db/repl/optime.h"
 #include "mongo/db/repl/replication_coordinator.h"
-#include "mongo/stdx/functional.h"
 
 namespace mongo {
 class Collection;
@@ -51,12 +51,7 @@ class OperationContext;
 class OperationSessionInfo;
 class Session;
 
-struct OplogSlot {
-    OplogSlot() {}
-    OplogSlot(repl::OpTime opTime, std::int64_t hash) : opTime(opTime), hash(hash) {}
-    repl::OpTime opTime;
-    std::int64_t hash = 0;
-};
+using OplogSlot = repl::OpTime;
 
 struct InsertStatement {
 public:
@@ -67,7 +62,7 @@ public:
     InsertStatement(StmtId statementId, BSONObj toInsert, OplogSlot os)
         : stmtId(statementId), oplogSlot(os), doc(toInsert) {}
     InsertStatement(BSONObj toInsert, Timestamp ts, long long term)
-        : oplogSlot(repl::OpTime(ts, term), 0), doc(toInsert) {}
+        : oplogSlot(repl::OpTime(ts, term)), doc(toInsert) {}
 
     StmtId stmtId = kUninitializedStmtId;
     OplogSlot oplogSlot;
@@ -86,11 +81,29 @@ struct OplogLink {
 };
 
 /**
+ * Set the "lsid", "txnNumber", "stmtId", "prevOpTime", "preImageOpTime" and "postImageOpTime"
+ * fields of the oplogEntry based on the given oplogLink for retryable writes (i.e. when stmtId !=
+ * kUninitializedStmtId).
+ *
+ * If the given oplogLink.prevOpTime is a null OpTime, both the oplogLink.prevOpTime and the
+ * "prevOpTime" field of the oplogEntry will be set to the TransactionParticipant's lastWriteOpTime.
+ * The "preImageOpTime" field will only be set if the given oplogLink.preImageOpTime is not null.
+ * Similarly, the "postImageOpTime" field will only be set if the given oplogLink.postImageOpTime is
+ * not null.
+ */
+void appendRetryableWriteInfo(OperationContext* opCtx,
+                              MutableOplogEntry* oplogEntry,
+                              OplogLink* oplogLink,
+                              StmtId stmtId);
+
+/**
  * Create a new capped collection for the oplog if it doesn't yet exist.
  * If the collection already exists (and isReplSet is false),
  * set the 'last' Timestamp from the last entry of the oplog collection (side effect!)
  */
-void createOplog(OperationContext* opCtx, const std::string& oplogCollectionName, bool isReplSet);
+void createOplog(OperationContext* opCtx,
+                 const NamespaceString& oplogCollectionName,
+                 bool isReplSet);
 
 /*
  * Shortcut for above function using oplogCollectionName = _oplogCollectionName,
@@ -100,58 +113,29 @@ void createOplog(OperationContext* opCtx);
 /**
  * Log insert(s) to the local oplog.
  * Returns the OpTime of every insert.
+ * @param oplogEntryTemplate: a template used to generate insert oplog entries. Callers must set the
+ * "ns", "ui", "fromMigrate" and "wall" fields before calling this function. This function will then
+ * augment the template with the "op" (which is set to kInsert), "lsid" and "txnNumber" fields if
+ * necessary.
+ * @param begin/end: first/last InsertStatement to be inserted. This function iterates from begin to
+ * end and generates insert oplog entries based on the augmented oplogEntryTemplate with the "ts",
+ * "t", "o", "prevOpTime" and "stmtId" fields replaced by the content of each InsertStatement
+ * defined by the begin-end range.
+ *
  */
 std::vector<OpTime> logInsertOps(OperationContext* opCtx,
-                                 const NamespaceString& nss,
-                                 OptionalCollectionUUID uuid,
+                                 MutableOplogEntry* oplogEntryTemplate,
                                  std::vector<InsertStatement>::const_iterator begin,
-                                 std::vector<InsertStatement>::const_iterator end,
-                                 bool fromMigrate,
-                                 Date_t wallClockTime);
+                                 std::vector<InsertStatement>::const_iterator end);
 
 /**
- * @param opstr
- *  "i" insert
- *  "u" update
- *  "d" delete
- *  "c" db cmd
- *  "n" no-op
- *  "db" declares presence of a database (ns is set to the db name + '.')
- *
- * For 'u' records, 'obj' captures the mutation made to the object but not
- * the object itself. 'o2' captures the the criteria for the object that will be modified.
- *
- * wallClockTime this specifies the wall-clock timestamp of then this oplog entry was generated. It
- *   is purely informational, may not be monotonically increasing and is not interpreted in any way
- *   by the replication subsystem.
- * oplogLink this contains the timestamp that points to the previous write that will be
- *   linked via prevTs, and the timestamps of the oplog entry that contains the document
- *   before/after update was applied. The timestamps are ignored if isNull() is true.
- * prepare this specifies if the oplog entry should be put into a 'prepare' state.
- * inTxn this specifies that the oplog entry is part of a transaction in progress.
- * oplogSlot If non-null, use this reserved oplog slot instead of a new one.
- *
  * Returns the optime of the oplog entry written to the oplog.
  * Returns a null optime if oplog was not modified.
  */
-OpTime logOp(OperationContext* opCtx,
-             const char* opstr,
-             const NamespaceString& ns,
-             OptionalCollectionUUID uuid,
-             const BSONObj& obj,
-             const BSONObj* o2,
-             bool fromMigrate,
-             Date_t wallClockTime,
-             const OperationSessionInfo& sessionInfo,
-             StmtId stmtId,
-             const OplogLink& oplogLink,
-             bool prepare,
-             bool inTxn,
-             const OplogSlot& oplogSlot);
+OpTime logOp(OperationContext* opCtx, MutableOplogEntry* oplogEntry);
 
 // Flush out the cached pointer to the oplog.
-// Used by the closeDatabase command to ensure we don't cache closed things.
-void oplogCheckCloseDatabase(OperationContext* opCtx, Database* db);
+void clearLocalOplogPtr();
 
 /**
  * Establish the cached pointer to the local oplog.
@@ -166,7 +150,7 @@ void acquireOplogCollectionForLogging(OperationContext* opCtx);
  */
 void establishOplogCollectionForLogging(OperationContext* opCtx, Collection* oplog);
 
-using IncrementOpsAppliedStatsFn = stdx::function<void()>;
+using IncrementOpsAppliedStatsFn = std::function<void()>;
 
 /**
  * This class represents the different modes of oplog application that are used within the
@@ -209,8 +193,8 @@ inline std::ostream& operator<<(std::ostream& s, OplogApplication::Mode mode) {
 }
 
 /**
- * Take a non-command op and apply it locally
- * Used for applying from an oplog
+ * Used for applying from an oplog entry or grouped inserts.
+ * @param opOrGroupedInserts a single oplog entry or grouped inserts to be applied.
  * @param alwaysUpsert convert some updates to upserts for idempotency reasons
  * @param mode specifies what oplog application mode we are in
  * @param incrementOpsAppliedStats is called whenever an op is applied.
@@ -218,7 +202,7 @@ inline std::ostream& operator<<(std::ostream& s, OplogApplication::Mode mode) {
  */
 Status applyOperation_inlock(OperationContext* opCtx,
                              Database* db,
-                             const BSONObj& op,
+                             const OplogEntryOrGroupedInserts& opOrGroupedInserts,
                              bool alwaysUpsert,
                              OplogApplication::Mode mode,
                              IncrementOpsAppliedStatsFn incrementOpsAppliedStats = {});
@@ -229,15 +213,13 @@ Status applyOperation_inlock(OperationContext* opCtx,
  * Returns failure status if the op that could not be applied.
  */
 Status applyCommand_inlock(OperationContext* opCtx,
-                           const BSONObj& op,
                            const OplogEntry& entry,
-                           OplogApplication::Mode mode,
-                           boost::optional<Timestamp> stableTimestampForRecovery);
+                           OplogApplication::Mode mode);
 
 /**
  * Initializes the global Timestamp with the value from the timestamp of the last oplog entry.
  */
-void initTimestampFromOplog(OperationContext* opCtx, const std::string& oplogNS);
+void initTimestampFromOplog(OperationContext* opCtx, const NamespaceString& oplogNS);
 
 /**
  * Sets the global Timestamp to be 'newTime'.
@@ -260,37 +242,19 @@ void signalOplogWaiters();
 void createIndexForApplyOps(OperationContext* opCtx,
                             const BSONObj& indexSpec,
                             const NamespaceString& indexNss,
-                            IncrementOpsAppliedStatsFn incrementOpsAppliedStats,
                             OplogApplication::Mode mode);
 
-// Shims currently do not support free functions so we wrap getNextOpTime in a class as a
-// workaround.
-struct GetNextOpTimeClass {
-    /**
-     * Allocates optimes for new entries in the oplog.  Returns an OplogSlot or a vector of
-     * OplogSlots, which contain the new optimes along with their terms and newly calculated hash
-     * fields.
-     */
-    static MONGO_DECLARE_SHIM((OperationContext * opCtx)->OplogSlot) getNextOpTime;
-};
+/**
+ * Allocates optimes for new entries in the oplog.  Returns a vector of OplogSlots, which
+ * contain the new optimes along with their terms and newly calculated hash fields.
+ */
+std::vector<OplogSlot> getNextOpTimes(OperationContext* opCtx, std::size_t count);
 
 inline OplogSlot getNextOpTime(OperationContext* opCtx) {
-    return GetNextOpTimeClass::getNextOpTime(opCtx);
+    auto slots = getNextOpTimes(opCtx, 1);
+    invariant(slots.size() == 1);
+    return slots.back();
 }
-
-/**
- * Allocates an OpTime, but does not update the storage engine with the timestamp. This is used to
- * test prepare support for transactions. It is necessary to do this because a transaction in
- * WiredTiger cannot be prepared if a timestamp has already been set (by a call to getNextOpTime),
- * but a timestamp is required to call prepare_transaction. The circular nature of this behavior
- * requires that an optime be allocated without updating the storage engine.
- *
- * TODO: This is a temporary workaround for prepared transactions that allows generating an
- * optime without setting the commit timestamp on the storage engine. This can be removed once
- * prepare generates an oplog entry in a separate unit of work.
- */
-OplogSlot getNextOpTimeNoPersistForTesting(OperationContext* opCtx);
-std::vector<OplogSlot> getNextOpTimes(OperationContext* opCtx, std::size_t count);
 
 }  // namespace repl
 }  // namespace mongo

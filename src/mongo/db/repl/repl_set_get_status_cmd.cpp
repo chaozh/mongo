@@ -30,6 +30,7 @@
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/db/lasterror.h"
 #include "mongo/db/repl/repl_set_command.h"
+#include "mongo/db/repl/replication_coordinator.h"
 
 namespace mongo {
 namespace repl {
@@ -54,9 +55,9 @@ public:
         Status status = ReplicationCoordinator::get(opCtx)->checkReplEnabledForCommand(&result);
         uassertStatusOK(status);
 
-        bool includeInitialSync = false;
+        bool includeInitialSync = true;
         Status initialSyncStatus =
-            bsonExtractBooleanFieldWithDefault(cmdObj, "initialSync", false, &includeInitialSync);
+            bsonExtractBooleanFieldWithDefault(cmdObj, "initialSync", true, &includeInitialSync);
         uassertStatusOK(initialSyncStatus);
 
         auto responseStyle = ReplicationCoordinator::ReplSetGetStatusResponseStyle::kBasic;

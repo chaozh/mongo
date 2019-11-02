@@ -12,14 +12,13 @@ if not env['MONGO_HAVE_LIBMONGOC']:
 
 if get_option('install-mode') == 'hygienic':
     env.AutoInstall(
-        'share/doc/mongoc_embedded',
+        '$PREFIX_DOCDIR/mongoc_embedded',
         source=[
             '#/LICENSE-Community.txt',
             '../LICENSE-Embedded.txt',
         ],
-        INSTALL_ALIAS=[
-            'embedded-dev',
-        ],
+        AIB_COMPONENT='embedded',
+        AIB_ROLE='base',
     )
 
 def create_mongoc_env(env):
@@ -72,18 +71,15 @@ mongocEmbeddedTargets = mongocEmbeddedEnv.Library(
         # No LIBDEPS or LIBDEPS_PRIVATE to mongo libraries are allowed in this library. They would get duplicated in mongo_embedded_capi.
         '$BUILD_DIR/mongo/embedded/mongo_embedded/mongo_embedded',
     ],
-    INSTALL_ALIAS=[
-        'embedded-dev',
-    ],
+    AIB_COMPONENT='embedded',
 )
 
 if get_option('install-mode') == 'hygienic':
     env.AutoInstall(
-        'include/mongoc_embedded/v1/mongoc_embedded',
+        '$PREFIX_INCLUDEDIR/mongoc_embedded/v1/mongoc_embedded',
         source=['mongoc_embedded.h'],
-        INSTALL_ALIAS=[
-            'embedded-dev',
-        ],
+        AIB_COMPONENT='embedded',
+        AIB_ROLE='dev'
     )
 
 yamlEnv = env.Clone()
@@ -104,8 +100,9 @@ if get_option('link-model') != 'dynamic-sdk':
             '$BUILD_DIR/mongo/util/options_parser/options_parser',
             'mongoc_embedded',
         ],
-        INSTALL_ALIAS=[
-            'embedded-test',
+        AIB_COMPONENT='embedded-test',
+        AIB_COMPONENTS_EXTRA=[
+            'tests',
         ],
     )
 
@@ -122,7 +119,7 @@ if get_option('link-model') != 'dynamic-sdk':
 if get_option('link-model') != 'dynamic-sdk' or get_option('install-mode') != 'hygienic' or not env.TargetOSIs('darwin') or env.TargetOSIs('macOS'):
     Return()
 
-frameworkDir = env.Dir('$INSTALL_DIR/Frameworks/mongoc_embedded.framework')
+frameworkDir = env.Dir('$DESTDIR/Frameworks/mongoc_embedded.framework')
 env.Alias('install-embedded-dev', frameworkDir)
 
 resourceDir = frameworkDir
@@ -136,7 +133,7 @@ env.Install(
             'LICENSE-Community.txt',
             'LICENSE-Embedded.txt',
         ],
-        directory=env.Dir('$INSTALL_DIR/share/doc/mongoc_embedded'),
+        directory=env.Dir('$PREFIX_DOCDIR/mongoc_embedded'),
     ),
 )
 
@@ -183,7 +180,7 @@ env.AddPostAction(
 
 mongocEmbeddedDSYM = getattr(mongocEmbeddedTargets[0].attributes, "separate_debug_file", None)
 if mongocEmbeddedDSYM:
-    frameworkDSYMDir = '$INSTALL_DIR/Frameworks/mongoc_embedded.framework.dSYM'
+    frameworkDSYMDir = '$DESTDIR/Frameworks/mongoc_embedded.framework.dSYM'
     env.Alias('install-embedded-dev', frameworkDSYMDir)
 
     env.InstallAs(

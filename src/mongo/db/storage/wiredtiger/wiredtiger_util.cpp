@@ -44,9 +44,9 @@
 #include "mongo/db/storage/wiredtiger/wiredtiger_session_cache.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
 #include "mongo/util/processinfo.h"
 #include "mongo/util/scopeguard.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -89,7 +89,7 @@ void WiredTigerUtil::fetchTypeAndSourceURI(OperationContext* opCtx,
     const size_t colon = tableUri.find(':');
     invariant(colon != string::npos);
     colgroupUri += tableUri.substr(colon);
-    StatusWith<std::string> colgroupResult = getMetadata(opCtx, colgroupUri);
+    StatusWith<std::string> colgroupResult = getMetadataCreate(opCtx, colgroupUri);
     invariant(colgroupResult.getStatus());
     WiredTigerConfigParser parser(colgroupResult.getValue());
 
@@ -104,12 +104,8 @@ void WiredTigerUtil::fetchTypeAndSourceURI(OperationContext* opCtx,
     *source = std::string(sourceItem.str, sourceItem.len);
 }
 
-StatusWith<std::string> WiredTigerUtil::getMetadataRaw(WT_SESSION* session, StringData uri) {
-    WT_CURSOR* cursor;
-    invariantWTOK(session->open_cursor(session, "metadata:create", nullptr, "", &cursor));
-    invariant(cursor);
-    ON_BLOCK_EXIT([cursor] { invariantWTOK(cursor->close(cursor)); });
-
+namespace {
+StatusWith<std::string> _getMetadata(WT_CURSOR* cursor, StringData uri) {
     std::string strUri = uri.toString();
     cursor->set_key(cursor, strUri.c_str());
     int ret = cursor->search(cursor);
@@ -119,7 +115,7 @@ StatusWith<std::string> WiredTigerUtil::getMetadataRaw(WT_SESSION* session, Stri
     } else if (ret != 0) {
         return StatusWith<std::string>(wtRCToStatus(ret));
     }
-    const char* metadata = NULL;
+    const char* metadata = nullptr;
     ret = cursor->get_value(cursor, &metadata);
     if (ret != 0) {
         return StatusWith<std::string>(wtRCToStatus(ret));
@@ -127,33 +123,62 @@ StatusWith<std::string> WiredTigerUtil::getMetadataRaw(WT_SESSION* session, Stri
     invariant(metadata);
     return StatusWith<std::string>(metadata);
 }
+}  // namespace
+
+StatusWith<std::string> WiredTigerUtil::getMetadataCreate(WT_SESSION* session, StringData uri) {
+    WT_CURSOR* cursor;
+    invariantWTOK(session->open_cursor(session, "metadata:create", nullptr, "", &cursor));
+    invariant(cursor);
+    ON_BLOCK_EXIT([cursor] { invariantWTOK(cursor->close(cursor)); });
+
+    return _getMetadata(cursor, uri);
+}
+
+StatusWith<std::string> WiredTigerUtil::getMetadataCreate(OperationContext* opCtx, StringData uri) {
+    invariant(opCtx);
+
+    auto session = WiredTigerRecoveryUnit::get(opCtx)->getSessionNoTxn();
+
+    WT_CURSOR* cursor = nullptr;
+    try {
+        cursor = session->getCachedCursor(
+            "metadata:create", WiredTigerSession::kMetadataCreateTableId, NULL);
+    } catch (const ExceptionFor<ErrorCodes::CursorNotFound>& ex) {
+        error() << ex;
+        fassertFailedNoTrace(51257);
+    }
+    invariant(cursor);
+    auto releaser = makeGuard(
+        [&] { session->releaseCursor(WiredTigerSession::kMetadataCreateTableId, cursor); });
+
+    return _getMetadata(cursor, uri);
+}
+
+StatusWith<std::string> WiredTigerUtil::getMetadata(WT_SESSION* session, StringData uri) {
+    WT_CURSOR* cursor;
+    invariantWTOK(session->open_cursor(session, "metadata:", nullptr, "", &cursor));
+    invariant(cursor);
+    ON_BLOCK_EXIT([cursor] { invariantWTOK(cursor->close(cursor)); });
+
+    return _getMetadata(cursor, uri);
+}
 
 StatusWith<std::string> WiredTigerUtil::getMetadata(OperationContext* opCtx, StringData uri) {
     invariant(opCtx);
 
     auto session = WiredTigerRecoveryUnit::get(opCtx)->getSessionNoTxn();
-    WT_CURSOR* cursor =
-        session->getCursor("metadata:create", WiredTigerSession::kMetadataTableId, false);
+    WT_CURSOR* cursor = nullptr;
+    try {
+        cursor = session->getCachedCursor("metadata:", WiredTigerSession::kMetadataTableId, NULL);
+    } catch (const ExceptionFor<ErrorCodes::CursorNotFound>& ex) {
+        error() << ex;
+        fassertFailedNoTrace(31293);
+    }
     invariant(cursor);
     auto releaser =
         makeGuard([&] { session->releaseCursor(WiredTigerSession::kMetadataTableId, cursor); });
 
-    std::string strUri = uri.toString();
-    cursor->set_key(cursor, strUri.c_str());
-    int ret = cursor->search(cursor);
-    if (ret == WT_NOTFOUND) {
-        return StatusWith<std::string>(ErrorCodes::NoSuchKey,
-                                       str::stream() << "Unable to find metadata for " << uri);
-    } else if (ret != 0) {
-        return StatusWith<std::string>(wtRCToStatus(ret));
-    }
-    const char* metadata = NULL;
-    ret = cursor->get_value(cursor, &metadata);
-    if (ret != 0) {
-        return StatusWith<std::string>(wtRCToStatus(ret));
-    }
-    invariant(metadata);
-    return StatusWith<std::string>(metadata);
+    return _getMetadata(cursor, uri);
 }
 
 Status WiredTigerUtil::getApplicationMetadata(OperationContext* opCtx,
@@ -187,9 +212,7 @@ Status WiredTigerUtil::getApplicationMetadata(OperationContext* opCtx,
         if (keysSeen.count(key)) {
             return Status(ErrorCodes::Error(50998),
                           str::stream() << "app_metadata must not contain duplicate keys. "
-                                        << "Found multiple instances of key '"
-                                        << key
-                                        << "'.");
+                                        << "Found multiple instances of key '" << key << "'.");
         }
         keysSeen.insert(key);
 
@@ -265,9 +288,7 @@ StatusWith<int64_t> WiredTigerUtil::checkApplicationMetadataFormatVersion(Operat
     if (version < minimumVersion || version > maximumVersion) {
         return Status(ErrorCodes::UnsupportedFormat,
                       str::stream() << "Application metadata for " << uri
-                                    << " has unsupported format version: "
-                                    << version
-                                    << ".");
+                                    << " has unsupported format version: " << version << ".");
     }
 
     LOG(2) << "WiredTigerUtil::checkApplicationMetadataFormatVersion "
@@ -309,19 +330,18 @@ Status WiredTigerUtil::checkTableCreationOptions(const BSONElement& configElem) 
 }
 
 // static
-StatusWith<uint64_t> WiredTigerUtil::getStatisticsValue(WT_SESSION* session,
-                                                        const std::string& uri,
-                                                        const std::string& config,
-                                                        int statisticsKey) {
+StatusWith<int64_t> WiredTigerUtil::getStatisticsValue(WT_SESSION* session,
+                                                       const std::string& uri,
+                                                       const std::string& config,
+                                                       int statisticsKey) {
     invariant(session);
-    WT_CURSOR* cursor = NULL;
-    const char* cursorConfig = config.empty() ? NULL : config.c_str();
-    int ret = session->open_cursor(session, uri.c_str(), NULL, cursorConfig, &cursor);
+    WT_CURSOR* cursor = nullptr;
+    const char* cursorConfig = config.empty() ? nullptr : config.c_str();
+    int ret = session->open_cursor(session, uri.c_str(), nullptr, cursorConfig, &cursor);
     if (ret != 0) {
-        return StatusWith<uint64_t>(ErrorCodes::CursorNotFound,
-                                    str::stream() << "unable to open cursor at URI " << uri
-                                                  << ". reason: "
-                                                  << wiredtiger_strerror(ret));
+        return StatusWith<int64_t>(ErrorCodes::CursorNotFound,
+                                   str::stream() << "unable to open cursor at URI " << uri
+                                                 << ". reason: " << wiredtiger_strerror(ret));
     }
     invariant(cursor);
     ON_BLOCK_EXIT([&] { cursor->close(cursor); });
@@ -329,28 +349,26 @@ StatusWith<uint64_t> WiredTigerUtil::getStatisticsValue(WT_SESSION* session,
     cursor->set_key(cursor, statisticsKey);
     ret = cursor->search(cursor);
     if (ret != 0) {
-        return StatusWith<uint64_t>(
-            ErrorCodes::NoSuchKey,
-            str::stream() << "unable to find key " << statisticsKey << " at URI " << uri
-                          << ". reason: "
-                          << wiredtiger_strerror(ret));
+        return StatusWith<int64_t>(ErrorCodes::NoSuchKey,
+                                   str::stream()
+                                       << "unable to find key " << statisticsKey << " at URI "
+                                       << uri << ". reason: " << wiredtiger_strerror(ret));
     }
 
-    uint64_t value;
-    ret = cursor->get_value(cursor, NULL, NULL, &value);
+    int64_t value;
+    ret = cursor->get_value(cursor, nullptr, nullptr, &value);
     if (ret != 0) {
-        return StatusWith<uint64_t>(
-            ErrorCodes::BadValue,
-            str::stream() << "unable to get value for key " << statisticsKey << " at URI " << uri
-                          << ". reason: "
-                          << wiredtiger_strerror(ret));
+        return StatusWith<int64_t>(ErrorCodes::BadValue,
+                                   str::stream() << "unable to get value for key " << statisticsKey
+                                                 << " at URI " << uri
+                                                 << ". reason: " << wiredtiger_strerror(ret));
     }
 
-    return StatusWith<uint64_t>(value);
+    return StatusWith<int64_t>(value);
 }
 
 int64_t WiredTigerUtil::getIdentSize(WT_SESSION* s, const std::string& uri) {
-    StatusWith<int64_t> result = WiredTigerUtil::getStatisticsValueAs<int64_t>(
+    StatusWith<int64_t> result = WiredTigerUtil::getStatisticsValue(
         s, "statistics:" + uri, "statistics=(size)", WT_STAT_DSRC_BLOCK_SIZE);
     const Status& status = result.getStatus();
     if (!status.isOK()) {
@@ -461,7 +479,7 @@ WT_EVENT_HANDLER defaultEventHandlers() {
     handlers.handle_progress = mdb_handle_progress;
     return handlers;
 }
-}
+}  // namespace
 
 WiredTigerEventHandler::WiredTigerEventHandler() {
     WT_EVENT_HANDLER* handler = static_cast<WT_EVENT_HANDLER*>(this);
@@ -516,11 +534,11 @@ int WiredTigerUtil::verifyTable(OperationContext* opCtx,
     // Open a new session with custom error handlers.
     WT_CONNECTION* conn = WiredTigerRecoveryUnit::get(opCtx)->getSessionCache()->conn();
     WT_SESSION* session;
-    invariantWTOK(conn->open_session(conn, &eventHandler, NULL, &session));
+    invariantWTOK(conn->open_session(conn, &eventHandler, nullptr, &session));
     ON_BLOCK_EXIT([&] { session->close(session, ""); });
 
     // Do the verify. Weird parens prevent treating "verify" as a macro.
-    return (session->verify)(session, uri.c_str(), NULL);
+    return (session->verify)(session, uri.c_str(), nullptr);
 }
 
 bool WiredTigerUtil::useTableLogging(NamespaceString ns, bool replEnabled) {
@@ -571,14 +589,13 @@ Status WiredTigerUtil::setTableLogging(WT_SESSION* session, const std::string& u
     //
     // If the settings need to be changed (only expected at startup), the alter table call must
     // succeed.
-    std::string existingMetadata = getMetadataRaw(session, uri).getValue();
+    std::string existingMetadata = getMetadataCreate(session, uri).getValue();
     if (existingMetadata.find("log=(enabled=true)") != std::string::npos &&
         existingMetadata.find("log=(enabled=false)") != std::string::npos) {
         // Sanity check against a table having multiple logging specifications.
         invariant(false,
                   str::stream() << "Table has contradictory logging settings. Uri: " << uri
-                                << " Conf: "
-                                << existingMetadata);
+                                << " Conf: " << existingMetadata);
     }
 
     if (existingMetadata.find(setting) != std::string::npos) {
@@ -602,15 +619,23 @@ Status WiredTigerUtil::exportTableToBSON(WT_SESSION* session,
                                          const std::string& uri,
                                          const std::string& config,
                                          BSONObjBuilder* bob) {
+    return exportTableToBSON(session, uri, config, bob, {});
+}
+
+Status WiredTigerUtil::exportTableToBSON(WT_SESSION* session,
+                                         const std::string& uri,
+                                         const std::string& config,
+                                         BSONObjBuilder* bob,
+                                         const std::vector<std::string>& filter) {
     invariant(session);
     invariant(bob);
-    WT_CURSOR* c = NULL;
-    const char* cursorConfig = config.empty() ? NULL : config.c_str();
-    int ret = session->open_cursor(session, uri.c_str(), NULL, cursorConfig, &c);
+    WT_CURSOR* c = nullptr;
+    const char* cursorConfig = config.empty() ? nullptr : config.c_str();
+    int ret = session->open_cursor(session, uri.c_str(), nullptr, cursorConfig, &c);
     if (ret != 0) {
         return Status(ErrorCodes::CursorNotFound,
-                      str::stream() << "unable to open cursor at URI " << uri << ". reason: "
-                                    << wiredtiger_strerror(ret));
+                      str::stream() << "unable to open cursor at URI " << uri
+                                    << ". reason: " << wiredtiger_strerror(ret));
     }
     bob->append("uri", uri);
     invariant(c);
@@ -619,7 +644,7 @@ Status WiredTigerUtil::exportTableToBSON(WT_SESSION* session,
     std::map<string, BSONObjBuilder*> subs;
     const char* desc;
     uint64_t value;
-    while (c->next(c) == 0 && c->get_value(c, &desc, NULL, &value) == 0) {
+    while (c->next(c) == 0 && c->get_value(c, &desc, nullptr, &value) == 0) {
         StringData key(desc);
 
         StringData prefix;
@@ -646,10 +671,15 @@ Status WiredTigerUtil::exportTableToBSON(WT_SESSION* session,
         if (prefix.size() == 0) {
             bob->appendNumber(desc, v);
         } else {
+            bool shouldSkipField = std::find(filter.begin(), filter.end(), prefix) != filter.end();
+            if (shouldSkipField) {
+                continue;
+            }
+
             BSONObjBuilder*& sub = subs[prefix.toString()];
             if (!sub)
                 sub = new BSONObjBuilder();
-            sub->appendNumber(mongoutils::str::ltrim(suffix.toString()), v);
+            sub->appendNumber(str::ltrim(suffix.toString()), v);
         }
     }
 
@@ -675,19 +705,22 @@ void WiredTigerUtil::appendSnapshotWindowSettings(WiredTigerKVEngine* engine,
     const unsigned currentAvailableSnapshotWindow =
         stableTimestamp.getSecs() - oldestTimestamp.getSecs();
 
-    int64_t score = uassertStatusOK(WiredTigerUtil::getStatisticsValueAs<int64_t>(
+    int64_t score = uassertStatusOK(WiredTigerUtil::getStatisticsValue(
         session->getSession(), "statistics:", "", WT_STAT_CONN_CACHE_LOOKASIDE_SCORE));
+
+    auto totalNumberOfSnapshotTooOldErrors = snapshotWindowParams.snapshotTooOldErrorCount.load();
 
     BSONObjBuilder settings(bob->subobjStart("snapshot-window-settings"));
     settings.append("cache pressure percentage threshold",
                     snapshotWindowParams.cachePressureThreshold.load());
     settings.append("current cache pressure percentage", score);
+    settings.append("total number of SnapshotTooOld errors", totalNumberOfSnapshotTooOldErrors);
     settings.append("max target available snapshots window size in seconds",
                     snapshotWindowParams.maxTargetSnapshotHistoryWindowInSeconds.load());
     settings.append("target available snapshots window size in seconds",
                     snapshotWindowParams.targetSnapshotHistoryWindowInSeconds.load());
     settings.append("current available snapshots window size in seconds",
-                    currentAvailableSnapshotWindow);
+                    static_cast<int>(currentAvailableSnapshotWindow));
     settings.append("latest majority snapshot timestamp available",
                     stableTimestamp.toStringPretty());
     settings.append("oldest majority snapshot timestamp available",

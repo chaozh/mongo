@@ -38,12 +38,38 @@
 #include "mongo/db/server_options.h"
 #include "mongo/db/session.h"
 #include "mongo/db/session_txn_record_gen.h"
+#include "mongo/db/transaction_participant_gen.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
 namespace repl {
 namespace {
+
+/**
+ * Creates an oplog entry to perform an update on the transaction table.
+ */
+OplogEntry createOplogEntryForTransactionTableUpdate(repl::OpTime opTime,
+                                                     const BSONObj& updateBSON,
+                                                     const BSONObj& o2Field,
+                                                     Date_t wallClockTime) {
+    return repl::OplogEntry(opTime,
+                            boost::none,  // hash
+                            repl::OpTypeEnum::kUpdate,
+                            NamespaceString::kSessionTransactionsTableNamespace,
+                            boost::none,  // uuid
+                            false,        // fromMigrate
+                            repl::OplogEntry::kOplogVersion,
+                            updateBSON,
+                            o2Field,
+                            {},    // sessionInfo
+                            true,  // upsert
+                            wallClockTime,
+                            boost::none,   // statementId
+                            boost::none,   // prevWriteOpTime
+                            boost::none,   // preImangeOpTime
+                            boost::none);  // postImageOpTime
+}
 
 /**
  * Constructs a new oplog entry if the given entry has transaction state embedded within in. The new
@@ -60,64 +86,42 @@ boost::optional<repl::OplogEntry> createMatchingTransactionTableUpdate(
     }
 
     invariant(sessionInfo.getSessionId());
-    invariant(entry.getWallClockTime());
 
     const auto updateBSON = [&] {
         SessionTxnRecord newTxnRecord;
         newTxnRecord.setSessionId(*sessionInfo.getSessionId());
         newTxnRecord.setTxnNum(*sessionInfo.getTxnNumber());
         newTxnRecord.setLastWriteOpTime(entry.getOpTime());
-        newTxnRecord.setLastWriteDate(*entry.getWallClockTime());
-
-        // "state" is a new field in 4.2.
-        if (serverGlobalParams.featureCompatibility.getVersion() >=
-            ServerGlobalParams::FeatureCompatibility::Version::kUpgradingTo42) {
-            switch (entry.getCommandType()) {
-                case repl::OplogEntry::CommandType::kApplyOps:
-                    if (entry.shouldPrepare()) {
-                        newTxnRecord.setState(DurableTxnStateEnum::kPrepared);
-                        newTxnRecord.setStartTimestamp(entry.getOpTime().getTimestamp());
-                    } else {
-                        newTxnRecord.setState(DurableTxnStateEnum::kCommitted);
-                    }
-                    break;
-                case repl::OplogEntry::CommandType::kCommitTransaction:
-                    newTxnRecord.setState(DurableTxnStateEnum::kCommitted);
-                    break;
-                case repl::OplogEntry::CommandType::kAbortTransaction:
-                    newTxnRecord.setState(DurableTxnStateEnum::kAborted);
-                    break;
-                default:
-                    break;
-            }
-        }
+        newTxnRecord.setLastWriteDate(entry.getWallClockTime());
 
         return newTxnRecord.toBSON();
     }();
 
-    return repl::OplogEntry(
+    return createOplogEntryForTransactionTableUpdate(
         entry.getOpTime(),
-        boost::none,  // hash
-        repl::OpTypeEnum::kUpdate,
-        NamespaceString::kSessionTransactionsTableNamespace,
-        boost::none,  // uuid
-        false,        // fromMigrate
-        repl::OplogEntry::kOplogVersion,
         updateBSON,
         BSON(SessionTxnRecord::kSessionIdFieldName << sessionInfo.getSessionId()->toBSON()),
-        {},    // sessionInfo
-        true,  // upsert
-        *entry.getWallClockTime(),
-        boost::none,  // statementId
-        boost::none,  // prevWriteOpTime
-        boost::none,  // preImangeOpTime
-        boost::none   // postImageOpTime
-        );
+        entry.getWallClockTime());
+}
+
+/**
+ * Returns true if the oplog entry represents an operation in a transaction and false otherwise.
+ */
+bool isTransactionEntry(OplogEntry entry) {
+    auto sessionInfo = entry.getOperationSessionInfo();
+    if (!sessionInfo.getTxnNumber()) {
+        return false;
+    }
+
+    return entry.isPartialTransaction() ||
+        entry.getCommandType() == repl::OplogEntry::CommandType::kAbortTransaction ||
+        entry.getCommandType() == repl::OplogEntry::CommandType::kCommitTransaction ||
+        entry.getCommandType() == repl::OplogEntry::CommandType::kApplyOps;
 }
 
 }  // namespace
 
-boost::optional<std::vector<OplogEntry>> SessionUpdateTracker::updateOrFlush(
+boost::optional<std::vector<OplogEntry>> SessionUpdateTracker::_updateOrFlush(
     const OplogEntry& entry) {
     const auto& ns = entry.getNss();
 
@@ -127,6 +131,28 @@ boost::optional<std::vector<OplogEntry>> SessionUpdateTracker::updateOrFlush(
     }
 
     _updateSessionInfo(entry);
+    return boost::none;
+}
+
+boost::optional<std::vector<OplogEntry>> SessionUpdateTracker::updateSession(
+    const OplogEntry& entry) {
+    if (!isTransactionEntry(entry)) {
+        return _updateOrFlush(entry);
+    }
+
+    // If we generate an update from a multi-statement transaction operation, we must clear (then
+    // replace) a possibly queued transaction table update for a retryable write on this session.
+    // It is okay to clear the transaction table update because retryable writes only care about
+    // the final state of the transaction table entry for a given session, not the full history
+    // of updates for the session. By contrast, we care about each transaction table update for
+    // multi-statement transactions -- we must maintain the timestamps and transaction states for
+    // each entry originating from a multi-statement transaction. For this reason, we cannot defer
+    // entries originating from multi-statement transactions.
+    if (auto txnTableUpdate = _createTransactionTableUpdateFromTransactionOp(entry)) {
+        _sessionsToUpdate.erase(*entry.getOperationSessionInfo().getSessionId());
+        return boost::optional<std::vector<OplogEntry>>({*txnTableUpdate});
+    }
+
     return boost::none;
 }
 
@@ -203,7 +229,6 @@ std::vector<OplogEntry> SessionUpdateTracker::flushAll() {
         invariant(newUpdate);
         opList.push_back(std::move(*newUpdate));
     }
-
     _sessionsToUpdate.clear();
 
     return opList;
@@ -226,6 +251,64 @@ std::vector<OplogEntry> SessionUpdateTracker::_flushForQueryPredicate(
     _sessionsToUpdate.erase(iter);
 
     return opList;
+}
+
+boost::optional<OplogEntry> SessionUpdateTracker::_createTransactionTableUpdateFromTransactionOp(
+    const repl::OplogEntry& entry) {
+    auto sessionInfo = entry.getOperationSessionInfo();
+
+    // We only update the transaction table on the first partialTxn operation.
+    if (entry.isPartialTransaction() && !entry.getPrevWriteOpTimeInTransaction()->isNull()) {
+        return boost::none;
+    }
+    invariant(sessionInfo.getSessionId());
+
+    const auto updateBSON = [&] {
+        SessionTxnRecord newTxnRecord;
+        newTxnRecord.setSessionId(*sessionInfo.getSessionId());
+        newTxnRecord.setTxnNum(*sessionInfo.getTxnNumber());
+        newTxnRecord.setLastWriteOpTime(entry.getOpTime());
+        newTxnRecord.setLastWriteDate(entry.getWallClockTime());
+
+        if (entry.isPartialTransaction()) {
+            invariant(entry.getPrevWriteOpTimeInTransaction()->isNull());
+            newTxnRecord.setState(DurableTxnStateEnum::kInProgress);
+            newTxnRecord.setStartOpTime(entry.getOpTime());
+            return newTxnRecord.toBSON();
+        }
+        switch (entry.getCommandType()) {
+            case repl::OplogEntry::CommandType::kApplyOps:
+                if (entry.shouldPrepare()) {
+                    newTxnRecord.setState(DurableTxnStateEnum::kPrepared);
+                    if (entry.getPrevWriteOpTimeInTransaction()->isNull()) {
+                        // The prepare oplog entry is the first operation of the transaction.
+                        newTxnRecord.setStartOpTime(entry.getOpTime());
+                    } else {
+                        // Update the transaction record using $set to avoid overwriting the
+                        // startOpTime.
+                        return BSON("$set" << newTxnRecord.toBSON());
+                    }
+                } else {
+                    newTxnRecord.setState(DurableTxnStateEnum::kCommitted);
+                }
+                break;
+            case repl::OplogEntry::CommandType::kCommitTransaction:
+                newTxnRecord.setState(DurableTxnStateEnum::kCommitted);
+                break;
+            case repl::OplogEntry::CommandType::kAbortTransaction:
+                newTxnRecord.setState(DurableTxnStateEnum::kAborted);
+                break;
+            default:
+                break;
+        }
+        return newTxnRecord.toBSON();
+    }();
+
+    return createOplogEntryForTransactionTableUpdate(
+        entry.getOpTime(),
+        updateBSON,
+        BSON(SessionTxnRecord::kSessionIdFieldName << sessionInfo.getSessionId()->toBSON()),
+        entry.getWallClockTime());
 }
 
 }  // namespace repl

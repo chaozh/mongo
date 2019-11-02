@@ -43,7 +43,8 @@ class ChunkSplitStateDriver;
  * Handles asynchronous auto-splitting of chunks.
  */
 class ChunkSplitter {
-    MONGO_DISALLOW_COPYING(ChunkSplitter);
+    ChunkSplitter(const ChunkSplitter&) = delete;
+    ChunkSplitter& operator=(const ChunkSplitter&) = delete;
 
 public:
     ChunkSplitter();
@@ -106,7 +107,7 @@ private:
                        long dataWritten);
 
     // Protects the state below.
-    stdx::mutex _mutex;
+    Mutex _mutex = MONGO_MAKE_LATCH("ChunkSplitter::_mutex");
 
     // The ChunkSplitter is only active on a primary node.
     bool _isPrimary{false};

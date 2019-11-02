@@ -56,13 +56,13 @@
 #include "mongo/db/wire_version.h"
 #include "mongo/executor/remote_command_request.h"
 #include "mongo/executor/remote_command_response.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/rpc/factory.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/rpc/metadata.h"
 #include "mongo/rpc/metadata/client_metadata.h"
 #include "mongo/rpc/reply_interface.h"
 #include "mongo/s/stale_exception.h"
-#include "mongo/stdx/mutex.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/concurrency/mutex.h"
 #include "mongo/util/debug_util.h"
@@ -73,11 +73,11 @@
 
 namespace mongo {
 
-using std::unique_ptr;
 using std::endl;
 using std::list;
 using std::string;
 using std::stringstream;
+using std::unique_ptr;
 using std::vector;
 
 using executor::RemoteCommandRequest;
@@ -221,23 +221,16 @@ std::pair<rpc::UniqueReply, DBClientBase*> DBClientBase::runCommandWithTarget(
     // more helpful error message. Note that call() can itself throw a socket exception.
     uassert(ErrorCodes::HostUnreachable,
             str::stream() << "network error while attempting to run "
-                          << "command '"
-                          << request.getCommandName()
-                          << "' "
-                          << "on host '"
-                          << host
-                          << "' ",
+                          << "command '" << request.getCommandName() << "' "
+                          << "on host '" << host << "' ",
             call(requestMsg, replyMsg, false, &host));
 
     auto commandReply = parseCommandReplyMessage(host, replyMsg);
 
     uassert(ErrorCodes::RPCProtocolNegotiationFailed,
             str::stream() << "Mismatched RPC protocols - request was '"
-                          << networkOpToString(requestMsg.operation())
-                          << "' '"
-                          << " but reply was '"
-                          << networkOpToString(replyMsg.operation())
-                          << "' ",
+                          << networkOpToString(requestMsg.operation()) << "' '"
+                          << " but reply was '" << networkOpToString(replyMsg.operation()) << "' ",
             rpc::protocolForMessage(requestMsg) == commandReply->getProtocol());
 
     return {std::move(commandReply), this};
@@ -287,7 +280,7 @@ bool DBClientBase::runCommand(const string& dbname, BSONObj cmd, BSONObj& info, 
 */
 bool DBClientBase::simpleCommand(const string& dbname, BSONObj* info, const string& command) {
     BSONObj o;
-    if (info == 0)
+    if (info == nullptr)
         info = &o;
     BSONObjBuilder b;
     b.append(command, 1);
@@ -314,8 +307,7 @@ bool DBClientBase::runPseudoCommand(StringData db,
         if (status == ErrorCodes::CommandResultSchemaViolation) {
             msgasserted(28624,
                         str::stream() << "Received bad " << realCommandName
-                                      << " response from server: "
-                                      << info);
+                                      << " response from server: " << info);
         } else if (status == ErrorCodes::CommandNotFound) {
             NamespaceString pseudoCommandNss(db, pseudoCommandCol);
             // if this throws we just let it escape as that's how runCommand works.
@@ -327,20 +319,28 @@ bool DBClientBase::runPseudoCommand(StringData db,
     return success;
 }
 
-unsigned long long DBClientBase::count(
-    const string& myns, const BSONObj& query, int options, int limit, int skip) {
-    BSONObj cmd = _countCmd(myns, query, options, limit, skip);
+long long DBClientBase::count(
+    const NamespaceStringOrUUID nsOrUuid, const BSONObj& query, int options, int limit, int skip) {
+    auto dbName = (nsOrUuid.uuid() ? nsOrUuid.dbname() : (*nsOrUuid.nss()).db().toString());
+    BSONObj cmd = _countCmd(nsOrUuid, query, options, limit, skip);
     BSONObj res;
-    if (!runCommand(nsToDatabase(myns), cmd, res, options))
-        uasserted(11010, string("count fails:") + res.toString());
+    if (!runCommand(dbName, cmd, res, options)) {
+        auto status = getStatusFromCommandResult(res);
+        uassertStatusOK(status.withContext("count fails:"));
+    }
+    uassert(ErrorCodes::NoSuchKey, "Missing 'n' field for count command.", res.hasField("n"));
     return res["n"].numberLong();
 }
 
 BSONObj DBClientBase::_countCmd(
-    const string& myns, const BSONObj& query, int options, int limit, int skip) {
-    NamespaceString ns(myns);
+    const NamespaceStringOrUUID nsOrUuid, const BSONObj& query, int options, int limit, int skip) {
     BSONObjBuilder b;
-    b.append("count", ns.coll());
+    if (nsOrUuid.uuid()) {
+        const auto uuid = *nsOrUuid.uuid();
+        uuid.appendToBuilder(&b, "count");
+    } else {
+        b.append("count", (*nsOrUuid.nss()).coll());
+    }
     b.append("query", query);
     if (limit)
         b.append("limit", limit);
@@ -412,7 +412,8 @@ string DBClientBase::createPasswordDigest(const string& username, const string& 
 
 namespace {
 class ScopedMetadataWriterRemover {
-    MONGO_DISALLOW_COPYING(ScopedMetadataWriterRemover);
+    ScopedMetadataWriterRemover(const ScopedMetadataWriterRemover&) = delete;
+    ScopedMetadataWriterRemover& operator=(const ScopedMetadataWriterRemover&) = delete;
 
 public:
     ScopedMetadataWriterRemover(DBClientBase* cli)
@@ -531,7 +532,7 @@ bool DBClientBase::isMaster(bool& isMaster, BSONObj* info) {
     }
 
     BSONObj o;
-    if (info == 0)
+    if (info == nullptr)
         info = &o;
     bool ok = runCommand("admin", bob.obj(), *info);
     isMaster = info->getField("ismaster").trueValue();
@@ -542,7 +543,7 @@ bool DBClientBase::createCollection(
     const string& ns, long long size, bool capped, int max, BSONObj* info) {
     verify(!capped || size);
     BSONObj o;
-    if (info == 0)
+    if (info == nullptr)
         info = &o;
     BSONObjBuilder b;
     string db = nsToDatabase(ns);
@@ -590,6 +591,42 @@ list<BSONObj> DBClientBase::getCollectionInfos(const string& db, const BSONObj& 
     uasserted(18630, str::stream() << "listCollections failed: " << res);
 }
 
+vector<BSONObj> DBClientBase::getDatabaseInfos(const BSONObj& filter,
+                                               const bool nameOnly,
+                                               const bool authorizedDatabases) {
+    vector<BSONObj> infos;
+
+    BSONObjBuilder bob;
+    bob.append("listDatabases", 1);
+    bob.append("filter", filter);
+
+    if (nameOnly) {
+        bob.append("nameOnly", 1);
+    }
+    if (authorizedDatabases) {
+        bob.append("authorizedDatabases", 1);
+    }
+
+    BSONObj cmd = bob.done();
+
+    BSONObj res;
+    if (runCommand("admin", cmd, res, QueryOption_SlaveOk)) {
+        BSONObj dbs = res["databases"].Obj();
+        BSONObjIterator it(dbs);
+        while (it.more()) {
+            BSONElement e = it.next();
+            infos.push_back(e.Obj().getOwned());
+        }
+
+        return infos;
+    }
+
+    uassertStatusOKWithContext(getStatusFromCommandResult(res),
+                               str::stream()
+                                   << "Command 'listDatabases' failed. Full command: " << cmd);
+    MONGO_UNREACHABLE;
+}
+
 bool DBClientBase::exists(const string& ns) {
     BSONObj filter = BSON("name" << nsToCollectionSubstring(ns));
     list<BSONObj> results = getCollectionInfos(nsToDatabase(ns), filter);
@@ -613,10 +650,7 @@ void DBClientBase::findN(vector<BSONObj>& out,
 
     uassert(10276,
             str::stream() << "DBClientBase::findN: transport error: " << getServerAddress()
-                          << " ns: "
-                          << ns
-                          << " query: "
-                          << query.toString(),
+                          << " ns: " << ns << " query: " << query.toString(),
             c.get());
 
     if (c->hasResultFlag(ResultFlag_ShardConfigStale)) {
@@ -709,10 +743,10 @@ struct DBClientFunConvertor {
             _f(i.nextSafe());
         }
     }
-    stdx::function<void(const BSONObj&)> _f;
+    std::function<void(const BSONObj&)> _f;
 };
 
-unsigned long long DBClientBase::query(stdx::function<void(const BSONObj&)> f,
+unsigned long long DBClientBase::query(std::function<void(const BSONObj&)> f,
                                        const NamespaceStringOrUUID& nsOrUuid,
                                        Query query,
                                        const BSONObj* fieldsToReturn,
@@ -720,11 +754,11 @@ unsigned long long DBClientBase::query(stdx::function<void(const BSONObj&)> f,
                                        int batchSize) {
     DBClientFunConvertor fun;
     fun._f = f;
-    stdx::function<void(DBClientCursorBatchIterator&)> ptr(fun);
+    std::function<void(DBClientCursorBatchIterator&)> ptr(fun);
     return this->query(ptr, nsOrUuid, query, fieldsToReturn, queryOptions, batchSize);
 }
 
-unsigned long long DBClientBase::query(stdx::function<void(DBClientCursorBatchIterator&)> f,
+unsigned long long DBClientBase::query(std::function<void(DBClientCursorBatchIterator&)> f,
                                        const NamespaceStringOrUUID& nsOrUuid,
                                        Query query,
                                        const BSONObj* fieldsToReturn,
@@ -795,13 +829,24 @@ void DBClientBase::killCursor(const NamespaceString& ns, long long cursorId) {
         OpMsgRequest::fromDBAndBody(ns.db(), KillCursorsRequest(ns, {cursorId}).toBSON()));
 }
 
-list<BSONObj> DBClientBase::getIndexSpecs(const string& ns, int options) {
+list<BSONObj> DBClientBase::getIndexSpecs(const NamespaceStringOrUUID& nsOrUuid, int options) {
     list<BSONObj> specs;
 
-    BSONObj cmd = BSON("listIndexes" << nsToCollectionSubstring(ns) << "cursor" << BSONObj());
+    BSONObjBuilder bob;
+    if (nsOrUuid.nss()) {
+        bob.append("listIndexes", (*nsOrUuid.nss()).coll());
+        bob.append("cursor", BSONObj());
+    } else {
+        const auto uuid = (*nsOrUuid.uuid());
+        uuid.appendToBuilder(&bob, "listIndexes");
+        bob.append("cursor", BSONObj());
+    }
+
+    BSONObj cmd = bob.obj();
+    auto dbName = (nsOrUuid.uuid() ? nsOrUuid.dbname() : (*nsOrUuid.nss()).db().toString());
 
     BSONObj res;
-    if (runCommand(nsToDatabase(ns), cmd, res, options)) {
+    if (runCommand(dbName, cmd, res, options)) {
         BSONObj cursorObj = res["cursor"].Obj();
         BSONObjIterator i(cursorObj["firstBatch"].Obj());
         while (i.more()) {
@@ -811,8 +856,11 @@ list<BSONObj> DBClientBase::getIndexSpecs(const string& ns, int options) {
         const long long id = cursorObj["id"].Long();
 
         if (id != 0) {
-            invariant(ns == cursorObj["ns"].String());
-            unique_ptr<DBClientCursor> cursor = getMore(ns, id, 0, 0);
+            const auto cursorNs = cursorObj["ns"].String();
+            if (nsOrUuid.nss()) {
+                invariant((*nsOrUuid.nss()).toString() == cursorNs);
+            }
+            unique_ptr<DBClientCursor> cursor = getMore(cursorNs, id, 0, 0);
             while (cursor->more()) {
                 specs.push_back(cursor->nextSafe().getOwned());
             }
@@ -820,12 +868,15 @@ list<BSONObj> DBClientBase::getIndexSpecs(const string& ns, int options) {
 
         return specs;
     }
-    int code = res["code"].numberInt();
+    Status status = getStatusFromCommandResult(res);
 
-    if (code == ErrorCodes::NamespaceNotFound) {
+    // "NamespaceNotFound" is an error for UUID but returns an empty list for NamespaceString; this
+    // matches the behavior for other commands such as 'find' and 'count'.
+    if (nsOrUuid.nss() && status.code() == ErrorCodes::NamespaceNotFound) {
         return specs;
     }
-    uasserted(18631, str::stream() << "listIndexes failed: " << res);
+    uassertStatusOK(status.withContext(str::stream() << "listIndexes failed: " << res));
+    MONGO_UNREACHABLE;
 }
 
 

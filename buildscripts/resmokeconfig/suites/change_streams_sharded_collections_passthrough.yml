@@ -3,9 +3,6 @@ test_kind: js_test
 selector:
   roots:
   - jstests/change_streams/**/*.js
-  exclude_files:
-  # Exercises an internal detail of mongos<->mongod communication. Not expected to work on mongos.
-  - jstests/change_streams/report_latest_observed_oplog_timestamp.js
   exclude_with_any_tags:
   ##
   # The next tags correspond to the special errors thrown by the
@@ -54,7 +51,6 @@ executor:
         enableTestCommands: 1
         writePeriodicNoops: 1
         periodicNoopIntervalSecs: 1
-    num_rs_nodes_per_shard: 1
     num_shards: 2
     enable_sharding:
     - test

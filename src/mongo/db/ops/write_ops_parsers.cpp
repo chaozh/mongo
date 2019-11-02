@@ -33,16 +33,17 @@
 
 #include "mongo/db/dbmessage.h"
 #include "mongo/db/ops/write_ops.h"
+#include "mongo/db/pipeline/aggregation_request.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
+using write_ops::Delete;
+using write_ops::DeleteOpEntry;
 using write_ops::Insert;
 using write_ops::Update;
-using write_ops::Delete;
 using write_ops::UpdateOpEntry;
-using write_ops::DeleteOpEntry;
 
 namespace {
 
@@ -50,10 +51,7 @@ template <class T>
 void checkOpCountForCommand(const T& op, size_t numOps) {
     uassert(ErrorCodes::InvalidLength,
             str::stream() << "Write batch sizes must be between 1 and "
-                          << write_ops::kMaxWriteBatchSize
-                          << ". Got "
-                          << numOps
-                          << " operations.",
+                          << write_ops::kMaxWriteBatchSize << ". Got " << numOps << " operations.",
             numOps != 0 && numOps <= write_ops::kMaxWriteBatchSize);
 
     const auto& stmtIds = op.getWriteCommandBase().getStmtIds();
@@ -166,7 +164,8 @@ write_ops::Update UpdateOp::parseLegacy(const Message& msgRaw) {
         singleUpdate.setUpsert(flags & UpdateOption_Upsert);
         singleUpdate.setMulti(flags & UpdateOption_Multi);
         singleUpdate.setQ(msg.nextJsObj());
-        singleUpdate.setU(msg.nextJsObj());
+        singleUpdate.setU(
+            write_ops::UpdateModification::parseLegacyOpUpdateFromBSON(msg.nextJsObj()));
 
         return updates;
     }());
@@ -207,6 +206,54 @@ write_ops::Delete DeleteOp::parseLegacy(const Message& msgRaw) {
     }());
 
     return op;
+}
+
+write_ops::UpdateModification::UpdateModification(BSONElement update) {
+    const auto type = update.type();
+    if (type == BSONType::Object) {
+        _classicUpdate = update.Obj();
+        _type = Type::kClassic;
+        return;
+    }
+
+    uassert(ErrorCodes::FailedToParse,
+            "Update argument must be either an object or an array",
+            type == BSONType::Array);
+
+    _type = Type::kPipeline;
+
+    _pipeline = uassertStatusOK(AggregationRequest::parsePipelineFromBSON(update));
+}
+
+write_ops::UpdateModification::UpdateModification(const BSONObj& update) {
+    _classicUpdate = update;
+    _type = Type::kClassic;
+}
+
+write_ops::UpdateModification::UpdateModification(std::vector<BSONObj> pipeline)
+    : _type{Type::kPipeline}, _pipeline{std::move(pipeline)} {}
+
+write_ops::UpdateModification write_ops::UpdateModification::parseFromBSON(BSONElement elem) {
+    return UpdateModification(elem);
+}
+
+write_ops::UpdateModification write_ops::UpdateModification::parseLegacyOpUpdateFromBSON(
+    const BSONObj& obj) {
+    return UpdateModification(obj);
+}
+
+void write_ops::UpdateModification::serializeToBSON(StringData fieldName,
+                                                    BSONObjBuilder* bob) const {
+    if (_type == Type::kClassic) {
+        *bob << fieldName << *_classicUpdate;
+        return;
+    }
+
+    BSONArrayBuilder arrayBuilder(bob->subarrayStart(fieldName));
+    for (auto&& stage : *_pipeline) {
+        arrayBuilder << stage;
+    }
+    arrayBuilder.doneFast();
 }
 
 }  // namespace mongo

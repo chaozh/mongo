@@ -56,17 +56,18 @@ public:
      */
     static FieldRef extractMultikeyPathFromIndexKey(const IndexKeyEntry& entry);
 
-    WildcardAccessMethod(IndexCatalogEntry* wildcardState, SortedDataInterface* btree);
+    WildcardAccessMethod(IndexCatalogEntry* wildcardState,
+                         std::unique_ptr<SortedDataInterface> btree);
 
     /**
      * Returns 'true' if the index should become multikey on the basis of the passed arguments.
      * Because it is possible for a $** index to generate multiple keys per document without any of
      * them lying along a multikey (i.e. array) path, this method will only return 'true' if one or
      * more multikey metadata keys have been generated; that is, if the 'multikeyMetadataKeys'
-     * BSONObjSet is non-empty.
+     * vector is non-empty.
      */
-    bool shouldMarkIndexAsMultikey(const BSONObjSet& keys,
-                                   const BSONObjSet& multikeyMetadataKeys,
+    bool shouldMarkIndexAsMultikey(size_t numberOfKeys,
+                                   const std::vector<KeyString::Value>& multikeyMetadataKeys,
                                    const MultikeyPaths& multikeyPaths) const final;
 
     /**
@@ -93,9 +94,10 @@ public:
 
 private:
     void doGetKeys(const BSONObj& obj,
-                   BSONObjSet* keys,
-                   BSONObjSet* multikeyMetadataKeys,
-                   MultikeyPaths* multikeyPaths) const final;
+                   KeyStringSet* keys,
+                   KeyStringSet* multikeyMetadataKeys,
+                   MultikeyPaths* multikeyPaths,
+                   boost::optional<RecordId> id) const final;
 
     std::set<FieldRef> _getMultikeyPathSet(OperationContext* opCtx,
                                            const IndexBounds& indexBounds,

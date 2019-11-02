@@ -88,17 +88,14 @@ TEST_F(ReplCoordHBV1Test,
     logger::globalLogDomain()->setMinimumLoggedSeverity(logger::LogSeverity::Debug(3));
     ReplSetConfig rsConfig = assertMakeRSConfig(BSON("_id"
                                                      << "mySet"
-                                                     << "version"
-                                                     << 3
-                                                     << "members"
+                                                     << "version" << 3 << "members"
                                                      << BSON_ARRAY(BSON("_id" << 1 << "host"
                                                                               << "h1:1")
                                                                    << BSON("_id" << 2 << "host"
                                                                                  << "h2:1")
                                                                    << BSON("_id" << 3 << "host"
                                                                                  << "h3:1"))
-                                                     << "protocolVersion"
-                                                     << 1));
+                                                     << "protocolVersion" << 1));
     init("mySet");
     addSelf(HostAndPort("h2", 1));
     const Date_t startDate = getNet()->now();
@@ -126,8 +123,8 @@ TEST_F(ReplCoordHBV1Test,
     hbResp.setConfig(rsConfig);
     // The smallest valid optime in PV1.
     OpTime opTime(Timestamp(), 0);
-    hbResp.setAppliedOpTime(opTime);
-    hbResp.setDurableOpTime(opTime);
+    hbResp.setAppliedOpTimeAndWallTime({opTime, Date_t()});
+    hbResp.setDurableOpTimeAndWallTime({opTime, Date_t()});
     BSONObjBuilder responseBuilder;
     responseBuilder << "ok" << 1;
     hbResp.addToBSON(&responseBuilder);
@@ -158,21 +155,18 @@ TEST_F(ReplCoordHBV1Test,
 TEST_F(ReplCoordHBV1Test,
        ArbiterJoinsExistingReplSetWhenReceivingAConfigContainingTheArbiterViaHeartbeat) {
     logger::globalLogDomain()->setMinimumLoggedSeverity(logger::LogSeverity::Debug(3));
-    ReplSetConfig rsConfig = assertMakeRSConfig(BSON("_id"
-                                                     << "mySet"
-                                                     << "version"
-                                                     << 3
-                                                     << "members"
-                                                     << BSON_ARRAY(BSON("_id" << 1 << "host"
-                                                                              << "h1:1")
-                                                                   << BSON("_id" << 2 << "host"
-                                                                                 << "h2:1"
-                                                                                 << "arbiterOnly"
-                                                                                 << true)
-                                                                   << BSON("_id" << 3 << "host"
-                                                                                 << "h3:1"))
-                                                     << "protocolVersion"
-                                                     << 1));
+    ReplSetConfig rsConfig =
+        assertMakeRSConfig(BSON("_id"
+                                << "mySet"
+                                << "version" << 3 << "members"
+                                << BSON_ARRAY(BSON("_id" << 1 << "host"
+                                                         << "h1:1")
+                                              << BSON("_id" << 2 << "host"
+                                                            << "h2:1"
+                                                            << "arbiterOnly" << true)
+                                              << BSON("_id" << 3 << "host"
+                                                            << "h3:1"))
+                                << "protocolVersion" << 1));
     init("mySet");
     addSelf(HostAndPort("h2", 1));
     const Date_t startDate = getNet()->now();
@@ -200,8 +194,8 @@ TEST_F(ReplCoordHBV1Test,
     hbResp.setConfig(rsConfig);
     // The smallest valid optime in PV1.
     OpTime opTime(Timestamp(), 0);
-    hbResp.setAppliedOpTime(opTime);
-    hbResp.setDurableOpTime(opTime);
+    hbResp.setAppliedOpTimeAndWallTime({opTime, Date_t()});
+    hbResp.setDurableOpTimeAndWallTime({opTime, Date_t()});
     BSONObjBuilder responseBuilder;
     responseBuilder << "ok" << 1;
     hbResp.addToBSON(&responseBuilder);
@@ -236,17 +230,14 @@ TEST_F(ReplCoordHBV1Test,
     logger::globalLogDomain()->setMinimumLoggedSeverity(logger::LogSeverity::Debug(3));
     ReplSetConfig rsConfig = assertMakeRSConfig(BSON("_id"
                                                      << "mySet"
-                                                     << "version"
-                                                     << 3
-                                                     << "members"
+                                                     << "version" << 3 << "members"
                                                      << BSON_ARRAY(BSON("_id" << 1 << "host"
                                                                               << "h1:1")
                                                                    << BSON("_id" << 2 << "host"
                                                                                  << "h2:1")
                                                                    << BSON("_id" << 3 << "host"
                                                                                  << "h3:1"))
-                                                     << "protocolVersion"
-                                                     << 1));
+                                                     << "protocolVersion" << 1));
     init("mySet");
     addSelf(HostAndPort("h4", 1));
     const Date_t startDate = getNet()->now();
@@ -274,8 +265,8 @@ TEST_F(ReplCoordHBV1Test,
     hbResp.setConfig(rsConfig);
     // The smallest valid optime in PV1.
     OpTime opTime(Timestamp(), 0);
-    hbResp.setAppliedOpTime(opTime);
-    hbResp.setDurableOpTime(opTime);
+    hbResp.setAppliedOpTimeAndWallTime({opTime, Date_t()});
+    hbResp.setDurableOpTimeAndWallTime({opTime, Date_t()});
     BSONObjBuilder responseBuilder;
     responseBuilder << "ok" << 1;
     hbResp.addToBSON(&responseBuilder);
@@ -321,9 +312,7 @@ TEST_F(ReplCoordHBV1Test,
     logger::globalLogDomain()->setMinimumLoggedSeverity(logger::LogSeverity::Debug(3));
     assertStartSuccess(BSON("_id"
                             << "mySet"
-                            << "version"
-                            << 1
-                            << "members"
+                            << "version" << 1 << "members"
                             << BSON_ARRAY(BSON("_id" << 1 << "host"
                                                      << "node1:12345")
                                           << BSON("_id" << 2 << "host"
@@ -336,12 +325,12 @@ TEST_F(ReplCoordHBV1Test,
     const NetworkInterfaceMock::NetworkOperationIterator noi = getNet()->getNextReadyRequest();
     const RemoteCommandRequest& request = noi->getRequest();
     log() << request.target.toString() << " processing " << request.cmdObj;
-    getNet()->scheduleResponse(noi,
-                               getNet()->now(),
-                               makeResponseStatus(BSON("ok" << 0.0 << "errmsg"
-                                                            << "unauth'd"
-                                                            << "code"
-                                                            << ErrorCodes::Unauthorized)));
+    getNet()->scheduleResponse(
+        noi,
+        getNet()->now(),
+        makeResponseStatus(BSON("ok" << 0.0 << "errmsg"
+                                     << "unauth'd"
+                                     << "code" << ErrorCodes::Unauthorized)));
 
     if (request.target != HostAndPort("node2", 12345) &&
         request.cmdObj.firstElement().fieldNameStringData() != "replSetHeartbeat") {
@@ -362,15 +351,11 @@ TEST_F(ReplCoordHBV1Test, IgnoreTheContentsOfMetadataWhenItsReplicaSetIdDoesNotM
     HostAndPort host2("node2:12345");
     assertStartSuccess(BSON("_id"
                             << "mySet"
-                            << "version"
-                            << 1
-                            << "members"
+                            << "version" << 1 << "members"
                             << BSON_ARRAY(BSON("_id" << 1 << "host"
                                                      << "node1:12345")
                                           << BSON("_id" << 2 << "host" << host2.toString()))
-                            << "settings"
-                            << BSON("replicaSetId" << OID::gen())
-                            << "protocolVersion"
+                            << "settings" << BSON("replicaSetId" << OID::gen()) << "protocolVersion"
                             << 1),
                        HostAndPort("node1", 12345));
     ASSERT_OK(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
@@ -386,15 +371,20 @@ TEST_F(ReplCoordHBV1Test, IgnoreTheContentsOfMetadataWhenItsReplicaSetIdDoesNotM
         hbResp.setSetName(rsConfig.getReplSetName());
         hbResp.setState(MemberState::RS_PRIMARY);
         hbResp.setConfigVersion(rsConfig.getConfigVersion());
-        hbResp.setAppliedOpTime(opTime);
-        hbResp.setDurableOpTime(opTime);
+        hbResp.setAppliedOpTimeAndWallTime({opTime, Date_t()});
+        hbResp.setDurableOpTimeAndWallTime({opTime, Date_t()});
 
         BSONObjBuilder responseBuilder;
         responseBuilder << "ok" << 1;
         hbResp.addToBSON(&responseBuilder);
 
-        rpc::ReplSetMetadata metadata(
-            opTime.getTerm(), opTime, opTime, rsConfig.getConfigVersion(), unexpectedId, 1, -1);
+        rpc::ReplSetMetadata metadata(opTime.getTerm(),
+                                      {opTime, Date_t()},
+                                      opTime,
+                                      rsConfig.getConfigVersion(),
+                                      unexpectedId,
+                                      1,
+                                      -1);
         uassertStatusOK(metadata.writeToMetadata(&responseBuilder));
 
         heartbeatResponse = makeResponseStatus(responseBuilder.obj());
@@ -437,10 +427,163 @@ TEST_F(ReplCoordHBV1Test, IgnoreTheContentsOfMetadataWhenItsReplicaSetIdDoesNotM
     ASSERT_EQ(MemberState(MemberState::RS_DOWN).toString(),
               MemberState(member["state"].numberInt()).toString());
     ASSERT_EQ(member["lastHeartbeatMessage"].String(),
-              std::string(str::stream() << "replica set IDs do not match, ours: "
-                                        << rsConfig.getReplicaSetId()
-                                        << "; remote node's: "
-                                        << unexpectedId));
+              std::string(str::stream()
+                          << "replica set IDs do not match, ours: " << rsConfig.getReplicaSetId()
+                          << "; remote node's: " << unexpectedId));
+}
+
+TEST_F(ReplCoordHBV1Test,
+       LastCommittedOpTimeOnlyUpdatesFromHeartbeatWhenLastAppliedHasTheSameTerm) {
+    // Ensure that the metadata is processed if it is contained in a heartbeat response.
+    assertStartSuccess(BSON("_id"
+                            << "mySet"
+                            << "version" << 2 << "members"
+                            << BSON_ARRAY(BSON("host"
+                                               << "node1:12345"
+                                               << "_id" << 0)
+                                          << BSON("host"
+                                                  << "node2:12345"
+                                                  << "_id" << 1))
+                            << "protocolVersion" << 1),
+                       HostAndPort("node1", 12345));
+    ASSERT_OK(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
+    ASSERT_EQUALS(OpTime(), getReplCoord()->getLastCommittedOpTime());
+
+    auto config = getReplCoord()->getConfig();
+
+    auto opTime1 = OpTime({10, 1}, 1);
+    auto opTime2 = OpTime({11, 1}, 2);  // In higher term.
+    auto commitPoint = OpTime({15, 1}, 2);
+    replCoordSetMyLastAppliedOpTime(opTime1, Date_t() + Seconds(100));
+
+    // Node 1 is the current primary. The commit point has a higher term than lastApplied.
+    rpc::ReplSetMetadata metadata(
+        2,                                                         // term
+        {commitPoint, Date_t() + Seconds(commitPoint.getSecs())},  // committed OpTime
+        commitPoint,                                               // visibleOpTime
+        config.getConfigVersion(),
+        {},  // replset id
+        1,   // currentPrimaryIndex,
+        1);  // currentSyncSourceIndex
+
+    auto net = getNet();
+    BSONObjBuilder responseBuilder;
+    ASSERT_OK(metadata.writeToMetadata(&responseBuilder));
+
+    ReplSetHeartbeatResponse hbResp;
+    hbResp.setConfigVersion(config.getConfigVersion());
+    hbResp.setSetName(config.getReplSetName());
+    hbResp.setState(MemberState::RS_PRIMARY);
+    responseBuilder.appendElements(hbResp.toBSON());
+    auto hbRespObj = responseBuilder.obj();
+    {
+        net->enterNetwork();
+        ASSERT_TRUE(net->hasReadyRequests());
+        auto noi = net->getNextReadyRequest();
+        auto& request = noi->getRequest();
+        ASSERT_EQUALS(config.getMemberAt(1).getHostAndPort(), request.target);
+        ASSERT_EQUALS("replSetHeartbeat", request.cmdObj.firstElement().fieldNameStringData());
+
+        net->scheduleResponse(noi, net->now(), makeResponseStatus(hbRespObj));
+        net->runReadyNetworkOperations();
+        net->exitNetwork();
+
+        ASSERT_EQUALS(OpTime(), getReplCoord()->getLastCommittedOpTime());
+        ASSERT_EQUALS(2, getReplCoord()->getTerm());
+    }
+
+    // Update lastApplied, so commit point can be advanced.
+    replCoordSetMyLastAppliedOpTime(opTime2, Date_t() + Seconds(100));
+    {
+        net->enterNetwork();
+        net->runUntil(net->now() + config.getHeartbeatInterval());
+        auto noi = net->getNextReadyRequest();
+        auto& request = noi->getRequest();
+        ASSERT_EQUALS("replSetHeartbeat", request.cmdObj.firstElement().fieldNameStringData());
+
+        net->scheduleResponse(noi, net->now(), makeResponseStatus(hbRespObj));
+        net->runReadyNetworkOperations();
+        net->exitNetwork();
+
+        ASSERT_EQUALS(commitPoint, getReplCoord()->getLastCommittedOpTime());
+    }
+}
+
+TEST_F(ReplCoordHBV1Test, LastCommittedOpTimeOnlyUpdatesFromHeartbeatIfNotInStartup) {
+    // Ensure that the metadata is not processed if it is contained in a heartbeat response,
+    // if we are in STARTUP2.
+    assertStartSuccess(BSON("_id"
+                            << "mySet"
+                            << "version" << 2 << "members"
+                            << BSON_ARRAY(BSON("host"
+                                               << "node1:12345"
+                                               << "_id" << 0)
+                                          << BSON("host"
+                                                  << "node2:12345"
+                                                  << "_id" << 1))
+                            << "protocolVersion" << 1),
+                       HostAndPort("node1", 12345));
+    ASSERT_EQUALS(OpTime(), getReplCoord()->getLastCommittedOpTime());
+
+    auto config = getReplCoord()->getConfig();
+
+    auto lastAppliedOpTime = OpTime({11, 1}, 2);
+    auto commitPoint = OpTime({15, 1}, 2);
+    replCoordSetMyLastAppliedOpTime(lastAppliedOpTime, Date_t() + Seconds(100));
+
+    // Node 1 is the current primary.
+    rpc::ReplSetMetadata metadata(
+        2,                                                         // term
+        {commitPoint, Date_t() + Seconds(commitPoint.getSecs())},  // committed OpTime
+        commitPoint,                                               // visibleOpTime
+        config.getConfigVersion(),
+        {},  // replset id
+        1,   // currentPrimaryIndex,
+        1);  // currentSyncSourceIndex
+
+    auto net = getNet();
+    BSONObjBuilder responseBuilder;
+    ASSERT_OK(metadata.writeToMetadata(&responseBuilder));
+
+    ReplSetHeartbeatResponse hbResp;
+    hbResp.setConfigVersion(config.getConfigVersion());
+    hbResp.setSetName(config.getReplSetName());
+    hbResp.setState(MemberState::RS_PRIMARY);
+    responseBuilder.appendElements(hbResp.toBSON());
+    auto hbRespObj = responseBuilder.obj();
+    // Last committed optime should not advance in STARTUP2.
+    ASSERT_EQ(getReplCoord()->getMemberState(), MemberState::RS_STARTUP2);
+    {
+        net->enterNetwork();
+        ASSERT_TRUE(net->hasReadyRequests());
+        auto noi = net->getNextReadyRequest();
+        auto& request = noi->getRequest();
+        ASSERT_EQUALS(config.getMemberAt(1).getHostAndPort(), request.target);
+        ASSERT_EQUALS("replSetHeartbeat", request.cmdObj.firstElement().fieldNameStringData());
+
+        net->scheduleResponse(noi, net->now(), makeResponseStatus(hbRespObj));
+        net->runReadyNetworkOperations();
+        net->exitNetwork();
+
+        ASSERT_EQUALS(OpTime(), getReplCoord()->getLastCommittedOpTime());
+        ASSERT_EQUALS(2, getReplCoord()->getTerm());
+    }
+
+    // Set follower mode to SECONDARY so commit point can be advanced through heartbeats.
+    ASSERT_OK(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
+    {
+        net->enterNetwork();
+        net->runUntil(net->now() + config.getHeartbeatInterval());
+        auto noi = net->getNextReadyRequest();
+        auto& request = noi->getRequest();
+        ASSERT_EQUALS("replSetHeartbeat", request.cmdObj.firstElement().fieldNameStringData());
+
+        net->scheduleResponse(noi, net->now(), makeResponseStatus(hbRespObj));
+        net->runReadyNetworkOperations();
+        net->exitNetwork();
+
+        ASSERT_EQUALS(commitPoint, getReplCoord()->getLastCommittedOpTime());
+    }
 }
 
 }  // namespace

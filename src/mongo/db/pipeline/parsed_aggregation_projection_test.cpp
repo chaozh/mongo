@@ -36,16 +36,15 @@
 #include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/bson/json.h"
-#include "mongo/db/pipeline/document.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/pipeline/expression_context_for_test.h"
-#include "mongo/db/pipeline/value.h"
+#include "mongo/db/pipeline/parsed_inclusion_projection.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
 namespace parsed_aggregation_projection {
 namespace {
-
-using ProjectionPolicies = ParsedAggregationProjection::ProjectionPolicies;
 
 template <typename T>
 BSONObj wrapInLiteral(const T& arg) {
@@ -55,16 +54,17 @@ BSONObj wrapInLiteral(const T& arg) {
 // Helper to simplify the creation of a ParsedAggregationProjection with default policies.
 std::unique_ptr<ParsedAggregationProjection> makeProjectionWithDefaultPolicies(BSONObj spec) {
     const boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    ParsedAggregationProjection::ProjectionPolicies defaultPolicies;
+    ProjectionPolicies defaultPolicies;
     return ParsedAggregationProjection::create(expCtx, spec, defaultPolicies);
 }
 
 // Helper to simplify the creation of a ParsedAggregationProjection which bans computed fields.
 std::unique_ptr<ParsedAggregationProjection> makeProjectionWithBannedComputedFields(BSONObj spec) {
     const boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    ParsedAggregationProjection::ProjectionPolicies banComputedFields;
-    banComputedFields.computedFieldsPolicy =
-        ProjectionPolicies::ComputedFieldsPolicy::kBanComputedFields;
+    ProjectionPolicies banComputedFields{
+        ProjectionPolicies::kDefaultIdPolicyDefault,
+        ProjectionPolicies::kArrayRecursionPolicyDefault,
+        ProjectionPolicies::ComputedFieldsPolicy::kBanComputedFields};
     return ParsedAggregationProjection::create(expCtx, spec, banComputedFields);
 }
 
@@ -148,15 +148,13 @@ TEST(ParsedAggregationProjectionErrors, ShouldRejectPathConflictsWithNonAlphaNum
 
     // Then assert that we throw when we introduce a prefixed field.
     ASSERT_THROWS(
-        makeProjectionWithDefaultPolicies(
-            BSON("a.b-c" << true << "a.b" << true << "a.b?c" << true << "a.b c" << true << "a.b.d"
-                         << true)),
+        makeProjectionWithDefaultPolicies(BSON("a.b-c" << true << "a.b" << true << "a.b?c" << true
+                                                       << "a.b c" << true << "a.b.d" << true)),
         AssertionException);
-    ASSERT_THROWS(
-        makeProjectionWithDefaultPolicies(BSON(
-            "a.b.d" << false << "a.b c" << false << "a.b?c" << false << "a.b" << false << "a.b-c"
-                    << false)),
-        AssertionException);
+    ASSERT_THROWS(makeProjectionWithDefaultPolicies(BSON("a.b.d" << false << "a.b c" << false
+                                                                 << "a.b?c" << false << "a.b"
+                                                                 << false << "a.b-c" << false)),
+                  AssertionException);
 
     // Adding the same field twice.
     ASSERT_THROWS(makeProjectionWithDefaultPolicies(
@@ -167,34 +165,24 @@ TEST(ParsedAggregationProjectionErrors, ShouldRejectPathConflictsWithNonAlphaNum
                   AssertionException);
 
     // Mix of include/exclude and adding a shared prefix.
-    ASSERT_THROWS(
-        makeProjectionWithDefaultPolicies(
-            BSON("a.b-c" << true << "a.b" << wrapInLiteral(1) << "a.b?c" << true << "a.b c" << true
-                         << "a.b.d"
-                         << true)),
-        AssertionException);
+    ASSERT_THROWS(makeProjectionWithDefaultPolicies(
+                      BSON("a.b-c" << true << "a.b" << wrapInLiteral(1) << "a.b?c" << true
+                                   << "a.b c" << true << "a.b.d" << true)),
+                  AssertionException);
     ASSERT_THROWS(makeProjectionWithDefaultPolicies(
                       BSON("a.b.d" << false << "a.b c" << false << "a.b?c" << false << "a.b"
-                                   << wrapInLiteral(0)
-                                   << "a.b-c"
-                                   << false)),
+                                   << wrapInLiteral(0) << "a.b-c" << false)),
                   AssertionException);
 
     // Adding a shared prefix twice.
     ASSERT_THROWS(makeProjectionWithDefaultPolicies(
                       BSON("a.b-c" << wrapInLiteral(1) << "a.b" << wrapInLiteral(1) << "a.b?c"
-                                   << wrapInLiteral(1)
-                                   << "a.b c"
-                                   << wrapInLiteral(1)
-                                   << "a.b.d"
+                                   << wrapInLiteral(1) << "a.b c" << wrapInLiteral(1) << "a.b.d"
                                    << wrapInLiteral(0))),
                   AssertionException);
     ASSERT_THROWS(makeProjectionWithDefaultPolicies(
                       BSON("a.b.d" << wrapInLiteral(1) << "a.b c" << wrapInLiteral(1) << "a.b?c"
-                                   << wrapInLiteral(1)
-                                   << "a.b"
-                                   << wrapInLiteral(0)
-                                   << "a.b-c"
+                                   << wrapInLiteral(1) << "a.b" << wrapInLiteral(0) << "a.b-c"
                                    << wrapInLiteral(1))),
                   AssertionException);
 }
@@ -571,6 +559,42 @@ TEST(ParsedAggregationProjectionType, ShouldCoerceNumericsToBools) {
         ASSERT(parsedProject->getType() ==
                TransformerInterface::TransformerType::kInclusionProjection);
     }
+}
+
+TEST(ParsedAggregationProjectionType, GetExpressionForPathGetsTopLevelExpression) {
+    const boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    auto projectObj = BSON("$add" << BSON_ARRAY(BSON("$const" << 1) << BSON("$const" << 3)));
+    auto expr = Expression::parseObject(expCtx, projectObj, expCtx->variablesParseState);
+    ProjectionPolicies defaultPolicies;
+    auto node = InclusionNode(defaultPolicies);
+    node.addExpressionForPath(FieldPath("key"), expr);
+    BSONObjBuilder bob;
+    ASSERT_EQ(expr, node.getExpressionForPath(FieldPath("key")));
+}
+
+TEST(ParsedAggregationProjectionType, GetExpressionForPathGetsCorrectTopLevelExpression) {
+    const boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    auto correctObj = BSON("$add" << BSON_ARRAY(BSON("$const" << 1) << BSON("$const" << 3)));
+    auto incorrectObj = BSON("$add" << BSON_ARRAY(BSON("$const" << 2) << BSON("$const" << 4)));
+    auto correctExpr = Expression::parseObject(expCtx, correctObj, expCtx->variablesParseState);
+    auto incorrectExpr = Expression::parseObject(expCtx, incorrectObj, expCtx->variablesParseState);
+    ProjectionPolicies defaultPolicies;
+    auto node = InclusionNode(defaultPolicies);
+    node.addExpressionForPath(FieldPath("key"), correctExpr);
+    node.addExpressionForPath(FieldPath("other"), incorrectExpr);
+    BSONObjBuilder bob;
+    ASSERT_EQ(correctExpr, node.getExpressionForPath(FieldPath("key")));
+}
+
+TEST(ParsedAggregationProjectionType, GetExpressionForPathGetsNonTopLevelExpression) {
+    const boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    auto projectObj = BSON("$add" << BSON_ARRAY(BSON("$const" << 1) << BSON("$const" << 3)));
+    auto expr = Expression::parseObject(expCtx, projectObj, expCtx->variablesParseState);
+    ProjectionPolicies defaultPolicies;
+    auto node = InclusionNode(defaultPolicies);
+    node.addExpressionForPath(FieldPath("key.second"), expr);
+    BSONObjBuilder bob;
+    ASSERT_EQ(expr, node.getExpressionForPath(FieldPath("key.second")));
 }
 
 }  // namespace

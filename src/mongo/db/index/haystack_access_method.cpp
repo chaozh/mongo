@@ -53,8 +53,8 @@ using std::unique_ptr;
 namespace dps = ::mongo::dotted_path_support;
 
 HaystackAccessMethod::HaystackAccessMethod(IndexCatalogEntry* btreeState,
-                                           SortedDataInterface* btree)
-    : AbstractIndexAccessMethod(btreeState, btree) {
+                                           std::unique_ptr<SortedDataInterface> btree)
+    : AbstractIndexAccessMethod(btreeState, std::move(btree)) {
     const IndexDescriptor* descriptor = btreeState->descriptor();
 
     ExpressionParams::parseHaystackParams(
@@ -65,10 +65,18 @@ HaystackAccessMethod::HaystackAccessMethod(IndexCatalogEntry* btreeState,
 }
 
 void HaystackAccessMethod::doGetKeys(const BSONObj& obj,
-                                     BSONObjSet* keys,
-                                     BSONObjSet* multikeyMetadataKeys,
-                                     MultikeyPaths* multikeyPaths) const {
-    ExpressionKeysPrivate::getHaystackKeys(obj, _geoField, _otherFields, _bucketSize, keys);
+                                     KeyStringSet* keys,
+                                     KeyStringSet* multikeyMetadataKeys,
+                                     MultikeyPaths* multikeyPaths,
+                                     boost::optional<RecordId> id) const {
+    ExpressionKeysPrivate::getHaystackKeys(obj,
+                                           _geoField,
+                                           _otherFields,
+                                           _bucketSize,
+                                           keys,
+                                           getSortedDataInterface()->getKeyStringVersion(),
+                                           getSortedDataInterface()->getOrdering(),
+                                           id);
 }
 
 void HaystackAccessMethod::searchCommand(OperationContext* opCtx,

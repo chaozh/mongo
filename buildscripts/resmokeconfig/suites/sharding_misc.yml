@@ -13,7 +13,6 @@ selector:
   - jstests/sharding/mongos_rs_shard_failure_tolerance.js
   - jstests/sharding/top_chunk_autosplit.js
   - jstests/sharding/mongos_rs_auth_shard_failure_tolerance.js
-  - jstests/sharding/zbigMapReduce.js
   - jstests/sharding/remove2.js
   - jstests/sharding/move_chunk_find_and_modify_with_write_retryability.js
   - jstests/sharding/batch_write_command_sharded.js
@@ -66,7 +65,7 @@ selector:
   - jstests/sharding/addshard4.js
   - jstests/sharding/split_with_force.js
   - jstests/sharding/auto_rebalance_parallel_replica_sets.js
-  - jstests/sharding/database_and_shard_versioning_all_commands.js
+  - jstests/sharding/database_versioning_all_commands.js
   - jstests/sharding/find_and_modify_after_multi_write.js
   - jstests/sharding/query_after_multi_write.js
   - jstests/sharding/safe_secondary_reads_single_migration_suspend_range_deletion.js
@@ -89,13 +88,11 @@ selector:
   - jstests/sharding/autosplit_with_balancer.js
   - jstests/sharding/migrateBig_balancer.js
   - jstests/sharding/lagged_config_secondary.js
-  - jstests/sharding/mapReduce_inSharded.js
   - jstests/sharding/auto_rebalance_parallel.js
   - jstests/sharding/index1.js
   - jstests/sharding/shard_aware_primary_failover.js
   - jstests/sharding/shards_and_config_return_last_committed_optime.js
   - jstests/sharding/migrateBig.js
-  - jstests/sharding/mapReduce_inSharded_outSharded.js
   - jstests/sharding/change_stream_chunk_migration.js
   - jstests/sharding/large_chunk.js
   - jstests/sharding/auth_slaveok_routing.js
@@ -120,7 +117,6 @@ selector:
   - jstests/sharding/max_time_ms_sharded.js
   - jstests/sharding/change_stream_read_preference.js
   - jstests/sharding/features1.js
-  - jstests/sharding/mapReduce_nonSharded.js
   - jstests/sharding/read_committed_lookup.js
   - jstests/sharding/zero_shard_version.js
   - jstests/sharding/migration_move_chunk_after_receive.js
@@ -138,7 +134,6 @@ selector:
   - jstests/sharding/view_rewrite.js
   - jstests/sharding/lookup_change_stream_post_image_hashed_shard_key.js
   - jstests/sharding/coll_epoch_test1.js
-  - jstests/sharding/mapReduce_outSharded.js
   - jstests/sharding/hash_shard_num_chunks.js
   - jstests/sharding/basic_sharding_params.js
   - jstests/sharding/migration_ignore_interrupts_3.js
@@ -256,7 +251,6 @@ selector:
   - jstests/sharding/autosplit.js
   - jstests/sharding/limit_push.js
   - jstests/sharding/shard_keycount.js
-  - jstests/sharding/shard_key_immutable.js
   - jstests/sharding/sharding_system_namespaces.js
   - jstests/sharding/logical_time_metadata.js
   - jstests/sharding/time_zone_info_mongos.js
@@ -290,7 +284,6 @@ selector:
   - jstests/sharding/authConnectionHook.js
   - jstests/sharding/update_immutable_fields.js
   - jstests/sharding/min_optime_recovery_on_failed_move_chunk_commit.js
-  - jstests/sharding/SERVER-7379.js
   - jstests/sharding/create_database.js
   - jstests/sharding/shard_aware_on_add_shard.js
   - jstests/sharding/killop.js
@@ -315,7 +308,6 @@ selector:
   - jstests/sharding/keys_rotation_interval_sec.js
   - jstests/sharding/major_version_check.js
   - jstests/sharding/sharded_profile.js
-  - jstests/sharding/missing_key.js
   - jstests/sharding/replication_with_undefined_shard_key.js
   - jstests/sharding/hash_single_shard.js
   - jstests/sharding/version2.js
@@ -326,7 +318,6 @@ selector:
   - jstests/sharding/version1.js
   - jstests/sharding/disable_autosplit.js
   - jstests/sharding/allow_partial_results.js
-  - jstests/sharding/map_reduce_validation.js
   - jstests/sharding/query_sharded.js
   - jstests/sharding/server_status.js
   - jstests/sharding/ssv_config_check.js

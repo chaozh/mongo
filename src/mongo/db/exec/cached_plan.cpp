@@ -33,11 +33,14 @@
 
 #include "mongo/db/exec/cached_plan.h"
 
+#include <memory>
+
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/exec/multi_plan.h"
 #include "mongo/db/exec/scoped_timer.h"
 #include "mongo/db/exec/working_set_common.h"
+#include "mongo/db/query/collection_query_info.h"
 #include "mongo/db/query/explain.h"
 #include "mongo/db/query/plan_cache.h"
 #include "mongo/db/query/plan_ranker.h"
@@ -45,9 +48,8 @@
 #include "mongo/db/query/query_knobs_gen.h"
 #include "mongo/db/query/query_planner.h"
 #include "mongo/db/query/stage_builder.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 #include "mongo/util/transitional_tools_do_not_use/vector_spooling.h"
 
 namespace mongo {
@@ -61,13 +63,13 @@ CachedPlanStage::CachedPlanStage(OperationContext* opCtx,
                                  CanonicalQuery* cq,
                                  const QueryPlannerParams& params,
                                  size_t decisionWorks,
-                                 PlanStage* root)
+                                 std::unique_ptr<PlanStage> root)
     : RequiresAllIndicesStage(kStageType, opCtx, collection),
       _ws(ws),
       _canonicalQuery(cq),
       _plannerParams(params),
       _decisionWorks(decisionWorks) {
-    _children.emplace_back(root);
+    _children.emplace_back(std::move(root));
 }
 
 Status CachedPlanStage::pickBestPlan(PlanYieldPolicy* yieldPolicy) {
@@ -137,8 +139,7 @@ Status CachedPlanStage::pickBestPlan(PlanYieldPolicy* yieldPolicy) {
         } else if (PlanStage::FAILURE == state) {
             // On failure, fall back to replanning the whole query. We neither evict the
             // existing cache entry nor cache the result of replanning.
-            BSONObj statusObj;
-            WorkingSetCommon::getStatusMemberObject(*_ws, id, &statusObj);
+            BSONObj statusObj = WorkingSetCommon::getStatusMemberDocument(*_ws, id)->toBson();
 
             LOG(1) << "Execution of cached plan failed, falling back to replan."
                    << " query: " << redact(_canonicalQuery->toStringShort())
@@ -191,17 +192,16 @@ Status CachedPlanStage::replan(PlanYieldPolicy* yieldPolicy, bool shouldCache) {
 
     if (shouldCache) {
         // Deactivate the current cache entry.
-        PlanCache* cache = collection()->infoCache()->getPlanCache();
+        PlanCache* cache = CollectionQueryInfo::get(collection()).getPlanCache();
         cache->deactivate(*_canonicalQuery);
     }
 
     // Use the query planning module to plan the whole query.
     auto statusWithSolutions = QueryPlanner::plan(*_canonicalQuery, _plannerParams);
     if (!statusWithSolutions.isOK()) {
-        return Status(ErrorCodes::BadValue,
-                      str::stream() << "error processing query: " << _canonicalQuery->toString()
-                                    << " planner returned error: "
-                                    << statusWithSolutions.getStatus().reason());
+        return statusWithSolutions.getStatus().withContext(
+            str::stream() << "error processing query: " << _canonicalQuery->toString()
+                          << " planner returned error");
     }
 
     auto solutions = std::move(statusWithSolutions.getValue());
@@ -209,17 +209,16 @@ Status CachedPlanStage::replan(PlanYieldPolicy* yieldPolicy, bool shouldCache) {
     // We cannot figure out how to answer the query.  Perhaps it requires an index
     // we do not have?
     if (0 == solutions.size()) {
-        return Status(ErrorCodes::BadValue,
+        return Status(ErrorCodes::NoQueryExecutionPlans,
                       str::stream() << "error processing query: " << _canonicalQuery->toString()
                                     << " No query solutions");
     }
 
     if (1 == solutions.size()) {
-        PlanStage* newRoot;
         // Only one possible plan. Build the stages from the solution.
-        verify(StageBuilder::build(
-            getOpCtx(), collection(), *_canonicalQuery, *solutions[0], _ws, &newRoot));
-        _children.emplace_back(newRoot);
+        auto newRoot =
+            StageBuilder::build(getOpCtx(), collection(), *_canonicalQuery, *solutions[0], _ws);
+        _children.emplace_back(std::move(newRoot));
         _replannedQs = std::move(solutions.back());
         solutions.pop_back();
 
@@ -244,12 +243,10 @@ Status CachedPlanStage::replan(PlanYieldPolicy* yieldPolicy, bool shouldCache) {
             solutions[ix]->cacheData->indexFilterApplied = _plannerParams.indexFiltersApplied;
         }
 
-        PlanStage* nextPlanRoot;
-        verify(StageBuilder::build(
-            getOpCtx(), collection(), *_canonicalQuery, *solutions[ix], _ws, &nextPlanRoot));
+        auto nextPlanRoot =
+            StageBuilder::build(getOpCtx(), collection(), *_canonicalQuery, *solutions[ix], _ws);
 
-        // Takes ownership of 'nextPlanRoot'.
-        multiPlanStage->addPlan(std::move(solutions[ix]), nextPlanRoot, _ws);
+        multiPlanStage->addPlan(std::move(solutions[ix]), std::move(nextPlanRoot), _ws);
     }
 
     // Delegate to the MultiPlanStage's plan selection facility.
@@ -288,8 +285,8 @@ std::unique_ptr<PlanStageStats> CachedPlanStage::getStats() {
     _commonStats.isEOF = isEOF();
 
     std::unique_ptr<PlanStageStats> ret =
-        stdx::make_unique<PlanStageStats>(_commonStats, STAGE_CACHED_PLAN);
-    ret->specific = stdx::make_unique<CachedPlanStats>(_specificStats);
+        std::make_unique<PlanStageStats>(_commonStats, STAGE_CACHED_PLAN);
+    ret->specific = std::make_unique<CachedPlanStats>(_specificStats);
     ret->children.emplace_back(child()->getStats());
 
     return ret;
@@ -302,7 +299,7 @@ const SpecificStats* CachedPlanStage::getSpecificStats() const {
 void CachedPlanStage::updatePlanCache() {
     const double score = PlanRanker::scoreTree(getStats()->children[0].get());
 
-    PlanCache* cache = collection()->infoCache()->getPlanCache();
+    PlanCache* cache = CollectionQueryInfo::get(collection()).getPlanCache();
     Status fbs = cache->feedback(*_canonicalQuery, score);
     if (!fbs.isOK()) {
         LOG(5) << _canonicalQuery->ns() << ": Failed to update cache with feedback: " << redact(fbs)

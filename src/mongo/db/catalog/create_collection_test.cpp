@@ -29,9 +29,10 @@
 
 #include "mongo/platform/basic.h"
 
-#include "mongo/db/catalog/collection_catalog_entry.h"
+#include <memory>
+
+#include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/catalog/create_collection.h"
-#include "mongo/db/catalog/uuid_catalog.h"
 #include "mongo/db/client.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/jsobj.h"
@@ -39,7 +40,7 @@
 #include "mongo/db/repl/replication_coordinator_mock.h"
 #include "mongo/db/repl/storage_interface_impl.h"
 #include "mongo/db/service_context_d_test_fixture.h"
-#include "mongo/stdx/memory.h"
+#include "mongo/db/storage/durable_catalog.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/uuid.h"
 
@@ -64,11 +65,11 @@ void CreateCollectionTest::setUp() {
     auto service = getServiceContext();
 
     // Set up ReplicationCoordinator and ensure that we are primary.
-    auto replCoord = stdx::make_unique<repl::ReplicationCoordinatorMock>(service);
+    auto replCoord = std::make_unique<repl::ReplicationCoordinatorMock>(service);
     ASSERT_OK(replCoord->setFollowerMode(repl::MemberState::RS_PRIMARY));
     repl::ReplicationCoordinator::set(service, std::move(replCoord));
 
-    _storage = stdx::make_unique<repl::StorageInterfaceImpl>();
+    _storage = std::make_unique<repl::StorageInterfaceImpl>();
 }
 
 void CreateCollectionTest::tearDown() {
@@ -100,8 +101,7 @@ CollectionOptions getCollectionOptions(OperationContext* opCtx, const NamespaceS
     auto collection = autoColl.getCollection();
     ASSERT_TRUE(collection) << "Unable to get collections options for " << nss
                             << " because collection does not exist.";
-    auto catalogEntry = collection->getCatalogEntry();
-    return catalogEntry->getCollectionOptions(opCtx);
+    return DurableCatalog::get(opCtx)->getCollectionOptions(opCtx, nss);
 }
 
 /**
@@ -120,11 +120,9 @@ TEST_F(CreateCollectionTest, CreateCollectionForApplyOpsWithSpecificUuidNoExisti
     ASSERT_FALSE(collectionExists(opCtx.get(), newNss));
 
     auto uuid = UUID::gen();
-    Lock::DBLock lock(opCtx.get(), newNss.db(), MODE_X);
-    ASSERT_OK(createCollectionForApplyOps(opCtx.get(),
-                                          newNss.db().toString(),
-                                          uuid.toBSON()["uuid"],
-                                          BSON("create" << newNss.coll())));
+    Lock::DBLock lock(opCtx.get(), newNss.db(), MODE_IX);
+    ASSERT_OK(createCollectionForApplyOps(
+        opCtx.get(), newNss.db().toString(), uuid, BSON("create" << newNss.coll())));
 
     ASSERT_TRUE(collectionExists(opCtx.get(), newNss));
 }
@@ -136,7 +134,7 @@ TEST_F(CreateCollectionTest,
 
     auto opCtx = makeOpCtx();
     auto uuid = UUID::gen();
-    Lock::DBLock lock(opCtx.get(), newNss.db(), MODE_X);
+    Lock::DBLock lock(opCtx.get(), newNss.db(), MODE_IX);
 
     // Create existing collection using StorageInterface.
     {
@@ -149,10 +147,8 @@ TEST_F(CreateCollectionTest,
 
     // This should rename the existing collection 'curNss' to the collection 'newNss' we are trying
     // to create.
-    ASSERT_OK(createCollectionForApplyOps(opCtx.get(),
-                                          newNss.db().toString(),
-                                          uuid.toBSON()["uuid"],
-                                          BSON("create" << newNss.coll())));
+    ASSERT_OK(createCollectionForApplyOps(
+        opCtx.get(), newNss.db().toString(), uuid, BSON("create" << newNss.coll())));
 
     ASSERT_FALSE(collectionExists(opCtx.get(), curNss));
     ASSERT_TRUE(collectionExists(opCtx.get(), newNss));
@@ -164,7 +160,7 @@ TEST_F(CreateCollectionTest,
 
     auto opCtx = makeOpCtx();
     auto uuid = UUID::gen();
-    Lock::DBLock lock(opCtx.get(), newNss.db(), MODE_X);
+    Lock::DBLock lock(opCtx.get(), newNss.db(), MODE_IX);
 
     // Create existing collection with same name but different UUID using StorageInterface.
     auto existingCollectionUuid = UUID::gen();
@@ -177,20 +173,19 @@ TEST_F(CreateCollectionTest,
     ASSERT_NOT_EQUALS(uuid, getCollectionUuid(opCtx.get(), newNss));
 
     // This should rename the existing collection 'newNss' to a randomly generated collection name.
-    ASSERT_OK(createCollectionForApplyOps(opCtx.get(),
-                                          newNss.db().toString(),
-                                          uuid.toBSON()["uuid"],
-                                          BSON("create" << newNss.coll())));
+    ASSERT_OK(createCollectionForApplyOps(
+        opCtx.get(), newNss.db().toString(), uuid, BSON("create" << newNss.coll())));
 
     ASSERT_TRUE(collectionExists(opCtx.get(), newNss));
     ASSERT_EQUALS(uuid, getCollectionUuid(opCtx.get(), newNss));
 
     // Check that old collection that was renamed out of the way still exists.
-    auto& uuidCatalog = UUIDCatalog::get(opCtx.get());
-    auto renamedCollectionNss = uuidCatalog.lookupNSSByUUID(existingCollectionUuid);
-    ASSERT_TRUE(collectionExists(opCtx.get(), renamedCollectionNss))
+    auto& catalog = CollectionCatalog::get(opCtx.get());
+    auto renamedCollectionNss = catalog.lookupNSSByUUID(existingCollectionUuid);
+    ASSERT(renamedCollectionNss);
+    ASSERT_TRUE(collectionExists(opCtx.get(), *renamedCollectionNss))
         << "old renamed collection with UUID " << existingCollectionUuid
-        << " missing: " << renamedCollectionNss;
+        << " missing: " << *renamedCollectionNss;
 }
 
 TEST_F(CreateCollectionTest,
@@ -202,7 +197,7 @@ TEST_F(CreateCollectionTest,
 
     auto opCtx = makeOpCtx();
     auto uuid = UUID::gen();
-    Lock::DBLock lock(opCtx.get(), newNss.db(), MODE_X);
+    Lock::DBLock lock(opCtx.get(), newNss.db(), MODE_IX);
 
     // Create drop pending collection using StorageInterface.
     {
@@ -216,10 +211,8 @@ TEST_F(CreateCollectionTest,
     // This should fail because we are not allowed to take a collection out of its drop-pending
     // state.
     ASSERT_EQUALS(ErrorCodes::NamespaceExists,
-                  createCollectionForApplyOps(opCtx.get(),
-                                              newNss.db().toString(),
-                                              uuid.toBSON()["uuid"],
-                                              BSON("create" << newNss.coll())));
+                  createCollectionForApplyOps(
+                      opCtx.get(), newNss.db().toString(), uuid, BSON("create" << newNss.coll())));
 
     ASSERT_TRUE(collectionExists(opCtx.get(), dropPendingNss));
     ASSERT_FALSE(collectionExists(opCtx.get(), newNss));

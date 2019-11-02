@@ -137,18 +137,18 @@ assert.commandWorked(explain);
 assert(isIxscan(db, explain.queryPlanner.winningPlan));
 
 // .min()
-explain = t.explain().find().min({a: 1}).finish();
+explain = t.explain().find().min({a: 1}).hint({a: 1}).finish();
 assert.commandWorked(explain);
 assert(isIxscan(db, explain.queryPlanner.winningPlan));
-explain = t.find().min({a: 1}).explain();
+explain = t.find().min({a: 1}).hint({a: 1}).explain();
 assert.commandWorked(explain);
 assert(isIxscan(db, explain.queryPlanner.winningPlan));
 
 // .max()
-explain = t.explain().find().max({a: 1}).finish();
+explain = t.explain().find().max({a: 1}).hint({a: 1}).finish();
 assert.commandWorked(explain);
 assert(isIxscan(db, explain.queryPlanner.winningPlan));
-explain = t.find().max({a: 1}).explain();
+explain = t.find().max({a: 1}).hint({a: 1}).explain();
 assert.commandWorked(explain);
 assert(isIxscan(db, explain.queryPlanner.winningPlan));
 
@@ -199,26 +199,26 @@ assert.commandWorked(results[0]);
 // .aggregate()
 //
 
-explain = t.explain().aggregate([{$match: {a: 3}}]);
+explain = t.explain().aggregate([{$match: {a: 3}}, {$group: {_id: null}}]);
 assert.commandWorked(explain);
-assert.eq(1, explain.stages.length);
+assert.eq(2, explain.stages.length);
 assert("queryPlanner" in explain.stages[0].$cursor);
 
 // Legacy varargs format.
-explain = t.explain().aggregate({$match: {a: 3}});
+explain = t.explain().aggregate({$group: {_id: null}});
 assert.commandWorked(explain);
-assert.eq(1, explain.stages.length);
+assert.eq(2, explain.stages.length);
 assert("queryPlanner" in explain.stages[0].$cursor);
 
-explain = t.explain().aggregate({$match: {a: 3}}, {$project: {a: 1}});
+explain = t.explain().aggregate({$project: {a: 3}}, {$group: {_id: null}});
 assert.commandWorked(explain);
 assert.eq(2, explain.stages.length);
 assert("queryPlanner" in explain.stages[0].$cursor);
 
 // Options already provided.
-explain = t.explain().aggregate([{$match: {a: 3}}], {allowDiskUse: true});
+explain = t.explain().aggregate([{$match: {a: 3}}, {$group: {_id: null}}], {allowDiskUse: true});
 assert.commandWorked(explain);
-assert.eq(1, explain.stages.length);
+assert.eq(2, explain.stages.length);
 assert("queryPlanner" in explain.stages[0].$cursor);
 
 //

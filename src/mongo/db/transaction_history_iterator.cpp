@@ -29,50 +29,127 @@
 
 #include "mongo/platform/basic.h"
 
-#include "mongo/db/dbdirectclient.h"
+#include "mongo/db/catalog/database_holder.h"
+#include "mongo/db/db_raii.h"
+#include "mongo/db/exec/working_set_common.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/query/get_executor.h"
+#include "mongo/db/query/query_request.h"
+#include "mongo/db/repl/local_oplog_info.h"
 #include "mongo/db/repl/oplog_entry.h"
 #include "mongo/db/transaction_history_iterator.h"
 #include "mongo/logger/redaction.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
-TransactionHistoryIterator::TransactionHistoryIterator(repl::OpTime startingOpTime)
-    : _nextOpTime(std::move(startingOpTime)) {}
+namespace {
+
+/**
+ * Query the oplog for an entry with the given timestamp.
+ */
+BSONObj findOneOplogEntry(OperationContext* opCtx,
+                          const repl::OpTime& opTime,
+                          bool permitYield,
+                          bool prevOpOnly = false) {
+    BSONObj oplogBSON;
+    invariant(!opTime.isNull());
+
+    auto qr = std::make_unique<QueryRequest>(NamespaceString::kRsOplogNamespace);
+    qr->setFilter(opTime.asQuery());
+
+    if (prevOpOnly) {
+        qr->setProj(
+            BSON("_id" << 0 << repl::OplogEntry::kPrevWriteOpTimeInTransactionFieldName << 1LL));
+    }
+
+    const boost::intrusive_ptr<ExpressionContext> expCtx;
+
+    auto statusWithCQ = CanonicalQuery::canonicalize(opCtx,
+                                                     std::move(qr),
+                                                     expCtx,
+                                                     ExtensionsCallbackNoop(),
+                                                     MatchExpressionParser::kBanAllSpecialFeatures);
+    invariant(statusWithCQ.isOK(),
+              str::stream() << "Failed to canonicalize oplog lookup"
+                            << causedBy(statusWithCQ.getStatus()));
+    std::unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
+
+    ShouldNotConflictWithSecondaryBatchApplicationBlock noPBWMBlock(opCtx->lockState());
+    Lock::GlobalLock globalLock(opCtx, MODE_IS);
+    const auto localDb = DatabaseHolder::get(opCtx)->getDb(opCtx, "local");
+    invariant(localDb);
+    AutoStatsTracker statsTracker(opCtx,
+                                  NamespaceString::kRsOplogNamespace,
+                                  Top::LockType::ReadLocked,
+                                  AutoStatsTracker::LogMode::kUpdateTop,
+                                  localDb->getProfilingLevel(),
+                                  Date_t::max());
+    auto oplog = repl::LocalOplogInfo::get(opCtx)->getCollection();
+    invariant(oplog);
+
+    auto exec = uassertStatusOK(getExecutorFind(opCtx, oplog, std::move(cq), permitYield));
+
+    auto getNextResult = exec->getNext(&oplogBSON, nullptr);
+    uassert(ErrorCodes::IncompleteTransactionHistory,
+            str::stream() << "oplog no longer contains the complete write history of this "
+                             "transaction, log with opTime "
+                          << opTime.toBSON() << " cannot be found",
+            getNextResult != PlanExecutor::IS_EOF);
+    if (getNextResult != PlanExecutor::ADVANCED) {
+        uassertStatusOKWithContext(WorkingSetCommon::getMemberObjectStatus(oplogBSON),
+                                   "PlanExecutor error in TransactionHistoryIterator");
+    }
+
+    return oplogBSON.getOwned();
+}
+
+}  // namespace
+
+TransactionHistoryIterator::TransactionHistoryIterator(repl::OpTime startingOpTime,
+                                                       bool permitYield)
+    : _permitYield(permitYield), _nextOpTime(std::move(startingOpTime)) {}
 
 bool TransactionHistoryIterator::hasNext() const {
     return !_nextOpTime.isNull();
 }
 
 repl::OplogEntry TransactionHistoryIterator::next(OperationContext* opCtx) {
-    invariant(hasNext());
-
-    DBDirectClient client(opCtx);
-    auto oplogBSON = client.findOne(NamespaceString::kRsOplogNamespace.ns(),
-                                    _nextOpTime.asQuery(),
-                                    nullptr,
-                                    QueryOption_OplogReplay);
-
-    uassert(ErrorCodes::IncompleteTransactionHistory,
-            str::stream() << "oplog no longer contains the complete write history of this "
-                             "transaction, log with opTime "
-                          << _nextOpTime.toBSON()
-                          << " cannot be found",
-            !oplogBSON.isEmpty());
+    BSONObj oplogBSON = findOneOplogEntry(opCtx, _nextOpTime, _permitYield);
 
     auto oplogEntry = uassertStatusOK(repl::OplogEntry::parse(oplogBSON));
     const auto& oplogPrevTsOption = oplogEntry.getPrevWriteOpTimeInTransaction();
-    uassert(
-        ErrorCodes::FailedToParse,
-        str::stream() << "Missing prevTs field on oplog entry of previous write in transcation: "
-                      << redact(oplogBSON),
-        oplogPrevTsOption);
+    uassert(ErrorCodes::FailedToParse,
+            str::stream()
+                << "Missing prevOpTime field on oplog entry of previous write in transaction: "
+                << redact(oplogBSON),
+            oplogPrevTsOption);
 
     _nextOpTime = oplogPrevTsOption.value();
 
     return oplogEntry;
+}
+
+repl::OplogEntry TransactionHistoryIterator::nextFatalOnErrors(OperationContext* opCtx) try {
+    return next(opCtx);
+} catch (const DBException& ex) {
+    fassertFailedWithStatus(31145, ex.toStatus());
+}
+
+repl::OpTime TransactionHistoryIterator::nextOpTime(OperationContext* opCtx) {
+    BSONObj oplogBSON = findOneOplogEntry(opCtx, _nextOpTime, _permitYield, true /* prevOpOnly */);
+
+    auto prevOpTime = oplogBSON[repl::OplogEntry::kPrevWriteOpTimeInTransactionFieldName];
+    uassert(ErrorCodes::FailedToParse,
+            str::stream()
+                << "Missing prevOpTime field on oplog entry of previous write in transaction: "
+                << redact(oplogBSON),
+            !prevOpTime.eoo() && prevOpTime.isABSONObj());
+
+    auto returnOpTime = _nextOpTime;
+    _nextOpTime = repl::OpTime::parse(prevOpTime.Obj());
+    return returnOpTime;
 }
 
 }  // namespace mongo

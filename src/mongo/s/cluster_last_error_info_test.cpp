@@ -40,7 +40,7 @@
 #include "mongo/s/sharding_router_test_fixture.h"
 #include "mongo/stdx/future.h"
 #include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 namespace {
@@ -91,7 +91,7 @@ TEST_F(ClusterGetLastErrorTest,
         return RemoteCommandResponse(bob.obj(), Milliseconds(1));
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 
     // Ensure the last error info was updated with the contacted host and returned opTime.
 
@@ -135,7 +135,7 @@ TEST_F(ClusterGetLastErrorTest, ClusterLastErrorInfoNotUpdatedIfNotInitialized) 
         return RemoteCommandResponse(bob.obj(), Milliseconds(1));
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 
     // Ensure the clusterGLE on the Client has still not been initialized.
     ASSERT(!ClusterLastErrorInfo::get(client));
@@ -176,7 +176,7 @@ TEST_F(ClusterGetLastErrorTest, ClusterLastErrorInfoNotUpdatedIfReplyDoesntHaveS
         return RemoteCommandResponse(BSON("ok" << 1), Milliseconds(1));
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 
     // Ensure the last error info was not updated.
 

@@ -51,17 +51,7 @@ MozJSProxyScope::MozJSProxyScope(MozJSScriptEngine* engine)
       _mutex(),
       _state(State::Idle),
       _status(Status::OK()),
-      // Despite calling PR_CreateThread, we're actually using our own
-      // implementation of PosixNSPR.cpp in this directory. So these threads
-      // are actually hosted on top of stdx::threads and most of the flags
-      // don't matter.
-      _thread(PR_CreateThread(PR_USER_THREAD,
-                              implThread,
-                              this,
-                              PR_PRIORITY_NORMAL,
-                              PR_LOCAL_THREAD,
-                              PR_JOINABLE_THREAD,
-                              0)) {
+      _thread(implThread, this) {
     // Test the child on startup to make sure it's awake and that the
     // implementation scope sucessfully constructed.
     try {
@@ -266,7 +256,7 @@ void MozJSProxyScope::run(Closure&& closure) {
     // methods on it from there. If we're on the same thread, it's safe to
     // simply call back in, so let's do that.
 
-    if (_thread == PR_GetCurrentThread()) {
+    if (_thread.get_id() == stdx::this_thread::get_id()) {
         return closure();
     }
 
@@ -285,7 +275,7 @@ void MozJSProxyScope::runWithoutInterruptionExceptAtGlobalShutdown(Closure&& clo
 }
 
 void MozJSProxyScope::runOnImplThread(unique_function<void()> f) {
-    stdx::unique_lock<stdx::mutex> lk(_mutex);
+    stdx::unique_lock<Latch> lk(_mutex);
     _function = std::move(f);
 
     invariant(_state == State::Idle);
@@ -302,10 +292,11 @@ void MozJSProxyScope::runOnImplThread(unique_function<void()> f) {
     try {
         interruptible->waitForConditionOrInterrupt(_proxyCondvar, lk, pred);
     } catch (const DBException& ex) {
-        _status = ex.toStatus();
-
         _implScope->kill();
         _proxyCondvar.wait(lk, pred);
+
+        // update _status after the wait, otherwise it would get overwritten in implThread
+        _status = ex.toStatus();
     }
 
     _state = State::Idle;
@@ -321,7 +312,7 @@ void MozJSProxyScope::runOnImplThread(unique_function<void()> f) {
 
 void MozJSProxyScope::shutdownThread() {
     {
-        stdx::lock_guard<stdx::mutex> lk(_mutex);
+        stdx::lock_guard<Latch> lk(_mutex);
 
         invariant(_state == State::Idle);
 
@@ -330,7 +321,7 @@ void MozJSProxyScope::shutdownThread() {
 
     _implCondvar.notify_one();
 
-    PR_JoinThread(_thread);
+    _thread.join();
 }
 
 /**
@@ -345,9 +336,7 @@ void MozJSProxyScope::shutdownThread() {
  * Shutdown: Shutdown -> _
  *   break out of the loop and return.
  */
-void MozJSProxyScope::implThread(void* arg) {
-    auto proxy = static_cast<MozJSProxyScope*>(arg);
-
+void MozJSProxyScope::implThread(MozJSProxyScope* proxy) {
     if (hasGlobalServiceContext())
         Client::initThread("js");
 
@@ -368,7 +357,7 @@ void MozJSProxyScope::implThread(void* arg) {
     const auto unbindImplScope = makeGuard([&proxy] { proxy->_implScope = nullptr; });
 
     while (true) {
-        stdx::unique_lock<stdx::mutex> lk(proxy->_mutex);
+        stdx::unique_lock<Latch> lk(proxy->_mutex);
         {
             MONGO_IDLE_THREAD_BLOCK;
             proxy->_implCondvar.wait(lk, [proxy] {

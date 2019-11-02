@@ -33,6 +33,8 @@
 
 #include "mongo/db/query/find.h"
 
+#include <memory>
+
 #include "mongo/base/error_codes.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/catalog/collection.h"
@@ -47,6 +49,7 @@
 #include "mongo/db/exec/working_set_common.h"
 #include "mongo/db/keypattern.h"
 #include "mongo/db/matcher/extensions_callback_real.h"
+#include "mongo/db/query/collection_query_info.h"
 #include "mongo/db/query/explain.h"
 #include "mongo/db/query/find_common.h"
 #include "mongo/db/query/get_executor.h"
@@ -62,16 +65,14 @@
 #include "mongo/db/views/view_catalog.h"
 #include "mongo/s/chunk_version.h"
 #include "mongo/s/stale_exception.h"
-#include "mongo/stdx/memory.h"
-#include "mongo/util/fail_point_service.h"
+#include "mongo/util/fail_point.h"
 #include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
 #include "mongo/util/scopeguard.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
 using std::unique_ptr;
-using stdx::make_unique;
 
 // Failpoint for checking whether we've received a getmore.
 MONGO_FAIL_POINT_DEFINE(failReceivedGetmore);
@@ -150,7 +151,7 @@ void endQueryOp(OperationContext* opCtx,
     curOp->debug().setPlanSummaryMetrics(summaryStats);
 
     if (collection) {
-        collection->infoCache()->notifyOfQuery(opCtx, summaryStats.indexesUsed);
+        CollectionQueryInfo::get(collection).notifyOfQuery(opCtx, summaryStats);
     }
 
     if (curOp->shouldDBProfile()) {
@@ -180,9 +181,11 @@ void generateBatch(int ntoreturn,
                    PlanExecutor::ExecState* state) {
     PlanExecutor* exec = cursor->getExecutor();
 
-    BSONObj obj;
+    Document doc;
     while (!FindCommon::enoughForGetMore(ntoreturn, *numResults) &&
-           PlanExecutor::ADVANCED == (*state = exec->getNext(&obj, NULL))) {
+           PlanExecutor::ADVANCED == (*state = exec->getNext(&doc, nullptr))) {
+        BSONObj obj = doc.toBson();
+
         // If we can't fit this result inside the current batch, then we stash it for later.
         if (!FindCommon::haveSpaceForNext(obj, *numResults, bb->len())) {
             exec->enqueue(obj);
@@ -203,7 +206,7 @@ void generateBatch(int ntoreturn,
             error() << "getMore executor error, stats: "
                     << redact(Explain::getWinningPlanStats(exec));
             // We should always have a valid status object by this point.
-            auto status = WorkingSetCommon::getMemberObjectStatus(obj);
+            auto status = WorkingSetCommon::getMemberObjectStatus(doc);
             invariant(!status.isOK());
             uassertStatusOK(status);
         }
@@ -247,7 +250,7 @@ Message getMore(OperationContext* opCtx,
     curOp.ensureStarted();
 
     // For testing, we may want to fail if we receive a getmore.
-    if (MONGO_FAIL_POINT(failReceivedGetmore)) {
+    if (MONGO_unlikely(failReceivedGetmore.shouldFail())) {
         MONGO_UNREACHABLE;
     }
 
@@ -337,8 +340,7 @@ Message getMore(OperationContext* opCtx,
     // cursor.
     uassert(ErrorCodes::Unauthorized,
             str::stream() << "Requested getMore on namespace " << ns << ", but cursor " << cursorid
-                          << " belongs to namespace "
-                          << cursorPin->nss().ns(),
+                          << " belongs to namespace " << cursorPin->nss().ns(),
             nss == cursorPin->nss());
 
     // A user can only call getMore on their own cursor. If there were multiple users authenticated
@@ -353,7 +355,7 @@ Message getMore(OperationContext* opCtx,
     *isCursorAuthorized = true;
 
     // Only used by the failpoints.
-    stdx::function<void()> dropAndReaquireReadLock = [&] {
+    std::function<void()> dropAndReaquireReadLock = [&] {
         // Make sure an interrupted operation does not prevent us from reacquiring the lock.
         UninterruptibleLockGuard noInterrupt(opCtx->lockState());
 
@@ -369,8 +371,7 @@ Message getMore(OperationContext* opCtx,
     // repeatedly release and re-acquire the collection readLock at regular intervals until
     // the failpoint is released. This is done in order to avoid deadlocks caused by the
     // pinned-cursor failpoints in this file (see SERVER-21997).
-    MONGO_FAIL_POINT_BLOCK(waitAfterPinningCursorBeforeGetMoreBatch, options) {
-        const BSONObj& data = options.getData();
+    waitAfterPinningCursorBeforeGetMoreBatch.execute([&](const BSONObj& data) {
         if (data["shouldNotdropLock"].booleanSafe()) {
             dropAndReaquireReadLock = []() {};
         }
@@ -381,7 +382,7 @@ Message getMore(OperationContext* opCtx,
                                                          dropAndReaquireReadLock,
                                                          false,
                                                          nss);
-    }
+    });
 
 
     const auto replicationMode = repl::ReplicationCoordinator::get(opCtx)->getReplicationMode();
@@ -397,6 +398,13 @@ Message getMore(OperationContext* opCtx,
             "OP_GET_MORE operations are not supported on tailable aggregations. Only clients "
             "which support the getMore command can be used on tailable aggregations.",
             readLock || !cursorPin->isAwaitData());
+    uassert(
+        31124,
+        str::stream()
+            << "OP_GET_MORE does not support cursors with a write concern other than the default."
+               " Use the getMore command instead. Write concern was: "
+            << cursorPin->getWriteConcernOptions().toBSON(),
+        cursorPin->getWriteConcernOptions().usedDefault);
 
     // If the operation that spawned this cursor had a time limit set, apply leftover time to this
     // getmore.
@@ -452,7 +460,7 @@ Message getMore(OperationContext* opCtx,
     // accumulate over the course of a cursor's lifetime.
     PlanSummaryStats preExecutionStats;
     Explain::getSummaryStats(*exec, &preExecutionStats);
-    if (MONGO_FAIL_POINT(waitWithPinnedCursorDuringGetMoreBatch)) {
+    if (MONGO_unlikely(waitWithPinnedCursorDuringGetMoreBatch.shouldFail())) {
         CurOpFailpointHelpers::waitWhileFailPointEnabled(&waitWithPinnedCursorDuringGetMoreBatch,
                                                          opCtx,
                                                          "waitWithPinnedCursorDuringGetMoreBatch",
@@ -541,7 +549,7 @@ Message getMore(OperationContext* opCtx,
     // If the 'waitBeforeUnpinningOrDeletingCursorAfterGetMoreBatch' failpoint is active, we
     // set the 'msg' field of this operation's CurOp to signal that we've hit this point and
     // then spin until the failpoint is released.
-    if (MONGO_FAIL_POINT(waitBeforeUnpinningOrDeletingCursorAfterGetMoreBatch)) {
+    if (MONGO_unlikely(waitBeforeUnpinningOrDeletingCursorAfterGetMoreBatch.shouldFail())) {
         CurOpFailpointHelpers::waitWhileFailPointEnabled(
             &waitBeforeUnpinningOrDeletingCursorAfterGetMoreBatch,
             opCtx,
@@ -574,6 +582,12 @@ std::string runQuery(OperationContext* opCtx,
 
     // Set CurOp information.
     const auto upconvertedQuery = upconvertQueryEntry(q.query, nss, q.ntoreturn, q.ntoskip);
+
+    // Extract the 'comment' parameter from the upconverted query, if it exists.
+    if (auto commentField = upconvertedQuery["comment"]) {
+        opCtx->setComment(commentField.wrap());
+    }
+
     beginQueryOp(opCtx, nss, upconvertedQuery, q.ntoreturn, q.ntoskip);
 
     // Parse the qm into a CanonicalQuery.
@@ -619,8 +633,11 @@ std::string runQuery(OperationContext* opCtx,
         bb.skip(sizeof(QueryResult::Value));
 
         BSONObjBuilder explainBob;
-        Explain::explainStages(
-            exec.get(), collection, ExplainOptions::Verbosity::kExecAllPlans, &explainBob);
+        Explain::explainStages(exec.get(),
+                               collection,
+                               ExplainOptions::Verbosity::kExecAllPlans,
+                               BSONObj(),
+                               &explainBob);
 
         // Add the resulting object to the return buffer.
         BSONObj explainObj = explainBob.obj();
@@ -648,8 +665,7 @@ std::string runQuery(OperationContext* opCtx,
     }
     opCtx->checkForInterrupt();  // May trigger maxTimeAlwaysTimeOut fail point.
 
-    CurOpFailpointHelpers::waitWhileFailPointEnabled(
-        &waitInFindBeforeMakingBatch, opCtx, "waitInFindBeforeMakingBatch");
+    FindCommon::waitInFindBeforeMakingBatch(opCtx, *exec->getCanonicalQuery());
 
     // Run the query.
     // bb is used to hold query results
@@ -670,7 +686,10 @@ std::string runQuery(OperationContext* opCtx,
         curOp.setPlanSummary_inlock(Explain::getPlanSummary(exec.get()));
     }
 
-    while (PlanExecutor::ADVANCED == (state = exec->getNext(&obj, NULL))) {
+    Document doc;
+    while (PlanExecutor::ADVANCED == (state = exec->getNext(&doc, nullptr))) {
+        obj = doc.toBson();
+
         // If we can't fit this result inside the current batch, then we stash it for later.
         if (!FindCommon::haveSpaceForNext(obj, numResults, bb.len())) {
             exec->enqueue(obj);
@@ -695,15 +714,10 @@ std::string runQuery(OperationContext* opCtx,
     if (PlanExecutor::FAILURE == state) {
         error() << "Plan executor error during find: " << PlanExecutor::statestr(state)
                 << ", stats: " << redact(Explain::getWinningPlanStats(exec.get()));
-        uassertStatusOKWithContext(WorkingSetCommon::getMemberObjectStatus(obj),
+        uassertStatusOKWithContext(WorkingSetCommon::getMemberObjectStatus(doc),
                                    "Executor error during OP_QUERY find");
         MONGO_UNREACHABLE;
     }
-
-    // Before saving the cursor, ensure that whatever plan we established happened with the expected
-    // collection version
-    auto css = CollectionShardingState::get(opCtx, nss);
-    css->checkShardVersionOrThrow(opCtx);
 
     // Fill out CurOp based on query results. If we have a cursorid, we will fill out CurOp with
     // this cursorid later.
@@ -718,13 +732,17 @@ std::string runQuery(OperationContext* opCtx,
         // Allocate a new ClientCursor and register it with the cursor manager.
         ClientCursorPin pinnedCursor = CursorManager::get(opCtx)->registerCursor(
             opCtx,
-            {std::move(exec),
-             nss,
-             AuthorizationSession::get(opCtx->getClient())->getAuthenticatedUserNames(),
-             readConcernArgs,
-             upconvertedQuery,
-             ClientCursorParams::LockPolicy::kLockExternally,
-             {Privilege(ResourcePattern::forExactNamespace(nss), ActionType::find)}});
+            {
+                std::move(exec),
+                nss,
+                AuthorizationSession::get(opCtx->getClient())->getAuthenticatedUserNames(),
+                opCtx->getWriteConcern(),
+                readConcernArgs,
+                upconvertedQuery,
+                ClientCursorParams::LockPolicy::kLockExternally,
+                {Privilege(ResourcePattern::forExactNamespace(nss), ActionType::find)},
+                false  // needsMerge always 'false' for find().
+            });
         ccId = pinnedCursor.getCursor()->cursorid();
 
         LOG(5) << "caching executor with cursorid " << ccId << " after returning " << numResults

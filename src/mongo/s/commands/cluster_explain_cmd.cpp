@@ -148,8 +148,7 @@ BSONObj makeExplainedObj(const BSONObj& outerObj, StringData dbName) {
     if (auto innerDb = innerObj["$db"]) {
         uassert(ErrorCodes::InvalidNamespace,
                 str::stream() << "Mismatched $db in explain command. Expected " << dbName
-                              << " but got "
-                              << innerDb.checkAndGetStringData(),
+                              << " but got " << innerDb.checkAndGetStringData(),
                 innerDb.checkAndGetStringData() == dbName);
     }
 
@@ -177,6 +176,13 @@ std::unique_ptr<CommandInvocation> ClusterExplainCmd::parse(OperationContext* op
     // arguments into the inner command since it is what is passed to the virtual
     // CommandInvocation::explain() method.
     const BSONObj explainedObj = makeExplainedObj(cmdObj, dbName);
+
+    // Extract 'comment' field from the 'explainedObj' only if there is no top-level comment.
+    auto commentField = explainedObj["comment"];
+    if (!opCtx->getComment() && commentField) {
+        opCtx->setComment(commentField.wrap());
+    }
+
     const std::string cmdName = explainedObj.firstElementFieldName();
     auto explainedCommand = CommandHelpers::findCommand(cmdName);
     uassert(ErrorCodes::CommandNotFound,
@@ -184,7 +190,7 @@ std::unique_ptr<CommandInvocation> ClusterExplainCmd::parse(OperationContext* op
             explainedCommand);
     auto innerRequest = std::make_unique<OpMsgRequest>(OpMsg{explainedObj});
     auto innerInvocation = explainedCommand->parse(opCtx, *innerRequest);
-    return stdx::make_unique<Invocation>(
+    return std::make_unique<Invocation>(
         this, request, std::move(verbosity), std::move(innerRequest), std::move(innerInvocation));
 }
 

@@ -30,39 +30,34 @@
 #pragma once
 
 #include <memory>
+#include <type_traits>
 
-#include "mongo/client/connection_string.h"
 #include "mongo/client/connpool.h"
 #include "mongo/client/remote_command_targeter.h"
 #include "mongo/db/logical_session_id.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/sessions_collection.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
 
-class DBDirectClient;
 class OperationContext;
-class RemoteCommandTargeter;
 
 /**
  * Accesses the sessions collection for replica set members.
  */
-class SessionsCollectionRS : public SessionsCollection {
+class SessionsCollectionRS final : public SessionsCollection {
 public:
-    /**
-     * Constructs a new SessionsCollectionRS.
-     */
-    SessionsCollectionRS() = default;
-
     /**
      * Ensures that the sessions collection exists and has the proper indexes.
      */
-    Status setupSessionsCollection(OperationContext* opCtx) override;
+    void setupSessionsCollection(OperationContext* opCtx) override;
 
     /**
      * Checks if the sessions collection exists and has the proper indexes.
      */
-    Status checkSessionsCollectionExists(OperationContext* opCtx) override;
+    void checkSessionsCollectionExists(OperationContext* opCtx) override;
 
     /**
      * Updates the last-use times on the given sessions to be greater than
@@ -70,15 +65,14 @@ public:
      *
      * If a step-down happens on this node as this method is running, it may fail.
      */
-    Status refreshSessions(OperationContext* opCtx,
-                           const LogicalSessionRecordSet& sessions) override;
+    void refreshSessions(OperationContext* opCtx, const LogicalSessionRecordSet& sessions) override;
 
     /**
      * Removes the authoritative records for the specified sessions.
      *
      * If a step-down happens on this node as this method is running, it may fail.
      */
-    Status removeRecords(OperationContext* opCtx, const LogicalSessionIdSet& sessions) override;
+    void removeRecords(OperationContext* opCtx, const LogicalSessionIdSet& sessions) override;
 
     /**
      * Returns the subset of sessions from the given set that do not have entries
@@ -87,26 +81,35 @@ public:
      * If a step-down happens on this node as this method is running, it may
      * return stale results.
      */
-    StatusWith<LogicalSessionIdSet> findRemovedSessions(
-        OperationContext* opCtx, const LogicalSessionIdSet& sessions) override;
+    LogicalSessionIdSet findRemovedSessions(OperationContext* opCtx,
+                                            const LogicalSessionIdSet& sessions) override;
 
-    /**
-     * Removes the transaction records for the specified sessions from the
-     * transaction table.
-     *
-     * If a step-down happens on this node as this method is running, it may fail.
-     */
-    Status removeTransactionRecords(OperationContext* opCtx,
-                                    const LogicalSessionIdSet& sessions) override;
+private:
+    auto _makePrimaryConnection(OperationContext* opCtx);
 
-    /**
-     * Helper for a shard server to run its transaction operations as a replica set
-     * member.
-     *
-     * If a step-down happens on this node as this method is running, it may fail.
-     */
-    static Status removeTransactionRecordsHelper(OperationContext* opCtx,
-                                                 const LogicalSessionIdSet& sessions);
+    bool _isStandaloneOrPrimary(const NamespaceString& ns, OperationContext* opCtx);
+
+    template <typename LocalCallback, typename RemoteCallback>
+    struct CommonResult {
+        using LocalReturnType = std::invoke_result_t<LocalCallback>;
+        using RemoteReturnType = std::invoke_result_t<RemoteCallback, DBClientBase*>;
+        static_assert(std::is_same_v<LocalReturnType, RemoteReturnType>,
+                      "LocalCallback and RemoteCallback must have the same return type");
+
+        using Type =
+            std::conditional_t<std::is_void<LocalReturnType>::value, void, LocalReturnType>;
+    };
+    template <typename LocalCallback, typename RemoteCallback>
+    using CommonResultT = typename CommonResult<LocalCallback, RemoteCallback>::Type;
+
+    template <typename LocalCallback, typename RemoteCallback>
+    CommonResultT<LocalCallback, RemoteCallback> _dispatch(const NamespaceString& ns,
+                                                           OperationContext* opCtx,
+                                                           LocalCallback&& localCallback,
+                                                           RemoteCallback&& remoteCallback);
+
+    Mutex _mutex = MONGO_MAKE_LATCH("SessionsCollectionRS::_mutex");
+    std::unique_ptr<RemoteCommandTargeter> _targeter;
 };
 
 }  // namespace mongo

@@ -38,7 +38,6 @@
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/sorted_data_interface.h"
 #include "mongo/db/storage/test_harness_helper.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/util/unowned_ptr.h"
 
 namespace mongo {
@@ -52,6 +51,7 @@ const BSONObj key5 = BSON("" << 5);
 const BSONObj key6 = BSON("" << 6);
 const BSONObj key7 = BSON(""
                           << "\x00");
+
 const BSONObj key8 = BSON(""
                           << "\xff");
 
@@ -92,6 +92,7 @@ public:
     virtual std::unique_ptr<SortedDataInterface> newSortedDataInterface(bool unique,
                                                                         bool partial) = 0;
 
+    virtual std::unique_ptr<SortedDataInterface> newIdIndexSortedDataInterface() = 0;
     /**
      * Creates a new SDI with some initial data.
      *
@@ -100,6 +101,20 @@ public:
     std::unique_ptr<SortedDataInterface> newSortedDataInterface(
         bool unique, bool partial, std::initializer_list<IndexKeyEntry> toInsert);
 };
+
+void registerSortedDataInterfaceHarnessHelperFactory(
+    std::function<std::unique_ptr<SortedDataInterfaceHarnessHelper>()> factory);
+
+std::unique_ptr<SortedDataInterfaceHarnessHelper> newSortedDataInterfaceHarnessHelper();
+
+KeyString::Value makeKeyString(SortedDataInterface* sorted,
+                               BSONObj bsonKey,
+                               boost::optional<RecordId> rid = boost::none);
+
+KeyString::Value makeKeyStringForSeek(SortedDataInterface* sorted,
+                                      BSONObj bsonKey,
+                                      bool isForward,
+                                      bool inclusive);
 
 /**
  * Inserts all entries in toInsert into index.
@@ -136,7 +151,4 @@ inline void removeFromIndex(unowned_ptr<HarnessHelper> harness,
     removeFromIndex(harness->newOperationContext(client.get()), index, toRemove);
 }
 
-inline std::unique_ptr<SortedDataInterfaceHarnessHelper> newSortedDataInterfaceHarnessHelper() {
-    return dynamic_ptr_cast<SortedDataInterfaceHarnessHelper>(newHarnessHelper());
-}
 }  // namespace mongo

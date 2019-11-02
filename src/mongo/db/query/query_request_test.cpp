@@ -33,8 +33,8 @@
 #include <boost/optional.hpp>
 #include <boost/optional/optional_io.hpp>
 
+#include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/catalog/collection_mock.h"
-#include "mongo/db/catalog/uuid_catalog.h"
 #include "mongo/db/dbmessage.h"
 #include "mongo/db/json.h"
 #include "mongo/db/namespace_string.h"
@@ -429,7 +429,7 @@ TEST(QueryRequestTest, ParseFromCommandReadOnceDefaultsToFalse) {
     ASSERT(!qr->isReadOnce());
 }
 
-TEST(QueryRequestTest, ParseFromCommandCommentWithValidMinMax) {
+TEST(QueryRequestTest, ParseFromCommandValidMinMax) {
     BSONObj cmdObj = fromjson(
         "{find: 'testns',"
         "comment: 'the comment',"
@@ -440,7 +440,6 @@ TEST(QueryRequestTest, ParseFromCommandCommentWithValidMinMax) {
     unique_ptr<QueryRequest> qr(
         assertGet(QueryRequest::makeFromFindCommand(nss, cmdObj, isExplain)));
 
-    ASSERT_EQUALS("the comment", qr->getComment());
     BSONObj expectedMin = BSON("a" << 1);
     ASSERT_EQUALS(0, expectedMin.woCompare(qr->getMin()));
     BSONObj expectedMax = BSON("a" << 2);
@@ -448,19 +447,22 @@ TEST(QueryRequestTest, ParseFromCommandCommentWithValidMinMax) {
 }
 
 TEST(QueryRequestTest, ParseFromCommandAllNonOptionFields) {
+    RuntimeConstants rtc{Date_t::now(), Timestamp(1, 1)};
+    BSONObj rtcObj = BSON("runtimeConstants" << rtc.toBSON());
     BSONObj cmdObj = fromjson(
-        "{find: 'testns',"
-        "filter: {a: 1},"
-        "sort: {b: 1},"
-        "projection: {c: 1},"
-        "hint: {d: 1},"
-        "readConcern: {e: 1},"
-        "$queryOptions: {$readPreference: 'secondary'},"
-        "collation: {f: 1},"
-        "limit: 3,"
-        "skip: 5,"
-        "batchSize: 90,"
-        "singleBatch: false}");
+                         "{find: 'testns',"
+                         "filter: {a: 1},"
+                         "sort: {b: 1},"
+                         "projection: {c: 1},"
+                         "hint: {d: 1},"
+                         "readConcern: {e: 1},"
+                         "$queryOptions: {$readPreference: 'secondary'},"
+                         "collation: {f: 1},"
+                         "limit: 3,"
+                         "skip: 5,"
+                         "batchSize: 90,"
+                         "singleBatch: false}")
+                         .addField(rtcObj["runtimeConstants"]);
     const NamespaceString nss("test.testns");
     bool isExplain = false;
     unique_ptr<QueryRequest> qr(
@@ -485,6 +487,9 @@ TEST(QueryRequestTest, ParseFromCommandAllNonOptionFields) {
     ASSERT_EQUALS(3, *qr->getLimit());
     ASSERT_EQUALS(5, *qr->getSkip());
     ASSERT_EQUALS(90, *qr->getBatchSize());
+    ASSERT(qr->getRuntimeConstants().has_value());
+    ASSERT_EQUALS(qr->getRuntimeConstants()->getLocalNow(), rtc.getLocalNow());
+    ASSERT_EQUALS(qr->getRuntimeConstants()->getClusterTime(), rtc.getClusterTime());
     ASSERT(qr->wantMore());
 }
 
@@ -594,17 +599,6 @@ TEST(QueryRequestTest, ParseFromCommandSingleBatchWrongType) {
         "filter:  {a: 1},"
         "singleBatch: 'false',"
         "projection: {a: 1}}");
-    const NamespaceString nss("test.testns");
-    bool isExplain = false;
-    auto result = QueryRequest::makeFromFindCommand(nss, cmdObj, isExplain);
-    ASSERT_NOT_OK(result.getStatus());
-}
-
-TEST(QueryRequestTest, ParseFromCommandCommentWrongType) {
-    BSONObj cmdObj = fromjson(
-        "{find: 'testns',"
-        "filter:  {a: 1},"
-        "comment: 1}");
     const NamespaceString nss("test.testns");
     bool isExplain = false;
     auto result = QueryRequest::makeFromFindCommand(nss, cmdObj, isExplain);
@@ -787,6 +781,33 @@ TEST(QueryRequestTest, ParseFromCommandReadOnceWrongType) {
     auto result = QueryRequest::makeFromFindCommand(nss, cmdObj, isExplain);
     ASSERT_EQ(ErrorCodes::FailedToParse, result.getStatus());
 }
+
+TEST(QueryRequestTest, ParseFromCommandRuntimeConstantsWrongType) {
+    BSONObj cmdObj = BSON("find"
+                          << "testns"
+                          << "runtimeConstants"
+                          << "shouldNotBeString");
+    const NamespaceString nss("test.testns");
+    bool isExplain = false;
+    auto result = QueryRequest::makeFromFindCommand(nss, cmdObj, isExplain);
+    ASSERT_EQ(ErrorCodes::FailedToParse, result.getStatus());
+}
+
+TEST(QueryRequestTest, ParseFromCommandRuntimeConstantsSubfieldsWrongType) {
+    BSONObj cmdObj = BSON("find"
+                          << "testns"
+                          << "runtimeConstants"
+                          << BSON("localNow"
+                                  << "shouldBeDate"
+                                  << "clusterTime"
+                                  << "shouldBeTimestamp"));
+    const NamespaceString nss("test.testns");
+    bool isExplain = false;
+    ASSERT_THROWS_CODE(QueryRequest::makeFromFindCommand(nss, cmdObj, isExplain),
+                       AssertionException,
+                       ErrorCodes::TypeMismatch);
+}
+
 //
 // Parsing errors where a field has the right type but a bad value.
 //
@@ -879,18 +900,21 @@ TEST(QueryRequestTest, ParseFromCommandDefaultBatchSize) {
 //
 
 TEST(QueryRequestTest, AsFindCommandAllNonOptionFields) {
+    BSONObj rtcObj =
+        BSON("runtimeConstants" << (RuntimeConstants{Date_t::now(), Timestamp(1, 1)}.toBSON()));
     BSONObj cmdObj = fromjson(
-        "{find: 'testns',"
-        "filter: {a: 1},"
-        "projection: {c: 1},"
-        "sort: {b: 1},"
-        "hint: {d: 1},"
-        "readConcern: {e: 1},"
-        "collation: {f: 1},"
-        "skip: 5,"
-        "limit: 3,"
-        "batchSize: 90,"
-        "singleBatch: true}");
+                         "{find: 'testns',"
+                         "filter: {a: 1},"
+                         "projection: {c: 1},"
+                         "sort: {b: 1},"
+                         "hint: {d: 1},"
+                         "readConcern: {e: 1},"
+                         "collation: {f: 1},"
+                         "skip: 5,"
+                         "limit: 3,"
+                         "batchSize: 90,"
+                         "singleBatch: true}")
+                         .addField(rtcObj["runtimeConstants"]);
     const NamespaceString nss("test.testns");
     bool isExplain = false;
     unique_ptr<QueryRequest> qr(
@@ -899,19 +923,23 @@ TEST(QueryRequestTest, AsFindCommandAllNonOptionFields) {
 }
 
 TEST(QueryRequestTest, AsFindCommandWithUuidAllNonOptionFields) {
-    BSONObj cmdObj = fromjson(
-        // This binary value is UUID("01234567-89ab-cdef-edcb-a98765432101")
-        "{find: { \"$binary\" : \"ASNFZ4mrze/ty6mHZUMhAQ==\", \"$type\" : \"04\" },"
-        "filter: {a: 1},"
-        "projection: {c: 1},"
-        "sort: {b: 1},"
-        "hint: {d: 1},"
-        "readConcern: {e: 1},"
-        "collation: {f: 1},"
-        "skip: 5,"
-        "limit: 3,"
-        "batchSize: 90,"
-        "singleBatch: true}");
+    BSONObj rtcObj =
+        BSON("runtimeConstants" << (RuntimeConstants{Date_t::now(), Timestamp(1, 1)}.toBSON()));
+    BSONObj cmdObj =
+        fromjson(
+            // This binary value is UUID("01234567-89ab-cdef-edcb-a98765432101")
+            "{find: { \"$binary\" : \"ASNFZ4mrze/ty6mHZUMhAQ==\", \"$type\" : \"04\" },"
+            "filter: {a: 1},"
+            "projection: {c: 1},"
+            "sort: {b: 1},"
+            "hint: {d: 1},"
+            "readConcern: {e: 1},"
+            "collation: {f: 1},"
+            "skip: 5,"
+            "limit: 3,"
+            "batchSize: 90,"
+            "singleBatch: true}")
+            .addField(rtcObj["runtimeConstants"]);
     const NamespaceString nss("test.testns");
     bool isExplain = false;
     unique_ptr<QueryRequest> qr(
@@ -1048,6 +1076,28 @@ TEST(QueryRequestTest, DefaultQueryParametersCorrect) {
     ASSERT_EQUALS(false, qr->isTailableAndAwaitData());
     ASSERT_EQUALS(false, qr->isExhaust());
     ASSERT_EQUALS(false, qr->isAllowPartialResults());
+    ASSERT_EQUALS(false, qr->getRuntimeConstants().has_value());
+    ASSERT_EQUALS(false, qr->allowDiskUse());
+}
+
+TEST(QueryRequestTest, ParseCommandAllowDiskUseTrue) {
+    BSONObj cmdObj = fromjson("{find: 'testns', allowDiskUse: true}");
+    const NamespaceString nss("test.testns");
+    const bool isExplain = false;
+    auto result = QueryRequest::makeFromFindCommand(nss, cmdObj, isExplain);
+
+    ASSERT_OK(result.getStatus());
+    ASSERT_EQ(true, result.getValue()->allowDiskUse());
+}
+
+TEST(QueryRequestTest, ParseCommandAllowDiskUseFalse) {
+    BSONObj cmdObj = fromjson("{find: 'testns', allowDiskUse: false}");
+    const NamespaceString nss("test.testns");
+    const bool isExplain = false;
+    auto result = QueryRequest::makeFromFindCommand(nss, cmdObj, isExplain);
+
+    ASSERT_OK(result.getStatus());
+    ASSERT_EQ(false, result.getValue()->allowDiskUse());
 }
 
 //
@@ -1185,17 +1235,6 @@ TEST(QueryRequestTest, ConvertToAggregationWithReturnKeyFails) {
     ASSERT_NOT_OK(qr.asAggregationCommand());
 }
 
-TEST(QueryRequestTest, ConvertToAggregationWithCommentSucceeds) {
-    QueryRequest qr(testns);
-    qr.setComment("test");
-    const auto aggCmd = qr.asAggregationCommand();
-    ASSERT_OK(aggCmd);
-
-    auto ar = AggregationRequest::parseFromBSON(testns, aggCmd.getValue());
-    ASSERT_OK(ar.getStatus());
-    ASSERT_EQ(qr.getComment(), ar.getValue().getComment());
-}
-
 TEST(QueryRequestTest, ConvertToAggregationWithShowRecordIdFails) {
     QueryRequest qr(testns);
     qr.setShowRecordId(true);
@@ -1329,29 +1368,58 @@ TEST(QueryRequestTest, ConvertToAggregationWithAllowSpeculativeMajorityReadFails
     ASSERT_EQ(ErrorCodes::InvalidPipelineOperator, aggCmd.getStatus().code());
 }
 
-TEST(QueryRequestTest, ParseFromLegacyObjMetaOpComment) {
-    BSONObj queryObj = fromjson(
-        "{$query: {a: 1},"
-        "$comment: {b: 2, c: {d: 'ParseFromLegacyObjMetaOpComment'}}}");
-    const NamespaceString nss("test.testns");
-    unique_ptr<QueryRequest> qr(
-        assertGet(QueryRequest::fromLegacyQuery(nss, queryObj, BSONObj(), 0, 0, 0)));
+TEST(QueryRequestTest, ConvertToAggregationWithRuntimeConstantsSucceeds) {
+    RuntimeConstants rtc{Date_t::now(), Timestamp(1, 1)};
+    QueryRequest qr(testns);
+    qr.setRuntimeConstants(rtc);
+    auto agg = qr.asAggregationCommand();
+    ASSERT_OK(agg);
 
-    // Ensure that legacy comment meta-operator is parsed to a string comment
-    ASSERT_EQ(qr->getComment(), "{ b: 2, c: { d: \"ParseFromLegacyObjMetaOpComment\" } }");
-    ASSERT_BSONOBJ_EQ(qr->getFilter(), fromjson("{a: 1}"));
+    auto ar = AggregationRequest::parseFromBSON(testns, agg.getValue());
+    ASSERT_OK(ar.getStatus());
+    ASSERT(ar.getValue().getRuntimeConstants().has_value());
+    ASSERT_EQ(ar.getValue().getRuntimeConstants()->getLocalNow(), rtc.getLocalNow());
+    ASSERT_EQ(ar.getValue().getRuntimeConstants()->getClusterTime(), rtc.getClusterTime());
 }
 
-TEST(QueryRequestTest, ParseFromLegacyStringMetaOpComment) {
-    BSONObj queryObj = fromjson(
-        "{$query: {a: 1},"
-        "$comment: 'ParseFromLegacyStringMetaOpComment'}");
-    const NamespaceString nss("test.testns");
-    unique_ptr<QueryRequest> qr(
-        assertGet(QueryRequest::fromLegacyQuery(nss, queryObj, BSONObj(), 0, 0, 0)));
+TEST(QueryRequestTest, ConvertToAggregationWithAllowDiskUseTrueSucceeds) {
+    QueryRequest qr(testns);
+    qr.setAllowDiskUse(true);
+    const auto aggCmd = qr.asAggregationCommand();
+    ASSERT_OK(aggCmd.getStatus());
 
-    ASSERT_EQ(qr->getComment(), "ParseFromLegacyStringMetaOpComment");
-    ASSERT_BSONOBJ_EQ(qr->getFilter(), fromjson("{a: 1}"));
+    auto ar = AggregationRequest::parseFromBSON(testns, aggCmd.getValue());
+    ASSERT_OK(ar.getStatus());
+    ASSERT_EQ(true, ar.getValue().shouldAllowDiskUse());
+}
+
+TEST(QueryRequestTest, ConvertToAggregationWithAllowDiskUseFalseSucceeds) {
+    QueryRequest qr(testns);
+    qr.setAllowDiskUse(false);
+    const auto aggCmd = qr.asAggregationCommand();
+    ASSERT_OK(aggCmd.getStatus());
+
+    auto ar = AggregationRequest::parseFromBSON(testns, aggCmd.getValue());
+    ASSERT_OK(ar.getStatus());
+    ASSERT_EQ(false, ar.getValue().shouldAllowDiskUse());
+}
+
+TEST(QueryRequestTest, ConvertToFindWithAllowDiskUseTrueSucceeds) {
+    QueryRequest qr(testns);
+    qr.setAllowDiskUse(true);
+    const auto findCmd = qr.asFindCommand();
+
+    BSONElement elem = findCmd[QueryRequest::kAllowDiskUseField];
+    ASSERT_EQ(true, elem.isBoolean());
+    ASSERT_EQ(true, elem.Bool());
+}
+
+TEST(QueryRequestTest, ConvertToFindWithAllowDiskUseFalseSucceeds) {
+    QueryRequest qr(testns);
+    qr.setAllowDiskUse(false);
+    const auto findCmd = qr.asFindCommand();
+
+    ASSERT_FALSE(findCmd[QueryRequest::kAllowDiskUseField]);
 }
 
 TEST(QueryRequestTest, ParseFromLegacyQuery) {
@@ -1418,17 +1486,17 @@ class QueryRequestTest : public ServiceContextTest {};
 
 TEST_F(QueryRequestTest, ParseFromUUID) {
     auto opCtx = makeOperationContext();
-    // Register a UUID/Collection pair in the UUIDCatalog.
+    // Register a UUID/Collection pair in the CollectionCatalog.
     const CollectionUUID uuid = UUID::gen();
     const NamespaceString nss("test.testns");
-    CollectionMock coll(nss);
-    UUIDCatalog& catalog = UUIDCatalog::get(opCtx.get());
-    catalog.onCreateCollection(opCtx.get(), &coll, uuid);
+    auto coll = std::make_unique<CollectionMock>(nss);
+    CollectionCatalog& catalog = CollectionCatalog::get(opCtx.get());
+    catalog.registerCollection(uuid, std::move(coll));
     QueryRequest qr(NamespaceStringOrUUID("test", uuid));
     // Ensure a call to refreshNSS succeeds.
     qr.refreshNSS(opCtx.get());
     ASSERT_EQ(nss, qr.nss());
 }
 
-}  // namespace mongo
 }  // namespace
+}  // namespace mongo

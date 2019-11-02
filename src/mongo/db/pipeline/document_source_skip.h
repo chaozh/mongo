@@ -57,10 +57,9 @@ public:
                 HostTypeRequirement::kNone,
                 DiskUseRequirement::kNoDiskUse,
                 FacetRequirement::kAllowed,
-                TransactionRequirement::kAllowed};
+                TransactionRequirement::kAllowed,
+                LookupRequirement::kAllowed};
     }
-
-    GetNextResult getNext() final;
 
     const char* getSourceName() const final {
         return kStageName.rawData();
@@ -72,12 +71,10 @@ public:
      */
     Pipeline::SourceContainer::iterator doOptimizeAt(Pipeline::SourceContainer::iterator itr,
                                                      Pipeline::SourceContainer* container) final;
+
     Value serialize(boost::optional<ExplainOptions::Verbosity> explain = boost::none) const final;
+
     boost::intrusive_ptr<DocumentSource> optimize() final;
-    BSONObjSet getOutputSorts() final {
-        return pSource ? pSource->getOutputSorts()
-                       : SimpleBSONObjComparator::kInstance.makeBSONObjSet();
-    }
 
     DepsTracker::State getDependencies(DepsTracker* deps) const final {
         return DepsTracker::State::SEE_NEXT;  // This doesn't affect needed fields
@@ -86,9 +83,9 @@ public:
     /**
      * The $skip stage must run on the merging half of the pipeline.
      */
-    boost::optional<MergingLogic> mergingLogic() final {
+    boost::optional<DistributedPlanLogic> distributedPlanLogic() final {
         // {shardsStage, mergingStage, sortPattern}
-        return MergingLogic{nullptr, this, boost::none};
+        return DistributedPlanLogic{nullptr, this, boost::none};
     }
 
     long long getSkip() const {
@@ -101,6 +98,8 @@ public:
 private:
     explicit DocumentSourceSkip(const boost::intrusive_ptr<ExpressionContext>& pExpCtx,
                                 long long nToSkip);
+
+    GetNextResult doGetNext() final;
 
     long long _nToSkip = 0;
     long long _nSkippedSoFar = 0;

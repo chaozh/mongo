@@ -29,7 +29,6 @@
 
 #pragma once
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/base/status_with.h"
 #include "mongo/db/repl/optime.h"
 
@@ -59,7 +58,8 @@ public:
 };
 
 class ReplicationRecoveryImpl : public ReplicationRecovery {
-    MONGO_DISALLOW_COPYING(ReplicationRecoveryImpl);
+    ReplicationRecoveryImpl(const ReplicationRecoveryImpl&) = delete;
+    ReplicationRecoveryImpl& operator=(const ReplicationRecoveryImpl&) = delete;
 
 public:
     ReplicationRecoveryImpl(StorageInterface* storageInterface,
@@ -69,13 +69,6 @@ public:
                           boost::optional<Timestamp> stableTimestamp) override;
 
 private:
-    /**
-     * Reconstruct prepared transactions by iterating over the transactions table to see which
-     * transactions should be in the prepared state, getting the corresponding oplog entry and
-     * applying the operations.
-     */
-    void _reconstructPreparedTransactions(OperationContext* opCtx);
-
     /**
      * After truncating the oplog, completes recovery if we're recovering from a stable timestamp
      * or a stable checkpoint.
@@ -108,9 +101,25 @@ private:
     StatusWith<OpTime> _getTopOfOplog(OperationContext* opCtx) const;
 
     /**
-     * Truncates the oplog after and including the "truncateTimestamp" entry.
+     * Truncates the oplog after the "truncateTimestamp" entry. Includes the "truncateTimestamp"
+     * entry if "inclusive" is set to true.
      */
-    void _truncateOplogTo(OperationContext* opCtx, Timestamp truncateTimestamp);
+    void _truncateOplogTo(OperationContext* opCtx, Timestamp truncateTimestamp, bool inclusive);
+
+    /**
+     * Uses the oplogTruncateAfterPoint, accessed via '_consistencyMarkers', to decide whether to
+     * truncate part of the oplog. If oplogTruncateAfterPoint has been set, then there may be holes
+     * in the oplog after that point. In that case, we will truncate the oplog entries starting at
+     * and including the entry associated with the oplogTruncateAfterPoint timestamp.
+     *
+     * If the oplogTruncateAfterPoint is earlier in time than or equal to the stable timestamp, we
+     * will truncate the oplog after the stable timestamp instead. There cannot be holes before a
+     * stable timestamp. The oplogTruncateAfterPoint can lag behind the stable timestamp because the
+     * oplogTruncateAfterPoint is updated on primaries by an asynchronously looping thread that can
+     * potentially be starved.
+     */
+    void _truncateOplogIfNeededAndThenClearOplogTruncateAfterPoint(
+        OperationContext* opCtx, boost::optional<Timestamp> stableTimestamp);
 
     StorageInterface* _storageInterface;
     ReplicationConsistencyMarkers* _consistencyMarkers;

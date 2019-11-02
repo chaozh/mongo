@@ -30,6 +30,7 @@
 #pragma once
 
 #include "mongo/db/matcher/expression.h"
+#include "mongo/db/matcher/expression_parser.h"
 #include "mongo/db/matcher/expression_tree.h"
 #include "mongo/db/matcher/expression_type.h"
 
@@ -86,14 +87,17 @@ public:
      * Converts a JSON schema, represented as BSON, into a semantically equivalent match expression
      * tree. Returns a non-OK status if the schema is invalid or cannot be parsed.
      */
-    static StatusWithMatchExpression parse(BSONObj schema, bool ignoreUnknownKeywords = false);
+    static StatusWithMatchExpression parse(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                                           BSONObj schema,
+                                           bool ignoreUnknownKeywords = false);
 
     /**
-     * Builds a set of type aliases from the given type element using 'aliasMap'. Returns a non-OK
-     * status if 'typeElt' is invalid or does not contain an entry in the 'aliasMap'.
+     * Builds a set of type aliases from the given type element using 'aliasMapFind'. Returns a
+     * non-OK status if 'typeElt' is invalid or does not contain an entry in the 'aliasMap' by
+     * calling 'aliasMapFind'.
      */
     static StatusWith<MatcherTypeSet> parseTypeSet(BSONElement typeElt,
-                                                   const StringMap<BSONType>& aliasMap);
+                                                   const findBSONTypeAliasFun& aliasMapFind);
 };
 
 }  // namespace mongo

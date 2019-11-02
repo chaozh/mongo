@@ -40,7 +40,7 @@ namespace mongo {
 
 class S2AccessMethod : public AbstractIndexAccessMethod {
 public:
-    S2AccessMethod(IndexCatalogEntry* btreeState, SortedDataInterface* btree);
+    S2AccessMethod(IndexCatalogEntry* btreeState, std::unique_ptr<SortedDataInterface> btree);
 
     /**
      * Takes an index spec object for this index and returns a copy tweaked to conform to the
@@ -65,9 +65,10 @@ private:
      * be multikey as a result of inserting 'keys'.
      */
     void doGetKeys(const BSONObj& obj,
-                   BSONObjSet* keys,
-                   BSONObjSet* multikeyMetadataKeys,
-                   MultikeyPaths* multikeyPaths) const final;
+                   KeyStringSet* keys,
+                   KeyStringSet* multikeyMetadataKeys,
+                   MultikeyPaths* multikeyPaths,
+                   boost::optional<RecordId> id) const final;
 
     S2IndexingParams _params;
 

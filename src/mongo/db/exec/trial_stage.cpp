@@ -143,8 +143,8 @@ PlanStage::StageState TrialStage::_workTrialPlan(WorkingSetID* out) {
             return NEED_TIME;
         case PlanStage::FAILURE:
             // Either of these cause us to immediately end the trial phase and switch to the backup.
-            BSONObj statusObj;
-            WorkingSetCommon::getStatusMemberObject(*_ws, *out, &statusObj);
+            auto statusDoc = WorkingSetCommon::getStatusMemberDocument(*_ws, *out);
+            BSONObj statusObj = statusDoc ? statusDoc->toBson() : BSONObj();
             LOG(1) << "Trial plan failed; switching to backup plan. Status: " << redact(statusObj);
             _specificStats.trialCompleted = true;
             _replaceCurrentPlan(_backupPlan);
@@ -174,8 +174,8 @@ void TrialStage::_assessTrialAndBuildFinalPlan() {
     // final plan which UNIONs across the QueuedDataStage and the trial plan.
     std::unique_ptr<PlanStage> unionPlan =
         std::make_unique<OrStage>(getOpCtx(), _ws, false, nullptr);
-    static_cast<OrStage*>(unionPlan.get())->addChild(_queuedData.release());
-    static_cast<OrStage*>(unionPlan.get())->addChild(_children.front().release());
+    static_cast<OrStage*>(unionPlan.get())->addChild(std::move(_queuedData));
+    static_cast<OrStage*>(unionPlan.get())->addChild(std::move(_children.front()));
     _replaceCurrentPlan(unionPlan);
 }
 

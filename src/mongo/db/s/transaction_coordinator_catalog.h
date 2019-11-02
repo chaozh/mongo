@@ -32,7 +32,6 @@
 #include <boost/optional.hpp>
 #include <map>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/db/s/transaction_coordinator.h"
 #include "mongo/stdx/condition_variable.h"
 #include "mongo/util/concurrency/with_lock.h"
@@ -40,11 +39,12 @@
 namespace mongo {
 
 /**
- * A container for TransactionCoordinator objects, indexed by logical session id and transaction
- * number. It allows holding several coordinator objects per session.
+ * This class is a registry for all the active TransactionCoordinator objects, indexed by lsid and
+ * txnNumber. It supports holding several coordinator objects per session.
  */
 class TransactionCoordinatorCatalog {
-    MONGO_DISALLOW_COPYING(TransactionCoordinatorCatalog);
+    TransactionCoordinatorCatalog(const TransactionCoordinatorCatalog&) = delete;
+    TransactionCoordinatorCatalog& operator=(const TransactionCoordinatorCatalog&) = delete;
 
 public:
     TransactionCoordinatorCatalog();
@@ -61,11 +61,15 @@ public:
     void onStepDown();
 
     /**
-     * Inserts a coordinator into the catalog.
+     * Inserts a coordinator to be tracked by the catalog.
      *
-     * Note: Inserting a duplicate coordinator for the given session id and transaction number
-     * is not allowed and will lead to an invariant failure. Users of the catalog must ensure this
-     * does not take place.
+     * Duplicate lsid + txnNumber are not legal and will lead to invariant. The consumer of this
+     * class (TransactionCoordinatorService) guarantees this will not happen through the following
+     * means:
+     *  - At step-up recovery time - the catalog starts empty and the coordinators inserted are read
+     *    from the `config.coordinators` collection, which only contains unique entries
+     *  - At regular run time - the session check-out mechanism guarantees that calls to get,
+     *    followed by insert are atomic for the same lsid + txnNumber
      */
     void insert(OperationContext* opCtx,
                 const LogicalSessionId& lsid,
@@ -100,6 +104,17 @@ public:
      */
     std::string toString() const;
 
+    using FilterPredicate =
+        std::function<bool(const LogicalSessionId lsid,
+                           const TxnNumber txnNumber,
+                           const std::shared_ptr<TransactionCoordinator> transactionCoordinator)>;
+    using FilterVisitor =
+        std::function<void(const LogicalSessionId lsid,
+                           const TxnNumber txnNumber,
+                           const std::shared_ptr<TransactionCoordinator> transactionCoordinator)>;
+
+    void filter(FilterPredicate predicate, FilterVisitor visitor);
+
 private:
     // Map of transaction coordinators, ordered in decreasing transaction number with the most
     // recent transaction at the front
@@ -110,7 +125,7 @@ private:
      * Blocks in an interruptible wait until the catalog is not marked as having a stepup in
      * progress.
      */
-    void _waitForStepUpToComplete(stdx::unique_lock<stdx::mutex>& lk, OperationContext* opCtx);
+    void _waitForStepUpToComplete(stdx::unique_lock<Latch>& lk, OperationContext* opCtx);
 
     /**
      * Removes the coordinator with the given session id and transaction number from the catalog, if
@@ -122,31 +137,17 @@ private:
     void _remove(const LogicalSessionId& lsid, TxnNumber txnNumber);
 
     /**
-     * Goes through the '_coordinatorsToCleanup' list and deletes entries from it. As a side-effect
-     * also unlocks the passed-in lock, so no other synchronized members of the class should be
-     * accessed after it is called.
-     */
-    void _cleanupCompletedCoordinators(stdx::unique_lock<stdx::mutex>& ul);
-
-    /**
      * Constructs a string representation of all the coordinators registered on the catalog.
      */
     std::string _toString(WithLock wl) const;
 
     // Protects the state below.
-    mutable stdx::mutex _mutex;
+    mutable Mutex _mutex = MONGO_MAKE_LATCH("TransactionCoordinatorCatalog::_mutex");
 
     // Contains TransactionCoordinator objects by session id and transaction number. May contain
     // more than one coordinator per session. All coordinators for a session that do not correspond
     // to the latest transaction should either be in the process of committing or aborting.
     LogicalSessionIdMap<TransactionCoordinatorMap> _coordinatorsBySession;
-
-    // Used only for testing. Contains TransactionCoordinator objects which have completed their
-    // commit coordination and would normally be expunged from memory.
-    LogicalSessionIdMap<TransactionCoordinatorMap> _coordinatorsBySessionDefunct;
-
-    // Set of coordinators which have completed, but have not yet been destroyed.
-    std::list<std::shared_ptr<TransactionCoordinator>> _coordinatorsToCleanup;
 
     // Stores the result of the coordinator catalog's recovery attempt (the status passed to
     // exitStepUp). This is what the values mean:

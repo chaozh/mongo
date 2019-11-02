@@ -45,12 +45,18 @@
 #include "mongo/stdx/thread.h"
 #include "mongo/util/concurrency/thread_name.h"
 #include "mongo/util/exit.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
 namespace {
 thread_local ServiceContext::UniqueClient currentClient;
+
+void invariantNoCurrentClient() {
+    invariant(!haveClient(),
+              str::stream() << "Already have client on this thread: "  //
+                            << '"' << Client::getCurrent()->desc() << '"');
+}
 }  // namespace
 
 void Client::initThread(StringData desc, transport::SessionHandle session) {
@@ -60,7 +66,7 @@ void Client::initThread(StringData desc, transport::SessionHandle session) {
 void Client::initThread(StringData desc,
                         ServiceContext* service,
                         transport::SessionHandle session) {
-    invariant(!haveClient());
+    invariantNoCurrentClient();
 
     std::string fullDesc;
     if (session) {
@@ -73,6 +79,13 @@ void Client::initThread(StringData desc,
 
     // Create the client obj, attach to thread
     currentClient = service->makeClient(fullDesc, std::move(session));
+}
+
+void Client::initKillableThread(StringData desc, ServiceContext* service) {
+    initThread(desc, service, nullptr);
+
+    stdx::lock_guard lk(*currentClient);
+    currentClient->setSystemOperationKillable(lk);
 }
 
 namespace {
@@ -109,13 +122,13 @@ ServiceContext::UniqueOperationContext Client::makeOperationContext() {
 
 void Client::setOperationContext(OperationContext* opCtx) {
     // We can only set the OperationContext once before resetting it.
-    invariant(opCtx != NULL && _opCtx == NULL);
+    invariant(opCtx != nullptr && _opCtx == nullptr);
     _opCtx = opCtx;
 }
 
 void Client::resetOperationContext() {
-    invariant(_opCtx != NULL);
-    _opCtx = NULL;
+    invariant(_opCtx != nullptr);
+    _opCtx = nullptr;
 }
 
 std::string Client::clientAddress(bool includePort) const {
@@ -147,7 +160,7 @@ ServiceContext::UniqueClient Client::releaseCurrent() {
 }
 
 void Client::setCurrent(ServiceContext::UniqueClient client) {
-    invariant(!haveClient());
+    invariantNoCurrentClient();
     currentClient = std::move(client);
 }
 
@@ -157,7 +170,7 @@ ThreadClient::ThreadClient(ServiceContext* serviceContext)
 ThreadClient::ThreadClient(StringData desc,
                            ServiceContext* serviceContext,
                            transport::SessionHandle session) {
-    invariant(!currentClient);
+    invariantNoCurrentClient();
     Client::initThread(desc, serviceContext, std::move(session));
 }
 

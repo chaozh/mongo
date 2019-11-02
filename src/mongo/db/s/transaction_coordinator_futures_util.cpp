@@ -33,12 +33,13 @@
 
 #include "mongo/db/s/transaction_coordinator_futures_util.h"
 
-#include "mongo/client/remote_command_retry_scheduler.h"
 #include "mongo/client/remote_command_targeter.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/s/sharding_state.h"
+#include "mongo/rpc/get_status_from_command_result.h"
+#include "mongo/s/grid.h"
 #include "mongo/transport/service_entry_point.h"
-#include "mongo/util/fail_point_service.h"
+#include "mongo/util/fail_point.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
@@ -59,49 +60,44 @@ AsyncWorkScheduler::AsyncWorkScheduler(ServiceContext* serviceContext)
 
 AsyncWorkScheduler::~AsyncWorkScheduler() {
     {
-        stdx::unique_lock<stdx::mutex> ul(_mutex);
-        _allListsEmptyCV.wait(ul, [&] {
-            return _activeOpContexts.empty() && _activeHandles.empty() && _childSchedulers.empty();
-        });
+        stdx::lock_guard<Latch> lg(_mutex);
+        invariant(_quiesced(lg));
     }
 
     if (!_parent)
         return;
 
-    stdx::lock_guard<stdx::mutex> lg(_parent->_mutex);
+    stdx::lock_guard<Latch> lg(_parent->_mutex);
     _parent->_childSchedulers.erase(_itToRemove);
     _parent->_notifyAllTasksComplete(lg);
     _parent = nullptr;
 }
 
 Future<executor::TaskExecutor::ResponseStatus> AsyncWorkScheduler::scheduleRemoteCommand(
-    const ShardId& shardId, const ReadPreferenceSetting& readPref, const BSONObj& commandObj) {
+    const ShardId& shardId,
+    const ReadPreferenceSetting& readPref,
+    const BSONObj& commandObj,
+    OperationContextFn operationContextFn) {
 
-    bool isSelfShard = [this, shardId] {
-        if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
-            return shardId == ShardRegistry::kConfigServerShardId;
-        }
-        if (serverGlobalParams.clusterRole == ClusterRole::ShardServer) {
-            return shardId == ShardingState::get(_serviceContext)->shardId();
-        }
-        MONGO_UNREACHABLE;  // Only sharded systems should use the two-phase commit path.
-    }();
+    const bool isSelfShard = (shardId == getLocalShardId(_serviceContext));
 
     if (isSelfShard) {
         // If sending a command to the same shard as this node is in, send it directly to this node
         // rather than going through the host targeting below. This ensures that the state changes
         // for the participant and coordinator occur sequentially on a single branch of replica set
         // history. See SERVER-38142 for details.
-        return scheduleWork([ this, shardId, commandObj = commandObj.getOwned() ](OperationContext *
-                                                                                  opCtx) {
-            // Note: This internal authorization is tied to the lifetime of 'opCtx', which is
-            // destroyed by 'scheduleWork' immediately after this lambda ends.
-            AuthorizationSession::get(Client::getCurrent())
-                ->grantInternalAuthorization(Client::getCurrent());
+        return scheduleWork([this, shardId, operationContextFn, commandObj = commandObj.getOwned()](
+                                OperationContext* opCtx) {
+            operationContextFn(opCtx);
 
-            if (MONGO_FAIL_POINT(hangWhileTargetingLocalHost)) {
+            // Note: This internal authorization is tied to the lifetime of the client, which will
+            // be destroyed by 'scheduleWork' immediately after this lambda ends
+            AuthorizationSession::get(opCtx->getClient())
+                ->grantInternalAuthorization(opCtx->getClient());
+
+            if (MONGO_unlikely(hangWhileTargetingLocalHost.shouldFail())) {
                 LOG(0) << "Hit hangWhileTargetingLocalHost failpoint";
-                MONGO_FAIL_POINT_PAUSE_WHILE_SET_OR_INTERRUPTED(opCtx, hangWhileTargetingLocalHost);
+                hangWhileTargetingLocalHost.pauseWhileSet(opCtx);
             }
 
             const auto service = opCtx->getServiceContext();
@@ -122,10 +118,10 @@ Future<executor::TaskExecutor::ResponseStatus> AsyncWorkScheduler::scheduleRemot
         });
     }
 
-    return _targetHostAsync(shardId, readPref)
-        .then([ this, shardId, commandObj = commandObj.getOwned(), readPref ](
-            HostAndPort shardHostAndPort) mutable {
-            executor::RemoteCommandRequest request(shardHostAndPort,
+    return _targetHostAsync(shardId, readPref, operationContextFn)
+        .then([this, shardId, commandObj = commandObj.getOwned(), readPref](
+                  HostAndShard hostAndShard) mutable {
+            executor::RemoteCommandRequest request(hostAndShard.hostTargeted,
                                                    NamespaceString::kAdminDb.toString(),
                                                    commandObj,
                                                    readPref.toContainingBSON(),
@@ -133,7 +129,7 @@ Future<executor::TaskExecutor::ResponseStatus> AsyncWorkScheduler::scheduleRemot
 
             auto pf = makePromiseFuture<ResponseStatus>();
 
-            stdx::unique_lock<stdx::mutex> ul(_mutex);
+            stdx::unique_lock<Latch> ul(_mutex);
             uassertStatusOK(_shutdownStatus);
 
             auto scheduledCommandHandle =
@@ -141,16 +137,27 @@ Future<executor::TaskExecutor::ResponseStatus> AsyncWorkScheduler::scheduleRemot
                     this,
                     commandObj = std::move(commandObj),
                     shardId = std::move(shardId),
+                    hostTargeted = std::move(hostAndShard.hostTargeted),
+                    shard = std::move(hostAndShard.shard),
                     promise = std::make_shared<Promise<ResponseStatus>>(std::move(pf.promise))
                 ](const RemoteCommandCallbackArgs& args) mutable noexcept {
                     auto status = args.response.status;
+                    shard->updateReplSetMonitor(hostTargeted, status);
+
                     // Only consider actual failures to send the command as errors.
                     if (status.isOK()) {
+                        auto commandStatus = getStatusFromCommandResult(args.response.data);
+                        shard->updateReplSetMonitor(hostTargeted, commandStatus);
+
+                        auto writeConcernStatus =
+                            getWriteConcernStatusFromCommandResult(args.response.data);
+                        shard->updateReplSetMonitor(hostTargeted, writeConcernStatus);
+
                         promise->emplaceValue(std::move(args.response));
                     } else {
                         promise->setError([&] {
                             if (status == ErrorCodes::CallbackCanceled) {
-                                stdx::unique_lock<stdx::mutex> ul(_mutex);
+                                stdx::unique_lock<Latch> ul(_mutex);
                                 return _shutdownStatus.isOK() ? status : _shutdownStatus;
                             }
                             return status;
@@ -164,8 +171,8 @@ Future<executor::TaskExecutor::ResponseStatus> AsyncWorkScheduler::scheduleRemot
             ul.unlock();
 
             return std::move(pf.future).tapAll(
-                [ this, it = std::move(it) ](StatusWith<ResponseStatus> s) {
-                    stdx::lock_guard<stdx::mutex> lg(_mutex);
+                [this, it = std::move(it)](StatusWith<ResponseStatus> s) {
+                    stdx::lock_guard<Latch> lg(_mutex);
                     _activeHandles.erase(it);
                     _notifyAllTasksComplete(lg);
                 });
@@ -173,9 +180,9 @@ Future<executor::TaskExecutor::ResponseStatus> AsyncWorkScheduler::scheduleRemot
 }
 
 std::unique_ptr<AsyncWorkScheduler> AsyncWorkScheduler::makeChildScheduler() {
-    auto child = stdx::make_unique<AsyncWorkScheduler>(_serviceContext);
+    auto child = std::make_unique<AsyncWorkScheduler>(_serviceContext);
 
-    stdx::lock_guard<stdx::mutex> lg(_mutex);
+    stdx::lock_guard<Latch> lg(_mutex);
     if (!_shutdownStatus.isOK())
         child->shutdown(_shutdownStatus);
 
@@ -188,7 +195,7 @@ std::unique_ptr<AsyncWorkScheduler> AsyncWorkScheduler::makeChildScheduler() {
 void AsyncWorkScheduler::shutdown(Status status) {
     invariant(!status.isOK());
 
-    stdx::lock_guard<stdx::mutex> lg(_mutex);
+    stdx::lock_guard<Latch> lg(_mutex);
     if (!_shutdownStatus.isOK())
         return;
 
@@ -208,28 +215,53 @@ void AsyncWorkScheduler::shutdown(Status status) {
     }
 }
 
-Future<HostAndPort> AsyncWorkScheduler::_targetHostAsync(const ShardId& shardId,
-                                                         const ReadPreferenceSetting& readPref) {
-    return scheduleWork([shardId, readPref](OperationContext* opCtx) {
-        const auto shardRegistry = Grid::get(opCtx)->shardRegistry();
-        const auto shard = uassertStatusOK(shardRegistry->getShard(opCtx, shardId));
-
-        if (MONGO_FAIL_POINT(hangWhileTargetingRemoteHost)) {
-            LOG(0) << "Hit hangWhileTargetingRemoteHost failpoint for shard " << shardId;
-            MONGO_FAIL_POINT_PAUSE_WHILE_SET_OR_INTERRUPTED(opCtx, hangWhileTargetingRemoteHost);
-        }
-
-        // TODO (SERVER-35678): Return a SemiFuture<HostAndPort> rather than using a blocking call
-        return shard->getTargeter()->findHostWithMaxWait(readPref, Seconds(20)).get(opCtx);
+void AsyncWorkScheduler::join() {
+    stdx::unique_lock<Latch> ul(_mutex);
+    _allListsEmptyCV.wait(ul, [&] {
+        return _activeOpContexts.empty() && _activeHandles.empty() && _childSchedulers.empty();
     });
 }
 
-void AsyncWorkScheduler::_notifyAllTasksComplete(WithLock) {
-    if (_shutdownStatus.isOK())
-        return;
+Future<AsyncWorkScheduler::HostAndShard> AsyncWorkScheduler::_targetHostAsync(
+    const ShardId& shardId,
+    const ReadPreferenceSetting& readPref,
+    OperationContextFn operationContextFn) {
+    return scheduleWork([shardId, readPref, operationContextFn](OperationContext* opCtx) {
+        operationContextFn(opCtx);
+        const auto shardRegistry = Grid::get(opCtx)->shardRegistry();
+        const auto shard = uassertStatusOK(shardRegistry->getShard(opCtx, shardId));
 
-    if (_activeOpContexts.empty() && _activeHandles.empty() && _childSchedulers.empty())
+        if (MONGO_unlikely(hangWhileTargetingRemoteHost.shouldFail())) {
+            LOG(0) << "Hit hangWhileTargetingRemoteHost failpoint for shard " << shardId;
+            hangWhileTargetingRemoteHost.pauseWhileSet(opCtx);
+        }
+
+        // TODO (SERVER-35678): Return a SemiFuture<HostAndShard> rather than using a blocking call
+        return HostAndShard{
+            shard->getTargeter()->findHostWithMaxWait(readPref, Seconds(20)).get(opCtx),
+            std::move(shard)};
+    });
+}
+
+bool AsyncWorkScheduler::_quiesced(WithLock) const {
+    return _activeOpContexts.empty() && _activeHandles.empty() && _childSchedulers.empty();
+}
+
+void AsyncWorkScheduler::_notifyAllTasksComplete(WithLock wl) {
+    if (_quiesced(wl))
         _allListsEmptyCV.notify_all();
+}
+
+ShardId getLocalShardId(ServiceContext* service) {
+    if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
+        return ShardRegistry::kConfigServerShardId;
+    }
+    if (serverGlobalParams.clusterRole == ClusterRole::ShardServer) {
+        return ShardingState::get(service)->shardId();
+    }
+
+    // Only sharded systems should use the two-phase commit path
+    MONGO_UNREACHABLE;
 }
 
 Future<void> whenAll(std::vector<Future<void>>& futures) {

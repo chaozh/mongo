@@ -29,18 +29,19 @@
 
 #pragma once
 
+#include <memory>
+
 #include "mongo/bson/bsonelement_comparator.h"
 #include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/db/matcher/expression.h"
 #include "mongo/db/matcher/expression_path.h"
 #include "mongo/db/query/collation/collator_interface.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/stdx/unordered_map.h"
 
 namespace pcrecpp {
 class RE;
-}  // namespace pcrecpp;
+}  // namespace pcrecpp
 
 namespace mongo {
 
@@ -104,7 +105,7 @@ public:
 
     virtual ~ComparisonMatchExpressionBase() = default;
 
-    virtual void debugString(StringBuilder& debug, int level = 0) const;
+    virtual void debugString(StringBuilder& debug, int indentationLevel = 0) const;
 
     BSONObj getSerializedRightHandSide() const final;
 
@@ -191,7 +192,7 @@ public:
 
     virtual std::unique_ptr<MatchExpression> shallowClone() const {
         std::unique_ptr<ComparisonMatchExpression> e =
-            stdx::make_unique<EqualityMatchExpression>(path(), _rhs);
+            std::make_unique<EqualityMatchExpression>(path(), _rhs);
         if (getTag()) {
             e->setTag(getTag()->clone());
         }
@@ -213,7 +214,7 @@ public:
 
     virtual std::unique_ptr<MatchExpression> shallowClone() const {
         std::unique_ptr<ComparisonMatchExpression> e =
-            stdx::make_unique<LTEMatchExpression>(path(), _rhs);
+            std::make_unique<LTEMatchExpression>(path(), _rhs);
         if (getTag()) {
             e->setTag(getTag()->clone());
         }
@@ -235,7 +236,7 @@ public:
 
     virtual std::unique_ptr<MatchExpression> shallowClone() const {
         std::unique_ptr<ComparisonMatchExpression> e =
-            stdx::make_unique<LTMatchExpression>(path(), _rhs);
+            std::make_unique<LTMatchExpression>(path(), _rhs);
         if (getTag()) {
             e->setTag(getTag()->clone());
         }
@@ -257,7 +258,7 @@ public:
 
     virtual std::unique_ptr<MatchExpression> shallowClone() const {
         std::unique_ptr<ComparisonMatchExpression> e =
-            stdx::make_unique<GTMatchExpression>(path(), _rhs);
+            std::make_unique<GTMatchExpression>(path(), _rhs);
         if (getTag()) {
             e->setTag(getTag()->clone());
         }
@@ -279,7 +280,7 @@ public:
 
     virtual std::unique_ptr<MatchExpression> shallowClone() const {
         std::unique_ptr<ComparisonMatchExpression> e =
-            stdx::make_unique<GTEMatchExpression>(path(), _rhs);
+            std::make_unique<GTEMatchExpression>(path(), _rhs);
         if (getTag()) {
             e->setTag(getTag()->clone());
         }
@@ -299,7 +300,7 @@ public:
 
     virtual std::unique_ptr<MatchExpression> shallowClone() const {
         std::unique_ptr<RegexMatchExpression> e =
-            stdx::make_unique<RegexMatchExpression>(path(), _regex, _flags);
+            std::make_unique<RegexMatchExpression>(path(), _regex, _flags);
         if (getTag()) {
             e->setTag(getTag()->clone());
         }
@@ -308,7 +309,7 @@ public:
 
     bool matchesSingleElement(const BSONElement&, MatchDetails* details = nullptr) const final;
 
-    virtual void debugString(StringBuilder& debug, int level) const;
+    virtual void debugString(StringBuilder& debug, int indentationLevel) const;
 
     BSONObj getSerializedRightHandSide() const final;
 
@@ -343,7 +344,7 @@ public:
 
     virtual std::unique_ptr<MatchExpression> shallowClone() const {
         std::unique_ptr<ModMatchExpression> m =
-            stdx::make_unique<ModMatchExpression>(path(), _divisor, _remainder);
+            std::make_unique<ModMatchExpression>(path(), _divisor, _remainder);
         if (getTag()) {
             m->setTag(getTag()->clone());
         }
@@ -352,7 +353,7 @@ public:
 
     bool matchesSingleElement(const BSONElement&, MatchDetails* details = nullptr) const final;
 
-    virtual void debugString(StringBuilder& debug, int level) const;
+    virtual void debugString(StringBuilder& debug, int indentationLevel) const;
 
     BSONObj getSerializedRightHandSide() const final;
 
@@ -379,7 +380,7 @@ public:
     explicit ExistsMatchExpression(StringData path);
 
     virtual std::unique_ptr<MatchExpression> shallowClone() const {
-        std::unique_ptr<ExistsMatchExpression> e = stdx::make_unique<ExistsMatchExpression>(path());
+        std::unique_ptr<ExistsMatchExpression> e = std::make_unique<ExistsMatchExpression>(path());
         if (getTag()) {
             e->setTag(getTag()->clone());
         }
@@ -388,7 +389,7 @@ public:
 
     bool matchesSingleElement(const BSONElement&, MatchDetails* details = nullptr) const final;
 
-    virtual void debugString(StringBuilder& debug, int level) const;
+    virtual void debugString(StringBuilder& debug, int indentationLevel) const;
 
     BSONObj getSerializedRightHandSide() const final;
 
@@ -411,7 +412,7 @@ public:
 
     bool matchesSingleElement(const BSONElement&, MatchDetails* details = nullptr) const final;
 
-    virtual void debugString(StringBuilder& debug, int level) const;
+    virtual void debugString(StringBuilder& debug, int indentationLevel) const;
 
     BSONObj getSerializedRightHandSide() const final;
 
@@ -426,9 +427,11 @@ public:
 
     Status addRegex(std::unique_ptr<RegexMatchExpression> expr);
 
-    const BSONEltFlatSet& getEqualities() const {
+    const std::vector<BSONElement>& getEqualities() const {
         return _equalitySet;
     }
+
+    bool contains(const BSONElement& e) const;
 
     const std::vector<std::unique_ptr<RegexMatchExpression>>& getRegexes() const {
         return _regexes;
@@ -465,15 +468,16 @@ private:
     // '_equalitySet' in case '_collator' changes after elements have been added.
     //
     // We keep the equalities in sorted order according to the current BSON element comparator. This
-    // list of equalities will be used to construct a boost::flat_set, which maintains the set of
-    // elements in sorted order within a contiguous region of memory. Sorting and then constructing
-    // a flat_set is O(n log n), whereas the boost::flat_set constructor is O(n ^ 2) due to
-    // https://svn.boost.org/trac10/ticket/13140.
+    // enables a fast-path to avoid re-sorting if the expression is serialized and re-parsed.
     std::vector<BSONElement> _originalEqualityVector;
 
-    // Set of equality elements associated with this expression. '_eltCmp' is used as a comparator
-    // for this set.
-    BSONEltFlatSet _equalitySet;
+    // Deduped set of equality elements associated with this expression. Kept in sorted order to
+    // support std::binary_search. Because we need to sort the elements anyway for things like index
+    // bounds building, using binary search avoids the overhead of inserting into a hash table which
+    // doesn't pay for itself in the common case where lookups are done a few times if ever.
+    // TODO It may be worth dynamically creating a hashset after matchesSingleElement() has been
+    // called "many" times.
+    std::vector<BSONElement> _equalitySet;
 
     // Container of regex elements this object owns.
     std::vector<std::unique_ptr<RegexMatchExpression>> _regexes;
@@ -500,7 +504,7 @@ public:
 
     bool matchesSingleElement(const BSONElement&, MatchDetails* details = nullptr) const final;
 
-    virtual void debugString(StringBuilder& debug, int level) const;
+    virtual void debugString(StringBuilder& debug, int indentationLevel) const;
 
     BSONObj getSerializedRightHandSide() const final;
 
@@ -560,7 +564,7 @@ public:
 
     virtual std::unique_ptr<MatchExpression> shallowClone() const {
         std::unique_ptr<BitTestMatchExpression> bitTestMatchExpression =
-            stdx::make_unique<BitsAllSetMatchExpression>(path(), getBitPositions());
+            std::make_unique<BitsAllSetMatchExpression>(path(), getBitPositions());
         if (getTag()) {
             bitTestMatchExpression->setTag(getTag()->clone());
         }
@@ -581,7 +585,7 @@ public:
 
     virtual std::unique_ptr<MatchExpression> shallowClone() const {
         std::unique_ptr<BitTestMatchExpression> bitTestMatchExpression =
-            stdx::make_unique<BitsAllClearMatchExpression>(path(), getBitPositions());
+            std::make_unique<BitsAllClearMatchExpression>(path(), getBitPositions());
         if (getTag()) {
             bitTestMatchExpression->setTag(getTag()->clone());
         }
@@ -602,7 +606,7 @@ public:
 
     virtual std::unique_ptr<MatchExpression> shallowClone() const {
         std::unique_ptr<BitTestMatchExpression> bitTestMatchExpression =
-            stdx::make_unique<BitsAnySetMatchExpression>(path(), getBitPositions());
+            std::make_unique<BitsAnySetMatchExpression>(path(), getBitPositions());
         if (getTag()) {
             bitTestMatchExpression->setTag(getTag()->clone());
         }
@@ -623,7 +627,7 @@ public:
 
     virtual std::unique_ptr<MatchExpression> shallowClone() const {
         std::unique_ptr<BitTestMatchExpression> bitTestMatchExpression =
-            stdx::make_unique<BitsAnyClearMatchExpression>(path(), getBitPositions());
+            std::make_unique<BitsAnyClearMatchExpression>(path(), getBitPositions());
         if (getTag()) {
             bitTestMatchExpression->setTag(getTag()->clone());
         }

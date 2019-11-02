@@ -41,7 +41,7 @@
 #include "mongo/stdx/thread.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/concurrency/notification.h"
-#include "mongo/util/fail_point_service.h"
+#include "mongo/util/fail_point.h"
 #include "mongo/util/net/socket_exception.h"
 
 namespace {
@@ -62,7 +62,7 @@ SocketPair socketPair(const int type, const int protocol = 0);
 namespace detail {
 void awaitAccept(SOCKET* acceptSock, SOCKET listenSock, Notification<void>& notify) {
     *acceptSock = INVALID_SOCKET;
-    const SOCKET result = ::accept(listenSock, NULL, 0);
+    const SOCKET result = ::accept(listenSock, nullptr, 0);
     if (result != INVALID_SOCKET) {
         *acceptSock = result;
     }
@@ -98,7 +98,7 @@ SocketPair socketPair(const int type, const int protocol) {
     hints.ai_socktype = type;
     hints.ai_flags = AI_PASSIVE;
 
-    int result = ::getaddrinfo(NULL, "0", &hints, &res);
+    int result = ::getaddrinfo(nullptr, "0", &hints, &res);
     if (result != 0) {
         closesocket(listenSock);
         return SocketPair();
@@ -135,7 +135,7 @@ SocketPair socketPair(const int type, const int protocol) {
     connectHints.ai_socktype = type;
     std::stringstream portStream;
     portStream << ntohs(bindAddr.sin_port);
-    result = ::getaddrinfo(NULL, portStream.str().c_str(), &connectHints, &connectRes);
+    result = ::getaddrinfo(nullptr, portStream.str().c_str(), &connectHints, &connectRes);
     if (result != 0) {
         closesocket(listenSock);
         ::freeaddrinfo(res);
@@ -208,9 +208,9 @@ const char kSocketFailPointName[] = "throwSockExcep";
 class SocketFailPointTest : public unittest::Test {
 public:
     SocketFailPointTest()
-        : _failPoint(getGlobalFailPointRegistry()->getFailPoint(kSocketFailPointName)),
+        : _failPoint(globalFailPointRegistry().find(kSocketFailPointName)),
           _sockets(socketPair(SOCK_STREAM)) {
-        ASSERT_TRUE(_failPoint != NULL);
+        ASSERT_TRUE(_failPoint != nullptr);
         ASSERT_TRUE(_sockets.first);
         ASSERT_TRUE(_sockets.second);
     }
@@ -269,7 +269,9 @@ TEST_F(SocketFailPointTest, TestSend) {
     ASSERT_TRUE(tryRecv());
     {
         const ScopedFailPointEnabler enabled(*_failPoint);
-        ASSERT_THROWS(trySend(), NetworkException);
+        auto expectedEx =
+            makeSocketError(SocketErrorKind::SEND_ERROR, _sockets.first->remoteString());
+        ASSERT_THROWS_WHAT(trySend(), NetworkException, expectedEx.reason());
     }
     // Channel should be working again
     ASSERT_TRUE(trySend());
@@ -293,7 +295,9 @@ TEST_F(SocketFailPointTest, TestRecv) {
     {
         ASSERT_TRUE(trySend());  // data for recv
         const ScopedFailPointEnabler enabled(*_failPoint);
-        ASSERT_THROWS(tryRecv(), NetworkException);
+        auto expectedEx =
+            makeSocketError(SocketErrorKind::RECV_ERROR, _sockets.first->remoteString());
+        ASSERT_THROWS_WHAT(tryRecv(), NetworkException, expectedEx.reason());
     }
     ASSERT_TRUE(trySend());  // data for recv
     ASSERT_TRUE(tryRecv());

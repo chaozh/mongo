@@ -31,34 +31,34 @@
 
 #include "mongo/db/exec/fetch.h"
 
+#include <memory>
+
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/exec/filter.h"
 #include "mongo/db/exec/scoped_timer.h"
 #include "mongo/db/exec/working_set_common.h"
-#include "mongo/stdx/memory.h"
-#include "mongo/util/fail_point_service.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/fail_point.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
 using std::unique_ptr;
 using std::vector;
-using stdx::make_unique;
 
 // static
 const char* FetchStage::kStageType = "FETCH";
 
 FetchStage::FetchStage(OperationContext* opCtx,
                        WorkingSet* ws,
-                       PlanStage* child,
+                       std::unique_ptr<PlanStage> child,
                        const MatchExpression* filter,
                        const Collection* collection)
     : RequiresCollectionStage(kStageType, opCtx, collection),
       _ws(ws),
       _filter(filter),
       _idRetrying(WorkingSet::INVALID_ID) {
-    _children.emplace_back(child);
+    _children.emplace_back(std::move(child));
 }
 
 FetchStage::~FetchStage() {}
@@ -186,14 +186,14 @@ unique_ptr<PlanStageStats> FetchStage::getStats() {
     _commonStats.isEOF = isEOF();
 
     // Add a BSON representation of the filter to the stats tree, if there is one.
-    if (NULL != _filter) {
+    if (nullptr != _filter) {
         BSONObjBuilder bob;
         _filter->serialize(&bob);
         _commonStats.filter = bob.obj();
     }
 
-    unique_ptr<PlanStageStats> ret = make_unique<PlanStageStats>(_commonStats, STAGE_FETCH);
-    ret->specific = make_unique<FetchStats>(_specificStats);
+    unique_ptr<PlanStageStats> ret = std::make_unique<PlanStageStats>(_commonStats, STAGE_FETCH);
+    ret->specific = std::make_unique<FetchStats>(_specificStats);
     ret->children.emplace_back(child()->getStats());
     return ret;
 }

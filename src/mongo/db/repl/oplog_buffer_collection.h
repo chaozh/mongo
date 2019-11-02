@@ -34,7 +34,7 @@
 
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/repl/oplog_buffer.h"
-#include "mongo/stdx/mutex.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/util/queue.h"
 
 namespace mongo {
@@ -114,15 +114,9 @@ public:
 
     void startup(OperationContext* opCtx) override;
     void shutdown(OperationContext* opCtx) override;
-    void pushEvenIfFull(OperationContext* opCtx, const Value& value) override;
-    void push(OperationContext* opCtx, const Value& value) override;
-    /**
-     * Pushing documents with 'pushAllNonBlocking' will not handle sentinel documents properly. If
-     * pushing sentinel documents is required, use 'push' or 'pushEvenIfFull'.
-     */
-    void pushAllNonBlocking(OperationContext* opCtx,
-                            Batch::const_iterator begin,
-                            Batch::const_iterator end) override;
+    void push(OperationContext* opCtx,
+              Batch::const_iterator begin,
+              Batch::const_iterator end) override;
     void waitForSpace(OperationContext* opCtx, std::size_t size) override;
     bool isEmpty() const override;
     std::size_t getMaxSize() const override;
@@ -183,7 +177,7 @@ private:
     stdx::condition_variable _cvNoLongerEmpty;
 
     // Protects member data below and synchronizes it with the underlying collection.
-    mutable stdx::mutex _mutex;
+    mutable Mutex _mutex = MONGO_MAKE_LATCH("OplogBufferCollection::_mutex");
 
     // Number of documents in buffer.
     std::size_t _count = 0;

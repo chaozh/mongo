@@ -38,7 +38,7 @@
 
 #include "mongo/base/checked_cast.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/stdx/mutex.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/stdx/unordered_map.h"
 #include "mongo/transport/baton.h"
 #include "mongo/transport/session_asio.h"
@@ -55,6 +55,8 @@ namespace transport {
  * We implement our networking reactor on top of poll + eventfd for wakeups
  */
 class TransportLayerASIO::BatonASIO : public NetworkingBaton {
+    static const inline auto kDetached = Status(ErrorCodes::ShutdownInProgress, "Baton detached");
+
     /**
      * We use this internal reactor timer to exit run_until calls (by forcing an early timeout for
      * ::poll).
@@ -80,9 +82,14 @@ class TransportLayerASIO::BatonASIO : public NetworkingBaton {
     struct EventFDHolder {
         EventFDHolder() : fd(::eventfd(0, EFD_CLOEXEC)) {
             if (fd < 0) {
-                auto ewd = errnoWithDescription();
-                severe() << "error in eventfd: " << ewd;
-                fassertFailed(50833);
+                auto e = errno;
+                std::string reason = str::stream()
+                    << "error in creating eventfd: " << errnoWithDescription(e);
+
+                auto code = (e == EMFILE || e == ENFILE) ? ErrorCodes::TooManyFilesOpen
+                                                         : ErrorCodes::UnknownError;
+
+                uasserted(code, reason);
             }
         }
 
@@ -151,15 +158,14 @@ public:
         auto pf = makePromiseFuture<void>();
         auto id = timer.id();
 
-        stdx::unique_lock<stdx::mutex> lk(_mutex);
+        stdx::unique_lock<Latch> lk(_mutex);
 
         if (!_opCtx) {
-            return Status(ErrorCodes::ShutdownInProgress,
-                          "baton is detached, cannot waitUntil on timer");
+            return kDetached;
         }
 
         _safeExecute(std::move(lk),
-                     [ id, expiration, promise = std::move(pf.promise), this ]() mutable {
+                     [id, expiration, promise = std::move(pf.promise), this]() mutable {
                          auto iter = _timers.emplace(std::piecewise_construct,
                                                      std::forward_as_tuple(expiration),
                                                      std::forward_as_tuple(id, std::move(promise)));
@@ -172,7 +178,7 @@ public:
     bool cancelSession(Session& session) noexcept override {
         const auto id = session.id();
 
-        stdx::unique_lock<stdx::mutex> lk(_mutex);
+        stdx::unique_lock<Latch> lk(_mutex);
 
         if (_sessions.find(id) == _sessions.end()) {
             return false;
@@ -186,7 +192,7 @@ public:
     bool cancelTimer(const ReactorTimer& timer) noexcept override {
         const auto id = timer.id();
 
-        stdx::unique_lock<stdx::mutex> lk(_mutex);
+        stdx::unique_lock<Latch> lk(_mutex);
 
         if (_timersById.find(id) == _timersById.end()) {
             return false;
@@ -204,11 +210,11 @@ public:
         return true;
     }
 
-    void schedule(unique_function<void(OperationContext*)> func) noexcept override {
-        stdx::lock_guard<stdx::mutex> lk(_mutex);
+    void schedule(Task func) noexcept override {
+        stdx::lock_guard<Latch> lk(_mutex);
 
         if (!_opCtx) {
-            func(nullptr);
+            func(kDetached);
 
             return;
         }
@@ -255,23 +261,19 @@ public:
                 promise.emplaceValue();
             }
 
-            stdx::unique_lock<stdx::mutex> lk(_mutex);
+            stdx::unique_lock<Latch> lk(_mutex);
             while (_scheduled.size()) {
-                decltype(_scheduled) toRun;
-                {
-                    using std::swap;
-                    swap(_scheduled, toRun);
-                }
+                auto toRun = std::exchange(_scheduled, {});
 
                 lk.unlock();
                 for (auto& job : toRun) {
-                    job(_opCtx);
+                    job(Status::OK());
                 }
                 lk.lock();
             }
         });
 
-        stdx::unique_lock<stdx::mutex> lk(_mutex);
+        stdx::unique_lock<Latch> lk(_mutex);
 
         // If anything was scheduled, run it now.  No need to poll
         if (_scheduled.size()) {
@@ -303,7 +305,8 @@ public:
         // If we don't have a timeout, or we have a timeout that's unexpired, run poll.
         if (!deadline || (*deadline > now)) {
             if (deadline && !clkSource->tracksSystemClock()) {
-                invariant(clkSource->setAlarm(*deadline, [this] { notify(); }));
+                invariant(clkSource->setAlarm(*deadline,
+                                              [this, anchor = shared_from_this()] { notify(); }));
 
                 deadline.reset();
             }
@@ -372,14 +375,14 @@ private:
         auto id = session.id();
         auto pf = makePromiseFuture<void>();
 
-        stdx::unique_lock<stdx::mutex> lk(_mutex);
+        stdx::unique_lock<Latch> lk(_mutex);
 
         if (!_opCtx) {
-            return Status(ErrorCodes::ShutdownInProgress, "baton is detached, cannot addSession");
+            return kDetached;
         }
 
         _safeExecute(std::move(lk),
-                     [ id, fd, type, promise = std::move(pf.promise), this ]() mutable {
+                     [id, fd, type, promise = std::move(pf.promise), this]() mutable {
                          _sessions[id] = TransportSession{fd, type, std::move(promise)};
                      });
 
@@ -392,13 +395,10 @@ private:
         decltype(_timers) timers;
 
         {
-            stdx::lock_guard<stdx::mutex> lk(_mutex);
+            stdx::lock_guard<Latch> lk(_mutex);
 
-            {
-                stdx::lock_guard<Client> lk(*_opCtx->getClient());
-                invariant(_opCtx->getBaton().get() == this);
-                _opCtx->setBaton(nullptr);
-            }
+            invariant(_opCtx->getBaton().get() == this);
+            _opCtx->setBaton(nullptr);
 
             _opCtx = nullptr;
 
@@ -409,17 +409,15 @@ private:
         }
 
         for (auto& job : scheduled) {
-            job(nullptr);
+            job(kDetached);
         }
 
         for (auto& session : sessions) {
-            session.second.promise.setError(Status(ErrorCodes::ShutdownInProgress,
-                                                   "baton is detached, cannot wait for socket"));
+            session.second.promise.setError(kDetached);
         }
 
         for (auto& pair : timers) {
-            pair.second.promise.setError(Status(ErrorCodes::ShutdownInProgress,
-                                                "baton is detached, completing timer early"));
+            pair.second.promise.setError(kDetached);
         }
     }
 
@@ -441,13 +439,12 @@ private:
      * the eventfd.  If not, we run inline.
      */
     template <typename Callback>
-    void _safeExecute(stdx::unique_lock<stdx::mutex> lk, Callback&& cb) {
+    void _safeExecute(stdx::unique_lock<Latch> lk, Callback&& cb) {
         if (_inPoll) {
-            _scheduled.push_back(
-                [ cb = std::forward<Callback>(cb), this ](OperationContext*) mutable {
-                    stdx::lock_guard<stdx::mutex> lk(_mutex);
-                    cb();
-                });
+            _scheduled.push_back([cb = std::forward<Callback>(cb), this](Status) mutable {
+                stdx::lock_guard<Latch> lk(_mutex);
+                cb();
+            });
 
             efd().notify();
         } else {
@@ -459,7 +456,7 @@ private:
         return EventFDHolder::getForClient(_opCtx->getClient());
     }
 
-    stdx::mutex _mutex;
+    Mutex _mutex = MONGO_MAKE_LATCH("BatonASIO::_mutex");
 
     OperationContext* _opCtx;
 
@@ -475,7 +472,7 @@ private:
     stdx::unordered_map<size_t, decltype(_timers)::const_iterator> _timersById;
 
     // For tasks that come in via schedule.  Or that were deferred because we were in poll
-    std::vector<unique_function<void(OperationContext*)>> _scheduled;
+    std::vector<Task> _scheduled;
 
     // We hold the two following values at the object level to save on allocations when a baton is
     // waited on many times over the course of its lifetime.

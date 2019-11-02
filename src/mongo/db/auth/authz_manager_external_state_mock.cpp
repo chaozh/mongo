@@ -31,6 +31,7 @@
 
 #include "mongo/db/auth/authz_manager_external_state_mock.h"
 
+#include <memory>
 #include <string>
 
 #include "mongo/base/status.h"
@@ -44,9 +45,8 @@
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context_noop.h"
 #include "mongo/db/update/update_driver.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/util/map_util.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -81,17 +81,15 @@ void addPrivilegeObjectsOrWarningsToArrayElement(mutablebson::Element privileges
             fassert(17179,
                     warningsElement.appendString(
                         "",
-                        std::string(mongoutils::str::stream()
-                                    << "Skipped privileges on resource "
-                                    << privileges[i].getResourcePattern().toString()
-                                    << ". Reason: "
-                                    << errmsg)));
+                        std::string(str::stream() << "Skipped privileges on resource "
+                                                  << privileges[i].getResourcePattern().toString()
+                                                  << ". Reason: " << errmsg)));
         }
     }
 }
 }  // namespace
 
-AuthzManagerExternalStateMock::AuthzManagerExternalStateMock() : _authzManager(NULL) {}
+AuthzManagerExternalStateMock::AuthzManagerExternalStateMock() : _authzManager(nullptr) {}
 AuthzManagerExternalStateMock::~AuthzManagerExternalStateMock() {}
 
 void AuthzManagerExternalStateMock::setAuthorizationManager(AuthorizationManager* authzManager) {
@@ -111,7 +109,7 @@ void AuthzManagerExternalStateMock::setAuthzVersion(int version) {
 
 std::unique_ptr<AuthzSessionExternalState>
 AuthzManagerExternalStateMock::makeAuthzSessionExternalState(AuthorizationManager* authzManager) {
-    return stdx::make_unique<AuthzSessionExternalStateMock>(authzManager);
+    return std::make_unique<AuthzSessionExternalStateMock>(authzManager);
 }
 
 Status AuthzManagerExternalStateMock::findOne(OperationContext* opCtx,
@@ -131,7 +129,7 @@ Status AuthzManagerExternalStateMock::query(
     const NamespaceString& collectionName,
     const BSONObj& query,
     const BSONObj&,
-    const stdx::function<void(const BSONObj&)>& resultProcessor) {
+    const std::function<void(const BSONObj&)>& resultProcessor) {
     std::vector<BSONObjCollection::iterator> iterVector;
     Status status = _queryVector(opCtx, collectionName, query, &iterVector);
     if (!status.isOK()) {
@@ -165,7 +163,7 @@ Status AuthzManagerExternalStateMock::insert(OperationContext* opCtx,
     _documents[collectionName].push_back(toInsert);
 
     if (_authzManager) {
-        _authzManager->logOp(opCtx, "i", collectionName, toInsert, NULL);
+        _authzManager->logOp(opCtx, "i", collectionName, toInsert, nullptr);
     }
 
     return Status::OK();
@@ -263,7 +261,7 @@ Status AuthzManagerExternalStateMock::remove(OperationContext* opCtx,
         ++n;
 
         if (_authzManager) {
-            _authzManager->logOp(opCtx, "d", collectionName, idQuery, NULL);
+            _authzManager->logOp(opCtx, "d", collectionName, idQuery, nullptr);
         }
     }
     *numRemoved = n;

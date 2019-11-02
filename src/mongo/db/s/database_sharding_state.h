@@ -29,7 +29,6 @@
 
 #pragma once
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/s/sharding_migration_critical_section.h"
 #include "mongo/db/s/sharding_state_lock.h"
@@ -44,7 +43,8 @@ class OperationContext;
  * Synchronizes access to this shard server's cached database version for Database.
  */
 class DatabaseShardingState {
-    MONGO_DISALLOW_COPYING(DatabaseShardingState);
+    DatabaseShardingState(const DatabaseShardingState&) = delete;
+    DatabaseShardingState& operator=(const DatabaseShardingState&) = delete;
 
 public:
     /**
@@ -53,10 +53,17 @@ public:
      */
     using DSSLock = ShardingStateLock<DatabaseShardingState>;
 
-    static const Database::Decoration<DatabaseShardingState> get;
-
-    DatabaseShardingState();
+    DatabaseShardingState(const StringData dbName);
     ~DatabaseShardingState() = default;
+
+    /**
+     * Obtains the sharding state for the specified database. If it does not exist, it will be
+     * created and will remain in memory until the database is dropped.
+     *
+     * Must be called with some lock held on the database being looked up and the returned
+     * pointer must not be stored.
+     */
+    static DatabaseShardingState* get(OperationContext* opCtx, const StringData dbName);
 
     /**
      * Methods to control the databases's critical section. Must be called with the database X lock
@@ -123,9 +130,11 @@ private:
     // within.
     Lock::ResourceMutex _stateChangeMutex{"DatabaseShardingState"};
 
+    const std::string _dbName;
+
     // Modifying the state below requires holding the DBLock in X mode; holding the DBLock in any
     // mode is acceptable for reading it. (Note: accessing this class at all requires holding the
-    // DBLock in some mode, since it requires having a pointer to the Database).
+    // DBLock in some mode).
 
     ShardingMigrationCriticalSection _critSec;
 

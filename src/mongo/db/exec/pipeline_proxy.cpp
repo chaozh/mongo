@@ -31,11 +31,11 @@
 
 #include "mongo/db/exec/pipeline_proxy.h"
 
+#include <memory>
 
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/pipeline_d.h"
-#include "mongo/stdx/memory.h"
 
 namespace mongo {
 
@@ -43,7 +43,6 @@ using boost::intrusive_ptr;
 using std::shared_ptr;
 using std::unique_ptr;
 using std::vector;
-using stdx::make_unique;
 
 const char* PipelineProxyStage::kStageType = "PIPELINE_PROXY";
 
@@ -73,16 +72,22 @@ PlanStage::StageState PipelineProxyStage::doWork(WorkingSetID* out) {
     if (!_stash.empty()) {
         *out = _ws->allocate();
         WorkingSetMember* member = _ws->get(*out);
-        member->obj = Snapshotted<BSONObj>(SnapshotId(), _stash.back());
+        if (_includeMetaData && _stash.back().metadata()) {
+            member->metadata() = _stash.back().metadata();
+        }
+        member->doc = {SnapshotId(), std::move(_stash.back())};
         _stash.pop_back();
         member->transitionToOwnedObj();
         return PlanStage::ADVANCED;
     }
 
-    if (boost::optional<BSONObj> next = getNextBson()) {
+    if (auto next = getNext()) {
         *out = _ws->allocate();
         WorkingSetMember* member = _ws->get(*out);
-        member->obj = Snapshotted<BSONObj>(SnapshotId(), *next);
+        if (_includeMetaData && next->metadata()) {
+            member->metadata() = next->metadata();
+        }
+        member->doc = {SnapshotId(), std::move(*next)};
         member->transitionToOwnedObj();
         return PlanStage::ADVANCED;
     }
@@ -94,8 +99,8 @@ bool PipelineProxyStage::isEOF() {
     if (!_stash.empty())
         return false;
 
-    if (boost::optional<BSONObj> next = getNextBson()) {
-        _stash.push_back(*next);
+    if (auto next = getNext()) {
+        _stash.emplace_back(*next);
         return false;
     }
 
@@ -116,21 +121,13 @@ void PipelineProxyStage::doDispose() {
 
 unique_ptr<PlanStageStats> PipelineProxyStage::getStats() {
     unique_ptr<PlanStageStats> ret =
-        make_unique<PlanStageStats>(CommonStats(kStageType), STAGE_PIPELINE_PROXY);
-    ret->specific = make_unique<CollectionScanStats>();
+        std::make_unique<PlanStageStats>(CommonStats(kStageType), STAGE_PIPELINE_PROXY);
+    ret->specific = std::make_unique<CollectionScanStats>();
     return ret;
 }
 
-boost::optional<BSONObj> PipelineProxyStage::getNextBson() {
-    if (auto next = _pipeline->getNext()) {
-        if (_includeMetaData) {
-            return next->toBsonWithMetaData();
-        } else {
-            return next->toBson();
-        }
-    }
-
-    return boost::none;
+boost::optional<Document> PipelineProxyStage::getNext() {
+    return _pipeline->getNext();
 }
 
 std::string PipelineProxyStage::getPlanSummaryStr() const {

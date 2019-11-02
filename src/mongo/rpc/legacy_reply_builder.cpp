@@ -32,15 +32,15 @@
 #include "mongo/rpc/legacy_reply_builder.h"
 
 #include <iterator>
+#include <memory>
 
 #include "mongo/db/dbmessage.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/rpc/metadata.h"
 #include "mongo/rpc/metadata/sharding_metadata.h"
 #include "mongo/s/stale_exception.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 namespace rpc {

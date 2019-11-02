@@ -46,6 +46,7 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/server_status_metric.h"
 #include "mongo/db/commands/test_commands_enabled.h"
+#include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/lasterror.h"
 #include "mongo/db/op_observer.h"
@@ -63,7 +64,8 @@
 #include "mongo/executor/network_interface.h"
 #include "mongo/transport/session.h"
 #include "mongo/transport/transport_layer.h"
-#include "mongo/util/fail_point_service.h"
+#include "mongo/util/decimal_counter.h"
+#include "mongo/util/fail_point.h"
 #include "mongo/util/log.h"
 #include "mongo/util/net/socket_utils.h"
 #include "mongo/util/scopeguard.h"
@@ -73,6 +75,8 @@ namespace repl {
 
 using std::string;
 using std::stringstream;
+
+static const std::string kReplSetReconfigNss = "local.replset.reconfig";
 
 class ReplExecutorSSM : public ServerStatusMetric {
 public:
@@ -248,14 +252,14 @@ void parseReplSetSeedList(ReplicationCoordinatorExternalState* externalState,
         *setname = p;
     }
 
-    if (slash == 0) {
+    if (slash == nullptr) {
         return;
     }
 
     p = slash + 1;
     while (1) {
         const char* comma = strchr(p, ',');
-        if (comma == 0) {
+        if (comma == nullptr) {
             comma = strchr(p, 0);
         }
         if (p == comma) {
@@ -327,11 +331,18 @@ public:
             b.append("version", 1);
             BSONObjBuilder members;
             HostAndPort me = someHostAndPortForMe();
-            members.append("0", BSON("_id" << 0 << "host" << me.toString()));
+
+            auto appendMember =
+                [&members, serial = DecimalCounter<uint32_t>()](const HostAndPort& host) mutable {
+                    members.append(
+                        StringData{serial},
+                        BSON("_id" << static_cast<int>(serial) << "host" << host.toString()));
+                    ++serial;
+                };
+            appendMember(me);
             result.append("me", me.toString());
-            for (unsigned i = 0; i < seeds.size(); i++) {
-                members.append(BSONObjBuilder::numStr(i + 1),
-                               BSON("_id" << i + 1 << "host" << seeds[i].toString()));
+            for (const HostAndPort& seed : seeds) {
+                appendMember(seed);
             }
             b.appendArray("members", members.obj());
             configObj = b.obj();
@@ -359,18 +370,20 @@ private:
 
 class CmdReplSetReconfig : public ReplSetCommand {
 public:
+    CmdReplSetReconfig() : ReplSetCommand("replSetReconfig") {}
+
     std::string help() const override {
         return "Adjust configuration of a replica set\n"
                "{ replSetReconfig : config_object }\n"
                "http://dochub.mongodb.org/core/replicasetcommands";
     }
-    CmdReplSetReconfig() : ReplSetCommand("replSetReconfig") {}
-    virtual bool run(OperationContext* opCtx,
-                     const string&,
-                     const BSONObj& cmdObj,
-                     BSONObjBuilder& result) {
-        Status status = ReplicationCoordinator::get(opCtx)->checkReplEnabledForCommand(&result);
-        uassertStatusOK(status);
+
+    bool run(OperationContext* opCtx,
+             const string&,
+             const BSONObj& cmdObj,
+             BSONObjBuilder& result) override {
+        const auto replCoord = ReplicationCoordinator::get(opCtx);
+        uassertStatusOK(replCoord->checkReplEnabledForCommand(&result));
 
         if (cmdObj["replSetReconfig"].type() != Object) {
             result.append("errmsg", "no configuration specified");
@@ -380,23 +393,24 @@ public:
         ReplicationCoordinator::ReplSetReconfigArgs parsedArgs;
         parsedArgs.newConfigObj = cmdObj["replSetReconfig"].Obj();
         parsedArgs.force = cmdObj.hasField("force") && cmdObj["force"].trueValue();
-        status =
-            ReplicationCoordinator::get(opCtx)->processReplSetReconfig(opCtx, parsedArgs, &result);
+        auto status = replCoord->processReplSetReconfig(opCtx, parsedArgs, &result);
 
-        Lock::GlobalWrite globalWrite(opCtx);
-
-        WriteUnitOfWork wuow(opCtx);
         if (status.isOK() && !parsedArgs.force) {
-            // Users must not be allowed to provide their own contents for the o2 field.
-            // o2 field of no-ops is supposed to be used internally.
-            getGlobalServiceContext()->getOpObserver()->onOpMessage(
-                opCtx,
-                BSON("msg"
-                     << "Reconfig set"
-                     << "version"
-                     << parsedArgs.newConfigObj["version"]));
+            const auto service = opCtx->getServiceContext();
+            Lock::GlobalLock globalLock(opCtx, MODE_IX);
+            writeConflictRetry(opCtx, "replSetReconfig", kReplSetReconfigNss, [&] {
+                WriteUnitOfWork wuow(opCtx);
+                // Users must not be allowed to provide their own contents for the o2 field.
+                // o2 field of no-ops is supposed to be used internally.
+
+                service->getOpObserver()->onOpMessage(opCtx,
+                                                      BSON("msg"
+                                                           << "Reconfig set"
+                                                           << "version"
+                                                           << parsedArgs.newConfigObj["version"]));
+                wuow.commit();
+            });
         }
-        wuow.commit();
 
         uassertStatusOK(status);
         return true;
@@ -449,15 +463,30 @@ public:
                "primary.)\n"
                "http://dochub.mongodb.org/core/replicasetcommands";
     }
-    CmdReplSetStepDown() : ReplSetCommand("replSetStepDown") {}
+    CmdReplSetStepDown()
+        : ReplSetCommand("replSetStepDown"),
+          _stepDownCmdsWithForceExecutedMetric("commands.replSetStepDownWithForce.total",
+                                               &_stepDownCmdsWithForceExecuted),
+          _stepDownCmdsWithForceFailedMetric("commands.replSetStepDownWithForce.failed",
+                                             &_stepDownCmdsWithForceFailed) {}
     virtual bool run(OperationContext* opCtx,
                      const string&,
                      const BSONObj& cmdObj,
                      BSONObjBuilder& result) {
+        const bool force = cmdObj["force"].trueValue();
+
+        if (force) {
+            _stepDownCmdsWithForceExecuted.increment();
+        }
+
+        auto onExitGuard = makeGuard([&] {
+            if (force) {
+                _stepDownCmdsWithForceFailed.increment();
+            }
+        });
+
         Status status = ReplicationCoordinator::get(opCtx)->checkReplEnabledForCommand(&result);
         uassertStatusOK(status);
-
-        const bool force = cmdObj["force"].trueValue();
 
         long long stepDownForSecs = cmdObj.firstElement().numberLong();
         if (stepDownForSecs == 0) {
@@ -497,10 +526,19 @@ public:
 
         ReplicationCoordinator::get(opCtx)->stepDown(
             opCtx, force, Seconds(secondaryCatchUpPeriodSecs), Seconds(stepDownForSecs));
+
+        log() << "replSetStepDown command completed";
+
+        onExitGuard.dismiss();
         return true;
     }
 
 private:
+    mutable Counter64 _stepDownCmdsWithForceExecuted;
+    mutable Counter64 _stepDownCmdsWithForceFailed;
+    ServerStatusMetricField<Counter64> _stepDownCmdsWithForceExecutedMetric;
+    ServerStatusMetricField<Counter64> _stepDownCmdsWithForceFailedMetric;
+
     ActionSet getAuthActionSet() const override {
         return ActionSet{ActionType::replSetStateChange};
     }
@@ -616,9 +654,8 @@ namespace {
  * Used to set the hasData field on replset heartbeat command response.
  */
 bool replHasDatabases(OperationContext* opCtx) {
-    std::vector<string> names;
     StorageEngine* storageEngine = getGlobalServiceContext()->getStorageEngine();
-    storageEngine->listDatabases(&names);
+    std::vector<string> names = storageEngine->listDatabases();
 
     if (names.size() >= 2)
         return true;
@@ -647,10 +684,8 @@ public:
                      const string&,
                      const BSONObj& cmdObj,
                      BSONObjBuilder& result) {
-        MONGO_FAIL_POINT_BLOCK(rsDelayHeartbeatResponse, delay) {
-            const BSONObj& data = delay.getData();
-            sleepsecs(data["delay"].numberInt());
-        }
+        rsDelayHeartbeatResponse.execute(
+            [&](const BSONObj& data) { sleepsecs(data["delay"].numberInt()); });
 
         LOG_FOR_HEARTBEATS(2) << "Received heartbeat request from " << cmdObj.getStringField("from")
                               << ", " << cmdObj;
@@ -666,13 +701,15 @@ public:
         ReplSetHeartbeatArgsV1 args;
         uassertStatusOK(args.initialize(cmdObj));
 
+        LOG_FOR_HEARTBEATS(2) << "Processing heartbeat request from "
+                              << cmdObj.getStringField("from") << ", " << cmdObj;
         ReplSetHeartbeatResponse response;
         status = ReplicationCoordinator::get(opCtx)->processHeartbeatV1(args, &response);
         if (status.isOK())
             response.addToBSON(&result);
 
-        LOG_FOR_HEARTBEATS(2) << "Processed heartbeat from " << cmdObj.getStringField("from")
-                              << " and generated response, " << response;
+        LOG_FOR_HEARTBEATS(2) << "Generated heartbeat response to  "
+                              << cmdObj.getStringField("from") << ", " << response;
         uassertStatusOK(status);
         return true;
     }
@@ -726,7 +763,9 @@ public:
         uassertStatusOK(status);
         log() << "Received replSetAbortPrimaryCatchUp request";
 
-        status = ReplicationCoordinator::get(opCtx)->abortCatchupIfNeeded();
+        status = ReplicationCoordinator::get(opCtx)->abortCatchupIfNeeded(
+            ReplicationCoordinator::PrimaryCatchUpConclusionReason::
+                kFailedWithReplSetAbortPrimaryCatchUpCmd);
         if (!status.isOK()) {
             log() << "replSetAbortPrimaryCatchUp request failed" << causedBy(status);
         }

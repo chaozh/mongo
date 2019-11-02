@@ -96,9 +96,8 @@ BSONObj KeyPattern::extendRangeBound(const BSONObj& bound, bool makeUpperInclusi
         BSONElement patElt = pat.next();
         massert(16634,
                 str::stream() << "field names of bound " << bound
-                              << " do not match those of keyPattern "
-                              << _pattern,
-                str::equals(srcElt.fieldName(), patElt.fieldName()));
+                              << " do not match those of keyPattern " << _pattern,
+                srcElt.fieldNameStringData() == patElt.fieldNameStringData());
         newBound.append(srcElt);
     }
     while (pat.more()) {

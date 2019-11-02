@@ -47,8 +47,9 @@ namespace mongo {
 
 static const string kIndexVersionFieldName("2dsphereIndexVersion");
 
-S2AccessMethod::S2AccessMethod(IndexCatalogEntry* btreeState, SortedDataInterface* btree)
-    : AbstractIndexAccessMethod(btreeState, btree) {
+S2AccessMethod::S2AccessMethod(IndexCatalogEntry* btreeState,
+                               std::unique_ptr<SortedDataInterface> btree)
+    : AbstractIndexAccessMethod(btreeState, std::move(btree)) {
     const IndexDescriptor* descriptor = btreeState->descriptor();
 
     ExpressionParams::initialize2dsphereParams(
@@ -96,30 +97,18 @@ StatusWith<BSONObj> S2AccessMethod::fixSpec(const BSONObj& specObj) {
     if (!indexVersionElt.isNumber()) {
         return {ErrorCodes::CannotCreateIndex,
                 str::stream() << "Invalid type for geo index version { " << kIndexVersionFieldName
-                              << " : "
-                              << indexVersionElt
-                              << " }, only versions: ["
-                              << S2_INDEX_VERSION_1
-                              << ","
-                              << S2_INDEX_VERSION_2
-                              << ","
-                              << S2_INDEX_VERSION_3
-                              << "] are supported"};
+                              << " : " << indexVersionElt << " }, only versions: ["
+                              << S2_INDEX_VERSION_1 << "," << S2_INDEX_VERSION_2 << ","
+                              << S2_INDEX_VERSION_3 << "] are supported"};
     }
 
     if (indexVersionElt.type() == BSONType::NumberDouble &&
         !std::isnormal(indexVersionElt.numberDouble())) {
         return {ErrorCodes::CannotCreateIndex,
                 str::stream() << "Invalid value for geo index version { " << kIndexVersionFieldName
-                              << " : "
-                              << indexVersionElt
-                              << " }, only versions: ["
-                              << S2_INDEX_VERSION_1
-                              << ","
-                              << S2_INDEX_VERSION_2
-                              << ","
-                              << S2_INDEX_VERSION_3
-                              << "] are supported"};
+                              << " : " << indexVersionElt << " }, only versions: ["
+                              << S2_INDEX_VERSION_1 << "," << S2_INDEX_VERSION_2 << ","
+                              << S2_INDEX_VERSION_3 << "] are supported"};
     }
 
     const auto indexVersion = indexVersionElt.numberLong();
@@ -127,25 +116,27 @@ StatusWith<BSONObj> S2AccessMethod::fixSpec(const BSONObj& specObj) {
         indexVersion != S2_INDEX_VERSION_3) {
         return {ErrorCodes::CannotCreateIndex,
                 str::stream() << "unsupported geo index version { " << kIndexVersionFieldName
-                              << " : "
-                              << indexVersionElt
-                              << " }, only versions: ["
-                              << S2_INDEX_VERSION_1
-                              << ","
-                              << S2_INDEX_VERSION_2
-                              << ","
-                              << S2_INDEX_VERSION_3
-                              << "] are supported"};
+                              << " : " << indexVersionElt << " }, only versions: ["
+                              << S2_INDEX_VERSION_1 << "," << S2_INDEX_VERSION_2 << ","
+                              << S2_INDEX_VERSION_3 << "] are supported"};
     }
 
     return specObj;
 }
 
 void S2AccessMethod::doGetKeys(const BSONObj& obj,
-                               BSONObjSet* keys,
-                               BSONObjSet* multikeyMetadataKeys,
-                               MultikeyPaths* multikeyPaths) const {
-    ExpressionKeysPrivate::getS2Keys(obj, _descriptor->keyPattern(), _params, keys, multikeyPaths);
+                               KeyStringSet* keys,
+                               KeyStringSet* multikeyMetadataKeys,
+                               MultikeyPaths* multikeyPaths,
+                               boost::optional<RecordId> id) const {
+    ExpressionKeysPrivate::getS2Keys(obj,
+                                     _descriptor->keyPattern(),
+                                     _params,
+                                     keys,
+                                     multikeyPaths,
+                                     getSortedDataInterface()->getKeyStringVersion(),
+                                     getSortedDataInterface()->getOrdering(),
+                                     id);
 }
 
 }  // namespace mongo

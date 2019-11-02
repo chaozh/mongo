@@ -30,6 +30,7 @@
 #pragma once
 
 #include <map>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
@@ -37,7 +38,6 @@
 #include "mongo/base/clonable_ptr.h"
 #include "mongo/db/matcher/expression_with_placeholder.h"
 #include "mongo/db/update/update_internal_node.h"
-#include "mongo/stdx/memory.h"
 
 namespace mongo {
 
@@ -66,7 +66,7 @@ public:
         : UpdateInternalNode(Type::Array), _arrayFilters(arrayFilters) {}
 
     std::unique_ptr<UpdateNode> clone() const final {
-        return stdx::make_unique<UpdateArrayNode>(*this);
+        return std::make_unique<UpdateArrayNode>(*this);
     }
 
     void setCollator(const CollatorInterface* collator) final {
@@ -75,7 +75,8 @@ public:
         }
     }
 
-    ApplyResult apply(ApplyParams applyParams) const final;
+    ApplyResult apply(ApplyParams applyParams,
+                      UpdateNodeApplyParams updateNodeApplyParams) const final;
 
     UpdateNode* getChild(const std::string& field) const final;
 
@@ -85,10 +86,15 @@ public:
         FieldRef* currentPath,
         std::map<std::string, std::vector<std::pair<std::string, BSONObj>>>*
             operatorOrientedUpdates) const final {
-        for (const auto & [ pathSuffix, child ] : _children) {
-            FieldRefTempAppend tempAppend(*currentPath, toArrayFilterIdentifier(pathSuffix));
+        for (const auto& [pathSuffix, child] : _children) {
+            FieldRef::FieldRefTempAppend tempAppend(*currentPath,
+                                                    toArrayFilterIdentifier(pathSuffix));
             child->produceSerializationMap(currentPath, operatorOrientedUpdates);
         }
+    }
+
+    void acceptVisitor(UpdateNodeVisitor* visitor) final {
+        visitor->visit(this);
     }
 
 private:

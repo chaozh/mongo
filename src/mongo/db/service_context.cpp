@@ -33,6 +33,9 @@
 
 #include "mongo/db/service_context.h"
 
+#include <list>
+#include <memory>
+
 #include "mongo/base/init.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/db/client.h"
@@ -41,21 +44,20 @@
 #include "mongo/db/op_observer.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/storage/recovery_unit_noop.h"
-#include "mongo/stdx/list.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/transport/service_entry_point.h"
 #include "mongo/transport/session.h"
 #include "mongo/transport/transport_layer.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 #include "mongo/util/system_clock_source.h"
 #include "mongo/util/system_tick_source.h"
+#include <iostream>
 
 namespace mongo {
 namespace {
 
-using ConstructorActionList = stdx::list<ServiceContext::ConstructorDestructorActions>;
+using ConstructorActionList = std::list<ServiceContext::ConstructorDestructorActions>;
 
 ServiceContext* globalServiceContext = nullptr;
 
@@ -90,12 +92,12 @@ bool supportsDocLocking() {
 }
 
 ServiceContext::ServiceContext()
-    : _tickSource(stdx::make_unique<SystemTickSource>()),
-      _fastClockSource(stdx::make_unique<SystemClockSource>()),
-      _preciseClockSource(stdx::make_unique<SystemClockSource>()) {}
+    : _tickSource(std::make_unique<SystemTickSource>()),
+      _fastClockSource(std::make_unique<SystemClockSource>()),
+      _preciseClockSource(std::make_unique<SystemClockSource>()) {}
 
 ServiceContext::~ServiceContext() {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     for (const auto& client : _clients) {
         severe() << "Client " << client->desc() << " still exists while destroying ServiceContext@"
                  << static_cast<void*>(this);
@@ -160,7 +162,7 @@ ServiceContext::UniqueClient ServiceContext::makeClient(std::string desc,
     std::unique_ptr<Client> client(new Client(std::move(desc), this, std::move(session)));
     onCreate(client.get(), _clientObservers);
     {
-        stdx::lock_guard<stdx::mutex> lk(_mutex);
+        stdx::lock_guard<Latch> lk(_mutex);
         invariant(_clients.insert(client.get()).second);
     }
     return UniqueClient(client.release());
@@ -224,11 +226,8 @@ void ServiceContext::setServiceExecutor(std::unique_ptr<transport::ServiceExecut
 void ServiceContext::ClientDeleter::operator()(Client* client) const {
     ServiceContext* const service = client->getServiceContext();
     {
-        stdx::lock_guard<stdx::mutex> lk(service->_mutex);
+        stdx::lock_guard<Latch> lk(service->_mutex);
         invariant(service->_clients.erase(client));
-        if (service->_clients.empty()) {
-            service->_clientsEmptyCondVar.notify_all();
-        }
     }
     onDestroy(client, service->_clientObservers);
     delete client;
@@ -248,21 +247,20 @@ ServiceContext::UniqueOperationContext ServiceContext::makeOperationContext(Clie
         opCtx->setRecoveryUnit(std::make_unique<RecoveryUnitNoop>(),
                                WriteUnitOfWork::RecoveryUnitState::kNotInUnitOfWork);
     }
-    {
-        stdx::lock_guard<Client> lk(*client);
-        client->setOperationContext(opCtx.get());
-    }
+    // The baton must be attached before attaching to a client
     if (_transportLayer) {
         _transportLayer->makeBaton(opCtx.get());
     } else {
         makeBaton(opCtx.get());
     }
+    {
+        stdx::lock_guard<Client> lk(*client);
+        client->setOperationContext(opCtx.get());
+    }
     return UniqueOperationContext(opCtx.release());
 };
 
 void ServiceContext::OperationContextDeleter::operator()(OperationContext* opCtx) const {
-    opCtx->getBaton()->detach();
-
     auto client = opCtx->getClient();
     if (client->session()) {
         _numCurrentOps.subtractAndFetch(1);
@@ -272,6 +270,8 @@ void ServiceContext::OperationContextDeleter::operator()(OperationContext* opCtx
         stdx::lock_guard<Client> lk(*client);
         client->resetOperationContext();
     }
+    opCtx->getBaton()->detach();
+
     onDestroy(opCtx, service->_clientObservers);
     delete opCtx;
 }
@@ -292,7 +292,7 @@ Client* ServiceContext::LockedClientsCursor::next() {
 }
 
 void ServiceContext::setKillAllOperations() {
-    stdx::lock_guard<stdx::mutex> clientLock(_mutex);
+    stdx::lock_guard<Latch> clientLock(_mutex);
 
     // Ensure that all newly created operation contexts will immediately be in the interrupted state
     _globalKill.store(true);
@@ -333,25 +333,17 @@ void ServiceContext::unsetKillAllOperations() {
 }
 
 void ServiceContext::registerKillOpListener(KillOpListenerInterface* listener) {
-    stdx::lock_guard<stdx::mutex> clientLock(_mutex);
+    stdx::lock_guard<Latch> clientLock(_mutex);
     _killOpListeners.push_back(listener);
 }
 
 void ServiceContext::waitForStartupComplete() {
-    stdx::unique_lock<stdx::mutex> lk(_mutex);
+    stdx::unique_lock<Latch> lk(_mutex);
     _startupCompleteCondVar.wait(lk, [this] { return _startupComplete; });
 }
 
-void ServiceContext::waitForClientsToFinish() {
-    stdx::unique_lock<stdx::mutex> lk(_mutex);
-    for (const auto& client : _clients) {
-        log() << "Waiting for client " << client->desc() << " to exit";
-    }
-    _clientsEmptyCondVar.wait(lk, [this] { return _clients.empty(); });
-}
-
 void ServiceContext::notifyStartupComplete() {
-    stdx::unique_lock<stdx::mutex> lk(_mutex);
+    stdx::unique_lock<Latch> lk(_mutex);
     _startupComplete = true;
     lk.unlock();
     _startupCompleteCondVar.notify_all();
@@ -387,7 +379,6 @@ ServiceContext::ConstructorActionRegisterer::ConstructorActionRegisterer(
     if (!destructor)
         destructor = [](ServiceContext*) {};
     _registerer.emplace(std::move(name),
-                        std::move(prereqs),
                         [this, constructor, destructor](InitializerContext* context) {
                             _iter = registeredConstructorActions().emplace(
                                 registeredConstructorActions().end(),
@@ -398,7 +389,8 @@ ServiceContext::ConstructorActionRegisterer::ConstructorActionRegisterer(
                         [this](DeinitializerContext* context) {
                             registeredConstructorActions().erase(_iter);
                             return Status::OK();
-                        });
+                        },
+                        std::move(prereqs));
 }
 
 ServiceContext::UniqueServiceContext ServiceContext::make() {
@@ -413,13 +405,10 @@ void ServiceContext::ServiceContextDeleter::operator()(ServiceContext* service) 
 }
 
 BatonHandle ServiceContext::makeBaton(OperationContext* opCtx) const {
-    auto baton = std::make_shared<DefaultBaton>(opCtx);
+    invariant(!opCtx->getBaton());
 
-    {
-        stdx::lock_guard<Client> lk(*opCtx->getClient());
-        invariant(!opCtx->getBaton());
-        opCtx->setBaton(baton);
-    }
+    auto baton = std::make_shared<DefaultBaton>(opCtx);
+    opCtx->setBaton(baton);
 
     return baton;
 }

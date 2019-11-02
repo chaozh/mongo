@@ -58,9 +58,7 @@ bool isInvalidatingCommand(const boost::intrusive_ptr<ExpressionContext>& pExpCt
 
 }  // namespace
 
-DocumentSource::GetNextResult DocumentSourceCheckInvalidate::getNext() {
-    pExpCtx->checkForInterrupt();
-
+DocumentSource::GetNextResult DocumentSourceCheckInvalidate::doGetNext() {
     if (_queuedInvalidate) {
         const auto res = DocumentSource::GetNextResult(std::move(_queuedInvalidate.get()));
         _queuedInvalidate.reset();
@@ -81,31 +79,34 @@ DocumentSource::GetNextResult DocumentSourceCheckInvalidate::getNext() {
     // identical resume token to the notification for the command, except with an extra flag
     // indicating that the token is from an invalidate. This flag is necessary to disambiguate
     // the two tokens, and thus preserve a total ordering on the stream.
-
-    // As a special case, if a client receives an invalidate like this one and then wants to
-    // start a new stream after the invalidate, they can use the "startAfter" option, in which
-    // case '_ignoreFirstInvalidate' will be set, and we should ignore (AKA not generate) the
-    // very first invalidation.
-    if (isInvalidatingCommand(pExpCtx, operationType) && !_ignoreFirstInvalidate) {
+    if (isInvalidatingCommand(pExpCtx, operationType)) {
         auto resumeTokenData = ResumeToken::parse(doc[DSCS::kIdField].getDocument()).getData();
         resumeTokenData.fromInvalidate = ResumeTokenData::FromInvalidate::kFromInvalidate;
+
+        // If a client receives an invalidate and wants to start a new stream after the invalidate,
+        // they can use the 'startAfter' option. In this case, '_startAfterInvalidate' will be set
+        // to the resume token with which the client restarted the stream. We must be sure to avoid
+        // re-invalidating the new stream, and so we will swallow the first invalidate we see on
+        // each shard. The one exception is the invalidate which matches the 'startAfter' resume
+        // token. We must re-generate this invalidate, since DSEnsureResumeTokenPresent needs to see
+        // (and will take care of swallowing) the event which exactly matches the client's token.
+        if (_startAfterInvalidate && resumeTokenData != _startAfterInvalidate) {
+            _startAfterInvalidate.reset();
+            return nextInput;
+        }
+
         auto resumeTokenDoc = ResumeToken(resumeTokenData).toDocument();
 
         MutableDocument result(Document{{DSCS::kIdField, resumeTokenDoc},
                                         {DSCS::kOperationTypeField, DSCS::kInvalidateOpType},
                                         {DSCS::kClusterTimeField, doc[DSCS::kClusterTimeField]}});
+        result.copyMetaDataFrom(doc);
 
         // We set the resume token as the document's sort key in both the sharded and non-sharded
         // cases, since we will later rely upon it to generate a correct postBatchResumeToken. We
         // must therefore update the sort key to match the new resume token that we generated above.
-        // TODO SERVER-38539: when returning results for merging, we check whether 'mergeByPBRT' has
-        // been set. If not, then the request was sent from an older mongoS which cannot merge by
-        // raw resume tokens, and the sort key should therefore be left alone. The 'mergeByPBRT'
-        // flag is no longer necessary in 4.4; all change streams will be merged by resume token.
-        result.copyMetaDataFrom(doc);
-        if (!pExpCtx->needsMerge || pExpCtx->mergeByPBRT) {
-            result.setSortKeyMetaField(resumeTokenDoc.toBson());
-        }
+        const bool isSingleElementKey = true;
+        result.metadata().setSortKey(Value{resumeTokenDoc}, isSingleElementKey);
 
         _queuedInvalidate = result.freeze();
     }
@@ -113,7 +114,7 @@ DocumentSource::GetNextResult DocumentSourceCheckInvalidate::getNext() {
     // Regardless of whether the first document we see is an invalidating command, we only skip the
     // first invalidate for streams with the 'startAfter' option, so we should not skip any
     // invalidates that come after the first one.
-    _ignoreFirstInvalidate = false;
+    _startAfterInvalidate.reset();
 
     return nextInput;
 }

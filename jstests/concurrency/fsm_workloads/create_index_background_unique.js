@@ -9,7 +9,6 @@
  */
 
 var $config = (function() {
-
     var data = {
         prefix: "create_index_background_unique_",
         numDocsToLoad: 5000,
@@ -56,7 +55,6 @@ var $config = (function() {
             buildIndex: buildIndex,
             dropIndex: dropIndex,
         };
-
     })();
 
     var transitions = {
@@ -77,7 +75,7 @@ var $config = (function() {
                 const uniqueValuePrefix = i.toString() + "_";
                 bulk.insert(this.buildvariableSizedDoc(uniqueValuePrefix));
             }
-            assertAlways.writeOK(bulk.execute());
+            assertAlways.commandWorked(bulk.execute());
             assertAlways.eq(this.numDocsToLoad, db[collectionName].find({}).itcount());
         }
     }

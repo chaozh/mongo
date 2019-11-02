@@ -42,7 +42,7 @@
 #include "mongo/db/query/query_test_service_context.h"
 #include "mongo/stdx/unordered_set.h"
 #include "mongo/unittest/unittest.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 using namespace mongo;
 
@@ -61,7 +61,7 @@ unique_ptr<CanonicalQuery> canonicalize(const char* queryStr,
     QueryTestServiceContext serviceContext;
     auto opCtx = serviceContext.makeOperationContext();
 
-    auto qr = stdx::make_unique<QueryRequest>(nss);
+    auto qr = std::make_unique<QueryRequest>(nss);
     qr->setFilter(fromjson(queryStr));
     qr->setSort(fromjson(sortStr));
     qr->setProj(fromjson(projStr));
@@ -189,14 +189,13 @@ TEST(GetExecutorTest, GetAllowedIndicesDescendingOrder) {
 }
 
 TEST(GetExecutorTest, GetAllowedIndicesMatchesByName) {
-    testAllowedIndices(
-        {buildSimpleIndexEntry(fromjson("{a: 1}"), "a_1"),
-         buildSimpleIndexEntry(fromjson("{a: 1}"), "a_1:en")},
-        // BSONObjSet default constructor is explicit, so we cannot copy-list-initialize until
-        // C++14.
-        SimpleBSONObjComparator::kInstance.makeBSONObjSet(),
-        {"a_1"},
-        {"a_1"});
+    testAllowedIndices({buildSimpleIndexEntry(fromjson("{a: 1}"), "a_1"),
+                        buildSimpleIndexEntry(fromjson("{a: 1}"), "a_1:en")},
+                       // BSONObjSet default constructor is explicit, so we cannot
+                       // copy-list-initialize until C++14.
+                       SimpleBSONObjComparator::kInstance.makeBSONObjSet(),
+                       {"a_1"},
+                       {"a_1"});
 }
 
 TEST(GetExecutorTest, GetAllowedIndicesMatchesMultipleIndexesByKey) {
@@ -261,6 +260,34 @@ TEST(GetExecutorTest, GetAllowedPathSpecifiedWildcardIndicesByName) {
                        SimpleBSONObjComparator::kInstance.makeBSONObjSet(),
                        {"a.$**_1"},
                        {"a.$**_1"});
+}
+
+TEST(GetExecutorTest, isComponentOfPathMultikeyNoMetadata) {
+    BSONObj indexKey = BSON("a" << 1 << "b.c" << -1);
+    MultikeyPaths multikeyInfo = {};
+
+    ASSERT_TRUE(isAnyComponentOfPathMultikey(indexKey, true, multikeyInfo, "a"));
+    ASSERT_TRUE(isAnyComponentOfPathMultikey(indexKey, true, multikeyInfo, "b.c"));
+
+    ASSERT_FALSE(isAnyComponentOfPathMultikey(indexKey, false, multikeyInfo, "a"));
+    ASSERT_FALSE(isAnyComponentOfPathMultikey(indexKey, false, multikeyInfo, "b.c"));
+}
+
+TEST(GetExecutorTest, isComponentOfPathMultikeyWithMetadata) {
+    BSONObj indexKey = BSON("a" << 1 << "b.c" << -1);
+    MultikeyPaths multikeyInfo = {{}, {1}};
+
+    ASSERT_FALSE(isAnyComponentOfPathMultikey(indexKey, true, multikeyInfo, "a"));
+    ASSERT_TRUE(isAnyComponentOfPathMultikey(indexKey, true, multikeyInfo, "b.c"));
+}
+
+TEST(GetExecutorTest, isComponentOfPathMultikeyWithEmptyMetadata) {
+    BSONObj indexKey = BSON("a" << 1 << "b.c" << -1);
+
+
+    MultikeyPaths multikeyInfoAllPathsScalar = {{}, {}};
+    ASSERT_FALSE(isAnyComponentOfPathMultikey(indexKey, false, multikeyInfoAllPathsScalar, "a"));
+    ASSERT_FALSE(isAnyComponentOfPathMultikey(indexKey, false, multikeyInfoAllPathsScalar, "b.c"));
 }
 
 }  // namespace

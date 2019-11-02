@@ -69,10 +69,10 @@ while (bigStr.length < (1024 * 1024)) {
     bigStr += bigStr;
 }
 
-// Make a collection that is about 40 MB * number of shards.
+// Make a collection that is about 120 MB * number of shards.
 const numShards = FixtureHelpers.numberOfShardsForCollection(t);
-for (var i = 0; i < 40 * numShards; i++) {
-    assert.writeOK(t.insert({a: bigStr, b: 1, c: i}));
+for (var i = 0; i < 120 * numShards; i++) {
+    assert.commandWorked(t.insert({a: bigStr, b: 1, c: i}));
 }
 
 // A query which sorts the whole collection by "b" should throw an error due to hitting the

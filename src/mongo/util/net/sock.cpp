@@ -60,14 +60,14 @@
 #include "mongo/util/background.h"
 #include "mongo/util/concurrency/value.h"
 #include "mongo/util/debug_util.h"
-#include "mongo/util/fail_point_service.h"
+#include "mongo/util/fail_point.h"
 #include "mongo/util/hex.h"
 #include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
 #include "mongo/util/net/private/socket_poll.h"
 #include "mongo/util/net/socket_exception.h"
 #include "mongo/util/net/socket_utils.h"
 #include "mongo/util/net/ssl_manager.h"
+#include "mongo/util/str.h"
 #include "mongo/util/winutil.h"
 
 namespace mongo {
@@ -110,8 +110,7 @@ void networkWarnWithDescription(const Socket& socket, StringData call, int error
 const double kMaxConnectTimeoutMS = 5000;
 
 void setSockTimeouts(int sock, double secs) {
-    bool report = shouldLog(logger::LogSeverity::Debug(4));
-    DEV report = true;
+    bool report = shouldLog(logger::LogSeverity::Debug(4)) || kDebugBuild;
 #if defined(_WIN32)
     DWORD timeout = secs * 1000;  // Windows timeout is a DWORD, in milliseconds.
     int status =
@@ -120,8 +119,8 @@ void setSockTimeouts(int sock, double secs) {
         log() << "unable to set SO_RCVTIMEO: " << errnoWithDescription(WSAGetLastError());
     status =
         setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<char*>(&timeout), sizeof(DWORD));
-    DEV if (report && (status == SOCKET_ERROR)) log() << "unable to set SO_SNDTIMEO: "
-                                                      << errnoWithDescription(WSAGetLastError());
+    if (kDebugBuild && report && (status == SOCKET_ERROR))
+        log() << "unable to set SO_SNDTIMEO: " << errnoWithDescription(WSAGetLastError());
 #else
     struct timeval tv;
     tv.tv_sec = (int)secs;
@@ -130,7 +129,8 @@ void setSockTimeouts(int sock, double secs) {
     if (report && !ok)
         log() << "unable to set SO_RCVTIMEO";
     ok = setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, (char*)&tv, sizeof(tv)) == 0;
-    DEV if (report && !ok) log() << "unable to set SO_SNDTIMEO";
+    if (kDebugBuild && report && !ok)
+        log() << "unable to set SO_SNDTIMEO";
 #endif
 }
 
@@ -190,7 +190,7 @@ Socket::Socket(int fd, const SockAddr& remote)
     : _fd(fd),
       _remote(remote),
       _timeout(0),
-      _lastValidityCheckAtSecs(time(0)),
+      _lastValidityCheckAtSecs(time(nullptr)),
       _logLevel(logger::LogSeverity::Log()) {
     _init();
     if (fd >= 0) {
@@ -201,7 +201,7 @@ Socket::Socket(int fd, const SockAddr& remote)
 Socket::Socket(double timeout, logger::LogSeverity ll) : _logLevel(ll) {
     _fd = INVALID_SOCKET;
     _timeout = timeout;
-    _lastValidityCheckAtSecs = time(0);
+    _lastValidityCheckAtSecs = time(nullptr);
     _init();
 }
 
@@ -214,7 +214,7 @@ void Socket::_init() {
     _bytesIn = 0;
     _awaitingHandshake = true;
 #ifdef MONGO_CONFIG_SSL
-    _sslManager = 0;
+    _sslManager = nullptr;
 #endif
 }
 
@@ -261,15 +261,15 @@ SSLPeerInfo Socket::doSSLHandshake(const char* firstBytes, int len) {
         _sslConnection.get(), "", HostAndPort());
 }
 
-std::string Socket::getSNIServerName() const {
-    if (!_sslConnection)
-        return "";
-
-    return _sslConnection->getSNIServerName();
-}
 #endif
 
 bool Socket::connect(SockAddr& remote) {
+    const Milliseconds connectTimeoutMillis(static_cast<int64_t>(
+        _timeout > 0 ? std::min(kMaxConnectTimeoutMS, (_timeout * 1000)) : kMaxConnectTimeoutMS));
+    return connect(remote, connectTimeoutMillis);
+}
+
+bool Socket::connect(SockAddr& remote, Milliseconds connectTimeoutMillis) {
     _remote = remote;
 
     _fd = ::socket(remote.getType(), SOCK_STREAM, 0);
@@ -283,10 +283,7 @@ bool Socket::connect(SockAddr& remote) {
         return false;
     }
 
-    const Milliseconds connectTimeoutMillis(static_cast<int64_t>(
-        _timeout > 0 ? std::min(kMaxConnectTimeoutMS, (_timeout * 1000)) : kMaxConnectTimeoutMS));
     const Date_t expiration = Date_t::now() + connectTimeoutMillis;
-
     bool connectSucceeded = ::connect(_fd, _remote.raw(), _remote.addressSize) == 0;
 
     if (!connectSucceeded) {
@@ -395,7 +392,7 @@ int Socket::_send(const char* data, int len, const char* context) {
 void Socket::send(const char* data, int len, const char* context) {
     while (len > 0) {
         int ret = -1;
-        if (MONGO_FAIL_POINT(throwSockExcep)) {
+        if (MONGO_unlikely(throwSockExcep.shouldFail())) {
 #if defined(_WIN32)
             WSASetLastError(WSAENETUNREACH);
 #else
@@ -458,7 +455,7 @@ void Socket::send(const vector<pair<char*, int>>& data, const char* context) {
 
     while (meta.msg_iovlen > 0) {
         int ret = -1;
-        if (MONGO_FAIL_POINT(throwSockExcep)) {
+        if (MONGO_unlikely(throwSockExcep.shouldFail())) {
 #if defined(_WIN32)
             WSASetLastError(WSAENETUNREACH);
 #else
@@ -491,7 +488,7 @@ void Socket::send(const vector<pair<char*, int>>& data, const char* context) {
 void Socket::recv(char* buf, int len) {
     while (len > 0) {
         int ret = -1;
-        if (MONGO_FAIL_POINT(throwSockExcep)) {
+        if (MONGO_unlikely(throwSockExcep.shouldFail())) {
 #if defined(_WIN32)
             WSASetLastError(WSAENETUNREACH);
 #else
@@ -547,7 +544,7 @@ void Socket::handleSendError(int ret, const char* context) {
                        << ' ' << remoteString();
         throwSocketError(SocketErrorKind::SEND_ERROR, remoteString());
     }
-}
+}  // namespace mongo
 
 void Socket::handleRecvError(int ret, int len) {
     if (ret == 0) {
@@ -612,7 +609,7 @@ bool Socket::isStillConnected() {
     if (!isPollSupported())
         return true;  // nothing we can do
 
-    time_t now = time(0);
+    time_t now = time(nullptr);
     time_t idleTimeSecs = now - _lastValidityCheckAtSecs;
 
     // Only check once every 5 secs
@@ -676,7 +673,7 @@ bool Socket::isStillConnected() {
                     << " bytes of data during connectivity check"
                     << " (idle " << idleTimeSecs << " secs,"
                     << " remote host " << remoteString() << ")";
-            DEV {
+            if (kDebugBuild) {
                 std::string hex = hexdump(testBuf, recvd);
                 error() << "Hex dump of stale log data: " << hex;
             }

@@ -28,15 +28,21 @@
  */
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kControl
+#define MONGO_LOGV2_DEFAULT_COMPONENT mongo::logv2::LogComponent::kControl
+
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/util/log.h"
 
+#include "mongo/db/server_options.h"
 #include "mongo/logger/console_appender.h"
 #include "mongo/logger/message_event_utf8_encoder.h"
 #include "mongo/logger/ramlog.h"
 #include "mongo/logger/rotatable_file_manager.h"
+#include "mongo/logv2/log_domain.h"
+#include "mongo/logv2/log_domain_global.h"
+#include "mongo/logv2/log_manager.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/concurrency/thread_name.h"
 #include "mongo/util/stacktrace.h"
@@ -61,7 +67,11 @@ Status logger::registerExtraLogContextFn(logger::ExtraLogContextFn contextFn) {
     return Status::OK();
 }
 
-bool rotateLogs(bool renameFiles) {
+bool rotateLogs(bool renameFiles, bool useLogV2) {
+    if (useLogV2) {
+        log() << "Logv2 rotation initiated";
+        return logv2::LogManager::global().getGlobalDomainInternal().rotate().isOK();
+    }
     using logger::RotatableFileManager;
     RotatableFileManager* manager = logger::globalRotatableFileManager();
     log() << "Log rotation initiated";
@@ -91,7 +101,6 @@ void setPlainConsoleLogger() {
             std::make_unique<logger::MessageEventUnadornedEncoder>()));
 }
 
-Tee* const warnings = RamLog::get("warnings");  // Things put here go in serverStatus
 Tee* const startupWarningsLog = RamLog::get("startupWarnings");  // intentionally leaked
 
 }  // namespace mongo

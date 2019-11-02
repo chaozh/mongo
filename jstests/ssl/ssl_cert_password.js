@@ -132,12 +132,12 @@ requireSSLProvider('openssl', function() {
 
     exit_code = MongoRunner.runMongoTool("mongofiles",
                                          {
-                                           db: mongofiles_ssl_dbname,
-                                           port: md.port,
-                                           ssl: "",
-                                           sslCAFile: "jstests/libs/ca.pem",
-                                           sslPEMKeyFile: "jstests/libs/password_protected.pem",
-                                           sslPEMKeyPassword: "qwerty",
+                                             db: mongofiles_ssl_dbname,
+                                             port: md.port,
+                                             ssl: "",
+                                             sslCAFile: "jstests/libs/ca.pem",
+                                             sslPEMKeyFile: "jstests/libs/password_protected.pem",
+                                             sslPEMKeyPassword: "qwerty",
                                          },
                                          "put",
                                          source_filename);
@@ -145,23 +145,23 @@ requireSSLProvider('openssl', function() {
     assert.eq(exit_code, 0, "Failed to start mongofiles with ssl");
 
     md5 = md5sumFile(source_filename);
-
     file_obj = mongofiles_db.fs.files.findOne();
     assert(file_obj, "failed to find file object in mongofiles_ssl db using gridfs");
-    md5_stored = file_obj.md5;
-    md5_computed = mongofiles_db.runCommand({filemd5: file_obj._id}).md5;
-    assert.eq(md5, md5_stored, "md5 incorrect for file");
+    md5_computed_res = mongofiles_db.runCommand({filemd5: file_obj._id});
+    assert.commandWorked(md5_computed_res);
+    md5_computed = md5_computed_res.md5;
+    assert(md5_computed);
     assert.eq(md5, md5_computed, "md5 computed incorrectly by server");
 
     exit_code = MongoRunner.runMongoTool("mongofiles",
                                          {
-                                           db: mongofiles_ssl_dbname,
-                                           local: external_scratch_dir + filename,
-                                           port: md.port,
-                                           ssl: "",
-                                           sslCAFile: "jstests/libs/ca.pem",
-                                           sslPEMKeyFile: "jstests/libs/password_protected.pem",
-                                           sslPEMKeyPassword: "qwerty",
+                                             db: mongofiles_ssl_dbname,
+                                             local: external_scratch_dir + filename,
+                                             port: md.port,
+                                             ssl: "",
+                                             sslCAFile: "jstests/libs/ca.pem",
+                                             sslPEMKeyFile: "jstests/libs/password_protected.pem",
+                                             sslPEMKeyPassword: "qwerty",
                                          },
                                          "get",
                                          source_filename);
@@ -169,7 +169,7 @@ requireSSLProvider('openssl', function() {
     assert.eq(exit_code, 0, "Failed to start mongofiles with ssl");
 
     md5 = md5sumFile(external_scratch_dir + filename);
-    assert.eq(md5, md5_stored, "hash of stored file does not match the expected value");
+    assert.eq(md5, md5_computed, "hash of stored file does not match the expected value");
 
     if (!_isWindows()) {
         // Stop the server

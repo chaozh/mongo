@@ -1,112 +1,114 @@
 /**
  * A speculative snapshot must not include any writes ordered after any uncommitted writes.
  *
- * @tags: [uses_transactions]
+ * @tags: [uses_transactions, requires_majority_read_concern]
  */
 (function() {
-    "use strict";
+"use strict";
 
-    load("jstests/libs/check_log.js");
+load("jstests/libs/check_log.js");
 
-    const dbName = "test";
-    const collName = "speculative_snapshot_includes_all_writes_1";
-    const collName2 = "speculative_snapshot_includes_all_writes_2";
-    const testDB = db.getSiblingDB(dbName);
-    const testColl = testDB[collName];
-    const testColl2 = testDB[collName2];
+const dbName = "test";
+const collName = "speculative_snapshot_includes_all_writes_1";
+const collName2 = "speculative_snapshot_includes_all_writes_2";
+const testDB = db.getSiblingDB(dbName);
+const testColl = testDB[collName];
+const testColl2 = testDB[collName2];
 
-    testDB.runCommand({drop: collName, writeConcern: {w: "majority"}});
-    testDB.runCommand({drop: collName2, writeConcern: {w: "majority"}});
+testDB.runCommand({drop: collName, writeConcern: {w: "majority"}});
+testDB.runCommand({drop: collName2, writeConcern: {w: "majority"}});
 
-    assert.commandWorked(testDB.createCollection(collName, {writeConcern: {w: "majority"}}));
-    assert.commandWorked(testDB.createCollection(collName2, {writeConcern: {w: "majority"}}));
+assert.commandWorked(testDB.createCollection(collName, {writeConcern: {w: "majority"}}));
+assert.commandWorked(testDB.createCollection(collName2, {writeConcern: {w: "majority"}}));
 
-    const sessionOptions = {causalConsistency: false};
-    const session = db.getMongo().startSession(sessionOptions);
-    const sessionDb = session.getDatabase(dbName);
-    const sessionColl = sessionDb.getCollection(collName);
-    const sessionColl2 = sessionDb.getCollection(collName2);
+const sessionOptions = {
+    causalConsistency: false
+};
 
-    const session2 = db.getMongo().startSession(sessionOptions);
-    const session2Db = session2.getDatabase(dbName);
-    const session2Coll = session2Db.getCollection(collName);
-    const session2Coll2 = session2Db.getCollection(collName2);
+function startSessionAndTransaction(readConcernLevel) {
+    let session = db.getMongo().startSession(sessionOptions);
+    jsTestLog("Start a transaction with readConcern " + readConcernLevel.level + ".");
+    session.startTransaction({readConcern: readConcernLevel});
+    return session;
+}
 
-    // Clear ramlog so checkLog can't find log messages from previous times this fail point was
-    // enabled.
-    assert.commandWorked(testDB.adminCommand({clearLog: 'global'}));
+let checkReads = (session, collExpected, coll2Expected) => {
+    let sessionDb = session.getDatabase(dbName);
+    let coll = sessionDb.getCollection(collName);
+    let coll2 = sessionDb.getCollection(collName2);
+    assert.sameMembers(collExpected, coll.find().toArray());
+    assert.sameMembers(coll2Expected, coll2.find().toArray());
+};
 
-    jsTest.log("Prepopulate the collections.");
-    assert.commandWorked(testColl.insert([{_id: 0}], {writeConcern: {w: "majority"}}));
-    assert.commandWorked(testColl2.insert([{_id: "a"}], {writeConcern: {w: "majority"}}));
+// Clear ramlog so checkLog can't find log messages from previous times this fail point was
+// enabled.
+assert.commandWorked(testDB.adminCommand({clearLog: 'global'}));
 
-    jsTest.log("Create the uncommitted write.");
+jsTest.log("Prepopulate the collections.");
+assert.commandWorked(testColl.insert([{_id: 0}], {writeConcern: {w: "majority"}}));
+assert.commandWorked(testColl2.insert([{_id: "a"}], {writeConcern: {w: "majority"}}));
 
-    assert.commandWorked(db.adminCommand({
-        configureFailPoint: "hangAfterCollectionInserts",
-        mode: "alwaysOn",
-        data: {collectionNS: testColl2.getFullName()}
-    }));
+jsTest.log("Create the uncommitted write.");
 
-    const joinHungWrite = startParallelShell(() => {
-        assert.commandWorked(
-            db.getSiblingDB("test").speculative_snapshot_includes_all_writes_2.insert(
-                {_id: "b"}, {writeConcern: {w: "majority"}}));
-    });
+assert.commandWorked(db.adminCommand({
+    configureFailPoint: "hangAfterCollectionInserts",
+    mode: "alwaysOn",
+    data: {collectionNS: testColl2.getFullName()}
+}));
 
-    checkLog.contains(
-        db.getMongo(),
-        "hangAfterCollectionInserts fail point enabled for " + testColl2.getFullName());
+const joinHungWrite = startParallelShell(() => {
+    assert.commandWorked(db.getSiblingDB("test").speculative_snapshot_includes_all_writes_2.insert(
+        {_id: "b"}, {writeConcern: {w: "majority"}}));
+});
 
-    jsTest.log("Create a write following the uncommitted write.");
-    // Note this write must use local write concern; it cannot be majority committed until
-    // the prior uncommitted write is committed.
-    assert.commandWorked(testColl.insert([{_id: 1}]));
+checkLog.contains(db.getMongo(),
+                  "hangAfterCollectionInserts fail point enabled for " + testColl2.getFullName());
 
-    jsTestLog("Start a snapshot transaction.");
+jsTest.log("Create a write following the uncommitted write.");
+// Note this write must use local write concern; it cannot be majority committed until
+// the prior uncommitted write is committed.
+assert.commandWorked(testColl.insert([{_id: 1}]));
 
-    session.startTransaction({readConcern: {level: "snapshot"}});
+const snapshotSession = startSessionAndTransaction({level: "snapshot"});
+checkReads(snapshotSession, [{_id: 0}], [{_id: "a"}]);
 
-    assert.sameMembers([{_id: 0}], sessionColl.find().toArray());
+const majoritySession = startSessionAndTransaction({level: "majority"});
+checkReads(majoritySession, [{_id: 0}, {_id: 1}], [{_id: "a"}]);
 
-    assert.sameMembers([{_id: "a"}], sessionColl2.find().toArray());
+const localSession = startSessionAndTransaction({level: "local"});
+checkReads(localSession, [{_id: 0}, {_id: 1}], [{_id: "a"}]);
 
-    jsTestLog("Start a majority-read transaction.");
+const defaultSession = startSessionAndTransaction({});
+checkReads(defaultSession, [{_id: 0}, {_id: 1}], [{_id: "a"}]);
 
-    session2.startTransaction({readConcern: {level: "majority"}});
+jsTestLog("Allow the uncommitted write to finish.");
+assert.commandWorked(db.adminCommand({
+    configureFailPoint: "hangAfterCollectionInserts",
+    mode: "off",
+}));
 
-    assert.sameMembers([{_id: 0}, {_id: 1}], session2Coll.find().toArray());
+joinHungWrite();
 
-    assert.sameMembers([{_id: "a"}], session2Coll2.find().toArray());
+jsTestLog("Double-checking that writes not committed at start of snapshot cannot appear.");
+checkReads(snapshotSession, [{_id: 0}], [{_id: "a"}]);
 
-    jsTestLog("Allow the uncommitted write to finish.");
-    assert.commandWorked(db.adminCommand({
-        configureFailPoint: "hangAfterCollectionInserts",
-        mode: "off",
-    }));
+jsTestLog(
+    "Double-checking that writes performed before the start of a transaction of 'majority' or lower must appear.");
+checkReads(majoritySession, [{_id: 0}, {_id: 1}], [{_id: "a"}]);
+checkReads(localSession, [{_id: 0}, {_id: 1}], [{_id: "a"}]);
+checkReads(defaultSession, [{_id: 0}, {_id: 1}], [{_id: "a"}]);
 
-    joinHungWrite();
+jsTestLog("Committing transactions.");
+assert.commandWorked(snapshotSession.commitTransaction_forTesting());
+assert.commandWorked(majoritySession.commitTransaction_forTesting());
+assert.commandWorked(localSession.commitTransaction_forTesting());
+assert.commandWorked(defaultSession.commitTransaction_forTesting());
 
-    jsTestLog("Double-checking that writes not committed at start of snapshot cannot appear.");
-    assert.sameMembers([{_id: 0}], sessionColl.find().toArray());
+jsTestLog("A new local read must see all committed writes.");
+checkReads(defaultSession, [{_id: 0}, {_id: 1}], [{_id: "a"}, {_id: "b"}]);
 
-    assert.sameMembers([{_id: "a"}], sessionColl2.find().toArray());
-
-    assert.sameMembers([{_id: 0}, {_id: 1}], session2Coll.find().toArray());
-
-    assert.sameMembers([{_id: "a"}], session2Coll2.find().toArray());
-
-    jsTestLog("Committing transactions.");
-    session.commitTransaction();
-    session2.commitTransaction();
-
-    assert.sameMembers([{_id: 0}, {_id: 1}], sessionColl.find().toArray());
-
-    assert.sameMembers([{_id: "a"}, {_id: "b"}], sessionColl2.find().toArray());
-
-    assert.sameMembers([{_id: 0}, {_id: 1}], session2Coll.find().toArray());
-
-    assert.sameMembers([{_id: "a"}, {_id: "b"}], session2Coll2.find().toArray());
-
-    session.endSession();
+snapshotSession.endSession();
+majoritySession.endSession();
+localSession.endSession();
+defaultSession.endSession();
 }());

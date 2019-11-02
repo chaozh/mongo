@@ -12,6 +12,7 @@ selector:
   # SERVER-17397 Drops of sharded namespaces may not fully succeed
   - jstests/concurrency/fsm_workloads/create_database.js
   - jstests/concurrency/fsm_workloads/drop_database.js
+  - jstests/concurrency/fsm_workloads/map_reduce_drop.js
 
   # Disabled due to SERVER-33753, '.count() without a predicate can be wrong on sharded
   # collections'. This bug is problematic for these workloads because they assert on count()
@@ -21,19 +22,6 @@ selector:
   # $lookup and $graphLookup are not supported on sharded collections.
   - jstests/concurrency/fsm_workloads/agg_graph_lookup.js
   - jstests/concurrency/fsm_workloads/view_catalog_cycle_lookup.js
-
-  # Disabled due to SERVER-20057, 'Concurrent, sharded mapReduces can fail when temporary
-  # namespaces collide across mongos processes'
-  - jstests/concurrency/fsm_workloads/map_reduce_drop.js
-  - jstests/concurrency/fsm_workloads/map_reduce_inline.js
-  - jstests/concurrency/fsm_workloads/map_reduce_interrupt.js
-  - jstests/concurrency/fsm_workloads/map_reduce_merge.js
-  - jstests/concurrency/fsm_workloads/map_reduce_merge_nonatomic.js
-  - jstests/concurrency/fsm_workloads/map_reduce_reduce.js
-  - jstests/concurrency/fsm_workloads/map_reduce_reduce_nonatomic.js
-  - jstests/concurrency/fsm_workloads/map_reduce_replace.js
-  - jstests/concurrency/fsm_workloads/map_reduce_replace_nonexistent.js
-  - jstests/concurrency/fsm_workloads/map_reduce_replace_remove.js
 
   # Disabled due to MongoDB restrictions and/or workload restrictions
 
@@ -51,7 +39,7 @@ selector:
 
   # compact can only be run against a standalone mongod
   - jstests/concurrency/fsm_workloads/compact.js
-  - jstests/concurrency/fsm_workloads/compact_simultaneous_padding_bytes.js
+  - jstests/concurrency/fsm_workloads/compact_while_creating_indexes.js
 
   # convertToCapped can't be run on mongos processes
   - jstests/concurrency/fsm_workloads/convert_to_capped_collection.js
@@ -77,6 +65,10 @@ selector:
   # reIndex is not supported in mongos.
   - jstests/concurrency/fsm_workloads/reindex.js
   - jstests/concurrency/fsm_workloads/reindex_background.js
+  - jstests/concurrency/fsm_workloads/reindex_writeconflict.js
+
+  # The WTWriteConflictException failpoint is not supported on mongos.
+  - jstests/concurrency/fsm_workloads/collmod_writeconflict.js
 
   # our .remove(query, {justOne: true}) calls lack shard keys
   - jstests/concurrency/fsm_workloads/remove_single_document.js
@@ -112,19 +104,14 @@ selector:
   # router tries to commit, it may not know the full participant list.
   - jstests/concurrency/fsm_workloads/multi_statement_transaction_all_commands_same_session.js
 
-  # TODO SERVER-38190: Killing an operation committing a prepared txn can crash.
-  # TODO SERVER-38297: Killing session on a secondary applying a prepare oplog entry can crash.
-  # TODO SERVER-38299: Killing an operation preparing a transaction can crash.
-  - jstests/concurrency/fsm_workloads/multi_statement_transaction_kill_sessions_atomicity_isolation.js
-  - jstests/concurrency/fsm_workloads/snapshot_read_kill_op_only.js
-  - jstests/concurrency/fsm_workloads/snapshot_read_kill_operations.js
-
   exclude_with_any_tags:
   - requires_replication
+  - assumes_balancer_on
 
 executor:
   archive:
     hooks:
+      - CheckReplDBHashInBackground
       - CheckReplDBHash
       - ValidateCollections
     tests: true
@@ -137,6 +124,7 @@ executor:
           runningWithAutoSplit: false
           runningWithBalancer: false
   hooks:
+  - class: CheckReplDBHashInBackground
   - class: CheckReplDBHash
   - class: ValidateCollections
   - class: CleanupConcurrencyWorkloads
@@ -153,10 +141,6 @@ executor:
     mongod_options:
       set_parameters:
         enableTestCommands: 1
-        # TODO SERVER-38302: Write noops to avoid hangs if the stable timestamp does not advance
-        # when the oldest prepared transaction commits or aborts.
-        periodicNoopIntervalSecs: 1
-        writePeriodicNoops: true
     num_rs_nodes_per_shard: 3
     num_shards: 2
     num_mongos: 2

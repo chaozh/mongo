@@ -55,6 +55,7 @@
 #include "mongo/db/catalog_raii.h"
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/commands/create_gen.h"
 #include "mongo/db/commands/profile_common.h"
 #include "mongo/db/commands/profile_gen.h"
 #include "mongo/db/commands/server_status.h"
@@ -87,7 +88,7 @@
 #include "mongo/db/storage/storage_engine_init.h"
 #include "mongo/db/write_concern.h"
 #include "mongo/scripting/engine.h"
-#include "mongo/util/fail_point_service.h"
+#include "mongo/util/fail_point.h"
 #include "mongo/util/log.h"
 #include "mongo/util/md5.hpp"
 #include "mongo/util/scopeguard.h"
@@ -142,8 +143,8 @@ public:
              repl::ReplicationCoordinator::modeNone) &&
             (dbname == NamespaceString::kLocalDb)) {
             uasserted(ErrorCodes::IllegalOperation,
-                      str::stream() << "Cannot drop '" << dbname
-                                    << "' database while replication is active");
+                      str::stream()
+                          << "Cannot drop '" << dbname << "' database while replication is active");
         }
         BSONElement e = cmdObj.firstElement();
         int p = (int)e.number();
@@ -232,16 +233,22 @@ public:
                            BSONObjBuilder& result) {
         const NamespaceString nsToDrop(CommandHelpers::parseNsCollectionRequired(dbname, cmdObj));
 
-        if (nsToDrop.isVirtualized()) {
-            errmsg = "can't drop a virtual collection";
-            return false;
-        }
+        if (nsToDrop.isOplog()) {
+            if (repl::ReplicationCoordinator::get(opCtx)->isReplEnabled()) {
+                errmsg = "can't drop live oplog while replicating";
+                return false;
+            }
 
-        if ((repl::ReplicationCoordinator::get(opCtx)->getReplicationMode() !=
-             repl::ReplicationCoordinator::modeNone) &&
-            nsToDrop.isOplog()) {
-            errmsg = "can't drop live oplog while replicating";
-            return false;
+            auto storageEngine = opCtx->getServiceContext()->getStorageEngine();
+            invariant(storageEngine);
+            if (storageEngine->supportsRecoveryTimestamp()) {
+                // We use the method supportsRecoveryTimestamp() to detect whether we are using
+                // the WiredTiger storage engine, which is currently only storage engine that
+                // supports the replSetResizeOplog command.
+                errmsg =
+                    "can't drop oplog on storage engines that support replSetResizeOplog command";
+                return false;
+            }
         }
 
         uassertStatusOK(
@@ -259,22 +266,41 @@ public:
 class CmdCreate : public BasicCommand {
 public:
     CmdCreate() : BasicCommand("create") {}
+
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kNever;
     }
+
     virtual bool adminOnly() const {
         return false;
     }
-
 
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return true;
     }
 
     std::string help() const override {
-        return "create a collection explicitly\n"
-               "{ create: <ns>[, capped: <bool>, size: <collSizeInBytes>, max: <nDocs>] }";
+        return str::stream()
+            << "explicitly creates a collection or view\n"
+            << "{\n"
+            << "  create: <string: collection or view name> [,\n"
+            << "  capped: <bool: capped collection>,\n"
+            << "  autoIndexId: <bool: automatic creation of _id index>,\n"
+            << "  idIndex: <document: _id index specification>,\n"
+            << "  size: <int: size in bytes of the capped collection>,\n"
+            << "  max: <int: max number of documents in the capped collection>,\n"
+            << "  storageEngine: <document: storage engine configuration>,\n"
+            << "  validator: <document: validation rules>,\n"
+            << "  validationLevel: <string: validation level>,\n"
+            << "  validationAction: <string: validation action>,\n"
+            << "  indexOptionDefaults: <document: default configuration for indexes>,\n"
+            << "  viewOn: <string: name of source collection or view>,\n"
+            << "  pipeline: <array<object>: aggregation pipeline stage>,\n"
+            << "  collation: <document: default collation for the collection or view>,\n"
+            << "  writeConcern: <document: write concern expression for the operation>]\n"
+            << "}";
     }
+
     virtual Status checkAuthForCommand(Client* client,
                                        const std::string& dbname,
                                        const BSONObj& cmdObj) const {
@@ -286,55 +312,69 @@ public:
                      const string& dbname,
                      const BSONObj& cmdObj,
                      BSONObjBuilder& result) {
-        const NamespaceString ns(CommandHelpers::parseNsCollectionRequired(dbname, cmdObj));
+        IDLParserErrorContext ctx("create");
+        CreateCommand cmd = CreateCommand::parse(ctx, cmdObj);
 
-        if (cmdObj.hasField("autoIndexId")) {
+        const NamespaceString ns = cmd.getNamespace();
+
+        if (cmd.getAutoIndexId()) {
             const char* deprecationWarning =
                 "the autoIndexId option is deprecated and will be removed in a future release";
             warning() << deprecationWarning;
             result.append("note", deprecationWarning);
         }
 
+        // Ensure that the 'size' field is present if 'capped' is set to true.
+        if (cmd.getCapped()) {
+            uassert(ErrorCodes::InvalidOptions,
+                    str::stream() << "the 'size' field is required when 'capped' is true",
+                    cmd.getSize());
+        }
+
+        // If the 'size' or 'max' fields are present, then 'capped' must be set to true.
+        if (cmd.getSize() || cmd.getMax()) {
+            uassert(ErrorCodes::InvalidOptions,
+                    str::stream() << "the 'capped' field needs to be true when either the 'size'"
+                                  << " or 'max' fields are present",
+                    cmd.getCapped());
+        }
+
+        // The 'temp' field is only allowed to be used internally and isn't available to clients.
+        if (cmd.getTemp()) {
+            uassert(ErrorCodes::InvalidOptions,
+                    str::stream() << "the 'temp' field is an invalid option",
+                    opCtx->getClient()->isInDirectClient());
+        }
+
         // Validate _id index spec and fill in missing fields.
-        if (auto idIndexElem = cmdObj["idIndex"]) {
-            if (cmdObj["viewOn"]) {
-                uasserted(ErrorCodes::InvalidOptions,
-                          str::stream() << "'idIndex' is not allowed with 'viewOn': "
-                                        << idIndexElem);
-            }
-            if (cmdObj["autoIndexId"]) {
-                uasserted(ErrorCodes::InvalidOptions,
-                          str::stream() << "'idIndex' is not allowed with 'autoIndexId': "
-                                        << idIndexElem);
-            }
+        if (cmd.getIdIndex()) {
+            auto idIndexSpec = *cmd.getIdIndex();
 
-            if (idIndexElem.type() != BSONType::Object) {
-                uasserted(ErrorCodes::TypeMismatch,
-                          str::stream() << "'idIndex' has to be a document: " << idIndexElem);
-            }
+            uassert(ErrorCodes::InvalidOptions,
+                    str::stream() << "'idIndex' is not allowed with 'viewOn': " << idIndexSpec,
+                    !cmd.getViewOn());
 
-            auto idIndexSpec = idIndexElem.Obj();
+            uassert(ErrorCodes::InvalidOptions,
+                    str::stream() << "'idIndex' is not allowed with 'autoIndexId': " << idIndexSpec,
+                    !cmd.getAutoIndexId());
 
             // Perform index spec validation.
             idIndexSpec = uassertStatusOK(index_key_validate::validateIndexSpec(
-                opCtx, idIndexSpec, ns, serverGlobalParams.featureCompatibility));
+                opCtx, idIndexSpec, serverGlobalParams.featureCompatibility));
             uassertStatusOK(index_key_validate::validateIdIndexSpec(idIndexSpec));
 
             // Validate or fill in _id index collation.
             std::unique_ptr<CollatorInterface> defaultCollator;
-            if (auto collationElem = cmdObj["collation"]) {
-                if (collationElem.type() != BSONType::Object) {
-                    uasserted(ErrorCodes::TypeMismatch,
-                              str::stream() << "'collation' has to be a document: "
-                                            << collationElem);
-                }
+            if (cmd.getCollation()) {
                 auto collatorStatus = CollatorFactoryInterface::get(opCtx->getServiceContext())
-                                          ->makeFromBSON(collationElem.Obj());
+                                          ->makeFromBSON(*cmd.getCollation());
                 uassertStatusOK(collatorStatus.getStatus());
                 defaultCollator = std::move(collatorStatus.getValue());
             }
+
             idIndexSpec = uassertStatusOK(index_key_validate::validateIndexSpecCollation(
                 opCtx, idIndexSpec, defaultCollator.get()));
+
             std::unique_ptr<CollatorInterface> idIndexCollator;
             if (auto collationElem = idIndexSpec["collation"]) {
                 auto collatorStatus = CollatorFactoryInterface::get(opCtx->getServiceContext())
@@ -450,7 +490,7 @@ public:
                                                                          keyPattern,
                                                                          true);  // requireSingleKey
 
-            if (idx == NULL) {
+            if (idx == nullptr) {
                 errmsg = "couldn't find valid index containing key pattern";
                 return false;
             }
@@ -572,7 +612,7 @@ public:
     }
     std::string help() const override {
         return "Sets collection options.\n"
-               "Example: { collMod: 'foo', usePowerOf2Sizes:true }\n"
+               "Example: { collMod: 'foo', viewOn: 'bar'} "
                "Example: { collMod: 'foo', index: {keyPattern: {a: 1}, expireAfterSeconds: 600} "
                "Example: { collMod: 'foo', index: {name: 'bar', expireAfterSeconds: 600} }\n";
     }
@@ -665,9 +705,10 @@ public:
             result.append("avgObjSize", 0);
             result.appendNumber("dataSize", 0);
             result.appendNumber("storageSize", 0);
-            result.appendNumber("numExtents", 0);
+            result.appendNumber("totalSize", 0);
             result.appendNumber("indexes", 0);
             result.appendNumber("indexSize", 0);
+            result.appendNumber("scaleFactor", scale);
             result.appendNumber("fileSize", 0);
             if (!getGlobalServiceContext()->getStorageEngine()->isEphemeral()) {
                 result.appendNumber("fsUsedSize", 0);

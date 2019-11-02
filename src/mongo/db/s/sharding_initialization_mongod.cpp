@@ -67,15 +67,18 @@
 #include "mongo/util/log.h"
 
 namespace mongo {
+
+// Failpoint for disabling updateShardIdentityConfigString calls on signaled RS nodes.
+MONGO_FAIL_POINT_DEFINE(failUpdateShardIdentityConfigString);
+
 namespace {
 
 const auto getInstance = ServiceContext::declareDecoration<ShardingInitializationMongoD>();
 
 auto makeEgressHooksList(ServiceContext* service) {
-    auto unshardedHookList = stdx::make_unique<rpc::EgressMetadataHookList>();
-    unshardedHookList->addHook(stdx::make_unique<rpc::LogicalTimeMetadataHook>(service));
-    unshardedHookList->addHook(
-        stdx::make_unique<rpc::ShardingEgressMetadataHookForMongod>(service));
+    auto unshardedHookList = std::make_unique<rpc::EgressMetadataHookList>();
+    unshardedHookList->addHook(std::make_unique<rpc::LogicalTimeMetadataHook>(service));
+    unshardedHookList->addHook(std::make_unique<rpc::ShardingEgressMetadataHookForMongod>(service));
 
     return unshardedHookList;
 }
@@ -83,41 +86,73 @@ auto makeEgressHooksList(ServiceContext* service) {
 /**
  * Updates the config server field of the shardIdentity document with the given connection string if
  * setName is equal to the config server replica set name.
- *
- * NOTE: This is intended to be used on a new thread that hasn't called Client::initThread.
- *
- * One example use case is for the ReplicaSetMonitor asynchronous callback when it detects changes
- * to replica set membership.
  */
-void updateShardIdentityConfigStringCB(const std::string& setName,
-                                       const std::string& newConnectionString) {
-    auto configsvrConnStr =
-        Grid::get(getGlobalServiceContext())->shardRegistry()->getConfigServerConnectionString();
-    if (configsvrConnStr.getSetName() != setName) {
-        // Ignore all change notification for other sets that are not the config server.
-        return;
+class ShardingReplicaSetChangeListener final : public ReplicaSetChangeNotifier::Listener {
+public:
+    ShardingReplicaSetChangeListener(ServiceContext* serviceContext)
+        : _serviceContext(serviceContext) {}
+    ~ShardingReplicaSetChangeListener() final = default;
+
+    void onFoundSet(const Key&) final {}
+
+    // Update the shard identy config string
+    void onConfirmedSet(const State& state) final {
+        Grid::get(_serviceContext)
+            ->getExecutorPool()
+            ->getFixedExecutor()
+            ->schedule([serviceContext = _serviceContext, connStr = state.connStr](Status status) {
+                if (ErrorCodes::isCancelationError(status.code())) {
+                    LOG(2) << "Unable to schedule confirmed set update due to " << status;
+                    return;
+                }
+                invariant(status);
+
+                try {
+                    LOG(0) << "Updating config server with confirmed set " << connStr;
+                    Grid::get(serviceContext)->shardRegistry()->updateReplSetHosts(connStr);
+
+                    if (MONGO_unlikely(failUpdateShardIdentityConfigString.shouldFail())) {
+                        return;
+                    }
+
+                    auto configsvrConnStr = Grid::get(serviceContext)
+                                                ->shardRegistry()
+                                                ->getConfigServerConnectionString();
+
+                    // Only proceed if the notification is for the configsvr
+                    if (configsvrConnStr.getSetName() != connStr.getSetName()) {
+                        return;
+                    }
+
+                    ThreadClient tc("updateShardIdentityConfigString", serviceContext);
+                    auto opCtx = tc->makeOperationContext();
+
+                    ShardingInitializationMongoD::updateShardIdentityConfigString(opCtx.get(),
+                                                                                  connStr);
+                } catch (const ExceptionForCat<ErrorCategory::ShutdownError>& e) {
+                    LOG(0) << "Unable to update config server due to " << e;
+                }
+            });
     }
-
-    Client::initThread("updateShardIdentityConfigConnString");
-    auto uniqOpCtx = Client::getCurrent()->makeOperationContext();
-
-    auto status = ShardingInitializationMongoD::updateShardIdentityConfigString(
-        uniqOpCtx.get(), uassertStatusOK(ConnectionString::parse(newConnectionString)));
-    if (!status.isOK() && !ErrorCodes::isNotMasterError(status.code())) {
-        warning() << "Error encountered while trying to update config connection string to "
-                  << newConnectionString << causedBy(redact(status));
+    void onPossibleSet(const State& state) final {
+        Grid::get(_serviceContext)->shardRegistry()->updateReplSetHosts(state.connStr);
     }
-}
+    void onDroppedSet(const Key&) final {}
 
-void initializeShardingEnvironmentOnShardServer(OperationContext* opCtx,
-                                                const ShardIdentity& shardIdentity,
-                                                StringData distLockProcessId) {
+private:
+    ServiceContext* _serviceContext;
+};
+
+}  // namespace
+
+void ShardingInitializationMongoD::initializeShardingEnvironmentOnShardServer(
+    OperationContext* opCtx, const ShardIdentity& shardIdentity, StringData distLockProcessId) {
     initializeGlobalShardingStateForMongoD(
         opCtx, shardIdentity.getConfigsvrConnectionString(), distLockProcessId);
 
-    ReplicaSetMonitor::setSynchronousConfigChangeHook(
-        &ShardRegistry::replicaSetChangeShardRegistryUpdateHook);
-    ReplicaSetMonitor::setAsynchronousConfigChangeHook(&updateShardIdentityConfigStringCB);
+    _replicaSetChangeListener =
+        ReplicaSetMonitor::getNotifier().makeListener<ShardingReplicaSetChangeListener>(
+            opCtx->getServiceContext());
 
     // Determine primary/secondary/standalone state in order to properly initialize sharding
     // components.
@@ -141,10 +176,10 @@ void initializeShardingEnvironmentOnShardServer(OperationContext* opCtx,
            << (isStandaloneOrPrimary ? "primary" : "secondary") << " node.";
 }
 
-}  // namespace
-
 ShardingInitializationMongoD::ShardingInitializationMongoD()
-    : _initFunc(initializeShardingEnvironmentOnShardServer) {}
+    : _initFunc([this](auto... args) {
+          this->initializeShardingEnvironmentOnShardServer(std::forward<decltype(args)>(args)...);
+      }) {}
 
 ShardingInitializationMongoD::~ShardingInitializationMongoD() = default;
 
@@ -165,6 +200,8 @@ void ShardingInitializationMongoD::shutDown(OperationContext* opCtx) {
 
     grid->getExecutorPool()->shutdownAndJoin();
     grid->catalogClient()->shutDown(opCtx);
+    grid->shardRegistry()->shutdown();
+    _replicaSetChangeListener.reset();
 }
 
 bool ShardingInitializationMongoD::initializeShardingAwarenessIfNeeded(OperationContext* opCtx) {
@@ -276,7 +313,7 @@ void ShardingInitializationMongoD::initializeFromShardIdentity(
     auto const shardingState = ShardingState::get(opCtx);
     auto const shardRegistry = Grid::get(opCtx)->shardRegistry();
 
-    stdx::unique_lock<stdx::mutex> ul(_initSynchronizationMutex);
+    stdx::unique_lock<Latch> ul(_initSynchronizationMutex);
 
     if (shardingState->enabled()) {
         uassert(40371, "", shardingState->shardId() == shardIdentity.getShardName());
@@ -305,14 +342,14 @@ void ShardingInitializationMongoD::initializeFromShardIdentity(
     }
 }
 
-Status ShardingInitializationMongoD::updateShardIdentityConfigString(
+void ShardingInitializationMongoD::updateShardIdentityConfigString(
     OperationContext* opCtx, const ConnectionString& newConnectionString) {
     BSONObj updateObj(
         ShardIdentityType::createConfigServerUpdateObject(newConnectionString.toString()));
 
     UpdateRequest updateReq(NamespaceString::kServerConfigurationNamespace);
     updateReq.setQuery(BSON("_id" << ShardIdentityType::IdName));
-    updateReq.setUpdates(updateObj);
+    updateReq.setUpdateModification(updateObj);
 
     try {
         AutoGetOrCreateDb autoDb(
@@ -327,33 +364,35 @@ Status ShardingInitializationMongoD::updateShardIdentityConfigString(
                    << newConnectionString;
         }
     } catch (const DBException& exception) {
-        return exception.toStatus();
+        auto status = exception.toStatus();
+        if (!ErrorCodes::isNotMasterError(status.code())) {
+            warning() << "Error encountered while trying to update config connection string to "
+                      << newConnectionString.toString() << causedBy(redact(status));
+        }
     }
-
-    return Status::OK();
 }
 
 void initializeGlobalShardingStateForMongoD(OperationContext* opCtx,
                                             const ConnectionString& configCS,
                                             StringData distLockProcessId) {
-    auto targeterFactory = stdx::make_unique<RemoteCommandTargeterFactoryImpl>();
+    auto targeterFactory = std::make_unique<RemoteCommandTargeterFactoryImpl>();
     auto targeterFactoryPtr = targeterFactory.get();
 
-    ShardFactory::BuilderCallable setBuilder =
-        [targeterFactoryPtr](const ShardId& shardId, const ConnectionString& connStr) {
-            return stdx::make_unique<ShardRemote>(
-                shardId, connStr, targeterFactoryPtr->create(connStr));
-        };
+    ShardFactory::BuilderCallable setBuilder = [targeterFactoryPtr](
+                                                   const ShardId& shardId,
+                                                   const ConnectionString& connStr) {
+        return std::make_unique<ShardRemote>(shardId, connStr, targeterFactoryPtr->create(connStr));
+    };
 
-    ShardFactory::BuilderCallable masterBuilder =
-        [targeterFactoryPtr](const ShardId& shardId, const ConnectionString& connStr) {
-            return stdx::make_unique<ShardRemote>(
-                shardId, connStr, targeterFactoryPtr->create(connStr));
-        };
+    ShardFactory::BuilderCallable masterBuilder = [targeterFactoryPtr](
+                                                      const ShardId& shardId,
+                                                      const ConnectionString& connStr) {
+        return std::make_unique<ShardRemote>(shardId, connStr, targeterFactoryPtr->create(connStr));
+    };
 
     ShardFactory::BuilderCallable localBuilder = [](const ShardId& shardId,
                                                     const ConnectionString& connStr) {
-        return stdx::make_unique<ShardLocal>(shardId);
+        return std::make_unique<ShardLocal>(shardId);
     };
 
     ShardFactory::BuildersMap buildersMap{
@@ -363,20 +402,20 @@ void initializeGlobalShardingStateForMongoD(OperationContext* opCtx,
     };
 
     auto shardFactory =
-        stdx::make_unique<ShardFactory>(std::move(buildersMap), std::move(targeterFactory));
+        std::make_unique<ShardFactory>(std::move(buildersMap), std::move(targeterFactory));
 
     auto const service = opCtx->getServiceContext();
 
     if (serverGlobalParams.clusterRole == ClusterRole::ShardServer) {
         if (storageGlobalParams.readOnly) {
-            CatalogCacheLoader::set(service, stdx::make_unique<ReadOnlyCatalogCacheLoader>());
+            CatalogCacheLoader::set(service, std::make_unique<ReadOnlyCatalogCacheLoader>());
         } else {
             CatalogCacheLoader::set(service,
-                                    stdx::make_unique<ShardServerCatalogCacheLoader>(
-                                        stdx::make_unique<ConfigServerCatalogCacheLoader>()));
+                                    std::make_unique<ShardServerCatalogCacheLoader>(
+                                        std::make_unique<ConfigServerCatalogCacheLoader>()));
         }
     } else {
-        CatalogCacheLoader::set(service, stdx::make_unique<ConfigServerCatalogCacheLoader>());
+        CatalogCacheLoader::set(service, std::make_unique<ConfigServerCatalogCacheLoader>());
     }
 
     auto validator = LogicalTimeValidator::get(service);
@@ -387,16 +426,34 @@ void initializeGlobalShardingStateForMongoD(OperationContext* opCtx,
     globalConnPool.addHook(new ShardingConnectionHook(false, makeEgressHooksList(service)));
     shardConnectionPool.addHook(new ShardingConnectionHook(true, makeEgressHooksList(service)));
 
-    uassertStatusOK(initializeGlobalShardingState(
-        opCtx,
-        configCS,
-        distLockProcessId,
-        std::move(shardFactory),
-        stdx::make_unique<CatalogCache>(CatalogCacheLoader::get(opCtx)),
-        [service] { return makeEgressHooksList(service); },
-        // We only need one task executor here because sharding task executors aren't used for user
-        // queries in mongod.
-        1));
+    auto catalogCache = std::make_unique<CatalogCache>(CatalogCacheLoader::get(opCtx));
+
+    // List of hooks which will be called by the ShardRegistry when it discovers a shard has been
+    // removed.
+    std::vector<ShardRegistry::ShardRemovalHook> shardRemovalHooks = {
+        // Invalidate appropriate entries in the CatalogCache when a shard is removed. It's safe to
+        // capture the CatalogCache pointer since the Grid (and therefore CatalogCache and
+        // ShardRegistry) are never destroyed.
+        [catCache = catalogCache.get()](const ShardId& removedShard) {
+            catCache->invalidateEntriesThatReferenceShard(removedShard);
+        }};
+
+    uassert(ErrorCodes::BadValue,
+            "Unrecognized connection string.",
+            configCS.type() != ConnectionString::INVALID);
+
+    auto shardRegistry = std::make_unique<ShardRegistry>(
+        std::move(shardFactory), configCS, std::move(shardRemovalHooks));
+
+    uassertStatusOK(
+        initializeGlobalShardingState(opCtx,
+                                      distLockProcessId,
+                                      std::move(catalogCache),
+                                      std::move(shardRegistry),
+                                      [service] { return makeEgressHooksList(service); },
+                                      // We only need one task executor here because sharding task
+                                      // executors aren't used for user queries in mongod.
+                                      1));
 
     auto const replCoord = repl::ReplicationCoordinator::get(service);
     if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer &&

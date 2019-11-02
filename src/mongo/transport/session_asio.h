@@ -74,7 +74,8 @@ Future<void> futurize(const std::error_code& ec) {
 using GenericSocket = asio::generic::stream_protocol::socket;
 
 class TransportLayerASIO::ASIOSession final : public Session {
-    MONGO_DISALLOW_COPYING(ASIOSession);
+    ASIOSession(const ASIOSession&) = delete;
+    ASIOSession& operator=(const ASIOSession&) = delete;
 
 public:
     // If the socket is disconnected while any of these options are being set, this constructor
@@ -90,8 +91,10 @@ public:
             setSocketKeepAliveParams(_socket.native_handle());
         }
 
-        _local = endpointToHostAndPort(_socket.local_endpoint());
-        _remote = endpointToHostAndPort(_socket.remote_endpoint());
+        _localAddr = endpointToSockAddr(_socket.local_endpoint());
+        _remoteAddr = endpointToSockAddr(_socket.remote_endpoint());
+        _local = HostAndPort(_localAddr.toString(true));
+        _remote = HostAndPort(_remoteAddr.toString(true));
     } catch (const DBException&) {
         throw;
     } catch (const asio::system_error& error) {
@@ -116,10 +119,17 @@ public:
         return _local;
     }
 
+    const SockAddr& remoteAddr() const override {
+        return _remoteAddr;
+    }
+
+    const SockAddr& localAddr() const override {
+        return _localAddr;
+    }
+
     void end() override {
         if (getSocket().is_open()) {
             std::error_code ec;
-            cancelAsyncOperations();
             getSocket().shutdown(GenericSocket::shutdown_both, ec);
             if ((ec) && (ec != asio::error::not_connected)) {
                 error() << "Error shutting down socket: " << ec.message();
@@ -212,7 +222,7 @@ protected:
 #ifdef MONGO_CONFIG_SSL
     // The unique_lock here is held by TransportLayerASIO to synchronize with the asyncConnect
     // timeout callback. It will be unlocked before the SSL actually handshake begins.
-    Future<void> handshakeSSLForEgressWithLock(stdx::unique_lock<stdx::mutex> lk,
+    Future<void> handshakeSSLForEgressWithLock(stdx::unique_lock<Latch> lk,
                                                const HostAndPort& target) {
         if (!_tl->_egressSSLContext) {
             return Future<void>::makeReady(Status(ErrorCodes::SSLHandshakeFailed,
@@ -235,20 +245,17 @@ protected:
         return doHandshake().then([this, target] {
             _ranHandshake = true;
 
-            auto swPeerInfo = uassertStatusOK(getSSLManager()->parseAndValidatePeerCertificate(
-                _sslSocket->native_handle(), target.host(), target));
-
-            if (swPeerInfo) {
-                SSLPeerInfo::forSession(shared_from_this()) = std::move(*swPeerInfo);
-            }
+            SSLPeerInfo::forSession(shared_from_this()) =
+                uassertStatusOK(getSSLManager()->parseAndValidatePeerCertificate(
+                    _sslSocket->native_handle(), _sslSocket->get_sni(), target.host(), target));
         });
     }
 
     // For synchronous connections where we don't have an async timer, just take a dummy lock and
     // pass it to the WithLock version of handshakeSSLForEgress
     Future<void> handshakeSSLForEgress(const HostAndPort& target) {
-        stdx::mutex mutex;
-        return handshakeSSLForEgressWithLock(stdx::unique_lock<stdx::mutex>(mutex), target);
+        auto mutex = MONGO_MAKE_LATCH();
+        return handshakeSSLForEgressWithLock(stdx::unique_lock<Latch>(mutex), target);
     }
 #endif
 
@@ -346,7 +353,7 @@ private:
         auto headerBuffer = SharedBuffer::allocate(kHeaderSize);
         auto ptr = headerBuffer.get();
         return read(asio::buffer(ptr, kHeaderSize), baton)
-            .then([ headerBuffer = std::move(headerBuffer), this, baton ]() mutable {
+            .then([headerBuffer = std::move(headerBuffer), this, baton]() mutable {
                 if (checkForHTTPRequest(asio::buffer(headerBuffer.get(), kHeaderSize))) {
                     return sendHTTPResponse(baton);
                 }
@@ -375,7 +382,7 @@ private:
 
                 MsgData::View msgView(buffer.get());
                 return read(asio::buffer(msgView.data(), msgView.dataLen()), baton)
-                    .then([ this, buffer = std::move(buffer), msgLen ]() mutable {
+                    .then([this, buffer = std::move(buffer), msgLen]() mutable {
                         if (_isIngressSession) {
                             networkCounter.hitPhysicalIn(msgLen);
                         }
@@ -439,7 +446,7 @@ private:
         std::error_code ec;
         size_t size;
 
-        if (MONGO_FAIL_POINT(transportLayerASIOshortOpportunisticReadWrite) &&
+        if (MONGO_unlikely(transportLayerASIOshortOpportunisticReadWrite.shouldFail()) &&
             _blockingMode == Async) {
             asio::mutable_buffer localBuffer = buffers;
 
@@ -509,6 +516,10 @@ private:
 
         return boost::none;
     }
+
+    boost::optional<std::string> getSniName() const override {
+        return SSLPeerInfo::forSession(shared_from_this()).sniName;
+    }
 #endif
 
     template <typename Stream, typename ConstBufferSequence>
@@ -518,7 +529,7 @@ private:
         std::error_code ec;
         std::size_t size;
 
-        if (MONGO_FAIL_POINT(transportLayerASIOshortOpportunisticReadWrite) &&
+        if (MONGO_unlikely(transportLayerASIOshortOpportunisticReadWrite.shouldFail()) &&
             _blockingMode == Async) {
             asio::const_buffer localBuffer = buffers;
 
@@ -613,24 +624,8 @@ private:
                 auto& sslPeerInfo = SSLPeerInfo::forSession(shared_from_this());
 
                 if (sslPeerInfo.subjectName.empty()) {
-                    auto swPeerInfo = getSSLManager()->parseAndValidatePeerCertificate(
-                        _sslSocket->native_handle(), "", _remote);
-
-                    // The value of swPeerInfo is a bit complicated:
-                    //
-                    // If !swPeerInfo.isOK(), then there was an error doing the SSL
-                    // handshake and we should reject the connection.
-                    //
-                    // If !sslPeerInfo.getValue(), then the SSL handshake was successful,
-                    // but the peer didn't provide a SSL certificate, and we do not require
-                    // one. sslPeerInfo should be empty.
-                    //
-                    // Otherwise the SSL handshake was successful and the peer did provide
-                    // a certificate that is valid, and we should store that info on the
-                    // session's SSLPeerInfo decoration.
-                    if (auto optPeerInfo = uassertStatusOK(swPeerInfo)) {
-                        sslPeerInfo = *optPeerInfo;
-                    }
+                    sslPeerInfo = uassertStatusOK(getSSLManager()->parseAndValidatePeerCertificate(
+                        _sslSocket->native_handle(), _sslSocket->get_sni(), "", _remote));
                 }
                 return true;
             });
@@ -697,6 +692,9 @@ private:
 
     HostAndPort _remote;
     HostAndPort _local;
+
+    SockAddr _remoteAddr;
+    SockAddr _localAddr;
 
     boost::optional<Milliseconds> _configuredTimeout;
     boost::optional<Milliseconds> _socketTimeout;

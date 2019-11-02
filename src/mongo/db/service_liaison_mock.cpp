@@ -30,32 +30,29 @@
 #include "mongo/platform/basic.h"
 
 #include <algorithm>
+#include <memory>
 
 #include "mongo/db/service_liaison_mock.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/util/periodic_runner_factory.h"
 
 namespace mongo {
 
 MockServiceLiaisonImpl::MockServiceLiaisonImpl() {
-    _timerFactory = stdx::make_unique<executor::AsyncTimerFactoryMock>();
+    _timerFactory = std::make_unique<executor::AsyncTimerFactoryMock>();
     _runner = makePeriodicRunner(getGlobalServiceContext());
-    _runner->startup();
 }
 
 LogicalSessionIdSet MockServiceLiaisonImpl::getActiveOpSessions() const {
-    stdx::unique_lock<stdx::mutex> lk(_mutex);
+    stdx::unique_lock<Latch> lk(_mutex);
     return _activeSessions;
 }
 
 LogicalSessionIdSet MockServiceLiaisonImpl::getOpenCursorSessions(OperationContext* opCtx) const {
-    stdx::unique_lock<stdx::mutex> lk(_mutex);
+    stdx::unique_lock<Latch> lk(_mutex);
     return _cursorSessions;
 }
 
-void MockServiceLiaisonImpl::join() {
-    _runner->shutdown();
-}
+void MockServiceLiaisonImpl::join() {}
 
 Date_t MockServiceLiaisonImpl::now() const {
     return _timerFactory->now();
@@ -68,32 +65,32 @@ void MockServiceLiaisonImpl::scheduleJob(PeriodicRunner::PeriodicJob job) {
 
 
 void MockServiceLiaisonImpl::addCursorSession(LogicalSessionId lsid) {
-    stdx::unique_lock<stdx::mutex> lk(_mutex);
+    stdx::unique_lock<Latch> lk(_mutex);
     _cursorSessions.insert(std::move(lsid));
 }
 
 void MockServiceLiaisonImpl::removeCursorSession(LogicalSessionId lsid) {
-    stdx::unique_lock<stdx::mutex> lk(_mutex);
+    stdx::unique_lock<Latch> lk(_mutex);
     _cursorSessions.erase(lsid);
 }
 
 void MockServiceLiaisonImpl::clearCursorSession() {
-    stdx::unique_lock<stdx::mutex> lk(_mutex);
+    stdx::unique_lock<Latch> lk(_mutex);
     _cursorSessions.clear();
 }
 
 void MockServiceLiaisonImpl::add(LogicalSessionId lsid) {
-    stdx::unique_lock<stdx::mutex> lk(_mutex);
+    stdx::unique_lock<Latch> lk(_mutex);
     _cursorSessions.insert(std::move(lsid));
 }
 
 void MockServiceLiaisonImpl::remove(LogicalSessionId lsid) {
-    stdx::unique_lock<stdx::mutex> lk(_mutex);
+    stdx::unique_lock<Latch> lk(_mutex);
     _activeSessions.erase(lsid);
 }
 
 void MockServiceLiaisonImpl::clear() {
-    stdx::unique_lock<stdx::mutex> lk(_mutex);
+    stdx::unique_lock<Latch> lk(_mutex);
     _activeSessions.clear();
 }
 

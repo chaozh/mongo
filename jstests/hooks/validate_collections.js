@@ -2,7 +2,6 @@
 'use strict';
 
 function CollectionValidator() {
-    load('jstests/libs/feature_compatibility_version.js');
     load('jstests/libs/parallelTester.js');
 
     if (!(this instanceof CollectionValidator)) {
@@ -25,8 +24,6 @@ function CollectionValidator() {
         assert.eq(typeof obj, 'object', 'The `obj` argument must be an object');
         assert(obj.hasOwnProperty('full'), 'Please specify whether to use full validation');
 
-        const full = obj.full;
-
         // Failed collection validation results are saved in failed_res.
         let full_res = {ok: 1, failed_res: []};
 
@@ -46,9 +43,11 @@ function CollectionValidator() {
             jsTest.options().skipValidationNamespaces.length > 0) {
             let skippedCollections = [];
             for (let ns of jsTest.options().skipValidationNamespaces) {
-                // Strip off the database name from 'ns' to extract the collName.
+                // Attempt to strip the name of the database we are about to validate off of the
+                // namespace we wish to skip. If the replace() function does find a match with the
+                // database, then we know that the collection we want to skip is in the database we
+                // are about to validate. We will then put it in the 'filter' for later use.
                 const collName = ns.replace(new RegExp('^' + db.getName() + '\.'), '');
-                // Skip the collection 'collName' if the db name was removed from 'ns'.
                 if (collName !== ns) {
                     skippedCollections.push({name: {$ne: collName}});
                 }
@@ -59,11 +58,11 @@ function CollectionValidator() {
         let collInfo = db.getCollectionInfos(filter);
         for (let collDocument of collInfo) {
             const coll = db.getCollection(collDocument['name']);
-            const res = coll.validate(full);
+            const res = coll.validate(obj);
 
             if (!res.ok || !res.valid) {
                 if (jsTest.options().skipValidationOnNamespaceNotFound &&
-                    res.errmsg === 'ns not found') {
+                    res.codeName === "NamespaceNotFound") {
                     // During a 'stopStart' backup/restore on the secondary node, the actual list of
                     // collections can be out of date if ops are still being applied from the oplog.
                     // In this case we skip the collection if the ns was not found at time of
@@ -73,8 +72,8 @@ function CollectionValidator() {
                     continue;
                 }
                 const host = db.getMongo().host;
-                print('Collection validation failed on host ' + host + ' with response: ' +
-                      tojson(res));
+                print('Collection validation failed on host ' + host +
+                      ' with response: ' + tojson(res));
                 dumpCollection(coll, 100);
                 full_res.failed_res.push(res);
                 full_res.ok = 0;
@@ -87,8 +86,6 @@ function CollectionValidator() {
     // Run a separate thread to validate collections on each server in parallel.
     const validateCollectionsThread = function(validatorFunc, host) {
         try {
-            load('jstests/libs/feature_compatibility_version.js');
-
             print('Running validate() on ' + host);
             const conn = new Mongo(host);
             conn.setSlaveOk();
@@ -150,7 +147,7 @@ function CollectionValidator() {
         try {
             hostList.forEach(host => {
                 const thread =
-                    new ScopedThread(validateCollectionsThread, this.validateCollections, host);
+                    new Thread(validateCollectionsThread, this.validateCollections, host);
                 threads.push(thread);
                 thread.start();
             });

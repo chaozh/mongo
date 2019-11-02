@@ -33,7 +33,9 @@
 #include <ostream>
 
 #include "mongo/db/jsobj.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/storage/duplicate_key_error_info.h"
+#include "mongo/db/storage/key_string.h"
 
 namespace mongo {
 
@@ -109,66 +111,71 @@ int IndexEntryComparison::compare(const IndexKeyEntry& lhs, const IndexKeyEntry&
     return lhs.loc.compare(rhs.loc);  // is supposed to ignore ordering
 }
 
-// reading the comment in the .h file is highly recommended if you need to understand what this
-// function is doing
-BSONObj IndexEntryComparison::makeQueryObject(const BSONObj& keyPrefix,
-                                              int prefixLen,
-                                              bool prefixExclusive,
-                                              const std::vector<const BSONElement*>& keySuffix,
-                                              const std::vector<bool>& suffixInclusive,
-                                              const int cursorDirection) {
-    // Please read the comments in the header file to see why this is done.
-    // The basic idea is that we use the field name to store a byte which indicates whether
-    // each field in the query object is inclusive and exclusive, and if it is exclusive, in
-    // which direction.
-    const char exclusiveByte = (cursorDirection == 1 ? greater : less);
+KeyString::Value IndexEntryComparison::makeKeyStringFromSeekPointForSeek(
+    const IndexSeekPoint& seekPoint, KeyString::Version version, Ordering ord, bool isForward) {
 
-    const StringData exclusiveFieldName(&exclusiveByte, 1);
+    // Determines the discriminator used to build the KeyString.
+    auto suffixExclusive = [&]() {
+        for (size_t i = seekPoint.prefixLen; i < seekPoint.keySuffix.size(); i++) {
+            if (!seekPoint.suffixInclusive[i])
+                return true;
+        }
+        return false;
+    };
+    bool inclusive = !seekPoint.prefixExclusive && !suffixExclusive();
+    const auto discriminator = isForward == inclusive ? KeyString::Discriminator::kExclusiveBefore
+                                                      : KeyString::Discriminator::kExclusiveAfter;
 
-    BSONObjBuilder bb;
+    KeyString::Builder builder(version, ord, discriminator);
 
-    // handle the prefix
-    if (prefixLen > 0) {
-        BSONObjIterator it(keyPrefix);
-        for (int i = 0; i < prefixLen; i++) {
+    // Appends keyPrefix elements to the builder.
+    if (seekPoint.prefixLen > 0) {
+        BSONObjIterator it(seekPoint.keyPrefix);
+        for (int i = 0; i < seekPoint.prefixLen; i++) {
             invariant(it.more());
             const BSONElement e = it.next();
-
-            if (prefixExclusive && i == prefixLen - 1) {
-                bb.appendAs(e, exclusiveFieldName);
-            } else {
-                bb.appendAs(e, StringData());
-            }
+            builder.appendBSONElement(e);
         }
     }
 
-    // If the prefix is exclusive then the suffix does not matter as it will never be used
-    if (prefixExclusive) {
-        invariant(prefixLen > 0);
-        return bb.obj();
+    // If the prefix is exclusive then the suffix does not matter as it will never be used.
+    if (seekPoint.prefixExclusive) {
+        invariant(seekPoint.prefixLen > 0);
+        return builder.getValueCopy();
     }
 
-    // Handle the suffix. Note that the useful parts of the suffix start at index prefixLen
-    // rather than at 0.
-    invariant(keySuffix.size() == suffixInclusive.size());
-    for (size_t i = prefixLen; i < keySuffix.size(); i++) {
-        invariant(keySuffix[i]);
-        if (suffixInclusive[i]) {
-            bb.appendAs(*keySuffix[i], StringData());
-        } else {
-            bb.appendAs(*keySuffix[i], exclusiveFieldName);
+    // Handles the suffix. Note that the useful parts of the suffix start at index prefixLen rather
+    // than at 0.
+    invariant(seekPoint.keySuffix.size() == seekPoint.suffixInclusive.size());
+    for (size_t i = seekPoint.prefixLen; i < seekPoint.keySuffix.size(); i++) {
+        invariant(seekPoint.keySuffix[i]);
+        builder.appendBSONElement(*seekPoint.keySuffix[i]);
 
-            // If an exclusive field exists then no fields after this will matter, since an
-            // exclusive field never evaluates as equal
-            return bb.obj();
+        // If an exclusive field exists then no fields after this will matter, since an
+        // exclusive field never evaluates as equal.
+        if (!seekPoint.suffixInclusive[i]) {
+            return builder.getValueCopy();
         }
     }
+    return builder.getValueCopy();
+}
 
-    return bb.obj();
+KeyString::Value IndexEntryComparison::makeKeyStringFromBSONKeyForSeek(const BSONObj& bsonKey,
+                                                                       KeyString::Version version,
+                                                                       Ordering ord,
+                                                                       bool isForward,
+                                                                       bool inclusive) {
+    BSONObj finalKey = BSONObj::stripFieldNames(bsonKey);
+    KeyString::Builder builder(version,
+                               finalKey,
+                               ord,
+                               isForward == inclusive ? KeyString::Discriminator::kExclusiveBefore
+                                                      : KeyString::Discriminator::kExclusiveAfter);
+    return builder.getValueCopy();
 }
 
 Status buildDupKeyErrorStatus(const BSONObj& key,
-                              const std::string& collectionNamespace,
+                              const NamespaceString& collectionNamespace,
                               const std::string& indexName,
                               const BSONObj& keyPattern) {
     StringBuilder sb;
@@ -193,8 +200,20 @@ Status buildDupKeyErrorStatus(const BSONObj& key,
         builder.appendAs(keyValueElem, keyNameElem.fieldName());
     }
 
-    sb << builder.obj();
-    return Status(DuplicateKeyErrorInfo(keyPattern, key), sb.str());
+    auto keyValueWithName = builder.obj();
+    sb << keyValueWithName;
+    return Status(DuplicateKeyErrorInfo(keyPattern, keyValueWithName), sb.str());
+}
+
+Status buildDupKeyErrorStatus(const KeyString::Value& keyString,
+                              const NamespaceString& collectionNamespace,
+                              const std::string& indexName,
+                              const BSONObj& keyPattern,
+                              const Ordering& ordering) {
+    const BSONObj key = KeyString::toBson(
+        keyString.getBuffer(), keyString.getSize(), ordering, keyString.getTypeBits());
+
+    return buildDupKeyErrorStatus(key, collectionNamespace, indexName, keyPattern);
 }
 
 }  // namespace mongo

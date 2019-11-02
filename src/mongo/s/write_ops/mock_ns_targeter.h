@@ -29,11 +29,12 @@
 
 #pragma once
 
+#include <memory>
+
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/ns_targeter.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
@@ -119,8 +120,13 @@ public:
         // No-op
     }
 
-    void noteStaleResponse(const ShardEndpoint& endpoint,
-                           const StaleConfigInfo& staleInfo) override {
+    void noteStaleShardResponse(const ShardEndpoint& endpoint,
+                                const StaleConfigInfo& staleInfo) override {
+        // No-op
+    }
+
+    void noteStaleDbResponse(const ShardEndpoint& endpoint,
+                             const StaleDbRoutingVersion& staleInfo) override {
         // No-op
     }
 

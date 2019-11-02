@@ -27,6 +27,8 @@
  *    it in the license file.
  */
 
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/pipeline/parsed_aggregation_projection.h"
@@ -40,9 +42,11 @@
 #include "mongo/db/pipeline/field_path.h"
 #include "mongo/db/pipeline/parsed_exclusion_projection.h"
 #include "mongo/db/pipeline/parsed_inclusion_projection.h"
+#include "mongo/db/query/projection_parser.h"
 #include "mongo/stdx/unordered_set.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/log.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 namespace parsed_aggregation_projection {
@@ -55,13 +59,8 @@ using expression::isPathPrefixOf;
 // ProjectionSpecValidator
 //
 
-void ProjectionSpecValidator::uassertValid(const BSONObj& spec, StringData stageName) {
-    try {
-        ProjectionSpecValidator(spec).validate();
-    } catch (DBException& ex) {
-        ex.addContext("Invalid " + stageName.toString());
-        throw;
-    }
+void ProjectionSpecValidator::uassertValid(const BSONObj& spec) {
+    ProjectionSpecValidator(spec).validate();
 }
 
 void ProjectionSpecValidator::ensurePathDoesNotConflictOrThrow(const std::string& path) {
@@ -86,11 +85,7 @@ void ProjectionSpecValidator::ensurePathDoesNotConflictOrThrow(const std::string
     uassert(40176,
             str::stream() << "specification contains two conflicting paths. "
                              "Cannot specify both '"
-                          << path
-                          << "' and '"
-                          << *conflictingPath
-                          << "': "
-                          << _rawObj.toString(),
+                          << path << "' and '" << *conflictingPath << "': " << _rawObj.toString(),
             !conflictingPath);
 }
 
@@ -129,10 +124,8 @@ void ProjectionSpecValidator::parseNestedObject(const BSONObj& thisLevelSpec,
                 uasserted(40181,
                           str::stream() << "an expression specification must contain exactly "
                                            "one field, the name of the expression. Found "
-                                        << thisLevelSpec.nFields()
-                                        << " fields in "
-                                        << thisLevelSpec.toString()
-                                        << ", while parsing object "
+                                        << thisLevelSpec.nFields() << " fields in "
+                                        << thisLevelSpec.toString() << ", while parsing object "
                                         << _rawObj.toString());
             }
             ensurePathDoesNotConflictOrThrow(prefix.fullPath());
@@ -141,8 +134,7 @@ void ProjectionSpecValidator::parseNestedObject(const BSONObj& thisLevelSpec,
         if (fieldName.find('.') != std::string::npos) {
             uasserted(40183,
                       str::stream() << "cannot use dotted field name '" << fieldName
-                                    << "' in a sub object: "
-                                    << _rawObj.toString());
+                                    << "' in a sub object: " << _rawObj.toString());
         }
         parseElement(elem, FieldPath::getFullyQualifiedPath(prefix.fullPath(), fieldName));
     }
@@ -150,7 +142,6 @@ void ProjectionSpecValidator::parseNestedObject(const BSONObj& thisLevelSpec,
 
 namespace {
 
-using ProjectionPolicies = ParsedAggregationProjection::ProjectionPolicies;
 using ComputedFieldsPolicy = ProjectionPolicies::ComputedFieldsPolicy;
 
 std::string makeBannedComputedFieldsErrorMessage(BSONObj projSpec) {
@@ -245,23 +236,25 @@ private:
         } else if ((elem.isBoolean() || elem.isNumber()) && !elem.trueValue()) {
             // If this is an excluded field other than '_id', ensure that the projection type has
             // not already been set to kInclusionProjection.
-            uassert(40178,
-                    str::stream() << "Bad projection specification, cannot exclude fields "
-                                     "other than '_id' in an inclusion projection: "
-                                  << _rawObj.toString(),
-                    !_parsedType || (*_parsedType ==
-                                     TransformerInterface::TransformerType::kExclusionProjection));
+            uassert(
+                40178,
+                str::stream() << "Bad projection specification, cannot exclude fields "
+                                 "other than '_id' in an inclusion projection: "
+                              << _rawObj.toString(),
+                !_parsedType ||
+                    (*_parsedType == TransformerInterface::TransformerType::kExclusionProjection));
             _parsedType = TransformerInterface::TransformerType::kExclusionProjection;
         } else {
             // A boolean true, a truthy numeric value, or any expression can only be used with an
             // inclusion projection. Note that literal values like "string" or null are also treated
             // as expressions.
-            uassert(40179,
-                    str::stream() << "Bad projection specification, cannot include fields or "
-                                     "add computed fields during an exclusion projection: "
-                                  << _rawObj.toString(),
-                    !_parsedType || (*_parsedType ==
-                                     TransformerInterface::TransformerType::kInclusionProjection));
+            uassert(
+                40179,
+                str::stream() << "Bad projection specification, cannot include fields or "
+                                 "add computed fields during an exclusion projection: "
+                              << _rawObj.toString(),
+                !_parsedType ||
+                    (*_parsedType == TransformerInterface::TransformerType::kInclusionProjection));
             _parsedType = TransformerInterface::TransformerType::kInclusionProjection;
         }
     }
@@ -314,11 +307,8 @@ std::unique_ptr<ParsedAggregationProjection> ParsedAggregationProjection::create
     const boost::intrusive_ptr<ExpressionContext>& expCtx,
     const BSONObj& spec,
     ProjectionPolicies policies) {
-    // Check that the specification was valid. Status returned is unspecific because validate()
-    // is used by the $addFields stage as well as $project.
-    // If there was an error, uassert with a $project-specific message.
-    ProjectionSpecValidator::uassertValid(spec, "$project");
-
+    // Checks that the specification was valid, and throws if it is not.
+    ProjectionSpecValidator::uassertValid(spec);
     // Check for any conflicting specifications, and determine the type of the projection.
     auto projectionType = ProjectTypeParser::parse(spec, policies);
     // kComputed is a projection type reserved for $addFields, and should never be detected by the
@@ -335,6 +325,19 @@ std::unique_ptr<ParsedAggregationProjection> ParsedAggregationProjection::create
 
     // Actually parse the specification.
     parsedProject->parse(spec);
+
+    // If we got here, it means that parsing using ParsedAggProjection::parse() succeeded.
+    // Since the query system is currently between two implementations of projection, we want to
+    // make sure that the old version and new version agree on which projections are valid. Check
+    // that the new parser also finds this projection valid.
+    try {
+        projection_ast::parse(expCtx, spec, policies);
+    } catch (const DBException& e) {
+        error() << "old parser found projection " << spec << " valid but new parser returned "
+                << e.toStatus();
+        MONGO_UNREACHABLE;
+    }
+
     return parsedProject;
 }
 }  // namespace parsed_aggregation_projection

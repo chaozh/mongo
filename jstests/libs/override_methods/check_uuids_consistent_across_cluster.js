@@ -47,6 +47,7 @@ ShardingTest.prototype.checkUUIDsConsistentAcrossCluster = function() {
                 continue;
             }
             var rs = this._rs[i].test;
+
             var keyFile = this._otherParams.keyFile;
             if (keyFile) {
                 authutil.asCluster(rs.nodes, keyFile, function() {
@@ -116,7 +117,7 @@ ShardingTest.prototype.checkUUIDsConsistentAcrossCluster = function() {
 
         for (let authoritativeCollMetadata of authoritativeCollMetadataArr) {
             const ns = authoritativeCollMetadata._id;
-            const[dbName, collName] = parseNs(ns);
+            const [dbName, collName] = parseNs(ns);
 
             for (let shardConnString of authoritativeCollMetadata.shardConnStrings) {
                 // A connection the shard may not be cached in ShardingTest if the shard was added

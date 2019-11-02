@@ -33,13 +33,14 @@
 
 #include "mongo/s/config_server_catalog_cache_loader.h"
 
+#include <memory>
+
 #include "mongo/db/client.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/s/catalog/sharding_catalog_client.h"
 #include "mongo/s/database_version_helpers.h"
 #include "mongo/s/grid.h"
-#include "mongo/stdx/memory.h"
-#include "mongo/util/fail_point_service.h"
+#include "mongo/util/fail_point.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
@@ -142,8 +143,7 @@ ConfigServerCatalogCacheLoader::ConfigServerCatalogCacheLoader()
 }
 
 ConfigServerCatalogCacheLoader::~ConfigServerCatalogCacheLoader() {
-    _threadPool.shutdown();
-    _threadPool.join();
+    shutDown();
 }
 
 void ConfigServerCatalogCacheLoader::initializeReplicaSetRole(bool isPrimary) {
@@ -156,6 +156,20 @@ void ConfigServerCatalogCacheLoader::onStepDown() {
 
 void ConfigServerCatalogCacheLoader::onStepUp() {
     MONGO_UNREACHABLE;
+}
+
+void ConfigServerCatalogCacheLoader::shutDown() {
+    {
+        stdx::lock_guard<Latch> lg(_mutex);
+        if (_inShutdown) {
+            return;
+        }
+
+        _inShutdown = true;
+    }
+
+    _threadPool.shutdown();
+    _threadPool.join();
 }
 
 void ConfigServerCatalogCacheLoader::notifyOfCollectionVersionUpdate(const NamespaceString& nss) {
@@ -176,7 +190,9 @@ std::shared_ptr<Notification<void>> ConfigServerCatalogCacheLoader::getChunksSin
     const NamespaceString& nss, ChunkVersion version, GetChunksSinceCallbackFn callbackFn) {
     auto notify = std::make_shared<Notification<void>>();
 
-    uassertStatusOK(_threadPool.schedule([ nss, version, notify, callbackFn ]() noexcept {
+    _threadPool.schedule([ nss, version, notify, callbackFn ](auto status) noexcept {
+        invariant(status);
+
         auto opCtx = Client::getCurrent()->makeOperationContext();
 
         auto swCollAndChunks = [&]() -> StatusWith<CollectionAndChangedChunks> {
@@ -189,15 +205,17 @@ std::shared_ptr<Notification<void>> ConfigServerCatalogCacheLoader::getChunksSin
 
         callbackFn(opCtx.get(), std::move(swCollAndChunks));
         notify->set();
-    }));
+    });
 
     return notify;
 }
 
 void ConfigServerCatalogCacheLoader::getDatabase(
     StringData dbName,
-    stdx::function<void(OperationContext*, StatusWith<DatabaseType>)> callbackFn) {
-    uassertStatusOK(_threadPool.schedule([ name = dbName.toString(), callbackFn ]() noexcept {
+    std::function<void(OperationContext*, StatusWith<DatabaseType>)> callbackFn) {
+    _threadPool.schedule([ name = dbName.toString(), callbackFn ](auto status) noexcept {
+        invariant(status);
+
         auto opCtx = Client::getCurrent()->makeOperationContext();
 
         auto swDbt = [&]() -> StatusWith<DatabaseType> {
@@ -214,7 +232,7 @@ void ConfigServerCatalogCacheLoader::getDatabase(
         }();
 
         callbackFn(opCtx.get(), std::move(swDbt));
-    }));
+    });
 }
 
 }  // namespace mongo

@@ -29,16 +29,20 @@
 
 #pragma once
 
+#include <functional>
 #include <iosfwd>
 #include <string>
 
-#include "mongo/base/disallow_copying.h"
+#include "mongo/db/repl/is_master_response.h"
 #include "mongo/db/repl/last_vote.h"
+#include "mongo/db/repl/repl_set_heartbeat_args_v1.h"
 #include "mongo/db/repl/repl_set_heartbeat_response.h"
+#include "mongo/db/repl/repl_set_request_votes_args.h"
 #include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/repl/replication_metrics_gen.h"
+#include "mongo/db/repl/split_horizon.h"
 #include "mongo/db/repl/update_position_args.h"
 #include "mongo/db/server_options.h"
-#include "mongo/stdx/functional.h"
 #include "mongo/util/net/hostandport.h"
 #include "mongo/util/time_support.h"
 
@@ -65,7 +69,8 @@ const int kMaxHeartbeatRetries = 2;
  * Methods of this class should be non-blocking.
  */
 class TopologyCoordinator {
-    MONGO_DISALLOW_COPYING(TopologyCoordinator);
+    TopologyCoordinator(const TopologyCoordinator&) = delete;
+    TopologyCoordinator& operator=(const TopologyCoordinator&) = delete;
 
 public:
     /**
@@ -112,15 +117,26 @@ public:
     MemberState getMemberState() const;
 
     /**
+     * Returns the replica set's MemberData.
+     */
+    std::vector<MemberData> getMemberData() const;
+
+    /**
      * Returns whether this node should be allowed to accept writes.
      */
     bool canAcceptWrites() const;
 
     /**
-     * Returns true if this node is in the process of stepping down.  Note that this can be
-     * due to an unconditional stepdown that must succeed (for instance from learning about a new
-     * term) or due to a stepdown attempt that could fail (for instance from a stepdown cmd that
-     * could fail if not enough nodes are caught up).
+     * Returns true if this node is in the process of stepping down unconditionally.
+     */
+    bool isSteppingDownUnconditionally() const;
+
+    /**
+     * Returns true if this node is in the process of stepping down either conditionally or
+     * unconditionally. Note that this can be due to an unconditional stepdown that must
+     * succeed (for instance from learning about a new term) or due to a stepdown attempt
+     * that could fail (for instance from a stepdown cmd that could fail if not enough nodes
+     * are caught up).
      */
     bool isSteppingDown() const;
 
@@ -225,18 +241,24 @@ public:
      * the config getWriteConcernMajorityShouldJournal is set.
      * Returns true if the _lastCommittedOpTime was changed.
      */
-    bool updateLastCommittedOpTime();
+    bool updateLastCommittedOpTimeAndWallTime();
 
     /**
-     * Updates _lastCommittedOpTime to be "committedOpTime" if it is more recent than the
-     * current last committed OpTime.  Returns true if _lastCommittedOpTime is changed.
+     * Updates _lastCommittedOpTime to be 'committedOpTime' if it is more recent than the current
+     * last committed OpTime.  Returns true if _lastCommittedOpTime is changed. We ignore
+     * 'committedOpTime' if it has a different term than our lastApplied, unless
+     * 'fromSyncSource'=true, which guarantees we are on the same branch of history as
+     * 'committedOpTime', so we update our commit point to min(committedOpTime, lastApplied).
      */
-    bool advanceLastCommittedOpTime(const OpTime& committedOpTime);
+    bool advanceLastCommittedOpTimeAndWallTime(OpTimeAndWallTime committedOpTimeAndWallTime,
+                                               bool fromSyncSource);
 
     /**
      * Returns the OpTime of the latest majority-committed op known to this server.
      */
     OpTime getLastCommittedOpTime() const;
+
+    OpTimeAndWallTime getLastCommittedOpTimeAndWallTime() const;
 
     /**
      * Returns true if it's safe to transition to LeaderMode::kMaster.
@@ -281,13 +303,10 @@ public:
     struct ReplSetStatusArgs {
         const Date_t now;
         const unsigned selfUptime;
-        const OpTime readConcernMajorityOpTime;
+        const OpTimeAndWallTime readConcernMajorityOpTime;
         const BSONObj initialSyncStatus;
-
-        // boost::none if the storage engine does not support RTT, or if it does but does not
-        // persist data to necessitate taking checkpoints. Timestamp::min() if a checkpoint is yet
-        // to be taken.
-        const boost::optional<Timestamp> lastStableCheckpointTimestampDeprecated;
+        const BSONObj electionCandidateMetrics;
+        const BSONObj electionParticipantMetrics;
 
         // boost::none if the storage engine does not support recovery to a timestamp.
         // Timestamp::min() if a stable recovery timestamp is yet to be taken.
@@ -296,6 +315,7 @@ public:
         // as well as startup recovery without re-initial syncing in the case of durable storage
         // engines.
         const boost::optional<Timestamp> lastStableRecoveryTimestamp;
+        bool tooStale;
     };
 
     // produce a reply to a status request
@@ -310,7 +330,8 @@ public:
     // Produce a reply to an ismaster request.  It is only valid to call this if we are a
     // replset.  Drivers interpret the isMaster fields according to the Server Discovery and
     // Monitoring Spec, see the "Parsing an isMaster response" section.
-    void fillIsMasterForReplSet(IsMasterResponse* response);
+    void fillIsMasterForReplSet(IsMasterResponse* response,
+                                const SplitHorizon::Parameters& horizonParams);
 
     // Produce member data for the serverStatus command and diagnostic logging.
     void fillMemberData(BSONObjBuilder* result);
@@ -386,14 +407,14 @@ public:
         const StatusWith<ReplSetHeartbeatResponse>& hbResponse);
 
     /**
-     *  Returns whether or not at least 'numNodes' have reached the given opTime.
+     *  Returns whether or not at least 'numNodes' have reached the given opTime with the same term.
      * "durablyWritten" indicates whether the operation has to be durably applied.
      */
     bool haveNumNodesReachedOpTime(const OpTime& opTime, int numNodes, bool durablyWritten);
 
     /**
-     * Returns whether or not at least one node matching the tagPattern has reached
-     * the given opTime.
+     * Returns whether or not at least one node matching the tagPattern has reached the given opTime
+     * with the same term.
      * "durablyWritten" indicates whether the operation has to be durably applied.
      */
     bool haveTaggedNodesReachedOpTime(const OpTime& opTime,
@@ -415,10 +436,10 @@ public:
 
     /**
      * Goes through the memberData and determines which member that is currently live
-     * has the stalest (earliest) last update time.  Returns (-1, Date_t::max()) if there are
-     * no other members.
+     * has the stalest (earliest) last update time.  Returns (MemberId(), Date_t::max()) if there
+     * are no other members.
      */
-    std::pair<int, Date_t> getStalestLiveMember() const;
+    std::pair<MemberId, Date_t> getStalestLiveMember() const;
 
     /**
      * Go through the memberData, and mark nodes which haven't been updated
@@ -442,6 +463,7 @@ public:
      * Returns the last optime that this node has applied, whether or not it has been journaled.
      */
     OpTime getMyLastAppliedOpTime() const;
+    OpTimeAndWallTime getMyLastAppliedOpTimeAndWallTime() const;
 
     /*
      * Sets the last optime that this node has applied, whether or not it has been journaled. Fails
@@ -449,12 +471,15 @@ public:
      * backwards. The Date_t 'now' is used to track liveness; setting a node's applied optime
      * updates its liveness information.
      */
-    void setMyLastAppliedOpTime(OpTime opTime, Date_t now, bool isRollbackAllowed);
+    void setMyLastAppliedOpTimeAndWallTime(OpTimeAndWallTime opTimeAndWallTime,
+                                           Date_t now,
+                                           bool isRollbackAllowed);
 
     /*
      * Returns the last optime that this node has applied and journaled.
      */
     OpTime getMyLastDurableOpTime() const;
+    OpTimeAndWallTime getMyLastDurableOpTimeAndWallTime() const;
 
     /*
      * Sets the last optime that this node has applied and journaled. Fails with an invariant if
@@ -462,7 +487,9 @@ public:
      * 'now' is used to track liveness; setting a node's durable optime updates its liveness
      * information.
      */
-    void setMyLastDurableOpTime(OpTime opTime, Date_t now, bool isRollbackAllowed);
+    void setMyLastDurableOpTimeAndWallTime(OpTimeAndWallTime opTimeAndWallTime,
+                                           Date_t now,
+                                           bool isRollbackAllowed);
 
     /*
      * Sets the last optimes for a node, other than this node, based on the data from a
@@ -506,7 +533,7 @@ public:
     void processLoseElection();
 
 
-    using StepDownAttemptAbortFn = stdx::function<void()>;
+    using StepDownAttemptAbortFn = std::function<void()>;
     /**
      * Readies the TopologyCoordinator for an attempt to stepdown that may fail.  This is used
      * when we receive a stepdown command (which can fail if not enough secondaries are caught up)
@@ -521,9 +548,8 @@ public:
     StatusWith<StepDownAttemptAbortFn> prepareForStepDownAttempt();
 
     /**
-     * Tries to transition the coordinator from the leader role to the follower role.
-     *
-     * A step down succeeds based on the following conditions:
+     * Tries to transition the coordinator's leader mode from kAttemptingStepDown to
+     * kSteppingDown only if we are able to meet the below requirements for stepdown.
      *
      *      C1. 'force' is true and now > waitUntil
      *
@@ -532,21 +558,20 @@ public:
      *
      *      C3. There exists at least one electable secondary node in the majority set M.
      *
-     *
-     * If C1 is true, or if both C2 and C3 are true, then the stepdown occurs and this method
-     * returns true. If the conditions for successful stepdown aren't met yet, but waiting for more
-     * time to pass could make it succeed, returns false.  If the whole stepdown attempt should be
-     * abandoned (for example because the time limit expired or because we've already stepped down),
-     * throws an exception.
+     * If C1 is true, or if both C2 and C3 are true, then the transition succeeds and this
+     * method returns true. If the conditions for successful stepdown aren't met yet, but waiting
+     * for more time to pass could make it succeed, returns false.  If the whole stepdown attempt
+     * should be abandoned (for example because the time limit expired or because we've already
+     * stepped down), throws an exception.
      * TODO(spencer): Unify with the finishUnconditionalStepDown() method.
      */
-    bool attemptStepDown(
+    bool tryToStartStepDown(
         long long termAtStart, Date_t now, Date_t waitUntil, Date_t stepDownUntil, bool force);
 
     /**
      * Returns whether it is safe for a stepdown attempt to complete, ignoring the 'force' argument.
      * This is essentially checking conditions C2 and C3 as described in the comment to
-     * attemptStepDown().
+     * tryToStartStepDown().
      */
     bool isSafeToStepDown();
 
@@ -554,8 +579,18 @@ public:
      * Readies the TopologyCoordinator for stepdown.  Returns false if we're already in the process
      * of an unconditional step down.  If we are in the middle of a stepdown command attempt when
      * this is called then this unconditional stepdown will supersede the stepdown attempt, which
-     * will cause the stepdown to fail.  When this returns true it must be followed by a call to
-     * finishUnconditionalStepDown() that is called when holding the global X lock.
+     * will cause the stepdown to fail.  When this returns true, step down via heartbeat and
+     * reconfig should call finishUnconditionalStepDown() and updateConfig respectively by holding
+     * the RSTL lock in X mode.
+     *
+     * An unconditional step down can be caused due to below reasons.
+     *     1) Learning new term via heartbeat.
+     *     2) Liveness timeout.
+     *     3) Force reconfig command.
+     *     4) Force reconfig via heartbeat.
+     * At most 2 operations can be in the middle of unconditional step down. And, out of 2
+     * operations, one should be due to reason #1 or #2 and other should be due to reason #3 or #4,
+     * in which case only one succeeds in stepping down and other does nothing.
      */
     bool prepareForUnconditionalStepDown();
 
@@ -616,19 +651,10 @@ public:
      */
     int getCurrentPrimaryIndex() const;
 
-    enum StartElectionReason {
-        kElectionTimeout,
-        kPriorityTakeover,
-        kStepUpRequest,
-        kStepUpRequestSkipDryRun,
-        kCatchupTakeover,
-        kSingleNodePromptElection
-    };
-
     /**
      * Transitions to the candidate role if the node is electable.
      */
-    Status becomeCandidateIfElectable(const Date_t now, StartElectionReason reason);
+    Status becomeCandidateIfElectable(const Date_t now, StartElectionReasonEnum reason);
 
     /**
      * Updates the storage engine read committed support in the TopologyCoordinator options after
@@ -640,6 +666,9 @@ public:
      * Reset the booleans to record the last heartbeat restart.
      */
     void restartHeartbeats();
+
+    // Scans through all members that are 'up' and returns the latest known optime.
+    OpTime latestKnownOpTime() const;
 
     /**
      * Scans through all members that are 'up' and return the latest known optime, if we have
@@ -656,7 +685,8 @@ public:
      * each member in the config. If the member is not up or hasn't responded to a heartbeat since
      * we last restarted, then its value will be boost::none.
      */
-    std::map<int, boost::optional<OpTime>> latestKnownOpTimeSinceHeartbeatRestartPerMember() const;
+    std::map<MemberId, boost::optional<OpTime>> latestKnownOpTimeSinceHeartbeatRestartPerMember()
+        const;
 
     /**
      * Checks if the 'commitQuorum' can be satisifed by 'members'. Returns true if it can be
@@ -666,14 +696,6 @@ public:
      */
     bool checkIfCommitQuorumCanBeSatisfied(const CommitQuorumOptions& commitQuorum,
                                            const std::vector<MemberConfig>& members) const;
-
-    /**
-     * Returns 'true' if the 'commitQuorum' is satisifed by the 'commitReadyMembers'.
-     *
-     * 'commitReadyMembers' must be part of the replica set configuration.
-     */
-    bool checkIfCommitQuorumIsSatisfied(const CommitQuorumOptions& commitQuorum,
-                                        const std::vector<HostAndPort>& commitReadyMembers) const;
 
     ////////////////////////////////////////////////////////////
     //
@@ -726,19 +748,16 @@ private:
      *        |  |   |  |                |    |           |
      *        |  |   |  |                |    |           |
      *        v  |   |  v                v    v           |
-     *  kAttemptingStepDown----------->kSteppingDown      |
-     *        |                              |            |
-     *        |                              |            |
-     *        |                              |            |
-     *        ---------------------------------------------
-     *
+     *  kAttemptingStepDown----------->kSteppingDown------|
      */
     enum class LeaderMode {
         kNotLeader,           // This node is not currently a leader.
         kLeaderElect,         // This node has been elected leader, but can't yet accept writes.
         kMaster,              // This node reports ismaster:true and can accept writes.
-        kSteppingDown,        // This node is in the middle of a (hb) stepdown that must complete.
-        kAttemptingStepDown,  // This node is in the middle of a stepdown (cmd) that might fail.
+        kSteppingDown,        // This node is in the middle of a hb, force reconfig or stepdown
+                              // command that must complete.
+        kAttemptingStepDown,  // This node is in the middle of a cmd initiated step down that might
+                              // fail.
     };
 
     enum UnelectableReason {
@@ -782,7 +801,7 @@ private:
 
     // Returns reason why "self" member is unelectable
     UnelectableReasonMask _getMyUnelectableReason(const Date_t now,
-                                                  StartElectionReason reason) const;
+                                                  StartElectionReasonEnum reason) const;
 
     // Returns reason why memberIndex is unelectable
     UnelectableReasonMask _getUnelectableReason(int memberIndex) const;
@@ -792,9 +811,6 @@ private:
 
     // Return true if we are currently primary
     bool _iAmPrimary() const;
-
-    // Scans through all members that are 'up' and return the latest known optime.
-    OpTime _latestKnownOpTime() const;
 
     // Helper shortcut to self config
     const MemberConfig& _selfConfig() const;
@@ -835,7 +851,8 @@ private:
 
     /**
      * Returns whether a stepdown attempt should be allowed to proceed.  See the comment for
-     * attemptStepDown() for more details on the rules of when stepdown attempts succeed or fail.
+     * tryToStartStepDown() for more details on the rules of when stepdown attempts succeed
+     * or fail.
      */
     bool _canCompleteStepDownAttempt(Date_t now, Date_t waitUntil, bool force);
 
@@ -921,7 +938,7 @@ private:
     Date_t _electionSleepUntil;
 
     // OpTime of the latest committed operation.
-    OpTime _lastCommittedOpTime;
+    OpTimeAndWallTime _lastCommittedOpTimeAndWallTime;
 
     // OpTime representing our transition to PRIMARY and the start of our term.
     // _lastCommittedOpTime cannot be set to an earlier OpTime.
@@ -1044,7 +1061,7 @@ public:
     /**
      * Gets the number of retries left for this heartbeat attempt. Invalid to call if the current
      * state is 'UNINITIALIZED'.
-    */
+     */
     int retriesLeft() const {
         return kMaxHeartbeatRetries - _numFailuresSinceLastStart;
     }

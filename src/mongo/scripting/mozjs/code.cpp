@@ -31,19 +31,21 @@
 
 #include "mongo/scripting/mozjs/code.h"
 
+#include <memory>
+
 #include "mongo/scripting/mozjs/implscope.h"
 #include "mongo/scripting/mozjs/objectwrapper.h"
 #include "mongo/scripting/mozjs/valuereader.h"
 #include "mongo/scripting/mozjs/valuewriter.h"
 #include "mongo/scripting/mozjs/wrapconstrainedmethod.h"
-#include "mongo/stdx/memory.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 namespace mozjs {
 
 const JSFunctionSpec CodeInfo::methods[2] = {
-    MONGO_ATTACH_JS_CONSTRAINED_METHOD(toString, CodeInfo), JS_FS_END,
+    MONGO_ATTACH_JS_CONSTRAINED_METHOD(toString, CodeInfo),
+    JS_FS_END,
 };
 
 const char* const CodeInfo::className = "Code";
@@ -51,9 +53,9 @@ const char* const CodeInfo::className = "Code";
 void CodeInfo::Functions::toString::call(JSContext* cx, JS::CallArgs args) {
     ObjectWrapper o(cx, args.thisv());
 
-    std::string str = str::stream() << "Code({\"code\":\"" << o.getString(InternedString::code)
-                                    << "\","
-                                    << "\"scope\":" << o.getObject(InternedString::scope) << "\"})";
+    std::string str = str::stream()
+        << "Code({\"code\":\"" << o.getString(InternedString::code) << "\","
+        << "\"scope\":" << o.getObject(InternedString::scope) << "\"})";
 
     ValueReader(cx, args.rval()).fromStringData(str);
 }

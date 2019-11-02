@@ -1,4 +1,5 @@
-/** Simple test of sharding TTL collections.
+/**
+ * Simple test of sharding TTL collections.
  *  - Creates a new collection with a TTL index
  *  - Shards it, and moves one chunk containing half the docs to another shard.
  *  - Checks that both shards have TTL index, and docs get deleted on both shards.
@@ -27,7 +28,7 @@ for (var i = 0; i < 24; i++) {
     var past = new Date(now - (3600 * 1000 * i));
     bulk.insert({_id: i, x: past});
 }
-assert.writeOK(bulk.execute());
+assert.commandWorked(bulk.execute());
 assert.eq(t.count(), 24, "initial docs not inserted");
 
 // create the TTL index which delete anything older than ~5.5 hours

@@ -29,6 +29,7 @@
 
 #include "mongo/platform/basic.h"
 
+#include <memory>
 #include <vector>
 
 #include "mongo/base/checked_cast.h"
@@ -38,9 +39,8 @@
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/catalog/collection.h"
-#include "mongo/db/catalog/collection_catalog_entry.h"
+#include "mongo/db/catalog/collection_catalog_helper.h"
 #include "mongo/db/catalog/database.h"
-#include "mongo/db/catalog/database_catalog_entry.h"
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/commands.h"
@@ -56,10 +56,10 @@
 #include "mongo/db/query/cursor_response.h"
 #include "mongo/db/query/find_common.h"
 #include "mongo/db/service_context.h"
+#include "mongo/db/storage/durable_catalog.h"
 #include "mongo/db/storage/storage_engine.h"
 #include "mongo/db/storage/storage_options.h"
 #include "mongo/db/views/view_catalog.h"
-#include "mongo/stdx/memory.h"
 
 namespace mongo {
 
@@ -67,7 +67,6 @@ using std::string;
 using std::stringstream;
 using std::unique_ptr;
 using std::vector;
-using stdx::make_unique;
 
 namespace {
 
@@ -90,7 +89,7 @@ boost::optional<vector<StringData>> _getExactNameMatches(const MatchExpression* 
     if (matchType == MatchExpression::EQ) {
         auto eqMatch = checked_cast<const EqualityMatchExpression*>(matcher);
         if (eqMatch->path() == "name") {
-            StringData name(eqMatch->getData().valuestrsafe());
+            StringData name(eqMatch->getData().valueStringDataSafe());
             if (name.size()) {
                 return {vector<StringData>{name}};
             } else {
@@ -102,7 +101,7 @@ boost::optional<vector<StringData>> _getExactNameMatches(const MatchExpression* 
         if (matchIn->path() == "name" && matchIn->getRegexes().empty()) {
             vector<StringData> exactMatches;
             for (auto&& elem : matchIn->getEqualities()) {
-                StringData name(elem.valuestrsafe());
+                StringData name(elem.valueStringDataSafe());
                 if (name.size()) {
                     exactMatches.push_back(elem.valueStringData());
                 }
@@ -132,7 +131,7 @@ void _addWorkingSetMember(OperationContext* opCtx,
     WorkingSetMember* member = ws->get(id);
     member->keyData.clear();
     member->recordId = RecordId();
-    member->obj = Snapshotted<BSONObj>(SnapshotId(), maybe);
+    member->resetDocument(SnapshotId(), maybe);
     member->transitionToOwnedObj();
     root->pushBack(id);
 }
@@ -187,8 +186,7 @@ BSONObj buildCollectionBson(OperationContext* opCtx,
         return b.obj();
     }
 
-    Lock::CollectionLock clk(opCtx->lockState(), nss.ns(), MODE_IS);
-    CollectionOptions options = collection->getCatalogEntry()->getCollectionOptions(opCtx);
+    CollectionOptions options = DurableCatalog::get(opCtx)->getCollectionOptions(opCtx, nss);
 
     // While the UUID is stored as a collection option, from the user's perspective it is an
     // unsettable read-only property, so put it in the 'info' section.
@@ -295,8 +293,8 @@ public:
                                                              false,
                                                              cursorNss);
 
-            auto ws = make_unique<WorkingSet>();
-            auto root = make_unique<QueuedDataStage>(opCtx, ws.get());
+            auto ws = std::make_unique<WorkingSet>();
+            auto root = std::make_unique<QueuedDataStage>(opCtx, ws.get());
 
             if (db) {
                 if (auto collNames = _getExactNameMatches(matcher.get())) {
@@ -306,13 +304,14 @@ public:
                         // Only validate on a per-collection basis if the user requested
                         // a list of authorized collections
                         if (authorizedCollections &&
-                            (nss.coll().startsWith("system.") ||
-                             !as->isAuthorizedForAnyActionOnResource(
-                                 ResourcePattern::forExactNamespace(nss)))) {
+                            (!as->isAuthorizedForAnyActionOnResource(
+                                ResourcePattern::forExactNamespace(nss)))) {
                             continue;
                         }
 
-                        Collection* collection = db->getCollection(opCtx, nss);
+                        Lock::CollectionLock clk(opCtx, nss, MODE_IS);
+                        Collection* collection =
+                            CollectionCatalog::get(opCtx).lookupCollectionByNamespace(nss);
                         BSONObj collBson =
                             buildCollectionBson(opCtx, collection, includePendingDrops, nameOnly);
                         if (!collBson.isEmpty()) {
@@ -321,20 +320,21 @@ public:
                         }
                     }
                 } else {
-                    for (auto&& collection : *db) {
-                        if (authorizedCollections &&
-                            (collection->ns().coll().startsWith("system.") ||
-                             !as->isAuthorizedForAnyActionOnResource(
-                                 ResourcePattern::forExactNamespace(collection->ns())))) {
-                            continue;
-                        }
-                        BSONObj collBson =
-                            buildCollectionBson(opCtx, collection, includePendingDrops, nameOnly);
-                        if (!collBson.isEmpty()) {
-                            _addWorkingSetMember(
-                                opCtx, collBson, matcher.get(), ws.get(), root.get());
-                        }
-                    }
+                    mongo::catalog::forEachCollectionFromDb(
+                        opCtx, dbname, MODE_IS, [&](const Collection* collection) {
+                            if (authorizedCollections &&
+                                (!as->isAuthorizedForAnyActionOnResource(
+                                    ResourcePattern::forExactNamespace(collection->ns())))) {
+                                return true;
+                            }
+                            BSONObj collBson = buildCollectionBson(
+                                opCtx, collection, includePendingDrops, nameOnly);
+                            if (!collBson.isEmpty()) {
+                                _addWorkingSetMember(
+                                    opCtx, collBson, matcher.get(), ws.get(), root.get());
+                            }
+                            return true;
+                        });
                 }
 
                 // Skipping views is only necessary for internal cloning operations.
@@ -343,6 +343,12 @@ public:
                         filterElt.Obj() == ListCollectionsFilter::makeTypeCollectionFilter());
                 if (!skipViews) {
                     ViewCatalog::get(db)->iterate(opCtx, [&](const ViewDefinition& view) {
+                        if (authorizedCollections &&
+                            !as->isAuthorizedForAnyActionOnResource(
+                                ResourcePattern::forExactNamespace(view.name()))) {
+                            return;
+                        }
+
                         BSONObj viewBson = buildViewBson(view, nameOnly);
                         if (!viewBson.isEmpty()) {
                             _addWorkingSetMember(
@@ -353,17 +359,18 @@ public:
             }
 
             exec = uassertStatusOK(PlanExecutor::make(
-                opCtx, std::move(ws), std::move(root), cursorNss, PlanExecutor::NO_YIELD));
+                opCtx, std::move(ws), std::move(root), nullptr, PlanExecutor::NO_YIELD, cursorNss));
 
             for (long long objCount = 0; objCount < batchSize; objCount++) {
-                BSONObj next;
-                PlanExecutor::ExecState state = exec->getNext(&next, NULL);
+                Document nextDoc;
+                PlanExecutor::ExecState state = exec->getNext(&nextDoc, nullptr);
                 if (state == PlanExecutor::IS_EOF) {
                     break;
                 }
                 invariant(state == PlanExecutor::ADVANCED);
 
                 // If we can't fit this result inside the current batch, then we stash it for later.
+                BSONObj next = nextDoc.toBson();
                 if (!FindCommon::haveSpaceForNext(next, objCount, firstBatch.len())) {
                     exec->enqueue(next);
                     break;
@@ -381,14 +388,18 @@ public:
 
         auto pinnedCursor = CursorManager::get(opCtx)->registerCursor(
             opCtx,
-            {std::move(exec),
-             cursorNss,
-             AuthorizationSession::get(opCtx->getClient())->getAuthenticatedUserNames(),
-             repl::ReadConcernArgs::get(opCtx),
-             jsobj,
-             ClientCursorParams::LockPolicy::kLocksInternally,
-             uassertStatusOK(AuthorizationSession::get(opCtx->getClient())
-                                 ->checkAuthorizedToListCollections(dbname, jsobj))});
+            {
+                std::move(exec),
+                cursorNss,
+                AuthorizationSession::get(opCtx->getClient())->getAuthenticatedUserNames(),
+                opCtx->getWriteConcern(),
+                repl::ReadConcernArgs::get(opCtx),
+                jsobj,
+                ClientCursorParams::LockPolicy::kLocksInternally,
+                uassertStatusOK(AuthorizationSession::get(opCtx->getClient())
+                                    ->checkAuthorizedToListCollections(dbname, jsobj)),
+                false  // needsMerge always 'false' for listCollections.
+            });
 
         appendCursorResponseObject(
             pinnedCursor.getCursor()->cursorid(), cursorNss.ns(), firstBatch.arr(), &result);

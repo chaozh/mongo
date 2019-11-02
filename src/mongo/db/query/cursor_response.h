@@ -31,7 +31,6 @@
 
 #include <vector>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/base/status_with.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/db/clientcursor.h"
@@ -42,11 +41,11 @@
 namespace mongo {
 
 /**
- * Builds the cursor field and the _latestOplogTimestamp field for a reply to a cursor-generating
- * command in place.
+ * Builds the cursor field for a reply to a cursor-generating command in-place.
  */
 class CursorResponseBuilder {
-    MONGO_DISALLOW_COPYING(CursorResponseBuilder);
+    CursorResponseBuilder(const CursorResponseBuilder&) = delete;
+    CursorResponseBuilder& operator=(const CursorResponseBuilder&) = delete;
 
 public:
     /**
@@ -88,10 +87,6 @@ public:
         _numDocs++;
     }
 
-    void setLatestOplogTimestamp(Timestamp ts) {
-        _latestOplogTimestamp = ts;
-    }
-
     void setPostBatchResumeToken(BSONObj token) {
         _postBatchResumeToken = token.getOwned();
     }
@@ -124,7 +119,6 @@ private:
 
     bool _active = true;
     long long _numDocs = 0;
-    Timestamp _latestOplogTimestamp;
     BSONObj _postBatchResumeToken;
 };
 
@@ -157,14 +151,6 @@ void appendGetMoreResponseObject(long long cursorId,
                                  BSONObjBuilder* builder);
 
 class CursorResponse {
-// In order to work around a bug in the compiler on the s390x platform, the IDL needs to invoke the
-// copy constructor on that platform.
-// TODO SERVER-32467 Remove this ifndef once the compiler has been fixed and the workaround has been
-// removed.
-#ifndef __s390x__
-    MONGO_DISALLOW_COPYING(CursorResponse);
-#endif
-
 public:
     enum class ResponseType {
         InitialResponse,
@@ -201,21 +187,11 @@ public:
                    CursorId cursorId,
                    std::vector<BSONObj> batch,
                    boost::optional<long long> numReturnedSoFar = boost::none,
-                   boost::optional<Timestamp> latestOplogTimestamp = boost::none,
                    boost::optional<BSONObj> postBatchResumeToken = boost::none,
                    boost::optional<BSONObj> writeConcernError = boost::none);
 
     CursorResponse(CursorResponse&& other) = default;
     CursorResponse& operator=(CursorResponse&& other) = default;
-
-// In order to work around a bug in the compiler on the s390x platform, the IDL needs to invoke the
-// copy constructor on that platform.
-// TODO SERVER-32467 Remove this ifndef once the compiler has been fixed and the workaround has been
-// removed.
-#ifdef __s390x__
-    CursorResponse(const CursorResponse& other) = default;
-    CursorResponse& operator=(const CursorResponse& other) = default;
-#endif
 
     //
     // Accessors.
@@ -241,10 +217,6 @@ public:
         return _numReturnedSoFar;
     }
 
-    boost::optional<Timestamp> getLastOplogTimestamp() const {
-        return _latestOplogTimestamp;
-    }
-
     boost::optional<BSONObj> getPostBatchResumeToken() const {
         return _postBatchResumeToken;
     }
@@ -267,7 +239,6 @@ private:
     CursorId _cursorId;
     std::vector<BSONObj> _batch;
     boost::optional<long long> _numReturnedSoFar;
-    boost::optional<Timestamp> _latestOplogTimestamp;
     boost::optional<BSONObj> _postBatchResumeToken;
     boost::optional<BSONObj> _writeConcernError;
 };

@@ -38,8 +38,7 @@
 #include "mongo/util/allocator.h"
 #include "mongo/util/hex.h"
 #include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
-#include "mongo/util/stringutils.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -100,8 +99,34 @@ void BSONObj::_assertInvalid(int maxSize) const {
 }
 
 BSONObj BSONObj::copy() const {
-    auto storage = SharedBuffer::allocate(objsize());
-    memcpy(storage.get(), objdata(), objsize());
+    // The undefined behavior checks in this function are best-effort and attempt to detect
+    // undefined behavior as early as possible. We cannot make any guarantees about detection
+    // because we are observing undefined state, and we assume the compiler does not make either
+    // of the following optimizations: a) optimizing away the call to objsize() on freed memory, and
+    // b) optimizing away the two sequential calls to objsize() as one.
+    // The behavior of this function must degrade as gracefully as possible under violation of
+    // those assumptions, and preserving any currently observed behavior does not form an argument
+    // against the later application of such optimizations.
+    int size = objsize();
+    if (!isOwned() && (size < kMinBSONLength || size > BufferMaxSize)) {
+        // Only for unowned objects, the size is validated in the constructor, so it is an error for
+        // the size to ever be invalid. This means that the unowned memory we are reading has
+        // changed, and we must exit immediately to avoid further undefined behavior.
+        severe() << "BSONObj::copy() - size " << size
+                 << " of unowned BSONObj is invalid and differs from previously validated size.";
+        fassertFailed(31322);
+    }
+    auto storage = SharedBuffer::allocate(size);
+
+    // If the call to objsize() changes between this call and the previous one, this indicates that
+    // that the memory we are reading has changed, and we must exit immediately to avoid further
+    // undefined behavior.
+    if (int sizeAfter = objsize(); sizeAfter != size) {
+        severe() << "BSONObj::copy() - size " << sizeAfter
+                 << " differs from previously observed size " << size;
+        fassertFailed(31323);
+    }
+    memcpy(storage.get(), objdata(), size);
     return BSONObj(std::move(storage));
 }
 
@@ -109,6 +134,10 @@ BSONObj BSONObj::getOwned() const {
     if (isOwned())
         return *this;
     return copy();
+}
+
+BSONObj BSONObj::getOwned(const BSONObj& obj) {
+    return obj.getOwned();
 }
 
 std::string BSONObj::jsonString(JsonStringFormat format, int pretty, bool isArray) const {
@@ -217,7 +246,7 @@ bool BSONObj::isFieldNamePrefixOf(const BSONObj& otherObj) const {
     while (a.more() && b.more()) {
         BSONElement x = a.next();
         BSONElement y = b.next();
-        if (!str::equals(x.fieldName(), y.fieldName())) {
+        if (x.fieldNameStringData() != y.fieldNameStringData()) {
             return false;
         }
     }
@@ -375,6 +404,25 @@ BSONObj BSONObj::replaceFieldNames(const BSONObj& names) const {
     return b.obj();
 }
 
+BSONObj BSONObj::stripFieldNames(const BSONObj& obj) {
+    if (!obj.hasFieldNames())
+        return obj;
+
+    BSONObjBuilder bb;
+    for (auto e : obj) {
+        bb.appendAs(e, StringData());
+    }
+    return bb.obj();
+}
+
+bool BSONObj::hasFieldNames() const {
+    for (auto e : *this) {
+        if (e.fieldName()[0])
+            return true;
+    }
+    return false;
+}
+
 Status BSONObj::storageValidEmbedded() const {
     BSONObjIterator i(*this);
 
@@ -382,26 +430,26 @@ Status BSONObj::storageValidEmbedded() const {
     bool first = true;
     while (i.more()) {
         BSONElement e = i.next();
-        const char* name = e.fieldName();
+        StringData name = e.fieldNameStringData();
 
         // Cannot start with "$", unless dbref which must start with ($ref, $id)
-        if (str::startsWith(name, '$')) {
+        if (name.startsWith("$")) {
             if (first &&
                 // $ref is a collection name and must be a String
-                str::equals(name, "$ref") &&
-                e.type() == String && str::equals(i.next().fieldName(), "$id")) {
+                (name == "$ref") && e.type() == String &&
+                (i.next().fieldNameStringData() == "$id")) {
                 first = false;
                 // keep inspecting fields for optional "$db"
                 e = i.next();
-                name = e.fieldName();  // "" if eoo()
+                name = e.fieldNameStringData();  // "" if eoo()
 
                 // optional $db field must be a String
-                if (str::equals(name, "$db") && e.type() == String) {
+                if ((name == "$db") && e.type() == String) {
                     continue;  // this element is fine, so continue on to siblings (if any more)
                 }
 
                 // Can't start with a "$", all other checks are done below (outside if blocks)
-                if (str::startsWith(name, '$')) {
+                if (name.startsWith("$")) {
                     return Status(ErrorCodes::DollarPrefixedFieldName,
                                   str::stream() << name << " is not valid for storage.");
                 }
@@ -619,10 +667,13 @@ void BSONObj::toString(
     s << (isArray ? " ]" : " }");
 }
 
-Status DataType::Handler<BSONObj>::store(
-    const BSONObj& bson, char* ptr, size_t length, size_t* advanced, std::ptrdiff_t debug_offset) {
+Status DataType::Handler<BSONObj>::store(const BSONObj& bson,
+                                         char* ptr,
+                                         size_t length,
+                                         size_t* advanced,
+                                         std::ptrdiff_t debug_offset) noexcept try {
     if (bson.objsize() > static_cast<int>(length)) {
-        mongoutils::str::stream ss;
+        str::stream ss;
         ss << "buffer too small to write bson of size (" << bson.objsize()
            << ") at offset: " << debug_offset;
         return Status(ErrorCodes::Overflow, ss);
@@ -637,6 +688,8 @@ Status DataType::Handler<BSONObj>::store(
     }
 
     return Status::OK();
+} catch (const DBException& e) {
+    return e.toStatus();
 }
 
 std::ostream& operator<<(std::ostream& s, const BSONObj& o) {
@@ -655,7 +708,7 @@ public:
     bool operator()(const char* s1, const char* s2) const;
 
 private:
-    LexNumCmp _cmp;
+    str::LexNumCmp _cmp;
 };
 
 BSONIteratorSorted::ElementFieldCmp::ElementFieldCmp(bool isArray) : _cmp(!isArray) {}

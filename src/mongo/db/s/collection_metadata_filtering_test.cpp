@@ -44,7 +44,7 @@ class CollectionMetadataFilteringTest : public ShardServerTestFixture {
 protected:
     void setUp() override {
         ShardServerTestFixture::setUp();
-        _manager = std::make_shared<MetadataManager>(getServiceContext(), kNss, executor());
+        _manager = std::make_shared<MetadataManager>(getServiceContext(), kNss, executor().get());
     }
 
     /**
@@ -132,15 +132,14 @@ TEST_F(CollectionMetadataFilteringTest, FilterDocumentsInTheFuture) {
     {
         BSONObj readConcern = BSON("readConcern" << BSON("level"
                                                          << "snapshot"
-                                                         << "atClusterTime"
-                                                         << Timestamp(100, 0)));
+                                                         << "atClusterTime" << Timestamp(100, 0)));
 
         auto&& readConcernArgs = repl::ReadConcernArgs::get(operationContext());
         ASSERT_OK(readConcernArgs.initialize(readConcern["readConcern"]));
 
         AutoGetCollection autoColl(operationContext(), kNss, MODE_IS);
         auto* const css = CollectionShardingState::get(operationContext(), kNss);
-        testFn(css->getOrphansFilter(operationContext()));
+        testFn(css->getOrphansFilter(operationContext(), true /* isCollection */));
     }
 
     {
@@ -163,15 +162,14 @@ TEST_F(CollectionMetadataFilteringTest, FilterDocumentsInThePast) {
     {
         BSONObj readConcern = BSON("readConcern" << BSON("level"
                                                          << "snapshot"
-                                                         << "atClusterTime"
-                                                         << Timestamp(50, 0)));
+                                                         << "atClusterTime" << Timestamp(50, 0)));
 
         auto&& readConcernArgs = repl::ReadConcernArgs::get(operationContext());
         ASSERT_OK(readConcernArgs.initialize(readConcern["readConcern"]));
 
         AutoGetCollection autoColl(operationContext(), kNss, MODE_IS);
         auto* const css = CollectionShardingState::get(operationContext(), kNss);
-        testFn(css->getOrphansFilter(operationContext()));
+        testFn(css->getOrphansFilter(operationContext(), true /* isCollection */));
     }
 
     {
@@ -202,15 +200,14 @@ TEST_F(CollectionMetadataFilteringTest, FilterDocumentsTooFarInThePastThrowsStal
     {
         BSONObj readConcern = BSON("readConcern" << BSON("level"
                                                          << "snapshot"
-                                                         << "atClusterTime"
-                                                         << Timestamp(10, 0)));
+                                                         << "atClusterTime" << Timestamp(10, 0)));
 
         auto&& readConcernArgs = repl::ReadConcernArgs::get(operationContext());
         ASSERT_OK(readConcernArgs.initialize(readConcern["readConcern"]));
 
         AutoGetCollection autoColl(operationContext(), kNss, MODE_IS);
         auto* const css = CollectionShardingState::get(operationContext(), kNss);
-        testFn(css->getOrphansFilter(operationContext()));
+        testFn(css->getOrphansFilter(operationContext(), true /* isCollection */));
     }
 
     {

@@ -32,6 +32,7 @@
 #include <vector>
 
 #include "mongo/s/query/router_exec_stage.h"
+#include "mongo/util/string_map.h"
 
 namespace mongo {
 
@@ -42,14 +43,14 @@ class RouterStageRemoveMetadataFields final : public RouterExecStage {
 public:
     RouterStageRemoveMetadataFields(OperationContext* opCtx,
                                     std::unique_ptr<RouterExecStage> child,
-                                    std::vector<StringData> fieldsToRemove);
+                                    StringDataSet fieldsToRemove);
 
     StatusWith<ClusterQueryResult> next(ExecContext) final;
 
 private:
     // Use a StringMap so we can look up by StringData - avoiding a string allocation on each field
     // in each object. The value here is meaningless.
-    std::vector<StringData> _metaFields;
+    StringDataSet _metaFields;
 };
 
 }  // namespace mongo

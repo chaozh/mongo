@@ -30,6 +30,7 @@
 #pragma once
 
 #include <boost/optional.hpp>
+#include <functional>
 
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/auth/user_name.h"
@@ -39,7 +40,6 @@
 #include "mongo/db/query/plan_executor.h"
 #include "mongo/db/record_id.h"
 #include "mongo/db/repl/read_concern_level.h"
-#include "mongo/stdx/functional.h"
 
 namespace mongo {
 
@@ -78,19 +78,23 @@ struct ClientCursorParams {
     ClientCursorParams(std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> planExecutor,
                        NamespaceString nss,
                        UserNameIterator authenticatedUsersIter,
+                       WriteConcernOptions writeConcernOptions,
                        repl::ReadConcernArgs readConcernArgs,
                        BSONObj originatingCommandObj,
                        LockPolicy lockPolicy,
-                       PrivilegeVector originatingPrivileges)
+                       PrivilegeVector originatingPrivileges,
+                       bool needsMerge)
         : exec(std::move(planExecutor)),
           nss(std::move(nss)),
-          readConcernArgs(readConcernArgs),
+          writeConcernOptions(std::move(writeConcernOptions)),
+          readConcernArgs(std::move(readConcernArgs)),
           queryOptions(exec->getCanonicalQuery()
                            ? exec->getCanonicalQuery()->getQueryRequest().getOptions()
                            : 0),
           originatingCommandObj(originatingCommandObj.getOwned()),
           lockPolicy(lockPolicy),
-          originatingPrivileges(std::move(originatingPrivileges)) {
+          originatingPrivileges(std::move(originatingPrivileges)),
+          needsMerge(needsMerge) {
         while (authenticatedUsersIter.more()) {
             authenticatedUsers.emplace_back(authenticatedUsersIter.next());
         }
@@ -113,11 +117,13 @@ struct ClientCursorParams {
     std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> exec;
     const NamespaceString nss;
     std::vector<UserName> authenticatedUsers;
+    const WriteConcernOptions writeConcernOptions;
     const repl::ReadConcernArgs readConcernArgs;
     int queryOptions = 0;
     BSONObj originatingCommandObj;
     const LockPolicy lockPolicy;
     PrivilegeVector originatingPrivileges;
+    const bool needsMerge;
 };
 
 /**
@@ -137,7 +143,8 @@ struct ClientCursorParams {
  * of inactivity.
  */
 class ClientCursor {
-    MONGO_DISALLOW_COPYING(ClientCursor);
+    ClientCursor(const ClientCursor&) = delete;
+    ClientCursor& operator=(const ClientCursor&) = delete;
 
 public:
     CursorId cursorid() const {
@@ -162,6 +169,14 @@ public:
 
     repl::ReadConcernArgs getReadConcernArgs() const {
         return _readConcernArgs;
+    }
+
+    WriteConcernOptions getWriteConcernOptions() const {
+        return _writeConcernOptions;
+    }
+
+    bool needsMerge() const {
+        return _needsMerge;
     }
 
     /**
@@ -369,6 +384,7 @@ private:
     // A transaction number for this cursor, if it was provided in the originating command.
     const boost::optional<TxnNumber> _txnNumber;
 
+    const WriteConcernOptions _writeConcernOptions;
     const repl::ReadConcernArgs _readConcernArgs;
 
     // Tracks whether dispose() has been called, to make sure it happens before destruction. It is
@@ -391,6 +407,13 @@ private:
     const int _queryOptions = 0;
 
     const ClientCursorParams::LockPolicy _lockPolicy;
+
+    // The value of a flag specified on the originating command which indicates whether the result
+    // of this cursor will be consumed by a merging node (mongos or a mongod selected to perform a
+    // merge). Note that this flag is only set for aggregate() commands, and not for find()
+    // commands. It is therefore possible that 'needsMerge' is false when in fact there will be a
+    // merge performed.
+    const bool _needsMerge;
 
     // Unused maxTime budget for this cursor.
     Microseconds _leftoverMaxTimeMicros = Microseconds::max();
@@ -456,7 +479,8 @@ private:
  * policy.
  */
 class ClientCursorPin {
-    MONGO_DISALLOW_COPYING(ClientCursorPin);
+    ClientCursorPin(const ClientCursorPin&) = delete;
+    ClientCursorPin& operator=(const ClientCursorPin&) = delete;
 
 public:
     /**

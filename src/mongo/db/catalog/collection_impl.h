@@ -31,49 +31,31 @@
 
 #include "mongo/bson/timestamp.h"
 #include "mongo/db/catalog/collection.h"
-#include "mongo/db/catalog/collection_catalog_entry.h"
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 
 namespace mongo {
 class IndexConsistency;
-class UUIDCatalog;
+class CollectionCatalog;
 class CollectionImpl final : public Collection, public CappedCallback {
-private:
-    static const int kMagicNumber = 1357924;
-
 public:
     enum ValidationAction { WARN, ERROR_V };
     enum ValidationLevel { OFF, MODERATE, STRICT_V };
 
     explicit CollectionImpl(OperationContext* opCtx,
-                            StringData fullNS,
-                            OptionalCollectionUUID uuid,
-                            CollectionCatalogEntry* details,  // does not own
-                            RecordStore* recordStore,         // does not own
-                            DatabaseCatalogEntry* dbce);      // does not own
+                            const NamespaceString& nss,
+                            UUID uuid,
+                            std::unique_ptr<RecordStore> recordStore);
 
     ~CollectionImpl();
 
-    bool ok() const final {
-        return _magic == kMagicNumber;
-    }
-
-    CollectionCatalogEntry* getCatalogEntry() final {
-        return _details;
-    }
-
-    const CollectionCatalogEntry* getCatalogEntry() const final {
-        return _details;
-    }
-
-    CollectionInfoCache* infoCache() final {
-        return _infoCache.get();
-    }
-
-    const CollectionInfoCache* infoCache() const final {
-        return _infoCache.get();
-    }
+    class FactoryImpl : public Factory {
+    public:
+        std::unique_ptr<Collection> make(OperationContext* opCtx,
+                                         const NamespaceString& nss,
+                                         CollectionUUID uuid,
+                                         std::unique_ptr<RecordStore> rs) const final;
+    };
 
     const NamespaceString& ns() const final {
         return _ns;
@@ -81,7 +63,7 @@ public:
 
     void setNs(NamespaceString nss) final;
 
-    OptionalCollectionUUID uuid() const {
+    UUID uuid() const {
         return _uuid;
     }
 
@@ -94,11 +76,15 @@ public:
     }
 
     const RecordStore* getRecordStore() const final {
-        return _recordStore;
+        return _recordStore.get();
     }
 
     RecordStore* getRecordStore() final {
-        return _recordStore;
+        return _recordStore.get();
+    }
+
+    const BSONObj getValidatorDoc() const final {
+        return _validatorDoc.getOwned();
     }
 
     bool requiresIdIndex() const final;
@@ -170,9 +156,8 @@ public:
      * this method.
      */
     Status insertDocumentsForOplog(OperationContext* opCtx,
-                                   const DocWriter* const* docs,
-                                   Timestamp* timestamps,
-                                   size_t nDocs) final;
+                                   std::vector<Record>* records,
+                                   const std::vector<Timestamp>& timestamps) final;
 
     /**
      * Inserts a document into the record store for a bulk loader that manages the index building
@@ -224,34 +209,20 @@ public:
      * removes all documents as fast as possible
      * indexes before and after will be the same
      * as will other characteristics
+     *
+     * The caller should hold a collection X lock and ensure there are no index builds in progress
+     * on the collection.
      */
     Status truncate(OperationContext* opCtx) final;
-
-    /**
-     * @return OK if the validate run successfully
-     *         OK will be returned even if corruption is found
-     *         deatils will be in result
-     */
-    Status validate(OperationContext* opCtx,
-                    ValidateCmdLevel level,
-                    bool background,
-                    std::unique_ptr<Lock::CollectionLock> collLk,
-                    ValidateResults* results,
-                    BSONObjBuilder* output) final;
-
-    /**
-     * forces data into cache
-     */
-    Status touch(OperationContext* opCtx,
-                 bool touchData,
-                 bool touchIndexes,
-                 BSONObjBuilder* output) const final;
 
     /**
      * Truncate documents newer than the document at 'end' from the capped
      * collection.  The collection cannot be completely emptied using this
      * function.  An assertion will be thrown if that is attempted.
      * @param inclusive - Truncate 'end' as well iff true
+     *
+     * The caller should hold a collection X lock and ensure there are no index builds in progress
+     * on the collection.
      */
     void cappedTruncateAfter(OperationContext* opCtx, RecordId end, bool inclusive) final;
 
@@ -289,7 +260,7 @@ public:
                            StringData newLevel,
                            StringData newAction) final;
 
-    // -----------
+    bool isTemporary(OperationContext* opCtx) const final;
 
     //
     // Stats
@@ -320,8 +291,8 @@ public:
     }
 
     uint64_t getIndexSize(OperationContext* opCtx,
-                          BSONObjBuilder* details = NULL,
-                          int scale = 1) final;
+                          BSONObjBuilder* details = nullptr,
+                          int scale = 1) const final;
 
     /**
      * If return value is not boost::none, reads with majority read concern using an older snapshot
@@ -331,9 +302,11 @@ public:
         return _minVisibleSnapshot;
     }
 
-    void setMinimumVisibleSnapshot(Timestamp name) final {
-        _minVisibleSnapshot = name;
-    }
+    /**
+     * Updates the minimum visible snapshot. The 'newMinimumVisibleSnapshot' is ignored if it would
+     * set the minimum visible snapshot backwards in time.
+     */
+    void setMinimumVisibleSnapshot(Timestamp newMinimumVisibleSnapshot) final;
 
     bool haveCappedWaiters() final;
 
@@ -360,9 +333,8 @@ public:
 
     void establishOplogCollectionForLogging(OperationContext* opCtx) final;
 
-    inline DatabaseCatalogEntry* dbce() const final {
-        return this->_dbce;
-    }
+    void init(OperationContext* opCtx) final;
+    bool isInitialized() const final;
 
 private:
     /**
@@ -384,15 +356,12 @@ private:
                             std::vector<InsertStatement>::const_iterator end,
                             OpDebug* opDebug);
 
-    int _magic;
-
     NamespaceString _ns;
-    OptionalCollectionUUID _uuid;
-    CollectionCatalogEntry* const _details;
-    RecordStore* const _recordStore;
-    DatabaseCatalogEntry* const _dbce;
+    UUID _uuid;
+
+    // The RecordStore may be null during a repair operation.
+    std::unique_ptr<RecordStore> _recordStore;  // owned
     const bool _needCappedLock;
-    std::unique_ptr<CollectionInfoCache> _infoCache;
     std::unique_ptr<IndexCatalog> _indexCatalog;
 
 
@@ -419,5 +388,7 @@ private:
 
     // The earliest snapshot that is allowed to use this collection.
     boost::optional<Timestamp> _minVisibleSnapshot;
+
+    bool _initialized = false;
 };
 }  // namespace mongo

@@ -30,6 +30,7 @@
 #pragma once
 
 #include <boost/optional.hpp>
+#include <functional>
 #include <string>
 
 #include "mongo/base/owned_pointer_vector.h"
@@ -39,15 +40,12 @@
 #include "mongo/db/record_id.h"
 #include "mongo/db/storage/kv/kv_prefix.h"
 #include "mongo/platform/atomic_word.h"
-#include "mongo/stdx/functional.h"
-#include "mongo/stdx/mutex.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/util/debug_util.h"
 
 namespace mongo {
 class CollatorInterface;
 class CollectionCatalogEntry;
-class CollectionInfoCache;
-class HeadManager;
 class IndexAccessMethod;
 class IndexBuildInterceptor;
 class IndexDescriptor;
@@ -62,9 +60,11 @@ public:
     inline IndexCatalogEntry(IndexCatalogEntry&&) = delete;
     inline IndexCatalogEntry& operator=(IndexCatalogEntry&&) = delete;
 
-    virtual const std::string& ns() const = 0;
+    virtual const NamespaceString& ns() const = 0;
 
     virtual void init(std::unique_ptr<IndexAccessMethod> accessMethod) = 0;
+
+    virtual const std::string& getIdent() const = 0;
 
     virtual IndexDescriptor* descriptor() = 0;
 
@@ -90,20 +90,17 @@ public:
 
     /// ---------------------
 
-    virtual const RecordId& head(OperationContext* const opCtx) const = 0;
-
-    virtual void setHead(OperationContext* const opCtx, const RecordId newHead) = 0;
-
     virtual void setIsReady(const bool newIsReady) = 0;
 
-    virtual HeadManager* headManager() const = 0;
+    virtual void setDropped() = 0;
+    virtual bool isDropped() const = 0;
 
     // --
 
     /**
      * Returns true if this index is multikey and false otherwise.
      */
-    virtual bool isMultikey(OperationContext* opCtx) const = 0;
+    virtual bool isMultikey() const = 0;
 
     /**
      * Returns the path components that cause this index to be multikey if this index supports
@@ -133,12 +130,6 @@ public:
      */
     virtual void setMultikey(OperationContext* const opCtx, const MultikeyPaths& multikeyPaths) = 0;
 
-    /**
-     * TODO SERVER-36385 Remove this function: we don't set the feature tracker bit in 4.4
-     * because 4.4 can only downgrade to 4.2 which can read long TypeBits.
-     */
-    virtual void setIndexKeyStringWithLongTypeBitsExistsOnDisk(OperationContext* const opCtx) = 0;
-
     // if this ready is ready for queries
     virtual bool isReady(OperationContext* const opCtx) const = 0;
 
@@ -151,8 +142,6 @@ public:
     virtual boost::optional<Timestamp> getMinimumVisibleSnapshot() = 0;
 
     virtual void setMinimumVisibleSnapshot(const Timestamp name) = 0;
-
-    virtual void setNs(NamespaceString ns) = 0;
 };
 
 class IndexCatalogEntryContainer {

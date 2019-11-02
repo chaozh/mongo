@@ -51,7 +51,6 @@ class ReplSetHeartbeatResponse {
 public:
     /**
      * Initializes this ReplSetHeartbeatResponse from the contents of "doc".
-     * "term" is only used to complete a V0 OpTime (which is really a Timestamp).
      */
     Status initialize(const BSONObj& doc, long long term);
 
@@ -104,10 +103,12 @@ public:
         return _appliedOpTimeSet;
     }
     OpTime getAppliedOpTime() const;
+    OpTimeAndWallTime getAppliedOpTimeAndWallTime() const;
     bool hasDurableOpTime() const {
         return _durableOpTimeSet;
     }
     OpTime getDurableOpTime() const;
+    OpTimeAndWallTime getDurableOpTimeAndWallTime() const;
 
     /**
      * Sets _setName to "name".
@@ -158,13 +159,15 @@ public:
         _primaryIdSet = true;
         _primaryId = primaryId;
     }
-    void setAppliedOpTime(OpTime time) {
+    void setAppliedOpTimeAndWallTime(OpTimeAndWallTime time) {
         _appliedOpTimeSet = true;
-        _appliedOpTime = time;
+        _appliedOpTime = time.opTime;
+        _appliedWallTime = time.wallTime;
     }
-    void setDurableOpTime(OpTime time) {
+    void setDurableOpTimeAndWallTime(OpTimeAndWallTime time) {
         _durableOpTimeSet = true;
-        _durableOpTime = time;
+        _durableOpTime = time.opTime;
+        _durableWallTime = time.wallTime;
     }
     void setTerm(long long term) {
         _term = term;
@@ -176,9 +179,11 @@ private:
 
     bool _appliedOpTimeSet = false;
     OpTime _appliedOpTime;
+    Date_t _appliedWallTime;
 
     bool _durableOpTimeSet = false;
     OpTime _durableOpTime;
+    Date_t _durableWallTime;
 
     bool _stateSet = false;
     MemberState _state;

@@ -36,11 +36,12 @@ namespace mongo {
 
 class DocumentSourceUnwind final : public DocumentSource {
 public:
+    static constexpr StringData kStageName = "$unwind"_sd;
+
     // virtuals from DocumentSource
-    GetNextResult getNext() final;
     const char* getSourceName() const final;
+
     Value serialize(boost::optional<ExplainOptions::Verbosity> explain = boost::none) const final;
-    BSONObjSet getOutputSorts() final;
 
     /**
      * Returns the unwound path, and the 'includeArrayIndex' path, if specified.
@@ -53,13 +54,14 @@ public:
                                      HostTypeRequirement::kNone,
                                      DiskUseRequirement::kNoDiskUse,
                                      FacetRequirement::kAllowed,
-                                     TransactionRequirement::kAllowed);
+                                     TransactionRequirement::kAllowed,
+                                     LookupRequirement::kAllowed);
 
         constraints.canSwapWithMatch = true;
         return constraints;
     }
 
-    boost::optional<MergingLogic> mergingLogic() final {
+    boost::optional<DistributedPlanLogic> distributedPlanLogic() final {
         return boost::none;
     }
 
@@ -94,6 +96,8 @@ private:
                          const FieldPath& fieldPath,
                          bool includeNullIfEmptyOrMissing,
                          const boost::optional<FieldPath>& includeArrayIndex);
+
+    GetNextResult doGetNext() final;
 
     // Configuration state.
     const FieldPath _unwindPath;

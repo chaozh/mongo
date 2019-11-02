@@ -30,11 +30,12 @@
 
 #include "mongo/platform/basic.h"
 
+#include <memory>
+
 #include "mongo/db/client.h"
 #include "mongo/db/repl/rollback_checker.h"
 #include "mongo/executor/network_interface_mock.h"
 #include "mongo/executor/thread_pool_task_executor_test_fixture.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/log.h"
 
@@ -45,7 +46,7 @@ using namespace mongo::repl;
 using executor::NetworkInterfaceMock;
 using executor::RemoteCommandResponse;
 
-using LockGuard = stdx::lock_guard<stdx::mutex>;
+using LockGuard = stdx::lock_guard<Latch>;
 
 class RollbackCheckerTest : public executor::ThreadPoolExecutorTest {
 public:
@@ -57,15 +58,15 @@ protected:
     std::unique_ptr<RollbackChecker> _rollbackChecker;
     RollbackChecker::Result _hasRolledBackResult = {ErrorCodes::NotYetInitialized, ""};
     bool _hasCalledCallback;
-    mutable stdx::mutex _mutex;
+    mutable Mutex _mutex = MONGO_MAKE_LATCH("RollbackCheckerTest::_mutex");
 };
 
 void RollbackCheckerTest::setUp() {
     executor::ThreadPoolExecutorTest::setUp();
     launchExecutorThread();
     getNet()->enterNetwork();
-    _rollbackChecker = stdx::make_unique<RollbackChecker>(&getExecutor(), HostAndPort());
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    _rollbackChecker = std::make_unique<RollbackChecker>(&getExecutor(), HostAndPort());
+    stdx::lock_guard<Latch> lk(_mutex);
     _hasRolledBackResult = {ErrorCodes::NotYetInitialized, ""};
     _hasCalledCallback = false;
 }

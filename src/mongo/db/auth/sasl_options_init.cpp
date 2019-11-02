@@ -32,12 +32,14 @@
 #include "mongo/db/auth/sasl_options.h"
 #include "mongo/db/auth/sasl_options_gen.h"
 
+#include <boost/algorithm/string.hpp>
+
 #include "mongo/base/status.h"
 #include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
 #include "mongo/util/net/socket_utils.h"
 #include "mongo/util/options_parser/startup_option_init.h"
 #include "mongo/util/options_parser/startup_options.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -81,6 +83,11 @@ Status storeSASLOptions(const moe::Environment& params) {
     if (saslGlobalParams.serviceName.empty())
         saslGlobalParams.serviceName = "mongodb";
 
+    // Strip white space for authentication mechanisms
+    for (auto& mechanism : saslGlobalParams.authenticationMechanisms) {
+        boost::trim(mechanism);
+    }
+
     return Status::OK();
 }
 
@@ -88,4 +95,4 @@ MONGO_INITIALIZER_GENERAL(StoreSASLOptions, ("CoreOptions_Store"), ("EndStartupO
 (InitializerContext* const context) {
     return storeSASLOptions(moe::startupOptionsParsed);
 }
-}
+}  // namespace mongo

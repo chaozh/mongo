@@ -30,11 +30,11 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 
 #include "mongo/db/operation_context_noop.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/test_harness_helper.h"
-#include "mongo/stdx/memory.h"
 
 namespace mongo {
 
@@ -63,7 +63,9 @@ public:
     virtual bool supportsDocLocking() = 0;
 };
 
-inline std::unique_ptr<RecordStoreHarnessHelper> newRecordStoreHarnessHelper() {
-    return dynamic_ptr_cast<RecordStoreHarnessHelper>(newHarnessHelper());
-}
+void registerRecordStoreHarnessHelperFactory(
+    std::function<std::unique_ptr<RecordStoreHarnessHelper>()> factory);
+
+std::unique_ptr<RecordStoreHarnessHelper> newRecordStoreHarnessHelper();
+
 }  // namespace mongo

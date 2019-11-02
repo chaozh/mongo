@@ -1,7 +1,5 @@
 """Fixture for generating lots of log messages."""
 
-from __future__ import absolute_import
-
 import signal
 
 from . import interface
@@ -17,6 +15,10 @@ class YesFixture(interface.Fixture):  # pylint: disable=abstract-method
 
         self.__processes = [None] * num_instances
         self.__message = "y" * message_length
+
+    def pids(self):
+        """:return: pids owned by this fixture if any."""
+        return [x.pid for x in self.__processes if x is not None]
 
     def setup(self):
         """Start the yes processes."""

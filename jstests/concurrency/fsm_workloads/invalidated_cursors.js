@@ -13,7 +13,6 @@
 load('jstests/concurrency/fsm_workload_helpers/server_types.js');  // for isMongos
 
 var $config = (function() {
-
     let data = {
         chooseRandomlyFrom: function chooseRandomlyFrom(arr) {
             if (!Array.isArray(arr)) {
@@ -39,7 +38,7 @@ var $config = (function() {
                 bulk.insert({});
             }
             let res = bulk.execute();
-            assertAlways.writeOK(res);
+            assertAlways.commandWorked(res);
             assertAlways.eq(this.numDocs, res.nInserted, tojson(res));
 
             this.indexSpecs.forEach(indexSpec => {
@@ -162,11 +161,11 @@ var $config = (function() {
                     // killOp.
                     assertAlways.contains(e.code,
                                           [
-                                            ErrorCodes.OperationFailed,
-                                            ErrorCodes.QueryPlanKilled,
-                                            ErrorCodes.CursorNotFound,
-                                            ErrorCodes.CursorKilled,
-                                            ErrorCodes.Interrupted,
+                                              ErrorCodes.OperationFailed,
+                                              ErrorCodes.QueryPlanKilled,
+                                              ErrorCodes.CursorNotFound,
+                                              ErrorCodes.CursorKilled,
+                                              ErrorCodes.Interrupted,
                                           ],
                                           'unexpected error code: ' + e.code + ': ' + e.message);
                 }

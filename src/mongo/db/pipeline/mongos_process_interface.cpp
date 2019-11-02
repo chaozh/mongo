@@ -32,7 +32,7 @@
 #include "mongo/db/pipeline/mongos_process_interface.h"
 
 #include "mongo/db/auth/authorization_session.h"
-#include "mongo/db/catalog/uuid_catalog.h"
+#include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/pipeline/document_source.h"
@@ -163,7 +163,6 @@ boost::optional<Document> MongoSInterface::lookupSingleDocument(
         cmdBuilder.append("find", nss.coll());
     }
     cmdBuilder.append("filter", filterObj);
-    cmdBuilder.append("comment", expCtx->comment);
     if (readConcern) {
         cmdBuilder.append(repl::ReadConcernArgs::kReadConcernFieldName, *readConcern);
     }
@@ -228,15 +227,12 @@ boost::optional<Document> MongoSInterface::lookupSingleDocument(
     uassert(ErrorCodes::InternalError,
             str::stream() << "Shard cursor was unexpectedly open after lookup: "
                           << shardResult.front().getHostAndPort()
-                          << ", id: "
-                          << cursor.getCursorId(),
+                          << ", id: " << cursor.getCursorId(),
             cursor.getCursorId() == 0);
     uassert(ErrorCodes::TooManyMatchingDocuments,
             str::stream() << "found more than one document matching " << filter.toString() << " ["
-                          << batch.begin()->toString()
-                          << ", "
-                          << std::next(batch.begin())->toString()
-                          << "]",
+                          << batch.begin()->toString() << ", "
+                          << std::next(batch.begin())->toString() << "]",
             batch.size() <= 1u);
 
     return (!batch.empty() ? Document(batch.front()) : boost::optional<Document>{});
@@ -244,14 +240,56 @@ boost::optional<Document> MongoSInterface::lookupSingleDocument(
 
 BSONObj MongoSInterface::_reportCurrentOpForClient(OperationContext* opCtx,
                                                    Client* client,
-                                                   CurrentOpTruncateMode truncateOps) const {
+                                                   CurrentOpTruncateMode truncateOps,
+                                                   CurrentOpBacktraceMode backtraceMode) const {
     BSONObjBuilder builder;
 
-    CurOp::reportCurrentOpForClient(
-        opCtx, client, (truncateOps == CurrentOpTruncateMode::kTruncateOps), &builder);
+    CurOp::reportCurrentOpForClient(opCtx,
+                                    client,
+                                    (truncateOps == CurrentOpTruncateMode::kTruncateOps),
+                                    (backtraceMode == CurrentOpBacktraceMode::kIncludeBacktrace),
+                                    &builder);
+
+    OperationContext* clientOpCtx = client->getOperationContext();
+
+    if (clientOpCtx) {
+        if (auto txnRouter = TransactionRouter::get(clientOpCtx)) {
+            txnRouter.reportState(clientOpCtx, &builder, true /* sessionIsActive */);
+        }
+    }
 
     return builder.obj();
 }
+
+void MongoSInterface::_reportCurrentOpsForIdleSessions(OperationContext* opCtx,
+                                                       CurrentOpUserMode userMode,
+                                                       std::vector<BSONObj>* ops) const {
+    auto sessionCatalog = SessionCatalog::get(opCtx);
+
+    const bool authEnabled =
+        AuthorizationSession::get(opCtx->getClient())->getAuthorizationManager().isAuthEnabled();
+
+    // If the user is listing only their own ops, we use makeSessionFilterForAuthenticatedUsers to
+    // create a pattern that will match against all authenticated usernames for the current client.
+    // If the user is listing ops for all users, we create an empty pattern; constructing an
+    // instance of SessionKiller::Matcher with this empty pattern will return all sessions.
+    auto sessionFilter = (authEnabled && userMode == CurrentOpUserMode::kExcludeOthers
+                              ? makeSessionFilterForAuthenticatedUsers(opCtx)
+                              : KillAllSessionsByPatternSet{{}});
+
+    sessionCatalog->scanSessions({std::move(sessionFilter)}, [&](const ObservableSession& session) {
+        if (!session.currentOperation()) {
+            auto op =
+                TransactionRouter::get(session).reportState(opCtx, false /* sessionIsActive */);
+            if (!op.isEmpty()) {
+                ops->emplace_back(op);
+            }
+        }
+    });
+}
+
+void MongoSInterface::_reportCurrentOpsForTransactionCoordinators(
+    OperationContext* opCtx, bool includeIdle, std::vector<BSONObj>* ops) const {};
 
 std::vector<GenericCursor> MongoSInterface::getIdleCursors(
     const intrusive_ptr<ExpressionContext>& expCtx, CurrentOpUserMode userMode) const {
@@ -266,10 +304,10 @@ bool MongoSInterface::isSharded(OperationContext* opCtx, const NamespaceString& 
     return routingInfo.isOK() && routingInfo.getValue().cm();
 }
 
-bool MongoSInterface::uniqueKeyIsSupportedByIndex(
+bool MongoSInterface::fieldsHaveSupportingUniqueIndex(
     const boost::intrusive_ptr<ExpressionContext>& expCtx,
     const NamespaceString& nss,
-    const std::set<FieldPath>& uniqueKeyPaths) const {
+    const std::set<FieldPath>& fieldPaths) const {
     const auto opCtx = expCtx->opCtx;
     const auto routingInfo =
         uassertStatusOK(Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfo(opCtx, nss));
@@ -282,17 +320,59 @@ bool MongoSInterface::uniqueKeyIsSupportedByIndex(
         BSON("listIndexes" << nss.coll()),
         opCtx->hasDeadline() ? opCtx->getRemainingMaxTimeMillis() : Milliseconds(-1));
 
-    // If the namespace does not exist, then the unique key *must* be _id only.
+    // If the namespace does not exist, then the field paths *must* be _id only.
     if (response.getStatus() == ErrorCodes::NamespaceNotFound) {
-        return uniqueKeyPaths == std::set<FieldPath>{"_id"};
+        return fieldPaths == std::set<FieldPath>{"_id"};
     }
     uassertStatusOK(response);
 
     const auto& indexes = response.getValue().docs;
-    return std::any_of(
-        indexes.begin(), indexes.end(), [&expCtx, &uniqueKeyPaths](const auto& index) {
-            return supportsUniqueKey(expCtx, index, uniqueKeyPaths);
-        });
+    return std::any_of(indexes.begin(), indexes.end(), [&expCtx, &fieldPaths](const auto& index) {
+        return supportsUniqueKey(expCtx, index, fieldPaths);
+    });
+}
+
+std::pair<std::set<FieldPath>, boost::optional<ChunkVersion>>
+MongoSInterface::ensureFieldsUniqueOrResolveDocumentKey(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx,
+    boost::optional<std::vector<std::string>> fields,
+    boost::optional<ChunkVersion> targetCollectionVersion,
+    const NamespaceString& outputNs) const {
+    invariant(expCtx->inMongos);
+    uassert(
+        51179, "Received unexpected 'targetCollectionVersion' on mongos", !targetCollectionVersion);
+
+    if (fields) {
+        // Convert 'fields' array to a set of FieldPaths.
+        auto fieldPaths = _convertToFieldPaths(*fields);
+        uassert(51190,
+                "Cannot find index to verify that join fields will be unique",
+                fieldsHaveSupportingUniqueIndex(expCtx, outputNs, fieldPaths));
+
+        // If the user supplies the 'fields' array, we don't need to attach a ChunkVersion for the
+        // shards since we are not at risk of 'guessing' the wrong shard key.
+        return {fieldPaths, boost::none};
+    }
+
+    // In case there are multiple shards which will perform this stage in parallel, we need to
+    // figure out and attach the collection's shard version to ensure each shard is talking about
+    // the same version of the collection. This mongos will coordinate that. We force a catalog
+    // refresh to do so because there is no shard versioning protocol on this namespace and so we
+    // otherwise could not be sure this node is (or will become) at all recent. We will also
+    // figure out and attach the 'joinFields' to send to the shards.
+
+    // There are edge cases when the collection could be dropped or re-created during or near the
+    // time of the operation (for example, during aggregation). This is okay - we are mostly
+    // paranoid that this mongos is very stale and want to prevent returning an error if the
+    // collection was dropped a long time ago. Because of this, we are okay with piggy-backing off
+    // another thread's request to refresh the cache, simply waiting for that request to return
+    // instead of forcing another refresh.
+    targetCollectionVersion = refreshAndGetCollectionVersion(expCtx, outputNs);
+
+    auto docKeyPaths = collectDocumentKeyFieldsActingAsRouter(expCtx->opCtx, outputNs);
+    return {std::set<FieldPath>(std::make_move_iterator(docKeyPaths.begin()),
+                                std::make_move_iterator(docKeyPaths.end())),
+            targetCollectionVersion};
 }
 
 }  // namespace mongo

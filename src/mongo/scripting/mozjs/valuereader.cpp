@@ -73,7 +73,8 @@ void ValueReader::fromBSONElement(const BSONElement& elem, const BSONObj& parent
                 JS::AutoValueArray<2> args(_context);
 
                 ValueReader(_context, args[0]).fromStringData(elem.codeWScopeCode());
-                ValueReader(_context, args[1]).fromBSON(elem.codeWScopeObject(), nullptr, readOnly);
+                ValueReader(_context, args[1])
+                    .fromBSON(elem.codeWScopeObject().getOwned(), nullptr, readOnly);
 
                 scope->getProto<CodeInfo>().newInstance(args, _value);
             } else {
@@ -119,8 +120,6 @@ void ValueReader::fromBSONElement(const BSONElement& elem, const BSONObj& parent
             _value.setUndefined();
             return;
         case mongo::RegEx: {
-            // TODO parse into a custom type that can support any patterns and flags SERVER-9803
-
             JS::AutoValueArray<2> args(_context);
 
             ValueReader(_context, args[0]).fromStringData(elem.regex());
@@ -208,12 +207,12 @@ void ValueReader::fromBSON(const BSONObj& obj, const BSONObj* parent, bool readO
     JS::RootedObject child(_context);
 
     bool filledDBRef = false;
-    if (obj.firstElementType() == String && str::equals(obj.firstElementFieldName(), "$ref")) {
+    if (obj.firstElementType() == String && (obj.firstElementFieldNameStringData() == "$ref")) {
         BSONObjIterator it(obj);
         it.next();
         const BSONElement id = it.next();
 
-        if (id.ok() && str::equals(id.fieldName(), "$id")) {
+        if (id.ok() && id.fieldNameStringData() == "$id") {
             DBRefInfo::make(_context, &child, obj, parent, readOnly);
             filledDBRef = true;
         }

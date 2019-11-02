@@ -30,6 +30,7 @@
 #pragma once
 
 #include <boost/optional.hpp>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -48,14 +49,13 @@
 #include "mongo/db/write_concern.h"
 #include "mongo/rpc/op_msg.h"
 #include "mongo/rpc/reply_builder_interface.h"
-#include "mongo/stdx/functional.h"
-#include "mongo/util/fail_point_service.h"
+#include "mongo/util/fail_point.h"
 #include "mongo/util/string_map.h"
 
 namespace mongo {
 
-MONGO_FAIL_POINT_DECLARE(failCommand);
-MONGO_FAIL_POINT_DECLARE(waitInCommandMarkKillOnClientDisconnect);
+extern FailPoint failCommand;
+extern FailPoint waitInCommandMarkKillOnClientDisconnect;
 
 class Command;
 class CommandInvocation;
@@ -211,9 +211,12 @@ struct CommandHelpers {
                                           const OpMsgRequest& request);
 
     /**
-     * Returns OK if command is allowed to run under a transaction in the given database.
+     * Verifies that command is allowed to run under a transaction in the given database or
+     * namespace, and throws if that verification doesn't pass.
      */
-    static Status canUseTransactions(StringData dbName, StringData cmdName);
+    static void canUseTransactions(const NamespaceString& nss,
+                                   StringData cmdName,
+                                   bool allowTransactionsOnConfigDatabase);
 
     static constexpr StringData kHelpFieldName = "help"_sd;
 
@@ -222,12 +225,15 @@ struct CommandHelpers {
      */
     static bool shouldActivateFailCommandFailPoint(const BSONObj& data,
                                                    StringData cmdName,
-                                                   Client* client);
+                                                   Client* client,
+                                                   const NamespaceString& nss);
 
     /**
      * Possibly uasserts according to the "failCommand" fail point.
      */
-    static void evaluateFailCommandFailPoint(OperationContext* opCtx, StringData commandName);
+    static void evaluateFailCommandFailPoint(OperationContext* opCtx,
+                                             StringData commandName,
+                                             const NamespaceString& nss);
 
     /**
      * Handles marking kill on client disconnect.
@@ -426,6 +432,46 @@ private:
 };
 
 /**
+ * The result of checking an invocation's support for readConcern.  There are two parts:
+ * - Whether or not the invocation supports the given readConcern.
+ * - Whether or not the invocation permits having the default readConcern applied to it.
+ */
+struct ReadConcernSupportResult {
+    /**
+     * Whether this command invocation supports the requested readConcern level. This only
+     * applies when running outside transactions because all commands that are allowed to run
+     * in a transaction must support all the read concerns that can be used in a transaction.
+     */
+    enum class ReadConcern { kSupported, kNotSupported } readConcern;
+
+    /**
+     * Whether this command invocation supports applying the default readConcern to it.
+     */
+    enum class DefaultReadConcern { kPermitted, kNotPermitted } defaultReadConcern;
+
+    /**
+     * Construct with either the enum value or a bool, where true indicates
+     * ReadConcern::kSupported or DefaultReadConcern::kPermitted (as appropriate).
+     */
+    ReadConcernSupportResult(ReadConcern supported, DefaultReadConcern defaultPermitted)
+        : readConcern(supported), defaultReadConcern(defaultPermitted) {}
+
+    ReadConcernSupportResult(bool supported, DefaultReadConcern defaultPermitted)
+        : readConcern(supported ? ReadConcern::kSupported : ReadConcern::kNotSupported),
+          defaultReadConcern(defaultPermitted) {}
+
+    ReadConcernSupportResult(ReadConcern supported, bool defaultPermitted)
+        : readConcern(supported),
+          defaultReadConcern(defaultPermitted ? DefaultReadConcern::kPermitted
+                                              : DefaultReadConcern::kNotPermitted) {}
+
+    ReadConcernSupportResult(bool supported, bool defaultPermitted)
+        : readConcern(supported ? ReadConcern::kSupported : ReadConcern::kNotSupported),
+          defaultReadConcern(defaultPermitted ? DefaultReadConcern::kPermitted
+                                              : DefaultReadConcern::kNotPermitted) {}
+};
+
+/**
  * Represents a single invocation of a given command.
  */
 class CommandInvocation {
@@ -466,19 +512,11 @@ public:
     virtual bool supportsWriteConcern() const = 0;
 
     /**
-     * Returns true if this Command supports the given readConcern level. Takes the command object
-     * and the name of the database on which it was invoked as arguments, so that readConcern can be
-     * conditionally rejected based on the command's parameters and/or namespace.
-     *
-     * If a readConcern level argument is sent to a command that returns false the command processor
-     * will reject the command, returning an appropriate error message.
-     *
-     * Note that this is never called on mongos. Sharded commands are responsible for forwarding
-     * the option to the shards as needed. We rely on the shards to fail the commands in the
-     * cases where it isn't supported.
+     * Returns this invocation's support for readConcern.
      */
-    virtual bool supportsReadConcern(repl::ReadConcernLevel level) const {
-        return level == repl::ReadConcernLevel::kLocalReadConcern;
+    virtual ReadConcernSupportResult supportsReadConcern(repl::ReadConcernLevel level) const {
+        return {level == repl::ReadConcernLevel::kLocalReadConcern,
+                ReadConcernSupportResult::DefaultReadConcern::kNotPermitted};
     }
 
     /**
@@ -488,6 +526,14 @@ public:
      */
     virtual bool allowsAfterClusterTime() const {
         return true;
+    }
+
+    /**
+     * Returns true if a command may be able to safely ignore prepare conflicts. Only commands that
+     * can guarantee they will only perform reads may ignore prepare conflicts.
+     */
+    virtual bool canIgnorePrepareConflicts() const {
+        return false;
     }
 
     /**
@@ -597,8 +643,7 @@ public:
      * field and wait for that write concern to be satisfied after the command runs.
      *
      * @param cmd is a BSONObj representation of the command that is used to determine if the
-     *            the command supports a write concern. Ex. aggregate only supports write concern
-     *            when $out is provided.
+     *            the command supports a write concern.
      */
     virtual bool supportsWriteConcern(const BSONObj& cmdObj) const = 0;
 
@@ -610,18 +655,31 @@ public:
      * If a readConcern level argument is sent to a command that returns false the command processor
      * will reject the command, returning an appropriate error message.
      *
+     * This only applies when running outside transactions because all commands that are allowed to
+     * run in a transaction must support all the read concerns that can be used in a
+     * transaction.
+     *
      * Note that this is never called on mongos. Sharded commands are responsible for forwarding
      * the option to the shards as needed. We rely on the shards to fail the commands in the
      * cases where it isn't supported.
      */
-    virtual bool supportsReadConcern(const std::string& dbName,
-                                     const BSONObj& cmdObj,
-                                     repl::ReadConcernLevel level) const {
-        return level == repl::ReadConcernLevel::kLocalReadConcern;
+    virtual ReadConcernSupportResult supportsReadConcern(const std::string& dbName,
+                                                         const BSONObj& cmdObj,
+                                                         repl::ReadConcernLevel level) const {
+        return {level == repl::ReadConcernLevel::kLocalReadConcern,
+                ReadConcernSupportResult::DefaultReadConcern::kNotPermitted};
     }
 
     virtual bool allowsAfterClusterTime(const BSONObj& cmdObj) const {
         return true;
+    }
+
+    /**
+     * Returns true if a command may be able to safely ignore prepare conflicts. Only commands that
+     * can guarantee they will only perform reads may ignore prepare conflicts.
+     */
+    virtual bool canIgnorePrepareConflicts() const {
+        return false;
     }
 
 private:

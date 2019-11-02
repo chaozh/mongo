@@ -77,7 +77,7 @@ OplogEntry makeOplogEntry(int ts) {
                       boost::none,                  // o2
                       {},                           // sessionInfo
                       boost::none,                  // upsert
-                      boost::none,                  // wall clock time
+                      Date_t(),                     // wall clock time
                       boost::none,                  // statement id
                       boost::none,   // optime of previous write within same transaction
                       boost::none,   // pre-image optime
@@ -258,14 +258,15 @@ TEST_F(
 
     ASSERT_TRUE(multiApplyTxn);
     ASSERT_EQUALS(1U, operationsToApply.size());
-    ASSERT_BSONOBJ_EQ(operations[0].raw, operationsToApply[0].raw);
+    ASSERT_BSONOBJ_EQ(operations[0].getRaw(), operationsToApply[0].getRaw());
 
     ASSERT_OK(callbackResult);
     ASSERT_FALSE(callbackTxn);
 }
 
 class SharedCallbackState {
-    MONGO_DISALLOW_COPYING(SharedCallbackState);
+    SharedCallbackState(const SharedCallbackState&) = delete;
+    SharedCallbackState& operator=(const SharedCallbackState&) = delete;
 
 public:
     explicit SharedCallbackState(bool* sharedCallbackStateDestroyed)

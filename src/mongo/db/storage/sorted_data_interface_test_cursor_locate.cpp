@@ -47,14 +47,15 @@ TEST(SortedDataInterface, Locate) {
     {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
         const std::unique_ptr<SortedDataInterface::Cursor> cursor(sorted->newCursor(opCtx.get()));
-        ASSERT(!cursor->seek(key1, true));
+
+        ASSERT(!cursor->seek(makeKeyStringForSeek(sorted.get(), key1, true, true)));
     }
 
     {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
         {
             WriteUnitOfWork uow(opCtx.get());
-            ASSERT_OK(sorted->insert(opCtx.get(), key1, loc1, true));
+            ASSERT_OK(sorted->insert(opCtx.get(), makeKeyString(sorted.get(), key1, loc1), true));
             uow.commit();
         }
     }
@@ -63,7 +64,8 @@ TEST(SortedDataInterface, Locate) {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
         const std::unique_ptr<SortedDataInterface::Cursor> cursor(sorted->newCursor(opCtx.get()));
 
-        ASSERT_EQ(cursor->seek(key1, true), IndexKeyEntry(key1, loc1));
+        ASSERT_EQ(cursor->seek(makeKeyStringForSeek(sorted.get(), key1, true, true)),
+                  IndexKeyEntry(key1, loc1));
         ASSERT_EQ(cursor->next(), boost::none);
     }
 }
@@ -79,14 +81,14 @@ TEST(SortedDataInterface, LocateReversed) {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
         const std::unique_ptr<SortedDataInterface::Cursor> cursor(
             sorted->newCursor(opCtx.get(), false));
-        ASSERT(!cursor->seek(key1, true));
+        ASSERT(!cursor->seek(makeKeyStringForSeek(sorted.get(), key1, false, true)));
     }
 
     {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
         {
             WriteUnitOfWork uow(opCtx.get());
-            ASSERT_OK(sorted->insert(opCtx.get(), key1, loc1, true));
+            ASSERT_OK(sorted->insert(opCtx.get(), makeKeyString(sorted.get(), key1, loc1), true));
             uow.commit();
         }
     }
@@ -96,7 +98,8 @@ TEST(SortedDataInterface, LocateReversed) {
         const std::unique_ptr<SortedDataInterface::Cursor> cursor(
             sorted->newCursor(opCtx.get(), false));
 
-        ASSERT_EQ(cursor->seek(key1, true), IndexKeyEntry(key1, loc1));
+        ASSERT_EQ(cursor->seek(makeKeyStringForSeek(sorted.get(), key1, false, true)),
+                  IndexKeyEntry(key1, loc1));
         ASSERT_EQ(cursor->next(), boost::none);
     }
 }
@@ -111,14 +114,15 @@ TEST(SortedDataInterface, LocateCompoundKey) {
     {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
         const std::unique_ptr<SortedDataInterface::Cursor> cursor(sorted->newCursor(opCtx.get()));
-        ASSERT(!cursor->seek(compoundKey1a, true));
+        ASSERT(!cursor->seek(makeKeyStringForSeek(sorted.get(), compoundKey1a, true, true)));
     }
 
     {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
         {
             WriteUnitOfWork uow(opCtx.get());
-            ASSERT_OK(sorted->insert(opCtx.get(), compoundKey1a, loc1, true));
+            ASSERT_OK(sorted->insert(
+                opCtx.get(), makeKeyString(sorted.get(), compoundKey1a, loc1), true));
             uow.commit();
         }
     }
@@ -127,7 +131,8 @@ TEST(SortedDataInterface, LocateCompoundKey) {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
         const std::unique_ptr<SortedDataInterface::Cursor> cursor(sorted->newCursor(opCtx.get()));
 
-        ASSERT_EQ(cursor->seek(compoundKey1a, true), IndexKeyEntry(compoundKey1a, loc1));
+        ASSERT_EQ(cursor->seek(makeKeyStringForSeek(sorted.get(), compoundKey1a, true, true)),
+                  IndexKeyEntry(compoundKey1a, loc1));
         ASSERT_EQ(cursor->next(), boost::none);
     }
 }
@@ -143,14 +148,15 @@ TEST(SortedDataInterface, LocateCompoundKeyReversed) {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
         const std::unique_ptr<SortedDataInterface::Cursor> cursor(
             sorted->newCursor(opCtx.get(), false));
-        ASSERT(!cursor->seek(compoundKey1a, true));
+        ASSERT(!cursor->seek(makeKeyStringForSeek(sorted.get(), compoundKey1a, false, true)));
     }
 
     {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
         {
             WriteUnitOfWork uow(opCtx.get());
-            ASSERT_OK(sorted->insert(opCtx.get(), compoundKey1a, loc1, true));
+            ASSERT_OK(sorted->insert(
+                opCtx.get(), makeKeyString(sorted.get(), compoundKey1a, loc1), true));
             uow.commit();
         }
     }
@@ -160,7 +166,8 @@ TEST(SortedDataInterface, LocateCompoundKeyReversed) {
         const std::unique_ptr<SortedDataInterface::Cursor> cursor(
             sorted->newCursor(opCtx.get(), false));
 
-        ASSERT_EQ(cursor->seek(compoundKey1a, true), IndexKeyEntry(compoundKey1a, loc1));
+        ASSERT_EQ(cursor->seek(makeKeyStringForSeek(sorted.get(), compoundKey1a, false, true)),
+                  IndexKeyEntry(compoundKey1a, loc1));
         ASSERT_EQ(cursor->next(), boost::none);
     }
 }
@@ -175,15 +182,15 @@ TEST(SortedDataInterface, LocateMultiple) {
     {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
         const std::unique_ptr<SortedDataInterface::Cursor> cursor(sorted->newCursor(opCtx.get()));
-        ASSERT(!cursor->seek(key1, true));
+        ASSERT(!cursor->seek(makeKeyStringForSeek(sorted.get(), key1, true, true)));
     }
 
     {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
         {
             WriteUnitOfWork uow(opCtx.get());
-            ASSERT_OK(sorted->insert(opCtx.get(), key1, loc1, true));
-            ASSERT_OK(sorted->insert(opCtx.get(), key2, loc2, true));
+            ASSERT_OK(sorted->insert(opCtx.get(), makeKeyString(sorted.get(), key1, loc1), true));
+            ASSERT_OK(sorted->insert(opCtx.get(), makeKeyString(sorted.get(), key2, loc2), true));
             uow.commit();
         }
     }
@@ -192,7 +199,8 @@ TEST(SortedDataInterface, LocateMultiple) {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
         const std::unique_ptr<SortedDataInterface::Cursor> cursor(sorted->newCursor(opCtx.get()));
 
-        ASSERT_EQ(cursor->seek(key1, true), IndexKeyEntry(key1, loc1));
+        ASSERT_EQ(cursor->seek(makeKeyStringForSeek(sorted.get(), key1, true, true)),
+                  IndexKeyEntry(key1, loc1));
         ASSERT_EQ(cursor->next(), IndexKeyEntry(key2, loc2));
         ASSERT_EQ(cursor->next(), boost::none);
     }
@@ -201,7 +209,7 @@ TEST(SortedDataInterface, LocateMultiple) {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
         {
             WriteUnitOfWork uow(opCtx.get());
-            ASSERT_OK(sorted->insert(opCtx.get(), key3, loc3, true));
+            ASSERT_OK(sorted->insert(opCtx.get(), makeKeyString(sorted.get(), key3, loc3), true));
             uow.commit();
         }
     }
@@ -210,11 +218,13 @@ TEST(SortedDataInterface, LocateMultiple) {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
         const std::unique_ptr<SortedDataInterface::Cursor> cursor(sorted->newCursor(opCtx.get()));
 
-        ASSERT_EQ(cursor->seek(key2, true), IndexKeyEntry(key2, loc2));
+        ASSERT_EQ(cursor->seek(makeKeyStringForSeek(sorted.get(), key2, true, true)),
+                  IndexKeyEntry(key2, loc2));
         ASSERT_EQ(cursor->next(), IndexKeyEntry(key3, loc3));
         ASSERT_EQ(cursor->next(), boost::none);
 
-        ASSERT_EQ(cursor->seek(key1, true), IndexKeyEntry(key1, loc1));
+        ASSERT_EQ(cursor->seek(makeKeyStringForSeek(sorted.get(), key1, true, true)),
+                  IndexKeyEntry(key1, loc1));
         ASSERT_EQ(cursor->next(), IndexKeyEntry(key2, loc2));
         ASSERT_EQ(cursor->next(), IndexKeyEntry(key3, loc3));
         ASSERT_EQ(cursor->next(), boost::none);
@@ -232,15 +242,15 @@ TEST(SortedDataInterface, LocateMultipleReversed) {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
         const std::unique_ptr<SortedDataInterface::Cursor> cursor(
             sorted->newCursor(opCtx.get(), false));
-        ASSERT(!cursor->seek(key3, true));
+        ASSERT(!cursor->seek(makeKeyStringForSeek(sorted.get(), key3, true, true)));
     }
 
     {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
         {
             WriteUnitOfWork uow(opCtx.get());
-            ASSERT_OK(sorted->insert(opCtx.get(), key1, loc1, true));
-            ASSERT_OK(sorted->insert(opCtx.get(), key2, loc2, true));
+            ASSERT_OK(sorted->insert(opCtx.get(), makeKeyString(sorted.get(), key1, loc1), true));
+            ASSERT_OK(sorted->insert(opCtx.get(), makeKeyString(sorted.get(), key2, loc2), true));
             uow.commit();
         }
     }
@@ -250,7 +260,8 @@ TEST(SortedDataInterface, LocateMultipleReversed) {
         const std::unique_ptr<SortedDataInterface::Cursor> cursor(
             sorted->newCursor(opCtx.get(), false));
 
-        ASSERT_EQ(cursor->seek(key2, true), IndexKeyEntry(key2, loc2));
+        ASSERT_EQ(cursor->seek(makeKeyStringForSeek(sorted.get(), key2, false, true)),
+                  IndexKeyEntry(key2, loc2));
         ASSERT_EQ(cursor->next(), IndexKeyEntry(key1, loc1));
         ASSERT_EQ(cursor->next(), boost::none);
     }
@@ -259,7 +270,7 @@ TEST(SortedDataInterface, LocateMultipleReversed) {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
         {
             WriteUnitOfWork uow(opCtx.get());
-            ASSERT_OK(sorted->insert(opCtx.get(), key3, loc3, true));
+            ASSERT_OK(sorted->insert(opCtx.get(), makeKeyString(sorted.get(), key3, loc3), true));
             uow.commit();
         }
     }
@@ -269,11 +280,13 @@ TEST(SortedDataInterface, LocateMultipleReversed) {
         const std::unique_ptr<SortedDataInterface::Cursor> cursor(
             sorted->newCursor(opCtx.get(), false));
 
-        ASSERT_EQ(cursor->seek(key2, true), IndexKeyEntry(key2, loc2));
+        ASSERT_EQ(cursor->seek(makeKeyStringForSeek(sorted.get(), key2, false, true)),
+                  IndexKeyEntry(key2, loc2));
         ASSERT_EQ(cursor->next(), IndexKeyEntry(key1, loc1));
         ASSERT_EQ(cursor->next(), boost::none);
 
-        ASSERT_EQ(cursor->seek(key3, true), IndexKeyEntry(key3, loc3));
+        ASSERT_EQ(cursor->seek(makeKeyStringForSeek(sorted.get(), key3, false, true)),
+                  IndexKeyEntry(key3, loc3));
         ASSERT_EQ(cursor->next(), IndexKeyEntry(key2, loc2));
         ASSERT_EQ(cursor->next(), IndexKeyEntry(key1, loc1));
         ASSERT_EQ(cursor->next(), boost::none);
@@ -290,16 +303,19 @@ TEST(SortedDataInterface, LocateMultipleCompoundKeys) {
     {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
         const std::unique_ptr<SortedDataInterface::Cursor> cursor(sorted->newCursor(opCtx.get()));
-        ASSERT(!cursor->seek(compoundKey1a, true));
+        ASSERT(!cursor->seek(makeKeyStringForSeek(sorted.get(), compoundKey1a, true, true)));
     }
 
     {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
         {
             WriteUnitOfWork uow(opCtx.get());
-            ASSERT_OK(sorted->insert(opCtx.get(), compoundKey1a, loc1, true));
-            ASSERT_OK(sorted->insert(opCtx.get(), compoundKey1b, loc2, true));
-            ASSERT_OK(sorted->insert(opCtx.get(), compoundKey2b, loc3, true));
+            ASSERT_OK(sorted->insert(
+                opCtx.get(), makeKeyString(sorted.get(), compoundKey1a, loc1), true));
+            ASSERT_OK(sorted->insert(
+                opCtx.get(), makeKeyString(sorted.get(), compoundKey1b, loc2), true));
+            ASSERT_OK(sorted->insert(
+                opCtx.get(), makeKeyString(sorted.get(), compoundKey2b, loc3), true));
             uow.commit();
         }
     }
@@ -308,7 +324,8 @@ TEST(SortedDataInterface, LocateMultipleCompoundKeys) {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
         const std::unique_ptr<SortedDataInterface::Cursor> cursor(sorted->newCursor(opCtx.get()));
 
-        ASSERT_EQ(cursor->seek(compoundKey1a, true), IndexKeyEntry(compoundKey1a, loc1));
+        ASSERT_EQ(cursor->seek(makeKeyStringForSeek(sorted.get(), compoundKey1a, true, true)),
+                  IndexKeyEntry(compoundKey1a, loc1));
         ASSERT_EQ(cursor->next(), IndexKeyEntry(compoundKey1b, loc2));
         ASSERT_EQ(cursor->next(), IndexKeyEntry(compoundKey2b, loc3));
         ASSERT_EQ(cursor->next(), boost::none);
@@ -318,8 +335,10 @@ TEST(SortedDataInterface, LocateMultipleCompoundKeys) {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
         {
             WriteUnitOfWork uow(opCtx.get());
-            ASSERT_OK(sorted->insert(opCtx.get(), compoundKey1c, loc4, true));
-            ASSERT_OK(sorted->insert(opCtx.get(), compoundKey3a, loc5, true));
+            ASSERT_OK(sorted->insert(
+                opCtx.get(), makeKeyString(sorted.get(), compoundKey1c, loc4), true));
+            ASSERT_OK(sorted->insert(
+                opCtx.get(), makeKeyString(sorted.get(), compoundKey3a, loc5), true));
             uow.commit();
         }
     }
@@ -328,7 +347,8 @@ TEST(SortedDataInterface, LocateMultipleCompoundKeys) {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
         const std::unique_ptr<SortedDataInterface::Cursor> cursor(sorted->newCursor(opCtx.get()));
 
-        ASSERT_EQ(cursor->seek(compoundKey1a, true), IndexKeyEntry(compoundKey1a, loc1));
+        ASSERT_EQ(cursor->seek(makeKeyStringForSeek(sorted.get(), compoundKey1a, true, true)),
+                  IndexKeyEntry(compoundKey1a, loc1));
         ASSERT_EQ(cursor->next(), IndexKeyEntry(compoundKey1b, loc2));
         ASSERT_EQ(cursor->next(), IndexKeyEntry(compoundKey1c, loc4));
         ASSERT_EQ(cursor->next(), IndexKeyEntry(compoundKey2b, loc3));
@@ -348,16 +368,19 @@ TEST(SortedDataInterface, LocateMultipleCompoundKeysReversed) {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
         const std::unique_ptr<SortedDataInterface::Cursor> cursor(
             sorted->newCursor(opCtx.get(), false));
-        ASSERT(!cursor->seek(compoundKey3a, true));
+        ASSERT(!cursor->seek(makeKeyStringForSeek(sorted.get(), compoundKey3a, false, true)));
     }
 
     {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
         {
             WriteUnitOfWork uow(opCtx.get());
-            ASSERT_OK(sorted->insert(opCtx.get(), compoundKey1a, loc1, true));
-            ASSERT_OK(sorted->insert(opCtx.get(), compoundKey1b, loc2, true));
-            ASSERT_OK(sorted->insert(opCtx.get(), compoundKey2b, loc3, true));
+            ASSERT_OK(sorted->insert(
+                opCtx.get(), makeKeyString(sorted.get(), compoundKey1a, loc1), true));
+            ASSERT_OK(sorted->insert(
+                opCtx.get(), makeKeyString(sorted.get(), compoundKey1b, loc2), true));
+            ASSERT_OK(sorted->insert(
+                opCtx.get(), makeKeyString(sorted.get(), compoundKey2b, loc3), true));
             uow.commit();
         }
     }
@@ -367,7 +390,8 @@ TEST(SortedDataInterface, LocateMultipleCompoundKeysReversed) {
         const std::unique_ptr<SortedDataInterface::Cursor> cursor(
             sorted->newCursor(opCtx.get(), false));
 
-        ASSERT_EQ(cursor->seek(compoundKey2b, true), IndexKeyEntry(compoundKey2b, loc3));
+        ASSERT_EQ(cursor->seek(makeKeyStringForSeek(sorted.get(), compoundKey2b, false, true)),
+                  IndexKeyEntry(compoundKey2b, loc3));
         ASSERT_EQ(cursor->next(), IndexKeyEntry(compoundKey1b, loc2));
         ASSERT_EQ(cursor->next(), IndexKeyEntry(compoundKey1a, loc1));
         ASSERT_EQ(cursor->next(), boost::none);
@@ -377,8 +401,10 @@ TEST(SortedDataInterface, LocateMultipleCompoundKeysReversed) {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
         {
             WriteUnitOfWork uow(opCtx.get());
-            ASSERT_OK(sorted->insert(opCtx.get(), compoundKey1c, loc4, true));
-            ASSERT_OK(sorted->insert(opCtx.get(), compoundKey3a, loc5, true));
+            ASSERT_OK(sorted->insert(
+                opCtx.get(), makeKeyString(sorted.get(), compoundKey1c, loc4), true));
+            ASSERT_OK(sorted->insert(
+                opCtx.get(), makeKeyString(sorted.get(), compoundKey3a, loc5), true));
             uow.commit();
         }
     }
@@ -388,7 +414,8 @@ TEST(SortedDataInterface, LocateMultipleCompoundKeysReversed) {
         const std::unique_ptr<SortedDataInterface::Cursor> cursor(
             sorted->newCursor(opCtx.get(), false));
 
-        ASSERT_EQ(cursor->seek(compoundKey3a, true), IndexKeyEntry(compoundKey3a, loc5));
+        ASSERT_EQ(cursor->seek(makeKeyStringForSeek(sorted.get(), compoundKey3a, false, true)),
+                  IndexKeyEntry(compoundKey3a, loc5));
         ASSERT_EQ(cursor->next(), IndexKeyEntry(compoundKey2b, loc3));
         ASSERT_EQ(cursor->next(), IndexKeyEntry(compoundKey1c, loc4));
         ASSERT_EQ(cursor->next(), IndexKeyEntry(compoundKey1b, loc2));
@@ -407,15 +434,15 @@ TEST(SortedDataInterface, LocateIndirect) {
     {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
         const std::unique_ptr<SortedDataInterface::Cursor> cursor(sorted->newCursor(opCtx.get()));
-        ASSERT(!cursor->seek(key1, true));
+        ASSERT(!cursor->seek(makeKeyStringForSeek(sorted.get(), key1, true, true)));
     }
 
     {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
         {
             WriteUnitOfWork uow(opCtx.get());
-            ASSERT_OK(sorted->insert(opCtx.get(), key1, loc1, true));
-            ASSERT_OK(sorted->insert(opCtx.get(), key2, loc2, true));
+            ASSERT_OK(sorted->insert(opCtx.get(), makeKeyString(sorted.get(), key1, loc1), true));
+            ASSERT_OK(sorted->insert(opCtx.get(), makeKeyString(sorted.get(), key2, loc2), true));
             uow.commit();
         }
     }
@@ -424,7 +451,8 @@ TEST(SortedDataInterface, LocateIndirect) {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
         const std::unique_ptr<SortedDataInterface::Cursor> cursor(sorted->newCursor(opCtx.get()));
 
-        ASSERT_EQ(cursor->seek(key1, false), IndexKeyEntry(key2, loc2));
+        ASSERT_EQ(cursor->seek(makeKeyStringForSeek(sorted.get(), key1, true, false)),
+                  IndexKeyEntry(key2, loc2));
         ASSERT_EQ(cursor->next(), boost::none);
     }
 
@@ -432,7 +460,7 @@ TEST(SortedDataInterface, LocateIndirect) {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
         {
             WriteUnitOfWork uow(opCtx.get());
-            ASSERT_OK(sorted->insert(opCtx.get(), key3, loc3, true));
+            ASSERT_OK(sorted->insert(opCtx.get(), makeKeyString(sorted.get(), key3, loc3), true));
             uow.commit();
         }
     }
@@ -441,7 +469,8 @@ TEST(SortedDataInterface, LocateIndirect) {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
         const std::unique_ptr<SortedDataInterface::Cursor> cursor(sorted->newCursor(opCtx.get()));
 
-        ASSERT_EQ(cursor->seek(key1, true), IndexKeyEntry(key1, loc1));
+        ASSERT_EQ(cursor->seek(makeKeyStringForSeek(sorted.get(), key1, true, true)),
+                  IndexKeyEntry(key1, loc1));
         ASSERT_EQ(cursor->next(), IndexKeyEntry(key2, loc2));
         ASSERT_EQ(cursor->next(), IndexKeyEntry(key3, loc3));
         ASSERT_EQ(cursor->next(), boost::none);
@@ -459,15 +488,15 @@ TEST(SortedDataInterface, LocateIndirectReversed) {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
         const std::unique_ptr<SortedDataInterface::Cursor> cursor(
             sorted->newCursor(opCtx.get(), false));
-        ASSERT(!cursor->seek(key3, true));
+        ASSERT(!cursor->seek(makeKeyStringForSeek(sorted.get(), key3, false, true)));
     }
 
     {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
         {
             WriteUnitOfWork uow(opCtx.get());
-            ASSERT_OK(sorted->insert(opCtx.get(), key1, loc1, true));
-            ASSERT_OK(sorted->insert(opCtx.get(), key2, loc2, true));
+            ASSERT_OK(sorted->insert(opCtx.get(), makeKeyString(sorted.get(), key1, loc1), true));
+            ASSERT_OK(sorted->insert(opCtx.get(), makeKeyString(sorted.get(), key2, loc2), true));
             uow.commit();
         }
     }
@@ -477,7 +506,8 @@ TEST(SortedDataInterface, LocateIndirectReversed) {
         const std::unique_ptr<SortedDataInterface::Cursor> cursor(
             sorted->newCursor(opCtx.get(), false));
 
-        ASSERT_EQ(cursor->seek(key2, false), IndexKeyEntry(key1, loc1));
+        ASSERT_EQ(cursor->seek(makeKeyStringForSeek(sorted.get(), key2, false, false)),
+                  IndexKeyEntry(key1, loc1));
         ASSERT_EQ(cursor->next(), boost::none);
     }
 
@@ -485,7 +515,7 @@ TEST(SortedDataInterface, LocateIndirectReversed) {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
         {
             WriteUnitOfWork uow(opCtx.get());
-            ASSERT_OK(sorted->insert(opCtx.get(), key3, loc3, true));
+            ASSERT_OK(sorted->insert(opCtx.get(), makeKeyString(sorted.get(), key3, loc3), true));
             uow.commit();
         }
     }
@@ -495,7 +525,8 @@ TEST(SortedDataInterface, LocateIndirectReversed) {
         const std::unique_ptr<SortedDataInterface::Cursor> cursor(
             sorted->newCursor(opCtx.get(), false));
 
-        ASSERT_EQ(cursor->seek(key3, true), IndexKeyEntry(key3, loc3));
+        ASSERT_EQ(cursor->seek(makeKeyStringForSeek(sorted.get(), key3, false, true)),
+                  IndexKeyEntry(key3, loc3));
         ASSERT_EQ(cursor->next(), IndexKeyEntry(key2, loc2));
         ASSERT_EQ(cursor->next(), IndexKeyEntry(key1, loc1));
         ASSERT_EQ(cursor->next(), boost::none);
@@ -512,16 +543,19 @@ TEST(SortedDataInterface, LocateIndirectCompoundKeys) {
     {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
         const std::unique_ptr<SortedDataInterface::Cursor> cursor(sorted->newCursor(opCtx.get()));
-        ASSERT(!cursor->seek(compoundKey1a, true));
+        ASSERT(!cursor->seek(makeKeyStringForSeek(sorted.get(), compoundKey1a, true, true)));
     }
 
     {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
         {
             WriteUnitOfWork uow(opCtx.get());
-            ASSERT_OK(sorted->insert(opCtx.get(), compoundKey1a, loc1, true));
-            ASSERT_OK(sorted->insert(opCtx.get(), compoundKey1b, loc2, true));
-            ASSERT_OK(sorted->insert(opCtx.get(), compoundKey2b, loc3, true));
+            ASSERT_OK(sorted->insert(
+                opCtx.get(), makeKeyString(sorted.get(), compoundKey1a, loc1), true));
+            ASSERT_OK(sorted->insert(
+                opCtx.get(), makeKeyString(sorted.get(), compoundKey1b, loc2), true));
+            ASSERT_OK(sorted->insert(
+                opCtx.get(), makeKeyString(sorted.get(), compoundKey2b, loc3), true));
             uow.commit();
         }
     }
@@ -530,7 +564,8 @@ TEST(SortedDataInterface, LocateIndirectCompoundKeys) {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
         const std::unique_ptr<SortedDataInterface::Cursor> cursor(sorted->newCursor(opCtx.get()));
 
-        ASSERT_EQ(cursor->seek(compoundKey1a, false), IndexKeyEntry(compoundKey1b, loc2));
+        ASSERT_EQ(cursor->seek(makeKeyStringForSeek(sorted.get(), compoundKey1a, true, false)),
+                  IndexKeyEntry(compoundKey1b, loc2));
         ASSERT_EQ(cursor->next(), IndexKeyEntry(compoundKey2b, loc3));
         ASSERT_EQ(cursor->next(), boost::none);
     }
@@ -539,8 +574,10 @@ TEST(SortedDataInterface, LocateIndirectCompoundKeys) {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
         {
             WriteUnitOfWork uow(opCtx.get());
-            ASSERT_OK(sorted->insert(opCtx.get(), compoundKey1c, loc4, true));
-            ASSERT_OK(sorted->insert(opCtx.get(), compoundKey3a, loc5, true));
+            ASSERT_OK(sorted->insert(
+                opCtx.get(), makeKeyString(sorted.get(), compoundKey1c, loc4), true));
+            ASSERT_OK(sorted->insert(
+                opCtx.get(), makeKeyString(sorted.get(), compoundKey3a, loc5), true));
             uow.commit();
         }
     }
@@ -549,7 +586,8 @@ TEST(SortedDataInterface, LocateIndirectCompoundKeys) {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
         const std::unique_ptr<SortedDataInterface::Cursor> cursor(sorted->newCursor(opCtx.get()));
 
-        ASSERT_EQ(cursor->seek(compoundKey2a, true), IndexKeyEntry(compoundKey2b, loc3));
+        ASSERT_EQ(cursor->seek(makeKeyStringForSeek(sorted.get(), compoundKey2a, true, true)),
+                  IndexKeyEntry(compoundKey2b, loc3));
         ASSERT_EQ(cursor->next(), IndexKeyEntry(compoundKey3a, loc5));
         ASSERT_EQ(cursor->next(), boost::none);
     }
@@ -566,16 +604,19 @@ TEST(SortedDataInterface, LocateIndirectCompoundKeysReversed) {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
         const std::unique_ptr<SortedDataInterface::Cursor> cursor(
             sorted->newCursor(opCtx.get(), false));
-        ASSERT(!cursor->seek(compoundKey3a, true));
+        ASSERT(!cursor->seek(makeKeyStringForSeek(sorted.get(), compoundKey3a, false, true)));
     }
 
     {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
         {
             WriteUnitOfWork uow(opCtx.get());
-            ASSERT_OK(sorted->insert(opCtx.get(), compoundKey1a, loc1, true));
-            ASSERT_OK(sorted->insert(opCtx.get(), compoundKey1b, loc2, true));
-            ASSERT_OK(sorted->insert(opCtx.get(), compoundKey2b, loc3, true));
+            ASSERT_OK(sorted->insert(
+                opCtx.get(), makeKeyString(sorted.get(), compoundKey1a, loc1), true));
+            ASSERT_OK(sorted->insert(
+                opCtx.get(), makeKeyString(sorted.get(), compoundKey1b, loc2), true));
+            ASSERT_OK(sorted->insert(
+                opCtx.get(), makeKeyString(sorted.get(), compoundKey2b, loc3), true));
             uow.commit();
         }
     }
@@ -585,7 +626,8 @@ TEST(SortedDataInterface, LocateIndirectCompoundKeysReversed) {
         const std::unique_ptr<SortedDataInterface::Cursor> cursor(
             sorted->newCursor(opCtx.get(), false));
 
-        ASSERT_EQ(cursor->seek(compoundKey2b, false), IndexKeyEntry(compoundKey1b, loc2));
+        ASSERT_EQ(cursor->seek(makeKeyStringForSeek(sorted.get(), compoundKey2b, true, true)),
+                  IndexKeyEntry(compoundKey1b, loc2));
         ASSERT_EQ(cursor->next(), IndexKeyEntry(compoundKey1a, loc1));
         ASSERT_EQ(cursor->next(), boost::none);
     }
@@ -594,8 +636,10 @@ TEST(SortedDataInterface, LocateIndirectCompoundKeysReversed) {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
         {
             WriteUnitOfWork uow(opCtx.get());
-            ASSERT_OK(sorted->insert(opCtx.get(), compoundKey1c, loc4, true));
-            ASSERT_OK(sorted->insert(opCtx.get(), compoundKey3a, loc5, true));
+            ASSERT_OK(sorted->insert(
+                opCtx.get(), makeKeyString(sorted.get(), compoundKey1c, loc4), true));
+            ASSERT_OK(sorted->insert(
+                opCtx.get(), makeKeyString(sorted.get(), compoundKey3a, loc5), true));
             uow.commit();
         }
     }
@@ -605,7 +649,8 @@ TEST(SortedDataInterface, LocateIndirectCompoundKeysReversed) {
         const std::unique_ptr<SortedDataInterface::Cursor> cursor(
             sorted->newCursor(opCtx.get(), false));
 
-        ASSERT_EQ(cursor->seek(compoundKey1d, true), IndexKeyEntry(compoundKey1c, loc4));
+        ASSERT_EQ(cursor->seek(makeKeyStringForSeek(sorted.get(), compoundKey1d, true, true)),
+                  IndexKeyEntry(compoundKey1c, loc4));
         ASSERT_EQ(cursor->next(), IndexKeyEntry(compoundKey1b, loc2));
         ASSERT_EQ(cursor->next(), IndexKeyEntry(compoundKey1a, loc1));
         ASSERT_EQ(cursor->next(), boost::none);
@@ -628,7 +673,7 @@ TEST(SortedDataInterface, LocateEmpty) {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
         const std::unique_ptr<SortedDataInterface::Cursor> cursor(sorted->newCursor(opCtx.get()));
 
-        ASSERT(!cursor->seek(BSONObj(), true));
+        ASSERT(!cursor->seek(makeKeyStringForSeek(sorted.get(), BSONObj(), true, true)));
         ASSERT(!cursor->next());
     }
 }
@@ -650,7 +695,7 @@ TEST(SortedDataInterface, LocateEmptyReversed) {
         const std::unique_ptr<SortedDataInterface::Cursor> cursor(
             sorted->newCursor(opCtx.get(), false));
 
-        ASSERT(!cursor->seek(BSONObj(), true));
+        ASSERT(!cursor->seek(makeKeyStringForSeek(sorted.get(), BSONObj(), false, true)));
         ASSERT(!cursor->next());
     }
 }

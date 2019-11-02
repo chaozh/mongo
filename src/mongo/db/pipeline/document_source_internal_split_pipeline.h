@@ -58,9 +58,9 @@ public:
         return kStageName.rawData();
     }
 
-    boost::optional<MergingLogic> mergingLogic() final {
+    boost::optional<DistributedPlanLogic> distributedPlanLogic() final {
         // {shardsStage, mergingStage, sortPattern}
-        return MergingLogic{nullptr, this, boost::none};
+        return DistributedPlanLogic{nullptr, this, boost::none};
     }
 
     StageConstraints constraints(Pipeline::SplitState pipeState) const final {
@@ -69,18 +69,20 @@ public:
                 _mergeType,
                 DiskUseRequirement::kNoDiskUse,
                 FacetRequirement::kAllowed,
-                TransactionRequirement::kAllowed};
+                TransactionRequirement::kAllowed,
+                _mergeType == HostTypeRequirement::kMongoS ? LookupRequirement::kNotAllowed
+                                                           : LookupRequirement::kAllowed};
     }
-
-    GetNextResult getNext() final;
 
 private:
     DocumentSourceInternalSplitPipeline(const boost::intrusive_ptr<ExpressionContext>& expCtx,
                                         HostTypeRequirement mergeType)
-        : DocumentSource(expCtx), _mergeType(mergeType) {}
+        : DocumentSource(kStageName, expCtx), _mergeType(mergeType) {}
+
+    GetNextResult doGetNext() final;
 
     Value serialize(boost::optional<ExplainOptions::Verbosity> explain = boost::none) const final;
     HostTypeRequirement _mergeType = HostTypeRequirement::kNone;
 };
 
-}  // namesace mongo
+}  // namespace mongo

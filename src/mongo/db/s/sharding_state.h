@@ -31,10 +31,9 @@
 
 #include <string>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/bson/oid.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/s/shard_id.h"
-#include "mongo/stdx/mutex.h"
 
 namespace mongo {
 
@@ -50,7 +49,8 @@ class ServiceContext;
  * never gets destroyed or uninitialized.
  */
 class ShardingState {
-    MONGO_DISALLOW_COPYING(ShardingState);
+    ShardingState(const ShardingState&) = delete;
+    ShardingState& operator=(const ShardingState&) = delete;
 
 public:
     ShardingState();
@@ -136,7 +136,7 @@ private:
     }
 
     // Protects state below
-    stdx::mutex _mutex;
+    Mutex _mutex = MONGO_MAKE_LATCH("ShardingState::_mutex");
 
     // State of the initialization of the sharding state along with any potential errors
     AtomicWord<unsigned> _initializationState{static_cast<uint32_t>(InitializationState::kNew)};

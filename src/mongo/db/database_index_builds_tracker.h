@@ -32,7 +32,6 @@
 #include <map>
 #include <string>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/db/repl_index_build_state.h"
 #include "mongo/stdx/condition_variable.h"
 #include "mongo/util/concurrency/with_lock.h"
@@ -88,7 +87,7 @@ public:
     /**
      * Returns when no index builds remain on this database.
      */
-    void waitUntilNoIndexBuildsRemain(stdx::unique_lock<stdx::mutex>& lk);
+    void waitUntilNoIndexBuildsRemain(stdx::unique_lock<Latch>& lk);
 
 private:
     // Map of index build states on the database, by build UUID.

@@ -91,10 +91,7 @@ DatabaseType ShardingCatalogManager::createDatabase(OperationContext* opCtx,
 
         uassert(ErrorCodes::DatabaseDifferCase,
                 str::stream() << "can't have 2 databases that just differ on case "
-                              << " have: "
-                              << actualDbName
-                              << " want to add: "
-                              << dbName,
+                              << " have: " << actualDbName << " want to add: " << dbName,
                 actualDbName == dbName);
 
         // We did a local read of the database entry above and found that the database already
@@ -117,8 +114,41 @@ DatabaseType ShardingCatalogManager::createDatabase(OperationContext* opCtx,
 
     log() << "Registering new database " << db << " in sharding catalog";
 
+    // Do this write with majority writeConcern to guarantee that the shard sees the write when it
+    // receives the _flushDatabaseCacheUpdates.
     uassertStatusOK(Grid::get(opCtx)->catalogClient()->insertConfigDocument(
-        opCtx, DatabaseType::ConfigNS, db.toBSON(), ShardingCatalogClient::kLocalWriteConcern));
+        opCtx, DatabaseType::ConfigNS, db.toBSON(), ShardingCatalogClient::kMajorityWriteConcern));
+
+    // Note, making the primary shard refresh its databaseVersion here is not required for
+    // correctness, since either:
+    // 1) This is the first time this database is being created. The primary shard will not have a
+    //    databaseVersion already cached.
+    // 2) The database was dropped and is being re-created. Since dropping a database also sends
+    //    _flushDatabaseCacheUpdates to all shards, the primary shard should not have a database
+    //    version cached. (Note, it is possible that dropping a database will skip sending
+    //    _flushDatabaseCacheUpdates if the config server fails over while dropping the database.)
+    // However, routers don't support retrying internally on StaleDbVersion in transactions
+    // (SERVER-39704), so if the first operation run against the database is in a transaction, it
+    // would fail with StaleDbVersion. Making the primary shard refresh here allows that first
+    // transaction to succeed. This allows our transaction passthrough suites and transaction demos
+    // to succeed without additional special logic.
+    const auto shard =
+        uassertStatusOK(Grid::get(opCtx)->shardRegistry()->getShard(opCtx, db.getPrimary()));
+    auto cmdResponse = uassertStatusOK(
+        shard->runCommandWithFixedRetryAttempts(opCtx,
+                                                ReadPreferenceSetting{ReadPreference::PrimaryOnly},
+                                                "admin",
+                                                BSON("_flushDatabaseCacheUpdates" << dbName),
+                                                Shard::RetryPolicy::kIdempotent));
+
+    // If the shard had binary version v4.2 when it received the _flushDatabaseCacheUpdates, it will
+    // have responded with NamespaceNotFound, because the shard does not have the database (see
+    // SERVER-34431). Ignore this error, since the _flushDatabaseCacheUpdates is only a nicety for
+    // users testing transactions, and the transaction passthrough suites do not change shard binary
+    // versions.
+    if (cmdResponse.commandStatus != ErrorCodes::NamespaceNotFound) {
+        uassertStatusOK(cmdResponse.commandStatus);
+    }
 
     return db;
 }
@@ -251,8 +281,7 @@ Status ShardingCatalogManager::commitMovePrimary(OperationContext* opCtx,
     // are holding the dist lock during the movePrimary operation.
     uassert(ErrorCodes::IncompatibleShardingMetadata,
             str::stream() << "Tried to update primary shard for database '" << dbname
-                          << " with version "
-                          << currentDatabaseVersion.getLastMod(),
+                          << " with version " << currentDatabaseVersion.getLastMod(),
             updateStatus.getValue());
 
     // Ensure the next attempt to retrieve the database or any of its collections will do a full

@@ -30,7 +30,6 @@
 
 #pragma once
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
 #include "mongo/base/string_data.h"
@@ -43,7 +42,8 @@ namespace mongo {
 namespace repl {
 
 class StorageInterfaceImpl : public StorageInterface {
-    MONGO_DISALLOW_COPYING(StorageInterfaceImpl);
+    StorageInterfaceImpl(const StorageInterfaceImpl&) = delete;
+    StorageInterfaceImpl& operator=(const StorageInterfaceImpl&) = delete;
 
 public:
     static const char kDefaultRollbackIdNamespace[];
@@ -156,8 +156,6 @@ public:
     StatusWith<OptionalCollectionUUID> getCollectionUUID(OperationContext* opCtx,
                                                          const NamespaceString& nss) override;
 
-    Status upgradeNonReplicatedUniqueIndexes(OperationContext* opCtx) override;
-
     void setStableTimestamp(ServiceContext* serviceCtx, Timestamp snapshotName) override;
 
     void setInitialDataTimestamp(ServiceContext* serviceCtx, Timestamp snapshotName) override;
@@ -168,11 +166,13 @@ public:
 
     bool supportsRecoveryTimestamp(ServiceContext* serviceCtx) const override;
 
+    void initializeStorageControlsForReplication(ServiceContext* serviceCtx) const override;
+
     boost::optional<Timestamp> getRecoveryTimestamp(ServiceContext* serviceCtx) const override;
 
     bool supportsDocLocking(ServiceContext* serviceCtx) const override;
 
-    Timestamp getAllCommittedTimestamp(ServiceContext* serviceCtx) const override;
+    Timestamp getAllDurableTimestamp(ServiceContext* serviceCtx) const override;
 
     Timestamp getOldestOpenReadTimestamp(ServiceContext* serviceCtx) const override;
 
@@ -188,9 +188,6 @@ public:
                               bool orderedCommit) override;
 
     boost::optional<Timestamp> getLastStableRecoveryTimestamp(
-        ServiceContext* serviceCtx) const override;
-
-    boost::optional<Timestamp> getLastStableCheckpointTimestampDeprecated(
         ServiceContext* serviceCtx) const override;
 
     Timestamp getPointInTimeReadTimestamp(OperationContext* opCtx) const override;

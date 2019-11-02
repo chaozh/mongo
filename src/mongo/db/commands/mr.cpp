@@ -39,7 +39,6 @@
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/bson/dotted_path_support.h"
 #include "mongo/db/catalog/collection.h"
-#include "mongo/db/catalog/collection_catalog_entry.h"
 #include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/catalog/document_validation.h"
 #include "mongo/db/catalog/index_catalog.h"
@@ -47,23 +46,26 @@
 #include "mongo/db/client.h"
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/commands/map_reduce_gen.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/exec/working_set_common.h"
 #include "mongo/db/index/index_descriptor.h"
+#include "mongo/db/index_builds_coordinator.h"
 #include "mongo/db/matcher/extensions_callback_real.h"
 #include "mongo/db/op_observer.h"
 #include "mongo/db/ops/insert.h"
-#include "mongo/db/query/find_common.h"
+#include "mongo/db/query/collection_query_info.h"
 #include "mongo/db/query/get_executor.h"
 #include "mongo/db/query/plan_summary_stats.h"
 #include "mongo/db/query/query_planner.h"
-#include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/s/collection_sharding_runtime.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/service_context.h"
+#include "mongo/db/storage/durable_catalog.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/s/catalog_cache.h"
 #include "mongo/s/client/parallel.h"
 #include "mongo/s/client/shard_connection.h"
@@ -72,10 +74,10 @@
 #include "mongo/s/shard_key_pattern.h"
 #include "mongo/s/stale_exception.h"
 #include "mongo/scripting/engine.h"
-#include "mongo/stdx/mutex.h"
+#include "mongo/util/debug_util.h"
 #include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
 #include "mongo/util/scopeguard.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -92,6 +94,8 @@ namespace dps = ::mongo::dotted_path_support;
 
 namespace mr {
 namespace {
+
+Rarely mapParamsDeprecationSampler;  // Used to occasionally log deprecation messages.
 
 /**
  * Runs a count against the namespace specified by 'ns'. If the caller holds the global write lock,
@@ -110,7 +114,7 @@ unsigned long long collectionCount(OperationContext* opCtx,
         auto databaseHolder = DatabaseHolder::get(opCtx);
         auto db = databaseHolder->getDb(opCtx, nss.ns());
         if (db) {
-            coll = db->getCollection(opCtx, nss);
+            coll = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(nss);
         }
     } else {
         ctx.emplace(opCtx, nss);
@@ -168,6 +172,9 @@ void assertCollectionNotNull(const NamespaceString& nss, AutoT& autoT) {
 void dropTempCollections(OperationContext* cleanupOpCtx,
                          const NamespaceString& tempNamespace,
                          const NamespaceString& incLong) {
+    // Make sure we enforce prepare conflicts before writing.
+    EnforcePrepareConflictsBlock enforcePrepare(cleanupOpCtx);
+
     if (!tempNamespace.isEmpty()) {
         writeConflictRetry(
             cleanupOpCtx,
@@ -176,15 +183,21 @@ void dropTempCollections(OperationContext* cleanupOpCtx,
             [cleanupOpCtx, &tempNamespace] {
                 AutoGetDb autoDb(cleanupOpCtx, tempNamespace.db(), MODE_X);
                 if (auto db = autoDb.getDb()) {
-                    WriteUnitOfWork wunit(cleanupOpCtx);
-                    uassert(ErrorCodes::PrimarySteppedDown,
-                            str::stream() << "no longer primary while dropping temporary "
-                                             "collection for mapReduce: "
-                                          << tempNamespace.ns(),
-                            repl::ReplicationCoordinator::get(cleanupOpCtx)
-                                ->canAcceptWritesFor(cleanupOpCtx, tempNamespace));
-                    uassertStatusOK(db->dropCollection(cleanupOpCtx, tempNamespace.ns()));
-                    wunit.commit();
+                    if (auto collection = CollectionCatalog::get(cleanupOpCtx)
+                                              .lookupCollectionByNamespace(tempNamespace)) {
+                        uassert(ErrorCodes::PrimarySteppedDown,
+                                str::stream() << "no longer primary while dropping temporary "
+                                                 "collection for mapReduce: "
+                                              << tempNamespace.ns(),
+                                repl::ReplicationCoordinator::get(cleanupOpCtx)
+                                    ->canAcceptWritesFor(cleanupOpCtx, tempNamespace));
+                        BackgroundOperation::assertNoBgOpInProgForNs(tempNamespace.ns());
+                        IndexBuildsCoordinator::get(cleanupOpCtx)
+                            ->assertNoIndexBuildInProgForCollection(collection->uuid());
+                        WriteUnitOfWork wunit(cleanupOpCtx);
+                        uassertStatusOK(db->dropCollection(cleanupOpCtx, tempNamespace));
+                        wunit.commit();
+                    }
                 }
             });
         // Always forget about temporary namespaces, so we don't cache lots of them
@@ -196,9 +209,15 @@ void dropTempCollections(OperationContext* cleanupOpCtx,
                 Lock::DBLock lk(cleanupOpCtx, incLong.db(), MODE_X);
                 auto databaseHolder = DatabaseHolder::get(cleanupOpCtx);
                 if (auto db = databaseHolder->getDb(cleanupOpCtx, incLong.ns())) {
-                    WriteUnitOfWork wunit(cleanupOpCtx);
-                    uassertStatusOK(db->dropCollection(cleanupOpCtx, incLong.ns()));
-                    wunit.commit();
+                    if (auto collection = CollectionCatalog::get(cleanupOpCtx)
+                                              .lookupCollectionByNamespace(incLong)) {
+                        BackgroundOperation::assertNoBgOpInProgForNs(incLong.ns());
+                        IndexBuildsCoordinator::get(cleanupOpCtx)
+                            ->assertNoIndexBuildInProgForCollection(collection->uuid());
+                        WriteUnitOfWork wunit(cleanupOpCtx);
+                        uassertStatusOK(db->dropCollection(cleanupOpCtx, incLong));
+                        wunit.commit();
+                    }
                 }
             });
 
@@ -208,7 +227,7 @@ void dropTempCollections(OperationContext* cleanupOpCtx,
 
 }  // namespace
 
-AtomicWord<unsigned> Config::JOB_NUMBER;
+AtomicWord<unsigned> Config::jobNumber;
 
 JSFunction::JSFunction(const std::string& type, const BSONElement& e) {
     _type = type;
@@ -252,7 +271,7 @@ void JSMapper::map(const BSONObj& o) {
 BSONObj JSFinalizer::finalize(const BSONObj& o) {
     Scope* s = _func.scope();
 
-    s->invokeSafe(_func.func(), &o, 0);
+    s->invokeSafe(_func.func(), &o, nullptr);
 
     // We don't want to use o.objsize() to size b since there are many cases where the point of
     // finalize is converting many fields to 1
@@ -357,7 +376,7 @@ void JSReducer::_reduce(const BSONList& tuples, BSONObj& key, int& endSizeEstima
 
     Scope* s = _func.scope();
 
-    s->invokeSafe(_func.func(), &args, 0);
+    s->invokeSafe(_func.func(), &args, nullptr);
     ++numReduces;
 
     if (s->type("__returnValue") == Array) {
@@ -407,23 +426,23 @@ Config::Config(const string& _dbname, const BSONObj& cmdObj) {
 
     uassert(13602, "outType is no longer a valid option", cmdObj["outType"].eoo());
 
-    outputOptions = parseOutputOptions(dbname, cmdObj);
+    outputOptions = map_reduce_common::parseOutputOptions(dbname, cmdObj);
 
     shardedFirstPass = false;
     if (cmdObj.hasField("shardedFirstPass") && cmdObj["shardedFirstPass"].trueValue()) {
         massert(16054,
                 "shardedFirstPass should only use replace outType",
-                outputOptions.outType == REPLACE);
+                outputOptions.outType == OutputType::Replace);
         shardedFirstPass = true;
     }
 
-    if (outputOptions.outType != INMEMORY) {
+    if (outputOptions.outType != OutputType::InMemory) {
         // Create names for the temp collection and the incremental collection. The incremental
         // collection goes in the "local" database, so that it doesn't get replicated.
         const std::string& outDBName = outputOptions.outDB.empty() ? dbname : outputOptions.outDB;
         const std::string tmpCollDesc = str::stream()
             << "tmp.mr." << cmdObj.firstElement().valueStringData() << "_"
-            << JOB_NUMBER.fetchAndAdd(1);
+            << jobNumber.fetchAndAdd(1);
         tempNamespace = NamespaceString(outDBName, tmpCollDesc);
 
         // The name of the incremental collection includes the name of the database that we put
@@ -444,8 +463,14 @@ Config::Config(const string& _dbname, const BSONObj& cmdObj) {
         if (cmdObj["finalize"].type() && cmdObj["finalize"].trueValue())
             finalizer.reset(new JSFinalizer(cmdObj["finalize"]));
 
-        if (cmdObj["mapparams"].type() == Array) {
-            mapParams = cmdObj["mapparams"].embeddedObjectUserCheck().getOwned();
+        // DEPRECATED
+        if (auto mapParamsElem = cmdObj["mapparams"]) {
+            if (mapParamsDeprecationSampler.tick()) {
+                warning() << "The mapparams option to MapReduce is deprecated.";
+            }
+            if (mapParamsElem.type() == Array) {
+                mapParams = mapParamsElem.embeddedObjectUserCheck().getOwned();
+            }
         }
     }
 
@@ -488,6 +513,9 @@ void State::prepTempCollection() {
     if (!_onDisk)
         return;
 
+    // Make sure we enforce prepare conflicts before writing.
+    EnforcePrepareConflictsBlock enforcePrepare(_opCtx);
+
     dropTempCollections(
         _opCtx, _config.tempNamespace, _useIncremental ? _config.incLong : NamespaceString());
 
@@ -497,7 +525,7 @@ void State::prepTempCollection() {
         writeConflictRetry(_opCtx, "M/R prepTempCollection", _config.incLong.ns(), [this] {
             AutoGetOrCreateDb autoGetIncCollDb(_opCtx, _config.incLong.db(), MODE_X);
             auto const db = autoGetIncCollDb.getDb();
-            invariant(!db->getCollection(_opCtx, _config.incLong));
+            invariant(!CollectionCatalog::get(_opCtx).lookupCollectionByNamespace(_config.incLong));
 
             CollectionOptions options;
             options.setNoIdIndex();
@@ -506,13 +534,12 @@ void State::prepTempCollection() {
 
             WriteUnitOfWork wuow(_opCtx);
             auto incColl = db->createCollection(
-                _opCtx, _config.incLong.ns(), options, false /* force no _id index */);
+                _opCtx, _config.incLong, options, false /* force no _id index */);
 
-            auto rawIndexSpec =
-                BSON("key" << BSON("0" << 1) << "ns" << _config.incLong.ns() << "name"
-                           << "_temp_0");
+            auto rawIndexSpec = BSON("key" << BSON("0" << 1) << "name"
+                                           << "_temp_0");
             auto indexSpec = uassertStatusOK(index_key_validate::validateIndexSpec(
-                _opCtx, rawIndexSpec, _config.incLong, serverGlobalParams.featureCompatibility));
+                _opCtx, rawIndexSpec, serverGlobalParams.featureCompatibility));
 
             uassertStatusOKWithContext(
                 incColl->getIndexCatalog()->createIndexOnEmptyCollection(_opCtx, indexSpec),
@@ -533,7 +560,8 @@ void State::prepTempCollection() {
 
         auto const finalColl = autoGetFinalColl.getCollection();
         if (finalColl) {
-            finalOptions = finalColl->getCatalogEntry()->getCollectionOptions(_opCtx);
+            finalOptions =
+                DurableCatalog::get(_opCtx)->getCollectionOptions(_opCtx, finalColl->ns());
 
             std::unique_ptr<IndexCatalog::IndexIterator> ii =
                 finalColl->getIndexCatalog()->getIndexIterator(_opCtx, true);
@@ -541,13 +569,12 @@ void State::prepTempCollection() {
             while (ii->more()) {
                 const IndexDescriptor* currIndex = ii->next()->descriptor();
                 BSONObjBuilder b;
-                b.append("ns", _config.tempNamespace.ns());
 
                 // Copy over contents of the index descriptor's infoObj.
                 BSONObjIterator j(currIndex->infoObj());
                 while (j.more()) {
                     BSONElement e = j.next();
-                    if (str::equals(e.fieldName(), "_id") || str::equals(e.fieldName(), "ns"))
+                    if (e.fieldNameStringData() == "_id")
                         continue;
                     b.append(e);
                 }
@@ -560,7 +587,8 @@ void State::prepTempCollection() {
         // Create temp collection and insert the indexes from temporary storage
         AutoGetOrCreateDb autoGetFinalDb(_opCtx, _config.tempNamespace.db(), MODE_X);
         auto const db = autoGetFinalDb.getDb();
-        invariant(!db->getCollection(_opCtx, _config.tempNamespace));
+        invariant(
+            !CollectionCatalog::get(_opCtx).lookupCollectionByNamespace(_config.tempNamespace));
 
         uassert(
             ErrorCodes::PrimarySteppedDown,
@@ -586,20 +614,50 @@ void State::prepTempCollection() {
 
         WriteUnitOfWork wuow(_opCtx);
         auto const tempColl =
-            db->createCollection(_opCtx, _config.tempNamespace.ns(), options, buildIdIndex);
+            db->createCollection(_opCtx, _config.tempNamespace, options, buildIdIndex);
 
-        for (const auto& indexToInsert : indexesToInsert) {
-            try {
-                uassertStatusOK(tempColl->getIndexCatalog()->createIndexOnEmptyCollection(
-                    _opCtx, indexToInsert));
-            } catch (const ExceptionFor<ErrorCodes::IndexAlreadyExists>&) {
-                continue;
+        // Secondary index builds do not filter existing indexes so we have to do this on the
+        // primary.
+        auto removeIndexBuildsToo = false;
+        auto filteredIndexes = tempColl->getIndexCatalog()->removeExistingIndexes(
+            _opCtx, indexesToInsert, removeIndexBuildsToo);
+
+        if (!filteredIndexes.empty()) {
+            // Emit startIndexBuild and commitIndexBuild oplog entries if supported by the
+            // current FCV.
+            auto opObserver = _opCtx->getServiceContext()->getOpObserver();
+            const auto& tmpName = _config.tempNamespace;
+            auto fromMigrate = false;
+            auto buildUUID = serverGlobalParams.featureCompatibility.isVersionInitialized() &&
+                    serverGlobalParams.featureCompatibility.getVersion() ==
+                        ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo44
+                ? boost::make_optional(UUID::gen())
+                : boost::none;
+
+            if (buildUUID) {
+                opObserver->onStartIndexBuild(
+                    _opCtx, tmpName, tempColl->uuid(), *buildUUID, filteredIndexes, fromMigrate);
             }
 
-            // Log the createIndex operation.
-            _opCtx->getServiceContext()->getOpObserver()->onCreateIndex(
-                _opCtx, _config.tempNamespace, *(tempColl->uuid()), indexToInsert, false);
+            for (const auto& indexToInsert : filteredIndexes) {
+                uassertStatusOK(tempColl->getIndexCatalog()->createIndexOnEmptyCollection(
+                    _opCtx, indexToInsert));
+
+                // If two phase index builds is enabled, index build will be coordinated using
+                // startIndexBuild and commitIndexBuild oplog entries.
+                if (!IndexBuildsCoordinator::get(_opCtx)->supportsTwoPhaseIndexBuild()) {
+                    // Log the createIndex operation.
+                    opObserver->onCreateIndex(
+                        _opCtx, tmpName, tempColl->uuid(), indexToInsert, fromMigrate);
+                }
+            }
+
+            if (buildUUID) {
+                opObserver->onCommitIndexBuild(
+                    _opCtx, tmpName, tempColl->uuid(), *buildUUID, filteredIndexes, fromMigrate);
+            }
         }
+
         wuow.commit();
 
         CollectionShardingRuntime::get(_opCtx, _config.tempNamespace)
@@ -631,9 +689,7 @@ void State::appendResults(BSONObjBuilder& final) {
             BSONObj idKey = BSON("_id" << 1);
             if (!_db.runCommand("admin",
                                 BSON("splitVector" << _config.outputOptions.finalNamespace.ns()
-                                                   << "keyPattern"
-                                                   << idKey
-                                                   << "maxChunkSizeBytes"
+                                                   << "keyPattern" << idKey << "maxChunkSizeBytes"
                                                    << _config.splitInfo),
                                 res)) {
                 uasserted(15921, str::stream() << "splitVector failed: " << res);
@@ -652,7 +708,7 @@ void State::appendResults(BSONObjBuilder& final) {
             "  result.push({_id: key, value: map[key]});"
             "}"
             "return result;");
-        _scope->invoke(getResult, 0, 0, 0, false);
+        _scope->invoke(getResult, nullptr, nullptr, 0, false);
         BSONObj obj = _scope->getObject("__returnValue");
         final.append("results", BSONArray(obj));
         return;
@@ -686,7 +742,7 @@ void State::appendResults(BSONObjBuilder& final) {
  * This may involve replacing, merging or reducing.
  */
 long long State::postProcessCollection(OperationContext* opCtx, CurOp* curOp) {
-    if (_onDisk == false || _config.outputOptions.outType == Config::INMEMORY)
+    if (_onDisk == false || _config.outputOptions.outType == OutputType::InMemory)
         return numInMemKeys();
 
     bool holdingGlobalLock = false;
@@ -704,10 +760,13 @@ long long State::postProcessCollection(OperationContext* opCtx, CurOp* curOp) {
 long long State::postProcessCollectionNonAtomic(OperationContext* opCtx,
                                                 CurOp* curOp,
                                                 bool callerHoldsGlobalLock) {
+    // Make sure we enforce prepare conflicts before writing.
+    EnforcePrepareConflictsBlock enforcePrepare(opCtx);
+
     if (_config.outputOptions.finalNamespace == _config.tempNamespace)
         return collectionCount(opCtx, _config.outputOptions.finalNamespace, callerHoldsGlobalLock);
 
-    if (_config.outputOptions.outType == Config::REPLACE ||
+    if (_config.outputOptions.outType == OutputType::Replace ||
         collectionCount(opCtx, _config.outputOptions.finalNamespace, callerHoldsGlobalLock) == 0) {
         // This must be global because we may write across different databases.
         Lock::GlobalWrite lock(opCtx);
@@ -718,14 +777,13 @@ long long State::postProcessCollectionNonAtomic(OperationContext* opCtx,
         if (!_db.runCommand("admin",
                             BSON("renameCollection" << _config.tempNamespace.ns() << "to"
                                                     << _config.outputOptions.finalNamespace.ns()
-                                                    << "stayTemp"
-                                                    << _config.shardedFirstPass),
+                                                    << "stayTemp" << _config.shardedFirstPass),
                             info)) {
             uasserted(10076, str::stream() << "rename failed: " << info);
         }
 
         _db.dropCollection(_config.tempNamespace.ns());
-    } else if (_config.outputOptions.outType == Config::MERGE) {
+    } else if (_config.outputOptions.outType == OutputType::Merge) {
         // merge: upsert new docs into old collection
         const auto count = collectionCount(opCtx, _config.tempNamespace, callerHoldsGlobalLock);
 
@@ -744,7 +802,7 @@ long long State::postProcessCollectionNonAtomic(OperationContext* opCtx,
         }
         _db.dropCollection(_config.tempNamespace.ns());
         pm.finished();
-    } else if (_config.outputOptions.outType == Config::REDUCE) {
+    } else if (_config.outputOptions.outType == OutputType::Reduce) {
         // reduce: apply reduce op on new result and existing one
         BSONList values;
 
@@ -795,21 +853,22 @@ long long State::postProcessCollectionNonAtomic(OperationContext* opCtx,
 void State::insert(const NamespaceString& nss, const BSONObj& o) {
     invariant(_onDisk);
 
+    // Make sure we enforce prepare conflicts before writing.
+    EnforcePrepareConflictsBlock enforcePrepare(_opCtx);
+
     writeConflictRetry(_opCtx, "M/R insert", nss.ns(), [this, &nss, &o] {
         AutoGetCollection autoColl(_opCtx, nss, MODE_IX);
         uassert(
             ErrorCodes::PrimarySteppedDown,
             str::stream() << "no longer primary while inserting mapReduce result into collection: "
-                          << nss.ns()
-                          << ": "
-                          << redact(o),
+                          << nss << ": " << redact(o),
             repl::ReplicationCoordinator::get(_opCtx)->canAcceptWritesFor(_opCtx, nss));
         assertCollectionNotNull(nss, autoColl);
 
         WriteUnitOfWork wuow(_opCtx);
         BSONObjBuilder b;
         if (!o.hasField("_id")) {
-            b.appendOID("_id", NULL, true);
+            b.appendOID("_id", nullptr, true);
         }
         b.appendElements(o);
         BSONObj bo = b.obj();
@@ -834,6 +893,9 @@ void State::insert(const NamespaceString& nss, const BSONObj& o) {
 void State::_insertToInc(BSONObj& o) {
     verify(_onDisk);
 
+    // Make sure we enforce prepare conflicts before writing.
+    EnforcePrepareConflictsBlock enforcePrepare(_opCtx);
+
     writeConflictRetry(_opCtx, "M/R insertToInc", _config.incLong.ns(), [this, &o] {
         AutoGetCollection autoColl(_opCtx, _config.incLong, MODE_IX);
         assertCollectionNotNull(_config.incLong, autoColl);
@@ -846,10 +908,8 @@ void State::_insertToInc(BSONObj& o) {
         if (o.objsize() > BSONObjMaxUserSize) {
             uasserted(ErrorCodes::BadValue,
                       str::stream() << "object to insert too large for incremental collection"
-                                    << ". size in bytes: "
-                                    << o.objsize()
-                                    << ", max size: "
-                                    << BSONObjMaxUserSize);
+                                    << ". size in bytes: " << o.objsize()
+                                    << ", max size: " << BSONObjMaxUserSize);
         }
 
         // TODO: Consider whether to pass OpDebug for stats tracking under SERVER-23261.
@@ -869,7 +929,7 @@ State::State(OperationContext* opCtx, const Config& c)
       _dupCount(0),
       _numEmits(0) {
     _temp.reset(new InMemory());
-    _onDisk = _config.outputOptions.outType != Config::INMEMORY;
+    _onDisk = _config.outputOptions.outType != OutputType::InMemory;
 }
 
 bool State::sourceExists() {
@@ -898,8 +958,9 @@ State::~State() {
                                 _useIncremental ? _config.incLong : NamespaceString());
         } catch (...) {
             error() << "Unable to drop temporary collection created by mapReduce: "
-                    << _config.tempNamespace << ". This collection will be removed automatically "
-                                                "the next time the server starts up. "
+                    << _config.tempNamespace
+                    << ". This collection will be removed automatically "
+                       "the next time the server starts up. "
                     << exceptionToStatus();
         }
     }
@@ -908,7 +969,7 @@ State::~State() {
         try {
             ScriptingFunction cleanup =
                 _scope->createFunction("delete _emitCt; delete _keyCt; delete _mrMap;");
-            _scope->invoke(cleanup, 0, 0, 0, true);
+            _scope->invoke(cleanup, nullptr, nullptr, 0, true);
         } catch (const DBException&) {
             // not important because properties will be reset if scope is reused
             LOG(1) << "MapReduce terminated during state destruction";
@@ -921,8 +982,6 @@ State::~State() {
  */
 void State::init() {
     // setup js
-    const string userToken =
-        AuthorizationSession::get(Client::getCurrent())->getAuthenticatedUserNamesToken();
     _scope.reset(getGlobalScriptEngine()->newScopeForCurrentThread());
     _scope->requireOwnedObjects();
     _scope->registerOperation(_opCtx);
@@ -936,7 +995,7 @@ void State::init() {
     _config.reducer->init(this);
     if (_config.finalizer)
         _config.finalizer->init(this);
-    _scope->setBoolean("_doFinal", _config.finalizer.get() != 0);
+    _scope->setBoolean("_doFinal", _config.finalizer.get() != nullptr);
 
     switchMode(_config.jsMode);  // set up js-mode based on Config
 
@@ -953,7 +1012,7 @@ void State::init() {
         "if (typeof(_mrMap) === 'undefined') {"
         "  _mrMap = {};"
         "}");
-    _scope->invoke(init, 0, 0, 0, true);
+    _scope->invoke(init, nullptr, nullptr, 0, true);
 
     // js function to run reduce on all keys
     // redfunc = _scope->createFunction("for (var key in hashmap) {  print('Key is ' + key);
@@ -1059,7 +1118,7 @@ void State::bailFromJS() {
 
     // reduce and reemit into c++
     switchMode(false);
-    _scope->invoke(_reduceAndEmit, 0, 0, 0, true);
+    _scope->invoke(_reduceAndEmit, nullptr, nullptr, 0, true);
     // need to get the real number emitted so far
     _numEmits = _scope->getNumberInt("_emitCt");
     _config.reducer->numReduces = _scope->getNumberInt("_redCt");
@@ -1102,10 +1161,10 @@ void State::finalReduce(OperationContext* opCtx, CurOp* curOp) {
         // apply the reduce within JS
         if (_onDisk) {
             _scope->injectNative("_nativeToTemp", _nativeToTemp, this);
-            _scope->invoke(_reduceAndFinalizeAndInsert, 0, 0, 0, true);
+            _scope->invoke(_reduceAndFinalizeAndInsert, nullptr, nullptr, 0, true);
             return;
         } else {
-            _scope->invoke(_reduceAndFinalize, 0, 0, 0, true);
+            _scope->invoke(_reduceAndFinalize, nullptr, nullptr, 0, true);
             return;
         }
     }
@@ -1162,7 +1221,7 @@ void State::finalReduce(OperationContext* opCtx, CurOp* curOp) {
     BSONObj prev;
     BSONList all;
 
-    const auto count = _db.count(_config.incLong.ns(), BSONObj(), QueryOption_SlaveOk);
+    const auto count = _db.count(_config.incLong, BSONObj(), QueryOption_SlaveOk);
     ProgressMeterHolder pm;
     {
         stdx::unique_lock<Client> lk(*opCtx->getClient());
@@ -1171,7 +1230,7 @@ void State::finalReduce(OperationContext* opCtx, CurOp* curOp) {
 
     const ExtensionsCallbackReal extensionsCallback(_opCtx, &_config.incLong);
 
-    auto qr = stdx::make_unique<QueryRequest>(_config.incLong);
+    auto qr = std::make_unique<QueryRequest>(_config.incLong);
     qr->setSort(sortKey);
 
     const boost::intrusive_ptr<ExpressionContext> expCtx;
@@ -1194,7 +1253,7 @@ void State::finalReduce(OperationContext* opCtx, CurOp* curOp) {
         // iterate over all sorted objects
         BSONObj o;
         PlanExecutor::ExecState state;
-        while (PlanExecutor::ADVANCED == (state = exec->getNext(&o, NULL))) {
+        while (PlanExecutor::ADVANCED == (state = exec->getNext(&o, nullptr))) {
             o = o.getOwned();  // we will be accessing outside of the lock
             pm.hit();
 
@@ -1331,7 +1390,7 @@ void State::reduceAndSpillInMemoryStateIfNeeded() {
         } else if (dupCt > (keyCt * _config.reduceTriggerRatio)) {
             // reduce now to lower mem usage
             Timer t;
-            _scope->invoke(_reduceAll, 0, 0, 0, true);
+            _scope->invoke(_reduceAll, nullptr, nullptr, 0, true);
             LOG(3) << "  MR - did reduceAll: keys=" << keyCt << " dups=" << dupCt
                    << " newKeys=" << _scope->getNumberInt("_keyCt") << " time=" << t.millis()
                    << "ms";
@@ -1358,492 +1417,424 @@ void State::reduceAndSpillInMemoryStateIfNeeded() {
     }
 }
 
-/**
- * This class represents a map/reduce command executed on a single server
- */
-class MapReduceCommand : public ErrmsgCommandDeprecated {
-public:
-    MapReduceCommand() : ErrmsgCommandDeprecated("mapReduce", "mapreduce") {}
 
-    AllowedOnSecondary secondaryAllowed(ServiceContext* serviceContext) const override {
-        if (repl::ReplicationCoordinator::get(serviceContext)->getReplicationMode() !=
-            repl::ReplicationCoordinator::modeReplSet) {
-            return AllowedOnSecondary::kAlways;
-        }
-        return AllowedOnSecondary::kOptIn;
+bool runMapReduce(OperationContext* opCtx,
+                  const string& dbname,
+                  const BSONObj& cmd,
+                  string& errmsg,
+                  BSONObjBuilder& result) {
+    Timer t;
+
+    boost::optional<DisableDocumentValidation> maybeDisableValidation;
+    if (shouldBypassDocumentValidationForCommand(cmd))
+        maybeDisableValidation.emplace(opCtx);
+
+    auto client = opCtx->getClient();
+
+    if (client->isInDirectClient()) {
+        uasserted(ErrorCodes::IllegalOperation, "Cannot run mapReduce command from eval()");
     }
 
-    std::size_t reserveBytesForReply() const override {
-        return FindCommon::kInitReplyBufferSize;
-    }
+    auto curOp = CurOp::get(opCtx);
 
-    std::string help() const override {
-        return "Run a map/reduce operation on the server.\n"
-               "Note this is used for aggregation, not querying, in MongoDB.\n"
-               "http://dochub.mongodb.org/core/mapreduce";
-    }
+    const Config config(dbname, cmd);
 
+    LOG(1) << "mr ns: " << config.nss;
 
-    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
-        return mrSupportsWriteConcern(cmd);
-    }
+    uassert(16149, "cannot run map reduce without the js engine", getGlobalScriptEngine());
 
-    virtual void addRequiredPrivileges(const std::string& dbname,
-                                       const BSONObj& cmdObj,
-                                       std::vector<Privilege>* out) const {
-        addPrivilegesRequiredForMapReduce(this, dbname, cmdObj, out);
-    }
+    const auto metadata = [&] {
+        AutoGetCollectionForReadCommand autoColl(opCtx, config.nss);
+        return CollectionShardingState::get(opCtx, config.nss)
+            ->getOrphansFilter(opCtx, autoColl.getCollection());
+    }();
 
-    bool errmsgRun(OperationContext* opCtx,
-                   const string& dbname,
-                   const BSONObj& cmd,
-                   string& errmsg,
-                   BSONObjBuilder& result) {
-        Timer t;
+    bool shouldHaveData = false;
 
-        boost::optional<DisableDocumentValidation> maybeDisableValidation;
-        if (shouldBypassDocumentValidationForCommand(cmd))
-            maybeDisableValidation.emplace(opCtx);
-
-        auto client = opCtx->getClient();
-
-        if (client->isInDirectClient()) {
-            uasserted(ErrorCodes::IllegalOperation, "Cannot run mapReduce command from eval()");
-        }
-
-        auto curOp = CurOp::get(opCtx);
-
-        const Config config(dbname, cmd);
-
-        LOG(1) << "mr ns: " << config.nss;
-
-        uassert(16149, "cannot run map reduce without the js engine", getGlobalScriptEngine());
-
-        const auto metadata = [&] {
-            AutoGetCollectionForReadCommand autoColl(opCtx, config.nss);
-            return CollectionShardingState::get(opCtx, config.nss)->getCurrentMetadata();
-        }();
-
-        bool shouldHaveData = false;
-
-        BSONObjBuilder countsBuilder;
-        BSONObjBuilder timingBuilder;
-        try {
-            State state(opCtx, config);
-            if (!state.sourceExists()) {
-                uasserted(ErrorCodes::NamespaceNotFound,
-                          str::stream() << "namespace does not exist: " << config.nss.ns());
-            }
-
-            state.init();
-            state.prepTempCollection();
-
-            int64_t progressTotal = 0;
-            bool showTotal = true;
-            if (state.config().filter.isEmpty()) {
-                const bool holdingGlobalLock = false;
-                const auto count = collectionCount(opCtx, config.nss, holdingGlobalLock);
-                progressTotal =
-                    (config.limit && static_cast<unsigned long long>(config.limit) < count)
-                    ? config.limit
-                    : count;
-            } else {
-                showTotal = false;
-                // Set an arbitrary total > 0 so the meter will be activated.
-                progressTotal = 1;
-            }
-
-            ProgressMeterHolder pm;
-            {
-                stdx::unique_lock<Client> lk(*opCtx->getClient());
-                pm.set(curOp->setProgress_inlock("M/R: (1/3) Emit Phase", progressTotal));
-            }
-            pm->showTotal(showTotal);
-
-            long long mapTime = 0;
-            long long reduceTime = 0;
-            long long numInputs = 0;
-
-            {
-                // We've got a cursor preventing migrations off, now re-establish our useful cursor
-
-                // Need lock and context to use it
-                boost::optional<AutoGetCollection> scopedAutoColl;
-                scopedAutoColl.emplace(opCtx, config.nss, MODE_S);
-                assertCollectionNotNull(config.nss, *scopedAutoColl);
-
-                if (state.isOnDisk()) {
-                    // This means that it will be doing a write operation, make sure it is safe to
-                    // do so
-                    uassert(ErrorCodes::NotMaster,
-                            "not master",
-                            repl::ReplicationCoordinator::get(opCtx)->canAcceptWritesFor(
-                                opCtx, config.nss));
-                }
-
-                auto qr = stdx::make_unique<QueryRequest>(config.nss);
-                qr->setFilter(config.filter);
-                qr->setSort(config.sort);
-                qr->setCollation(config.collation);
-
-                const ExtensionsCallbackReal extensionsCallback(opCtx, &config.nss);
-
-                const boost::intrusive_ptr<ExpressionContext> expCtx;
-                auto cq = uassertStatusOKWithContext(
-                    CanonicalQuery::canonicalize(opCtx,
-                                                 std::move(qr),
-                                                 expCtx,
-                                                 extensionsCallback,
-                                                 MatchExpressionParser::kAllowAllSpecialFeatures),
-                    str::stream() << "Can't canonicalize query " << config.filter);
-
-                auto exec = uassertStatusOK(getExecutor(opCtx,
-                                                        scopedAutoColl->getCollection(),
-                                                        std::move(cq),
-                                                        PlanExecutor::YIELD_AUTO,
-                                                        0));
-
-                {
-                    stdx::lock_guard<Client> lk(*opCtx->getClient());
-                    CurOp::get(opCtx)->setPlanSummary_inlock(Explain::getPlanSummary(exec.get()));
-                }
-
-                Timer mt;
-
-                BSONObj o;
-                PlanExecutor::ExecState execState;
-                while (PlanExecutor::ADVANCED == (execState = exec->getNext(&o, NULL))) {
-                    o = o.getOwned();  // The object will be accessed outside of collection lock
-
-                    // Check to see if this is a new object we don't own yet because of a chunk
-                    // migration
-                    if (metadata->isSharded()) {
-                        ShardKeyPattern kp(metadata->getKeyPattern());
-                        if (!metadata->keyBelongsToMe(kp.extractShardKeyFromDoc(o))) {
-                            continue;
-                        }
-                    }
-
-                    if (config.verbose)
-                        mt.reset();
-
-                    config.mapper->map(o);
-
-                    if (config.verbose)
-                        mapTime += mt.micros();
-
-                    // Check if the state accumulated so far needs to be written to a collection.
-                    // This may yield the DB lock temporarily and then acquire it again.
-                    numInputs++;
-                    if (numInputs % 100 == 0) {
-                        Timer t;
-
-                        // TODO: As an optimization, we might want to do the save/restore state and
-                        // yield inside the reduceAndSpillInMemoryState method, so it only happens
-                        // if necessary.
-                        exec->saveState();
-
-                        scopedAutoColl.reset();
-
-                        state.reduceAndSpillInMemoryStateIfNeeded();
-                        scopedAutoColl.emplace(opCtx, config.nss, MODE_S);
-
-                        exec->restoreState();
-
-                        reduceTime += t.micros();
-
-                        opCtx->checkForInterrupt();
-                    }
-
-                    pm.hit();
-
-                    if (config.limit && numInputs >= config.limit)
-                        break;
-                }
-
-                if (PlanExecutor::FAILURE == execState) {
-                    uasserted(ErrorCodes::OperationFailed,
-                              str::stream() << "Executor error during mapReduce command: "
-                                            << WorkingSetCommon::toStatusString(o));
-                }
-
-                // Record the indexes used by the PlanExecutor.
-                PlanSummaryStats stats;
-                Explain::getSummaryStats(*exec, &stats);
-
-                // TODO SERVER-23261: Confirm whether this is the correct place to gather all
-                // metrics. There is no harm adding here for the time being.
-                curOp->debug().setPlanSummaryMetrics(stats);
-                scopedAutoColl->getCollection()->infoCache()->notifyOfQuery(opCtx,
-                                                                            stats.indexesUsed);
-
-                if (curOp->shouldDBProfile()) {
-                    BSONObjBuilder execStatsBob;
-                    Explain::getWinningPlanStats(exec.get(), &execStatsBob);
-                    curOp->debug().execStats = execStatsBob.obj();
-                }
-            }
-            pm.finished();
-
-            opCtx->checkForInterrupt();
-
-            // update counters
-            countsBuilder.appendNumber("input", numInputs);
-            countsBuilder.appendNumber("emit", state.numEmits());
-            if (state.numEmits())
-                shouldHaveData = true;
-
-            timingBuilder.appendNumber("mapTime", mapTime / 1000);
-            timingBuilder.append("emitLoop", t.millis());
-
-            {
-                stdx::lock_guard<Client> lk(*opCtx->getClient());
-                curOp->setMessage_inlock("M/R: (2/3) Final In-Memory Reduce");
-            }
-            Timer rt;
-            // do reduce in memory
-            // this will be the last reduce needed for inline mode
-            state.reduceInMemory();
-            // if not inline: dump the in memory map to inc collection, all data is on disk
-            state.dumpToInc();
-            // final reduce
-            state.finalReduce(opCtx, curOp);
-            reduceTime += rt.micros();
-
-            // Ensure the profile shows the source namespace. If the output was not inline, the
-            // active namespace will be the temporary collection we inserted into.
-            {
-                stdx::lock_guard<Client> lk(*opCtx->getClient());
-                curOp->setNS_inlock(config.nss.ns());
-            }
-
-            countsBuilder.appendNumber("reduce", state.numReduces());
-            timingBuilder.appendNumber("reduceTime", reduceTime / 1000);
-            timingBuilder.append("mode", state.jsMode() ? "js" : "mixed");
-
-            long long finalCount = state.postProcessCollection(opCtx, curOp);
-            state.appendResults(result);
-
-            timingBuilder.appendNumber("total", t.millis());
-            result.appendNumber("timeMillis", t.millis());
-            countsBuilder.appendNumber("output", finalCount);
-            if (config.verbose)
-                result.append("timing", timingBuilder.obj());
-            result.append("counts", countsBuilder.obj());
-
-            if (finalCount == 0 && shouldHaveData) {
-                result.append("cmd", cmd);
-                errmsg = "there were emits but no data!";
-                return false;
-            }
-        } catch (StaleConfigException& e) {
-            log() << "mr detected stale config, should retry" << redact(e);
-            throw;
-        }
-        // TODO:  The error handling code for queries is v. fragile,
-        // *requires* rethrow AssertionExceptions - should probably fix.
-        catch (AssertionException& e) {
-            log() << "mr failed, removing collection" << redact(e);
-            throw;
-        } catch (std::exception& e) {
-            log() << "mr failed, removing collection" << causedBy(e);
-            throw;
-        } catch (...) {
-            log() << "mr failed for unknown reason, removing collection";
-            throw;
-        }
-
-        return true;
-    }
-
-} mapReduceCommand;
-
-/**
- * This class represents a map/reduce command executed on the output server of a sharded env
- */
-class MapReduceFinishCommand : public BasicCommand {
-public:
-    std::string help() const override {
-        return "internal";
-    }
-    MapReduceFinishCommand() : BasicCommand("mapreduce.shardedfinish") {}
-
-    AllowedOnSecondary secondaryAllowed(ServiceContext* serviceContext) const override {
-        if (repl::ReplicationCoordinator::get(serviceContext)->getReplicationMode() !=
-            repl::ReplicationCoordinator::modeReplSet) {
-            return AllowedOnSecondary::kAlways;
-        }
-        return AllowedOnSecondary::kOptIn;
-    }
-
-    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
-        return true;
-    }
-    virtual void addRequiredPrivileges(const std::string& dbname,
-                                       const BSONObj& cmdObj,
-                                       std::vector<Privilege>* out) const {
-        ActionSet actions;
-        actions.addAction(ActionType::internal);
-        out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
-    }
-    bool run(OperationContext* opCtx,
-             const string& dbname,
-             const BSONObj& cmdObj,
-             BSONObjBuilder& result) {
-        if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
-            uasserted(ErrorCodes::CommandNotSupported,
-                      str::stream() << "Can not execute mapReduce with output database " << dbname
-                                    << " which lives on config servers");
-        }
-
-        boost::optional<DisableDocumentValidation> maybeDisableValidation;
-        if (shouldBypassDocumentValidationForCommand(cmdObj))
-            maybeDisableValidation.emplace(opCtx);
-
-        // legacy name
-        const auto shardedOutputCollectionElt = cmdObj["shardedOutputCollection"];
-        uassert(ErrorCodes::InvalidNamespace,
-                "'shardedOutputCollection' must be of type String",
-                shardedOutputCollectionElt.type() == BSONType::String);
-        const std::string shardedOutputCollection = shardedOutputCollectionElt.str();
-        verify(shardedOutputCollection.size() > 0);
-
-        std::string inputNS;
-        if (cmdObj["inputDB"].type() == String) {
-            inputNS =
-                NamespaceString(cmdObj["inputDB"].valueStringData(), shardedOutputCollection).ns();
-        } else {
-            inputNS = NamespaceString(dbname, shardedOutputCollection).ns();
-        }
-
-        CurOp* curOp = CurOp::get(opCtx);
-
-        Config config(dbname, cmdObj.firstElement().embeddedObjectUserCheck());
-
-        if (cmdObj.hasField("shardedOutputCollUUID")) {
-            config.finalOutputCollUUID =
-                uassertStatusOK(UUID::parse(cmdObj["shardedOutputCollUUID"]));
-        }
-
+    BSONObjBuilder countsBuilder;
+    BSONObjBuilder timingBuilder;
+    try {
         State state(opCtx, config);
+        if (!state.sourceExists()) {
+            uasserted(ErrorCodes::NamespaceNotFound,
+                      str::stream() << "namespace does not exist: " << config.nss);
+        }
+
         state.init();
-
-        // no need for incremental collection because records are already sorted
-        state._useIncremental = false;
-        config.incLong = config.tempNamespace;
-
-        BSONObj shardCounts = cmdObj["shardCounts"].embeddedObjectUserCheck();
-        BSONObj counts = cmdObj["counts"].embeddedObjectUserCheck();
-
-        {
-            stdx::unique_lock<Client> lk(*opCtx->getClient());
-            curOp->setMessage_inlock("M/R Merge Sort and Reduce");
-        }
-        set<string> servers;
-
-        {
-            // Parse per shard results
-            BSONObjIterator i(shardCounts);
-            while (i.more()) {
-                BSONElement e = i.next();
-                std::string server = e.fieldName();
-                servers.insert(server);
-
-                uassertStatusOK(Grid::get(opCtx)->shardRegistry()->getShard(opCtx, server));
-            }
-        }
-
         state.prepTempCollection();
 
-        std::vector<Chunk> chunks;
-
-        if (config.outputOptions.outType != Config::OutputType::INMEMORY) {
-            auto outRoutingInfoStatus = Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfo(
-                opCtx, config.outputOptions.finalNamespace);
-            uassertStatusOK(outRoutingInfoStatus.getStatus());
-
-            if (auto cm = outRoutingInfoStatus.getValue().cm()) {
-                // Fetch result from other shards 1 chunk at a time. It would be better to do just
-                // one big $or query, but then the sorting would not be efficient.
-                const auto shardId = ShardingState::get(opCtx)->shardId();
-
-                for (const auto& chunk : cm->chunks()) {
-                    if (chunk.getShardId() == shardId) {
-                        chunks.push_back(chunk);
-                    }
-                }
-            }
+        int64_t progressTotal = 0;
+        bool showTotal = true;
+        if (state.config().filter.isEmpty()) {
+            const bool holdingGlobalLock = false;
+            const auto count = collectionCount(opCtx, config.nss, holdingGlobalLock);
+            progressTotal = (config.limit && static_cast<unsigned long long>(config.limit) < count)
+                ? config.limit
+                : count;
+        } else {
+            showTotal = false;
+            // Set an arbitrary total > 0 so the meter will be activated.
+            progressTotal = 1;
         }
 
-        long long inputCount = 0;
-        unsigned int index = 0;
-        BSONObj query;
-        BSONList values;
+        ProgressMeterHolder pm;
+        {
+            stdx::unique_lock<Client> lk(*opCtx->getClient());
+            pm.set(curOp->setProgress_inlock("M/R: (1/3) Emit Phase", progressTotal));
+        }
+        pm->showTotal(showTotal);
 
-        while (true) {
-            if (chunks.size() > 0) {
-                const auto& chunk = chunks[index];
-                BSONObjBuilder b;
-                b.appendAs(chunk.getMin().firstElement(), "$gte");
-                b.appendAs(chunk.getMax().firstElement(), "$lt");
-                query = BSON("_id" << b.obj());
+        long long mapTime = 0;
+        long long reduceTime = 0;
+        long long numInputs = 0;
+
+        {
+            // We've got a cursor preventing migrations off, now re-establish our useful cursor
+
+            // Need lock and context to use it
+            boost::optional<AutoGetCollection> scopedAutoColl;
+            scopedAutoColl.emplace(opCtx, config.nss, MODE_S);
+            assertCollectionNotNull(config.nss, *scopedAutoColl);
+
+            if (state.isOnDisk()) {
+                // This means that it will be doing a write operation, make sure it is safe to
+                // do so
+                uassert(ErrorCodes::NotMaster,
+                        "not master",
+                        repl::ReplicationCoordinator::get(opCtx)->canAcceptWritesFor(opCtx,
+                                                                                     config.nss));
             }
 
-            // reduce from each shard for a chunk
-            BSONObj sortKey = BSON("_id" << 1);
-            ParallelSortClusteredCursor cursor(
-                servers, inputNS, Query(query).sort(sortKey), QueryOption_NoCursorTimeout);
-            cursor.init(opCtx);
+            auto qr = std::make_unique<QueryRequest>(config.nss);
+            qr->setFilter(config.filter);
+            qr->setSort(config.sort);
+            qr->setCollation(config.collation);
 
-            while (cursor.more() || !values.empty()) {
-                BSONObj t;
-                if (cursor.more()) {
-                    t = cursor.next().getOwned();
-                    ++inputCount;
+            const ExtensionsCallbackReal extensionsCallback(opCtx, &config.nss);
 
-                    if (values.size() == 0) {
-                        values.push_back(t);
-                        continue;
-                    }
+            const boost::intrusive_ptr<ExpressionContext> expCtx;
+            auto cq = uassertStatusOKWithContext(
+                CanonicalQuery::canonicalize(opCtx,
+                                             std::move(qr),
+                                             expCtx,
+                                             extensionsCallback,
+                                             MatchExpressionParser::kAllowAllSpecialFeatures),
+                str::stream() << "Can't canonicalize query " << config.filter);
 
-                    if (dps::compareObjectsAccordingToSort(t, *(values.begin()), sortKey) == 0) {
-                        values.push_back(t);
+            auto exec = uassertStatusOK(getExecutor(opCtx,
+                                                    scopedAutoColl->getCollection(),
+                                                    std::move(cq),
+                                                    PlanExecutor::YIELD_AUTO,
+                                                    0));
+
+            {
+                stdx::lock_guard<Client> lk(*opCtx->getClient());
+                CurOp::get(opCtx)->setPlanSummary_inlock(Explain::getPlanSummary(exec.get()));
+            }
+
+            Timer mt;
+
+            BSONObj o;
+            PlanExecutor::ExecState execState;
+            while (PlanExecutor::ADVANCED == (execState = exec->getNext(&o, nullptr))) {
+                o = o.getOwned();  // The object will be accessed outside of collection lock
+
+                // Check to see if this is a new object we don't own yet because of a chunk
+                // migration
+                if (metadata->isSharded()) {
+                    ShardKeyPattern kp(metadata->getKeyPattern());
+                    if (!metadata->keyBelongsToMe(kp.extractShardKeyFromDoc(o))) {
                         continue;
                     }
                 }
 
-                BSONObj res = config.reducer->finalReduce(values, config.finalizer.get());
-                if (state.isOnDisk())
-                    state.insert(config.tempNamespace, res);
-                else
-                    state.emit(res);
+                if (config.verbose)
+                    mt.reset();
 
-                values.clear();
+                config.mapper->map(o);
 
-                if (!t.isEmpty())
-                    values.push_back(t);
+                if (config.verbose)
+                    mapTime += mt.micros();
+
+                // Check if the state accumulated so far needs to be written to a collection.
+                // This may yield the DB lock temporarily and then acquire it again.
+                numInputs++;
+                if (numInputs % 100 == 0) {
+                    Timer t;
+
+                    // TODO: As an optimization, we might want to do the save/restore state and
+                    // yield inside the reduceAndSpillInMemoryState method, so it only happens
+                    // if necessary.
+                    exec->saveState();
+
+                    scopedAutoColl.reset();
+
+                    state.reduceAndSpillInMemoryStateIfNeeded();
+                    scopedAutoColl.emplace(opCtx, config.nss, MODE_S);
+
+                    exec->restoreState();
+
+                    reduceTime += t.micros();
+
+                    opCtx->checkForInterrupt();
+                }
+
+                pm.hit();
+
+                if (config.limit && numInputs >= config.limit)
+                    break;
             }
 
-            if (++index >= chunks.size())
-                break;
+            if (PlanExecutor::FAILURE == execState) {
+                uasserted(ErrorCodes::OperationFailed,
+                          str::stream() << "Executor error during mapReduce command: "
+                                        << WorkingSetCommon::toStatusString(o));
+            }
+
+            // Record the indexes used by the PlanExecutor.
+            PlanSummaryStats stats;
+            Explain::getSummaryStats(*exec, &stats);
+
+            // TODO SERVER-23261: Confirm whether this is the correct place to gather all
+            // metrics. There is no harm adding here for the time being.
+            curOp->debug().setPlanSummaryMetrics(stats);
+            CollectionQueryInfo::get(scopedAutoColl->getCollection()).notifyOfQuery(opCtx, stats);
+
+            if (curOp->shouldDBProfile()) {
+                BSONObjBuilder execStatsBob;
+                Explain::getWinningPlanStats(exec.get(), &execStatsBob);
+                curOp->debug().execStats = execStatsBob.obj();
+            }
+        }
+        pm.finished();
+
+        opCtx->checkForInterrupt();
+
+        // update counters
+        countsBuilder.appendNumber("input", numInputs);
+        countsBuilder.appendNumber("emit", state.numEmits());
+        if (state.numEmits())
+            shouldHaveData = true;
+
+        timingBuilder.appendNumber("mapTime", mapTime / 1000);
+        timingBuilder.append("emitLoop", t.millis());
+
+        {
+            stdx::lock_guard<Client> lk(*opCtx->getClient());
+            curOp->setMessage_inlock("M/R: (2/3) Final In-Memory Reduce");
+        }
+        Timer rt;
+        // do reduce in memory
+        // this will be the last reduce needed for inline mode
+        state.reduceInMemory();
+        // if not inline: dump the in memory map to inc collection, all data is on disk
+        state.dumpToInc();
+        // final reduce
+        state.finalReduce(opCtx, curOp);
+        reduceTime += rt.micros();
+
+        // Ensure the profile shows the source namespace. If the output was not inline, the
+        // active namespace will be the temporary collection we inserted into.
+        {
+            stdx::lock_guard<Client> lk(*opCtx->getClient());
+            curOp->setNS_inlock(config.nss.ns());
         }
 
-        // Forget temporary input collection, if output is sharded collection
-        ShardConnection::forgetNS(inputNS);
+        countsBuilder.appendNumber("reduce", state.numReduces());
+        timingBuilder.appendNumber("reduceTime", reduceTime / 1000);
+        timingBuilder.append("mode", state.jsMode() ? "js" : "mixed");
 
-        long long outputCount = state.postProcessCollection(opCtx, curOp);
+        long long finalCount = state.postProcessCollection(opCtx, curOp);
         state.appendResults(result);
 
-        BSONObjBuilder countsB(32);
-        countsB.append("input", inputCount);
-        countsB.append("reduce", state.numReduces());
-        countsB.append("output", outputCount);
-        result.append("counts", countsB.obj());
+        timingBuilder.appendNumber("total", t.millis());
+        result.appendNumber("timeMillis", t.millis());
+        countsBuilder.appendNumber("output", finalCount);
+        if (config.verbose)
+            result.append("timing", timingBuilder.obj());
+        result.append("counts", countsBuilder.obj());
 
-        return true;
+        if (finalCount == 0 && shouldHaveData) {
+            result.append("cmd", cmd);
+            errmsg = "there were emits but no data!";
+            return false;
+        }
+    } catch (StaleConfigException& e) {
+        log() << "mr detected stale config, should retry" << redact(e);
+        throw;
+    }
+    // TODO:  The error handling code for queries is v. fragile,
+    // *requires* rethrow AssertionExceptions - should probably fix.
+    catch (AssertionException& e) {
+        log() << "mr failed, removing collection" << redact(e);
+        throw;
+    } catch (std::exception& e) {
+        log() << "mr failed, removing collection" << causedBy(e);
+        throw;
+    } catch (...) {
+        log() << "mr failed for unknown reason, removing collection";
+        throw;
     }
 
-} mapReduceFinishCommand;
+    return true;
+}
+
+
+bool runMapReduceShardedFinish(OperationContext* opCtx,
+                               const string& dbname,
+                               const BSONObj& cmdObj,
+                               BSONObjBuilder& result) {
+    if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
+        uasserted(ErrorCodes::CommandNotSupported,
+                  str::stream() << "Can not execute mapReduce with output database " << dbname
+                                << " which lives on config servers");
+    }
+
+    boost::optional<DisableDocumentValidation> maybeDisableValidation;
+    if (shouldBypassDocumentValidationForCommand(cmdObj))
+        maybeDisableValidation.emplace(opCtx);
+
+    // legacy name
+    const auto shardedOutputCollectionElt = cmdObj["shardedOutputCollection"];
+    uassert(ErrorCodes::InvalidNamespace,
+            "'shardedOutputCollection' must be of type String",
+            shardedOutputCollectionElt.type() == BSONType::String);
+    const std::string shardedOutputCollection = shardedOutputCollectionElt.str();
+    verify(shardedOutputCollection.size() > 0);
+
+    std::string inputNS;
+    if (cmdObj["inputDB"].type() == String) {
+        inputNS =
+            NamespaceString(cmdObj["inputDB"].valueStringData(), shardedOutputCollection).ns();
+    } else {
+        inputNS = NamespaceString(dbname, shardedOutputCollection).ns();
+    }
+
+    CurOp* curOp = CurOp::get(opCtx);
+
+    Config config(dbname, cmdObj.firstElement().embeddedObjectUserCheck());
+
+    if (cmdObj.hasField("shardedOutputCollUUID")) {
+        config.finalOutputCollUUID = uassertStatusOK(UUID::parse(cmdObj["shardedOutputCollUUID"]));
+    }
+
+    State state(opCtx, config);
+    state.init();
+
+    // no need for incremental collection because records are already sorted
+    state._useIncremental = false;
+    config.incLong = config.tempNamespace;
+
+    BSONObj shardCounts = cmdObj["shardCounts"].embeddedObjectUserCheck();
+    BSONObj counts = cmdObj["counts"].embeddedObjectUserCheck();
+
+    {
+        stdx::unique_lock<Client> lk(*opCtx->getClient());
+        curOp->setMessage_inlock("M/R Merge Sort and Reduce");
+    }
+    set<string> servers;
+
+    {
+        // Parse per shard results
+        BSONObjIterator i(shardCounts);
+        while (i.more()) {
+            BSONElement e = i.next();
+            std::string server = e.fieldName();
+            servers.insert(server);
+
+            uassertStatusOK(Grid::get(opCtx)->shardRegistry()->getShard(opCtx, server));
+        }
+    }
+
+    state.prepTempCollection();
+
+    std::vector<Chunk> chunks;
+
+    if (config.outputOptions.outType != OutputType::InMemory) {
+        auto outRoutingInfoStatus = Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfo(
+            opCtx, config.outputOptions.finalNamespace);
+        uassertStatusOK(outRoutingInfoStatus.getStatus());
+
+        if (auto cm = outRoutingInfoStatus.getValue().cm()) {
+            // Fetch result from other shards 1 chunk at a time. It would be better to do just
+            // one big $or query, but then the sorting would not be efficient.
+            const auto shardId = ShardingState::get(opCtx)->shardId();
+
+            for (const auto& chunk : cm->chunks()) {
+                if (chunk.getShardId() == shardId) {
+                    chunks.push_back(chunk);
+                }
+            }
+        }
+    }
+
+    long long inputCount = 0;
+    unsigned int index = 0;
+    BSONObj query;
+    BSONList values;
+
+    while (true) {
+        if (chunks.size() > 0) {
+            const auto& chunk = chunks[index];
+            BSONObjBuilder b;
+            b.appendAs(chunk.getMin().firstElement(), "$gte");
+            b.appendAs(chunk.getMax().firstElement(), "$lt");
+            query = BSON("_id" << b.obj());
+        }
+
+        // reduce from each shard for a chunk
+        BSONObj sortKey = BSON("_id" << 1);
+        ParallelSortClusteredCursor cursor(
+            servers, inputNS, Query(query).sort(sortKey), QueryOption_NoCursorTimeout);
+        cursor.init(opCtx);
+
+        while (cursor.more() || !values.empty()) {
+            BSONObj t;
+            if (cursor.more()) {
+                t = cursor.next().getOwned();
+                ++inputCount;
+
+                if (values.size() == 0) {
+                    values.push_back(t);
+                    continue;
+                }
+
+                if (dps::compareObjectsAccordingToSort(t, *(values.begin()), sortKey) == 0) {
+                    values.push_back(t);
+                    continue;
+                }
+            }
+
+            BSONObj res = config.reducer->finalReduce(values, config.finalizer.get());
+            if (state.isOnDisk())
+                state.insert(config.tempNamespace, res);
+            else
+                state.emit(res);
+
+            values.clear();
+
+            if (!t.isEmpty())
+                values.push_back(t);
+        }
+
+        if (++index >= chunks.size())
+            break;
+    }
+
+    // Forget temporary input collection, if output is sharded collection
+    ShardConnection::forgetNS(inputNS);
+
+    long long outputCount = state.postProcessCollection(opCtx, curOp);
+    state.appendResults(result);
+
+    BSONObjBuilder countsB(32);
+    countsB.append("input", inputCount);
+    countsB.append("reduce", state.numReduces());
+    countsB.append("output", outputCount);
+    result.append("counts", countsB.obj());
+
+    return true;
+}
 
 }  // namespace mr
 }  // namespace mongo

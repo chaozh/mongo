@@ -37,15 +37,16 @@
 
 #include "mongo/base/status.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/stdx/condition_variable.h"
-#include "mongo/stdx/mutex.h"
 #include "mongo/util/assert_util.h"
 
 namespace mongo {
 namespace executor {
 
-AsyncMulticaster::AsyncMulticaster(executor::TaskExecutor* executor, Options options)
-    : _options(options), _executor(executor) {}
+AsyncMulticaster::AsyncMulticaster(std::shared_ptr<executor::TaskExecutor> executor,
+                                   Options options)
+    : _options(options), _executor(std::move(executor)) {}
 
 std::vector<AsyncMulticaster::Reply> AsyncMulticaster::multicast(
     const std::vector<HostAndPort> servers,
@@ -59,7 +60,7 @@ std::vector<AsyncMulticaster::Reply> AsyncMulticaster::multicast(
     struct State {
         State(size_t leftToDo) : leftToDo(leftToDo) {}
 
-        stdx::mutex mutex;
+        Mutex mutex = MONGO_MAKE_LATCH("State::mutex");
         stdx::condition_variable cv;
         size_t leftToDo;
         size_t running = 0;
@@ -70,7 +71,7 @@ std::vector<AsyncMulticaster::Reply> AsyncMulticaster::multicast(
 
     auto state = std::make_shared<State>(servers.size());
     for (const auto& server : servers) {
-        stdx::unique_lock<stdx::mutex> lk(state->mutex);
+        stdx::unique_lock<Latch> lk(state->mutex);
         // spin up no more than maxConcurrency tasks at once
         opCtx->waitForConditionOrInterrupt(
             state->cv, lk, [&] { return state->running < _options.maxConcurrency; });
@@ -79,7 +80,7 @@ std::vector<AsyncMulticaster::Reply> AsyncMulticaster::multicast(
         uassertStatusOK(_executor->scheduleRemoteCommand(
             RemoteCommandRequest{server, theDbName, theCmdObj, opCtx, timeoutMillis},
             [state](const TaskExecutor::RemoteCommandCallbackArgs& cbData) {
-                stdx::lock_guard<stdx::mutex> lk(state->mutex);
+                stdx::lock_guard<Latch> lk(state->mutex);
 
                 state->out.emplace_back(
                     std::forward_as_tuple(cbData.request.target, cbData.response));
@@ -95,7 +96,7 @@ std::vector<AsyncMulticaster::Reply> AsyncMulticaster::multicast(
             }));
     }
 
-    stdx::unique_lock<stdx::mutex> lk(state->mutex);
+    stdx::unique_lock<Latch> lk(state->mutex);
     opCtx->waitForConditionOrInterrupt(state->cv, lk, [&] { return state->leftToDo == 0; });
 
     return std::move(state->out);

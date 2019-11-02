@@ -29,7 +29,6 @@
 
 #pragma once
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/db/op_observer.h"
 
 namespace mongo {
@@ -39,7 +38,8 @@ namespace mongo {
  * server (--configsvr).
  */
 class ConfigServerOpObserver final : public OpObserver {
-    MONGO_DISALLOW_COPYING(ConfigServerOpObserver);
+    ConfigServerOpObserver(const ConfigServerOpObserver&) = delete;
+    ConfigServerOpObserver& operator=(const ConfigServerOpObserver&) = delete;
 
 public:
     ConfigServerOpObserver();
@@ -70,6 +70,7 @@ public:
                            CollectionUUID collUUID,
                            const UUID& indexBuildUUID,
                            const std::vector<BSONObj>& indexes,
+                           const Status& cause,
                            bool fromMigrate) override {}
 
     void onInserts(OperationContext* opCtx,
@@ -167,7 +168,7 @@ public:
         const std::vector<repl::ReplOperation>& statements) noexcept override {}
 
     void onTransactionPrepare(OperationContext* opCtx,
-                              const OplogSlot& prepareOpTime,
+                              const std::vector<OplogSlot>& reservedSlots,
                               std::vector<repl::ReplOperation>& statements) override {}
 
     void onTransactionAbort(OperationContext* opCtx,

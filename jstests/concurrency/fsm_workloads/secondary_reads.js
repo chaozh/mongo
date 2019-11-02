@@ -20,7 +20,6 @@
  */
 
 var $config = (function() {
-
     // Use the workload name as the collection name.
     var uniqueCollectionName = 'secondary_reads';
 
@@ -37,7 +36,7 @@ var $config = (function() {
             bulk.insert({_id: i, x: i});
         }
         let res = bulk.execute(writeConcern);
-        assertWhenOwnColl.writeOK(res);
+        assertWhenOwnColl.commandWorked(res);
         assertWhenOwnColl.eq(this.nDocumentsToInsert, res.nInserted);
         this.nDocumentsInTotal += this.nDocumentsToInsert;
     }
@@ -86,7 +85,6 @@ var $config = (function() {
     }
 
     var states = (function() {
-
         // One thread is dedicated to writing and other threads perform reads on
         // secondaries with a randomly chosen readConcern level.
         function readFromSecondaries(db, collName) {

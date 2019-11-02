@@ -47,12 +47,25 @@
 #undef _WCHAR_T
 
 #include "mongo/base/static_assert.h"
+#include "mongo/base/string_data.h"
 #include "mongo/config.h"
+#include "mongo/platform/endian.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/stringutils.h"
+#include "mongo/util/str.h"
 
 namespace {
-void validateInputString(mongo::StringData input, std::uint32_t* signalingFlags) {
+
+std::string toAsciiLowerCase(mongo::StringData input) {
+    std::string res = input.toString();
+    for (char& c : res) {
+        c = tolower(c);
+    }
+    return res;
+}
+
+// Returns the number of characters consumed from input string. If unable to parse,
+// it returns 0.
+size_t validateInputString(mongo::StringData input, std::uint32_t* signalingFlags) {
     // Input must be of these forms:
     // * Valid decimal (standard or scientific notation):
     //      /[-+]?\d*(.\d+)?([e][+\-]?\d+)?/
@@ -63,35 +76,36 @@ void validateInputString(mongo::StringData input, std::uint32_t* signalingFlags)
 
     // Check for NaN and Infinity
     size_t start = (isSigned) ? 1 : 0;
+    size_t charsConsumed = start;
     mongo::StringData noSign = input.substr(start);
     bool isNanOrInf = noSign == "nan" || noSign == "inf" || noSign == "infinity";
     if (isNanOrInf)
-        return;
+        return start + noSign.size();
 
     // Input starting with non digit
     if (!std::isdigit(noSign[0])) {
         if (noSign[0] != '.') {
             *signalingFlags = mongo::Decimal128::SignalingFlag::kInvalid;
-            return;
+            return 0;
         } else if (noSign.size() == 1) {
             *signalingFlags = mongo::Decimal128::SignalingFlag::kInvalid;
-            return;
+            return 0;
         }
     }
     bool isZero = true;
     bool hasCoefficient = false;
 
     // Check coefficient, i.e. the part before the e
-    int dotCount = 0;
+    bool parsedDot = false;
     size_t i = 0;
     for (/*i = 0*/; i < noSign.size(); i++) {
         char c = noSign[i];
         if (c == '.') {
-            dotCount++;
-            if (dotCount > 1) {
+            if (parsedDot) {
                 *signalingFlags = mongo::Decimal128::SignalingFlag::kInvalid;
-                return;
+                return 0;
             }
+            parsedDot = true;
         } else if (!std::isdigit(c)) {
             break;
         } else {
@@ -101,6 +115,7 @@ void validateInputString(mongo::StringData input, std::uint32_t* signalingFlags)
             }
         }
     }
+    charsConsumed += i;
 
     if (isZero) {
         // Override inexact/overflow flag set by the intel library
@@ -109,13 +124,13 @@ void validateInputString(mongo::StringData input, std::uint32_t* signalingFlags)
 
     // Input is valid if we've parsed the entire string
     if (i == noSign.size()) {
-        return;
+        return charsConsumed;
     }
 
     // String with empty coefficient and non-empty exponent
     if (!hasCoefficient) {
         *signalingFlags = mongo::Decimal128::SignalingFlag::kInvalid;
-        return;
+        return 0;
     }
 
     // Check exponent
@@ -123,39 +138,40 @@ void validateInputString(mongo::StringData input, std::uint32_t* signalingFlags)
 
     if (exponent[0] != 'e' || exponent.size() < 2) {
         *signalingFlags = mongo::Decimal128::SignalingFlag::kInvalid;
-        return;
+        return 0;
     }
     if (exponent[1] == '-' || exponent[1] == '+') {
         exponent = exponent.substr(2);
         if (exponent.size() == 0) {
             *signalingFlags = mongo::Decimal128::SignalingFlag::kInvalid;
-            return;
+            return 0;
         }
+        charsConsumed += 2;
     } else {
         exponent = exponent.substr(1);
+        ++charsConsumed;
     }
 
     for (size_t j = 0; j < exponent.size(); j++) {
         char c = exponent[j];
         if (!std::isdigit(c)) {
             *signalingFlags = mongo::Decimal128::SignalingFlag::kInvalid;
-            return;
+            return 0;
         }
+        ++charsConsumed;
     }
+    return charsConsumed;
 }
 }  // namespace
 
 namespace mongo {
 
 namespace {
+
 // Determine system's endian ordering in order to construct decimal 128 values directly
-#if MONGO_CONFIG_BYTE_ORDER == 1234
-const int kHigh64 = 1;
-const int kLow64 = 0;
-#else
-const int kHigh64 = 0;
-const int kLow64 = 1;
-#endif
+constexpr bool kNativeLittle = (endian::Order::kNative == endian::Order::kLittle);
+const int kLow64 = kNativeLittle ? 0 : 1;
+const int kHigh64 = kNativeLittle ? 1 : 0;
 
 // The Intel library uses long long for BID_UINT128s parts, which on some
 // systems is longer than a uint64_t.  We need to cast down, although there
@@ -176,12 +192,6 @@ BID_UINT128 decimal128ToLibraryType(Decimal128::Value value) {
     return dec128;
 }
 }  // namespace
-
-Decimal128::Decimal128(std::int32_t int32Value)
-    : _value(libraryTypeToValue(bid128_from_int32(int32Value))) {}
-
-Decimal128::Decimal128(std::int64_t int64Value)
-    : _value(libraryTypeToValue(bid128_from_int64(int64Value))) {}
 
 /**
  * Quantize a doubleValue argument to a Decimal128 with exactly 15 digits
@@ -279,8 +289,8 @@ Decimal128::Decimal128(double doubleValue,
 
     // Check if the quantization was done correctly: _value stores exactly 15
     // decimal digits of precision (15 digits can fit into the low 64 bits of the decimal)
-    uint64_t kSmallest15DigitInt = 1E14;     // A 1 with 14 zeros
-    uint64_t kLargest15DigitInt = 1E15 - 1;  // 15 nines
+    std::uint64_t kSmallest15DigitInt = 1E14;     // A 1 with 14 zeros
+    std::uint64_t kLargest15DigitInt = 1E15 - 1;  // 15 nines
     if (getCoefficientLow() > kLargest15DigitInt) {
         // If we didn't precisely get 15 digits of precision, the original base 10 exponent
         // guess was 1 off, so quantize once more with base10Exp + 1
@@ -294,25 +304,24 @@ Decimal128::Decimal128(double doubleValue,
     invariant(getCoefficientLow() <= kLargest15DigitInt);
 }
 
-Decimal128::Decimal128(std::string stringValue, RoundingMode roundMode) {
+Decimal128::Decimal128(std::string stringValue, RoundingMode roundMode, size_t* charsConsumed) {
     std::uint32_t throwAwayFlag = 0;
-    *this = Decimal128(stringValue, &throwAwayFlag, roundMode);
+    *this = Decimal128(stringValue, &throwAwayFlag, roundMode, charsConsumed);
 }
 
 Decimal128::Decimal128(std::string stringValue,
                        std::uint32_t* signalingFlags,
-                       RoundingMode roundMode) {
+                       RoundingMode roundMode,
+                       size_t* charsConsumed) {
     std::string lower = toAsciiLowerCase(stringValue);
     BID_UINT128 dec128;
     // The intel library function requires a char * while c_str() returns a const char*.
     // We're using const_cast here since the library function should not modify the input.
     dec128 = bid128_from_string(const_cast<char*>(lower.c_str()), roundMode, signalingFlags);
-    validateInputString(StringData(lower), signalingFlags);
+    size_t consumed = validateInputString(lower, signalingFlags);
+    if (charsConsumed)
+        *charsConsumed = consumed;
     _value = libraryTypeToValue(dec128);
-}
-
-Decimal128::Value Decimal128::getValue() const {
-    return _value;
 }
 
 Decimal128 Decimal128::toAbs() const {
@@ -448,12 +457,12 @@ std::int32_t Decimal128::toInt(std::uint32_t* signalingFlags, RoundingMode round
     }
 }
 
-int64_t Decimal128::toLong(RoundingMode roundMode) const {
+std::int64_t Decimal128::toLong(RoundingMode roundMode) const {
     std::uint32_t throwAwayFlag = 0;
     return toLong(&throwAwayFlag, roundMode);
 }
 
-int64_t Decimal128::toLong(std::uint32_t* signalingFlags, RoundingMode roundMode) const {
+std::int64_t Decimal128::toLong(std::uint32_t* signalingFlags, RoundingMode roundMode) const {
     BID_UINT128 dec128 = decimal128ToLibraryType(_value);
     switch (roundMode) {
         case kRoundTiesToEven:
@@ -514,6 +523,30 @@ std::int64_t Decimal128::toLongExact(std::uint32_t* signalingFlags, RoundingMode
             return bid128_to_int64_xrninta(dec128, signalingFlags);
         default:
             return bid128_to_int64_xrnint(dec128, signalingFlags);
+    }
+}
+
+std::uint64_t Decimal128::toULongExact(RoundingMode roundMode) const {
+    std::uint32_t throwAwayFlag = 0;
+    return toLongExact(&throwAwayFlag, roundMode);
+}
+
+std::uint64_t Decimal128::toULongExact(std::uint32_t* signalingFlags,
+                                       RoundingMode roundMode) const {
+    BID_UINT128 dec128 = decimal128ToLibraryType(_value);
+    switch (roundMode) {
+        case kRoundTiesToEven:
+            return bid128_to_uint64_xrnint(dec128, signalingFlags);
+        case kRoundTowardNegative:
+            return bid128_to_uint64_xfloor(dec128, signalingFlags);
+        case kRoundTowardPositive:
+            return bid128_to_uint64_xceil(dec128, signalingFlags);
+        case kRoundTowardZero:
+            return bid128_to_uint64_xint(dec128, signalingFlags);
+        case kRoundTiesToAway:
+            return bid128_to_uint64_xrninta(dec128, signalingFlags);
+        default:
+            return bid128_to_uint64_xrnint(dec128, signalingFlags);
     }
 }
 
@@ -876,10 +909,10 @@ Decimal128 Decimal128::quantize(const Decimal128& reference,
 
     auto normalizedThis = this->normalize();
     auto normalizedReferenceExponent =
-        static_cast<int32_t>(reference.normalize().getBiasedExponent());
+        static_cast<std::int32_t>(reference.normalize().getBiasedExponent());
     if (normalizedReferenceExponent != 0 &&
-        (static_cast<int32_t>(normalizedThis.getBiasedExponent()) - normalizedReferenceExponent) >
-            33) {
+        (static_cast<std::int32_t>(normalizedThis.getBiasedExponent()) -
+         normalizedReferenceExponent) > 33) {
         return normalizedThis;
     }
     return nonNormalizingQuantize(reference, signalingFlags, roundMode);
@@ -952,7 +985,7 @@ const std::uint64_t t17 = 100ull * 1000 * 1000 * 1000 * 1000 * 1000;
 // Computed by running the calculations in Python, and verified with static_assert.
 const std::uint64_t t34lo64 = 4003012203950112767ULL;
 #if defined(__GNUC__)
-static_assert(t34lo64 == t17 * t17 - 1, "precomputed constant is wrong");
+MONGO_STATIC_ASSERT(t34lo64 == t17 * t17 - 1);
 #endif
 // Mod t17 by 2^32 to get the low 32 bits of t17's binary representation
 const std::uint64_t t17lo32 = t17 % (1ull << 32);
@@ -977,7 +1010,7 @@ const Decimal128 Decimal128::kSmallestNegative(1, 0, 0, 1);
 
 // Get the representation of 0 (0E0).
 const Decimal128 Decimal128::kNormalizedZero(Decimal128::Value(
-    {0, static_cast<uint64_t>(Decimal128::kExponentBias) << Decimal128::kExponentFieldPos}));
+    {0, static_cast<std::uint64_t>(Decimal128::kExponentBias) << Decimal128::kExponentFieldPos}));
 
 // Shift the format of the combination bits to the right position to get Inf and NaN
 // +Inf = 0111 1000 ... ... = 0x78 ... ..., -Inf = 1111 1000 ... ... = 0xf8 ... ...

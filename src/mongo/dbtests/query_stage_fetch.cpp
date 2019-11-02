@@ -33,6 +33,8 @@
 
 #include "mongo/platform/basic.h"
 
+#include <memory>
+
 #include "mongo/client/dbclient_cursor.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database.h"
@@ -45,14 +47,12 @@
 #include "mongo/db/json.h"
 #include "mongo/db/matcher/expression_parser.h"
 #include "mongo/dbtests/dbtests.h"
-#include "mongo/stdx/memory.h"
 
 namespace QueryStageFetch {
 
 using std::set;
 using std::shared_ptr;
 using std::unique_ptr;
-using stdx::make_unique;
 
 class QueryStageFetchBase {
 public:
@@ -80,6 +80,9 @@ public:
     static const char* ns() {
         return "unittests.QueryStageFetch";
     }
+    static NamespaceString nss() {
+        return NamespaceString(ns());
+    }
 
 protected:
     const ServiceContext::UniqueOperationContext _opCtxPtr = cc().makeOperationContext();
@@ -96,10 +99,10 @@ public:
     void run() {
         dbtests::WriteContextForTests ctx(&_opCtx, ns());
         Database* db = ctx.db();
-        Collection* coll = db->getCollection(&_opCtx, ns());
+        Collection* coll = CollectionCatalog::get(&_opCtx).lookupCollectionByNamespace(nss());
         if (!coll) {
             WriteUnitOfWork wuow(&_opCtx);
-            coll = db->createCollection(&_opCtx, ns());
+            coll = db->createCollection(&_opCtx, nss());
             wuow.commit();
         }
 
@@ -112,14 +115,15 @@ public:
         ASSERT_EQUALS(size_t(1), recordIds.size());
 
         // Create a mock stage that returns the WSM.
-        auto mockStage = make_unique<QueuedDataStage>(&_opCtx, &ws);
+        auto mockStage = std::make_unique<QueuedDataStage>(&_opCtx, &ws);
 
         // Mock data.
         {
             WorkingSetID id = ws.allocate();
             WorkingSetMember* mockMember = ws.get(id);
             mockMember->recordId = *recordIds.begin();
-            mockMember->obj = coll->docFor(&_opCtx, mockMember->recordId);
+            auto snapshotBson = coll->docFor(&_opCtx, mockMember->recordId);
+            mockMember->doc = {snapshotBson.snapshotId(), Document{snapshotBson.value()}};
             ws.transitionToRecordIdAndObj(id);
             // Points into our DB.
             mockStage->pushBack(id);
@@ -128,14 +132,14 @@ public:
             WorkingSetID id = ws.allocate();
             WorkingSetMember* mockMember = ws.get(id);
             mockMember->recordId = RecordId();
-            mockMember->obj = Snapshotted<BSONObj>(SnapshotId(), BSON("foo" << 6));
+            mockMember->doc = {SnapshotId(), Document{BSON("foo" << 6)}};
             mockMember->transitionToOwnedObj();
-            ASSERT_TRUE(mockMember->obj.value().isOwned());
+            ASSERT_TRUE(mockMember->doc.value().isOwned());
             mockStage->pushBack(id);
         }
 
-        unique_ptr<FetchStage> fetchStage(
-            new FetchStage(&_opCtx, &ws, mockStage.release(), NULL, coll));
+        auto fetchStage =
+            std::make_unique<FetchStage>(&_opCtx, &ws, std::move(mockStage), nullptr, coll);
 
         WorkingSetID id = WorkingSet::INVALID_ID;
         PlanStage::StageState state;
@@ -158,13 +162,13 @@ public:
 class FetchStageFilter : public QueryStageFetchBase {
 public:
     void run() {
-        Lock::DBLock lk(&_opCtx, nsToDatabaseSubstring(ns()), MODE_X);
+        Lock::DBLock lk(&_opCtx, nss().db(), MODE_X);
         OldClientContext ctx(&_opCtx, ns());
         Database* db = ctx.db();
-        Collection* coll = db->getCollection(&_opCtx, ns());
+        Collection* coll = CollectionCatalog::get(&_opCtx).lookupCollectionByNamespace(nss());
         if (!coll) {
             WriteUnitOfWork wuow(&_opCtx);
-            coll = db->createCollection(&_opCtx, ns());
+            coll = db->createCollection(&_opCtx, nss());
             wuow.commit();
         }
 
@@ -177,7 +181,7 @@ public:
         ASSERT_EQUALS(size_t(1), recordIds.size());
 
         // Create a mock stage that returns the WSM.
-        auto mockStage = make_unique<QueuedDataStage>(&_opCtx, &ws);
+        auto mockStage = std::make_unique<QueuedDataStage>(&_opCtx, &ws);
 
         // Mock data.
         {
@@ -203,8 +207,8 @@ public:
         unique_ptr<MatchExpression> filterExpr = std::move(statusWithMatcher.getValue());
 
         // Matcher requires that foo==6 but we only have data with foo==5.
-        unique_ptr<FetchStage> fetchStage(
-            new FetchStage(&_opCtx, &ws, mockStage.release(), filterExpr.get(), coll));
+        auto fetchStage = std::make_unique<FetchStage>(
+            &_opCtx, &ws, std::move(mockStage), filterExpr.get(), coll);
 
         // First call should return a fetch request as it's not in memory.
         WorkingSetID id = WorkingSet::INVALID_ID;
@@ -220,9 +224,9 @@ public:
     }
 };
 
-class All : public Suite {
+class All : public OldStyleSuiteSpecification {
 public:
-    All() : Suite("query_stage_fetch") {}
+    All() : OldStyleSuiteSpecification("query_stage_fetch") {}
 
     void setupTests() {
         add<FetchStageAlreadyFetched>();
@@ -230,6 +234,6 @@ public:
     }
 };
 
-SuiteInstance<All> queryStageFetchAll;
+OldStyleSuiteInitializer<All> queryStageFetchAll;
 
 }  // namespace QueryStageFetch

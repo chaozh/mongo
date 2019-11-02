@@ -82,27 +82,11 @@ public:
         MONGO_UNREACHABLE;
     }
 
-    virtual void lockGlobal(OperationContext* opCtx, LockMode mode) {
+    virtual void lockGlobal(OperationContext* opCtx, LockMode mode, Date_t deadline) {
         MONGO_UNREACHABLE;
     }
 
-    virtual void lockGlobal(LockMode mode) {
-        MONGO_UNREACHABLE;
-    }
-
-    virtual LockResult lockGlobalBegin(OperationContext* opCtx, LockMode mode, Date_t deadline) {
-        MONGO_UNREACHABLE;
-    }
-
-    virtual LockResult lockGlobalBegin(LockMode mode, Date_t deadline) {
-        MONGO_UNREACHABLE;
-    }
-
-    virtual void lockGlobalComplete(OperationContext* opCtx, Date_t deadline) {
-        MONGO_UNREACHABLE;
-    }
-
-    virtual void lockGlobalComplete(Date_t deadline) {
+    virtual void lockGlobal(LockMode mode, Date_t deadline) {
         MONGO_UNREACHABLE;
     }
 
@@ -117,6 +101,20 @@ public:
     virtual bool inAWriteUnitOfWork() const {
         return false;
     }
+
+    virtual bool wasGlobalLockTakenForWrite() const {
+        return false;
+    }
+
+    virtual bool wasGlobalLockTakenInModeConflictingWithWrites() const {
+        return false;
+    }
+
+    virtual bool wasGlobalLockTaken() const {
+        return false;
+    }
+
+    virtual void setGlobalLockTakenInMode(LockMode mode) {}
 
     virtual LockResult lockRSTLBegin(OperationContext* opCtx, LockMode mode) {
         MONGO_UNREACHABLE;
@@ -183,12 +181,20 @@ public:
         MONGO_UNREACHABLE;
     }
 
-    bool releaseWriteUnitOfWork(LockSnapshot* stateOut) override {
+    bool releaseWriteUnitOfWorkAndUnlock(LockSnapshot* stateOut) override {
         MONGO_UNREACHABLE;
     }
 
-    void restoreWriteUnitOfWork(OperationContext* opCtx,
-                                const LockSnapshot& stateToRestore) override {
+    void restoreWriteUnitOfWorkAndLock(OperationContext* opCtx,
+                                       const LockSnapshot& stateToRestore) override {
+        MONGO_UNREACHABLE;
+    };
+
+    void releaseWriteUnitOfWork(WUOWLockSnapshot* stateOut) override {
+        MONGO_UNREACHABLE;
+    }
+
+    void restoreWriteUnitOfWork(const WUOWLockSnapshot& stateToRestore) override {
         MONGO_UNREACHABLE;
     };
 

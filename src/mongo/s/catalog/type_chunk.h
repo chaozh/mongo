@@ -59,6 +59,13 @@ public:
      */
     static StatusWith<ChunkRange> fromBSON(const BSONObj& obj);
 
+    /**
+     * A throwing version of 'fromBSON'.
+     */
+    static ChunkRange fromBSONThrowing(const BSONObj& obj) {
+        return uassertStatusOK(fromBSON(obj));
+    }
+
     const BSONObj& getMin() const {
         return _minKey;
     }
@@ -78,6 +85,8 @@ public:
      * Writes the contents of this chunk range as { min: <min bound>, max: <max bound> }.
      */
     void append(BSONObjBuilder* builder) const;
+
+    BSONObj toBSON() const;
 
     std::string toString() const;
 
@@ -174,7 +183,8 @@ public:
     static const std::string ShardNSPrefix;
 
     // Field names and types in the chunks collections.
-    static const BSONField<std::string> name;
+    static const BSONField<OID> name;
+    static const BSONField<std::string> legacyName;  // TODO SERVER-44034: Remove legacyName.
     static const BSONField<BSONObj> minShardID;
     static const BSONField<std::string> ns;
     static const BSONField<BSONObj> min;
@@ -192,8 +202,10 @@ public:
      * Constructs a new ChunkType object from BSON that has the config server's config.chunks
      * collection format.
      *
-     * Also does validation of the contents.
+     * Also does validation of the contents. Note that 'parseFromConfigBSONCommand' does not return
+     * ErrorCodes::NoSuchKey if the '_id' field is missing while 'fromConfigBSON' does.
      */
+    static StatusWith<ChunkType> parseFromConfigBSONCommand(const BSONObj& source);
     static StatusWith<ChunkType> fromConfigBSON(const BSONObj& source);
 
     /**
@@ -201,6 +213,14 @@ public:
      * collection.
      */
     BSONObj toConfigBSON() const;
+
+    /**
+     * Returns the BSON representation of the entry for the config server's config.chunks
+     * collection using the _id format expected by binaries in 4.2 and earlier.
+     *
+     * TODO SERVER-44034: Remove when 4.4 becomes last-stable.
+     */
+    BSONObj toConfigBSONLegacyID() const;
 
     /**
      * Constructs a new ChunkType object from BSON that has a shard server's config.chunks.<epoch>
@@ -211,12 +231,28 @@ public:
     static StatusWith<ChunkType> fromShardBSON(const BSONObj& source, const OID& epoch);
 
     /**
+     * Generates the chunk id that would be expected in binaries 4.2 and earlier based on the
+     * namespace and lower chunk bound.
+     *
+     * TODO SERVER-44034: Remove when 4.4 becomes last-stable.
+     */
+    static std::string genLegacyID(const NamespaceString& nss, const BSONObj& o);
+
+    /**
      * Returns the BSON representation of the entry for a shard server's config.chunks.<epoch>
      * collection.
      */
     BSONObj toShardBSON() const;
 
-    std::string getName() const;
+    /**
+     * Returns the _id that would be used for this chunk in binaries 4.2 and earlier.
+     *
+     * TODO SERVER-44034: Remove when 4.4 becomes last-stable.
+     */
+    std::string getLegacyName() const;
+
+    const OID& getName() const;
+    void setName(const OID& id);
 
     /**
      * Getters and setters.
@@ -271,11 +307,6 @@ public:
     void addHistoryToBSON(BSONObjBuilder& builder) const;
 
     /**
-     * Generates chunk id based on the namespace name and the lower bound of the chunk.
-     */
-    static std::string genID(const NamespaceString& nss, const BSONObj& min);
-
-    /**
      * Returns OK if all the mandatory fields have been set. Otherwise returns NoSuchKey and
      * information about the first field that is missing.
      */
@@ -289,6 +320,8 @@ public:
 private:
     // Convention: (M)andatory, (O)ptional, (S)pecial; (C)onfig, (S)hard.
 
+    // (M)(C)     auto-generated object id
+    boost::optional<OID> _id;
     // (O)(C)     collection this chunk is in
     boost::optional<NamespaceString> _nss;
     // (M)(C)(S)  first key of the range, inclusive

@@ -29,10 +29,14 @@
 
 #include "mongo/base/init.h"
 
+#include <memory>
+
 #include "mongo/db/storage/kv/kv_engine_test_harness.h"
 #include "mongo/db/storage/mobile/mobile_kv_engine.h"
-#include "mongo/stdx/memory.h"
+#include "mongo/db/storage/mobile/mobile_options_gen.h"
 #include "mongo/unittest/temp_dir.h"
+#include "mongo/util/options_parser/options_parser.h"
+#include "mongo/util/options_parser/startup_options.h"
 
 namespace mongo {
 namespace {
@@ -40,11 +44,26 @@ namespace {
 class MobileKVHarnessHelper : public KVHarnessHelper {
 public:
     MobileKVHarnessHelper() : _dbPath("mobile_kv_engine_harness") {
-        _engine = stdx::make_unique<MobileKVEngine>(_dbPath.path());
+        addMobileStorageOptionDefinitions(&optionenvironment::startupOptions).ignore();
+        optionenvironment::OptionsParser parser;
+        std::vector<std::string> args;
+        std::map<std::string, std::string> env;
+        parser
+            .run(optionenvironment::startupOptions,
+                 args,
+                 env,
+                 &optionenvironment::startupOptionsParsed)
+            .ignore();
+        storeMobileStorageOptionDefinitions(optionenvironment::startupOptionsParsed).ignore();
+
+        embedded::mobileGlobalOptions.disableVacuumJob = true;
+        _engine = std::make_unique<MobileKVEngine>(
+            _dbPath.path(), embedded::mobileGlobalOptions, nullptr);
     }
 
     virtual KVEngine* restartEngine() {
-        _engine.reset(new MobileKVEngine(_dbPath.path()));
+        _engine.reset(new MobileKVEngine(
+            _dbPath.path(), embedded::mobileGlobalOptions, _serviceContext.get()));
         return _engine.get();
     }
 
@@ -53,12 +72,13 @@ public:
     }
 
 private:
-    std::unique_ptr<MobileKVEngine> _engine;
     unittest::TempDir _dbPath;
+    std::unique_ptr<MobileKVEngine> _engine;
+    ServiceContext::UniqueServiceContext _serviceContext;
 };
 
 std::unique_ptr<KVHarnessHelper> makeHelper() {
-    return stdx::make_unique<MobileKVHarnessHelper>();
+    return std::make_unique<MobileKVHarnessHelper>();
 }
 
 MONGO_INITIALIZER(RegisterKVHarnessFactory)(InitializerContext*) {

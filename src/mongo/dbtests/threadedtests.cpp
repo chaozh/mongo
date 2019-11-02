@@ -32,6 +32,7 @@
 #include "mongo/platform/basic.h"
 
 #include <boost/version.hpp>
+#include <functional>
 #include <iostream>
 
 #include "mongo/config.h"
@@ -39,7 +40,6 @@
 #include "mongo/dbtests/dbtests.h"
 #include "mongo/platform/atomic_word.h"
 #include "mongo/platform/bits.h"
-#include "mongo/stdx/functional.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/util/concurrency/thread_pool.h"
 #include "mongo/util/concurrency/ticketholder.h"
@@ -48,10 +48,10 @@
 
 namespace ThreadedTests {
 
-using std::unique_ptr;
 using std::cout;
 using std::endl;
 using std::string;
+using std::unique_ptr;
 
 template <int nthreads_param = 10>
 class ThreadedTest {
@@ -130,7 +130,10 @@ public:
         tp.startup();
 
         for (unsigned i = 0; i < iterations; i++) {
-            ASSERT_OK(tp.schedule([=] { increment(2); }));
+            tp.schedule([=](auto status) {
+                ASSERT_OK(status);
+                increment(2);
+            });
         }
 
         tp.waitForIdle();
@@ -236,7 +239,7 @@ private:
         Hotel(int nRooms) : _nRooms(nRooms), _checkedIn(0), _maxRooms(0) {}
 
         void checkIn() {
-            stdx::lock_guard<stdx::mutex> lk(_frontDesk);
+            stdx::lock_guard<Latch> lk(_frontDesk);
             _checkedIn++;
             verify(_checkedIn <= _nRooms);
             if (_checkedIn > _maxRooms)
@@ -244,12 +247,12 @@ private:
         }
 
         void checkOut() {
-            stdx::lock_guard<stdx::mutex> lk(_frontDesk);
+            stdx::lock_guard<Latch> lk(_frontDesk);
             _checkedIn--;
             verify(_checkedIn >= 0);
         }
 
-        stdx::mutex _frontDesk;
+        Mutex _frontDesk = MONGO_MAKE_LATCH("Hotel::_frontDesk");
         int _nRooms;
         int _checkedIn;
         int _maxRooms;
@@ -286,9 +289,9 @@ private:
     }
 };
 
-class All : public Suite {
+class All : public OldStyleSuiteSpecification {
 public:
-    All() : Suite("threading") {}
+    All() : OldStyleSuiteSpecification("threading") {}
 
     void setupTests() {
         // Slack is a test to see how long it takes for another thread to pick up
@@ -304,5 +307,5 @@ public:
     }
 };
 
-SuiteInstance<All> myall;
+OldStyleSuiteInitializer<All> myall;
 }  // namespace ThreadedTests

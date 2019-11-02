@@ -40,6 +40,7 @@
 #include "mongo/db/curop.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/index/index_descriptor.h"
+#include "mongo/db/index_builds_coordinator.h"
 #include "mongo/db/op_observer.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/service_context.h"
@@ -104,7 +105,6 @@ Status wrappedRun(OperationContext* opCtx,
                                                                              collection->uuid(),
                                                                              desc->indexName(),
                                                                              desc->infoObj());
-
                 });
 
             anObjBuilder->append("msg", "non-_id indexes dropped for collection");
@@ -120,16 +120,14 @@ Status wrappedRun(OperationContext* opCtx,
             opCtx, indexElem.embeddedObject(), false, &indexes);
         if (indexes.empty()) {
             return Status(ErrorCodes::IndexNotFound,
-                          str::stream() << "can't find index with key: "
-                                        << indexElem.embeddedObject());
+                          str::stream()
+                              << "can't find index with key: " << indexElem.embeddedObject());
         } else if (indexes.size() > 1) {
             return Status(ErrorCodes::AmbiguousIndexKeyPattern,
-                          str::stream() << indexes.size() << " indexes found for key: "
-                                        << indexElem.embeddedObject()
+                          str::stream() << indexes.size()
+                                        << " indexes found for key: " << indexElem.embeddedObject()
                                         << ", identify by name instead."
-                                        << " Conflicting indexes: "
-                                        << indexes[0]->infoObj()
-                                        << ", "
+                                        << " Conflicting indexes: " << indexes[0]->infoObj() << ", "
                                         << indexes[1]->infoObj());
         }
 
@@ -165,23 +163,19 @@ Status wrappedRun(OperationContext* opCtx,
         for (auto indexNameElem : indexElem.Array()) {
             if (indexNameElem.type() != String) {
                 return Status(ErrorCodes::TypeMismatch,
-                              str::stream() << "dropIndexes " << collection->ns() << " ("
-                                            << collection->uuid()
-                                            << ") failed to drop multiple indexes "
-                                            << indexElem.toString(false)
-                                            << ": index name must be a string");
+                              str::stream()
+                                  << "dropIndexes " << collection->ns() << " ("
+                                  << collection->uuid() << ") failed to drop multiple indexes "
+                                  << indexElem.toString(false) << ": index name must be a string");
             }
 
             auto indexToDelete = indexNameElem.String();
             auto status = dropIndexByName(opCtx, collection, indexCatalog, indexToDelete);
             if (!status.isOK()) {
-                return status.withContext(str::stream() << "dropIndexes " << collection->ns()
-                                                        << " ("
-                                                        << collection->uuid()
-                                                        << ") failed to drop multiple indexes "
-                                                        << indexElem.toString(false)
-                                                        << ": "
-                                                        << indexToDelete);
+                return status.withContext(
+                    str::stream() << "dropIndexes " << collection->ns() << " ("
+                                  << collection->uuid() << ") failed to drop multiple indexes "
+                                  << indexElem.toString(false) << ": " << indexToDelete);
             }
         }
 
@@ -199,7 +193,7 @@ Status dropIndexes(OperationContext* opCtx,
                    const BSONObj& cmdObj,
                    BSONObjBuilder* result) {
     return writeConflictRetry(opCtx, "dropIndexes", nss.db(), [opCtx, &nss, &cmdObj, result] {
-        AutoGetDb autoDb(opCtx, nss.db(), MODE_X);
+        AutoGetCollection autoColl(opCtx, nss, MODE_X);
 
         bool userInitiatedWritesAndNotPrimary = opCtx->writesAreReplicated() &&
             !repl::ReplicationCoordinator::get(opCtx)->canAcceptWritesFor(opCtx, nss);
@@ -214,9 +208,9 @@ Status dropIndexes(OperationContext* opCtx,
         }
 
         // If db/collection does not exist, short circuit and return.
-        Database* db = autoDb.getDb();
-        Collection* collection = db ? db->getCollection(opCtx, nss) : nullptr;
-        if (!db || !collection) {
+        Database* db = autoColl.getDb();
+        Collection* collection = autoColl.getCollection();
+        if (!collection) {
             if (db && ViewCatalog::get(db)->lookup(opCtx, nss.ns())) {
                 return Status(ErrorCodes::CommandNotSupportedOnView,
                               str::stream() << "Cannot drop indexes on view " << nss);
@@ -225,16 +219,23 @@ Status dropIndexes(OperationContext* opCtx,
             return Status(ErrorCodes::NamespaceNotFound, "ns not found");
         }
 
+        BackgroundOperation::assertNoBgOpInProgForNs(nss);
+        IndexBuildsCoordinator::get(opCtx)->assertNoIndexBuildInProgForCollection(
+            collection->uuid());
+
         WriteUnitOfWork wunit(opCtx);
         OldClientContext ctx(opCtx, nss.ns());
-        BackgroundOperation::assertNoBgOpInProgForNs(nss);
 
-        Status status = wrappedRun(opCtx, collection, cmdObj, result);
+        // Use an empty BSONObjBuilder to avoid duplicate appends to result on retry loops.
+        BSONObjBuilder tempObjBuilder;
+        Status status = wrappedRun(opCtx, collection, cmdObj, &tempObjBuilder);
         if (!status.isOK()) {
             return status;
         }
 
         wunit.commit();
+
+        result->appendElementsUnique(tempObjBuilder.done());  // This append will only happen once.
         return Status::OK();
     });
 }

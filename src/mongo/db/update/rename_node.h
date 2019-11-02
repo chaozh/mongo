@@ -30,12 +30,12 @@
 #pragma once
 
 #include <map>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
 
 #include "mongo/db/update/update_leaf_node.h"
-#include "mongo/stdx/memory.h"
 
 namespace mongo {
 
@@ -52,12 +52,13 @@ public:
     Status init(BSONElement modExpr, const boost::intrusive_ptr<ExpressionContext>& expCtx) final;
 
     std::unique_ptr<UpdateNode> clone() const final {
-        return stdx::make_unique<RenameNode>(*this);
+        return std::make_unique<RenameNode>(*this);
     }
 
     void setCollator(const CollatorInterface* collator) final {}
 
-    ApplyResult apply(ApplyParams applyParams) const final;
+    ApplyResult apply(ApplyParams applyParams,
+                      UpdateNodeApplyParams updateNodeApplyParams) const final;
 
     void produceSerializationMap(
         FieldRef* currentPath,
@@ -70,6 +71,14 @@ public:
         // synthesize is the field (on the left).
         (*operatorOrientedUpdates)["$rename"].emplace_back(_val.fieldName(),
                                                            BSON("" << currentPath->dottedField()));
+    }
+
+    void acceptVisitor(UpdateNodeVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    BSONElement getValue() const {
+        return _val;
     }
 
 private:

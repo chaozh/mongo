@@ -43,11 +43,11 @@ public:
         return Status::OK();
     }
 
-    bool ok() const override {
-        return true;
+    bool haveAnyIndexes() const override {
+        return false;
     }
 
-    bool haveAnyIndexes() const override {
+    bool haveAnyIndexesInProgress() const override {
         return false;
     }
 
@@ -124,13 +124,16 @@ public:
         return {};
     }
 
-    Status checkUnfinished() const override {
-        return Status::OK();
-    }
-
     std::unique_ptr<IndexIterator> getIndexIterator(
         OperationContext* const opCtx, const bool includeUnfinishedIndexes) const override {
         return {};
+    }
+
+    IndexCatalogEntry* createIndexEntry(OperationContext* opCtx,
+                                        std::unique_ptr<IndexDescriptor> descriptor,
+                                        bool initFromDisk,
+                                        bool isReadyIndex) override {
+        return nullptr;
     }
 
     StatusWith<BSONObj> createIndexOnEmptyCollection(OperationContext* const opCtx,
@@ -145,13 +148,19 @@ public:
 
     std::vector<BSONObj> removeExistingIndexes(OperationContext* const opCtx,
                                                const std::vector<BSONObj>& indexSpecsToBuild,
-                                               bool throwOnErrors) const override {
+                                               const bool removeIndexBuildsToo) const override {
+        return indexSpecsToBuild;
+    }
+
+    std::vector<BSONObj> removeExistingIndexesNoChecks(
+        OperationContext* const opCtx,
+        const std::vector<BSONObj>& indexSpecsToBuild) const override {
         return {};
     }
 
     void dropAllIndexes(OperationContext* opCtx,
                         bool includingIdIndex,
-                        stdx::function<void(const IndexDescriptor*)> onDropFn) override {}
+                        std::function<void(const IndexDescriptor*)> onDropFn) override {}
 
     void dropAllIndexes(OperationContext* opCtx, bool includingIdIndex) override {}
 
@@ -159,11 +168,17 @@ public:
         return Status::OK();
     }
 
+    Status dropIndexEntry(OperationContext* opCtx, IndexCatalogEntry* entry) override {
+        return Status::OK();
+    }
+
+    void deleteIndexFromDisk(OperationContext* opCtx, const std::string& indexName) override {}
+
     std::vector<BSONObj> getAndClearUnfinishedIndexes(OperationContext* const opCtx) {
         return {};
     }
 
-    bool isMultikey(OperationContext* const opCtx, const IndexDescriptor* const idx) {
+    bool isMultikey(const IndexDescriptor* const idx) {
         return false;
     }
 
@@ -205,11 +220,6 @@ public:
         return "";
     }
 
-    std::unique_ptr<IndexBuildBlockInterface> createIndexBuildBlock(
-        OperationContext* opCtx, const BSONObj& spec, IndexBuildMethod method) override {
-        return {};
-    }
-
     std::string::size_type getLongestIndexNameLength(OperationContext* opCtx) const override {
         return 0U;
     }
@@ -221,8 +231,6 @@ public:
     void prepareInsertDeleteOptions(OperationContext* opCtx,
                                     const IndexDescriptor* desc,
                                     InsertDeleteOptions* options) const override {}
-
-    void setNs(NamespaceString ns) override {}
 
     void indexBuildSuccess(OperationContext* opCtx, IndexCatalogEntry* index) override {}
 };

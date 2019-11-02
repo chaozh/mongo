@@ -32,8 +32,8 @@
 #include <vector>
 
 #include "mongo/db/baton.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/stdx/condition_variable.h"
-#include "mongo/stdx/mutex.h"
 #include "mongo/util/functional.h"
 
 namespace mongo {
@@ -51,7 +51,7 @@ public:
 
     void markKillOnClientDisconnect() noexcept override;
 
-    void schedule(unique_function<void(OperationContext*)> func) noexcept override;
+    void schedule(Task func) noexcept override;
 
     void notify() noexcept override;
 
@@ -62,7 +62,7 @@ public:
 private:
     void detachImpl() noexcept override;
 
-    stdx::mutex _mutex;
+    Mutex _mutex = MONGO_MAKE_LATCH("DefaultBaton::_mutex");
     stdx::condition_variable _cv;
     bool _notified = false;
     bool _sleeping = false;
@@ -71,7 +71,7 @@ private:
 
     bool _hasIngressSocket = false;
 
-    std::vector<unique_function<void(OperationContext*)>> _scheduled;
+    std::vector<Task> _scheduled;
 };
 
 }  // namespace mongo

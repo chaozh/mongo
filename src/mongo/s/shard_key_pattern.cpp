@@ -40,7 +40,7 @@
 #include "mongo/db/matcher/extensions_callback_noop.h"
 #include "mongo/db/query/canonical_query.h"
 #include "mongo/db/update/path_support.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 #include "mongo/util/transitional_tools_do_not_use/vector_spooling.h"
 
 namespace mongo {
@@ -54,6 +54,8 @@ constexpr size_t kMaxFlattenedInCombinations = 4000000;
 
 constexpr auto kIdField = "_id"_sd;
 
+const BSONObj kNullObj = BSON("" << BSONNULL);
+
 /**
  * Currently the allowable shard keys are either:
  * i) a hashed single field, e.g. { a : "hashed" }, or
@@ -65,7 +67,7 @@ std::vector<std::unique_ptr<FieldRef>> parseShardKeyPattern(const BSONObj& keyPa
     std::vector<std::unique_ptr<FieldRef>> parsedPaths;
 
     for (const auto& patternEl : keyPattern) {
-        auto newFieldRef(stdx::make_unique<FieldRef>(patternEl.fieldNameStringData()));
+        auto newFieldRef(std::make_unique<FieldRef>(patternEl.fieldNameStringData()));
 
         // Empty path
         uassert(ErrorCodes::BadValue,
@@ -89,8 +91,7 @@ std::vector<std::unique_ptr<FieldRef>> parseShardKeyPattern(const BSONObj& keyPa
         // Numeric and ascending (1.0), or "hashed" and single field
         uassert(ErrorCodes::BadValue,
                 str::stream()
-                    << "Shard key "
-                    << keyPattern.toString()
+                    << "Shard key " << keyPattern.toString()
                     << " can contain either a single 'hashed' field"
                     << " or multiple numerical fields set to a value of 1. Failed to parse field "
                     << patternEl.fieldNameStringData(),
@@ -101,6 +102,10 @@ std::vector<std::unique_ptr<FieldRef>> parseShardKeyPattern(const BSONObj& keyPa
     }
 
     return parsedPaths;
+}
+
+bool isValidShardKeyElementForExtractionFromDocument(const BSONElement& element) {
+    return element.type() != Array;
 }
 
 bool isValidShardKeyElement(const BSONElement& element) {
@@ -154,21 +159,6 @@ BSONElement findEqualityElement(const EqualityMatches& equalities, const FieldRe
 }
 
 }  // namespace
-
-constexpr int ShardKeyPattern::kMaxShardKeySizeBytes;
-
-Status ShardKeyPattern::checkShardKeySize(const BSONObj& shardKey) {
-    if (shardKey.objsize() <= kMaxShardKeySizeBytes)
-        return Status::OK();
-
-    return {ErrorCodes::ShardKeyTooBig,
-            str::stream() << "shard keys must be less than " << kMaxShardKeySizeBytes
-                          << " bytes, but key "
-                          << shardKey
-                          << " is "
-                          << shardKey.objsize()
-                          << " bytes"};
-}
 
 Status ShardKeyPattern::checkShardKeyIsValidForMetadataStorage(const BSONObj& shardKey) {
     for (const auto& elem : shardKey) {
@@ -226,6 +216,10 @@ bool ShardKeyPattern::isShardKey(const BSONObj& shardKey) const {
     return shardKey.nFields() == keyPatternBSON.nFields();
 }
 
+bool ShardKeyPattern::isExtendedBy(const ShardKeyPattern& newShardKeyPattern) const {
+    return toBSON().isFieldNamePrefixOf(newShardKeyPattern.toBSON());
+}
+
 BSONObj ShardKeyPattern::normalizeShardKey(const BSONObj& shardKey) const {
     // We want to return an empty key if users pass us something that's not a shard key
     if (shardKey.nFields() > _keyPattern.toBSON().nFields())
@@ -257,8 +251,13 @@ BSONObj ShardKeyPattern::extractShardKeyFromMatchable(const MatchableDocument& m
         BSONElement matchEl =
             extractKeyElementFromMatchable(matchable, patternEl.fieldNameStringData());
 
-        if (!isValidShardKeyElement(matchEl))
+        if (matchEl.eoo()) {
+            matchEl = kNullObj.firstElement();
+        }
+
+        if (!isValidShardKeyElementForExtractionFromDocument(matchEl)) {
             return BSONObj();
+        }
 
         if (isHashedPatternEl(patternEl)) {
             keyBuilder.append(
@@ -280,20 +279,27 @@ BSONObj ShardKeyPattern::extractShardKeyFromDoc(const BSONObj& doc) const {
     return extractShardKeyFromMatchable(matchable);
 }
 
-std::vector<StringData> ShardKeyPattern::findMissingShardKeyFieldsFromDoc(const BSONObj doc) const {
-    std::vector<StringData> missingFields;
+BSONObj ShardKeyPattern::emplaceMissingShardKeyValuesForDocument(const BSONObj doc) const {
+    BSONObjBuilder fullDocBuilder(doc);
+
     BSONMatchableDocument matchable(doc);
     for (const auto& skField : _keyPattern.toBSON()) {
+        // Illegal to emplace a null _id.
+        if (skField.fieldNameStringData() == kIdField) {
+            continue;
+        }
         auto matchEl = extractKeyElementFromMatchable(matchable, skField.fieldNameStringData());
-        if (!isValidShardKeyElement(matchEl))
-            missingFields.emplace_back(skField.fieldNameStringData());
+        if (matchEl.eoo()) {
+            fullDocBuilder << skField.fieldNameStringData() << BSONNULL;
+        }
     }
-    return missingFields;
+
+    return fullDocBuilder.obj();
 }
 
 StatusWith<BSONObj> ShardKeyPattern::extractShardKeyFromQuery(OperationContext* opCtx,
                                                               const BSONObj& basicQuery) const {
-    auto qr = stdx::make_unique<QueryRequest>(NamespaceString(""));
+    auto qr = std::make_unique<QueryRequest>(NamespaceString(""));
     qr->setFilter(basicQuery);
 
     const boost::intrusive_ptr<ExpressionContext> expCtx;
@@ -353,8 +359,6 @@ BSONObj ShardKeyPattern::extractShardKeyFromQuery(const CanonicalQuery& query) c
 }
 
 bool ShardKeyPattern::isUniqueIndexCompatible(const BSONObj& uniqueIndexPattern) const {
-    dassert(!KeyPattern::isHashedKeyPattern(uniqueIndexPattern));
-
     if (!uniqueIndexPattern.isEmpty() && uniqueIndexPattern.firstElementFieldName() == kIdField) {
         return true;
     }

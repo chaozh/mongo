@@ -56,7 +56,7 @@ ActiveMovePrimariesRegistry& ActiveMovePrimariesRegistry::get(OperationContext* 
 
 StatusWith<ScopedMovePrimary> ActiveMovePrimariesRegistry::registerMovePrimary(
     const ShardMovePrimary& requestArgs) {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     if (_activeMovePrimaryState) {
         if (_activeMovePrimaryState->requestArgs == requestArgs) {
             return {ScopedMovePrimary(nullptr, false, _activeMovePrimaryState->notification)};
@@ -71,16 +71,16 @@ StatusWith<ScopedMovePrimary> ActiveMovePrimariesRegistry::registerMovePrimary(
 }
 
 boost::optional<NamespaceString> ActiveMovePrimariesRegistry::getActiveMovePrimaryNss() {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     if (_activeMovePrimaryState) {
-        return _activeMovePrimaryState->requestArgs.get_movePrimary();
+        return _activeMovePrimaryState->requestArgs.get_shardsvrMovePrimary();
     }
 
     return boost::none;
 }
 
 void ActiveMovePrimariesRegistry::_clearMovePrimary() {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     invariant(_activeMovePrimaryState);
     _activeMovePrimaryState.reset();
 }
@@ -90,9 +90,7 @@ Status ActiveMovePrimariesRegistry::ActiveMovePrimaryState::constructErrorStatus
             str::stream()
                 << "Unable to start new movePrimary operation because this shard is currently "
                    "moving its primary for namespace "
-                << requestArgs.get_movePrimary().ns()
-                << " to "
-                << requestArgs.getTo()};
+                << requestArgs.get_shardsvrMovePrimary()->ns() << " to " << requestArgs.getTo()};
 }
 
 ScopedMovePrimary::ScopedMovePrimary(ActiveMovePrimariesRegistry* registry,

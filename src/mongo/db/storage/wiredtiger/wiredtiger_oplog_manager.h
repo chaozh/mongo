@@ -29,10 +29,9 @@
 
 #pragma once
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_record_store.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/stdx/condition_variable.h"
-#include "mongo/stdx/mutex.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/util/concurrency/with_lock.h"
 
@@ -42,10 +41,11 @@ class WiredTigerRecordStore;
 class WiredTigerSessionCache;
 
 
-// Manages oplog visibility, by periodically querying WiredTiger's all_committed timestamp value and
+// Manages oplog visibility, by periodically querying WiredTiger's all_durable timestamp value and
 // then using that timestamp for all transactions that read the oplog collection.
 class WiredTigerOplogManager {
-    MONGO_DISALLOW_COPYING(WiredTigerOplogManager);
+    WiredTigerOplogManager(const WiredTigerOplogManager&) = delete;
+    WiredTigerOplogManager& operator=(const WiredTigerOplogManager&) = delete;
 
 public:
     WiredTigerOplogManager() {}
@@ -60,7 +60,7 @@ public:
     void halt();
 
     bool isRunning() {
-        stdx::lock_guard<stdx::mutex> lk(_oplogVisibilityStateMutex);
+        stdx::lock_guard<Latch> lk(_oplogVisibilityStateMutex);
         return _isRunning && !_shuttingDown;
     }
 
@@ -78,9 +78,9 @@ public:
     void waitForAllEarlierOplogWritesToBeVisible(const WiredTigerRecordStore* oplogRecordStore,
                                                  OperationContext* opCtx);
 
-    // Returns the all committed timestamp. All transactions with timestamps earlier than the
-    // all committed timestamp are committed.
-    uint64_t fetchAllCommittedValue(WT_CONNECTION* conn);
+    // Returns the all_durable timestamp. All transactions with timestamps earlier than the
+    // all_durable timestamp are committed.
+    uint64_t fetchAllDurableValue(WT_CONNECTION* conn);
 
 private:
     void _oplogJournalThreadLoop(WiredTigerSessionCache* sessionCache,
@@ -89,7 +89,8 @@ private:
     void _setOplogReadTimestamp(WithLock, uint64_t newTimestamp);
 
     stdx::thread _oplogJournalThread;
-    mutable stdx::mutex _oplogVisibilityStateMutex;
+    mutable Mutex _oplogVisibilityStateMutex =
+        MONGO_MAKE_LATCH("WiredTigerOplogManager::_oplogVisibilityStateMutex");
     mutable stdx::condition_variable
         _opsWaitingForJournalCV;  // Signaled to trigger a journal flush.
     mutable stdx::condition_variable

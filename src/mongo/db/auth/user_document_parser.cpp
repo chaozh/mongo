@@ -42,8 +42,7 @@
 #include "mongo/db/jsobj.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
-#include "mongo/util/stringutils.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -153,8 +152,8 @@ Status V2UserDocumentParser::checkValidUserDocument(const BSONObj& doc) const {
     StringData userDBStr = userDBElement.valueStringData();
     if (!NamespaceString::validDBName(userDBStr, NamespaceString::DollarInDbNameBehavior::Allow) &&
         userDBStr != "$external") {
-        return _badValue(mongoutils::str::stream() << "'" << userDBStr
-                                                   << "' is not a valid value for the db field.");
+        return _badValue(str::stream()
+                         << "'" << userDBStr << "' is not a valid value for the db field.");
     }
 
     // Validate the "credentials" element
@@ -185,8 +184,8 @@ Status V2UserDocumentParser::checkValidUserDocument(const BSONObj& doc) const {
                               str::stream() << fieldName << " does not exist");
             }
             if (scramElement.type() != Object) {
-                return _badValue(str::stream() << fieldName
-                                               << " credential must be an object, if present");
+                return _badValue(str::stream()
+                                 << fieldName << " credential must be an object, if present");
             }
             return Status::OK();
         };
@@ -478,7 +477,7 @@ Status V2UserDocumentParser::initializeUserPrivilegesFromUserDocument(const BSON
         }
         if (unrecognizedActions.size()) {
             std::string unrecognizedActionsString;
-            joinStringDelim(unrecognizedActions, &unrecognizedActionsString, ',');
+            str::joinStringDelim(unrecognizedActions, &unrecognizedActionsString, ',');
             warning() << "Encountered unrecognized actions \" " << unrecognizedActionsString
                       << "\" while parsing user document for " << user->getName();
         }

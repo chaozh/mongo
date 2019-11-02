@@ -33,6 +33,7 @@
 
 #include <boost/optional/optional.hpp>
 #include <fstream>
+#include <memory>
 #include <stdlib.h>
 
 #include "mongo/base/checked_cast.h"
@@ -43,7 +44,6 @@
 #include "mongo/crypto/sha1_block.h"
 #include "mongo/crypto/sha256_block.h"
 #include "mongo/platform/random.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/util/base64.h"
 #include "mongo/util/concurrency/mutex.h"
 #include "mongo/util/log.h"
@@ -53,6 +53,7 @@
 #include "mongo/util/net/ssl/apple.hpp"
 #include "mongo/util/net/ssl_manager.h"
 #include "mongo/util/net/ssl_options.h"
+#include "mongo/util/net/ssl_parameters_gen.h"
 
 using asio::ssl::apple::CFUniquePtr;
 
@@ -725,8 +726,7 @@ StatusWith<CFUniquePtr<::CFArrayRef>> loadPEM(const std::string& keyfilepath,
         return Status(ErrorCodes::InvalidSSLConfiguration,
                       str::stream() << "Unable to load PEM from '" << keyfilepath << "'"
                                     << (passphrase.empty() ? "" : " with passphrase")
-                                    << (msg.empty() ? "" : ": ")
-                                    << msg);
+                                    << (msg.empty() ? "" : ": ") << msg);
     };
 
     std::ifstream pemFile(keyfilepath, std::ios::binary);
@@ -746,7 +746,9 @@ StatusWith<CFUniquePtr<::CFArrayRef>> loadPEM(const std::string& keyfilepath,
             nullptr, reinterpret_cast<const uint8_t*>(passphrase.c_str()), passphrase.size()));
     }
     ::SecItemImportExportKeyParameters params = {
-        SEC_KEY_IMPORT_EXPORT_PARAMS_VERSION, 0, cfpass.get(),
+        SEC_KEY_IMPORT_EXPORT_PARAMS_VERSION,
+        0,
+        cfpass.get(),
     };
 
     CFUniquePtr<CFStringRef> cfkeyfile(
@@ -771,8 +773,8 @@ StatusWith<CFUniquePtr<::CFArrayRef>> loadPEM(const std::string& keyfilepath,
                       "key. Consider using a certificate selector or PKCS#12 instead");
     }
     if (status != ::errSecSuccess) {
-        return retFail(str::stream() << "Failing importing certificate(s): "
-                                     << stringFromOSStatus(status));
+        return retFail(str::stream()
+                       << "Failing importing certificate(s): " << stringFromOSStatus(status));
     }
 
     if (mode == kLoadPEMBindIdentities) {
@@ -1111,22 +1113,6 @@ public:
         uassertOSStatusOK(status, ErrorCodes::SSLHandshakeFailed);
     }
 
-    std::string getSNIServerName() const final {
-        size_t len = 0;
-        auto status = ::SSLCopyRequestedPeerNameLength(_ssl.get(), &len);
-        if (status != ::errSecSuccess) {
-            return "";
-        }
-        std::string ret;
-        ret.resize(len + 1);
-        status = ::SSLCopyRequestedPeerName(_ssl.get(), &ret[0], &len);
-        if (status != ::errSecSuccess) {
-            return "";
-        }
-        ret.resize(len);
-        return ret;
-    }
-
     ::SSLContextRef get() const {
         return const_cast<::SSLContextRef>(_ssl.get());
     }
@@ -1210,8 +1196,9 @@ public:
                                                           const std::string& remoteHost,
                                                           const HostAndPort& hostForLogging) final;
 
-    StatusWith<boost::optional<SSLPeerInfo>> parseAndValidatePeerCertificate(
+    StatusWith<SSLPeerInfo> parseAndValidatePeerCertificate(
         ::SSLContextRef conn,
+        boost::optional<std::string> sniName,
         const std::string& remoteHost,
         const HostAndPort& hostForLogging) final;
 
@@ -1406,12 +1393,13 @@ SSLPeerInfo SSLManagerApple::parseAndValidatePeerCertificateDeprecated(
     const HostAndPort& hostForLogging) {
     auto ssl = checked_cast<const SSLConnectionApple*>(conn)->get();
 
-    auto swPeerSubjectName = parseAndValidatePeerCertificate(ssl, remoteHost, hostForLogging);
+    auto swPeerSubjectName =
+        parseAndValidatePeerCertificate(ssl, boost::none, remoteHost, hostForLogging);
     // We can't use uassertStatusOK here because we need to throw a NetworkException.
     if (!swPeerSubjectName.isOK()) {
         throwSocketError(SocketErrorKind::CONNECT_ERROR, swPeerSubjectName.getStatus().reason());
     }
-    return swPeerSubjectName.getValue().get_value_or(SSLPeerInfo());
+    return swPeerSubjectName.getValue();
 }
 
 StatusWith<TLSVersion> mapTLSVersion(SSLContextRef ssl) {
@@ -1432,9 +1420,11 @@ StatusWith<TLSVersion> mapTLSVersion(SSLContextRef ssl) {
 }
 
 
-StatusWith<boost::optional<SSLPeerInfo>> SSLManagerApple::parseAndValidatePeerCertificate(
-    ::SSLContextRef ssl, const std::string& remoteHost, const HostAndPort& hostForLogging) {
-
+StatusWith<SSLPeerInfo> SSLManagerApple::parseAndValidatePeerCertificate(
+    ::SSLContextRef ssl,
+    boost::optional<std::string> sniName,
+    const std::string& remoteHost,
+    const HostAndPort& hostForLogging) {
     // Record TLS version stats
     auto tlsVersionStatus = mapTLSVersion(ssl);
     if (!tlsVersionStatus.isOK()) {
@@ -1451,15 +1441,14 @@ StatusWith<boost::optional<SSLPeerInfo>> SSLManagerApple::parseAndValidatePeerCe
      * so that the validation path runs anyway.
      */
     if (!_sslConfiguration.hasCA && isSSLServer) {
-        return {boost::none};
+        return SSLPeerInfo(sniName);
     }
 
-    const auto badCert = [](StringData msg,
-                            bool warn = false) -> StatusWith<boost::optional<SSLPeerInfo>> {
+    const auto badCert = [&](StringData msg, bool warn = false) -> StatusWith<SSLPeerInfo> {
         constexpr StringData prefix = "SSL peer certificate validation failed: "_sd;
         if (warn) {
             warning() << prefix << msg;
-            return {boost::none};
+            return SSLPeerInfo(sniName);
         } else {
             std::string m = str::stream() << prefix << msg << "; connection rejected";
             error() << m;
@@ -1472,7 +1461,7 @@ StatusWith<boost::optional<SSLPeerInfo>> SSLManagerApple::parseAndValidatePeerCe
     CFUniquePtr<::SecTrustRef> cftrust(trust);
     if ((status != ::errSecSuccess) || (!cftrust)) {
         if (_weakValidation && _suppressNoCertificateWarning) {
-            return {boost::none};
+            return SSLPeerInfo(sniName);
         } else {
             if (status == ::errSecSuccess) {
                 return badCert(str::stream() << "no SSL certificate provided by peer: "
@@ -1529,9 +1518,10 @@ StatusWith<boost::optional<SSLPeerInfo>> SSLManagerApple::parseAndValidatePeerCe
     }
 
     CFUniquePtr<::CFMutableArrayRef> oids(
-        ::CFArrayCreateMutable(nullptr, remoteHost.empty() ? 3 : 2, &::kCFTypeArrayCallBacks));
+        ::CFArrayCreateMutable(nullptr, remoteHost.empty() ? 4 : 3, &::kCFTypeArrayCallBacks));
     ::CFArrayAppendValue(oids.get(), ::kSecOIDX509V1SubjectName);
     ::CFArrayAppendValue(oids.get(), ::kSecOIDSubjectAltName);
+    ::CFArrayAppendValue(oids.get(), ::kSecOIDX509V1ValidityNotAfter);
     if (remoteHost.empty()) {
         ::CFArrayAppendValue(oids.get(), kMongoDBRolesOID);
     }
@@ -1551,20 +1541,37 @@ StatusWith<boost::optional<SSLPeerInfo>> SSLManagerApple::parseAndValidatePeerCe
     const auto peerSubjectName = std::move(swPeerSubjectName.getValue());
     LOG(2) << "Accepted TLS connection from peer: " << peerSubjectName;
 
-    // If this is a server and client and server certificate are the same, log a warning.
-    if (_sslConfiguration.serverSubjectName() == peerSubjectName) {
-        warning() << "Client connecting with server's own TLS certificate";
-    }
-
+    // Server side.
     if (remoteHost.empty()) {
+        const auto exprThreshold = tlsX509ExpirationWarningThresholdDays;
+        if (exprThreshold > 0) {
+            auto swExpiration =
+                extractValidityDate(cfdict.get(), ::kSecOIDX509V1ValidityNotAfter, "valid-until");
+            if (!swExpiration.isOK()) {
+                return badCert("Unable to parse expiration date from certificate",
+                               _allowInvalidCertificates);
+            }
+            const auto expiration = swExpiration.getValue();
+            const auto now = Date_t::now();
+
+            if ((now + Days(exprThreshold)) > expiration) {
+                tlsEmitWarningExpiringClientCertificate(peerSubjectName,
+                                                        duration_cast<Days>(expiration - now));
+            }
+        }
+
+        // If client and server certificate are the same, log a warning.
+        if (_sslConfiguration.serverSubjectName() == peerSubjectName) {
+            warning() << "Client connecting with server's own TLS certificate";
+        }
+
         // If this is an SSL server context (on a mongod/mongos)
         // parse any client roles out of the client certificate.
         auto swPeerCertificateRoles = parsePeerRoles(cfdict.get());
         if (!swPeerCertificateRoles.isOK()) {
             return swPeerCertificateRoles.getStatus();
         }
-        return boost::make_optional(
-            SSLPeerInfo(peerSubjectName, std::move(swPeerCertificateRoles.getValue())));
+        return SSLPeerInfo(peerSubjectName, sniName, std::move(swPeerCertificateRoles.getValue()));
     }
 
     // If this is an SSL client context (on a MongoDB server or client)
@@ -1598,8 +1605,9 @@ StatusWith<boost::optional<SSLPeerInfo>> SSLManagerApple::parseAndValidatePeerCe
             }
             certErr << san << " ";
         }
+    }
 
-    } else {
+    if (!sanMatch) {
         auto swCN = peerSubjectName.getOID(kOID_CommonName);
         if (swCN.isOK()) {
             auto commonName = std::move(swCN.getValue());
@@ -1611,8 +1619,13 @@ StatusWith<boost::optional<SSLPeerInfo>> SSLManagerApple::parseAndValidatePeerCe
             } else if (hostNameMatchForX509Certificates(remoteHost, commonName)) {
                 cnMatch = true;
             }
-            certErr << "CN: " << commonName;
-        } else {
+
+            if (cnMatch && !sans.empty()) {
+                // SANs override CN for matching purposes.
+                cnMatch = false;
+                certErr << "CN: " << commonName << " would have matched, but was overridden by SAN";
+            }
+        } else if (sans.empty()) {
             certErr << "No Common Name (CN) or Subject Alternate Names (SAN) found";
         }
     }
@@ -1627,7 +1640,7 @@ StatusWith<boost::optional<SSLPeerInfo>> SSLManagerApple::parseAndValidatePeerCe
         }
     }
 
-    return boost::make_optional(SSLPeerInfo(peerSubjectName, stdx::unordered_set<RoleName>()));
+    return SSLPeerInfo(peerSubjectName);
 }
 
 int SSLManagerApple::SSL_read(SSLConnectionInterface* conn, void* buf, int num) {
@@ -1667,7 +1680,7 @@ extern SSLManagerInterface* theSSLManager;
 
 std::unique_ptr<SSLManagerInterface> SSLManagerInterface::create(const SSLParams& params,
                                                                  bool isServer) {
-    return stdx::make_unique<SSLManagerApple>(params, isServer);
+    return std::make_unique<SSLManagerApple>(params, isServer);
 }
 
 MONGO_INITIALIZER_WITH_PREREQUISITES(SSLManager, ("EndStartupOptionHandling"))

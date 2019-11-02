@@ -30,13 +30,12 @@
 #pragma once
 
 #include <deque>
+#include <functional>
 #include <string>
 #include <vector>
 
-#include "mongo/base/disallow_copying.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/stdx/condition_variable.h"
-#include "mongo/stdx/functional.h"
-#include "mongo/stdx/mutex.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/util/concurrency/thread_pool_interface.h"
 #include "mongo/util/time_support.h"
@@ -51,7 +50,8 @@ class Status;
  * See the Options struct for information about how to configure an instance.
  */
 class ThreadPool final : public ThreadPoolInterface {
-    MONGO_DISALLOW_COPYING(ThreadPool);
+    ThreadPool(const ThreadPool&) = delete;
+    ThreadPool& operator=(const ThreadPool&) = delete;
 
 public:
     /**
@@ -89,7 +89,7 @@ public:
         Milliseconds maxIdleThreadAge = Seconds{30};
 
         // This function is run before each worker thread begins consuming tasks.
-        using OnCreateThreadFn = stdx::function<void(const std::string& threadName)>;
+        using OnCreateThreadFn = std::function<void(const std::string& threadName)>;
         OnCreateThreadFn onCreateThread = [](const std::string&) {};
     };
 
@@ -123,7 +123,7 @@ public:
     void startup() override;
     void shutdown() override;
     void join() override;
-    Status schedule(Task task) override;
+    void schedule(Task task) override;
 
     /**
      * Blocks the caller until there are no pending tasks on this pool.
@@ -189,7 +189,7 @@ private:
     /**
      * Implementation of join once _mutex is owned by "lk".
      */
-    void _join_inlock(stdx::unique_lock<stdx::mutex>* lk);
+    void _join_inlock(stdx::unique_lock<Latch>* lk);
 
     /**
      * Runs the remaining tasks on a new thread as part of the join process, blocking until
@@ -201,7 +201,7 @@ private:
      * Executes one task from _pendingTasks. "lk" must own _mutex, and _pendingTasks must have at
      * least one entry.
      */
-    void _doOneTask(stdx::unique_lock<stdx::mutex>* lk);
+    void _doOneTask(stdx::unique_lock<Latch>* lk) noexcept;
 
     /**
      * Changes the lifecycle state (_state) of the pool and wakes up any threads waiting for a state
@@ -213,7 +213,7 @@ private:
     const Options _options;
 
     // Mutex guarding all non-const member variables.
-    mutable stdx::mutex _mutex;
+    mutable Mutex _mutex = MONGO_MAKE_LATCH("ThreadPool::_mutex");
 
     // This variable represents the lifecycle state of the pool.
     //

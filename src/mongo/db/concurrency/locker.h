@@ -32,6 +32,7 @@
 #include <climits>  // For UINT_MAX
 #include <vector>
 
+#include "mongo/db/concurrency/flow_control_ticketholder.h"
 #include "mongo/db/concurrency/lock_manager.h"
 #include "mongo/db/concurrency/lock_stats.h"
 #include "mongo/db/operation_context.h"
@@ -46,7 +47,8 @@ namespace mongo {
  * Lock/unlock methods must always be called from a single thread.
  */
 class Locker {
-    MONGO_DISALLOW_COPYING(Locker);
+    Locker(const Locker&) = delete;
+    Locker& operator=(const Locker&) = delete;
 
     friend class UninterruptibleLockGuard;
 
@@ -151,36 +153,16 @@ public:
      * @param opCtx OperationContext used to interrupt the lock waiting, if provided.
      * @param mode Mode in which the global lock should be acquired. Also indicates the intent
      *              of the operation.
+     * @param deadline indicates the absolute time point when this lock acquisition will time out,
+     * if not yet granted. Deadline will be also used for TicketHolder, if there is one.
      *
-     * It may throw an exception if it is interrupted.
+     * It may throw an exception if it is interrupted. The ticket acquisition phase can also be
+     * interrupted by killOp or time out, thus throwing an exception.
      */
-    virtual void lockGlobal(OperationContext* opCtx, LockMode mode) = 0;
-    virtual void lockGlobal(LockMode mode) = 0;
-
-    /**
-     * Requests the global lock to be acquired in the specified mode.
-     *
-     * See the comments for lockBegin/Complete for more information on the semantics. The deadline
-     * indicates the absolute time point when this lock acquisition will time out, if not yet
-     * granted. The lockGlobalBegin method has a deadline for use with the TicketHolder, if there is
-     * one.
-     *
-     * Returns LOCK_OK if the global lock is successfully acquired,
-     *      or LOCK_WAITING if the global lock is currently held by someone else.
-     *
-     * The ticket acquisition phase can be interrupted or time out, thus throwing an exception.
-     */
-    virtual LockResult lockGlobalBegin(OperationContext* opCtx, LockMode mode, Date_t deadline) = 0;
-    virtual LockResult lockGlobalBegin(LockMode mode, Date_t deadline) = 0;
-
-    /**
-     * Calling lockGlobalComplete without an OperationContext does not allow the lock acquisition
-     * to be interrupted.
-     *
-     * It may throw an exception if it is interrupted.
-     */
-    virtual void lockGlobalComplete(OperationContext* opCtx, Date_t deadline) = 0;
-    virtual void lockGlobalComplete(Date_t deadline) = 0;
+    virtual void lockGlobal(OperationContext* opCtx,
+                            LockMode mode,
+                            Date_t deadline = Date_t::max()) = 0;
+    virtual void lockGlobal(LockMode mode, Date_t deadline = Date_t::max()) = 0;
 
     /**
      * Decrements the reference count on the global lock.  If the reference count on the
@@ -199,7 +181,7 @@ public:
      * Requests the RSTL to be acquired in the requested mode (typically mode X) . This should only
      * be called inside ReplicationStateTransitionLockGuard.
      *
-     * See the comments for lockBegin/Complete for more information on the semantics.
+     * See the comments for _lockBegin/Complete for more information on the semantics.
      */
     virtual LockResult lockRSTLBegin(OperationContext* opCtx, LockMode mode) = 0;
 
@@ -232,6 +214,29 @@ public:
     virtual void endWriteUnitOfWork() = 0;
 
     virtual bool inAWriteUnitOfWork() const = 0;
+
+    /**
+     * Returns whether we have ever taken a global lock in X or IX mode in this operation.
+     * Should only be called on the thread owning the locker.
+     */
+    virtual bool wasGlobalLockTakenForWrite() const = 0;
+
+    /**
+     * Returns whether we have ever taken a global lock in S, X, or IX mode in this operation.
+     */
+    virtual bool wasGlobalLockTakenInModeConflictingWithWrites() const = 0;
+
+    /**
+     * Returns whether we have ever taken a global lock in this operation.
+     * Should only be called on the thread owning the locker.
+     */
+    virtual bool wasGlobalLockTaken() const = 0;
+
+    /**
+     * Sets the mode bit in _globalLockMode. Once a mode bit is set, we won't clear it. Also sets
+     * _wasGlobalLockTakenInModeConflictingWithWrites to true if the mode is S, X, or IX.
+     */
+    virtual void setGlobalLockTakenInMode(LockMode mode) = 0;
 
     /**
      * Acquires lock on the specified resource in the specified mode and returns the outcome
@@ -360,9 +365,21 @@ public:
         // The global lock is handled differently from all other locks.
         LockMode globalMode;
 
-        // The non-global non-flush locks held, sorted by granularity.  That is, locks[i] is
+        // The non-global locks held, sorted by granularity.  That is, locks[i] is
         // coarser or as coarse as locks[i + 1].
         std::vector<OneLock> locks;
+    };
+
+    /**
+     * WUOWLockSnapshot captures all resources that have pending unlocks when releasing the write
+     * unit of work. If a lock has more than one pending unlock, it appears more than once here.
+     */
+    struct WUOWLockSnapshot {
+        // Nested WUOW can be released and restored all together.
+        int wuowNestingLevel = 0;
+
+        // The order of locks doesn't matter in this vector.
+        std::vector<OneLock> unlockPendingLocks;
     };
 
     /**
@@ -392,13 +409,22 @@ public:
     virtual void restoreLockState(const LockSnapshot& stateToRestore) = 0;
 
     /**
-     * releaseWriteUnitOfWork opts out two-phase locking and yield the locks after a WUOW
-     * has been released. restoreWriteUnitOfWork reaquires the locks and resume the two-phase
-     * locking behavior of WUOW.
+     * releaseWriteUnitOfWorkAndUnlock opts out of two-phase locking and yields the locks after a
+     * WUOW has been released. restoreWriteUnitOfWorkAndLock reacquires the locks and resumes the
+     * two-phase locking behavior of WUOW.
      */
-    virtual bool releaseWriteUnitOfWork(LockSnapshot* stateOut) = 0;
-    virtual void restoreWriteUnitOfWork(OperationContext* opCtx,
-                                        const LockSnapshot& stateToRestore) = 0;
+    virtual bool releaseWriteUnitOfWorkAndUnlock(LockSnapshot* stateOut) = 0;
+    virtual void restoreWriteUnitOfWorkAndLock(OperationContext* opCtx,
+                                               const LockSnapshot& stateToRestore) = 0;
+
+
+    /**
+     * releaseWriteUnitOfWork opts out of two-phase locking of the current locks held but keeps
+     * holding these locks.
+     * restoreWriteUnitOfWork resumes the two-phase locking behavior of WUOW.
+     */
+    virtual void releaseWriteUnitOfWork(WUOWLockSnapshot* stateOut) = 0;
+    virtual void restoreWriteUnitOfWork(const WUOWLockSnapshot& stateToRestore) = 0;
 
     /**
      * Releases the ticket associated with the Locker. This allows locks to be held without
@@ -453,16 +479,33 @@ public:
     }
 
     /**
-     * If set to false, this opts out of the ticket mechanism. This should be used sparingly
-     * for special purpose threads, such as FTDC.
+     * This will opt out of the ticket mechanism. This should be used sparingly for special purpose
+     * threads, such as FTDC and committing or aborting prepared transactions.
      */
-    void setShouldAcquireTicket(bool newValue) {
-        invariant(!isLocked() || isNoop());
-        _shouldAcquireTicket = newValue;
+    void skipAcquireTicket() {
+        // Should not hold or wait for the ticket.
+        invariant(isNoop() || getClientState() == Locker::ClientState::kInactive);
+        _shouldAcquireTicket = false;
     }
+
     bool shouldAcquireTicket() const {
         return _shouldAcquireTicket;
     }
+
+    /**
+     * Acquire a flow control admission ticket into the system. Flow control is used as a
+     * backpressure mechanism to limit replication majority point lag.
+     */
+    virtual void getFlowControlTicket(OperationContext* opCtx, LockMode lockMode) {}
+
+    /**
+     * If tracked by an implementation, returns statistics on effort spent acquiring a flow control
+     * ticket.
+     */
+    virtual FlowControlTicketholder::CurOp getFlowControlStats() const {
+        return FlowControlTicketholder::CurOp();
+    }
+
     /**
      * This function is for unit testing only.
      */
@@ -534,10 +577,13 @@ private:
 };
 
 /**
- * RAII-style class to opt out of replication's use of ParallelBatchWriterMode.
+ * RAII-style class to opt out of replication's use of the ParallelBatchWriterMode lock.
  */
 class ShouldNotConflictWithSecondaryBatchApplicationBlock {
-    MONGO_DISALLOW_COPYING(ShouldNotConflictWithSecondaryBatchApplicationBlock);
+    ShouldNotConflictWithSecondaryBatchApplicationBlock(
+        const ShouldNotConflictWithSecondaryBatchApplicationBlock&) = delete;
+    ShouldNotConflictWithSecondaryBatchApplicationBlock& operator=(
+        const ShouldNotConflictWithSecondaryBatchApplicationBlock&) = delete;
 
 public:
     explicit ShouldNotConflictWithSecondaryBatchApplicationBlock(Locker* lockState)

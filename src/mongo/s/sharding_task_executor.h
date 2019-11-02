@@ -29,14 +29,13 @@
 
 #pragma once
 
+#include <list>
 #include <memory>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/base/status_with.h"
 #include "mongo/executor/task_executor.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/stdx/condition_variable.h"
-#include "mongo/stdx/list.h"
-#include "mongo/stdx/mutex.h"
 
 namespace mongo {
 namespace executor {
@@ -49,7 +48,8 @@ class ThreadPoolTaskExecutor;
  * override methods if needed.
  */
 class ShardingTaskExecutor final : public TaskExecutor {
-    MONGO_DISALLOW_COPYING(ShardingTaskExecutor);
+    ShardingTaskExecutor(const ShardingTaskExecutor&) = delete;
+    ShardingTaskExecutor& operator=(const ShardingTaskExecutor&) = delete;
 
 public:
     ShardingTaskExecutor(std::unique_ptr<ThreadPoolTaskExecutor> executor);
@@ -61,16 +61,17 @@ public:
     Date_t now() override;
     StatusWith<EventHandle> makeEvent() override;
     void signalEvent(const EventHandle& event) override;
-    StatusWith<CallbackHandle> onEvent(const EventHandle& event, CallbackFn work) override;
+    StatusWith<CallbackHandle> onEvent(const EventHandle& event, CallbackFn&& work) override;
     void waitForEvent(const EventHandle& event) override;
     StatusWith<stdx::cv_status> waitForEvent(OperationContext* opCtx,
                                              const EventHandle& event,
                                              Date_t deadline) override;
-    StatusWith<CallbackHandle> scheduleWork(CallbackFn work) override;
-    StatusWith<CallbackHandle> scheduleWorkAt(Date_t when, CallbackFn work) override;
-    StatusWith<CallbackHandle> scheduleRemoteCommand(const RemoteCommandRequest& request,
-                                                     const RemoteCommandCallbackFn& cb,
-                                                     const BatonHandle& baton = nullptr) override;
+    StatusWith<CallbackHandle> scheduleWork(CallbackFn&& work) override;
+    StatusWith<CallbackHandle> scheduleWorkAt(Date_t when, CallbackFn&& work) override;
+    StatusWith<CallbackHandle> scheduleRemoteCommandOnAny(
+        const RemoteCommandRequestOnAny& request,
+        const RemoteCommandOnAnyCallbackFn& cb,
+        const BatonHandle& baton = nullptr) override;
     void cancel(const CallbackHandle& cbHandle) override;
     void wait(const CallbackHandle& cbHandle,
               Interruptible* interruptible = Interruptible::notInterruptible()) override;

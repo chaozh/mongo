@@ -33,9 +33,11 @@
 
 #include <boost/functional/hash.hpp>
 #include <cmath>
+#include <fmt/format.h>
 
 #include "mongo/base/compare_numbers.h"
 #include "mongo/base/data_cursor.h"
+#include "mongo/base/parse_number.h"
 #include "mongo/base/simple_string_data_comparator.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/platform/strnlen.h"
@@ -43,14 +45,16 @@
 #include "mongo/util/duration.h"
 #include "mongo/util/hex.h"
 #include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
 #include "mongo/util/scopeguard.h"
+#include "mongo/util/str.h"
 #include "mongo/util/string_map.h"
-#include "mongo/util/stringutils.h"
 #include "mongo/util/uuid.h"
 
+#if !defined(__has_feature)
+#define __has_feature(x) 0
+#endif
+
 namespace mongo {
-namespace str = mongoutils::str;
 
 using std::dec;
 using std::hex;
@@ -70,11 +74,11 @@ void BSONElement::jsonStringStream(JsonStringFormat format,
                                    int pretty,
                                    std::stringstream& s) const {
     if (includeFieldNames)
-        s << '"' << escape(fieldName()) << "\" : ";
+        s << '"' << str::escape(fieldName()) << "\" : ";
     switch (type()) {
         case mongo::String:
         case Symbol:
-            s << '"' << escape(string(valuestr(), valuestrsize() - 1)) << '"';
+            s << '"' << str::escape(string(valuestr(), valuestrsize() - 1)) << '"';
             break;
         case NumberLong:
             if (format == TenGen) {
@@ -162,9 +166,12 @@ void BSONElement::jsonStringStream(JsonStringFormat format,
                             s << "  ";
                     }
 
-                    if (strtol(e.fieldName(), 0, 10) > count) {
+                    long index;
+                    if (NumberParser::strToAny(10)(e.fieldName(), &index).isOK() && index > count) {
                         s << "undefined";
                     } else {
+                        // print the element if its index is being printed or if the index it
+                        // belongs to could not be parsed
                         e.jsonStringStream(format, false, pretty ? pretty + 1 : 0, s);
                         e = i.next();
                     }
@@ -272,16 +279,17 @@ void BSONElement::jsonStringStream(JsonStringFormat format,
             break;
         case RegEx:
             if (format == Strict) {
-                s << "{ \"$regex\" : \"" << escape(regex());
+                s << "{ \"$regex\" : \"" << str::escape(regex());
                 s << "\", \"$options\" : \"" << regexFlags() << "\" }";
             } else {
-                s << "/" << escape(regex(), true) << "/";
+                s << "/" << str::escape(regex(), true) << "/";
                 // FIXME Worry about alpha order?
                 for (const char* f = regexFlags(); *f; ++f) {
                     switch (*f) {
                         case 'g':
                         case 'i':
                         case 'm':
+                        case 's':
                             s << *f;
                         default:
                             break;
@@ -293,14 +301,14 @@ void BSONElement::jsonStringStream(JsonStringFormat format,
         case CodeWScope: {
             BSONObj scope = codeWScopeObject();
             if (!scope.isEmpty()) {
-                s << "{ \"$code\" : \"" << escape(_asCode()) << "\" , "
+                s << "{ \"$code\" : \"" << str::escape(_asCode()) << "\" , "
                   << "\"$scope\" : " << scope.jsonString() << " }";
                 break;
             }
         }
 
         case Code:
-            s << "\"" << escape(_asCode()) << "\"";
+            s << "\"" << str::escape(_asCode()) << "\"";
             break;
 
         case bsonTimestamp:
@@ -515,7 +523,7 @@ std::vector<BSONElement> BSONElement::Array() const {
         const char* f = e.fieldName();
 
         unsigned u;
-        Status status = parseNumberFromString(f, &u);
+        Status status = NumberParser{}(f, &u);
         if (status.isOK()) {
             verify(u < 1000000);
             if (u >= v.size())
@@ -569,6 +577,84 @@ bool BSONElement::binaryEqualValues(const BSONElement& rhs) const {
     return (valueSize == 0) || (memcmp(value(), rhs.value(), valueSize) == 0);
 }
 
+StatusWith<long long> BSONElement::parseIntegerElementToNonNegativeLong() const {
+    auto number = parseIntegerElementToLong();
+    if (!number.isOK()) {
+        return number;
+    }
+
+    if (number.getValue() < 0) {
+        return Status(ErrorCodes::FailedToParse,
+                      str::stream() << "Expected a positive number in: " << toString(true, true));
+    }
+
+    return number;
+}
+
+StatusWith<long long> BSONElement::parseIntegerElementToLong() const {
+    if (!isNumber()) {
+        return Status(ErrorCodes::FailedToParse,
+                      str::stream() << "Expected a number in: " << toString(true, true));
+    }
+
+    long long number = 0;
+    if (type() == BSONType::NumberDouble) {
+        auto eDouble = numberDouble();
+
+        // NaN doubles are rejected.
+        if (std::isnan(eDouble)) {
+            return Status(ErrorCodes::FailedToParse,
+                          str::stream()
+                              << "Expected an integer, but found NaN in: " << toString(true, true));
+        }
+
+        // No integral doubles that are too large to be represented as a 64 bit signed integer.
+        // We use 'kLongLongMaxAsDouble' because if we just did eDouble > 2^63-1, it would be
+        // compared against 2^63. eDouble=2^63 would not get caught that way.
+        if (eDouble >= kLongLongMaxPlusOneAsDouble ||
+            eDouble < std::numeric_limits<long long>::min()) {
+            return Status(ErrorCodes::FailedToParse,
+                          str::stream()
+                              << "Cannot represent as a 64-bit integer: " << toString(true, true));
+        }
+
+        // This checks if elem is an integral double.
+        if (eDouble != static_cast<double>(static_cast<long long>(eDouble))) {
+            return Status(ErrorCodes::FailedToParse,
+                          str::stream() << "Expected an integer: " << toString(true, true));
+        }
+
+        number = numberLong();
+    } else if (type() == BSONType::NumberDecimal) {
+        uint32_t signalingFlags = Decimal128::kNoFlag;
+        number = numberDecimal().toLongExact(&signalingFlags);
+        if (signalingFlags != Decimal128::kNoFlag) {
+            return Status(ErrorCodes::FailedToParse,
+                          str::stream()
+                              << "Cannot represent as a 64-bit integer: " << toString(true, true));
+        }
+    } else {
+        number = numberLong();
+    }
+
+    return number;
+}
+
+StatusWith<int> BSONElement::parseIntegerElementToInt() const {
+    auto parsedLong = parseIntegerElementToLong();
+    if (!parsedLong.isOK()) {
+        return parsedLong.getStatus();
+    }
+
+    auto valueLong = parsedLong.getValue();
+    if (valueLong < std::numeric_limits<int>::min() ||
+        valueLong > std::numeric_limits<int>::max()) {
+        return {ErrorCodes::FailedToParse,
+                str::stream() << "Cannot represent " << toString(true, true) << " in an int"};
+    }
+    return static_cast<int>(valueLong);
+}
+
 BSONObj BSONElement::embeddedObjectUserCheck() const {
     if (MONGO_likely(isABSONObj()))
         return BSONObj(value(), BSONObj::LargeSizeTrait{});
@@ -616,15 +702,48 @@ BSONElement BSONElement::operator[](StringData field) const {
 }
 
 namespace {
-NOINLINE_DECL void msgAssertedBadType[[noreturn]](int8_t type) {
-    msgasserted(10320, str::stream() << "BSONElement: bad type " << (int)type);
+MONGO_COMPILER_NOINLINE void msgAssertedBadType [[noreturn]] (const char* data) {
+    // We intentionally read memory that may be out of the allocated memory's boundary, so do not
+    // do this when the adress sanitizer is enabled. We do this in an attempt to log as much context
+    // about the failure, even if that risks undefined behavior or a segmentation fault.
+#if !__has_feature(address_sanitizer)
+    bool logMemory = true;
+#else
+    bool logMemory = false;
+#endif
+
+    str::stream output;
+    if (!logMemory) {
+        output << fmt::format("BSONElement: bad type {0:d} @ {1:p}", *data, data);
+    } else {
+        // To reduce the risk of a segmentation fault, only print the bytes in the 32-bit aligned
+        // block in which the address is located (i.e. round down to the lowest multiple of 32). The
+        // hope is that it's safe to read memory that may fall within the same cache line. Generate
+        // a mask to zero-out the last bits for a block-aligned address.
+        // Ex: Inverse of 0x1F (32 - 1) looks like 0xFFFFFFE0, and ANDed with the pointer, zeroes
+        // the lowest 5 bits, giving the starting address of a 32-bit block.
+        const size_t blockSize = 32;
+        const size_t mask = ~(blockSize - 1);
+        const char* startAddr =
+            reinterpret_cast<const char*>(reinterpret_cast<uintptr_t>(data) & mask);
+        const size_t offset = data - startAddr;
+
+        output << fmt::format(
+            "BSONElement: bad type {0:d} @ {1:p} at offset {2:d} in block: ", *data, data, offset);
+
+        for (size_t i = 0; i < blockSize; i++) {
+            output << fmt::format("{0:#x} ", static_cast<uint8_t>(startAddr[i]));
+        }
+    }
+    msgasserted(10320, output);
 }
 }  // namespace
-int BSONElement::computeSize() const {
+
+int BSONElement::computeSize(int8_t type, const char* elem, int fieldNameSize) {
     enum SizeStyle : uint8_t {
         kFixed,         // Total size is a fixed amount + key length.
         kIntPlusFixed,  // Like Fixed, but also add in the int32 immediately following the key.
-        kRegEx,         // Handled specially.
+        kSpecial,       // Handled specially: RegEx, MinKey, MaxKey.
     };
     struct SizeInfo {
         uint8_t style : 2;
@@ -632,8 +751,8 @@ int BSONElement::computeSize() const {
     };
     MONGO_STATIC_ASSERT(sizeof(SizeInfo) == 1);
 
-    // This table should take 20 bytes. Align to next power of 2 to avoid splitting across cache
-    // lines unnecessarily.
+    // This table should take 32 bytes. Align to that size to avoid splitting across cache lines
+    // unnecessarily.
     static constexpr SizeInfo kSizeInfoTable alignas(32)[] = {
         {SizeStyle::kFixed, 1},          // EOO
         {SizeStyle::kFixed, 9},          // NumberDouble
@@ -646,7 +765,7 @@ int BSONElement::computeSize() const {
         {SizeStyle::kFixed, 2},          // Bool
         {SizeStyle::kFixed, 9},          // Date
         {SizeStyle::kFixed, 1},          // Null
-        {SizeStyle::kRegEx},             // Regex
+        {SizeStyle::kSpecial},           // Regex
         {SizeStyle::kIntPlusFixed, 17},  // DBRef
         {SizeStyle::kIntPlusFixed, 5},   // Code
         {SizeStyle::kIntPlusFixed, 5},   // Symbol
@@ -655,38 +774,47 @@ int BSONElement::computeSize() const {
         {SizeStyle::kFixed, 9},          // Timestamp
         {SizeStyle::kFixed, 9},          // Long
         {SizeStyle::kFixed, 17},         // Decimal
+        {SizeStyle::kSpecial},           // reserved 20
+        {SizeStyle::kSpecial},           // reserved 21
+        {SizeStyle::kSpecial},           // reserved 22
+        {SizeStyle::kSpecial},           // reserved 23
+        {SizeStyle::kSpecial},           // reserved 24
+        {SizeStyle::kSpecial},           // reserved 25
+        {SizeStyle::kSpecial},           // reserved 26
+        {SizeStyle::kSpecial},           // reserved 27
+        {SizeStyle::kSpecial},           // reserved 28
+        {SizeStyle::kSpecial},           // reserved 29
+        {SizeStyle::kSpecial},           // reserved 30
+        {SizeStyle::kSpecial},           // MinKey,  MaxKey
     };
-    MONGO_STATIC_ASSERT((sizeof(kSizeInfoTable) / sizeof(kSizeInfoTable[0])) == JSTypeMax + 1);
+    MONGO_STATIC_ASSERT(sizeof(kSizeInfoTable) == 32);
 
-    // This is the start of the runtime code for this function. Everything above happens at compile
-    // time. This function attempts to push complex handling of unlikely events out-of-line to
-    // ensure that the common cases never need to spill any registers (at least on x64 with
-    // gcc-5.4), which reduces the function call overhead.
-    int8_t type = *data;
-    if (MONGO_unlikely(type < 0 || type > JSTypeMax)) {
-        if (MONGO_unlikely(type != MinKey && type != MaxKey)) {
-            msgAssertedBadType(type);
-        }
-
-        // MinKey and MaxKey should be treated the same as Null
-        type = jstNULL;
+    // This function attempts to push complex handling of unlikely events out-of-line to ensure that
+    // the common cases never need to spill any registers, which reduces the function call overhead.
+    // Most invalid types have type != sizeInfoIndex and fall through to the cold path, as do RegEx,
+    // MinKey, MaxKey and the remaining invalid types mapping to SizeStyle::kSpecial.
+    int sizeInfoIndex = type % sizeof(kSizeInfoTable);
+    const auto sizeInfo = kSizeInfoTable[sizeInfoIndex];
+    if (MONGO_likely(type == sizeInfoIndex)) {
+        if (sizeInfo.style == SizeStyle::kFixed)
+            return sizeInfo.bytes + fieldNameSize;
+        if (MONGO_likely(sizeInfo.style == SizeStyle::kIntPlusFixed))
+            return sizeInfo.bytes + fieldNameSize +
+                ConstDataView(elem + fieldNameSize + 1).read<LittleEndian<int32_t>>();
     }
 
-    const auto sizeInfo = kSizeInfoTable[type];
-    if (sizeInfo.style == SizeStyle::kFixed)
-        return sizeInfo.bytes + fieldNameSize();
-    if (MONGO_likely(sizeInfo.style == SizeStyle::kIntPlusFixed))
-        return sizeInfo.bytes + fieldNameSize() + valuestrsize();
+    // The following code handles all special cases: MinKey, MaxKey, RegEx and invalid types.
+    if (type == MaxKey || type == MinKey)
+        return fieldNameSize + 1;
+    if (type != BSONType::RegEx)
+        msgAssertedBadType(elem);
 
-    return [this, type]() NOINLINE_DECL {
-        // Regex is two c-strings back-to-back.
-        invariant(type == BSONType::RegEx);
-        const char* p = value();
-        size_t len1 = strlen(p);
-        p = p + len1 + 1;
-        size_t len2 = strlen(p);
-        return (len1 + 1 + len2 + 1) + fieldNameSize() + 1;
-    }();
+    // RegEx is two c-strings back-to-back.
+    const char* p = elem + fieldNameSize + 1;
+    size_t len1 = strlen(p);
+    p = p + len1 + 1;
+    size_t len2 = strlen(p);
+    return (len1 + 1 + len2 + 1) + fieldNameSize + 1;
 }
 
 std::string BSONElement::toString(bool includeFieldName, bool full) const {

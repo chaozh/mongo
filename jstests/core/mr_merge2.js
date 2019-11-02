@@ -1,7 +1,12 @@
 // Cannot implicitly shard accessed collections because of following errmsg: Cannot output to a
 // non-sharded collection because sharded collection exists already.
-// @tags: [assumes_unsharded_collection, does_not_support_stepdowns]
-
+// @tags: [
+//   assumes_unsharded_collection,
+//   # mapReduce does not support afterClusterTime.
+//   does_not_support_causal_consistency,
+//   does_not_support_stepdowns,
+//   uses_map_reduce_with_temp_collections,
+// ]
 t = db.mr_merge2;
 t.drop();
 
@@ -41,10 +46,10 @@ expected = {
     "3": 2,
     "4": 1
 };
-assert.eq(tos(expected), tos(res.convertToSingleObject()), "A");
+assert.eq(tos(expected), tos(out.convertToSingleObject("value")), "A");
 
 t.insert({a: [4, 5]});
 res = t.mapReduce(m, r, outOptions);
 expected["4"]++;
 expected["5"] = 1;
-assert.eq(tos(expected), tos(res.convertToSingleObject()), "B");
+assert.eq(tos(expected), tos(out.convertToSingleObject("value")), "B");

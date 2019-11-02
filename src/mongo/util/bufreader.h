@@ -38,7 +38,6 @@
 #include "mongo/base/data_range.h"
 #include "mongo/base/data_range_cursor.h"
 #include "mongo/base/data_type_terminated.h"
-#include "mongo/base/disallow_copying.h"
 #include "mongo/bson/util/builder.h"
 #include "mongo/platform/strnlen.h"
 #include "mongo/util/assert_util.h"
@@ -50,7 +49,8 @@ namespace mongo {
     buffer with which we are working.
 */
 class BufReader {
-    MONGO_DISALLOW_COPYING(BufReader);
+    BufReader(const BufReader&) = delete;
+    BufReader& operator=(const BufReader&) = delete;
 
 public:
     BufReader(const void* p, unsigned len)
@@ -64,7 +64,7 @@ public:
     template <typename T>
     void read(T& t) {
         ConstDataRangeCursor cdrc(_pos, _end);
-        uassertStatusOK(cdrc.readAndAdvance(&t));
+        cdrc.readAndAdvance(&t);
         _pos = cdrc.data();
     }
 
@@ -79,7 +79,7 @@ public:
     /** read in the object specified, but do not advance buffer pointer */
     template <typename T>
     void peek(T& t) const {
-        uassertStatusOK(ConstDataRange(_pos, _end).readInto(&t));
+        ConstDataRange(_pos, _end).readInto(&t);
     }
 
     /** read in and return an object of the specified type, but do not advance buffer pointer */
@@ -109,7 +109,7 @@ public:
     /** return current position pointer, and advance by len */
     const void* skip(unsigned len) {
         ConstDataRangeCursor cdrc(_pos, _end);
-        uassertStatusOK(cdrc.advance(len));
+        cdrc.advance(len);
         return std::exchange(_pos, cdrc.data());
     }
 
@@ -136,4 +136,4 @@ private:
     const char* _pos;
     const char* _end;
 };
-}
+}  // namespace mongo

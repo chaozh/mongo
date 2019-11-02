@@ -31,11 +31,10 @@
 
 #include <boost/optional.hpp>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/bson/oid.h"
 #include "mongo/db/repl/read_concern_args.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/stdx/condition_variable.h"
-#include "mongo/stdx/mutex.h"
 
 namespace mongo {
 
@@ -48,7 +47,8 @@ class StatusWith;
  * Decoration on ServiceContext used by any process in a sharded cluster to access the cluster ID.
  */
 class ClusterIdentityLoader {
-    MONGO_DISALLOW_COPYING(ClusterIdentityLoader);
+    ClusterIdentityLoader(const ClusterIdentityLoader&) = delete;
+    ClusterIdentityLoader& operator=(const ClusterIdentityLoader&) = delete;
 
 public:
     ClusterIdentityLoader() = default;
@@ -94,7 +94,7 @@ private:
     StatusWith<OID> _fetchClusterIdFromConfig(OperationContext* opCtx,
                                               const repl::ReadConcernLevel& readConcernLevel);
 
-    stdx::mutex _mutex;
+    Mutex _mutex = MONGO_MAKE_LATCH("ClusterIdentityLoader::_mutex");
     stdx::condition_variable _inReloadCV;
 
     // Used to ensure that only one thread at a time attempts to reload the cluster ID from the

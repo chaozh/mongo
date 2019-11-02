@@ -33,13 +33,16 @@
 #include <initializer_list>
 
 namespace mongo {
+class TransactionHistoryIteratorBase;
+
 namespace repl {
 
 /**
  * Simulates oplog for testing rollback functionality.
  */
 class OplogInterfaceMock : public OplogInterface {
-    MONGO_DISALLOW_COPYING(OplogInterfaceMock);
+    OplogInterfaceMock(const OplogInterfaceMock&) = delete;
+    OplogInterfaceMock& operator=(const OplogInterfaceMock&) = delete;
 
 public:
     using Operation = std::pair<BSONObj, RecordId>;
@@ -50,6 +53,8 @@ public:
     void setOperations(const Operations& operations);
     std::string toString() const override;
     std::unique_ptr<OplogInterface::Iterator> makeIterator() const override;
+    std::unique_ptr<TransactionHistoryIteratorBase> makeTransactionHistoryIterator(
+        const OpTime& startOpTime, bool permitYield = false) const override;
     HostAndPort hostAndPort() const override;
 
 private:

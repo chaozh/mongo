@@ -30,6 +30,7 @@
 #include "mongo/platform/basic.h"
 
 #include <algorithm>
+#include <functional>
 #include <map>
 #include <utility>
 #include <vector>
@@ -44,8 +45,7 @@
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/replication_coordinator_mock.h"
 #include "mongo/db/service_context_d_test_fixture.h"
-#include "mongo/stdx/functional.h"
-#include "mongo/stdx/mutex.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/unittest/barrier.h"
 #include "mongo/util/concurrency/thread_pool.h"
 
@@ -67,7 +67,7 @@ void OplogTest::setUp() {
     auto opCtx = cc().makeOperationContext();
 
     // Set up ReplicationCoordinator and create oplog.
-    ReplicationCoordinator::set(service, stdx::make_unique<ReplicationCoordinatorMock>(service));
+    ReplicationCoordinator::set(service, std::make_unique<ReplicationCoordinatorMock>(service));
     setOplogCollectionName(service);
     createOplog(opCtx.get());
 
@@ -80,7 +80,7 @@ void OplogTest::setUp() {
  * Assert that oplog only has a single entry and return that oplog entry.
  */
 OplogEntry _getSingleOplogEntry(OperationContext* opCtx) {
-    OplogInterfaceLocal oplogInterface(opCtx, NamespaceString::kRsOplogNamespace.ns());
+    OplogInterfaceLocal oplogInterface(opCtx);
     auto oplogIter = oplogInterface.makeIterator();
     auto opEntry = unittest::assertGet(oplogIter->next());
     ASSERT_EQUALS(ErrorCodes::CollectionIsEmpty, oplogIter->next().getStatus())
@@ -99,22 +99,14 @@ TEST_F(OplogTest, LogOpReturnsOpTimeOnSuccessfulInsertIntoOplogCollection) {
     // Write to the oplog.
     OpTime opTime;
     {
+        MutableOplogEntry oplogEntry;
+        oplogEntry.setOpType(repl::OpTypeEnum::kNoop);
+        oplogEntry.setNss(nss);
+        oplogEntry.setObject(msgObj);
+        oplogEntry.setWallClockTime(Date_t::now());
         AutoGetDb autoDb(opCtx.get(), nss.db(), MODE_X);
         WriteUnitOfWork wunit(opCtx.get());
-        opTime = logOp(opCtx.get(),
-                       "n",
-                       nss,
-                       {},
-                       msgObj,
-                       nullptr,
-                       false,
-                       Date_t::now(),
-                       {},
-                       kUninitializedStmtId,
-                       {},
-                       false /* prepare */,
-                       false /* inTxn */,
-                       OplogSlot());
+        opTime = logOp(opCtx.get(), &oplogEntry);
         ASSERT_FALSE(opTime.isNull());
         wunit.commit();
     }
@@ -126,9 +118,9 @@ TEST_F(OplogTest, LogOpReturnsOpTimeOnSuccessfulInsertIntoOplogCollection) {
         << "OpTime returned from logOp() did not match that in the oplog entry written to the "
            "oplog: "
         << oplogEntry.toBSON();
-    ASSERT(OpTypeEnum::kNoop == oplogEntry.getOpType()) << "Expected 'n' op type but found '"
-                                                        << OpType_serializer(oplogEntry.getOpType())
-                                                        << "' instead: " << oplogEntry.toBSON();
+    ASSERT(OpTypeEnum::kNoop == oplogEntry.getOpType())
+        << "Expected 'n' op type but found '" << OpType_serializer(oplogEntry.getOpType())
+        << "' instead: " << oplogEntry.toBSON();
     ASSERT_BSONOBJ_EQ(msgObj, oplogEntry.getObject());
 
     // Ensure that the msg optime returned is the same as the last optime in the ReplClientInfo.
@@ -156,12 +148,8 @@ void _checkOplogEntry(const OplogEntry& oplogEntry,
  * the contents of the oplog collection.
  */
 using OpTimeNamespaceStringMap = std::map<OpTime, NamespaceString>;
-using MakeTaskFunction =
-    stdx::function<ThreadPoolInterface::Task(const NamespaceString& nss,
-                                             stdx::mutex* mtx,
-                                             OpTimeNamespaceStringMap* opTimeNssMap,
-                                             unittest::Barrier* barrier)>;
-void _testConcurrentLogOp(const MakeTaskFunction& makeTaskFunction,
+template <typename F>
+void _testConcurrentLogOp(const F& makeTaskFunction,
                           OpTimeNamespaceStringMap* opTimeNssMap,
                           std::vector<OplogEntry>* oplogEntries,
                           std::size_t expectedNumOplogEntries) {
@@ -177,14 +165,18 @@ void _testConcurrentLogOp(const MakeTaskFunction& makeTaskFunction,
     // Run 2 concurrent logOp() requests using the thread pool.
     // Use a barrier with a thread count of 3 to ensure both logOp() tasks are complete before this
     // test thread can proceed with shutting the thread pool down.
-    stdx::mutex mtx;
+    auto mtx = MONGO_MAKE_LATCH();
     unittest::Barrier barrier(3U);
     const NamespaceString nss1("test1.coll");
     const NamespaceString nss2("test2.coll");
-    ASSERT_OK(pool.schedule(makeTaskFunction(nss1, &mtx, opTimeNssMap, &barrier)))
-        << "Failed to schedule logOp() task for namespace " << nss1;
-    ASSERT_OK(pool.schedule(makeTaskFunction(nss2, &mtx, opTimeNssMap, &barrier)))
-        << "Failed to schedule logOp() task for namespace " << nss2;
+    pool.schedule([&](auto status) mutable {
+        ASSERT_OK(status) << "Failed to schedule logOp() task for namespace " << nss1;
+        makeTaskFunction(nss1, &mtx, opTimeNssMap, &barrier)();
+    });
+    pool.schedule([&](auto status) mutable {
+        ASSERT_OK(status) << "Failed to schedule logOp() task for namespace " << nss2;
+        makeTaskFunction(nss2, &mtx, opTimeNssMap, &barrier)();
+    });
     barrier.countDownAndWait();
 
     // Shut thread pool down.
@@ -194,7 +186,7 @@ void _testConcurrentLogOp(const MakeTaskFunction& makeTaskFunction,
     // Read oplog entries from the oplog collection starting with the entry with the most recent
     // optime.
     auto opCtx = cc().makeOperationContext();
-    OplogInterfaceLocal oplogInterface(opCtx.get(), NamespaceString::kRsOplogNamespace.ns());
+    OplogInterfaceLocal oplogInterface(opCtx.get());
     auto oplogIter = oplogInterface.makeIterator();
     auto nextValue = oplogIter->next();
     while (nextValue.isOK()) {
@@ -208,7 +200,7 @@ void _testConcurrentLogOp(const MakeTaskFunction& makeTaskFunction,
     std::reverse(oplogEntries->begin(), oplogEntries->end());
 
     // Look up namespaces and their respective optimes (returned by logOp()) in the map.
-    stdx::lock_guard<stdx::mutex> lock(mtx);
+    stdx::lock_guard<Latch> lock(mtx);
     ASSERT_EQUALS(2U, opTimeNssMap->size());
 }
 
@@ -218,28 +210,19 @@ void _testConcurrentLogOp(const MakeTaskFunction& makeTaskFunction,
  * Returns optime of generated oplog entry.
  */
 OpTime _logOpNoopWithMsg(OperationContext* opCtx,
-                         stdx::mutex* mtx,
+                         Mutex* mtx,
                          OpTimeNamespaceStringMap* opTimeNssMap,
                          const NamespaceString& nss) {
-    stdx::lock_guard<stdx::mutex> lock(*mtx);
+    stdx::lock_guard<Latch> lock(*mtx);
 
     // logOp() must be called while holding lock because ephemeralForTest storage engine does not
     // support concurrent updates to its internal state.
-    const auto msgObj = BSON("msg" << nss.ns());
-    auto opTime = logOp(opCtx,
-                        "n",
-                        nss,
-                        {},
-                        msgObj,
-                        nullptr,
-                        false,
-                        Date_t::now(),
-                        {},
-                        kUninitializedStmtId,
-                        {},
-                        false /* prepare */,
-                        false /* inTxn */,
-                        OplogSlot());
+    MutableOplogEntry oplogEntry;
+    oplogEntry.setOpType(repl::OpTypeEnum::kNoop);
+    oplogEntry.setNss(nss);
+    oplogEntry.setObject(BSON("msg" << nss.ns()));
+    oplogEntry.setWallClockTime(Date_t::now());
+    auto opTime = logOp(opCtx, &oplogEntry);
     ASSERT_FALSE(opTime.isNull());
 
     ASSERT(opTimeNssMap->find(opTime) == opTimeNssMap->end())
@@ -256,7 +239,7 @@ TEST_F(OplogTest, ConcurrentLogOpWithoutDocLockingSupport) {
 
     _testConcurrentLogOp(
         [](const NamespaceString& nss,
-           stdx::mutex* mtx,
+           Mutex* mtx,
            OpTimeNamespaceStringMap* opTimeNssMap,
            unittest::Barrier* barrier) {
             return [=] {
@@ -289,7 +272,7 @@ TEST_F(OplogTest, ConcurrentLogOpWithDocLockingSupport) {
     ForceSupportsDocLocking support(true);
     _testConcurrentLogOp(
         [](const NamespaceString& nss,
-           stdx::mutex* mtx,
+           Mutex* mtx,
            OpTimeNamespaceStringMap* opTimeNssMap,
            unittest::Barrier* barrier) {
             return [=] {
@@ -321,7 +304,7 @@ TEST_F(OplogTest, ConcurrentLogOpWithDocLockingSupportRevertFirstOplogEntry) {
     ForceSupportsDocLocking support(true);
     _testConcurrentLogOp(
         [](const NamespaceString& nss,
-           stdx::mutex* mtx,
+           Mutex* mtx,
            OpTimeNamespaceStringMap* opTimeNssMap,
            unittest::Barrier* barrier) {
             return [=] {
@@ -339,7 +322,7 @@ TEST_F(OplogTest, ConcurrentLogOpWithDocLockingSupportRevertFirstOplogEntry) {
                 // Revert the first logOp() call and confirm that there are no holes in the
                 // oplog after committing the oplog entry with the more recent optime.
                 {
-                    stdx::lock_guard<stdx::mutex> lock(*mtx);
+                    stdx::lock_guard<Latch> lock(*mtx);
                     auto firstOpTimeAndNss = *(opTimeNssMap->cbegin());
                     if (opTime == firstOpTimeAndNss.first) {
                         ASSERT_EQUALS(nss, firstOpTimeAndNss.second)
@@ -368,7 +351,7 @@ TEST_F(OplogTest, ConcurrentLogOpWithDocLockingSupportRevertLastOplogEntry) {
     ForceSupportsDocLocking support(true);
     _testConcurrentLogOp(
         [](const NamespaceString& nss,
-           stdx::mutex* mtx,
+           Mutex* mtx,
            OpTimeNamespaceStringMap* opTimeNssMap,
            unittest::Barrier* barrier) {
             return [=] {
@@ -386,7 +369,7 @@ TEST_F(OplogTest, ConcurrentLogOpWithDocLockingSupportRevertLastOplogEntry) {
                 // Revert the last logOp() call and confirm that there are no holes in the
                 // oplog after committing the oplog entry with the earlier optime.
                 {
-                    stdx::lock_guard<stdx::mutex> lock(*mtx);
+                    stdx::lock_guard<Latch> lock(*mtx);
                     auto lastOpTimeAndNss = *(opTimeNssMap->crbegin());
                     if (opTime == lastOpTimeAndNss.first) {
                         ASSERT_EQUALS(nss, lastOpTimeAndNss.second)

@@ -44,7 +44,7 @@
 #include "mongo/base/string_data.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
-#include "mongo/stdx/mutex.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/log.h"
 #include "mongo/util/net/http_client.h"
@@ -131,17 +131,17 @@ private:
     }
 
     static void _lockShare(CURL*, curl_lock_data, curl_lock_access, void* ctx) {
-        reinterpret_cast<stdx::mutex*>(ctx)->lock();
+        reinterpret_cast<Mutex*>(ctx)->lock();
     }
 
     static void _unlockShare(CURL*, curl_lock_data, void* ctx) {
-        reinterpret_cast<stdx::mutex*>(ctx)->unlock();
+        reinterpret_cast<Mutex*>(ctx)->unlock();
     }
 
 private:
     bool _initialized = false;
     CURLSH* _share = nullptr;
-    stdx::mutex _shareMutex;
+    Mutex _shareMutex = MONGO_MAKE_LATCH("CurlLibraryManager::_shareMutex");
 } curlLibraryManager;
 
 /**
@@ -174,7 +174,7 @@ size_t ReadMemoryCallback(char* buffer, size_t size, size_t nitems, void* instre
     if (cdrc->length() > 0) {
         size_t readSize = std::min(size * nitems, cdrc->length());
         memcpy(buffer, cdrc->data(), readSize);
-        invariant(cdrc->advance(readSize).isOK());
+        invariant(cdrc->advanceNoThrow(readSize).isOK());
         ret = readSize;
     }
 
@@ -355,7 +355,7 @@ BSONObj HttpClient::getServerStatus() {
 
         BSONObjBuilder v(info.subobjStart("running"));
         v.append("version", curl_info->version);
-        v.append("version_num", curl_info->version_num);
+        v.append("version_num", static_cast<int>(curl_info->version_num));
     }
 
     return info.obj();

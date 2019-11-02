@@ -43,8 +43,8 @@ InternalSchemaMatchArrayIndexMatchExpression::InternalSchemaMatchArrayIndexMatch
 }
 
 void InternalSchemaMatchArrayIndexMatchExpression::debugString(StringBuilder& debug,
-                                                               int level) const {
-    _debugAddSpace(debug, level);
+                                                               int indentationLevel) const {
+    _debugAddSpace(debug, indentationLevel);
 
     BSONObjBuilder builder;
     serialize(&builder);
@@ -86,7 +86,7 @@ BSONObj InternalSchemaMatchArrayIndexMatchExpression::getSerializedRightHandSide
 
 std::unique_ptr<MatchExpression> InternalSchemaMatchArrayIndexMatchExpression::shallowClone()
     const {
-    auto clone = stdx::make_unique<InternalSchemaMatchArrayIndexMatchExpression>(
+    auto clone = std::make_unique<InternalSchemaMatchArrayIndexMatchExpression>(
         path(), _index, _expression->shallowClone());
     if (getTag()) {
         clone->setTag(getTag()->clone());

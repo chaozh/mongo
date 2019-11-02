@@ -95,11 +95,11 @@ def get_git_version():
 
 
 def get_git_describe():
-    """Return 'git describe'."""
+    """Return 'git describe --abbrev=7'."""
     with open(os.devnull, "r+") as devnull:
-        proc = subprocess.Popen("git describe", stdout=subprocess.PIPE, stderr=devnull,
+        proc = subprocess.Popen("git describe --abbrev=7", stdout=subprocess.PIPE, stderr=devnull,
                                 stdin=devnull, shell=True)
-        return proc.communicate()[0].strip()
+        return proc.communicate()[0].strip().decode('utf-8')
 
 
 def execsys(args):
@@ -130,17 +130,16 @@ def which(executable):
     return executable
 
 
-def find_python(min_version=(2, 5)):
+def find_python(min_version=(3, 7)):
     """Return path of python."""
     try:
-        if sys.version_info >= min_version:
-            return sys.executable
+        return sys.executable
     except AttributeError:
         # In case the version of Python is somehow missing sys.version_info or sys.executable.
         pass
 
     version = re.compile(r"[Pp]ython ([\d\.]+)", re.MULTILINE)
-    binaries = ("python27", "python2.7", "python26", "python2.6", "python25", "python2.5", "python")
+    binaries = ("python37", "python3.7", "python36", "python3.6", "python35", "python3.5", "python")
     for binary in binaries:
         try:
             out, err = subprocess.Popen([binary, "-V"], stdout=subprocess.PIPE,
@@ -154,8 +153,8 @@ def find_python(min_version=(2, 5)):
         except Exception:  # pylint: disable=broad-except
             pass
 
-    raise Exception("could not find suitable Python (version >= %s)" % ".".join(
-        str(v) for v in min_version))
+    raise Exception(
+        "could not find suitable Python (version >= %s)" % ".".join(str(v) for v in min_version))
 
 
 def replace_with_repr(unicode_error):
@@ -166,7 +165,7 @@ def replace_with_repr(unicode_error):
     # repr() of the offending bytes into the decoded string
     # at the position they occurred
     offender = unicode_error.object[unicode_error.start:unicode_error.end]
-    return (unicode(repr(offender).strip("'").strip('"')), unicode_error.end)
+    return (str(repr(offender).strip("'").strip('"')), unicode_error.end)
 
 
 codecs.register_error("repr", replace_with_repr)

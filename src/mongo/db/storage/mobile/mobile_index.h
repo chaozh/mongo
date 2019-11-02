@@ -52,14 +52,12 @@ public:
 
     virtual ~MobileIndex() {}
 
-    StatusWith<SpecialFormatInserted> insert(OperationContext* opCtx,
-                                             const BSONObj& key,
-                                             const RecordId& recId,
-                                             bool dupsAllowed) override;
+    Status insert(OperationContext* opCtx,
+                  const KeyString::Value& keyString,
+                  bool dupsAllowed) override;
 
     void unindex(OperationContext* opCtx,
-                 const BSONObj& key,
-                 const RecordId& recId,
+                 const KeyString::Value& keyString,
                  bool dupsAllowed) override;
 
     void fullValidate(OperationContext* opCtx,
@@ -78,7 +76,7 @@ public:
 
     Status initAsEmpty(OperationContext* opCtx) override;
 
-    Status dupKeyCheck(OperationContext* opCtx, const BSONObj& key) override;
+    Status dupKeyCheck(OperationContext* opCtx, const KeyString::Value& key) override;
 
     // Beginning of MobileIndex-specific methods
 
@@ -91,20 +89,14 @@ public:
      * Performs the insert into the table with the given key and value.
      */
     template <typename ValueType>
-    StatusWith<SpecialFormatInserted> doInsert(OperationContext* opCtx,
-                                               const KeyString& key,
-                                               const ValueType& value,
-                                               bool isTransactional = true);
+    Status doInsert(OperationContext* opCtx,
+                    const char* keyBuffer,
+                    size_t keySize,
+                    const KeyString::TypeBits& typeBits,
+                    const ValueType& value,
+                    bool isTransactional = true);
 
-    Ordering getOrdering() const {
-        return _ordering;
-    }
-
-    KeyString::Version getKeyStringVersion() const {
-        return _keyStringVersion;
-    }
-
-    bool isUnique() {
+    bool isUnique() const {
         return _isUnique;
     }
 
@@ -113,21 +105,26 @@ public:
     }
 
 protected:
-    bool _isDup(OperationContext* opCtx, const BSONObj& key);
+    bool _advanceNext();
+
+    KeyStringEntry _getKeyStringEntry();
+
+    bool _isDup(OperationContext* opCtx, const KeyString::Value& key);
 
     /**
      * Performs the deletion from the table matching the given key.
      */
-    void _doDelete(OperationContext* opCtx, const KeyString& key, KeyString* value = nullptr);
+    void _doDelete(OperationContext* opCtx,
+                   const char* keyBuffer,
+                   size_t keySize,
+                   KeyString::Builder* value = nullptr);
 
-    virtual StatusWith<SpecialFormatInserted> _insert(OperationContext* opCtx,
-                                                      const BSONObj& key,
-                                                      const RecordId& recId,
-                                                      bool dupsAllowed) = 0;
+    virtual Status _insert(OperationContext* opCtx,
+                           const KeyString::Value& keyString,
+                           bool dupsAllowed) = 0;
 
     virtual void _unindex(OperationContext* opCtx,
-                          const BSONObj& key,
-                          const RecordId& recId,
+                          const KeyString::Value& keyString,
                           bool dupsAllowed) = 0;
 
     class BulkBuilderBase;
@@ -136,9 +133,8 @@ protected:
 
     const bool _isUnique;
     const Ordering _ordering;
-    const KeyString::Version _keyStringVersion = KeyString::kLatestVersion;
     const std::string _ident;
-    const std::string _collectionNamespace;
+    const NamespaceString _collectionNamespace;
     const std::string _indexName;
     const BSONObj _keyPattern;
 };
@@ -155,14 +151,12 @@ public:
                                                            bool isForward) const override;
 
 protected:
-    StatusWith<SpecialFormatInserted> _insert(OperationContext* opCtx,
-                                              const BSONObj& key,
-                                              const RecordId& recId,
-                                              bool dupsAllowed) override;
+    Status _insert(OperationContext* opCtx,
+                   const KeyString::Value& keyString,
+                   bool dupsAllowed) override;
 
     void _unindex(OperationContext* opCtx,
-                  const BSONObj& key,
-                  const RecordId& recId,
+                  const KeyString::Value& keyString,
                   bool dupsAllowed) override;
 };
 
@@ -178,14 +172,12 @@ public:
                                                            bool isForward) const override;
 
 protected:
-    StatusWith<SpecialFormatInserted> _insert(OperationContext* opCtx,
-                                              const BSONObj& key,
-                                              const RecordId& recId,
-                                              bool dupsAllowed) override;
+    Status _insert(OperationContext* opCtx,
+                   const KeyString::Value& keyString,
+                   bool dupsAllowed) override;
 
     void _unindex(OperationContext* opCtx,
-                  const BSONObj& key,
-                  const RecordId& recId,
+                  const KeyString::Value& keyString,
                   bool dupsAllowed) override;
 
     const bool _isPartial = false;

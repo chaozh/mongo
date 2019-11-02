@@ -36,7 +36,7 @@
 namespace mongo {
 
 Status PopNode::init(BSONElement modExpr, const boost::intrusive_ptr<ExpressionContext>& expCtx) {
-    auto popVal = MatchExpressionParser::parseIntegerElementToLong(modExpr);
+    auto popVal = modExpr.parseIntegerElementToLong();
     if (!popVal.isOK()) {
         return popVal.getStatus();
     }
@@ -54,8 +54,7 @@ ModifierNode::ModifyResult PopNode::updateExistingElement(
     uassert(ErrorCodes::TypeMismatch,
             str::stream() << "Path '" << elementPath->dottedField()
                           << "' contains an element of non-array type '"
-                          << typeName(element->getType())
-                          << "'",
+                          << typeName(element->getType()) << "'",
             element->getType() == BSONType::Array);
 
     if (!element->hasChildren()) {

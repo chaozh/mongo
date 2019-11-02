@@ -31,6 +31,8 @@
 
 #include "mongo/db/pipeline/parsed_aggregation_projection.h"
 
+#include "mongo/db/query/projection_policies.h"
+
 namespace mongo {
 namespace parsed_aggregation_projection {
 
@@ -47,8 +49,6 @@ namespace parsed_aggregation_projection {
  */
 class ProjectionNode {
 public:
-    using ProjectionPolicies = ParsedAggregationProjection::ProjectionPolicies;
-
     ProjectionNode(ProjectionPolicies policies, std::string pathToNode = "");
 
     virtual ~ProjectionNode() = default;
@@ -62,6 +62,12 @@ public:
      * added a computed field "a".
      */
     void addProjectionForPath(const FieldPath& path);
+
+    /**
+     * Get the expression for the given path. Returns null if no expression for the given path is
+     * found.
+     */
+    boost::intrusive_ptr<Expression> getExpressionForPath(const FieldPath& path) const;
 
     /**
      * Recursively adds 'path' into the tree as a computed field, creating any child nodes if
@@ -120,6 +126,11 @@ public:
     void serialize(boost::optional<ExplainOptions::Verbosity> explain,
                    MutableDocument* output) const;
 
+    /**
+     * Returns true if this node or any child of this node contains a computed field.
+     */
+    bool subtreeContainsComputedFields() const;
+
 protected:
     // Returns a unique_ptr to a new instance of the implementing class for the given 'fieldName'.
     virtual std::unique_ptr<ProjectionNode> makeChild(std::string fieldName) const = 0;
@@ -175,9 +186,6 @@ private:
 
     // Returns nullptr if no such child exists.
     ProjectionNode* getChild(const std::string& field) const;
-
-    // Returns true if this node or any child of this node contains a computed field.
-    bool subtreeContainsComputedFields() const;
 
     // Our projection semantics are such that all field additions need to be processed in the order
     // specified. '_orderToProcessAdditionsAndChildren' tracks that order.

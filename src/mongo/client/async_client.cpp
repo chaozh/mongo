@@ -33,6 +33,8 @@
 
 #include "mongo/client/async_client.h"
 
+#include <memory>
+
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/client/authenticate.h"
 #include "mongo/config.h"
@@ -45,7 +47,6 @@
 #include "mongo/rpc/legacy_request_builder.h"
 #include "mongo/rpc/metadata/client_metadata.h"
 #include "mongo/rpc/reply_interface.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/util/log.h"
 #include "mongo/util/net/socket_utils.h"
 #include "mongo/util/net/ssl_manager.h"
@@ -202,6 +203,13 @@ Future<Message> AsyncDBClient::_call(Message request, const BatonHandle& baton) 
     auto msgId = nextMessageId();
     request.header().setId(msgId);
     request.header().setResponseToMsgId(0);
+#ifdef MONGO_CONFIG_SSL
+    if (!SSLPeerInfo::forSession(_session).isTLS) {
+        OpMsg::appendChecksum(&request);
+    }
+#else
+    OpMsg::appendChecksum(&request);
+#endif
 
     return _session->asyncSinkMessage(request, baton)
         .then([this, baton] { return _session->asyncSourceMessage(baton); })

@@ -38,9 +38,9 @@
 #include "mongo/base/init.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
 #include "mongo/util/options_parser/startup_option_init.h"
 #include "mongo/util/options_parser/startup_options.h"
+#include "mongo/util/str.h"
 
 
 namespace mongo {
@@ -48,7 +48,6 @@ namespace mongo {
 using std::string;
 
 namespace unittest {
-namespace str = mongoutils::str;
 namespace moe = mongo::optionenvironment;
 
 namespace {
@@ -74,7 +73,7 @@ MONGO_INITIALIZER(SetTempDirDefaultRoot)(InitializerContext* context) {
     }
     return Status::OK();
 }
-}
+}  // namespace
 
 TempDir::TempDir(const std::string& namePrefix) {
     fassert(17146, namePrefix.find_first_of("/\\") == std::string::npos);

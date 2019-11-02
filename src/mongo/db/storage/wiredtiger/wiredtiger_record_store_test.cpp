@@ -48,7 +48,6 @@
 #include "mongo/db/storage/wiredtiger/wiredtiger_recovery_unit.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_size_storer.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_util.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/unittest/temp_dir.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/fail_point.h"
@@ -57,9 +56,9 @@
 namespace mongo {
 namespace {
 
-using std::unique_ptr;
 using std::string;
 using std::stringstream;
+using std::unique_ptr;
 
 TEST(WiredTigerRecordStoreTest, GenerateCreateStringEmptyDocument) {
     BSONObj spec = fromjson("{}");
@@ -145,8 +144,8 @@ TEST(WiredTigerRecordStoreTest, Isolation1) {
             rs->updateRecord(t2.get(), id1, "c", 2).transitional_ignore();
             ASSERT(0);
         } catch (WriteConflictException&) {
-            w2.reset(NULL);
-            t2.reset(NULL);
+            w2.reset(nullptr);
+            t2.reset(nullptr);
         }
 
         w1->commit();  // this should succeed
@@ -865,6 +864,55 @@ TEST(WiredTigerRecordStoreTest, OplogStones_AscendingOrder) {
         ASSERT_EQ(0, oplogStones->currentRecords());
         ASSERT_EQ(0, oplogStones->currentBytes());
     }
+}
+
+TEST(WiredTigerRecordStoreTest, GetLatestOplogTest) {
+    unique_ptr<RecordStoreHarnessHelper> harnessHelper(newRecordStoreHarnessHelper());
+    unique_ptr<RecordStore> rs(harnessHelper->newCappedRecordStore("local.oplog.rs", 100000, -1));
+
+    auto wtrs = checked_cast<WiredTigerRecordStore*>(rs.get());
+
+    // 1) Initialize the top of oplog to "1".
+    ServiceContext::UniqueOperationContext op1(harnessHelper->newOperationContext());
+    op1->recoveryUnit()->beginUnitOfWork(op1.get());
+    Timestamp tsOne =
+        Timestamp(static_cast<unsigned long long>(_oplogOrderInsertOplog(op1.get(), rs, 1).repr()));
+    op1->recoveryUnit()->commitUnitOfWork();
+    // Asserting on a recovery unit without a snapshot.
+    ASSERT_EQ(tsOne, wtrs->getLatestOplogTimestamp(op1.get()));
+
+    // 2) Open a hole at time "2".
+    op1->recoveryUnit()->beginUnitOfWork(op1.get());
+    // Don't save the return value because the compiler complains about unused variables.
+    _oplogOrderInsertOplog(op1.get(), rs, 2);
+    // Querying with the recovery unit with a snapshot will not return the uncommitted value.
+    ASSERT_EQ(tsOne, wtrs->getLatestOplogTimestamp(op1.get()));
+
+    // Store the client with an uncommitted transaction. Create a new, concurrent client.
+    auto client1 = Client::releaseCurrent();
+    Client::initThread("client2");
+
+    ServiceContext::UniqueOperationContext op2(harnessHelper->newOperationContext());
+    op2->recoveryUnit()->beginUnitOfWork(op2.get());
+    Timestamp tsThree =
+        Timestamp(static_cast<unsigned long long>(_oplogOrderInsertOplog(op2.get(), rs, 3).repr()));
+    // Before committing, the query still only sees timestamp "1".
+    ASSERT_EQ(tsOne, wtrs->getLatestOplogTimestamp(op2.get()));
+    op2->recoveryUnit()->commitUnitOfWork();
+    // After committing, three is the top of oplog.
+    ASSERT_EQ(tsThree, wtrs->getLatestOplogTimestamp(op2.get()));
+
+    // Destroy client2.
+    op2.reset();
+    Client::releaseCurrent();
+    // Reinstall client 1.
+    Client::setCurrent(std::move(client1));
+
+    // A new query with client 1 will see timestamp "3".
+    ASSERT_EQ(tsThree, wtrs->getLatestOplogTimestamp(op1.get()));
+    op1->recoveryUnit()->commitUnitOfWork();
+    // Committing the write at timestamp "2" does not change the top of oplog result.
+    ASSERT_EQ(tsThree, wtrs->getLatestOplogTimestamp(op1.get()));
 }
 
 }  // namespace

@@ -29,7 +29,7 @@
 
 #include "mongo/bson/bsonobj.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/util/fail_point_service.h"
+#include "mongo/util/fail_point.h"
 
 namespace mongo {
 
@@ -53,26 +53,27 @@ struct AwaitDataState {
 extern const OperationContext::Decoration<AwaitDataState> awaitDataState;
 
 class BSONObj;
+class CanonicalQuery;
 class QueryRequest;
 
 // Failpoint for making find hang.
-MONGO_FAIL_POINT_DECLARE(waitInFindBeforeMakingBatch);
+extern FailPoint waitInFindBeforeMakingBatch;
 
 // Failpoint for making getMore not wait for an awaitdata cursor. Allows us to avoid waiting during
 // tests.
-MONGO_FAIL_POINT_DECLARE(disableAwaitDataForGetMoreCmd);
+extern FailPoint disableAwaitDataForGetMoreCmd;
 
 // Enabling this fail point will cause getMores to busy wait after pinning the cursor
 // but before we have started building the batch, until the fail point is disabled.
-MONGO_FAIL_POINT_DECLARE(waitAfterPinningCursorBeforeGetMoreBatch);
+extern FailPoint waitAfterPinningCursorBeforeGetMoreBatch;
 
 // Enabling this fail point will cause getMores to busy wait after setting up the plan executor and
 // before beginning the batch.
-MONGO_FAIL_POINT_DECLARE(waitWithPinnedCursorDuringGetMoreBatch);
+extern FailPoint waitWithPinnedCursorDuringGetMoreBatch;
 
 // Enabling this failpoint will cause getMores to wait just before it unpins its cursor after it
 // has completed building the current batch.
-MONGO_FAIL_POINT_DECLARE(waitBeforeUnpinningOrDeletingCursorAfterGetMoreBatch);
+extern FailPoint waitBeforeUnpinningOrDeletingCursorAfterGetMoreBatch;
 
 /**
  * Suite of find/getMore related functions used in both the mongod and mongos query paths.
@@ -116,15 +117,13 @@ public:
     static bool haveSpaceForNext(const BSONObj& nextDoc, long long numDocs, int bytesBuffered);
 
     /**
-     * Transforms the raw sort spec into one suitable for use as the ordering specification in
-     * BSONObj::woCompare().
+     * This function wraps waitWhileFailPointEnabled() on waitInFindBeforeMakingBatch.
      *
-     * In particular, eliminates text score meta-sort from 'sortSpec'.
-     *
-     * The input must be validated (each BSON element must be either a number or text score
-     * meta-sort specification).
+     * Since query processing happens in three different places, this function makes it easier to
+     * check the failpoint for a query's namespace and log a helpful diagnostic message when the
+     * failpoint is active.
      */
-    static BSONObj transformSortSpec(const BSONObj& sortSpec);
+    static void waitInFindBeforeMakingBatch(OperationContext* opCtx, const CanonicalQuery& cq);
 };
 
 }  // namespace mongo

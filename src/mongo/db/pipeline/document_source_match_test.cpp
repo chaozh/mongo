@@ -34,11 +34,11 @@
 #include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/json.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/document_value_test_util.h"
 #include "mongo/db/pipeline/aggregation_context_fixture.h"
-#include "mongo/db/pipeline/document.h"
 #include "mongo/db/pipeline/document_source_match.h"
 #include "mongo/db/pipeline/document_source_mock.h"
-#include "mongo/db/pipeline/document_value_test_util.h"
 #include "mongo/db/pipeline/pipeline.h"
 #include "mongo/unittest/death_test.h"
 #include "mongo/unittest/unittest.h"
@@ -184,7 +184,7 @@ TEST_F(DocumentSourceMatchTest, RedactSafePortion) {
     assertExpectedRedactSafePortion("{a: {$in: [1, 0, null]}}", "{}");
 
     {
-        const char* comparisonOps[] = {"$gt", "$lt", "$gte", "$lte", NULL};
+        const char* comparisonOps[] = {"$gt", "$lt", "$gte", "$lte", nullptr};
         for (int i = 0; comparisonOps[i]; i++) {
             const char* op = comparisonOps[i];
             assertExpectedRedactSafePortion(string("{a: {") + op + ": 1}}",
@@ -220,15 +220,15 @@ TEST_F(DocumentSourceMatchTest, ShouldAddDependenciesOfAllBranchesOfOrClause) {
     ASSERT_EQUALS(1U, dependencies.fields.count("x.y"));
     ASSERT_EQUALS(2U, dependencies.fields.size());
     ASSERT_EQUALS(false, dependencies.needWholeDocument);
-    ASSERT_EQUALS(false, dependencies.getNeedsMetadata(DepsTracker::MetadataType::TEXT_SCORE));
+    ASSERT_EQUALS(false, dependencies.getNeedsMetadata(DocumentMetadataFields::kTextScore));
 }
 
 TEST_F(DocumentSourceMatchTest, TextSearchShouldRequireWholeDocumentAndTextScore) {
     auto match = DocumentSourceMatch::create(fromjson("{$text: {$search: 'hello'} }"), getExpCtx());
-    DepsTracker dependencies(DepsTracker::MetadataAvailable::kTextScore);
+    DepsTracker dependencies(DepsTracker::kOnlyTextScore);
     ASSERT_EQUALS(DepsTracker::State::EXHAUSTIVE_FIELDS, match->getDependencies(&dependencies));
     ASSERT_EQUALS(true, dependencies.needWholeDocument);
-    ASSERT_EQUALS(true, dependencies.getNeedsMetadata(DepsTracker::MetadataType::TEXT_SCORE));
+    ASSERT_EQUALS(true, dependencies.getNeedsMetadata(DocumentMetadataFields::kTextScore));
 }
 
 TEST_F(DocumentSourceMatchTest, ShouldOnlyAddOuterFieldAsDependencyOfImplicitEqualityPredicate) {
@@ -239,7 +239,7 @@ TEST_F(DocumentSourceMatchTest, ShouldOnlyAddOuterFieldAsDependencyOfImplicitEqu
     ASSERT_EQUALS(1U, dependencies.fields.count("a"));
     ASSERT_EQUALS(1U, dependencies.fields.size());
     ASSERT_EQUALS(false, dependencies.needWholeDocument);
-    ASSERT_EQUALS(false, dependencies.getNeedsMetadata(DepsTracker::MetadataType::TEXT_SCORE));
+    ASSERT_EQUALS(false, dependencies.getNeedsMetadata(DocumentMetadataFields::kTextScore));
 }
 
 TEST_F(DocumentSourceMatchTest, ShouldOnlyAddOuterFieldAsDependencyOfClausesWithinElemMatch) {
@@ -250,7 +250,7 @@ TEST_F(DocumentSourceMatchTest, ShouldOnlyAddOuterFieldAsDependencyOfClausesWith
     ASSERT_EQUALS(1U, dependencies.fields.count("a"));
     ASSERT_EQUALS(1U, dependencies.fields.size());
     ASSERT_EQUALS(false, dependencies.needWholeDocument);
-    ASSERT_EQUALS(false, dependencies.getNeedsMetadata(DepsTracker::MetadataType::TEXT_SCORE));
+    ASSERT_EQUALS(false, dependencies.getNeedsMetadata(DocumentMetadataFields::kTextScore));
 }
 
 TEST_F(DocumentSourceMatchTest,
@@ -267,7 +267,7 @@ TEST_F(DocumentSourceMatchTest,
     ASSERT_EQUALS(1U, dependencies.fields.count("a"));
     ASSERT_EQUALS(1U, dependencies.fields.size());
     ASSERT_EQUALS(false, dependencies.needWholeDocument);
-    ASSERT_EQUALS(false, dependencies.getNeedsMetadata(DepsTracker::MetadataType::TEXT_SCORE));
+    ASSERT_EQUALS(false, dependencies.getNeedsMetadata(DocumentMetadataFields::kTextScore));
 }
 
 TEST_F(DocumentSourceMatchTest,
@@ -278,7 +278,7 @@ TEST_F(DocumentSourceMatchTest,
     ASSERT_EQUALS(DepsTracker::State::SEE_NEXT, match->getDependencies(&dependencies));
     ASSERT_EQUALS(0U, dependencies.fields.size());
     ASSERT_EQUALS(true, dependencies.needWholeDocument);
-    ASSERT_EQUALS(false, dependencies.getNeedsMetadata(DepsTracker::MetadataType::TEXT_SCORE));
+    ASSERT_EQUALS(false, dependencies.getNeedsMetadata(DocumentMetadataFields::kTextScore));
 }
 
 TEST_F(DocumentSourceMatchTest,
@@ -289,7 +289,7 @@ TEST_F(DocumentSourceMatchTest,
     ASSERT_EQUALS(DepsTracker::State::SEE_NEXT, match->getDependencies(&dependencies1));
     ASSERT_EQUALS(0U, dependencies1.fields.size());
     ASSERT_EQUALS(true, dependencies1.needWholeDocument);
-    ASSERT_EQUALS(false, dependencies1.getNeedsMetadata(DepsTracker::MetadataType::TEXT_SCORE));
+    ASSERT_EQUALS(false, dependencies1.getNeedsMetadata(DocumentMetadataFields::kTextScore));
 
     query = fromjson("{a: {$_internalSchemaObjectMatch: {$_internalSchemaMaxProperties: 1}}}");
     match = DocumentSourceMatch::create(query, getExpCtx());
@@ -298,7 +298,7 @@ TEST_F(DocumentSourceMatchTest,
     ASSERT_EQUALS(1U, dependencies2.fields.size());
     ASSERT_EQUALS(1U, dependencies2.fields.count("a"));
     ASSERT_EQUALS(false, dependencies2.needWholeDocument);
-    ASSERT_EQUALS(false, dependencies2.getNeedsMetadata(DepsTracker::MetadataType::TEXT_SCORE));
+    ASSERT_EQUALS(false, dependencies2.getNeedsMetadata(DocumentMetadataFields::kTextScore));
 }
 
 TEST_F(DocumentSourceMatchTest,
@@ -311,7 +311,7 @@ TEST_F(DocumentSourceMatchTest,
     ASSERT_EQUALS(DepsTracker::State::SEE_NEXT, match->getDependencies(&dependencies));
     ASSERT_EQUALS(1U, dependencies.fields.size());
     ASSERT_EQUALS(true, dependencies.needWholeDocument);
-    ASSERT_EQUALS(false, dependencies.getNeedsMetadata(DepsTracker::MetadataType::TEXT_SCORE));
+    ASSERT_EQUALS(false, dependencies.getNeedsMetadata(DocumentMetadataFields::kTextScore));
 }
 
 TEST_F(DocumentSourceMatchTest,
@@ -322,7 +322,7 @@ TEST_F(DocumentSourceMatchTest,
     ASSERT_EQUALS(DepsTracker::State::SEE_NEXT, match->getDependencies(&dependencies));
     ASSERT_EQUALS(0U, dependencies.fields.size());
     ASSERT_EQUALS(true, dependencies.needWholeDocument);
-    ASSERT_EQUALS(false, dependencies.getNeedsMetadata(DepsTracker::MetadataType::TEXT_SCORE));
+    ASSERT_EQUALS(false, dependencies.getNeedsMetadata(DocumentMetadataFields::kTextScore));
 }
 
 TEST_F(DocumentSourceMatchTest, ShouldAddCorrectDependenciesForClausesWithInternalSchemaType) {
@@ -333,7 +333,7 @@ TEST_F(DocumentSourceMatchTest, ShouldAddCorrectDependenciesForClausesWithIntern
     ASSERT_EQUALS(1U, dependencies.fields.size());
     ASSERT_EQUALS(1U, dependencies.fields.count("a"));
     ASSERT_EQUALS(false, dependencies.needWholeDocument);
-    ASSERT_EQUALS(false, dependencies.getNeedsMetadata(DepsTracker::MetadataType::TEXT_SCORE));
+    ASSERT_EQUALS(false, dependencies.getNeedsMetadata(DocumentMetadataFields::kTextScore));
 }
 
 TEST_F(DocumentSourceMatchTest, ShouldAddCorrectDependenciesForClausesWithInternalSchemaCond) {
@@ -346,7 +346,7 @@ TEST_F(DocumentSourceMatchTest, ShouldAddCorrectDependenciesForClausesWithIntern
     ASSERT_EQUALS(1U, dependencies.fields.count("b"));
     ASSERT_EQUALS(1U, dependencies.fields.count("c"));
     ASSERT_EQUALS(false, dependencies.needWholeDocument);
-    ASSERT_EQUALS(false, dependencies.getNeedsMetadata(DepsTracker::MetadataType::TEXT_SCORE));
+    ASSERT_EQUALS(false, dependencies.getNeedsMetadata(DocumentMetadataFields::kTextScore));
 }
 
 TEST_F(DocumentSourceMatchTest, ShouldAddCorrectDependenciesForClausesWithInternalSchemaXor) {
@@ -359,7 +359,7 @@ TEST_F(DocumentSourceMatchTest, ShouldAddCorrectDependenciesForClausesWithIntern
     ASSERT_EQUALS(1U, dependencies.fields.count("b"));
     ASSERT_EQUALS(1U, dependencies.fields.count("c"));
     ASSERT_EQUALS(false, dependencies.needWholeDocument);
-    ASSERT_EQUALS(false, dependencies.getNeedsMetadata(DepsTracker::MetadataType::TEXT_SCORE));
+    ASSERT_EQUALS(false, dependencies.getNeedsMetadata(DocumentMetadataFields::kTextScore));
 }
 
 TEST_F(DocumentSourceMatchTest, ShouldAddCorrectDependenciesForClausesWithEmptyJSONSchema) {
@@ -369,7 +369,7 @@ TEST_F(DocumentSourceMatchTest, ShouldAddCorrectDependenciesForClausesWithEmptyJ
     ASSERT_EQUALS(DepsTracker::State::SEE_NEXT, match->getDependencies(&dependencies));
     ASSERT_EQUALS(0U, dependencies.fields.size());
     ASSERT_EQUALS(false, dependencies.needWholeDocument);
-    ASSERT_EQUALS(false, dependencies.getNeedsMetadata(DepsTracker::MetadataType::TEXT_SCORE));
+    ASSERT_EQUALS(false, dependencies.getNeedsMetadata(DocumentMetadataFields::kTextScore));
 }
 
 TEST_F(DocumentSourceMatchTest, ShouldAddCorrectDependenciesForClausesWithJSONSchemaProperties) {
@@ -380,7 +380,7 @@ TEST_F(DocumentSourceMatchTest, ShouldAddCorrectDependenciesForClausesWithJSONSc
     ASSERT_EQUALS(1U, dependencies.fields.count("a"));
     ASSERT_EQUALS(1U, dependencies.fields.size());
     ASSERT_EQUALS(false, dependencies.needWholeDocument);
-    ASSERT_EQUALS(false, dependencies.getNeedsMetadata(DepsTracker::MetadataType::TEXT_SCORE));
+    ASSERT_EQUALS(false, dependencies.getNeedsMetadata(DocumentMetadataFields::kTextScore));
 }
 
 TEST_F(DocumentSourceMatchTest, ShouldAddCorrectDependenciesForMultiplePredicatesWithJSONSchema) {
@@ -392,7 +392,7 @@ TEST_F(DocumentSourceMatchTest, ShouldAddCorrectDependenciesForMultiplePredicate
     ASSERT_EQUALS(1U, dependencies.fields.count("a"));
     ASSERT_EQUALS(1U, dependencies.fields.count("b"));
     ASSERT_EQUALS(false, dependencies.needWholeDocument);
-    ASSERT_EQUALS(false, dependencies.getNeedsMetadata(DepsTracker::MetadataType::TEXT_SCORE));
+    ASSERT_EQUALS(false, dependencies.getNeedsMetadata(DocumentMetadataFields::kTextScore));
 }
 
 TEST_F(DocumentSourceMatchTest, ShouldAddOuterFieldToDependenciesIfElemMatchContainsNoFieldNames) {
@@ -403,7 +403,7 @@ TEST_F(DocumentSourceMatchTest, ShouldAddOuterFieldToDependenciesIfElemMatchCont
     ASSERT_EQUALS(1U, dependencies.fields.count("a"));
     ASSERT_EQUALS(1U, dependencies.fields.size());
     ASSERT_EQUALS(false, dependencies.needWholeDocument);
-    ASSERT_EQUALS(false, dependencies.getNeedsMetadata(DepsTracker::MetadataType::TEXT_SCORE));
+    ASSERT_EQUALS(false, dependencies.getNeedsMetadata(DocumentMetadataFields::kTextScore));
 }
 
 TEST_F(DocumentSourceMatchTest, ShouldAddNotClausesFieldAsDependency) {
@@ -413,7 +413,7 @@ TEST_F(DocumentSourceMatchTest, ShouldAddNotClausesFieldAsDependency) {
     ASSERT_EQUALS(1U, dependencies.fields.count("b"));
     ASSERT_EQUALS(1U, dependencies.fields.size());
     ASSERT_EQUALS(false, dependencies.needWholeDocument);
-    ASSERT_EQUALS(false, dependencies.getNeedsMetadata(DepsTracker::MetadataType::TEXT_SCORE));
+    ASSERT_EQUALS(false, dependencies.getNeedsMetadata(DocumentMetadataFields::kTextScore));
 }
 
 TEST_F(DocumentSourceMatchTest, ShouldAddDependenciesOfEachNorClause) {
@@ -425,7 +425,7 @@ TEST_F(DocumentSourceMatchTest, ShouldAddDependenciesOfEachNorClause) {
     ASSERT_EQUALS(1U, dependencies.fields.count("b.c"));
     ASSERT_EQUALS(2U, dependencies.fields.size());
     ASSERT_EQUALS(false, dependencies.needWholeDocument);
-    ASSERT_EQUALS(false, dependencies.getNeedsMetadata(DepsTracker::MetadataType::TEXT_SCORE));
+    ASSERT_EQUALS(false, dependencies.getNeedsMetadata(DocumentMetadataFields::kTextScore));
 }
 
 TEST_F(DocumentSourceMatchTest, CommentShouldNotAddAnyDependencies) {
@@ -434,7 +434,7 @@ TEST_F(DocumentSourceMatchTest, CommentShouldNotAddAnyDependencies) {
     ASSERT_EQUALS(DepsTracker::State::SEE_NEXT, match->getDependencies(&dependencies));
     ASSERT_EQUALS(0U, dependencies.fields.size());
     ASSERT_EQUALS(false, dependencies.needWholeDocument);
-    ASSERT_EQUALS(false, dependencies.getNeedsMetadata(DepsTracker::MetadataType::TEXT_SCORE));
+    ASSERT_EQUALS(false, dependencies.getNeedsMetadata(DocumentMetadataFields::kTextScore));
 }
 
 TEST_F(DocumentSourceMatchTest, ClauseAndedWithCommentShouldAddDependencies) {
@@ -445,7 +445,7 @@ TEST_F(DocumentSourceMatchTest, ClauseAndedWithCommentShouldAddDependencies) {
     ASSERT_EQUALS(1U, dependencies.fields.count("a"));
     ASSERT_EQUALS(1U, dependencies.fields.size());
     ASSERT_EQUALS(false, dependencies.needWholeDocument);
-    ASSERT_EQUALS(false, dependencies.getNeedsMetadata(DepsTracker::MetadataType::TEXT_SCORE));
+    ASSERT_EQUALS(false, dependencies.getNeedsMetadata(DocumentMetadataFields::kTextScore));
 }
 
 TEST_F(DocumentSourceMatchTest, MultipleMatchStagesShouldCombineIntoOne) {
@@ -477,13 +477,14 @@ TEST_F(DocumentSourceMatchTest, MultipleMatchStagesShouldCombineIntoOne) {
 
 TEST_F(DocumentSourceMatchTest, ShouldPropagatePauses) {
     auto match = DocumentSourceMatch::create(BSON("a" << 1), getExpCtx());
-    auto mock = DocumentSourceMock::create({DocumentSource::GetNextResult::makePauseExecution(),
-                                            Document{{"a", 1}},
-                                            DocumentSource::GetNextResult::makePauseExecution(),
-                                            Document{{"a", 2}},
-                                            Document{{"a", 2}},
-                                            DocumentSource::GetNextResult::makePauseExecution(),
-                                            Document{{"a", 1}}});
+    auto mock =
+        DocumentSourceMock::createForTest({DocumentSource::GetNextResult::makePauseExecution(),
+                                           Document{{"a", 1}},
+                                           DocumentSource::GetNextResult::makePauseExecution(),
+                                           Document{{"a", 2}},
+                                           Document{{"a", 2}},
+                                           DocumentSource::GetNextResult::makePauseExecution(),
+                                           Document{{"a", 1}}});
     match->setSource(mock.get());
 
     ASSERT_TRUE(match->getNext().isPaused());
@@ -504,10 +505,10 @@ TEST_F(DocumentSourceMatchTest, ShouldCorrectlyJoinWithSubsequentMatch) {
 
     match->joinMatchWith(secondMatch);
 
-    const auto mock = DocumentSourceMock::create({Document{{"a", 1}, {"b", 1}},
-                                                  Document{{"a", 2}, {"b", 1}},
-                                                  Document{{"a", 1}, {"b", 2}},
-                                                  Document{{"a", 2}, {"b", 2}}});
+    const auto mock = DocumentSourceMock::createForTest({Document{{"a", 1}, {"b", 1}},
+                                                         Document{{"a", 2}, {"b", 1}},
+                                                         Document{{"a", 1}, {"b", 2}},
+                                                         Document{{"a", 2}, {"b", 2}}});
 
     match->setSource(mock.get());
 
@@ -565,7 +566,7 @@ TEST_F(DocumentSourceMatchTest, ShouldMatchCorrectlyAfterDescendingMatch) {
 
     const auto descendedMatch =
         DocumentSourceMatch::descendMatchOnPath(matchExpression.get(), "a", expCtx);
-    const auto mock = DocumentSourceMock::create(
+    const auto mock = DocumentSourceMock::createForTest(
         {Document{{"b", 1}, {"c", 1}, {"d", 1}},
          Document{{"b", 1}, {"a", Document{{"c", 1}}}, {"d", 1}},
          Document{{"a", Document{{"b", 1}}}, {"a", Document{{"c", 1}}}, {"d", 1}},
@@ -588,7 +589,7 @@ TEST_F(DocumentSourceMatchTest, ShouldCorrectlyEvaluateElemMatchPredicate) {
 
     const std::vector<Document> matchingVector = {Document{{"b", 0}}, Document{{"b", 1}}};
     const std::vector<Document> nonMatchingVector = {Document{{"b", 0}}, Document{{"b", 2}}};
-    const auto mock = DocumentSourceMock::create(
+    const auto mock = DocumentSourceMock::createForTest(
         {Document{{"a", matchingVector}}, Document{{"a", nonMatchingVector}}, Document{{"a", 1}}});
 
     match->setSource(mock.get());
@@ -608,8 +609,8 @@ TEST_F(DocumentSourceMatchTest, ShouldCorrectlyEvaluateJSONSchemaPredicate) {
     const auto match = DocumentSourceMatch::create(
         fromjson("{$jsonSchema: {properties: {a: {type: 'number'}}}}"), getExpCtx());
 
-    const auto mock = DocumentSourceMock::create(
-        {Document{{"a", 1}}, Document{{"a", "str"_sd}}, Document{{"a", {Document{{0, 1}}}}}});
+    const auto mock = DocumentSourceMock::createForTest(
+        {Document{{"a", 1}}, Document{{"a", "str"_sd}}, Document{{"a", {Document{{nullptr, 1}}}}}});
 
     match->setSource(mock.get());
 

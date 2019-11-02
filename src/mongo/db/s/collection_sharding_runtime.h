@@ -29,7 +29,6 @@
 
 #pragma once
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/s/collection_sharding_state.h"
@@ -48,7 +47,8 @@ extern AtomicWord<int> migrationLockAcquisitionMaxWaitMS;
  */
 class CollectionShardingRuntime final : public CollectionShardingState,
                                         public Decorable<CollectionShardingRuntime> {
-    MONGO_DISALLOW_COPYING(CollectionShardingRuntime);
+    CollectionShardingRuntime(const CollectionShardingRuntime&) = delete;
+    CollectionShardingRuntime& operator=(const CollectionShardingRuntime&) = delete;
 
 public:
     CollectionShardingRuntime(ServiceContext* sc,
@@ -63,6 +63,13 @@ public:
      * returned pointer should never be stored.
      */
     static CollectionShardingRuntime* get(OperationContext* opCtx, const NamespaceString& nss);
+
+    /**
+     * It is the caller's responsibility to ensure that the collection locks for this namespace are
+     * held when this is called. The returned pointer should never be stored.
+     */
+    static CollectionShardingRuntime* get_UNSAFE(ServiceContext* svcCtx,
+                                                 const NamespaceString& nss);
 
     /**
      * Updates the collection's filtering metadata based on changes received from the config server
@@ -163,7 +170,8 @@ private:
  * RAII-style class, which obtains a reference to the critical section for the specified collection.
  */
 class CollectionCriticalSection {
-    MONGO_DISALLOW_COPYING(CollectionCriticalSection);
+    CollectionCriticalSection(const CollectionCriticalSection&) = delete;
+    CollectionCriticalSection& operator=(const CollectionCriticalSection&) = delete;
 
 public:
     CollectionCriticalSection(OperationContext* opCtx, NamespaceString ns);

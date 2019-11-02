@@ -41,39 +41,36 @@
 #include "mongo/db/record_id.h"
 #include "mongo/db/storage/kv/kv_prefix.h"
 #include "mongo/platform/atomic_word.h"
-#include "mongo/stdx/mutex.h"
+#include "mongo/platform/mutex.h"
 
 namespace mongo {
 
 class CollatorInterface;
-class CollectionCatalogEntry;
-class CollectionInfoCache;
-class HeadManager;
+class CollectionQueryInfo;
 class IndexAccessMethod;
 class IndexDescriptor;
 class MatchExpression;
 class OperationContext;
 
 class IndexCatalogEntryImpl : public IndexCatalogEntry {
-    MONGO_DISALLOW_COPYING(IndexCatalogEntryImpl);
+    IndexCatalogEntryImpl(const IndexCatalogEntryImpl&) = delete;
+    IndexCatalogEntryImpl& operator=(const IndexCatalogEntryImpl&) = delete;
 
 public:
-    explicit IndexCatalogEntryImpl(
-        OperationContext* opCtx,
-        StringData ns,
-        CollectionCatalogEntry* collection,           // not owned
-        std::unique_ptr<IndexDescriptor> descriptor,  // ownership passes to me
-        CollectionInfoCache* infoCache);              // not owned, optional
+    IndexCatalogEntryImpl(OperationContext* opCtx,
+                          const std::string& ident,
+                          std::unique_ptr<IndexDescriptor> descriptor,  // ownership passes to me
+                          CollectionQueryInfo* queryInfo);              // not owned, optional
 
     ~IndexCatalogEntryImpl() final;
 
-    const std::string& ns() const final {
-        return _ns;
-    }
-
-    void setNs(NamespaceString ns) final;
+    const NamespaceString& ns() const final;
 
     void init(std::unique_ptr<IndexAccessMethod> accessMethod) final;
+
+    const std::string& getIdent() const final {
+        return _ident;
+    }
 
     IndexDescriptor* descriptor() final {
         return _descriptor.get();
@@ -119,14 +116,14 @@ public:
 
     /// ---------------------
 
-    const RecordId& head(OperationContext* opCtx) const final;
-
-    void setHead(OperationContext* opCtx, RecordId newHead) final;
-
     void setIsReady(bool newIsReady) final;
 
-    HeadManager* headManager() const final {
-        return _headManager.get();
+    void setDropped() final {
+        _isDropped.store(true);
+    }
+
+    bool isDropped() const final {
+        return _isDropped.load();
     }
 
     // --
@@ -134,7 +131,7 @@ public:
     /**
      * Returns true if this index is multikey, and returns false otherwise.
      */
-    bool isMultikey(OperationContext* opCtx) const final;
+    bool isMultikey() const final;
 
     /**
      * Returns the path components that cause this index to be multikey if this index supports
@@ -164,10 +161,6 @@ public:
      */
     void setMultikey(OperationContext* opCtx, const MultikeyPaths& multikeyPaths) final;
 
-    // TODO SERVER-36385 Remove this function: we don't set the feature tracker bit in 4.4 because
-    // 4.4 can only downgrade to 4.2 which can read long TypeBits.
-    void setIndexKeyStringWithLongTypeBitsExistsOnDisk(OperationContext* opCtx) final;
-
     // if this ready is ready for queries
     bool isReady(OperationContext* opCtx) const final;
 
@@ -183,17 +176,17 @@ public:
         return _minVisibleSnapshot;
     }
 
-    void setMinimumVisibleSnapshot(Timestamp name) final {
-        _minVisibleSnapshot = name;
-    }
+    /**
+     * Updates the minimum visible snapshot. The 'newMinimumVisibleSnapshot' is ignored if it would
+     * set the minimum visible snapshot backwards in time.
+     */
+    void setMinimumVisibleSnapshot(Timestamp newMinimumVisibleSnapshot) final;
 
 private:
     class SetMultikeyChange;
-    class SetHeadChange;
 
     bool _catalogIsReady(OperationContext* opCtx) const;
     bool _catalogIsPresent(OperationContext* opCtx) const;
-    RecordId _catalogHead(OperationContext* opCtx) const;
 
     /**
      * Retrieves the multikey information associated with this index from '_collection',
@@ -206,28 +199,24 @@ private:
 
     // -----
 
-    std::string _ns;
-
-    CollectionCatalogEntry* _collection;  // not owned here
+    const std::string _ident;
 
     std::unique_ptr<IndexDescriptor> _descriptor;  // owned here
 
-    CollectionInfoCache* _infoCache;  // not owned here
+    CollectionQueryInfo* _queryInfo;  // not owned here
 
     std::unique_ptr<IndexAccessMethod> _accessMethod;
 
     IndexBuildInterceptor* _indexBuildInterceptor = nullptr;  // not owned here
 
-    // Owned here.
-    std::unique_ptr<HeadManager> _headManager;
     std::unique_ptr<CollatorInterface> _collator;
     std::unique_ptr<MatchExpression> _filterExpression;
 
     // cached stuff
 
-    Ordering _ordering;  // TODO: this might be b-tree specific
-    bool _isReady;       // cache of NamespaceDetails info
-    RecordId _head;      // cache of IndexDetails
+    Ordering _ordering;           // TODO: this might be b-tree specific
+    bool _isReady;                // cache of NamespaceDetails info
+    AtomicWord<bool> _isDropped;  // Whether the index drop is committed.
 
     // Set to true if this index supports path-level multikey tracking.
     // '_indexTracksPathLevelMultikeyInfo' is effectively const after IndexCatalogEntry::init() is
@@ -235,13 +224,14 @@ private:
     bool _indexTracksPathLevelMultikeyInfo = false;
 
     // Set to true if this index is multikey. '_isMultikey' serves as a cache of the information
-    // stored in the NamespaceDetails or KVCatalog.
+    // stored in the NamespaceDetails or DurableCatalog.
     AtomicWord<bool> _isMultikey;
 
     // Controls concurrent access to '_indexMultikeyPaths'. We acquire this mutex rather than the
     // RESOURCE_METADATA lock as a performance optimization so that it is cheaper to detect whether
     // there is actually any path-level multikey information to update or not.
-    mutable stdx::mutex _indexMultikeyPathsMutex;
+    mutable Mutex _indexMultikeyPathsMutex =
+        MONGO_MAKE_LATCH("IndexCatalogEntryImpl::_indexMultikeyPathsMutex");
 
     // Non-empty only if '_indexTracksPathLevelMultikeyInfo' is true.
     //

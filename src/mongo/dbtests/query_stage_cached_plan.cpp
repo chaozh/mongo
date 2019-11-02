@@ -29,6 +29,8 @@
 
 #include "mongo/platform/basic.h"
 
+#include <memory>
+
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database.h"
@@ -42,13 +44,13 @@
 #include "mongo/db/json.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/query/canonical_query.h"
+#include "mongo/db/query/collection_query_info.h"
 #include "mongo/db/query/get_executor.h"
 #include "mongo/db/query/plan_cache.h"
 #include "mongo/db/query/plan_yield_policy.h"
 #include "mongo/db/query/query_knobs_gen.h"
 #include "mongo/db/query/query_planner_params.h"
 #include "mongo/dbtests/dbtests.h"
-#include "mongo/stdx/memory.h"
 
 namespace QueryStageCachedPlan {
 
@@ -58,13 +60,13 @@ namespace {
 std::unique_ptr<CanonicalQuery> canonicalQueryFromFilterObj(OperationContext* opCtx,
                                                             const NamespaceString& nss,
                                                             BSONObj filter) {
-    auto qr = stdx::make_unique<QueryRequest>(nss);
+    auto qr = std::make_unique<QueryRequest>(nss);
     qr->setFilter(filter);
     auto statusWithCQ = CanonicalQuery::canonicalize(opCtx, std::move(qr));
     uassertStatusOK(statusWithCQ.getStatus());
     return std::move(statusWithCQ.getValue());
 }
-}
+}  // namespace
 
 class QueryStageCachedPlan : public unittest::Test {
 public:
@@ -105,7 +107,7 @@ public:
         }
 
         WriteUnitOfWork wuow(&_opCtx);
-        database->dropCollection(&_opCtx, nss.ns()).transitional_ignore();
+        database->dropCollection(&_opCtx, nss).transitional_ignore();
         wuow.commit();
     }
 
@@ -133,8 +135,8 @@ public:
             ASSERT_NE(state, PlanStage::FAILURE);
 
             if (state == PlanStage::ADVANCED) {
-                WorkingSetMember* member = ws.get(id);
-                ASSERT(cq->root()->matchesBSON(member->obj.value()));
+                auto member = ws.get(id);
+                ASSERT(cq->root()->matchesBSON(member->doc.value().toBson()));
                 numResults++;
             }
         }
@@ -150,13 +152,13 @@ public:
         const size_t decisionWorks = 10;
         const size_t mockWorks =
             1U + static_cast<size_t>(internalQueryCacheEvictionRatio * decisionWorks);
-        auto mockChild = stdx::make_unique<QueuedDataStage>(&_opCtx, &_ws);
+        auto mockChild = std::make_unique<QueuedDataStage>(&_opCtx, &_ws);
         for (size_t i = 0; i < mockWorks; i++) {
             mockChild->pushBack(PlanStage::NEED_TIME);
         }
 
         CachedPlanStage cachedPlanStage(
-            &_opCtx, collection, &_ws, cq, plannerParams, decisionWorks, mockChild.release());
+            &_opCtx, collection, &_ws, cq, plannerParams, decisionWorks, std::move(mockChild));
 
         // This should succeed after triggering a replan.
         PlanYieldPolicy yieldPolicy(PlanExecutor::NO_YIELD,
@@ -181,14 +183,14 @@ TEST_F(QueryStageCachedPlan, QueryStageCachedPlanFailure) {
     ASSERT(collection);
 
     // Query can be answered by either index on "a" or index on "b".
-    auto qr = stdx::make_unique<QueryRequest>(nss);
+    auto qr = std::make_unique<QueryRequest>(nss);
     qr->setFilter(fromjson("{a: {$gte: 8}, b: 1}"));
     auto statusWithCQ = CanonicalQuery::canonicalize(opCtx(), std::move(qr));
     ASSERT_OK(statusWithCQ.getStatus());
     const std::unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
 
     // We shouldn't have anything in the plan cache for this shape yet.
-    PlanCache* cache = collection->infoCache()->getPlanCache();
+    PlanCache* cache = CollectionQueryInfo::get(collection).getPlanCache();
     ASSERT(cache);
     ASSERT_EQ(cache->get(*cq).state, PlanCache::CacheEntryState::kNotPresent);
 
@@ -197,13 +199,13 @@ TEST_F(QueryStageCachedPlan, QueryStageCachedPlanFailure) {
     fillOutPlannerParams(&_opCtx, collection, cq.get(), &plannerParams);
 
     // Queued data stage will return a failure during the cached plan trial period.
-    auto mockChild = stdx::make_unique<QueuedDataStage>(&_opCtx, &_ws);
+    auto mockChild = std::make_unique<QueuedDataStage>(&_opCtx, &_ws);
     mockChild->pushBack(PlanStage::FAILURE);
 
     // High enough so that we shouldn't trigger a replan based on works.
     const size_t decisionWorks = 50;
     CachedPlanStage cachedPlanStage(
-        &_opCtx, collection, &_ws, cq.get(), plannerParams, decisionWorks, mockChild.release());
+        &_opCtx, collection, &_ws, cq.get(), plannerParams, decisionWorks, std::move(mockChild));
 
     // This should succeed after triggering a replan.
     PlanYieldPolicy yieldPolicy(PlanExecutor::NO_YIELD,
@@ -227,14 +229,14 @@ TEST_F(QueryStageCachedPlan, QueryStageCachedPlanHitMaxWorks) {
     ASSERT(collection);
 
     // Query can be answered by either index on "a" or index on "b".
-    auto qr = stdx::make_unique<QueryRequest>(nss);
+    auto qr = std::make_unique<QueryRequest>(nss);
     qr->setFilter(fromjson("{a: {$gte: 8}, b: 1}"));
     auto statusWithCQ = CanonicalQuery::canonicalize(opCtx(), std::move(qr));
     ASSERT_OK(statusWithCQ.getStatus());
     const std::unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
 
     // We shouldn't have anything in the plan cache for this shape yet.
-    PlanCache* cache = collection->infoCache()->getPlanCache();
+    PlanCache* cache = CollectionQueryInfo::get(collection).getPlanCache();
     ASSERT(cache);
     ASSERT_EQ(cache->get(*cq).state, PlanCache::CacheEntryState::kNotPresent);
 
@@ -247,13 +249,13 @@ TEST_F(QueryStageCachedPlan, QueryStageCachedPlanHitMaxWorks) {
     const size_t decisionWorks = 10;
     const size_t mockWorks =
         1U + static_cast<size_t>(internalQueryCacheEvictionRatio * decisionWorks);
-    auto mockChild = stdx::make_unique<QueuedDataStage>(&_opCtx, &_ws);
+    auto mockChild = std::make_unique<QueuedDataStage>(&_opCtx, &_ws);
     for (size_t i = 0; i < mockWorks; i++) {
         mockChild->pushBack(PlanStage::NEED_TIME);
     }
 
     CachedPlanStage cachedPlanStage(
-        &_opCtx, collection, &_ws, cq.get(), plannerParams, decisionWorks, mockChild.release());
+        &_opCtx, collection, &_ws, cq.get(), plannerParams, decisionWorks, std::move(mockChild));
 
     // This should succeed after triggering a replan.
     PlanYieldPolicy yieldPolicy(PlanExecutor::NO_YIELD,
@@ -285,7 +287,7 @@ TEST_F(QueryStageCachedPlan, QueryStageCachedPlanAddsActiveCacheEntries) {
         canonicalQueryFromFilterObj(opCtx(), nss, fromjson("{a: {$gte: 11}, b: {$gte: 11}}"));
 
     // We shouldn't have anything in the plan cache for this shape yet.
-    PlanCache* cache = collection->infoCache()->getPlanCache();
+    PlanCache* cache = CollectionQueryInfo::get(collection).getPlanCache();
     ASSERT(cache);
     ASSERT_EQ(cache->get(*shapeCq).state, PlanCache::CacheEntryState::kNotPresent);
 
@@ -344,7 +346,7 @@ TEST_F(QueryStageCachedPlan, DeactivatesEntriesOnReplan) {
         canonicalQueryFromFilterObj(opCtx(), nss, fromjson("{a: {$gte: 11}, b: {$gte: 11}}"));
 
     // We shouldn't have anything in the plan cache for this shape yet.
-    PlanCache* cache = collection->infoCache()->getPlanCache();
+    PlanCache* cache = CollectionQueryInfo::get(collection).getPlanCache();
     ASSERT(cache);
     ASSERT_EQ(cache->get(*shapeCq).state, PlanCache::CacheEntryState::kNotPresent);
 
@@ -403,7 +405,7 @@ TEST_F(QueryStageCachedPlan, EntriesAreNotDeactivatedWhenInactiveEntriesDisabled
         canonicalQueryFromFilterObj(opCtx(), nss, fromjson("{a: {$gte: 11}, b: {$gte: 11}}"));
 
     // We shouldn't have anything in the plan cache for this shape yet.
-    PlanCache* cache = collection->infoCache()->getPlanCache();
+    PlanCache* cache = CollectionQueryInfo::get(collection).getPlanCache();
     ASSERT(cache);
     ASSERT_EQ(cache->get(*shapeCq).state, PlanCache::CacheEntryState::kNotPresent);
 
@@ -437,13 +439,13 @@ TEST_F(QueryStageCachedPlan, ThrowsOnYieldRecoveryWhenIndexIsDroppedBeforePlanSe
     ASSERT(collection);
 
     // Query can be answered by either index on "a" or index on "b".
-    auto qr = stdx::make_unique<QueryRequest>(nss);
+    auto qr = std::make_unique<QueryRequest>(nss);
     auto statusWithCQ = CanonicalQuery::canonicalize(opCtx(), std::move(qr));
     ASSERT_OK(statusWithCQ.getStatus());
     const std::unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
 
     // We shouldn't have anything in the plan cache for this shape yet.
-    PlanCache* cache = collection->infoCache()->getPlanCache();
+    PlanCache* cache = CollectionQueryInfo::get(collection).getPlanCache();
     ASSERT(cache);
 
     // Get planner params.
@@ -457,7 +459,7 @@ TEST_F(QueryStageCachedPlan, ThrowsOnYieldRecoveryWhenIndexIsDroppedBeforePlanSe
                                     cq.get(),
                                     plannerParams,
                                     decisionWorks,
-                                    new QueuedDataStage(&_opCtx, &_ws));
+                                    std::make_unique<QueuedDataStage>(&_opCtx, &_ws));
 
     // Drop an index while the CachedPlanStage is in a saved state. Restoring should fail, since we
     // may still need the dropped index for plan selection.
@@ -479,13 +481,13 @@ TEST_F(QueryStageCachedPlan, DoesNotThrowOnYieldRecoveryWhenIndexIsDroppedAferPl
     ASSERT(collection);
 
     // Query can be answered by either index on "a" or index on "b".
-    auto qr = stdx::make_unique<QueryRequest>(nss);
+    auto qr = std::make_unique<QueryRequest>(nss);
     auto statusWithCQ = CanonicalQuery::canonicalize(opCtx(), std::move(qr));
     ASSERT_OK(statusWithCQ.getStatus());
     const std::unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
 
     // We shouldn't have anything in the plan cache for this shape yet.
-    PlanCache* cache = collection->infoCache()->getPlanCache();
+    PlanCache* cache = CollectionQueryInfo::get(collection).getPlanCache();
     ASSERT(cache);
 
     // Get planner params.
@@ -499,7 +501,7 @@ TEST_F(QueryStageCachedPlan, DoesNotThrowOnYieldRecoveryWhenIndexIsDroppedAferPl
                                     cq.get(),
                                     plannerParams,
                                     decisionWorks,
-                                    new QueuedDataStage(&_opCtx, &_ws));
+                                    std::make_unique<QueuedDataStage>(&_opCtx, &_ws));
 
     PlanYieldPolicy yieldPolicy(PlanExecutor::YIELD_MANUAL,
                                 _opCtx.getServiceContext()->getFastClockSource());

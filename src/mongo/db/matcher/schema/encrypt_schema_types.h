@@ -44,9 +44,8 @@ namespace mongo {
  * A JSON Pointer to the key id or an array of UUIDs identifying a set of keys.
  */
 class EncryptSchemaKeyId {
-    friend class EncryptionInfoNormalized;
-    friend class EncryptionMetadata;
     friend class EncryptionInfo;
+    friend class EncryptionMetadata;
 
 public:
     enum class Type {
@@ -90,6 +89,10 @@ public:
         return _type == Type::kUUIDs ? _uuids == other.uuids() : _pointer == other.jsonPointer();
     }
 
+    bool operator!=(const EncryptSchemaKeyId& other) const {
+        return !(*this == other);
+    }
+
     /**
      * IDL requires overload of all comparison operators, however for this class the only viable
      * comparison is equality. These should be removed once SERVER-39677 is implemented.
@@ -123,18 +126,21 @@ public:
      * This type is currenty only used for serialization, not parsing.
      */
     static EncryptSchemaAnyType parseFromBSON(const BSONElement& element) {
-        MONGO_UNREACHABLE;
+        return EncryptSchemaAnyType(element);
     }
 
     EncryptSchemaAnyType() = default;
-    EncryptSchemaAnyType(BSONElement element) : _element(element) {}
+    EncryptSchemaAnyType(const BSONElement& element) : _element(element) {}
 
     void serializeToBSON(StringData fieldName, BSONObjBuilder* builder) const {
         builder->appendAs(_element, fieldName);
     }
 
+    const BSONElement& getElement() const {
+        return _element;
+    }
+
 private:
     BSONElement _element;
 };
-
 }  // namespace mongo

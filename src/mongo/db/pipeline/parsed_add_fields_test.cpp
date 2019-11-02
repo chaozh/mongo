@@ -36,11 +36,11 @@
 #include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/bson/json.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/document_value_test_util.h"
+#include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/pipeline/dependencies.h"
-#include "mongo/db/pipeline/document.h"
-#include "mongo/db/pipeline/document_value_test_util.h"
 #include "mongo/db/pipeline/expression_context_for_test.h"
-#include "mongo/db/pipeline/value.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
@@ -545,8 +545,8 @@ TEST(ParsedAddFieldsExecutionTest, AlwaysKeepsMetadataFromOriginalDoc) {
     addition.parse(BSON("a" << true));
 
     MutableDocument inputDocBuilder(Document{{"a", 1}});
-    inputDocBuilder.setRandMetaField(1.0);
-    inputDocBuilder.setTextScore(10.0);
+    inputDocBuilder.metadata().setRandVal(1.0);
+    inputDocBuilder.metadata().setTextScore(10.0);
     Document inputDoc = inputDocBuilder.freeze();
 
     auto result = addition.applyProjection(inputDoc);

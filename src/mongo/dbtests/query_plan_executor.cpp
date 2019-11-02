@@ -30,6 +30,8 @@
 
 #include "mongo/platform/basic.h"
 
+#include <memory>
+
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/index_catalog.h"
@@ -52,7 +54,6 @@
 #include "mongo/db/query/plan_executor.h"
 #include "mongo/db/query/query_solution.h"
 #include "mongo/dbtests/dbtests.h"
-#include "mongo/stdx/memory.h"
 
 namespace mongo {
 namespace {
@@ -60,7 +61,6 @@ namespace {
 using std::shared_ptr;
 using std::string;
 using std::unique_ptr;
-using stdx::make_unique;
 
 static const NamespaceString nss("unittests.QueryPlanExecutor");
 
@@ -106,21 +106,21 @@ public:
         unique_ptr<WorkingSet> ws(new WorkingSet());
 
         // Canonicalize the query.
-        auto qr = stdx::make_unique<QueryRequest>(nss);
+        auto qr = std::make_unique<QueryRequest>(nss);
         qr->setFilter(filterObj);
         qr->setTailableMode(tailableMode);
         auto statusWithCQ = CanonicalQuery::canonicalize(&_opCtx, std::move(qr));
         ASSERT_OK(statusWithCQ.getStatus());
         unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
-        verify(NULL != cq.get());
+        verify(nullptr != cq.get());
 
         // Make the stage.
         unique_ptr<PlanStage> root(
             new CollectionScan(&_opCtx, coll, csparams, ws.get(), cq.get()->root()));
 
         // Hand the plan off to the executor.
-        auto statusWithPlanExecutor = PlanExecutor::make(
-            &_opCtx, std::move(ws), std::move(root), std::move(cq), coll, yieldPolicy);
+        auto statusWithPlanExecutor =
+            PlanExecutor::make(std::move(cq), std::move(ws), std::move(root), coll, yieldPolicy);
         ASSERT_OK(statusWithPlanExecutor.getStatus());
         return std::move(statusWithPlanExecutor.getValue());
     }
@@ -148,25 +148,23 @@ public:
         ixparams.bounds.endKey = BSON("" << end);
         ixparams.bounds.boundInclusion = BoundInclusion::kIncludeBothStartAndEndKeys;
 
-        const Collection* coll = db->getCollection(&_opCtx, nss);
+        const Collection* coll = CollectionCatalog::get(&_opCtx).lookupCollectionByNamespace(nss);
+
 
         unique_ptr<WorkingSet> ws(new WorkingSet());
-        IndexScan* ix = new IndexScan(&_opCtx, ixparams, ws.get(), NULL);
-        unique_ptr<PlanStage> root(new FetchStage(&_opCtx, ws.get(), ix, NULL, coll));
+        auto ixscan = std::make_unique<IndexScan>(&_opCtx, ixparams, ws.get(), nullptr);
+        unique_ptr<PlanStage> root =
+            std::make_unique<FetchStage>(&_opCtx, ws.get(), std::move(ixscan), nullptr, coll);
 
-        auto qr = stdx::make_unique<QueryRequest>(nss);
+        auto qr = std::make_unique<QueryRequest>(nss);
         auto statusWithCQ = CanonicalQuery::canonicalize(&_opCtx, std::move(qr));
         verify(statusWithCQ.isOK());
         unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
-        verify(NULL != cq.get());
+        verify(nullptr != cq.get());
 
         // Hand the plan off to the executor.
-        auto statusWithPlanExecutor = PlanExecutor::make(&_opCtx,
-                                                         std::move(ws),
-                                                         std::move(root),
-                                                         std::move(cq),
-                                                         coll,
-                                                         PlanExecutor::YIELD_MANUAL);
+        auto statusWithPlanExecutor = PlanExecutor::make(
+            std::move(cq), std::move(ws), std::move(root), coll, PlanExecutor::YIELD_MANUAL);
         ASSERT_OK(statusWithPlanExecutor.getStatus());
         return std::move(statusWithPlanExecutor.getValue());
     }
@@ -177,7 +175,7 @@ protected:
 
 private:
     const IndexDescriptor* getIndex(Database* db, const BSONObj& obj) {
-        Collection* collection = db->getCollection(&_opCtx, nss);
+        Collection* collection = CollectionCatalog::get(&_opCtx).lookupCollectionByNamespace(nss);
         std::vector<const IndexDescriptor*> indexes;
         collection->getIndexCatalog()->findIndexesByKeyPattern(&_opCtx, obj, false, &indexes);
         ASSERT_LTE(indexes.size(), 1U);
@@ -218,8 +216,8 @@ TEST_F(PlanExecutorTest, DropIndexScanAgg) {
     auto pipeline = assertGet(Pipeline::create({cursorSource}, expCtx));
 
     // Create the output PlanExecutor that pulls results from the pipeline.
-    auto ws = make_unique<WorkingSet>();
-    auto proxy = make_unique<PipelineProxyStage>(&_opCtx, std::move(pipeline), ws.get());
+    auto ws = std::make_unique<WorkingSet>();
+    auto proxy = std::make_unique<PipelineProxyStage>(&_opCtx, std::move(pipeline), ws.get());
 
     auto statusWithPlanExecutor = PlanExecutor::make(
         &_opCtx, std::move(ws), std::move(proxy), collection, PlanExecutor::NO_YIELD);
@@ -334,7 +332,7 @@ protected:
         BSONObj objOut;
         int idcount = 0;
         PlanExecutor::ExecState state;
-        while (PlanExecutor::ADVANCED == (state = exec->getNext(&objOut, NULL))) {
+        while (PlanExecutor::ADVANCED == (state = exec->getNext(&objOut, nullptr))) {
             ASSERT_EQUALS(expectedIds[idcount], objOut["_id"].numberInt());
             ++idcount;
         }
@@ -358,7 +356,7 @@ TEST_F(PlanExecutorSnapshotTest, SnapshotControl) {
     auto exec = makeCollScanExec(coll, filterObj);
 
     BSONObj objOut;
-    ASSERT_EQUALS(PlanExecutor::ADVANCED, exec->getNext(&objOut, NULL));
+    ASSERT_EQUALS(PlanExecutor::ADVANCED, exec->getNext(&objOut, nullptr));
     ASSERT_EQUALS(2, objOut["a"].numberInt());
 
     forceDocumentMove();
@@ -382,7 +380,7 @@ TEST_F(PlanExecutorSnapshotTest, SnapshotTest) {
     auto exec = makeIndexScanExec(ctx.db(), indexSpec, 2, 5);
 
     BSONObj objOut;
-    ASSERT_EQUALS(PlanExecutor::ADVANCED, exec->getNext(&objOut, NULL));
+    ASSERT_EQUALS(PlanExecutor::ADVANCED, exec->getNext(&objOut, nullptr));
     ASSERT_EQUALS(2, objOut["a"].numberInt());
 
     forceDocumentMove();

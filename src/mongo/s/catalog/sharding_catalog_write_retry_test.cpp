@@ -31,6 +31,7 @@
 
 #include "mongo/platform/basic.h"
 
+#include <memory>
 #include <set>
 #include <string>
 #include <vector>
@@ -56,7 +57,6 @@
 #include "mongo/s/sharding_router_test_fixture.h"
 #include "mongo/s/write_ops/batched_command_response.h"
 #include "mongo/stdx/future.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
@@ -100,7 +100,7 @@ TEST_F(InsertRetryTest, RetryOnInterruptedAndNetworkErrorSuccess) {
     onCommand([&](const RemoteCommandRequest& request) {
         ASSERT_EQ(request.target, kTestHosts[0]);
         configTargeter()->setFindHostReturnValue({kTestHosts[1]});
-        return Status(ErrorCodes::InterruptedDueToStepDown, "Interruption");
+        return Status(ErrorCodes::InterruptedDueToReplStateChange, "Interruption");
     });
 
     onCommand([&](const RemoteCommandRequest& request) {
@@ -111,7 +111,7 @@ TEST_F(InsertRetryTest, RetryOnInterruptedAndNetworkErrorSuccess) {
 
     expectInserts(kTestNamespace, {objToInsert});
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(InsertRetryTest, RetryOnNetworkErrorFails) {
@@ -146,7 +146,7 @@ TEST_F(InsertRetryTest, RetryOnNetworkErrorFails) {
         return Status(ErrorCodes::NetworkTimeout, "Network timeout");
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(InsertRetryTest, DuplicateKeyErrorAfterNetworkErrorMatch) {
@@ -184,7 +184,7 @@ TEST_F(InsertRetryTest, DuplicateKeyErrorAfterNetworkErrorMatch) {
         return vector<BSONObj>{objToInsert};
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(InsertRetryTest, DuplicateKeyErrorAfterNetworkErrorNotFound) {
@@ -222,7 +222,7 @@ TEST_F(InsertRetryTest, DuplicateKeyErrorAfterNetworkErrorNotFound) {
         return vector<BSONObj>();
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(InsertRetryTest, DuplicateKeyErrorAfterNetworkErrorMismatch) {
@@ -261,7 +261,7 @@ TEST_F(InsertRetryTest, DuplicateKeyErrorAfterNetworkErrorMismatch) {
                                           << "TestValue has changed")};
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(InsertRetryTest, DuplicateKeyErrorAfterWriteConcernFailureMatch) {
@@ -288,7 +288,7 @@ TEST_F(InsertRetryTest, DuplicateKeyErrorAfterWriteConcernFailureMatch) {
         response.setStatus(Status::OK());
         response.setN(1);
 
-        auto wcError = stdx::make_unique<WriteConcernErrorDetail>();
+        auto wcError = std::make_unique<WriteConcernErrorDetail>();
 
         WriteConcernResult wcRes;
         wcRes.err = "timeout";
@@ -316,7 +316,7 @@ TEST_F(InsertRetryTest, DuplicateKeyErrorAfterWriteConcernFailureMatch) {
         return vector<BSONObj>{objToInsert};
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(UpdateRetryTest, Success) {
@@ -350,7 +350,7 @@ TEST_F(UpdateRetryTest, Success) {
         return response.toBSON();
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(UpdateRetryTest, NotMasterErrorReturnedPersistently) {
@@ -380,7 +380,7 @@ TEST_F(UpdateRetryTest, NotMasterErrorReturnedPersistently) {
         });
     }
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(UpdateRetryTest, NotMasterReturnedFromTargeter) {
@@ -402,7 +402,7 @@ TEST_F(UpdateRetryTest, NotMasterReturnedFromTargeter) {
         ASSERT_EQUALS(ErrorCodes::NotMaster, status);
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(UpdateRetryTest, NotMasterOnceSuccessAfterRetry) {
@@ -456,7 +456,7 @@ TEST_F(UpdateRetryTest, NotMasterOnceSuccessAfterRetry) {
         return response.toBSON();
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(UpdateRetryTest, OperationInterruptedDueToPrimaryStepDown) {
@@ -486,9 +486,10 @@ TEST_F(UpdateRetryTest, OperationInterruptedDueToPrimaryStepDown) {
         BatchedCommandResponse response;
         response.setStatus(Status::OK());
 
-        auto writeErrDetail = stdx::make_unique<WriteErrorDetail>();
+        auto writeErrDetail = std::make_unique<WriteErrorDetail>();
         writeErrDetail->setIndex(0);
-        writeErrDetail->setStatus({ErrorCodes::InterruptedDueToStepDown, "Operation interrupted"});
+        writeErrDetail->setStatus(
+            {ErrorCodes::InterruptedDueToReplStateChange, "Operation interrupted"});
         response.addToErrDetails(writeErrDetail.release());
 
         return response.toBSON();
@@ -506,7 +507,7 @@ TEST_F(UpdateRetryTest, OperationInterruptedDueToPrimaryStepDown) {
         return response.toBSON();
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(UpdateRetryTest, WriteConcernFailure) {
@@ -537,7 +538,7 @@ TEST_F(UpdateRetryTest, WriteConcernFailure) {
         response.setStatus(Status::OK());
         response.setNModified(1);
 
-        auto wcError = stdx::make_unique<WriteConcernErrorDetail>();
+        auto wcError = std::make_unique<WriteConcernErrorDetail>();
 
         WriteConcernResult wcRes;
         wcRes.err = "timeout";
@@ -563,7 +564,7 @@ TEST_F(UpdateRetryTest, WriteConcernFailure) {
         return response.toBSON();
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 }  // namespace

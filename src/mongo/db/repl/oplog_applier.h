@@ -33,14 +33,16 @@
 #include <boost/optional.hpp>
 #include <vector>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
+#include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/oplog_buffer.h"
 #include "mongo/db/repl/oplog_entry.h"
 #include "mongo/db/repl/storage_interface.h"
 #include "mongo/executor/task_executor.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/util/concurrency/thread_pool.h"
+#include "mongo/util/functional.h"
 #include "mongo/util/future.h"
 #include "mongo/util/net/hostandport.h"
 
@@ -52,7 +54,8 @@ namespace repl {
  * Reads from an OplogBuffer batches of operations that may be applied in parallel.
  */
 class OplogApplier {
-    MONGO_DISALLOW_COPYING(OplogApplier);
+    OplogApplier(const OplogApplier&) = delete;
+    OplogApplier& operator=(const OplogApplier&) = delete;
 
 public:
     /**
@@ -60,26 +63,26 @@ public:
      **/
     class Options {
     public:
-        bool allowNamespaceNotFoundErrorsOnCrudOps = false;
-        bool relaxUniqueIndexConstraints = false;
-        bool skipWritesToOplog = false;
-
-        // For initial sync only. If an update fails, the missing document is fetched from
-        // this sync source to insert into the local collection.
-        boost::optional<HostAndPort> missingDocumentSourceForInitialSync;
+        Options() = delete;
+        explicit Options(OplogApplication::Mode inputMode)
+            : mode(inputMode),
+              allowNamespaceNotFoundErrorsOnCrudOps(
+                  inputMode == OplogApplication::Mode::kInitialSync ||
+                  inputMode == OplogApplication::Mode::kRecovering),
+              skipWritesToOplog(inputMode == OplogApplication::Mode::kRecovering) {}
 
         // Used to determine which operations should be applied. Only initial sync will set this to
         // be something other than the null optime.
         OpTime beginApplyingOpTime = OpTime();
 
-        // For replication recovery only. During replication rollback, this is used to keep track
-        // of the stable timestamp from which we replay the oplog.
-        boost::optional<Timestamp> stableTimestampForRecovery;
+        const OplogApplication::Mode mode;
+        const bool allowNamespaceNotFoundErrorsOnCrudOps;
+        const bool skipWritesToOplog;
     };
 
     /**
      * Controls what can popped from the oplog buffer into a single batch of operations that can be
-     * applied using multiApply().
+     * applied using applyOplogBatch().
      */
     class BatchLimits {
     public:
@@ -90,6 +93,10 @@ public:
         // This is intended for implementing slaveDelay, so it should be some number of seconds
         // before now.
         boost::optional<Date_t> slaveDelayLatestTimestamp = {};
+
+        // If non-null, the batch will include operations with timestamps either
+        // before-and-including this point or after it, not both.
+        Timestamp forceBatchBoundaryAfter;
     };
 
     // Used to report oplog application progress.
@@ -97,36 +104,21 @@ public:
 
     using Operations = std::vector<OplogEntry>;
 
-    /**
-     * Lower bound of batch limit size (in bytes) returned by calculateBatchLimitBytes().
-     */
-    static const unsigned int replBatchLimitBytes = 100 * 1024 * 1024;
-
-    /**
-     * Creates thread pool for writer tasks.
-     */
-    static std::unique_ptr<ThreadPool> makeWriterPool();
-    static std::unique_ptr<ThreadPool> makeWriterPool(int threadCount);
-
-    /**
-     * Returns maximum number of operations in each batch that can be applied using multiApply().
-     */
-    static std::size_t getBatchLimitOperations();
-
-    /**
-     * Calculates batch limit size (in bytes) using the maximum capped collection size of the oplog
-     * size.
-     * Batches are limited to 10% of the oplog.
-     */
-    static std::size_t calculateBatchLimitBytes(OperationContext* opCtx,
-                                                StorageInterface* storageInterface);
+    // TODO (SERVER-43001): This potentially violates layering as OpQueueBatcher calls an
+    // OplogApplier method.
+    // Used to access batching logic.
+    using GetNextApplierBatchFn = std::function<StatusWith<OplogApplier::Operations>(
+        OperationContext* opCtx, const BatchLimits& batchLimits)>;
 
     /**
      * Constructs this OplogApplier with specific options.
      * Obtains batches of operations from the OplogBuffer to apply.
      * Reports oplog application progress using the Observer.
      */
-    OplogApplier(executor::TaskExecutor* executor, OplogBuffer* oplogBuffer, Observer* observer);
+    OplogApplier(executor::TaskExecutor* executor,
+                 OplogBuffer* oplogBuffer,
+                 Observer* observer,
+                 const Options& options);
 
     virtual ~OplogApplier() = default;
 
@@ -146,6 +138,16 @@ public:
      * It is safe to call shutdown() multiplie times.
      */
     void shutdown();
+
+    /**
+     * Returns true if we are shutting down.
+     */
+    bool inShutdown() const;
+
+    /**
+     * Blocks until enough space is available.
+     */
+    void waitForSpace(OperationContext* opCtx, std::size_t size);
 
     /**
      * Pushes operations read into oplog buffer.
@@ -185,9 +187,16 @@ public:
      *
      * TODO: remove when enqueue() is implemented.
      */
-    StatusWith<OpTime> multiApply(OperationContext* opCtx, Operations ops);
+    StatusWith<OpTime> applyOplogBatch(OperationContext* opCtx, Operations ops);
+
+    const Options& getOptions() const;
 
 private:
+    /**
+     * Pops the operation at the front of the OplogBuffer.
+     */
+    void _consume(OperationContext* opCtx, OplogBuffer* oplogBuffer);
+
     /**
      * Called from startup() to run oplog application loop.
      * Currently applicable to steady state replication only.
@@ -196,17 +205,10 @@ private:
     virtual void _run(OplogBuffer* oplogBuffer) = 0;
 
     /**
-     * Called from shutdown to signals oplog application loop to stop running.
-     * Currently applicable to steady state replication only.
+     * Called from applyOplogBatch() to apply a batch of operations in parallel.
      * Implemented in subclasses but not visible otherwise.
      */
-    virtual void _shutdown() = 0;
-
-    /**
-     * Called from multiApply() to apply a batch of operations in parallel.
-     * Implemented in subclasses but not visible otherwise.
-     */
-    virtual StatusWith<OpTime> _multiApply(OperationContext* opCtx, Operations ops) = 0;
+    virtual StatusWith<OpTime> _applyOplogBatch(OperationContext* opCtx, Operations ops) = 0;
 
     // Used to schedule task for oplog application loop.
     // Not owned by us.
@@ -217,6 +219,15 @@ private:
 
     // Not owned by us.
     Observer* const _observer;
+
+    // Protects member data of OplogApplier.
+    mutable Mutex _mutex = MONGO_MAKE_LATCH("OplogApplier::_mutex");
+
+    // Set to true if shutdown() has been called.
+    bool _inShutdown = false;
+
+    // Configures this OplogApplier.
+    const Options _options;
 };
 
 /**
@@ -239,18 +250,34 @@ public:
      */
     virtual void onBatchEnd(const StatusWith<OpTime>& lastOpTimeApplied,
                             const OplogApplier::Operations& operations) = 0;
-
-    /**
-     * Called when documents are fetched and inserted into the collection in order to
-     * apply an update operation.
-     * Applies to initial sync only.
-     *
-     * TODO: Delegate fetching behavior to OplogApplier owner.
-     */
-    using FetchInfo = std::pair<OplogEntry, BSONObj>;
-    virtual void onMissingDocumentsFetchedAndInserted(
-        const std::vector<FetchInfo>& documentsFetchedAndInserted) = 0;
 };
+
+class NoopOplogApplierObserver : public repl::OplogApplier::Observer {
+public:
+    void onBatchBegin(const repl::OplogApplier::Operations&) final {}
+    void onBatchEnd(const StatusWith<repl::OpTime>&, const repl::OplogApplier::Operations&) final {}
+};
+
+extern NoopOplogApplierObserver noopOplogApplierObserver;
+
+/**
+ * Creates thread pool for writer tasks.
+ */
+std::unique_ptr<ThreadPool> makeReplWriterPool();
+std::unique_ptr<ThreadPool> makeReplWriterPool(int threadCount);
+
+/**
+ * Returns maximum number of operations in each batch that can be applied using
+ * applyOplogBatch().
+ */
+std::size_t getBatchLimitOplogEntries();
+
+/**
+ * Calculates batch limit size (in bytes) using the maximum capped collection size of the oplog
+ * size.
+ * Batches are limited to 10% of the oplog.
+ */
+std::size_t getBatchLimitOplogBytes(OperationContext* opCtx, StorageInterface* storageInterface);
 
 }  // namespace repl
 }  // namespace mongo

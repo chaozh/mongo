@@ -42,24 +42,27 @@
 namespace mongo {
 
 void WiredTigerSnapshotManager::setCommittedSnapshot(const Timestamp& timestamp) {
-    stdx::lock_guard<stdx::mutex> lock(_committedSnapshotMutex);
+    stdx::lock_guard<Latch> lock(_committedSnapshotMutex);
 
     invariant(!_committedSnapshot || *_committedSnapshot <= timestamp);
     _committedSnapshot = timestamp;
 }
 
 void WiredTigerSnapshotManager::setLocalSnapshot(const Timestamp& timestamp) {
-    stdx::lock_guard<stdx::mutex> lock(_localSnapshotMutex);
-    _localSnapshot = timestamp;
+    stdx::lock_guard<Latch> lock(_localSnapshotMutex);
+    if (timestamp.isNull())
+        _localSnapshot = boost::none;
+    else
+        _localSnapshot = timestamp;
 }
 
 boost::optional<Timestamp> WiredTigerSnapshotManager::getLocalSnapshot() {
-    stdx::lock_guard<stdx::mutex> lock(_localSnapshotMutex);
+    stdx::lock_guard<Latch> lock(_localSnapshotMutex);
     return _localSnapshot;
 }
 
 void WiredTigerSnapshotManager::dropAllSnapshots() {
-    stdx::lock_guard<stdx::mutex> lock(_committedSnapshotMutex);
+    stdx::lock_guard<Latch> lock(_committedSnapshotMutex);
     _committedSnapshot = boost::none;
 }
 
@@ -68,20 +71,22 @@ boost::optional<Timestamp> WiredTigerSnapshotManager::getMinSnapshotForNextCommi
         return boost::none;
     }
 
-    stdx::lock_guard<stdx::mutex> lock(_committedSnapshotMutex);
+    stdx::lock_guard<Latch> lock(_committedSnapshotMutex);
     return _committedSnapshot;
 }
 
 Timestamp WiredTigerSnapshotManager::beginTransactionOnCommittedSnapshot(
-    WT_SESSION* session, WiredTigerBeginTxnBlock::IgnorePrepared ignorePrepared) const {
-    WiredTigerBeginTxnBlock txnOpen(session, ignorePrepared);
+    WT_SESSION* session,
+    PrepareConflictBehavior prepareConflictBehavior,
+    RoundUpPreparedTimestamps roundUpPreparedTimestamps) const {
+    WiredTigerBeginTxnBlock txnOpen(session, prepareConflictBehavior, roundUpPreparedTimestamps);
 
-    stdx::lock_guard<stdx::mutex> lock(_committedSnapshotMutex);
+    stdx::lock_guard<Latch> lock(_committedSnapshotMutex);
     uassert(ErrorCodes::ReadConcernMajorityNotAvailableYet,
             "Committed view disappeared while running operation",
             _committedSnapshot);
 
-    auto status = txnOpen.setTimestamp(_committedSnapshot.get());
+    auto status = txnOpen.setReadSnapshot(_committedSnapshot.get());
     fassert(30635, status);
 
     txnOpen.done();
@@ -89,13 +94,15 @@ Timestamp WiredTigerSnapshotManager::beginTransactionOnCommittedSnapshot(
 }
 
 Timestamp WiredTigerSnapshotManager::beginTransactionOnLocalSnapshot(
-    WT_SESSION* session, WiredTigerBeginTxnBlock::IgnorePrepared ignorePrepared) const {
-    WiredTigerBeginTxnBlock txnOpen(session, ignorePrepared);
+    WT_SESSION* session,
+    PrepareConflictBehavior prepareConflictBehavior,
+    RoundUpPreparedTimestamps roundUpPreparedTimestamps) const {
+    WiredTigerBeginTxnBlock txnOpen(session, prepareConflictBehavior, roundUpPreparedTimestamps);
 
-    stdx::lock_guard<stdx::mutex> lock(_localSnapshotMutex);
+    stdx::lock_guard<Latch> lock(_localSnapshotMutex);
     invariant(_localSnapshot);
     LOG(3) << "begin_transaction on local snapshot " << _localSnapshot.get().toString();
-    auto status = txnOpen.setTimestamp(_localSnapshot.get());
+    auto status = txnOpen.setReadSnapshot(_localSnapshot.get());
     fassert(50775, status);
 
     txnOpen.done();

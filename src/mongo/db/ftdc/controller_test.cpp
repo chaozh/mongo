@@ -31,6 +31,7 @@
 
 #include <boost/filesystem.hpp>
 #include <iostream>
+#include <memory>
 
 #include "mongo/base/data_type_validated.h"
 #include "mongo/base/init.h"
@@ -45,7 +46,6 @@
 #include "mongo/db/ftdc/ftdc_test.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/service_context.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/unittest/temp_dir.h"
 #include "mongo/unittest/unittest.h"
 
@@ -107,7 +107,7 @@ public:
     }
 
     void wait() {
-        stdx::unique_lock<stdx::mutex> lck(_mutex);
+        stdx::unique_lock<Latch> lck(_mutex);
         while (_counter < _wait) {
             _condvar.wait(lck);
         }
@@ -119,8 +119,8 @@ public:
 
 private:
     /**
-    * Private enum to ensure caller uses class correctly.
-    */
+     * Private enum to ensure caller uses class correctly.
+     */
     enum class State {
         kNotStarted,
         kStarted,
@@ -133,7 +133,7 @@ private:
 
     std::vector<BSONObj> _docs;
 
-    stdx::mutex _mutex;
+    Mutex _mutex = MONGO_MAKE_LATCH("FTDCMetricsCollectorMockTee::_mutex");
     stdx::condition_variable _condvar;
     std::uint32_t _wait{0};
 };
@@ -142,7 +142,7 @@ class FTDCMetricsCollectorMock2 : public FTDCMetricsCollectorMockTee {
 public:
     void generateDocument(BSONObjBuilder& builder, std::uint32_t counter) final {
         builder.append("name", "joe");
-        builder.append("key1", (counter * 37));
+        builder.append("key1", static_cast<int32_t>(counter * 37));
         builder.append("key2", static_cast<double>(counter * static_cast<int>(log10f(counter))));
     }
 };
@@ -171,8 +171,8 @@ TEST_F(FTDCControllerTest, TestFull) {
 
     FTDCController c(dir, config);
 
-    auto c1 = stdx::make_unique<FTDCMetricsCollectorMock2>();
-    auto c2 = stdx::make_unique<FTDCMetricsCollectorMockRotate>();
+    auto c1 = std::make_unique<FTDCMetricsCollectorMock2>();
+    auto c2 = std::make_unique<FTDCMetricsCollectorMockRotate>();
 
     auto c1Ptr = c1.get();
     auto c2Ptr = c2.get();
@@ -243,7 +243,7 @@ TEST_F(FTDCControllerTest, TestStartAsDisabled) {
     config.maxFileSizeBytes = FTDCConfig::kMaxFileSizeBytesDefault;
     config.maxDirectorySizeBytes = FTDCConfig::kMaxDirectorySizeBytesDefault;
 
-    auto c1 = stdx::make_unique<FTDCMetricsCollectorMock2>();
+    auto c1 = std::make_unique<FTDCMetricsCollectorMock2>();
 
     auto c1Ptr = c1.get();
 

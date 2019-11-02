@@ -10,7 +10,6 @@ selector:
   # The following tests fail because a certain command or functionality is not supported by
   # mongos. This command or functionality is placed in a comment next to the failing test.
   - jstests/core/apitest_db.js  # serverStatus output doesn't have storageEngine.
-  - jstests/core/apitest_db_profile_level.js  # profiling.
   - jstests/core/apply_ops*.js  # applyOps, SERVER-1439.
   - jstests/core/awaitdata_getmore_cmd.js  # capped collections.
   - jstests/core/bypass_doc_validation.js  # sharded $out output not permitted
@@ -24,7 +23,6 @@ selector:
   - jstests/core/dbhash.js  # dbhash.
   - jstests/core/dbhash2.js  # dbhash.
   - jstests/core/diagdata.js # Command not supported in mongos
-  - jstests/core/do_txn*.js  # doTxn
   - jstests/core/dropdb_race.js  # syncdelay.
   - jstests/core/fsync.js  # uses fsync.
   - jstests/core/geo_haystack*.js  # geoSearch.
@@ -33,9 +31,7 @@ selector:
   - jstests/core/index_id_options.js  # "local" database.
   - jstests/core/index9.js  # "local" database.
   - jstests/core/max_time_ms.js  # sleep, SERVER-2212.
-  - jstests/core/mr_replaceIntoDB.js  # MapReduceResult, SERVER-20495.
   - jstests/core/notablescan.js  # notablescan.
-  - jstests/core/profile*.js  # profiling.
   - jstests/core/queryoptimizera.js  # "local" database.
   - jstests/core/rename*.js # renameCollection.
   - jstests/core/stages*.js  # stageDebug.
@@ -59,13 +55,13 @@ selector:
   - jstests/core/bad_index_plugin.js
   - jstests/core/create_indexes.js
   - jstests/core/list_indexes_non_existent_ns.js
+  - jstests/core/mr_preserve_indexes.js
   - jstests/core/rename6.js
   # The following tests fail because they expect no databases to be created. However a DB is created
   # automatically when we shard a collection.
   - jstests/core/dbcase.js
   - jstests/core/dbcase2.js
   - jstests/core/no_db_created.js
-  - jstests/core/ns_length.js
   - jstests/core/views/*.js # Views tests aren't expected to work when collections are implicitly sharded.
   - jstests/core/killop_drop_collection.js # Uses fsyncLock.
   # These tests fail because sharded clusters do not clean up correctly after failed index builds.
@@ -88,6 +84,13 @@ selector:
   - jstests/core/index_multikey.js
   - jstests/core/optimized_match_explain.js
   - jstests/core/sort_array.js
+
+  # The tests below use applyOps, SERVER-1439.
+  - jstests/core/list_collections1.js
+  - jstests/core/list_collections_filter.js
+  - jstests/core/rename_stayTemp.js
+  - jstests/core/txns/prepare_transaction_fails_on_temp_collections.js
+
   exclude_with_any_tags:
   - assumes_against_mongod_not_mongos
   # Tests tagged with the following will fail because they assume collections are not sharded.
@@ -95,6 +98,8 @@ selector:
   - assumes_no_implicit_index_creation
   - assumes_unsharded_collection
   - cannot_create_unique_index_when_using_hashed_shard_key
+  # system.profile collection doesn't exist on mongos.
+  - requires_profiling
 
 executor:
   archive:

@@ -250,7 +250,7 @@ unique_ptr<MatchExpression> createAndOfNodes(std::vector<unique_ptr<MatchExpress
         return std::move(children->at(0));
     }
 
-    unique_ptr<AndMatchExpression> splitAnd = stdx::make_unique<AndMatchExpression>();
+    unique_ptr<AndMatchExpression> splitAnd = std::make_unique<AndMatchExpression>();
     for (auto&& expr : *children) {
         splitAnd->add(expr.release());
     }
@@ -266,7 +266,7 @@ unique_ptr<MatchExpression> createNorOfNodes(std::vector<unique_ptr<MatchExpress
         return nullptr;
     }
 
-    unique_ptr<NorMatchExpression> splitNor = stdx::make_unique<NorMatchExpression>();
+    unique_ptr<NorMatchExpression> splitNor = std::make_unique<NorMatchExpression>();
     for (auto&& expr : *children) {
         splitNor->add(expr.release());
     }
@@ -356,6 +356,19 @@ splitMatchExpressionByWithoutRenames(unique_ptr<MatchExpression> expr,
 }  // namespace
 
 namespace expression {
+
+bool hasExistencePredicateOnPath(const MatchExpression& expr, StringData path) {
+    if (expr.getCategory() == MatchExpression::MatchCategory::kLeaf) {
+        return (expr.matchType() == MatchExpression::MatchType::EXISTS && expr.path() == path);
+    }
+    for (size_t i = 0; i < expr.numChildren(); i++) {
+        MatchExpression* child = expr.getChild(i);
+        if (hasExistencePredicateOnPath(*child, path)) {
+            return true;
+        }
+    }
+    return false;
+}
 
 bool isSubsetOf(const MatchExpression* lhs, const MatchExpression* rhs) {
     invariant(lhs);

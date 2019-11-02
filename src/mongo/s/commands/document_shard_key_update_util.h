@@ -36,6 +36,7 @@
 #include "mongo/db/logical_session_id.h"
 #include "mongo/db/ops/write_ops.h"
 #include "mongo/executor/task_executor_pool.h"
+#include "mongo/s/transaction_router.h"
 
 namespace mongo {
 
@@ -53,18 +54,37 @@ class TaskExecutor;
  */
 namespace documentShardKeyUpdateUtil {
 
+static constexpr StringData kDuplicateKeyErrorContext =
+    "Failed to update document's shard key "
+    "field. There is either an orphan for this document or _id for this collection is not "
+    "globally unique."_sd;
+
+static constexpr StringData kNonDuplicateKeyErrorContext =
+    "Update operation was converted into a "
+    "distributed transaction because the document being updated would move shards and that "
+    "transaction failed."_sd;
+
 /**
  * Coordinating method and external point of entry for updating a document's shard key. This method
  * creates the necessary extra operations. It will then run each operation using the ClusterWriter.
  * If any statement throws, an exception will leave this method, and must be handled by external
  * callers.
- *
- * This is the only method that should be called outside of this class.
  */
-void updateShardKeyForDocument(OperationContext* opCtx,
+bool updateShardKeyForDocument(OperationContext* opCtx,
                                const NamespaceString& nss,
-                               const WouldChangeOwningShardInfo& documentKeyChangeInfo,
-                               int stmtId);
+                               const WouldChangeOwningShardInfo& documentKeyChangeInfo);
+
+/**
+ * Starts a transaction on this session. This method is called when WouldChangeOwningShard is thrown
+ * for a write that is not in a transaction already.
+ */
+void startTransactionForShardKeyUpdate(OperationContext* opCtx);
+
+/**
+ * Commits the transaction on this session. This method is called to commit the transaction started
+ * when WouldChangeOwningShard is thrown for a write that is not in a transaction already.
+ */
+BSONObj commitShardKeyUpdateTransaction(OperationContext* opCtx);
 
 /**
  * Creates the BSONObj that will be used to delete the pre-image document. Will also attach
@@ -73,10 +93,7 @@ void updateShardKeyForDocument(OperationContext* opCtx,
  * This method should not be called outside of this class. It is only temporarily exposed for
  * intermediary test coverage.
  */
-BSONObj constructShardKeyDeleteCmdObj(const NamespaceString& nss,
-                                      const BSONObj& originalQueryPredicate,
-                                      const BSONObj& updatePostImage,
-                                      int stmtId);
+BSONObj constructShardKeyDeleteCmdObj(const NamespaceString& nss, const BSONObj& updatePreImage);
 
 /*
  * Creates the BSONObj that will be used to insert the new document with the post-update image.
@@ -85,8 +102,6 @@ BSONObj constructShardKeyDeleteCmdObj(const NamespaceString& nss,
  * This method should not be called outside of this class. It is only temporarily exposed for
  * intermediary test coverage.
  */
-BSONObj constructShardKeyInsertCmdObj(const NamespaceString& nss,
-                                      const BSONObj& updatePostImage,
-                                      int stmtId);
+BSONObj constructShardKeyInsertCmdObj(const NamespaceString& nss, const BSONObj& updatePostImage);
 }  // namespace documentShardKeyUpdateUtil
 }  // namespace mongo

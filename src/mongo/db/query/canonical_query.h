@@ -31,12 +31,11 @@
 
 
 #include "mongo/base/status.h"
-#include "mongo/db/dbmessage.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/matcher/expression.h"
 #include "mongo/db/matcher/extensions_callback_noop.h"
 #include "mongo/db/query/collation/collator_interface.h"
-#include "mongo/db/query/parsed_projection.h"
+#include "mongo/db/query/projection.h"
 #include "mongo/db/query/query_request.h"
 
 namespace mongo {
@@ -120,11 +119,34 @@ public:
     const QueryRequest& getQueryRequest() const {
         return *_qr;
     }
-    const ParsedProjection* getProj() const {
-        return _proj.get();
+
+    /**
+     * Returns the projection, or nullptr if none.
+     */
+    const projection_ast::Projection* getProj() const {
+        return _proj.get_ptr();
     }
+
+    projection_ast::Projection* getProj() {
+        return _proj.get_ptr();
+    }
+
     const CollatorInterface* getCollator() const {
         return _collator.get();
+    }
+
+    /**
+     * Returns a bitset indicating what metadata has been requested in the query.
+     */
+    const QueryMetadataBitSet& metadataDeps() const {
+        return _metadataDeps;
+    }
+
+    /**
+     * Allows callers to request metadata in addition to that needed as part of the query.
+     */
+    void requestAdditionalMetadata(const QueryMetadataBitSet& additionalDeps) {
+        _metadataDeps |= additionalDeps;
     }
 
     /**
@@ -181,22 +203,32 @@ public:
         return _canHaveNoopMatchNodes;
     }
 
+    const boost::intrusive_ptr<ExpressionContext>& getExpCtx() const {
+        return _expCtx;
+    }
+
 private:
     // You must go through canonicalize to create a CanonicalQuery.
     CanonicalQuery() {}
 
     Status init(OperationContext* opCtx,
+                boost::intrusive_ptr<ExpressionContext> expCtx,
                 std::unique_ptr<QueryRequest> qr,
                 bool canHaveNoopMatchNodes,
                 std::unique_ptr<MatchExpression> root,
                 std::unique_ptr<CollatorInterface> collator);
+
+    boost::intrusive_ptr<ExpressionContext> _expCtx;
 
     std::unique_ptr<QueryRequest> _qr;
 
     // _root points into _qr->getFilter()
     std::unique_ptr<MatchExpression> _root;
 
-    std::unique_ptr<ParsedProjection> _proj;
+    boost::optional<projection_ast::Projection> _proj;
+
+    // Keeps track of what metadata has been explicitly requested.
+    QueryMetadataBitSet _metadataDeps;
 
     std::unique_ptr<CollatorInterface> _collator;
 

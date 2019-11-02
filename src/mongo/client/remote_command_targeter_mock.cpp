@@ -55,18 +55,36 @@ ConnectionString RemoteCommandTargeterMock::connectionString() {
 
 StatusWith<HostAndPort> RemoteCommandTargeterMock::findHost(OperationContext* opCtx,
                                                             const ReadPreferenceSetting& readPref) {
-    return _findHostReturnValue;
+    if (!_findHostReturnValue.isOK()) {
+        return _findHostReturnValue.getStatus();
+    }
+
+    return _findHostReturnValue.getValue()[0];
 }
 
-SharedSemiFuture<HostAndPort> RemoteCommandTargeterMock::findHostWithMaxWait(
+SemiFuture<HostAndPort> RemoteCommandTargeterMock::findHostWithMaxWait(
     const ReadPreferenceSetting& readPref, Milliseconds maxTime) {
+    if (!_findHostReturnValue.isOK()) {
+        return _findHostReturnValue.getStatus();
+    }
+
+    return _findHostReturnValue.getValue()[0];
+}
+
+SemiFuture<std::vector<HostAndPort>> RemoteCommandTargeterMock::findHostsWithMaxWait(
+    const ReadPreferenceSetting& readPref, Milliseconds maxWait) {
 
     return _findHostReturnValue;
 }
 
-void RemoteCommandTargeterMock::markHostNotMaster(const HostAndPort& host, const Status& status) {}
+void RemoteCommandTargeterMock::markHostNotMaster(const HostAndPort& host, const Status& status) {
+    stdx::lock_guard<Latch> lg(_mutex);
+    _hostsMarkedDown.insert(host);
+}
 
 void RemoteCommandTargeterMock::markHostUnreachable(const HostAndPort& host, const Status& status) {
+    stdx::lock_guard<Latch> lg(_mutex);
+    _hostsMarkedDown.insert(host);
 }
 
 void RemoteCommandTargeterMock::setConnectionStringReturnValue(const ConnectionString returnValue) {
@@ -74,7 +92,23 @@ void RemoteCommandTargeterMock::setConnectionStringReturnValue(const ConnectionS
 }
 
 void RemoteCommandTargeterMock::setFindHostReturnValue(StatusWith<HostAndPort> returnValue) {
+    if (!returnValue.isOK()) {
+        _findHostReturnValue = returnValue.getStatus();
+    } else {
+        _findHostReturnValue = std::vector{returnValue.getValue()};
+    }
+}
+
+void RemoteCommandTargeterMock::setFindHostsReturnValue(
+    StatusWith<std::vector<HostAndPort>> returnValue) {
     _findHostReturnValue = std::move(returnValue);
+}
+
+std::set<HostAndPort> RemoteCommandTargeterMock::getAndClearMarkedDownHosts() {
+    stdx::lock_guard<Latch> lg(_mutex);
+    auto hostsMarkedDown = _hostsMarkedDown;
+    _hostsMarkedDown.clear();
+    return hostsMarkedDown;
 }
 
 }  // namespace mongo

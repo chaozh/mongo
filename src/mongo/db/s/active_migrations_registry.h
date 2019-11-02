@@ -30,12 +30,11 @@
 #pragma once
 
 #include <boost/optional.hpp>
+#include <memory>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/db/s/migration_session_id.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/s/request_types/move_chunk_request.h"
-#include "mongo/stdx/memory.h"
-#include "mongo/stdx/mutex.h"
 #include "mongo/util/concurrency/notification.h"
 
 namespace mongo {
@@ -51,7 +50,8 @@ class StatusWith;
  * to only one per shard. There is only one instance of this object per shard.
  */
 class ActiveMigrationsRegistry {
-    MONGO_DISALLOW_COPYING(ActiveMigrationsRegistry);
+    ActiveMigrationsRegistry(const ActiveMigrationsRegistry&) = delete;
+    ActiveMigrationsRegistry& operator=(const ActiveMigrationsRegistry&) = delete;
 
 public:
     ActiveMigrationsRegistry();
@@ -152,7 +152,7 @@ private:
     void _clearReceiveChunk();
 
     // Protects the state below
-    stdx::mutex _mutex;
+    Mutex _mutex = MONGO_MAKE_LATCH("ActiveMigrationsRegistry::_mutex");
 
     // If there is an active moveChunk operation, this field contains the original request
     boost::optional<ActiveMoveChunkState> _activeMoveChunkState;
@@ -167,7 +167,8 @@ private:
  * registerDonateChunk method for more details.
  */
 class ScopedDonateChunk {
-    MONGO_DISALLOW_COPYING(ScopedDonateChunk);
+    ScopedDonateChunk(const ScopedDonateChunk&) = delete;
+    ScopedDonateChunk& operator=(const ScopedDonateChunk&) = delete;
 
 public:
     ScopedDonateChunk(ActiveMigrationsRegistry* registry,
@@ -220,7 +221,8 @@ private:
  * registry.
  */
 class ScopedReceiveChunk {
-    MONGO_DISALLOW_COPYING(ScopedReceiveChunk);
+    ScopedReceiveChunk(const ScopedReceiveChunk&) = delete;
+    ScopedReceiveChunk& operator=(const ScopedReceiveChunk&) = delete;
 
 public:
     ScopedReceiveChunk(ActiveMigrationsRegistry* registry);

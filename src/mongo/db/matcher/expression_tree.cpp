@@ -51,9 +51,9 @@ void ListOfMatchExpression::add(MatchExpression* e) {
 }
 
 
-void ListOfMatchExpression::_debugList(StringBuilder& debug, int level) const {
+void ListOfMatchExpression::_debugList(StringBuilder& debug, int indentationLevel) const {
     for (unsigned i = 0; i < _expressions.size(); i++)
-        _expressions[i]->debugString(debug, level + 1);
+        _expressions[i]->debugString(debug, indentationLevel + 1);
 }
 
 void ListOfMatchExpression::_listToBSON(BSONArrayBuilder* out) const {
@@ -137,7 +137,7 @@ MatchExpression::ExpressionOptimizerFunc ListOfMatchExpression::getOptimizer() c
         // empty AND as the same thing. The planner can create inferior plans for $alwaysTrue which
         // it would not produce for an AND with no children.
         if (children.empty() && matchType == MatchExpression::OR) {
-            return stdx::make_unique<AlwaysFalseMatchExpression>();
+            return std::make_unique<AlwaysFalseMatchExpression>();
         }
 
         if (children.size() == 1) {
@@ -149,7 +149,7 @@ MatchExpression::ExpressionOptimizerFunc ListOfMatchExpression::getOptimizer() c
                 return std::unique_ptr<MatchExpression>(simplifiedExpression);
             } else if (matchType == NOR) {
                 // Simplify NOR of exactly one operand to NOT of that operand.
-                auto simplifiedExpression = stdx::make_unique<NotMatchExpression>(children.front());
+                auto simplifiedExpression = std::make_unique<NotMatchExpression>(children.front());
                 children.clear();
                 return std::move(simplifiedExpression);
             }
@@ -160,13 +160,13 @@ MatchExpression::ExpressionOptimizerFunc ListOfMatchExpression::getOptimizer() c
                 // An AND containing an expression that always evaluates to false can be
                 // optimized to a single $alwaysFalse expression.
                 if (childExpression->isTriviallyFalse() && matchType == MatchExpression::AND) {
-                    return stdx::make_unique<AlwaysFalseMatchExpression>();
+                    return std::make_unique<AlwaysFalseMatchExpression>();
                 }
 
                 // Likewise, an OR containing an expression that always evaluates to true can be
                 // optimized to a single $alwaysTrue expression.
                 if (childExpression->isTriviallyTrue() && matchType == MatchExpression::OR) {
-                    return stdx::make_unique<AlwaysTrueMatchExpression>();
+                    return std::make_unique<AlwaysTrueMatchExpression>();
                 }
             }
         }
@@ -215,10 +215,16 @@ bool AndMatchExpression::matchesSingleElement(const BSONElement& e, MatchDetails
 }
 
 
-void AndMatchExpression::debugString(StringBuilder& debug, int level) const {
-    _debugAddSpace(debug, level);
-    debug << "$and\n";
-    _debugList(debug, level);
+void AndMatchExpression::debugString(StringBuilder& debug, int indentationLevel) const {
+    _debugAddSpace(debug, indentationLevel);
+    debug << "$and";
+    MatchExpression::TagData* td = getTag();
+    if (td) {
+        debug << " ";
+        td->debugString(&debug);
+    }
+    debug << "\n";
+    _debugList(debug, indentationLevel);
 }
 
 void AndMatchExpression::serialize(BSONObjBuilder* out) const {
@@ -241,7 +247,7 @@ bool AndMatchExpression::isTriviallyTrue() const {
 
 bool OrMatchExpression::matches(const MatchableDocument* doc, MatchDetails* details) const {
     for (size_t i = 0; i < numChildren(); i++) {
-        if (getChild(i)->matches(doc, NULL)) {
+        if (getChild(i)->matches(doc, nullptr)) {
             return true;
         }
     }
@@ -258,10 +264,16 @@ bool OrMatchExpression::matchesSingleElement(const BSONElement& e, MatchDetails*
 }
 
 
-void OrMatchExpression::debugString(StringBuilder& debug, int level) const {
-    _debugAddSpace(debug, level);
-    debug << "$or\n";
-    _debugList(debug, level);
+void OrMatchExpression::debugString(StringBuilder& debug, int indentationLevel) const {
+    _debugAddSpace(debug, indentationLevel);
+    debug << "$or";
+    MatchExpression::TagData* td = getTag();
+    if (td) {
+        debug << " ";
+        td->debugString(&debug);
+    }
+    debug << "\n";
+    _debugList(debug, indentationLevel);
 }
 
 void OrMatchExpression::serialize(BSONObjBuilder* out) const {
@@ -284,7 +296,7 @@ bool OrMatchExpression::isTriviallyFalse() const {
 
 bool NorMatchExpression::matches(const MatchableDocument* doc, MatchDetails* details) const {
     for (size_t i = 0; i < numChildren(); i++) {
-        if (getChild(i)->matches(doc, NULL)) {
+        if (getChild(i)->matches(doc, nullptr)) {
             return false;
         }
     }
@@ -300,10 +312,10 @@ bool NorMatchExpression::matchesSingleElement(const BSONElement& e, MatchDetails
     return true;
 }
 
-void NorMatchExpression::debugString(StringBuilder& debug, int level) const {
-    _debugAddSpace(debug, level);
+void NorMatchExpression::debugString(StringBuilder& debug, int indentationLevel) const {
+    _debugAddSpace(debug, indentationLevel);
     debug << "$nor\n";
-    _debugList(debug, level);
+    _debugList(debug, indentationLevel);
 }
 
 void NorMatchExpression::serialize(BSONObjBuilder* out) const {
@@ -313,10 +325,10 @@ void NorMatchExpression::serialize(BSONObjBuilder* out) const {
 
 // -------
 
-void NotMatchExpression::debugString(StringBuilder& debug, int level) const {
-    _debugAddSpace(debug, level);
+void NotMatchExpression::debugString(StringBuilder& debug, int indentationLevel) const {
+    _debugAddSpace(debug, indentationLevel);
     debug << "$not\n";
-    _exp->debugString(debug, level + 1);
+    _exp->debugString(debug, indentationLevel + 1);
 }
 
 boost::optional<StringData> NotMatchExpression::getPathIfNotWithSinglePathMatchExpressionTree(
@@ -419,4 +431,4 @@ MatchExpression::ExpressionOptimizerFunc NotMatchExpression::getOptimizer() cons
         return expression;
     };
 }
-}
+}  // namespace mongo

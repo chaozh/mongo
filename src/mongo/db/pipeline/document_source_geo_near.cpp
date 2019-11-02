@@ -33,7 +33,7 @@
 
 #include "mongo/db/pipeline/document_source_geo_near.h"
 
-#include "mongo/db/pipeline/document.h"
+#include "mongo/db/exec/document_value/document.h"
 #include "mongo/db/pipeline/document_source_sort.h"
 #include "mongo/db/pipeline/lite_parsed_document_source.h"
 #include "mongo/util/log.h"
@@ -43,7 +43,6 @@ namespace mongo {
 using boost::intrusive_ptr;
 
 constexpr StringData DocumentSourceGeoNear::kKeyFieldName;
-constexpr const char* DocumentSourceGeoNear::kStageName;
 
 REGISTER_DOCUMENT_SOURCE(geoNear,
                          LiteParsedDocumentSourceDefault::parse,
@@ -226,19 +225,20 @@ DepsTracker::State DocumentSourceGeoNear::getDependencies(DepsTracker* deps) con
     // produced by this stage, and we could inform the query system that it need not include it in
     // its response. For now, assume that we require the entire document as well as the appropriate
     // geoNear metadata.
-    deps->setNeedsMetadata(DepsTracker::MetadataType::GEO_NEAR_DISTANCE, true);
-    deps->setNeedsMetadata(DepsTracker::MetadataType::GEO_NEAR_POINT, needsGeoNearPoint());
+    deps->setNeedsMetadata(DocumentMetadataFields::kGeoNearDist, true);
+    deps->setNeedsMetadata(DocumentMetadataFields::kGeoNearPoint, needsGeoNearPoint());
 
     deps->needWholeDocument = true;
     return DepsTracker::State::EXHAUSTIVE_FIELDS;
 }
 
 DocumentSourceGeoNear::DocumentSourceGeoNear(const intrusive_ptr<ExpressionContext>& pExpCtx)
-    : DocumentSource(pExpCtx), coordsIsArray(false), spherical(false) {}
+    : DocumentSource(kStageName, pExpCtx), coordsIsArray(false), spherical(false) {}
 
-boost::optional<DocumentSource::MergingLogic> DocumentSourceGeoNear::mergingLogic() {
+boost::optional<DocumentSource::DistributedPlanLogic>
+DocumentSourceGeoNear::distributedPlanLogic() {
     // {shardsStage, mergingStage, sortPattern}
-    return MergingLogic{this, nullptr, BSON(distanceField->fullPath() << 1)};
+    return DistributedPlanLogic{this, nullptr, BSON(distanceField->fullPath() << 1)};
 }
 
 }  // namespace mongo

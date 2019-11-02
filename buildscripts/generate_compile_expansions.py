@@ -1,12 +1,10 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 """
 Generate the compile expansions file used by Evergreen as part of the push/release process.
 
 Invoke by specifying an output file.
 $ python generate_compile_expansions.py --out compile_expansions.yml
 """
-
-from __future__ import print_function
 
 import argparse
 import json

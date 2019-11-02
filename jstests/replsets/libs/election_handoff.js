@@ -5,18 +5,23 @@
  */
 
 var ElectionHandoffTest = (function() {
-
     load("jstests/libs/check_log.js");
     load("jstests/replsets/rslib.js");
 
     const kStepDownPeriodSecs = 30;
+    const kSIGTERM = 15;
 
     /**
      * Exercises and validates an election handoff scenario by stepping down the primary and
      * ensuring that the node at "expectedCandidateId" is stepped up in its place. The desired
      * configuration of the replica set is passed in as its ReplSetTest instance.
+     *
+     * The options parameter contains extra options for the handoff.  Currently supported options
+     * are:
+     *   stepDownBySignal - When this option is set, the primary will be stepped down by stopping
+     *                      and restarting with sigterm, rather than with a replSetStepDown command
      */
-    function testElectionHandoff(rst, initialPrimaryId, expectedCandidateId) {
+    function testElectionHandoff(rst, initialPrimaryId, expectedCandidateId, options = {}) {
         const config = rst.getReplSetConfigFromNode();
         const numNodes = config.members.length;
         const memberInfo = config.members[expectedCandidateId];
@@ -45,15 +50,20 @@ var ElectionHandoffTest = (function() {
         // Make sure all secondaries are ready before stepping down. We must additionally
         // make sure that the primary is aware that the secondaries are ready and caught up
         // to the primary's lastApplied, so we issue a dummy write and wait on its optime.
-        assert.writeOK(primary.getDB("test").secondariesMustBeCaughtUpToHere.insert(
+        assert.commandWorked(primary.getDB("test").secondariesMustBeCaughtUpToHere.insert(
             {"a": 1}, {writeConcern: {w: rst.nodes.length}}));
         rst.awaitNodesAgreeOnAppliedOpTime();
 
-        // Step down the current primary.
-        assert.commandWorked(primary.adminCommand({
-            replSetStepDown: kStepDownPeriodSecs,
-            secondaryCatchUpPeriodSecs: kStepDownPeriodSecs / 2
-        }));
+        // Step down the current primary. Skip validation since it prevents election handoff.
+        if (options["stepDownBySignal"]) {
+            rst.stop(initialPrimaryId, kSIGTERM, {skipValidation: true}, {forRestart: true});
+            rst.start(initialPrimaryId, {}, true);
+        } else {
+            assert.commandWorked(primary.adminCommand({
+                replSetStepDown: kStepDownPeriodSecs,
+                secondaryCatchUpPeriodSecs: kStepDownPeriodSecs / 2
+            }));
+        }
 
         jsTestLog(`Checking that the secondary with id ${expectedCandidateId} is stepped up...`);
 
@@ -65,10 +75,10 @@ var ElectionHandoffTest = (function() {
         // If there are only two nodes in the set, verify that the old primary voted "yes".
         if (numNodes === 2) {
             checkLog.contains(expectedCandidate,
-                              `skipping dry run and running for election in term ${term+1}`);
+                              `skipping dry run and running for election in term ${term + 1}`);
             checkLog.contains(
                 expectedCandidate,
-                `VoteRequester(term ${term+1}) received a yes vote from ${primary.host}`);
+                `VoteRequester(term ${term + 1}) received a yes vote from ${primary.host}`);
         }
 
         rst.awaitNodesAgreeOnPrimary();
@@ -76,5 +86,4 @@ var ElectionHandoffTest = (function() {
     }
 
     return {testElectionHandoff: testElectionHandoff, stepDownPeriodSecs: kStepDownPeriodSecs};
-
 })();

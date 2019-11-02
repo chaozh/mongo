@@ -31,6 +31,10 @@
 #pragma once
 
 #include <string>
+#include <vector>
+
+#include "mongo/base/status.h"
+#include "mongo/bson/bsonobj.h"
 
 namespace mongo {
 

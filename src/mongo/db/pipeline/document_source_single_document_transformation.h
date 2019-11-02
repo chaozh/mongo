@@ -45,12 +45,12 @@ public:
     DocumentSourceSingleDocumentTransformation(
         const boost::intrusive_ptr<ExpressionContext>& pExpCtx,
         std::unique_ptr<TransformerInterface> parsedTransform,
-        std::string name,
+        const StringData name,
         bool independentOfAnyCollection);
 
     // virtuals from DocumentSource
     const char* getSourceName() const final;
-    GetNextResult getNext() final;
+
     boost::intrusive_ptr<DocumentSource> optimize() final;
     Value serialize(boost::optional<ExplainOptions::Verbosity> explain = boost::none) const final;
     DepsTracker::State getDependencies(DepsTracker* deps) const final;
@@ -62,16 +62,18 @@ public:
                                      DiskUseRequirement::kNoDiskUse,
                                      FacetRequirement::kAllowed,
                                      TransactionRequirement::kAllowed,
+                                     LookupRequirement::kAllowed,
                                      ChangeStreamRequirement::kWhitelist);
         constraints.canSwapWithMatch = true;
         constraints.canSwapWithLimitAndSample = true;
+        constraints.isAllowedWithinUpdatePipeline = true;
         // This transformation could be part of a 'collectionless' change stream on an entire
         // database or cluster, mark as independent of any collection if so.
         constraints.isIndependentOfAnyCollection = _isIndependentOfAnyCollection;
         return constraints;
     }
 
-    boost::optional<MergingLogic> mergingLogic() final {
+    boost::optional<DistributedPlanLogic> distributedPlanLogic() final {
         return boost::none;
     }
 
@@ -79,11 +81,12 @@ public:
         return _parsedTransform->getType();
     }
 
-    bool isSubsetOfProjection(const BSONObj& proj) const {
-        return _parsedTransform->isSubsetOfProjection(proj);
+    const auto& getTransformer() const {
+        return *_parsedTransform;
     }
 
 protected:
+    GetNextResult doGetNext() final;
     void doDispose() final;
 
     Pipeline::SourceContainer::iterator doOptimizeAt(Pipeline::SourceContainer::iterator itr,

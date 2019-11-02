@@ -40,8 +40,8 @@
 #include "mongo/db/operation_context.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
 #include "mongo/util/net/hostandport.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -61,9 +61,14 @@ ConnectionString RemoteCommandTargeterRS::connectionString() {
     return uassertStatusOK(ConnectionString::parse(_rsMonitor->getServerAddress()));
 }
 
-SharedSemiFuture<HostAndPort> RemoteCommandTargeterRS::findHostWithMaxWait(
+SemiFuture<HostAndPort> RemoteCommandTargeterRS::findHostWithMaxWait(
     const ReadPreferenceSetting& readPref, Milliseconds maxWait) {
     return _rsMonitor->getHostOrRefresh(readPref, maxWait);
+}
+
+SemiFuture<std::vector<HostAndPort>> RemoteCommandTargeterRS::findHostsWithMaxWait(
+    const ReadPreferenceSetting& readPref, Milliseconds maxWait) {
+    return _rsMonitor->getHostsOrRefresh(readPref, maxWait);
 }
 
 StatusWith<HostAndPort> RemoteCommandTargeterRS::findHost(OperationContext* opCtx,

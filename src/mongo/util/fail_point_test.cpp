@@ -31,22 +31,25 @@
 
 #include "mongo/platform/basic.h"
 
+#include <functional>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
-#include "mongo/stdx/functional.h"
+#include "mongo/db/client.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/unittest/unittest.h"
+#include "mongo/util/clock_source_mock.h"
 #include "mongo/util/fail_point.h"
-#include "mongo/util/fail_point_service.h"
 #include "mongo/util/log.h"
+#include "mongo/util/tick_source_mock.h"
 #include "mongo/util/time_support.h"
 
-using mongo::getGlobalFailPointRegistry;
 using mongo::BSONObj;
 using mongo::FailPoint;
 using mongo::FailPointEnableBlock;
+
 namespace stdx = mongo::stdx;
 
 namespace mongo_test {
@@ -60,7 +63,7 @@ TEST(FailPoint, AlwaysOn) {
     failPoint.setMode(FailPoint::alwaysOn);
     ASSERT(failPoint.shouldFail());
 
-    MONGO_FAIL_POINT_BLOCK(failPoint, scopedFp) {
+    if (auto scopedFp = failPoint.scoped(); MONGO_unlikely(scopedFp.isActive())) {
         ASSERT(scopedFp.getData().isEmpty());
     }
 
@@ -85,11 +88,7 @@ TEST(FailPoint, NTimes) {
 TEST(FailPoint, BlockOff) {
     FailPoint failPoint;
     bool called = false;
-
-    MONGO_FAIL_POINT_BLOCK(failPoint, scopedFp) {
-        called = true;
-    }
-
+    failPoint.execute([&](const BSONObj&) { called = true; });
     ASSERT_FALSE(called);
 }
 
@@ -98,9 +97,7 @@ TEST(FailPoint, BlockAlwaysOn) {
     failPoint.setMode(FailPoint::alwaysOn);
     bool called = false;
 
-    MONGO_FAIL_POINT_BLOCK(failPoint, scopedFp) {
-        called = true;
-    }
+    failPoint.execute([&](const BSONObj&) { called = true; });
 
     ASSERT(called);
 }
@@ -111,9 +108,7 @@ TEST(FailPoint, BlockNTimes) {
     size_t counter = 0;
 
     for (size_t x = 0; x < 10; x++) {
-        MONGO_FAIL_POINT_BLOCK(failPoint, scopedFp) {
-            counter++;
-        }
+        failPoint.execute([&](auto&&...) { counter++; });
     }
 
     ASSERT_EQUALS(1U, counter);
@@ -125,9 +120,8 @@ TEST(FailPoint, BlockWithException) {
     bool threw = false;
 
     try {
-        MONGO_FAIL_POINT_BLOCK(failPoint, scopedFp) {
-            throw std::logic_error("BlockWithException threw");
-        }
+        failPoint.execute(
+            [&](const BSONObj&) { throw std::logic_error("BlockWithException threw"); });
     } catch (const std::logic_error&) {
         threw = true;
     }
@@ -142,9 +136,7 @@ TEST(FailPoint, SetGetParam) {
     FailPoint failPoint;
     failPoint.setMode(FailPoint::alwaysOn, 0, BSON("x" << 20));
 
-    MONGO_FAIL_POINT_BLOCK(failPoint, scopedFp) {
-        ASSERT_EQUALS(20, scopedFp.getData()["x"].numberInt());
-    }
+    failPoint.execute([&](const BSONObj& data) { ASSERT_EQUALS(20, data["x"].numberInt()); });
 }
 
 class FailPointStress : public mongo::unittest::Test {
@@ -169,7 +161,7 @@ public:
 
     void stopTest() {
         {
-            stdx::lock_guard<stdx::mutex> lk(_mutex);
+            stdx::lock_guard<mongo::Latch> lk(_mutex);
             _inShutdown = true;
         }
         for (auto& t : _tasks) {
@@ -181,9 +173,7 @@ public:
 private:
     void blockTask() {
         while (true) {
-            MONGO_FAIL_POINT_BLOCK(_fp, scopedFp) {
-                const mongo::BSONObj& data = scopedFp.getData();
-
+            _fp.execute([](const BSONObj& data) {
                 // Expanded ASSERT_EQUALS since the error is not being
                 // printed out properly
                 if (data["a"].numberInt() != 44) {
@@ -191,9 +181,9 @@ private:
                                    << " - data: " << data << std::endl;
                     ASSERT(false);
                 }
-            }
+            });
 
-            stdx::lock_guard<stdx::mutex> lk(_mutex);
+            stdx::lock_guard<mongo::Latch> lk(_mutex);
             if (_inShutdown)
                 break;
         }
@@ -202,9 +192,7 @@ private:
     void blockWithExceptionTask() {
         while (true) {
             try {
-                MONGO_FAIL_POINT_BLOCK(_fp, scopedFp) {
-                    const mongo::BSONObj& data = scopedFp.getData();
-
+                _fp.execute([](const BSONObj& data) {
                     if (data["a"].numberInt() != 44) {
                         mongo::error() << "blockWithExceptionTask thread detected anomaly"
                                        << " - data: " << data << std::endl;
@@ -212,11 +200,11 @@ private:
                     }
 
                     throw std::logic_error("blockWithExceptionTask threw");
-                }
+                });
             } catch (const std::logic_error&) {
             }
 
-            stdx::lock_guard<stdx::mutex> lk(_mutex);
+            stdx::lock_guard<mongo::Latch> lk(_mutex);
             if (_inShutdown)
                 break;
         }
@@ -224,8 +212,8 @@ private:
 
     void simpleTask() {
         while (true) {
-            static_cast<void>(MONGO_FAIL_POINT(_fp));
-            stdx::lock_guard<stdx::mutex> lk(_mutex);
+            static_cast<void>(MONGO_unlikely(_fp.shouldFail()));
+            stdx::lock_guard<mongo::Latch> lk(_mutex);
             if (_inShutdown)
                 break;
         }
@@ -239,7 +227,7 @@ private:
                 _fp.setMode(FailPoint::alwaysOn, 0, BSON("a" << 44));
             }
 
-            stdx::lock_guard<stdx::mutex> lk(_mutex);
+            stdx::lock_guard<mongo::Latch> lk(_mutex);
             if (_inShutdown)
                 break;
         }
@@ -247,7 +235,8 @@ private:
 
     FailPoint _fp;
     std::vector<stdx::thread> _tasks;
-    stdx::mutex _mutex;
+
+    mongo::Mutex _mutex = MONGO_MAKE_LATCH();
     bool _inShutdown = false;
 };
 
@@ -398,13 +387,12 @@ TEST(FailPoint, parseBSONInvalidDataFails) {
 TEST(FailPoint, parseBSONValidDataSucceeds) {
     auto swTuple = FailPoint::parseBSON(BSON("mode"
                                              << "alwaysOn"
-                                             << "data"
-                                             << BSON("a" << 1)));
+                                             << "data" << BSON("a" << 1)));
     ASSERT_TRUE(swTuple.isOK());
 }
 
 TEST(FailPoint, FailPointBlockBasicTest) {
-    auto failPoint = getGlobalFailPointRegistry()->getFailPoint("dummy");
+    auto failPoint = mongo::globalFailPointRegistry().find("dummy");
 
     ASSERT_FALSE(failPoint->shouldFail());
 
@@ -419,33 +407,55 @@ TEST(FailPoint, FailPointBlockBasicTest) {
 TEST(FailPoint, FailPointBlockIfBasicTest) {
     FailPoint failPoint;
     failPoint.setMode(FailPoint::nTimes, 1, BSON("skip" << true));
-
     {
         bool hit = false;
-
-        MONGO_FAIL_POINT_BLOCK_IF(failPoint, scopedFp, [&](const BSONObj& obj) {
-            hit = obj["skip"].trueValue();
-            return false;
-        }) {
-            ASSERT(!"shouldn't get here");
-        }
-
+        failPoint.executeIf([](const BSONObj&) { ASSERT(!"shouldn't get here"); },
+                            [&hit](const BSONObj& obj) {
+                                hit = obj["skip"].trueValue();
+                                return false;
+                            });
         ASSERT(hit);
     }
-
     {
         bool hit = false;
-
-        MONGO_FAIL_POINT_BLOCK_IF(failPoint, scopedFp, [](auto) { return true; }) {
-            hit = true;
-            ASSERT(!scopedFp.getData().isEmpty());
-        }
-
+        failPoint.executeIf(
+            [&hit](const BSONObj& data) {
+                hit = true;
+                ASSERT(!data.isEmpty());
+            },
+            [](const BSONObj&) { return true; });
         ASSERT(hit);
     }
+    failPoint.executeIf([](auto&&) { ASSERT(!"shouldn't get here"); }, [](auto&&) { return true; });
+}
+}  // namespace mongo_test
 
-    MONGO_FAIL_POINT_BLOCK_IF(failPoint, scopedFp, [](auto) { return true; }) {
-        ASSERT(!"shouldn't get here");
-    }
+namespace mongo {
+
+TEST(FailPoint, WaitForFailPointTimeout) {
+    FailPoint failPoint;
+    failPoint.setMode(FailPoint::alwaysOn);
+
+    const auto service = ServiceContext::make();
+    const std::shared_ptr<ClockSourceMock> mockClock = std::make_shared<ClockSourceMock>();
+    service->setFastClockSource(std::make_unique<SharedClockSourceAdapter>(mockClock));
+    service->setPreciseClockSource(std::make_unique<SharedClockSourceAdapter>(mockClock));
+    service->setTickSource(std::make_unique<TickSourceMock<>>());
+
+    const auto client = service->makeClient("WaitForFailPointTest");
+    auto opCtx = client->makeOperationContext();
+    opCtx->setDeadlineAfterNowBy(Milliseconds{999}, ErrorCodes::ExceededTimeLimit);
+
+    stdx::thread waitForFailPoint([&] {
+        ASSERT_THROWS_CODE(failPoint.waitForTimesEntered(opCtx.get(), 1),
+                           AssertionException,
+                           ErrorCodes::ExceededTimeLimit);
+    });
+
+    mockClock->advance(Milliseconds{1000});
+    waitForFailPoint.join();
+
+    failPoint.setMode(FailPoint::off);
 }
-}
+
+}  // namespace mongo

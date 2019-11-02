@@ -39,6 +39,7 @@
 namespace mongo {
 
 class Status;
+class DBException;
 
 // ErrorExtraInfo subclasses:
 //#for $ec in $codes:
@@ -106,22 +107,40 @@ public:
     template <ErrorCategory category>
     static bool isA(Error code);
 
+    template <ErrorCategory category, typename ErrorContainer>
+    static bool isA(const ErrorContainer& object);
+
     //#for $cat in $categories
     static bool is${cat.name}(Error code);
-    //#end for
+    template <typename ErrorContainer>
+    static bool is${cat.name}(const ErrorContainer& object);
 
+    //#end for
     static bool shouldHaveExtraInfo(Error code);
 };
 
 std::ostream& operator<<(std::ostream& stream, ErrorCodes::Error code);
 
-//#for $cat in $categories
-template <>
-inline bool ErrorCodes::isA<ErrorCategory::$cat.name>(Error code) {
-    return is${cat.name}(code);
+template <ErrorCategory category, typename ErrorContainer>
+inline bool ErrorCodes::isA(const ErrorContainer& object) {
+    return isA<category>(object.code());
 }
-//#end for
 
+//#for $cat in $categories
+// Category function declarations for "${cat.name}"
+template <>
+bool ErrorCodes::isA<ErrorCategory::$cat.name>(Error code);
+
+inline bool ErrorCodes::is${cat.name}(Error code) {
+    return isA<ErrorCategory::$cat.name>(code);
+}
+
+template <typename ErrorContainer>
+inline bool ErrorCodes::is${cat.name}(const ErrorContainer& object) {
+    return isA<ErrorCategory::$cat.name>(object.code());
+}
+
+//#end for
 /**
  * This namespace contains implementation details for our error handling code and should not be used
  * directly in general code.
@@ -132,7 +151,7 @@ template <int32_t code>
 constexpr bool isNamedCode = false;
 //#for $ec in $codes
 template <>
-constexpr bool isNamedCode<ErrorCodes::$ec.name> = true;
+constexpr inline bool isNamedCode<ErrorCodes::$ec.name> = true;
 //#end for
 
 MONGO_COMPILER_NORETURN void throwExceptionForStatus(const Status& status);

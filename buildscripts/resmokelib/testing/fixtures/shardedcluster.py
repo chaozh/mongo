@@ -1,7 +1,5 @@
 """Sharded cluster fixture for executing JSTests against."""
 
-from __future__ import absolute_import
-
 import os.path
 import time
 
@@ -25,11 +23,10 @@ class ShardedClusterFixture(interface.Fixture):  # pylint: disable=too-many-inst
     _SHARD_REPLSET_NAME_PREFIX = "shard-rs"
 
     def __init__(  # pylint: disable=too-many-arguments,too-many-locals
-            self, logger, job_num, mongos_executable=None, mongos_options=None,
-            mongod_executable=None, mongod_options=None, dbpath_prefix=None, preserve_dbpath=False,
-            num_shards=1, num_rs_nodes_per_shard=None, num_mongos=1, enable_sharding=None,
-            enable_balancer=True, enable_autosplit=True, auth_options=None, configsvr_options=None,
-            shard_options=None):
+            self, logger, job_num, mongos_executable=None, mongos_options=None, mongod_options=None,
+            dbpath_prefix=None, preserve_dbpath=False, num_shards=1, num_rs_nodes_per_shard=1,
+            num_mongos=1, enable_sharding=None, enable_balancer=True, enable_autosplit=True,
+            auth_options=None, configsvr_options=None, shard_options=None, mixed_bin_versions=None):
         """Initialize ShardedClusterFixture with different options for the cluster processes."""
 
         interface.Fixture.__init__(self, logger, job_num, dbpath_prefix=dbpath_prefix)
@@ -39,7 +36,6 @@ class ShardedClusterFixture(interface.Fixture):  # pylint: disable=too-many-inst
 
         self.mongos_executable = mongos_executable
         self.mongos_options = utils.default_if_none(mongos_options, {})
-        self.mongod_executable = mongod_executable
         self.mongod_options = utils.default_if_none(mongod_options, {})
         self.mongod_options["set_parameters"] = mongod_options.get("set_parameters", {}).copy()
         self.mongod_options["set_parameters"]["migrationLockAcquisitionMaxWaitMS"] = \
@@ -54,12 +50,35 @@ class ShardedClusterFixture(interface.Fixture):  # pylint: disable=too-many-inst
         self.auth_options = auth_options
         self.configsvr_options = utils.default_if_none(configsvr_options, {})
         self.shard_options = utils.default_if_none(shard_options, {})
+        self.mixed_bin_versions = utils.default_if_none(mixed_bin_versions,
+                                                        config.MIXED_BIN_VERSIONS)
+        if self.mixed_bin_versions is not None and num_rs_nodes_per_shard is not None:
+            num_mongods = self.num_shards * self.num_rs_nodes_per_shard
+            if len(self.mixed_bin_versions) != num_mongods:
+                msg = (("The number of binary versions specified: {} do not match the number of"\
+                        " nodes in the sharded cluster: {}.")).format(len(self.mixed_bin_versions), num_mongods)
+                raise errors.ServerFailure(msg)
 
         self._dbpath_prefix = os.path.join(self._dbpath_prefix, config.FIXTURE_SUBDIR)
 
         self.configsvr = None
         self.mongos = []
         self.shards = []
+
+    def pids(self):
+        """:return: pids owned by this fixture if any."""
+        out = []
+        if self.configsvr is not None:
+            out.extend(self.configsvr.pids())
+        else:
+            self.logger.debug(
+                'Config server not running when gathering sharded cluster fixture pids.')
+        if self.shards is not None:
+            for shard in self.shards:
+                out.extend(shard.pids())
+        else:
+            self.logger.debug('No shards when gathering sharded cluster fixture pids.')
+        return out
 
     def setup(self):
         """Set up the sharded cluster."""
@@ -69,7 +88,7 @@ class ShardedClusterFixture(interface.Fixture):  # pylint: disable=too-many-inst
         self.configsvr.setup()
 
         if not self.shards:
-            for i in xrange(self.num_shards):
+            for i in range(self.num_shards):
                 if self.num_rs_nodes_per_shard is None:
                     shard = self._new_standalone_shard(i)
                 elif isinstance(self.num_rs_nodes_per_shard, int):
@@ -140,6 +159,11 @@ class ShardedClusterFixture(interface.Fixture):  # pylint: disable=too-many-inst
         # Ensure that the sessions collection gets auto-sharded by the config server
         if self.configsvr is not None:
             primary = self.configsvr.get_primary().mongo_client()
+            primary.admin.command({"refreshLogicalSessionCacheNow": 1})
+
+        for shard in self.shards:
+            primary = (shard.mongo_client() if self.num_rs_nodes_per_shard is None else
+                       shard.get_primary().mongo_client())
             primary.admin.command({"refreshLogicalSessionCacheNow": 1})
 
     def _auth_to_db(self, client):
@@ -218,7 +242,6 @@ class ShardedClusterFixture(interface.Fixture):  # pylint: disable=too-many-inst
         configsvr_options = self.configsvr_options.copy()
 
         auth_options = configsvr_options.pop("auth_options", self.auth_options)
-        mongod_executable = configsvr_options.pop("mongod_executable", self.mongod_executable)
         preserve_dbpath = configsvr_options.pop("preserve_dbpath", self.preserve_dbpath)
         num_nodes = configsvr_options.pop("num_nodes", 1)
 
@@ -233,9 +256,9 @@ class ShardedClusterFixture(interface.Fixture):  # pylint: disable=too-many-inst
         mongod_options["storageEngine"] = "wiredTiger"
 
         return replicaset.ReplicaSetFixture(
-            mongod_logger, self.job_num, mongod_executable=mongod_executable,
-            mongod_options=mongod_options, preserve_dbpath=preserve_dbpath, num_nodes=num_nodes,
-            auth_options=auth_options, replset_config_options=replset_config_options,
+            mongod_logger, self.job_num, mongod_options=mongod_options,
+            preserve_dbpath=preserve_dbpath, num_nodes=num_nodes, auth_options=auth_options,
+            mixed_bin_versions=None, replset_config_options=replset_config_options,
             **configsvr_options)
 
     def _new_rs_shard(self, index, num_rs_nodes_per_shard):
@@ -246,11 +269,16 @@ class ShardedClusterFixture(interface.Fixture):  # pylint: disable=too-many-inst
         shard_options = self.shard_options.copy()
 
         auth_options = shard_options.pop("auth_options", self.auth_options)
-        mongod_executable = shard_options.pop("mongod_executable", self.mongod_executable)
         preserve_dbpath = shard_options.pop("preserve_dbpath", self.preserve_dbpath)
 
         replset_config_options = shard_options.pop("replset_config_options", {})
         replset_config_options["configsvr"] = False
+
+        mixed_bin_versions = self.mixed_bin_versions
+        if mixed_bin_versions is not None:
+            start_index = index * num_rs_nodes_per_shard
+            mixed_bin_versions = mixed_bin_versions[start_index:start_index +
+                                                    num_rs_nodes_per_shard]
 
         mongod_options = self.mongod_options.copy()
         mongod_options.update(shard_options.pop("mongod_options", {}))
@@ -259,10 +287,10 @@ class ShardedClusterFixture(interface.Fixture):  # pylint: disable=too-many-inst
         mongod_options["replSet"] = ShardedClusterFixture._SHARD_REPLSET_NAME_PREFIX + str(index)
 
         return replicaset.ReplicaSetFixture(
-            mongod_logger, self.job_num, mongod_executable=mongod_executable,
-            mongod_options=mongod_options, preserve_dbpath=preserve_dbpath,
-            num_nodes=num_rs_nodes_per_shard, auth_options=auth_options,
-            replset_config_options=replset_config_options, **shard_options)
+            mongod_logger, self.job_num, mongod_options=mongod_options,
+            preserve_dbpath=preserve_dbpath, num_nodes=num_rs_nodes_per_shard,
+            auth_options=auth_options, replset_config_options=replset_config_options,
+            mixed_bin_versions=mixed_bin_versions, **shard_options)
 
     def _new_standalone_shard(self, index):
         """Return a standalone.MongoDFixture configured as a shard in a sharded cluster."""
@@ -271,7 +299,6 @@ class ShardedClusterFixture(interface.Fixture):  # pylint: disable=too-many-inst
 
         shard_options = self.shard_options.copy()
 
-        mongod_executable = shard_options.pop("mongod_executable", self.mongod_executable)
         preserve_dbpath = shard_options.pop("preserve_dbpath", self.preserve_dbpath)
 
         mongod_options = self.mongod_options.copy()
@@ -279,9 +306,8 @@ class ShardedClusterFixture(interface.Fixture):  # pylint: disable=too-many-inst
         mongod_options["shardsvr"] = ""
         mongod_options["dbpath"] = os.path.join(self._dbpath_prefix, "shard{}".format(index))
 
-        return standalone.MongoDFixture(
-            mongod_logger, self.job_num, mongod_executable=mongod_executable,
-            mongod_options=mongod_options, preserve_dbpath=preserve_dbpath, **shard_options)
+        return standalone.MongoDFixture(mongod_logger, self.job_num, mongod_options=mongod_options,
+                                        preserve_dbpath=preserve_dbpath, **shard_options)
 
     def _new_mongos(self, index, total):
         """
@@ -302,7 +328,13 @@ class ShardedClusterFixture(interface.Fixture):  # pylint: disable=too-many-inst
         mongos_options = self.mongos_options.copy()
         mongos_options["configdb"] = self.configsvr.get_internal_connection_string()
 
-        return _MongoSFixture(mongos_logger, self.job_num, mongos_executable=self.mongos_executable,
+        mongos_executable = utils.default_if_none(config.MONGOS_EXECUTABLE,
+                                                  config.DEFAULT_MONGOS_EXECUTABLE)
+        last_stable_executable = mongos_executable + "-" \
+                                + ShardedClusterFixture._LAST_STABLE_BIN_VERSION
+        mongos_executable = self.mongos_executable if self.mixed_bin_versions is None else last_stable_executable
+
+        return _MongoSFixture(mongos_logger, self.job_num, mongos_executable=mongos_executable,
                               mongos_options=mongos_options)
 
     def _add_shard(self, client, shard):
@@ -353,6 +385,14 @@ class _MongoSFixture(interface.Fixture):
             raise errors.ServerFailure(msg)
 
         self.mongos = mongos
+
+    def pids(self):
+        """:return: pids owned by this fixture if any."""
+        if self.mongos is not None:
+            return [self.mongos.pid]
+        else:
+            self.logger.debug('Mongos not running when gathering mongos fixture pids.')
+        return []
 
     def await_ready(self):
         """Block until the fixture can be used for testing."""

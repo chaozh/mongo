@@ -1,4 +1,9 @@
-// @tags: [does_not_support_stepdowns]
+// @tags: [
+//   # mapReduce does not support afterClusterTime.
+//   does_not_support_causal_consistency,
+//   does_not_support_stepdowns,
+//   uses_map_reduce_with_temp_collections,
+// ]
 
 // Geo mapreduce 2 from SERVER-3478
 
@@ -17,7 +22,6 @@ m = function() {
 
 // reduce function
 r = function(key, values) {
-
     var total = 0;
     for (var i = 0; i < values.length; i++) {
         total += values[i].count;

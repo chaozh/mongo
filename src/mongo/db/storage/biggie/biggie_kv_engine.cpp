@@ -31,15 +31,16 @@
 
 #include "mongo/platform/basic.h"
 
-#include "mongo/base/disallow_copying.h"
+#include "mongo/db/storage/biggie/biggie_kv_engine.h"
+
+#include <memory>
+
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/snapshot_window_options.h"
-#include "mongo/db/storage/biggie/biggie_kv_engine.h"
 #include "mongo/db/storage/biggie/biggie_recovery_unit.h"
 #include "mongo/db/storage/key_string.h"
 #include "mongo/db/storage/record_store.h"
 #include "mongo/db/storage/sorted_data_interface.h"
-#include "mongo/stdx/memory.h"
 
 namespace mongo {
 namespace biggie {
@@ -93,7 +94,7 @@ std::unique_ptr<mongo::RecordStore> KVEngine::getRecordStore(OperationContext* o
 }
 
 bool KVEngine::trySwapMaster(StringStore& newMaster, uint64_t version) {
-    stdx::lock_guard<stdx::mutex> lock(_masterLock);
+    stdx::lock_guard<Latch> lock(_masterLock);
     invariant(!newMaster.hasBranch() && !_master.hasBranch());
     if (_masterVersion != version)
         return false;
@@ -104,17 +105,17 @@ bool KVEngine::trySwapMaster(StringStore& newMaster, uint64_t version) {
 
 
 Status KVEngine::createSortedDataInterface(OperationContext* opCtx,
+                                           const CollectionOptions& collOptions,
                                            StringData ident,
                                            const IndexDescriptor* desc) {
     _idents[ident.toString()] = false;
     return Status::OK();  // I don't think we actually need to do anything here
 }
 
-mongo::SortedDataInterface* KVEngine::getSortedDataInterface(OperationContext* opCtx,
-                                                             StringData ident,
-                                                             const IndexDescriptor* desc) {
+std::unique_ptr<mongo::SortedDataInterface> KVEngine::getSortedDataInterface(
+    OperationContext* opCtx, StringData ident, const IndexDescriptor* desc) {
     _idents[ident.toString()] = false;
-    return new SortedDataInterface(opCtx, ident, desc);
+    return std::make_unique<SortedDataInterface>(opCtx, ident, desc);
 }
 
 Status KVEngine::dropIdent(OperationContext* opCtx, StringData ident) {

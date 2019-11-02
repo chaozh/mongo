@@ -32,17 +32,17 @@
 #include <semaphore.h>
 #endif
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/stdx/condition_variable.h"
-#include "mongo/stdx/mutex.h"
 #include "mongo/util/concurrency/mutex.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
 
 class TicketHolder {
-    MONGO_DISALLOW_COPYING(TicketHolder);
+    TicketHolder(const TicketHolder&) = delete;
+    TicketHolder& operator=(const TicketHolder&) = delete;
 
 public:
     explicit TicketHolder(int num);
@@ -87,13 +87,13 @@ private:
 
     // You can read _outof without a lock, but have to hold _resizeMutex to change.
     AtomicWord<int> _outof;
-    stdx::mutex _resizeMutex;
+    Mutex _resizeMutex = MONGO_MAKE_LATCH("TicketHolder::_resizeMutex");
 #else
     bool _tryAcquire();
 
     AtomicWord<int> _outof;
     int _num;
-    stdx::mutex _mutex;
+    Mutex _mutex = MONGO_MAKE_LATCH("TicketHolder::_mutex");
     stdx::condition_variable _newTicket;
 #endif
 };
@@ -113,11 +113,12 @@ private:
 };
 
 class TicketHolderReleaser {
-    MONGO_DISALLOW_COPYING(TicketHolderReleaser);
+    TicketHolderReleaser(const TicketHolderReleaser&) = delete;
+    TicketHolderReleaser& operator=(const TicketHolderReleaser&) = delete;
 
 public:
     TicketHolderReleaser() {
-        _holder = NULL;
+        _holder = nullptr;
     }
 
     explicit TicketHolderReleaser(TicketHolder* holder) {
@@ -131,10 +132,10 @@ public:
     }
 
     bool hasTicket() const {
-        return _holder != NULL;
+        return _holder != nullptr;
     }
 
-    void reset(TicketHolder* holder = NULL) {
+    void reset(TicketHolder* holder = nullptr) {
         if (_holder) {
             _holder->release();
         }

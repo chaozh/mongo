@@ -31,6 +31,7 @@
 
 #include "mongo/db/sessions_collection.h"
 
+#include <functional>
 #include <memory>
 #include <vector>
 
@@ -39,16 +40,10 @@
 #include "mongo/db/create_indexes_gen.h"
 #include "mongo/db/logical_session_id.h"
 #include "mongo/db/ops/write_ops.h"
-#include "mongo/db/refresh_sessions_gen.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/s/write_ops/batched_command_response.h"
-#include "mongo/stdx/functional.h"
-#include "mongo/stdx/memory.h"
 
 namespace mongo {
-
-constexpr StringData SessionsCollection::kSessionsTTLIndex;
-
 namespace {
 
 // This batch size is chosen to ensure that we don't form requests larger than the 16mb limit.
@@ -96,7 +91,7 @@ BSONObj updateQuery(const LogicalSessionRecord& record) {
 }
 
 template <typename TFactory, typename AddLineFn, typename SendFn, typename Container>
-Status runBulkGeneric(TFactory makeT, AddLineFn addLine, SendFn sendBatch, const Container& items) {
+void runBulkGeneric(TFactory makeT, AddLineFn addLine, SendFn sendBatch, const Container& items) {
     using T = decltype(makeT());
 
     size_t i = 0;
@@ -107,7 +102,7 @@ Status runBulkGeneric(TFactory makeT, AddLineFn addLine, SendFn sendBatch, const
         thing.emplace(makeT());
     };
 
-    auto sendLocalBatch = [&] { return sendBatch(thing.value()); };
+    auto sendLocalBatch = [&] { sendBatch(thing.value()); };
 
     setupBatch();
 
@@ -115,28 +110,23 @@ Status runBulkGeneric(TFactory makeT, AddLineFn addLine, SendFn sendBatch, const
         addLine(*thing, item);
 
         if (++i >= kMaxBatchSize) {
-            auto res = sendLocalBatch();
-            if (!res.isOK()) {
-                return res;
-            }
+            sendLocalBatch();
 
             setupBatch();
         }
     }
 
     if (i > 0) {
-        return sendLocalBatch();
-    } else {
-        return Status::OK();
+        sendLocalBatch();
     }
 }
 
 template <typename InitBatchFn, typename AddLineFn, typename SendBatchFn, typename Container>
-Status runBulkCmd(StringData label,
-                  InitBatchFn&& initBatch,
-                  AddLineFn&& addLine,
-                  SendBatchFn&& sendBatch,
-                  const Container& items) {
+void runBulkCmd(StringData label,
+                InitBatchFn&& initBatch,
+                AddLineFn&& addLine,
+                SendBatchFn&& sendBatch,
+                const Container& items) {
     BufBuilder buf;
 
     boost::optional<BSONObjBuilder> batchBuilder;
@@ -153,31 +143,27 @@ Status runBulkCmd(StringData label,
 
     auto sendLocalBatch = [&](BSONArrayBuilder*) {
         entries->done();
-        return sendBatch(batchBuilder->done());
+        sendBatch(batchBuilder->done());
     };
 
-    return runBulkGeneric(makeBatch, addLine, sendLocalBatch, items);
+    runBulkGeneric(makeBatch, addLine, sendLocalBatch, items);
 }
 
 }  // namespace
+
+constexpr StringData SessionsCollection::kSessionsTTLIndex;
+
+SessionsCollection::SessionsCollection() = default;
 
 SessionsCollection::~SessionsCollection() = default;
 
 SessionsCollection::SendBatchFn SessionsCollection::makeSendFnForBatchWrite(
     const NamespaceString& ns, DBClientBase* client) {
-    auto send = [client, ns](BSONObj batch) -> Status {
+    auto send = [client, ns](BSONObj batch) {
         BSONObj res;
         if (!client->runCommand(ns.db().toString(), batch, res)) {
-            return getStatusFromCommandResult(res);
+            uassertStatusOK(getStatusFromCommandResult(res));
         }
-
-        BatchedCommandResponse response;
-        std::string errmsg;
-        if (!response.parseBSON(res, &errmsg)) {
-            return {ErrorCodes::FailedToParse, errmsg};
-        }
-
-        return response.toStatus();
     };
 
     return send;
@@ -185,13 +171,11 @@ SessionsCollection::SendBatchFn SessionsCollection::makeSendFnForBatchWrite(
 
 SessionsCollection::SendBatchFn SessionsCollection::makeSendFnForCommand(const NamespaceString& ns,
                                                                          DBClientBase* client) {
-    auto send = [client, ns](BSONObj cmd) -> Status {
+    auto send = [client, ns](BSONObj cmd) {
         BSONObj res;
         if (!client->runCommand(ns.db().toString(), cmd, res)) {
-            return getStatusFromCommandResult(res);
+            uassertStatusOK(getStatusFromCommandResult(res));
         }
-
-        return Status::OK();
     };
 
     return send;
@@ -199,10 +183,10 @@ SessionsCollection::SendBatchFn SessionsCollection::makeSendFnForCommand(const N
 
 SessionsCollection::FindBatchFn SessionsCollection::makeFindFnForCommand(const NamespaceString& ns,
                                                                          DBClientBase* client) {
-    auto send = [client, ns](BSONObj cmd) -> StatusWith<BSONObj> {
+    auto send = [client, ns](BSONObj cmd) -> BSONObj {
         BSONObj res;
         if (!client->runCommand(ns.db().toString(), cmd, res)) {
-            return getStatusFromCommandResult(res);
+            uassertStatusOK(getStatusFromCommandResult(res));
         }
 
         return res;
@@ -211,9 +195,9 @@ SessionsCollection::FindBatchFn SessionsCollection::makeFindFnForCommand(const N
     return send;
 }
 
-Status SessionsCollection::doRefresh(const NamespaceString& ns,
-                                     const LogicalSessionRecordSet& sessions,
-                                     SendBatchFn send) {
+void SessionsCollection::_doRefresh(const NamespaceString& ns,
+                                    const std::vector<LogicalSessionRecord>& sessions,
+                                    SendBatchFn send) {
     auto init = [ns](BSONObjBuilder* batch) {
         batch->append("update", ns.coll());
         batch->append("ordered", false);
@@ -226,12 +210,12 @@ Status SessionsCollection::doRefresh(const NamespaceString& ns,
             BSON("q" << lsidQuery(record) << "u" << updateQuery(record) << "upsert" << true));
     };
 
-    return runBulkCmd("updates", init, add, send, sessions);
+    runBulkCmd("updates", init, add, send, sessions);
 }
 
-Status SessionsCollection::doRemove(const NamespaceString& ns,
-                                    const LogicalSessionIdSet& sessions,
-                                    SendBatchFn send) {
+void SessionsCollection::_doRemove(const NamespaceString& ns,
+                                   const std::vector<LogicalSessionId>& sessions,
+                                   SendBatchFn send) {
     auto init = [ns](BSONObjBuilder* batch) {
         batch->append("delete", ns.coll());
         batch->append("ordered", false);
@@ -242,34 +226,27 @@ Status SessionsCollection::doRemove(const NamespaceString& ns,
         builder->append(BSON("q" << lsidQuery(lsid) << "limit" << 0));
     };
 
-    return runBulkCmd("deletes", init, add, send, sessions);
+    runBulkCmd("deletes", init, add, send, sessions);
 }
 
-StatusWith<LogicalSessionIdSet> SessionsCollection::doFetch(const NamespaceString& ns,
-                                                            const LogicalSessionIdSet& sessions,
-                                                            FindBatchFn send) {
+LogicalSessionIdSet SessionsCollection::_doFindRemoved(
+    const NamespaceString& ns, const std::vector<LogicalSessionId>& sessions, FindBatchFn send) {
     auto makeT = [] { return std::vector<LogicalSessionId>{}; };
 
     auto add = [](std::vector<LogicalSessionId>& batch, const LogicalSessionId& record) {
         batch.push_back(record);
     };
 
-    LogicalSessionIdSet removed = sessions;
+    LogicalSessionIdSet removed{sessions.begin(), sessions.end()};
 
     auto wrappedSend = [&](BSONObj batch) {
         auto swBatchResult = send(batch);
 
-        if (!swBatchResult.isOK()) {
-            return swBatchResult.getStatus();
-        } else {
-            auto result = SessionsCollectionFetchResult::parse("SessionsCollectionFetchResult"_sd,
-                                                               swBatchResult.getValue());
+        auto result =
+            SessionsCollectionFetchResult::parse("SessionsCollectionFetchResult"_sd, swBatchResult);
 
-            for (const auto& lsid : result.getCursor().getFirstBatch()) {
-                removed.erase(lsid.get_id());
-            }
-
-            return Status::OK();
+        for (const auto& lsid : result.getCursor().getFirstBatch()) {
+            removed.erase(lsid.get_id());
         }
     };
 
@@ -287,14 +264,10 @@ StatusWith<LogicalSessionIdSet> SessionsCollection::doFetch(const NamespaceStrin
         request.setLimit(batch.size());
         request.setSingleBatch(true);
 
-        return wrappedSend(request.toBSON());
+        wrappedSend(request.toBSON());
     };
 
-    auto status = runBulkGeneric(makeT, add, sendLocal, sessions);
-
-    if (!status.isOK()) {
-        return status;
-    }
+    runBulkGeneric(makeT, add, sendLocal, sessions);
 
     return removed;
 }

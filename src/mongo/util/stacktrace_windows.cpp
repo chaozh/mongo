@@ -44,13 +44,12 @@
 #include <cstdio>
 #include <cstdlib>
 #include <iostream>
+#include <memory>
 #include <sstream>
 #include <string>
 #include <vector>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/base/init.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/concurrency/mutex.h"
 #include "mongo/util/log.h"
@@ -65,7 +64,8 @@ const auto kPathBufferSize = 1024;
 // symbol handler. Because access to the symbol handler API is not thread-safe, it also provides
 // a lock/unlock method so the whole symbol handler can be used with a stdx::lock_guard.
 class SymbolHandler {
-    MONGO_DISALLOW_COPYING(SymbolHandler);
+    SymbolHandler(const SymbolHandler&) = delete;
+    SymbolHandler& operator=(const SymbolHandler&) = delete;
 
 public:
     SymbolHandler() {
@@ -122,7 +122,7 @@ public:
 
 private:
     boost::optional<HANDLE> _processHandle;
-    stdx::mutex _mutex;
+    stdx::mutex _mutex;  // NOLINT
     DWORD _origOptions;
 };
 
@@ -220,7 +220,7 @@ static void getsymbolAndOffset(HANDLE process,
     std::string symbolString(symbolInfo->Name);
     static const size_t bufferSize = 32;
     std::unique_ptr<char[]> symbolOffset(new char[bufferSize]);
-    _snprintf(symbolOffset.get(), bufferSize, "+0x%llux", displacement64);
+    _snprintf(symbolOffset.get(), bufferSize, "+0x%llx", displacement64);
     symbolString += symbolOffset.get();
     returnedSymbolAndOffset->swap(symbolString);
 }
@@ -235,8 +235,6 @@ static const int maxBackTraceFrames = 100;
 
 /**
  * Print a stack backtrace for the current thread to the specified ostream.
- *
- * @param os    ostream& to receive printed stack backtrace
  */
 void printStackTrace(std::ostream& os) {
     CONTEXT context;
@@ -246,6 +244,13 @@ void printStackTrace(std::ostream& os) {
     printWindowsStackTrace(context, os);
 }
 
+/**
+ * Print a stack backtrace for the current thread to the specified ostream, signal-safe variant.
+ * (Currently the same as printStackTrace.)
+ */
+void printStackTraceFromSignal(std::ostream& os) {
+    printStackTrace(os);
+}
 
 /**
  * Print stack trace (using a specified stack context) to "os"
@@ -345,10 +350,4 @@ void printWindowsStackTrace(CONTEXT& context, std::ostream& os) {
     }
 }
 
-// Print error message from C runtime, then fassert
-int crtDebugCallback(int, char* originalMessage, int*) {
-    StringData message(originalMessage);
-    log() << "*** C runtime error: " << message.substr(0, message.find('\n')) << ", terminating";
-    fassertFailed(17006);
-}
-}
+}  // namespace mongo

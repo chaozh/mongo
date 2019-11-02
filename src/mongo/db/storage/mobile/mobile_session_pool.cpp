@@ -43,7 +43,7 @@
 #include "mongo/db/storage/mobile/mobile_session_pool.h"
 #include "mongo/db/storage/mobile/mobile_sqlite_statement.h"
 #include "mongo/db/storage/mobile/mobile_util.h"
-#include "mongo/stdx/mutex.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
@@ -95,15 +95,17 @@ bool MobileDelayedOpQueue::isEmpty() {
     return (_isEmpty.load());
 }
 
-MobileSessionPool::MobileSessionPool(const std::string& path, std::uint64_t maxPoolSize)
-    : _path(path), _maxPoolSize(maxPoolSize) {}
+MobileSessionPool::MobileSessionPool(const std::string& path,
+                                     const embedded::MobileOptions& options,
+                                     std::uint64_t maxPoolSize)
+    : _path(path), _options(options), _maxPoolSize(maxPoolSize) {}
 
 MobileSessionPool::~MobileSessionPool() {
     shutDown();
 }
 
 std::unique_ptr<MobileSession> MobileSessionPool::getSession(OperationContext* opCtx) {
-    stdx::unique_lock<stdx::mutex> lk(_mutex);
+    stdx::unique_lock<Latch> lk(_mutex);
 
     // We should never be able to get here after _shuttingDown is set, because no new operations
     // should be allowed to start.
@@ -112,16 +114,17 @@ std::unique_ptr<MobileSession> MobileSessionPool::getSession(OperationContext* o
     // Checks if there is an open session available.
     if (!_sessions.empty()) {
         sqlite3* session = _popSession_inlock();
-        return stdx::make_unique<MobileSession>(session, this);
+        return std::make_unique<MobileSession>(session, this);
     }
 
     // Checks if a new session can be opened.
     if (_curPoolSize < _maxPoolSize) {
         sqlite3* session;
         int status = sqlite3_open(_path.c_str(), &session);
-        checkStatus(status, SQLITE_OK, "sqlite3_open");
+        embedded::checkStatus(status, SQLITE_OK, "sqlite3_open");
+        embedded::configureSession(session, _options);
         _curPoolSize++;
-        return stdx::make_unique<MobileSession>(session, this);
+        return std::make_unique<MobileSession>(session, this);
     }
 
     // There are no open sessions available and the maxPoolSize has been reached.
@@ -130,7 +133,7 @@ std::unique_ptr<MobileSession> MobileSessionPool::getSession(OperationContext* o
         _releasedSessionNotifier, lk, [&] { return !_sessions.empty(); });
 
     sqlite3* session = _popSession_inlock();
-    return stdx::make_unique<MobileSession>(session, this);
+    return std::make_unique<MobileSession>(session, this);
 }
 
 void MobileSessionPool::releaseSession(MobileSession* session) {
@@ -138,13 +141,13 @@ void MobileSessionPool::releaseSession(MobileSession* session) {
     if (!failedDropsQueue.isEmpty())
         failedDropsQueue.execAndDequeueOp(session);
 
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     _sessions.push_back(session->getSession());
     _releasedSessionNotifier.notify_one();
 }
 
 void MobileSessionPool::shutDown() {
-    stdx::unique_lock<stdx::mutex> lk(_mutex);
+    stdx::unique_lock<Latch> lk(_mutex);
     _shuttingDown = true;
 
     // Retrieve the operation context from the thread's client if the client exists.
@@ -166,8 +169,8 @@ void MobileSessionPool::shutDown() {
         sqlite3* session;
 
         int status = sqlite3_open(_path.c_str(), &session);
-        checkStatus(status, SQLITE_OK, "sqlite3_open");
-        std::unique_ptr<MobileSession> mobSession = stdx::make_unique<MobileSession>(session, this);
+        embedded::checkStatus(status, SQLITE_OK, "sqlite3_open");
+        std::unique_ptr<MobileSession> mobSession = std::make_unique<MobileSession>(session, this);
         LOG(MOBILE_LOG_LEVEL_LOW) << "MobileSE: Executing queued drops at shutdown";
         failedDropsQueue.execAndDequeueAllOps(mobSession.get());
         sqlite3_close(session);

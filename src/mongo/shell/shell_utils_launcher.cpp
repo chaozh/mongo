@@ -39,10 +39,12 @@
 #include <boost/iostreams/stream.hpp>
 #include <boost/iostreams/stream_buffer.hpp>
 #include <boost/iostreams/tee.hpp>
+#include <cctype>
 #include <fcntl.h>
 #include <iostream>
 #include <iterator>
 #include <map>
+#include <memory>
 #include <signal.h>
 #include <vector>
 
@@ -58,12 +60,12 @@
 #include <unistd.h>
 #endif
 
+#include "mongo/base/environment_buffer.h"
 #include "mongo/client/dbclient_connection.h"
 #include "mongo/db/traffic_reader.h"
 #include "mongo/scripting/engine.h"
 #include "mongo/shell/shell_options.h"
 #include "mongo/shell/shell_utils.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/util/destructor_guard.h"
 #include "mongo/util/exit.h"
 #include "mongo/util/log.h"
@@ -71,12 +73,8 @@
 #include "mongo/util/quick_exit.h"
 #include "mongo/util/scopeguard.h"
 #include "mongo/util/signal_win32.h"
-#include "mongo/util/stringutils.h"
+#include "mongo/util/str.h"
 #include "mongo/util/text.h"
-
-#ifndef _WIN32
-extern char** environ;
-#endif
 
 namespace mongo {
 
@@ -121,7 +119,7 @@ void safeClose(int fd) {
         }
 
         ~ScopedSignalBlocker() {
-            pthread_sigmask(SIG_SETMASK, &_oldMask, NULL);
+            pthread_sigmask(SIG_SETMASK, &_oldMask, nullptr);
         }
 
     private:
@@ -136,7 +134,7 @@ void safeClose(int fd) {
     }
 }
 
-stdx::mutex _createProcessMtx;
+Mutex _createProcessMtx;
 }  // namespace
 
 ProgramOutputMultiplexer programOutputLogger;
@@ -241,7 +239,7 @@ void ProgramOutputMultiplexer::appendLine(int port,
                                           ProcessId pid,
                                           const std::string& name,
                                           const std::string& line) {
-    stdx::lock_guard<stdx::mutex> lk(mongoProgramOutputMutex);
+    stdx::lock_guard<Latch> lk(mongoProgramOutputMutex);
     boost::iostreams::tee_device<std::ostream, std::stringstream> teeDevice(cout, _buffer);
     boost::iostreams::stream<decltype(teeDevice)> teeStream(teeDevice);
     if (port > 0) {
@@ -252,12 +250,12 @@ void ProgramOutputMultiplexer::appendLine(int port,
 }
 
 string ProgramOutputMultiplexer::str() const {
-    stdx::lock_guard<stdx::mutex> lk(mongoProgramOutputMutex);
+    stdx::lock_guard<Latch> lk(mongoProgramOutputMutex);
     return _buffer.str();
 }
 
 void ProgramOutputMultiplexer::clear() {
-    stdx::lock_guard<stdx::mutex> lk(mongoProgramOutputMutex);
+    stdx::lock_guard<Latch> lk(mongoProgramOutputMutex);
     _buffer.str("");
 }
 
@@ -277,11 +275,13 @@ ProgramRunner::ProgramRunner(const BSONObj& args, const BSONObj& env, bool isMon
     _port = -1;
 
     string prefix("mongod-");
-    bool isMongodProgram = isMongo && (string("mongod") == programName ||
-                                       programName.string().compare(0, prefix.size(), prefix) == 0);
+    bool isMongodProgram = isMongo &&
+        (string("mongod") == programName ||
+         programName.string().compare(0, prefix.size(), prefix) == 0);
     prefix = "mongos-";
-    bool isMongosProgram = isMongo && (string("mongos") == programName ||
-                                       programName.string().compare(0, prefix.size(), prefix) == 0);
+    bool isMongosProgram = isMongo &&
+        (string("mongos") == programName ||
+         programName.string().compare(0, prefix.size(), prefix) == 0);
 
     if (!isMongo) {
         _name = "sh";
@@ -316,7 +316,8 @@ ProgramRunner::ProgramRunner(const BSONObj& args, const BSONObj& env, bool isMon
             if (str == "--port") {
                 _port = -2;
             } else if (_port == -2) {
-                _port = strtol(str.c_str(), 0, 10);
+                if (!NumberParser::strToAny(10)(str, &_port).isOK())
+                    _port = 0;  // same behavior as strtol
             } else if (isMongodProgram && str == "--configsvr") {
                 _name = "c";
             }
@@ -356,7 +357,7 @@ ProgramRunner::ProgramRunner(const BSONObj& args, const BSONObj& env, bool isMon
 #else
     // environ is a POSIX defined array of char*s. Each char* in the array is a <key>=<value>\0
     // pair.
-    char** environEntry = environ;
+    char** environEntry = getEnvironPointer();
     while (*environEntry) {
         std::string envKeyValue(*environEntry);
         size_t splitPoint = envKeyValue.find('=');
@@ -404,7 +405,7 @@ void ProgramRunner::start() {
         //
         // Holding the lock for the duration of those events prevents the leaks and thus the
         // associated deadlocks.
-        stdx::lock_guard<stdx::mutex> lk(_createProcessMtx);
+        stdx::lock_guard<Latch> lk(_createProcessMtx);
         int status = pipe(pipeEnds);
         if (status != 0) {
             const auto ewd = errnoWithDescription();
@@ -430,7 +431,7 @@ void ProgramRunner::start() {
         }
 #endif
 
-        fflush(0);
+        fflush(nullptr);
 
         launchProcess(pipeEnds[1]);  // sets _pid
 
@@ -525,7 +526,7 @@ boost::filesystem::path ProgramRunner::findProgram(const string& prog) {
 
     // PATH entries are separated by colons. Per POSIX 2013, there is no way to escape a colon in
     // an entry.
-    splitStringDelim(path, &pathEntries, ':');
+    str::splitStringDelim(path, &pathEntries, ':');
 
     for (const std::string& pathEntry : pathEntries) {
         boost::filesystem::path potentialBinary = boost::filesystem::path(pathEntry) / p;
@@ -586,7 +587,7 @@ void ProgramRunner::launchProcess(int child_stdout) {
     // Reserve space for the final NULL character which terminates the environment block
     environmentBlockSize += 1;
 
-    auto lpEnvironment = stdx::make_unique<wchar_t[]>(environmentBlockSize);
+    auto lpEnvironment = std::make_unique<wchar_t[]>(environmentBlockSize);
     size_t environmentOffset = 0;
     for (const std::wstring& envKeyValue : nativeEnvStrings) {
         // Ensure there is enough room to write the string, the string's NULL byte, and the block's
@@ -694,7 +695,7 @@ void ProgramRunner::launchProcess(int child_stdout) {
 // returns true if process exited
 // If this function returns true, it will always call `registry.unregisterProgram(pid);`
 // If block is true, this will throw if it cannot wait for the processes to exit.
-bool wait_for_pid(ProcessId pid, bool block = true, int* exit_code = NULL) {
+bool wait_for_pid(ProcessId pid, bool block = true, int* exit_code = nullptr) {
 #ifdef _WIN32
     verify(registry.countHandleForPid(pid));
     HANDLE h = registry.getHandleForPid(pid);
@@ -913,7 +914,7 @@ inline void kill_wrapper(ProcessId pid, int sig, int port, const BSONObj& opt) {
     std::string eventName = getShutdownSignalName(pid.asUInt32());
 
     HANDLE event = OpenEventA(EVENT_MODIFY_STATE, FALSE, eventName.c_str());
-    if (event == NULL) {
+    if (event == nullptr) {
         int gle = GetLastError();
         if (gle != ERROR_FILE_NOT_FOUND) {
             const auto ewd = errnoWithDescription();
@@ -928,8 +929,7 @@ inline void kill_wrapper(ProcessId pid, int sig, int port, const BSONObj& opt) {
             //
             try {
                 DBClientConnection conn;
-                conn.connect(HostAndPort{"127.0.0.1:" + BSONObjBuilder::numStr(port)},
-                             "MongoDB Shell");
+                conn.connect(HostAndPort{"127.0.0.1:" + std::to_string(port)}, "MongoDB Shell");
 
                 BSONElement authObj = opt["auth"];
 
@@ -1101,12 +1101,24 @@ std::vector<ProcessId> getRunningMongoChildProcessIds() {
     return outPids;
 }
 
+BSONObj RunningMongoChildProcessIds(const BSONObj&, void*) {
+    std::vector<ProcessId> pids = getRunningMongoChildProcessIds();
+    BSONObjBuilder bob;
+    BSONArrayBuilder pidArr(bob.subarrayStart("runningPids"));
+    for (const auto& pid : pids) {
+        pidArr << pid.asInt64();
+    }
+    pidArr.done();
+    return bob.obj();
+}
+
 MongoProgramScope::~MongoProgramScope() {
-    DESTRUCTOR_GUARD(KillMongoProgramInstances(); ClearRawMongoProgramOutput(BSONObj(), 0);)
+    DESTRUCTOR_GUARD(KillMongoProgramInstances(); ClearRawMongoProgramOutput(BSONObj(), nullptr);)
 }
 
 void installShellUtilsLauncher(Scope& scope) {
     scope.injectNative("_startMongoProgram", StartMongoProgram);
+    scope.injectNative("_runningMongoChildProcessIds", RunningMongoChildProcessIds);
     scope.injectNative("runProgram", RunMongoProgram);
     scope.injectNative("run", RunMongoProgram);
     scope.injectNative("_runMongoProgram", RunMongoProgram);

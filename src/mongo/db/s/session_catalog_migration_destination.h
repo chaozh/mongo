@@ -32,14 +32,13 @@
 #include <memory>
 #include <string>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/base/status_with.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/db/repl/oplog_entry.h"
 #include "mongo/db/s/migration_session_id.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/s/shard_id.h"
 #include "mongo/stdx/condition_variable.h"
-#include "mongo/stdx/mutex.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/util/concurrency/with_lock.h"
 
@@ -54,7 +53,9 @@ class OperationContext;
  * the source migration shard.
  */
 class SessionCatalogMigrationDestination {
-    MONGO_DISALLOW_COPYING(SessionCatalogMigrationDestination);
+    SessionCatalogMigrationDestination(const SessionCatalogMigrationDestination&) = delete;
+    SessionCatalogMigrationDestination& operator=(const SessionCatalogMigrationDestination&) =
+        delete;
 
 public:
     enum class State {
@@ -115,7 +116,7 @@ private:
     stdx::thread _thread;
 
     // Protects _state and _errMsg.
-    stdx::mutex _mutex;
+    Mutex _mutex = MONGO_MAKE_LATCH("SessionCatalogMigrationDestination::_mutex");
     stdx::condition_variable _isStateChanged;
     State _state = State::NotStarted;
     std::string _errMsg;  // valid only if _state == ErrorOccurred.

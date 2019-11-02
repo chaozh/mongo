@@ -40,7 +40,7 @@
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/repl/bson_extract_optime.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/stringutils.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -84,8 +84,7 @@ Status GetMoreRequest::isValid() const {
     if (batchSize && *batchSize <= 0) {
         return Status(ErrorCodes::BadValue,
                       str::stream() << "Batch size for getMore must be positive, "
-                                    << "but received: "
-                                    << *batchSize);
+                                    << "but received: " << *batchSize);
     }
 
     return Status::OK();
@@ -116,8 +115,8 @@ StatusWith<GetMoreRequest> GetMoreRequest::parseFromBSON(const std::string& dbna
         } else if (fieldName == kCollectionField) {
             if (el.type() != BSONType::String) {
                 return {ErrorCodes::TypeMismatch,
-                        str::stream() << "Field 'collection' must be of type string in: "
-                                      << cmdObj};
+                        str::stream()
+                            << "Field 'collection' must be of type string in: " << cmdObj};
             }
 
             BSONElement collElt = cmdObj["collection"];
@@ -155,9 +154,7 @@ StatusWith<GetMoreRequest> GetMoreRequest::parseFromBSON(const std::string& dbna
         } else if (!isGenericArgument(fieldName)) {
             return {ErrorCodes::FailedToParse,
                     str::stream() << "Failed to parse: " << cmdObj << ". "
-                                  << "Unrecognized field '"
-                                  << fieldName
-                                  << "'."};
+                                  << "Unrecognized field '" << fieldName << "'."};
         }
     }
 

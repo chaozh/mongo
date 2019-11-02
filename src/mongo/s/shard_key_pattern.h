@@ -66,14 +66,6 @@ typedef std::vector<std::pair<BSONObj, BSONObj>> BoundList;
  */
 class ShardKeyPattern {
 public:
-    // Maximum size of shard key
-    static constexpr int kMaxShardKeySizeBytes = 512;
-
-    /**
-     * Helper to check shard key size and generate an appropriate error message.
-     */
-    static Status checkShardKeySize(const BSONObj& shardKey);
-
     /**
      * Validates whether the specified shard key is valid to be written as part of the sharding
      * metadata.
@@ -113,6 +105,12 @@ public:
     bool isShardKey(const BSONObj& shardKey) const;
 
     /**
+     * Returns true if the new shard key pattern extends this shard key pattern - i.e. contains this
+     * shard key pattern as a prefix (begins with the same field names in the same order).
+     */
+    bool isExtendedBy(const ShardKeyPattern& newShardKeyPattern) const;
+
+    /**
      * Given a shard key, return it in normal form where the fields are in the same order as
      * the shard key pattern fields.
      *
@@ -125,8 +123,11 @@ public:
      * For each path in the shard key pattern, extracts a value from the matchable document.
      *
      * Paths to shard key fields must not contain arrays at any level, and shard keys may not
-     * be array fields, undefined, or non-storable sub-documents.  If the shard key pattern is
-     * a hashed key pattern, this method performs the hashing.
+     * be array fields or non-storable sub-documents.  If the shard key pattern is a hashed key
+     * pattern, this method performs the hashing.
+     *
+     * If any shard key fields are missing from the document, the extraction will treat these
+     * fields as null.
      *
      * If a shard key cannot be extracted, returns an empty BSONObj().
      *
@@ -141,6 +142,9 @@ public:
      *  If 'this' KeyPattern is { 'a.b' : 1 }
      *   { a : { b : "hi" } } --> returns { 'a.b' : "hi" }
      *   { a : [{ b : "hi" }] } --> returns {}
+     *  If 'this' KeyPattern is { a: 1 , b: 1 }
+     *   { a: 1 } --> returns { a: 1, b: null }
+     *   { b: 1 } --> returns { a: null, b: 1 }
      */
     BSONObj extractShardKeyFromMatchable(const MatchableDocument& matchable) const;
 
@@ -151,12 +155,9 @@ public:
     BSONObj extractShardKeyFromDoc(const BSONObj& doc) const;
 
     /**
-     * Returns the set of shard key fields which are absent from the given document. Note that the
-     * vector returned by this method contains StringData elements pointing into ShardKeyPattern's
-     * underlying BSONObj. If the fieldnames are required to survive beyond the lifetime of this
-     * ShardKeyPattern, callers should create their own copies.
+     * Returns the document with missing shard key values set to null.
      */
-    std::vector<StringData> findMissingShardKeyFieldsFromDoc(const BSONObj doc) const;
+    BSONObj emplaceMissingShardKeyValuesForDocument(const BSONObj doc) const;
 
     /**
      * Given a simple BSON query, extracts the shard key corresponding to the key pattern

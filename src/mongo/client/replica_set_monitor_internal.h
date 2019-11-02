@@ -29,7 +29,7 @@
 
 /**
  * This is an internal header.
- * This should only be included by replica_set_monitor.cpp and replica_set_monitor_test.cpp.
+ * This should only be included by replica_set_monitor.cpp and unittests.
  * This should never be included by any header.
  */
 
@@ -41,13 +41,12 @@
 #include <string>
 #include <vector>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/client/read_preference.h"
 #include "mongo/client/replica_set_monitor.h"
 #include "mongo/db/jsobj.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/platform/random.h"
 #include "mongo/stdx/condition_variable.h"
-#include "mongo/stdx/mutex.h"
 #include "mongo/util/net/hostandport.h"
 
 namespace mongo {
@@ -71,9 +70,10 @@ struct ReplicaSetMonitor::IsMasterReply {
     bool secondary;
     bool hidden;
     int configVersion{};
-    OID electionId;                     // Set if this isMaster reply is from the primary
-    HostAndPort primary;                // empty if not present
-    std::set<HostAndPort> normalHosts;  // both "hosts" and "passives"
+    OID electionId;                 // Set if this isMaster reply is from the primary
+    HostAndPort primary;            // empty if not present
+    std::set<HostAndPort> members;  // both "hosts" and "passives"
+    std::set<HostAndPort> passives;
     BSONObj tags;
     int minWireVersion{};
     int maxWireVersion{};
@@ -85,8 +85,17 @@ struct ReplicaSetMonitor::IsMasterReply {
     repl::OpTime opTime{};
 };
 
-struct ReplicaSetMonitor::SetState {
-    MONGO_DISALLOW_COPYING(SetState);
+/**
+ * The SetState is the underlying data object behind both the ReplicaSetMonitor and the Refresher
+ *
+ * Note that the SetState only holds its own lock in init() and drop(). Even those uses can probably
+ * be offloaded to the RSM eventually. In all other cases, the RSM and RSM::Refresher use the
+ * SetState lock to synchronize.
+ */
+struct ReplicaSetMonitor::SetState
+    : public std::enable_shared_from_this<ReplicaSetMonitor::SetState> {
+    SetState(const SetState&) = delete;
+    SetState& operator=(const SetState&) = delete;
 
 public:
     /**
@@ -134,26 +143,20 @@ public:
         Date_t lastWriteDate{};            // from isMasterReply
         Date_t lastWriteDateUpdateTime{};  // set to the local system's time at the time of updating
                                            // lastWriteDate
-        repl::OpTime opTime{};             // from isMasterReply
+        Date_t nextPossibleIsMasterCall{};  // time that previous isMaster check ended
+        executor::TaskExecutor::CallbackHandle scheduledIsMasterHandle;  //
+        repl::OpTime opTime{};                                           // from isMasterReply
     };
 
-    typedef std::vector<Node> Nodes;
+    using Nodes = std::vector<Node>;
 
     struct Waiter {
         Date_t deadline;
         ReadPreferenceSetting criteria;
-        Promise<HostAndPort> promise;
+        Promise<std::vector<HostAndPort>> promise;
     };
 
-    /**
-     * seedNodes must not be empty
-     */
-    SetState(StringData name,
-             const std::set<HostAndPort>& seedNodes,
-             executor::TaskExecutor* = nullptr,
-             MongoURI uri = {});
-
-    SetState(const MongoURI& uri, executor::TaskExecutor* = nullptr);
+    SetState(const MongoURI& uri, ReplicaSetChangeNotifier*, executor::TaskExecutor*);
 
     bool isUsable() const;
 
@@ -162,6 +165,8 @@ public:
      *
      * Note: Uses only local data and does not go over the network.
      */
+    std::vector<HostAndPort> getMatchingHosts(const ReadPreferenceSetting& criteria) const;
+
     HostAndPort getMatchingHost(const ReadPreferenceSetting& criteria) const;
 
     /**
@@ -181,18 +186,18 @@ public:
      * Returns the connection string of the nodes that are known the be in the set because we've
      * seen them in the isMaster reply of a PRIMARY.
      */
-    std::string getConfirmedServerAddress() const;
+    ConnectionString confirmedConnectionString() const;
 
     /**
      * Returns the connection string of the nodes that are believed to be in the set because we've
      * seen them in the isMaster reply of non-PRIMARY nodes in our seed list.
      */
-    std::string getUnconfirmedServerAddress() const;
+    ConnectionString possibleConnectionString() const;
 
     /**
-     * Call this to notify waiters after a scan processes a valid reply or finishes.
+     * Call this to notify waiters after a scan processes a valid reply, rescans, or finishes.
      */
-    void notify(bool finishedScan);
+    void notify();
 
     Date_t now() const {
         return executor ? executor->now() : Date_t::now();
@@ -200,35 +205,92 @@ public:
 
     Status makeUnsatisfedReadPrefError(const ReadPreferenceSetting& criteria) const;
 
+    // Tiny enum to convey semantics for rescheduleFefresh()
+    enum class SchedulingStrategy {
+        kKeepEarlyScan,
+        kCancelPreviousScan,
+    };
+
     /**
-     * Before unlocking, do DEV checkInvariants();
+     * Schedules a refresh via the task executor and cancel any previous refresh.
+     * (Task is automatically canceled in the d-tor.)
+     */
+    void rescheduleRefresh(SchedulingStrategy strategy);
+
+    /**
+     *  Notifies all listeners that the ReplicaSet is in use.
+     */
+    void init();
+
+    /**
+     *  Resets the current scan and notifies all listeners that the ReplicaSet isn't in use.
+     */
+    void drop();
+
+    /**
+     * Before unlocking, do `if (kDebugBuild) checkInvariants();`
      */
     void checkInvariants() const;
 
-    stdx::mutex mutex;  // must hold this to access any other member or method (except name).
+    /**
+     * Wrap the callback and schedule it to run at some time
+     *
+     * The callback wrapper does the following:
+     * * Return before running cb if isDropped is true
+     * * Return before running cb if the handle was canceled
+     * * Lock before running cb and unlock after
+     */
+    template <typename Callback>
+    auto scheduleWorkAt(Date_t when, Callback&& cb) const;
 
-    const std::string name;  // safe to read outside lock since it is const
-    int consecutiveFailedScans;
-    std::set<HostAndPort> seedNodes;  // updated whenever a master reports set membership changes
-    bool isMocked = false;            // True if this set is using nodes from MockReplicaSet
-    OID maxElectionId;                // largest election id observed by this ReplicaSetMonitor
-    int configVersion{0};             // version number of the replica set config.
-    HostAndPort lastSeenMaster;  // empty if we have never seen a master. can be same as current
-    Nodes nodes;                 // maintained sorted and unique by host
-    ScanStatePtr currentScan;    // NULL if no scan in progress
-    int64_t latencyThresholdMicros;
-    mutable PseudoRandom rand;   // only used for host selection to balance load
-    mutable int roundRobin;      // used when useDeterministicHostSelection is true
-    const MongoURI setUri;       // URI that may have constructed this
-    Seconds refreshPeriod;       // Normal refresh period when not expedited
-    bool isExpedited = false;    // True when we are doing more frequent refreshes due to waiters
-    stdx::list<Waiter> waiters;  // Everyone waiting for some ReadPreference to be satisfied
+    const MongoURI setUri;  // URI passed to ctor -- THIS IS NOT UPDATED BY SCANS
+    const std::string name;
 
+    ReplicaSetChangeNotifier* const notifier;
     executor::TaskExecutor* const executor;
+
+    bool isDropped = false;
+
+    // You must hold this to access any member below.
+    mutable Mutex mutex = MONGO_MAKE_LATCH("SetState::mutex");
+
+    executor::TaskExecutor::CallbackHandle refresherHandle;
+
+    // For starting scans
+    std::set<HostAndPort> seedNodes;  // updated whenever a master reports set membership changes
+    ConnectionString seedConnStr;     // The connection string from the last time we had valid seeds
+    int64_t seedGen = 0;
+
+    bool isMocked = false;  // True if this set is using nodes from MockReplicaSet
+
+    // For tracking scans
+    // lastSeenMaster is empty if we have never seen a master or the last scan didn't have one
+    HostAndPort lastSeenMaster;
+    int consecutiveFailedScans = 0;
+    Nodes nodes;                      // maintained sorted and unique by host
+    ConnectionString workingConnStr;  // The connection string from our last scan
+
+    // For tracking replies
+    OID maxElectionId;      // largest election id observed by this ReplicaSetMonitor
+    int configVersion = 0;  // version number of the replica set config.
+
+    // For matching hosts
+    int64_t latencyThresholdMicros = 0;
+    mutable int roundRobin = 0;  // used when useDeterministicHostSelection is true
+    mutable PseudoRandom rand;   // only used for host selection to balance load
+
+    // For scheduling scans
+    Seconds refreshPeriod;      // Normal refresh period when not expedited
+    bool isExpedited = false;   // True when we are doing more frequent refreshes due to waiters
+    std::list<Waiter> waiters;  // Everyone waiting for some ReadPreference to be satisfied
+    uint64_t nextScanId = 0;    // The id for the next scan
+    ScanStatePtr currentScan;   // NULL if no scan in progress
+    Date_t nextScanTime;        // The time at which the next scan is scheduled to start
 };
 
 struct ReplicaSetMonitor::ScanState {
-    MONGO_DISALLOW_COPYING(ScanState);
+    ScanState(const ScanState&) = delete;
+    ScanState& operator=(const ScanState&) = delete;
 
 public:
     ScanState() = default;
@@ -240,7 +302,12 @@ public:
     template <typename Container>
     void enqueAllUntriedHosts(const Container& container, PseudoRandom& rand);
 
-    // This is only for logging and should not effect behavior otherwise.
+    /**
+     * Adds all completed hosts back to hostsToScan and shuffles the queue.
+     */
+    void retryAllTriedHosts(PseudoRandom& rand);
+
+    // This is only for logging and should not affect behavior otherwise.
     Timer timer;
 
     // Access to fields is guarded by associated SetState's mutex.
@@ -252,7 +319,7 @@ public:
     std::set<HostAndPort> triedHosts;     // Hosts that have been returned from getNextStep.
 
     // All responses go here until we find a master.
-    typedef std::vector<IsMasterReply> UnconfirmedReplies;
+    typedef std::map<HostAndPort, IsMasterReply> UnconfirmedReplies;
     UnconfirmedReplies unconfirmedReplies;
 };
 

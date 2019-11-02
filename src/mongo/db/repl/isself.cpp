@@ -107,12 +107,12 @@ std::string stringifyError(int code) {
 std::vector<std::string> getAddrsForHost(const std::string& iporhost,
                                          const int port,
                                          const bool ipv6enabled) {
-    addrinfo* addrs = NULL;
+    addrinfo* addrs = nullptr;
     addrinfo hints = {0};
     hints.ai_socktype = SOCK_STREAM;
     hints.ai_family = (ipv6enabled ? AF_UNSPEC : AF_INET);
 
-    const std::string portNum = BSONObjBuilder::numStr(port);
+    const std::string portNum = std::to_string(port);
 
     std::vector<std::string> out;
 
@@ -126,13 +126,13 @@ std::vector<std::string> getAddrsForHost(const std::string& iporhost,
 
     ON_BLOCK_EXIT([&] { freeaddrinfo(addrs); });
 
-    for (addrinfo* addr = addrs; addr != NULL; addr = addr->ai_next) {
+    for (addrinfo* addr = addrs; addr != nullptr; addr = addr->ai_next) {
         int family = addr->ai_family;
         char host[NI_MAXHOST];
 
         if (family == AF_INET || family == AF_INET6) {
             err = getnameinfo(
-                addr->ai_addr, addr->ai_addrlen, host, NI_MAXHOST, NULL, 0, NI_NUMERICHOST);
+                addr->ai_addr, addr->ai_addrlen, host, NI_MAXHOST, nullptr, 0, NI_NUMERICHOST);
             if (err) {
                 warning() << "getnameinfo() failed: " << stringifyError(err) << std::endl;
                 continue;
@@ -235,8 +235,8 @@ std::vector<std::string> getBoundAddrs(const bool ipv6enabled) {
     ON_BLOCK_EXIT([&] { freeifaddrs(addrs); });
 
     // based on example code from linux getifaddrs manpage
-    for (ifaddrs* addr = addrs; addr != NULL; addr = addr->ifa_next) {
-        if (addr->ifa_addr == NULL)
+    for (ifaddrs* addr = addrs; addr != nullptr; addr = addr->ifa_next) {
+        if (addr->ifa_addr == nullptr)
             continue;
         int family = addr->ifa_addr->sa_family;
         char host[NI_MAXHOST];
@@ -247,7 +247,7 @@ std::vector<std::string> getBoundAddrs(const bool ipv6enabled) {
                 (family == AF_INET ? sizeof(struct sockaddr_in) : sizeof(struct sockaddr_in6)),
                 host,
                 NI_MAXHOST,
-                NULL,
+                nullptr,
                 0,
                 NI_NUMERICHOST);
             if (err) {
@@ -273,9 +273,8 @@ std::vector<std::string> getBoundAddrs(const bool ipv6enabled) {
     for (int tries = 0; tries < 3; ++tries) {
         err = GetAdaptersAddresses(family,
                                    GAA_FLAG_SKIP_ANYCAST |  // only want unicast addrs
-                                       GAA_FLAG_SKIP_MULTICAST |
-                                       GAA_FLAG_SKIP_DNS_SERVER,
-                                   NULL,
+                                       GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER,
+                                   nullptr,
                                    adapters,
                                    &adaptersLen);
 
@@ -293,8 +292,8 @@ std::vector<std::string> getBoundAddrs(const bool ipv6enabled) {
         return out;
     }
 
-    for (IP_ADAPTER_ADDRESSES* adapter = adapters; adapter != NULL; adapter = adapter->Next) {
-        for (IP_ADAPTER_UNICAST_ADDRESS* addr = adapter->FirstUnicastAddress; addr != NULL;
+    for (IP_ADAPTER_ADDRESSES* adapter = adapters; adapter != nullptr; adapter = adapter->Next) {
+        for (IP_ADAPTER_UNICAST_ADDRESS* addr = adapter->FirstUnicastAddress; addr != nullptr;
              addr = addr->Next) {
             short family = reinterpret_cast<SOCKADDR_STORAGE*>(addr->Address.lpSockaddr)->ss_family;
 

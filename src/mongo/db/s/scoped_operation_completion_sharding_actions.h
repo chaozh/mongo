@@ -29,7 +29,6 @@
 
 #pragma once
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/util/polymorphic_scoped.h"
 
 namespace mongo {
@@ -38,11 +37,14 @@ namespace mongo {
  * This class has a destructor that handles rerouting exceptions that might have occurred
  * during an operation. For this reason, there should be only one instance of this object
  * on the chain of one OperationContext.
-*/
+ */
 class OperationContext;
 
 class ScopedOperationCompletionShardingActions : public PolymorphicScoped {
-    MONGO_DISALLOW_COPYING(ScopedOperationCompletionShardingActions);
+    ScopedOperationCompletionShardingActions(const ScopedOperationCompletionShardingActions&) =
+        delete;
+    ScopedOperationCompletionShardingActions& operator=(
+        const ScopedOperationCompletionShardingActions&) = delete;
 
 public:
     ScopedOperationCompletionShardingActions(OperationContext* opCtx);

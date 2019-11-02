@@ -52,7 +52,7 @@ public:
      * May throw a AssertionException if there is an invalid stage specification, although full
      * validation happens later, during Pipeline construction.
      */
-    LiteParsedPipeline(const AggregationRequest& request) : _nss(request.getNamespaceString()) {
+    LiteParsedPipeline(const AggregationRequest& request) {
         _stageSpecs.reserve(request.getPipeline().size());
 
         for (auto&& rawStage : request.getPipeline()) {
@@ -103,28 +103,7 @@ public:
     }
 
     /**
-     * Returns true if this pipeline's UUID and collation should be resolved. For the latter, this
-     * means adopting the collection's default collation, unless a custom collation was specified.
-     */
-    bool shouldResolveUUIDAndCollation() const {
-        // Collectionless aggregations do not have a UUID or default collation.
-        return !_nss.isCollectionlessAggregateNS() &&
-            std::all_of(_stageSpecs.begin(), _stageSpecs.end(), [](auto&& spec) {
-                return spec->shouldResolveUUIDAndCollation();
-            });
-    }
-
-    /**
-     * Returns false if the pipeline has any stage which must be run locally on mongos.
-     */
-    bool allowedToForwardFromMongos() const {
-        return std::all_of(_stageSpecs.cbegin(), _stageSpecs.cend(), [](const auto& spec) {
-            return spec->allowedToForwardFromMongos();
-        });
-    }
-
-    /**
-     * Returns false if the pipeline has any Document Source which requires rewriting via serialize.
+     * Returns false if the pipeline has any stages which cannot be passed through to the shards.
      */
     bool allowedToPassthroughFromMongos() const {
         return std::all_of(_stageSpecs.cbegin(), _stageSpecs.cend(), [](const auto& spec) {
@@ -151,12 +130,19 @@ public:
                                    bool enableMajorityReadConcern) const;
 
     /**
+     * Verifies that this pipeline is allowed to run in a multi-document transaction. This ensures
+     * that each stage is compatible, and throws a UserException if not. This should only be called
+     * if the caller has determined the current operation is part of a transaction.
+     */
+    void assertSupportsMultiDocumentTransaction(
+        boost::optional<ExplainOptions::Verbosity> explain) const;
+
+    /**
      * Perform checks that verify that the LitePipe is valid. Note that this function must be called
      * before forwarding an aggregation command on an unsharded collection, in order to verify that
-     * the involved namespaces are allowed to be sharded. Returns true if any involved namespace is
-     * sharded.
+     * the involved namespaces are allowed to be sharded.
      */
-    bool verifyIsSupported(
+    void verifyIsSupported(
         OperationContext* opCtx,
         const std::function<bool(OperationContext*, const NamespaceString&)> isSharded,
         const boost::optional<ExplainOptions::Verbosity> explain,
@@ -164,7 +150,6 @@ public:
 
 private:
     std::vector<std::unique_ptr<LiteParsedDocumentSource>> _stageSpecs;
-    NamespaceString _nss;
 };
 
 }  // namespace mongo

@@ -29,6 +29,8 @@
 
 #include "mongo/platform/basic.h"
 
+#include <memory>
+
 #include "mongo/client/connection_string.h"
 #include "mongo/client/remote_command_targeter_mock.h"
 #include "mongo/db/concurrency/d_concurrency.h"
@@ -40,6 +42,7 @@
 #include "mongo/db/ops/write_ops_exec.h"
 #include "mongo/db/ops/write_ops_gen.h"
 #include "mongo/db/repl/oplog_entry.h"
+#include "mongo/db/repl/storage_interface_impl.h"
 #include "mongo/db/s/migration_session_id.h"
 #include "mongo/db/s/session_catalog_migration_destination.h"
 #include "mongo/db/server_options.h"
@@ -52,7 +55,6 @@
 #include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/shard_server_test_fixture.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/unittest/unittest.h"
 
@@ -85,7 +87,7 @@ repl::OplogEntry makeOplogEntry(repl::OpTime opTime,
                                 BSONObj object,
                                 boost::optional<BSONObj> object2,
                                 OperationSessionInfo sessionInfo,
-                                boost::optional<Date_t> wallClockTime,
+                                Date_t wallClockTime,
                                 boost::optional<StmtId> stmtId,
                                 boost::optional<repl::OpTime> preImageOpTime = boost::none,
                                 boost::optional<repl::OpTime> postImageOpTime = boost::none) {
@@ -130,9 +132,11 @@ public:
             RemoteCommandTargeterMock::get(donorShard->getTargeter())
                 ->setFindHostReturnValue(kDonorConnStr.getServers()[0]);
         }
-
+        // onStepUp() relies on the storage interface to create the config.transactions table.
+        repl::StorageInterface::set(getServiceContext(),
+                                    std::make_unique<repl::StorageInterfaceImpl>());
         MongoDSessionCatalog::onStepUp(operationContext());
-        LogicalSessionCache::set(getServiceContext(), stdx::make_unique<LogicalSessionCacheNoop>());
+        LogicalSessionCache::set(getServiceContext(), std::make_unique<LogicalSessionCacheNoop>());
     }
 
     void returnOplog(const std::vector<OplogEntry>& oplogList) {
@@ -283,7 +287,7 @@ private:
             }
         };
 
-        return stdx::make_unique<StaticCatalogClient>();
+        return std::make_unique<StaticCatalogClient>();
     }
 
     void _checkOplogExceptO2(const repl::OplogEntry& originalOplog,
@@ -592,7 +596,7 @@ TEST_F(SessionCatalogMigrationDestinationTest, ShouldNotNestAlreadyNestedOplog) 
                                           BSON("x" << 100),              // o
                                           boost::none,                   // o2
                                           sessionInfo,                   // session info
-                                          boost::none,                   // wall clock time
+                                          Date_t(),                      // wall clock time
                                           23);                           // statement id
 
     auto origInnerOplog2 = makeOplogEntry(OpTime(Timestamp(80, 2), 1),  // optime
@@ -600,7 +604,7 @@ TEST_F(SessionCatalogMigrationDestinationTest, ShouldNotNestAlreadyNestedOplog) 
                                           BSON("x" << 80),              // o
                                           boost::none,                  // o2
                                           sessionInfo,                  // session info
-                                          boost::none,                  // wall clock time
+                                          Date_t(),                     // wall clock time
                                           45);                          // statement id
 
     auto oplog1 = makeOplogEntry(OpTime(Timestamp(1100, 2), 1),  // optime

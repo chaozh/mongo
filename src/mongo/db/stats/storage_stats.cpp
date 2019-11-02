@@ -61,10 +61,12 @@ Status appendCollectionStorageStats(OperationContext* opCtx,
         result->appendNumber("size", 0);
         result->appendNumber("count", 0);
         result->appendNumber("storageSize", 0);
+        result->append("totalSize", 0);
         result->append("nindexes", 0);
         result->appendNumber("totalIndexSize", 0);
         result->append("indexDetails", BSONObj());
         result->append("indexSizes", BSONObj());
+        result->append("scaleFactor", scale);
         std::string errmsg = !(ctx.getDb()) ? "Database [" + nss.db().toString() + "] not found."
                                             : "Collection [" + nss.toString() + "] not found.";
         return {ErrorCodes::NamespaceNotFound, errmsg};
@@ -79,18 +81,20 @@ Status appendCollectionStorageStats(OperationContext* opCtx,
         result->append("avgObjSize", collection->averageObjectSize(opCtx));
 
     RecordStore* recordStore = collection->getRecordStore();
-    result->appendNumber(
-        "storageSize",
-        static_cast<long long>(recordStore->storageSize(opCtx, result, verbose ? 1 : 0)) / scale);
+    auto storageSize =
+        static_cast<long long>(recordStore->storageSize(opCtx, result, verbose ? 1 : 0));
+    result->appendNumber("storageSize", storageSize / scale);
 
     recordStore->appendCustomStats(opCtx, result, scale);
 
     IndexCatalog* indexCatalog = collection->getIndexCatalog();
-    result->append("nindexes", indexCatalog->numIndexesReady(opCtx));
+    result->append("nindexes", indexCatalog->numIndexesTotal(opCtx));
 
     BSONObjBuilder indexDetails;
+    std::vector<std::string> indexBuilds;
 
-    std::unique_ptr<IndexCatalog::IndexIterator> it = indexCatalog->getIndexIterator(opCtx, false);
+    std::unique_ptr<IndexCatalog::IndexIterator> it =
+        indexCatalog->getIndexIterator(opCtx, /*includeUnfinishedIndexes=*/true);
     while (it->more()) {
         const IndexCatalogEntry* entry = it->next();
         const IndexDescriptor* descriptor = entry->descriptor();
@@ -101,15 +105,22 @@ Status appendCollectionStorageStats(OperationContext* opCtx,
         if (iam->appendCustomStats(opCtx, &bob, scale)) {
             indexDetails.append(descriptor->indexName(), bob.obj());
         }
+
+        if (!entry->isReady(opCtx)) {
+            indexBuilds.push_back(descriptor->indexName());
+        }
     }
 
     result->append("indexDetails", indexDetails.obj());
+    result->append("indexBuilds", indexBuilds);
 
     BSONObjBuilder indexSizes;
     long long indexSize = collection->getIndexSize(opCtx, &indexSizes, scale);
 
     result->appendNumber("totalIndexSize", indexSize / scale);
+    result->appendNumber("totalSize", (storageSize + indexSize) / scale);
     result->append("indexSizes", indexSizes.obj());
+    result->append("scaleFactor", scale);
 
     return Status::OK();
 }

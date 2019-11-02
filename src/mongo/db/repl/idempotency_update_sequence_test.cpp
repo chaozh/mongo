@@ -31,12 +31,12 @@
 
 #include <algorithm>
 #include <cctype>
+#include <memory>
 
 #include "mongo/db/field_ref.h"
 #include "mongo/db/field_ref_set.h"
 #include "mongo/db/repl/idempotency_document_structure.h"
 #include "mongo/db/repl/idempotency_update_sequence.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
@@ -52,12 +52,13 @@ size_t getPathDepth_forTest(const std::string& path) {
 
 namespace {
 
+PseudoRandom random(SecureRandom().nextInt64());
+
 TEST(UpdateGenTest, FindsAllPaths) {
     std::set<StringData> fields{"a", "b"};
     size_t depth = 1;
     size_t length = 1;
 
-    PseudoRandom random(SecureRandom::create()->nextInt64());
     TrivialScalarGenerator trivialScalarGenerator;
     UpdateSequenceGenerator generator({fields, depth, length}, random, &trivialScalarGenerator);
 
@@ -89,7 +90,6 @@ TEST(UpdateGenTest, NoDuplicatePaths) {
     size_t depth = 2;
     size_t length = 2;
 
-    PseudoRandom random(SecureRandom::create()->nextInt64());
     TrivialScalarGenerator trivialScalarGenerator;
     UpdateSequenceGenerator generator({fields, depth, length}, random, &trivialScalarGenerator);
 
@@ -111,7 +111,6 @@ TEST(UpdateGenTest, UpdatesHaveValidPaths) {
     size_t depth = 1;
     size_t length = 1;
 
-    PseudoRandom random(SecureRandom::create()->nextInt64());
     TrivialScalarGenerator trivialScalarGenerator;
     UpdateSequenceGenerator generator({fields, depth, length}, random, &trivialScalarGenerator);
     auto update = generator.generateUpdate();
@@ -150,7 +149,6 @@ TEST(UpdateGenTest, UpdatesAreNotAmbiguous) {
     size_t depth = 1;
     size_t length = 1;
 
-    PseudoRandom random(SecureRandom::create()->nextInt64());
     TrivialScalarGenerator trivialScalarGenerator;
     UpdateSequenceGenerator generator({fields, depth, length}, random, &trivialScalarGenerator);
     auto update = generator.generateUpdate();
@@ -170,7 +168,7 @@ TEST(UpdateGenTest, UpdatesAreNotAmbiguous) {
     std::vector<std::unique_ptr<FieldRef>> argPathsRefVec;
     FieldRefSet pathRefSet;
     for (auto path : argPathsSet) {
-        argPathsRefVec.push_back(stdx::make_unique<FieldRef>(path));
+        argPathsRefVec.push_back(std::make_unique<FieldRef>(path));
         const FieldRef* conflict;
         if (!pathRefSet.insert(argPathsRefVec.back().get(), &conflict)) {
             StringBuilder sb;
@@ -198,7 +196,6 @@ TEST(UpdateGenTest, UpdatesPreserveDepthConstraint) {
     size_t depth = 2;
     size_t length = 1;
 
-    PseudoRandom random(SecureRandom::create()->nextInt64());
     TrivialScalarGenerator trivialScalarGenerator;
     UpdateSequenceGenerator generator(
         {fields, depth, length, 0.333, 0.333, 0.334}, random, &trivialScalarGenerator);
@@ -235,7 +232,6 @@ TEST(UpdateGenTest, OnlyGenerateUnset) {
     size_t depth = 1;
     size_t length = 1;
 
-    PseudoRandom random(SecureRandom::create()->nextInt64());
     TrivialScalarGenerator trivialScalarGenerator;
     UpdateSequenceGenerator generatorNoSet(
         {fields, depth, length, 0.0, 0.0, 0.0}, random, &trivialScalarGenerator);
@@ -257,7 +253,6 @@ TEST(UpdateGenTest, OnlySetUpdatesWithScalarValue) {
     size_t depth = 1;
     size_t length = 1;
 
-    PseudoRandom random(SecureRandom::create()->nextInt64());
     TrivialScalarGenerator trivialScalarGenerator;
     UpdateSequenceGenerator generatorNoUnsetAndOnlyScalar(
         {fields, depth, length, 1.0, 0.0, 0.0}, random, &trivialScalarGenerator);
@@ -285,7 +280,6 @@ TEST(UpdateGenTest, OnlySetUpdatesWithScalarsAtMaxDepth) {
     size_t depth = 2;
     size_t length = 1;
 
-    PseudoRandom random(SecureRandom::create()->nextInt64());
     TrivialScalarGenerator trivialScalarGenerator;
     UpdateSequenceGenerator generatorNeverScalar(
         {fields, depth, length, 0.0, 0.5, 0.5}, random, &trivialScalarGenerator);

@@ -31,17 +31,17 @@
 
 #include "mongo/db/pipeline/accumulator.h"
 
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/pipeline/accumulation_statement.h"
-#include "mongo/db/pipeline/document.h"
 #include "mongo/db/pipeline/expression.h"
 #include "mongo/db/pipeline/expression_context.h"
-#include "mongo/db/pipeline/value.h"
 
 namespace mongo {
 using boost::intrusive_ptr;
 
-REGISTER_ACCUMULATOR(stdDevPop, AccumulatorStdDevPop::create);
-REGISTER_ACCUMULATOR(stdDevSamp, AccumulatorStdDevSamp::create);
+REGISTER_ACCUMULATOR(stdDevPop, genericParseSingleExpressionAccumulator<AccumulatorStdDevPop>);
+REGISTER_ACCUMULATOR(stdDevSamp, genericParseSingleExpressionAccumulator<AccumulatorStdDevSamp>);
 REGISTER_EXPRESSION(stdDevPop, ExpressionFromAccumulator<AccumulatorStdDevPop>::parse);
 REGISTER_EXPRESSION(stdDevSamp, ExpressionFromAccumulator<AccumulatorStdDevSamp>::parse);
 
@@ -118,4 +118,4 @@ void AccumulatorStdDev::reset() {
     _mean = 0;
     _m2 = 0;
 }
-}
+}  // namespace mongo

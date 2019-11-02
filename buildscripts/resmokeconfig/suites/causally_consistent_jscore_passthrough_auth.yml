@@ -18,7 +18,6 @@ selector:
   # Skip any tests that run with auth explicitly.
   - jstests/core/*[aA]uth*.js
   # Skip any tests that require privileges for non test databases.
-  - jstests/core/system_profile.js
   # Cannot specify afterClusterTime and afterOpTime.
   - jstests/core/read_after_optime.js
   # Not expected to pass with replica-sets.
@@ -29,7 +28,6 @@ selector:
   # The following tests fail because a certain command or functionality is not supported on
   # mongos. This command or functionality is placed in a comment next to the failing test.
   - jstests/core/apitest_db.js  # serverStatus output doesn't have storageEngine.
-  - jstests/core/apitest_db_profile_level.js  # profiling.
   - jstests/core/apply_ops*.js  # applyOps, SERVER-1439.
   - jstests/core/capped_convertToCapped1.js  # cloneCollectionAsCapped.
   - jstests/core/capped_empty.js  # emptycapped.
@@ -43,14 +41,12 @@ selector:
   - jstests/core/dbhash.js  # dbhash.
   - jstests/core/dbhash2.js  # dbhash.
   - jstests/core/diagdata.js # Command not supported in mongos
-  - jstests/core/do_txn*.js  # doTxn
   - jstests/core/dropdb_race.js  # syncdelay.
   - jstests/core/fsync.js  # uses fsync.
   - jstests/core/geo_haystack*.js  # geoSearch.
   - jstests/core/geo_update_btree2.js  # notablescan.
   - jstests/core/index_id_options.js  # "local" database.
   - jstests/core/index9.js  # "local" database.
-  - jstests/core/profile*.js  # profiling.
   - jstests/core/queryoptimizera.js  # "local" database.
   - jstests/core/stages*.js  # stageDebug.
   # The following tests fail because mongos behaves differently from mongod when testing certain
@@ -71,7 +67,6 @@ selector:
   - jstests/core/geo_mapreduce2.js
   - jstests/core/geo_big_polygon3.js
   - jstests/core/mr*.js
-  - jstests/core/profile_mapreduce.js
   - jstests/core/collation.js
   - jstests/core/loadserverscripts.js
   - jstests/core/bypass_doc_validation.js
@@ -84,12 +79,14 @@ selector:
   - jstests/core/views/views_all_commands.js
   - jstests/core/or4.js
   - jstests/core/recursion.js
-  - jstests/core/temp_cleanup.js
   # An index drop does not necessarily cause cursors to be killed on the secondary.
   - jstests/core/ord.js
   # Parallel shell is not causally consistent
+  - jstests/core/benchrun_pipeline_updates.js
+  - jstests/core/crud_ops_do_not_throw_locktimeout.js
   - jstests/core/cursora.js
   - jstests/core/find_and_modify_concurrent_update.js
+  - jstests/core/removec.js
   - jstests/core/shellstartparallel.js
   # TODO SERVER-30466
   - jstests/core/explain_multi_plan.js
@@ -124,7 +121,13 @@ selector:
   - jstests/core/views/view_with_invalid_dbname.js
   - jstests/core/views/views_creation.js
   - jstests/core/views/views_drop.js
-  - jstests/core/views/views_rename.js
+
+  # The tests below use applyOps, SERVER-1439.
+  - jstests/core/list_collections1.js
+  - jstests/core/list_collections_filter.js
+  - jstests/core/rename_stayTemp.js
+  - jstests/core/txns/prepare_transaction_fails_on_temp_collections.js
+
   exclude_with_any_tags:
   - assumes_against_mongod_not_mongos
   ##
@@ -138,7 +141,11 @@ selector:
   - assumes_read_preference_unchanged
   # TODO SERVER-35447: Multiple users cannot be authenticated on one connection within a session.
   - creates_and_authenticates_user
+  - does_not_support_causal_consistency
   - requires_collstats
+  # The system.profile collection is not replicated. So the reads from secondaries will not be
+  # consistent with primary.
+  - requires_profiling
 
 executor:
   archive:
@@ -153,6 +160,7 @@ executor:
           authMechanism: SCRAM-SHA-1
           keyFile: *keyFile
           keyFileData: *keyFileData
+          roleGraphInvalidationIsFatal: true
       eval: |
         jsTest.authenticate(db.getMongo());
         (function() {

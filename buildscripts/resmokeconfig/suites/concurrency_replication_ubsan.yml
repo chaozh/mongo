@@ -18,6 +18,8 @@ selector:
 executor:
   archive:
     hooks:
+      - CheckReplDBHashInBackground
+      - ValidateCollectionsInBackground
       - CheckReplDBHash
       - ValidateCollections
     tests: true
@@ -30,7 +32,8 @@ executor:
   # validating the entire contents of the collection.
   #
   # TODO SERVER-26466: Add CheckReplOplogs hook to the concurrency suite.
-  # TODO SERVER-39321: Re-enable and archive the CheckReplDBHashInBackground hook.
+  - class: CheckReplDBHashInBackground
+  - class: ValidateCollectionsInBackground
   - class: CheckReplDBHash
   - class: ValidateCollections
   - class: CleanEveryN

@@ -77,10 +77,7 @@ public:
                 BSONObj info;
                 BSONObj cmd = BSON("captrunc"
                                    << "b"
-                                   << "n"
-                                   << 1
-                                   << "inc"
-                                   << true);
+                                   << "n" << 1 << "inc" << true);
                 // cout << cmd.toString() << endl;
                 bool ok = client.runCommand("a", cmd, info);
                 // cout << info.toString() << endl;
@@ -108,12 +105,12 @@ public:
         client.dropCollection(ns);
         client.insert(ns, objs);
         ASSERT_EQUALS(client.getLastErrorDetailed()["code"].numberInt(), 11000);
-        ASSERT_EQUALS((int)client.count(ns), 1);
+        ASSERT_EQUALS((int)client.count(NamespaceString(ns)), 1);
 
         client.dropCollection(ns);
         client.insert(ns, objs, InsertOption_ContinueOnError);
         ASSERT_EQUALS(client.getLastErrorDetailed()["code"].numberInt(), 11000);
-        ASSERT_EQUALS((int)client.count(ns), 2);
+        ASSERT_EQUALS((int)client.count(NamespaceString(ns)), 2);
     }
 };
 
@@ -193,9 +190,9 @@ public:
     }
 };
 
-class All : public Suite {
+class All : public OldStyleSuiteSpecification {
 public:
-    All() : Suite("directclient") {}
+    All() : OldStyleSuiteSpecification("directclient") {}
     void setupTests() {
         add<Capped>();
         add<InsertMany>();
@@ -208,5 +205,5 @@ public:
     }
 };
 
-SuiteInstance<All> myall;
+OldStyleSuiteInitializer<All> myall;
 }  // namespace DirectClientTests

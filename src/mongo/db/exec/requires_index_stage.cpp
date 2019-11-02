@@ -35,7 +35,8 @@ namespace mongo {
 
 RequiresIndexStage::RequiresIndexStage(const char* stageType,
                                        OperationContext* opCtx,
-                                       const IndexDescriptor* indexDescriptor)
+                                       const IndexDescriptor* indexDescriptor,
+                                       WorkingSet* workingSet)
     : RequiresCollectionStage(stageType, opCtx, indexDescriptor->getCollection()),
       _weakIndexCatalogEntry(collection()->getIndexCatalog()->getEntryShared(indexDescriptor)) {
     auto indexCatalogEntry = _weakIndexCatalogEntry.lock();
@@ -44,6 +45,7 @@ RequiresIndexStage::RequiresIndexStage(const char* stageType,
     invariant(_indexDescriptor);
     invariant(_indexAccessMethod);
     _indexName = _indexDescriptor->indexName();
+    _workingSetIndexId = workingSet->registerIndexAccessMethod(_indexAccessMethod);
 }
 
 void RequiresIndexStage::doSaveStateRequiresCollection() {
@@ -56,11 +58,12 @@ void RequiresIndexStage::doSaveStateRequiresCollection() {
 
 void RequiresIndexStage::doRestoreStateRequiresCollection() {
     // Attempt to lock the weak_ptr. If the resulting shared_ptr is null, then our index is no
-    // longer valid and the query should die.
+    // longer valid and the query should die. We must also check the `isDropped()` flag on the index
+    // catalog entry if we are able lock the weak_ptr.
     auto indexCatalogEntry = _weakIndexCatalogEntry.lock();
     uassert(ErrorCodes::QueryPlanKilled,
             str::stream() << "query plan killed :: index '" << _indexName << "' dropped",
-            indexCatalogEntry);
+            indexCatalogEntry && !indexCatalogEntry->isDropped());
 
     // Re-obtain catalog pointers that were set to null during yield preparation. It is safe to
     // access the catalog entry by raw pointer when the query is active, as its validity is

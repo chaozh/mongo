@@ -36,22 +36,22 @@
 #include "mongo/base/error_codes.h"
 #include "mongo/db/bson/dotted_path_support.h"
 #include "mongo/db/catalog/document_validation.h"
+#include "mongo/db/exec/document_value/document.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/pipeline/accumulator.h"
-#include "mongo/db/pipeline/document.h"
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/document_source_geo_near.h"
 #include "mongo/db/pipeline/document_source_match.h"
+#include "mongo/db/pipeline/document_source_merge.h"
 #include "mongo/db/pipeline/document_source_out.h"
-#include "mongo/db/pipeline/document_source_out_in_place.h"
 #include "mongo/db/pipeline/document_source_project.h"
 #include "mongo/db/pipeline/document_source_sort.h"
 #include "mongo/db/pipeline/document_source_unwind.h"
 #include "mongo/db/pipeline/expression.h"
 #include "mongo/db/pipeline/expression_context.h"
-#include "mongo/util/fail_point_service.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/fail_point.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -169,9 +169,9 @@ void Pipeline::validateTopLevelPipeline() const {
         if (nss.isCollectionlessAggregateNS() &&
             !firstStageConstraints.isIndependentOfAnyCollection) {
             uasserted(ErrorCodes::InvalidNamespace,
-                      str::stream() << "{aggregate: 1} is not valid for '"
-                                    << _sources.front()->getSourceName()
-                                    << "'; a collection is required.");
+                      str::stream()
+                          << "{aggregate: 1} is not valid for '"
+                          << _sources.front()->getSourceName() << "'; a collection is required.");
         }
 
         if (!nss.isCollectionlessAggregateNS() &&
@@ -192,19 +192,18 @@ void Pipeline::validateTopLevelPipeline() const {
             }
         }
     }
-    // Make sure we aren't reading and writing to the same namespace for an $out. This is
-    // allowed for mode "replaceCollection", but not for the in-place modes.
-    if (auto outStage = dynamic_cast<DocumentSourceOutInPlace*>(_sources.back().get())) {
-        const auto& outNss = outStage->getOutputNs();
+    // Make sure we aren't reading from and writing to the same namespace for a $merge.
+    if (auto mergeStage = dynamic_cast<DocumentSourceMerge*>(_sources.back().get())) {
+        const auto& outNss = mergeStage->getOutputNs();
         stdx::unordered_set<NamespaceString> collectionNames;
-        // In order to gather only the involved namespaces which we are reading to, not the one we
-        // are writing from, skip the final stage as we know it is an $out stage.
+        // In order to gather only the involved namespaces which we are reading from, not the one we
+        // are writing to, skip the final stage as we know it is a $merge stage.
         for (auto it = _sources.begin(); it != std::prev(_sources.end()); it++) {
             (*it)->addInvolvedCollections(&collectionNames);
         }
         uassert(51079,
-                "Cannot use $out to write to the same namespace being read from elsewhere in the "
-                "pipeline unless $out's mode is \"replaceCollection\"",
+                "Cannot use $merge to write to the same namespace being read from elsewhere in the "
+                "pipeline",
                 collectionNames.find(outNss) == collectionNames.end());
     }
 }
@@ -267,7 +266,7 @@ void Pipeline::validateCommon() const {
 
 void Pipeline::optimizePipeline() {
     // If the disablePipelineOptimization failpoint is enabled, the pipeline won't be optimized.
-    if (MONGO_FAIL_POINT(disablePipelineOptimization)) {
+    if (MONGO_unlikely(disablePipelineOptimization.shouldFail())) {
         return;
     }
 
@@ -298,7 +297,7 @@ void Pipeline::optimizePipeline() {
     stitch();
 }
 
-bool Pipeline::aggSupportsWriteConcern(const BSONObj& cmd) {
+bool Pipeline::aggHasWriteStage(const BSONObj& cmd) {
     auto pipelineElement = cmd["pipeline"];
     if (pipelineElement.type() != BSONType::Array) {
         return false;
@@ -309,7 +308,8 @@ bool Pipeline::aggSupportsWriteConcern(const BSONObj& cmd) {
             return false;
         }
 
-        if (stage.Obj().hasField("$out")) {
+        if (stage.Obj().hasField(DocumentSourceOut::kStageName) ||
+            stage.Obj().hasField(DocumentSourceMerge::kStageName)) {
             return true;
         }
     }
@@ -407,7 +407,7 @@ bool Pipeline::requiredToRunOnMongos() const {
     for (auto&& stage : _sources) {
         // If this pipeline is capable of splitting before the mongoS-only stage, then the pipeline
         // as a whole is not required to run on mongoS.
-        if (_splitState == SplitState::kUnsplit && stage->mergingLogic()) {
+        if (_splitState == SplitState::kUnsplit && stage->distributedPlanLogic()) {
             return false;
         }
 
@@ -500,49 +500,7 @@ void Pipeline::addFinalSource(intrusive_ptr<DocumentSource> source) {
     _sources.push_back(source);
 }
 
-boost::optional<StringMap<std::string>> Pipeline::renamedPaths(
-    SourceContainer::const_reverse_iterator rstart,
-    SourceContainer::const_reverse_iterator rend,
-    std::set<std::string> pathsOfInterest) {
-    // Use a vector to give a path id to each input path. A path's id is its index in the vector.
-    const std::vector<string> inputPaths(pathsOfInterest.begin(), pathsOfInterest.end());
-    std::vector<string> currentPaths(pathsOfInterest.begin(), pathsOfInterest.end());
-
-    // Loop backwards over the stages. We will re-use 'pathsOfInterest', modifying that set each
-    // time to be the current set of field's we're interested in. At the same time, we will maintain
-    // 'currentPaths'. 'pathsOfInterest' is used to compute the renames, while 'currentPaths' is
-    // used to tie a path back to its id.
-    //
-    // Interestingly, 'currentPaths' may contain duplicates. For example, if a stage like
-    // {$addFields: {a: "$b"}} duplicates the value of "a" and both paths are of interest, then
-    // 'currentPaths' may begin as ["a", "b"] representing the paths after the $addFields stage, but
-    // becomes ["a", "a"] via the rename.
-    for (auto it = rstart; it != rend; ++it) {
-        boost::optional<StringMap<string>> renamed = (*it)->renamedPaths(pathsOfInterest);
-        if (!renamed) {
-            return boost::none;
-        }
-        pathsOfInterest.clear();
-        for (std::size_t pathId = 0; pathId < inputPaths.size(); ++pathId) {
-            currentPaths[pathId] = (*renamed)[currentPaths[pathId]];
-            pathsOfInterest.insert(currentPaths[pathId]);
-        }
-    }
-
-    // We got all the way through the pipeline via renames! Construct the mapping from path at the
-    // end of the pipeline to path at the beginning.
-    StringMap<string> renameMap;
-    for (std::size_t pathId = 0; pathId < currentPaths.size(); ++pathId) {
-        renameMap[inputPaths[pathId]] = currentPaths[pathId];
-    }
-    return renameMap;
-}
-
-boost::optional<StringMap<string>> Pipeline::renamedPaths(std::set<string> pathsOfInterest) const {
-    return renamedPaths(_sources.rbegin(), _sources.rend(), std::move(pathsOfInterest));
-}
-
-DepsTracker Pipeline::getDependencies(DepsTracker::MetadataAvailable metadataAvailable) const {
+DepsTracker Pipeline::getDependencies(QueryMetadataBitSet metadataAvailable) const {
     DepsTracker deps(metadataAvailable);
     const bool scopeHasVariables = pCtx->variablesParseState.hasDefinedVariables();
     bool skipFieldsAndMetadataDeps = false;
@@ -574,9 +532,7 @@ DepsTracker Pipeline::getDependencies(DepsTracker::MetadataAvailable metadataAva
         }
 
         if (!knowAllMeta) {
-            for (auto&& req : localDeps.getAllRequiredMetadataTypes()) {
-                deps.setNeedsMetadata(req, true);
-            }
+            deps.requestMetadata(localDeps.metadataDeps());
             knowAllMeta = status & DepsTracker::State::EXHAUSTIVE_META;
         }
 
@@ -590,15 +546,15 @@ DepsTracker Pipeline::getDependencies(DepsTracker::MetadataAvailable metadataAva
     if (!knowAllFields)
         deps.needWholeDocument = true;  // don't know all fields we need
 
-    if (metadataAvailable & DepsTracker::MetadataAvailable::kTextScore) {
+    if (metadataAvailable[DocumentMetadataFields::kTextScore]) {
         // If there is a text score, assume we need to keep it if we can't prove we don't. If we are
         // the first half of a pipeline which has been split, future stages might need it.
         if (!knowAllMeta) {
-            deps.setNeedsMetadata(DepsTracker::MetadataType::TEXT_SCORE, true);
+            deps.setNeedsMetadata(DocumentMetadataFields::kTextScore, true);
         }
     } else {
         // If there is no text score available, then we don't need to ask for it.
-        deps.setNeedsMetadata(DepsTracker::MetadataType::TEXT_SCORE, false);
+        deps.setNeedsMetadata(DocumentMetadataFields::kTextScore, false);
     }
 
     return deps;
@@ -684,7 +640,7 @@ boost::intrusive_ptr<DocumentSource> Pipeline::popFrontWithName(StringData targe
 }
 
 boost::intrusive_ptr<DocumentSource> Pipeline::popFrontWithNameAndCriteria(
-    StringData targetStageName, stdx::function<bool(const DocumentSource* const)> predicate) {
+    StringData targetStageName, std::function<bool(const DocumentSource* const)> predicate) {
     if (_sources.empty() || _sources.front()->getSourceName() != targetStageName) {
         return nullptr;
     }

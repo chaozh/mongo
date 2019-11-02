@@ -1,12 +1,9 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 """Convert silent test failures into non-silent failures.
 
 Any test files with at least 2 executions in the report.json file that have a "silentfail" status,
 this script will change the outputted report to have a "fail" status instead.
 """
-
-from __future__ import absolute_import
-from __future__ import print_function
 
 import collections
 import json
@@ -31,10 +28,11 @@ def main():
 
     usage = "usage: %prog [options] report.json"
     parser = optparse.OptionParser(usage=usage)
-    parser.add_option("-o", "--output-file", dest="outfile", default="-",
-                      help=("If '-', then the report file is written to stdout."
-                            " Any other value is treated as the output file name. By default,"
-                            " output is written to stdout."))
+    parser.add_option(
+        "-o", "--output-file", dest="outfile", default="-",
+        help=("If '-', then the report file is written to stdout."
+              " Any other value is treated as the output file name. By default,"
+              " output is written to stdout."))
 
     (options, args) = parser.parse_args()
 

@@ -54,14 +54,14 @@
 #include "mongo/db/write_concern.h"
 #include "mongo/db/write_concern_options.h"
 #include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
 #include "mongo/util/scopeguard.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
-using std::unique_ptr;
 using std::set;
 using std::string;
+using std::unique_ptr;
 
 /* fetch a single object from collection ns that matches query
    set your db SavedContext first
@@ -88,7 +88,7 @@ RecordId Helpers::findOne(OperationContext* opCtx,
     if (!collection)
         return RecordId();
 
-    auto qr = stdx::make_unique<QueryRequest>(collection->ns());
+    auto qr = std::make_unique<QueryRequest>(collection->ns());
     qr->setFilter(query);
     return findOne(opCtx, collection, std::move(qr), requireIndex);
 }
@@ -138,7 +138,8 @@ bool Helpers::findById(OperationContext* opCtx,
                        bool* indexFound) {
     invariant(database);
 
-    Collection* collection = database->getCollection(opCtx, ns);
+    Collection* collection =
+        CollectionCatalog::get(opCtx).lookupCollectionByNamespace(NamespaceString(ns));
     if (!collection) {
         return false;
     }
@@ -176,7 +177,7 @@ bool Helpers::getSingleton(OperationContext* opCtx, const char* ns, BSONObj& res
     AutoGetCollectionForReadCommand ctx(opCtx, NamespaceString(ns));
     auto exec =
         InternalPlanner::collectionScan(opCtx, ns, ctx.getCollection(), PlanExecutor::NO_YIELD);
-    PlanExecutor::ExecState state = exec->getNext(&result, NULL);
+    PlanExecutor::ExecState state = exec->getNext(&result, nullptr);
 
     CurOp::get(opCtx)->done();
 
@@ -195,7 +196,7 @@ bool Helpers::getLast(OperationContext* opCtx, const char* ns, BSONObj& result) 
     AutoGetCollectionForReadCommand autoColl(opCtx, NamespaceString(ns));
     auto exec = InternalPlanner::collectionScan(
         opCtx, ns, autoColl.getCollection(), PlanExecutor::NO_YIELD, InternalPlanner::BACKWARD);
-    PlanExecutor::ExecState state = exec->getNext(&result, NULL);
+    PlanExecutor::ExecState state = exec->getNext(&result, nullptr);
 
     // Non-yielding collection scans from InternalPlanner will never error.
     invariant(PlanExecutor::ADVANCED == state || PlanExecutor::IS_EOF == state);
@@ -222,7 +223,7 @@ void Helpers::upsert(OperationContext* opCtx,
     UpdateRequest request(requestNs);
 
     request.setQuery(id);
-    request.setUpdates(o);
+    request.setUpdateModification(o);
     request.setUpsert();
     request.setFromMigration(fromMigrate);
 
@@ -235,7 +236,7 @@ void Helpers::putSingleton(OperationContext* opCtx, const char* ns, BSONObj obj)
     const NamespaceString requestNs(ns);
     UpdateRequest request(requestNs);
 
-    request.setUpdates(obj);
+    request.setUpdateModification(obj);
     request.setUpsert();
 
     update(opCtx, context.db(), request);
@@ -262,7 +263,8 @@ BSONObj Helpers::inferKeyPattern(const BSONObj& o) {
 void Helpers::emptyCollection(OperationContext* opCtx, const NamespaceString& nss) {
     OldClientContext context(opCtx, nss.ns());
     repl::UnreplicatedWritesBlock uwb(opCtx);
-    Collection* collection = context.db() ? context.db()->getCollection(opCtx, nss) : nullptr;
+    Collection* collection =
+        context.db() ? CollectionCatalog::get(opCtx).lookupCollectionByNamespace(nss) : nullptr;
     deleteObjects(opCtx, collection, nss, BSONObj(), false);
 }
 

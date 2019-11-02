@@ -6,7 +6,6 @@ load('jstests/concurrency/fsm_libs/parse_config.js');  // for parseConfig
 load('jstests/libs/specific_secondary_reader_mongo.js');
 
 var workerThread = (function() {
-
     // workloads = list of workload filenames
     // args.tid = the thread identifier
     // args.data = map of workload -> 'this' parameter passed to the FSM state functions
@@ -60,9 +59,9 @@ var workerThread = (function() {
                 let initialOperationTime;
 
                 // JavaScript objects backed by C++ objects (e.g. BSON values from a command
-                // response) do not serialize correctly when passed through the ScopedThread
+                // response) do not serialize correctly when passed through the Thread
                 // constructor. To work around this behavior, we instead pass a stringified form
-                // of the JavaScript object through the ScopedThread constructor and use eval()
+                // of the JavaScript object through the Thread constructor and use eval()
                 // to rehydrate it.
                 if (typeof args.sessionOptions.initialClusterTime === 'string') {
                     initialClusterTime = eval('(' + args.sessionOptions.initialClusterTime + ')');
@@ -149,7 +148,9 @@ var workerThread = (function() {
                     };
                     Object.assign(TestData, newOptions);
 
-                    load('jstests/libs/override_methods/auto_retry_on_network_error.js');
+                    assert(!TestData.hasOwnProperty('networkErrorAndTxnOverrideConfig'), TestData);
+                    TestData.networkErrorAndTxnOverrideConfig = {retryOnNetworkErrors: true};
+                    load('jstests/libs/override_methods/network_error_and_txn_override.js');
                 }
 
                 // Operations that run after a "dropDatabase" command has been issued may fail with
@@ -191,8 +192,7 @@ var workerThread = (function() {
                 // them here as non-configurable and non-writable.
                 Object.defineProperties(data, {
                     'iterations': {configurable: false, writable: false, value: data.iterations},
-                    'threadCount':
-                        {configurable: false, writable: false, value: data.threadCount}
+                    'threadCount': {configurable: false, writable: false, value: data.threadCount}
                 });
 
                 data.tid = args.tid;

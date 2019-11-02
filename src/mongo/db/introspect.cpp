@@ -49,9 +49,9 @@
 
 namespace mongo {
 
-using std::unique_ptr;
 using std::endl;
 using std::string;
+using std::unique_ptr;
 
 namespace {
 
@@ -92,7 +92,8 @@ void profile(OperationContext* opCtx, NetworkOp op) {
     {
         Locker::LockerInfo lockerInfo;
         opCtx->lockState()->getLockerInfo(&lockerInfo, CurOp::get(opCtx)->getLockStatsBase());
-        CurOp::get(opCtx)->debug().append(*CurOp::get(opCtx), lockerInfo.stats, b);
+        CurOp::get(opCtx)->debug().append(
+            opCtx, lockerInfo.stats, opCtx->lockState()->getFlowControlStats(), b);
     }
 
     b.appendDate("ts", jsTime());
@@ -120,7 +121,18 @@ void profile(OperationContext* opCtx, NetworkOp op) {
     // collection.
     bool acquireDbXLock = false;
 
+    auto origFlowControl = opCtx->shouldParticipateInFlowControl();
+
+    // The system.profile collection is non-replicated, so writes to it do not cause
+    // replication lag. As such, they should be excluded from Flow Control.
+    opCtx->setShouldParticipateInFlowControl(false);
+
+    // IX lock acquisitions beyond this block will not be related to writes to system.profile.
+    ON_BLOCK_EXIT(
+        [opCtx, origFlowControl] { opCtx->setShouldParticipateInFlowControl(origFlowControl); });
+
     try {
+
         // Even if the operation we are profiling was interrupted, we still want to output the
         // profiler entry.  This lock guard will prevent lock acquisitions from throwing exceptions
         // before we finish writing the entry. However, our maximum lock timeout overrides
@@ -152,10 +164,23 @@ void profile(OperationContext* opCtx, NetworkOp op) {
                 break;
             }
 
-            Lock::CollectionLock collLock(opCtx->lockState(), db->getProfilingNS(), MODE_IX);
+            Lock::CollectionLock collLock(opCtx, db->getProfilingNS(), MODE_IX);
 
-            Collection* const coll = db->getCollection(opCtx, db->getProfilingNS());
+            // We are about to enforce prepare conflicts for the OperationContext. But it is illegal
+            // to change the behavior of ignoring prepare conflicts while any storage transaction is
+            // still active. So we need to call abandonSnapshot() to close any open transactions.
+            // This call is also harmless because any previous reads or writes should have already
+            // completed, as profile() is called at the end of an operation.
+            opCtx->recoveryUnit()->abandonSnapshot();
+            // The profiler performs writes even after read commands. Ignoring prepare conflicts is
+            // not allowed while performing writes, so temporarily enforce prepare conflicts.
+            EnforcePrepareConflictsBlock enforcePrepare(opCtx);
+
+            Collection* const coll =
+                CollectionCatalog::get(opCtx).lookupCollectionByNamespace(db->getProfilingNS());
+
             if (coll) {
+                invariant(!opCtx->shouldParticipateInFlowControl());
                 WriteUnitOfWork wuow(opCtx);
                 OpDebug* const nullOpDebug = nullptr;
                 coll->insertDocument(opCtx, InsertStatement(p), nullOpDebug, false)
@@ -175,7 +200,7 @@ void profile(OperationContext* opCtx, NetworkOp op) {
             }
         }
     } catch (const AssertionException& assertionEx) {
-        if (acquireDbXLock && assertionEx.isA<ErrorCategory::Interruption>()) {
+        if (acquireDbXLock && ErrorCodes::isInterruption(assertionEx)) {
             warning()
                 << "Interrupted while attempting to create profile collection in database "
                 << dbName << " to profile operation " << networkOpToString(op) << " against "
@@ -191,10 +216,11 @@ void profile(OperationContext* opCtx, NetworkOp op) {
 
 Status createProfileCollection(OperationContext* opCtx, Database* db) {
     invariant(opCtx->lockState()->isDbLockedForMode(db->name(), MODE_X));
+    invariant(!opCtx->shouldParticipateInFlowControl());
 
-    const std::string dbProfilingNS(db->getProfilingNS());
-
-    Collection* const collection = db->getCollection(opCtx, dbProfilingNS);
+    auto& dbProfilingNS = db->getProfilingNS();
+    Collection* const collection =
+        CollectionCatalog::get(opCtx).lookupCollectionByNamespace(dbProfilingNS);
     if (collection) {
         if (!collection->isCapped()) {
             return Status(ErrorCodes::NamespaceExists,

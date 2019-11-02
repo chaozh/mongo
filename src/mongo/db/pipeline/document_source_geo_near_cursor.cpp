@@ -41,7 +41,7 @@
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/simple_bsonobj_comparator.h"
 #include "mongo/db/catalog/collection.h"
-#include "mongo/db/pipeline/document.h"
+#include "mongo/db/exec/document_value/document.h"
 #include "mongo/db/pipeline/document_source_cursor.h"
 #include "mongo/db/pipeline/document_source_sort.h"
 #include "mongo/db/pipeline/expression_context.h"
@@ -49,7 +49,6 @@
 #include "mongo/db/query/plan_executor.h"
 
 namespace mongo {
-constexpr const char* DocumentSourceGeoNearCursor::kStageName;
 
 boost::intrusive_ptr<DocumentSourceGeoNearCursor> DocumentSourceGeoNearCursor::create(
     Collection* collection,
@@ -81,37 +80,33 @@ DocumentSourceGeoNearCursor::DocumentSourceGeoNearCursor(
 }
 
 const char* DocumentSourceGeoNearCursor::getSourceName() const {
-    return kStageName;
+    return DocumentSourceGeoNearCursor::kStageName.rawData();
 }
 
-BSONObjSet DocumentSourceGeoNearCursor::getOutputSorts() {
-    return SimpleBSONObjComparator::kInstance.makeBSONObjSet(
-        {BSON(_distanceField.fullPath() << 1)});
-}
-
-Document DocumentSourceGeoNearCursor::transformBSONObjToDocument(const BSONObj& obj) const {
-    MutableDocument output(Document::fromBsonWithMetaData(obj));
+Document DocumentSourceGeoNearCursor::transformDoc(Document&& objInput) const {
+    MutableDocument output(std::move(objInput));
 
     // Scale the distance by the requested factor.
-    invariant(output.peek().hasGeoNearDistance(),
+    invariant(output.peek().metadata().hasGeoNearDistance(),
               str::stream()
                   << "Query returned a document that is unexpectedly missing the geoNear distance: "
-                  << obj.jsonString());
-    const auto distance = output.peek().getGeoNearDistance() * _distanceMultiplier;
+                  << output.peek().toString());
+    const auto distance = output.peek().metadata().getGeoNearDistance() * _distanceMultiplier;
 
     output.setNestedField(_distanceField, Value(distance));
     if (_locationField) {
         invariant(
-            output.peek().hasGeoNearPoint(),
+            output.peek().metadata().hasGeoNearPoint(),
             str::stream()
                 << "Query returned a document that is unexpectedly missing the geoNear point: "
-                << obj.jsonString());
-        output.setNestedField(*_locationField, output.peek().getGeoNearPoint());
+                << output.peek().toString());
+        output.setNestedField(*_locationField, output.peek().metadata().getGeoNearPoint());
     }
 
     // In a cluster, $geoNear will be merged via $sort, so add the sort key.
     if (pExpCtx->needsMerge) {
-        output.setSortKeyMetaField(BSON("" << distance));
+        const bool isSingleElementKey = true;
+        output.metadata().setSortKey(Value(distance), isSingleElementKey);
     }
 
     return output.freeze();

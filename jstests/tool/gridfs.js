@@ -21,8 +21,8 @@ function testGridFS(name) {
     // upload file (currently calls filemd5 internally)
     var exitCode = MongoRunner.runMongoTool("mongofiles",
                                             {
-                                              port: mongos.port,
-                                              db: name,
+                                                port: mongos.port,
+                                                db: name,
                                             },
                                             "put",
                                             filename);
@@ -31,7 +31,6 @@ function testGridFS(name) {
     assert.eq(d.fs.files.count(), 1);
     var fileObj = d.fs.files.findOne();
     print("fileObj: " + tojson(fileObj));
-    assert.eq(rawmd5, fileObj.md5);  // check that mongofiles inserted the correct md5
 
     // Call filemd5 ourself and check results.
     var res = d.runCommand({filemd5: fileObj._id});

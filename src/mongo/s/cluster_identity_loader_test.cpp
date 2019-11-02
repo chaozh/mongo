@@ -48,7 +48,7 @@
 #include "mongo/s/sharding_router_test_fixture.h"
 #include "mongo/stdx/future.h"
 #include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 namespace {
@@ -117,7 +117,7 @@ TEST_F(ClusterIdentityTest, BasicLoadSuccess) {
 
     expectConfigVersionLoad(clusterId);
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 
     // Subsequent requests for the cluster ID should not require any network traffic as we consult
     // the cached version.
@@ -153,9 +153,9 @@ TEST_F(ClusterIdentityTest, MultipleThreadsLoadingSuccess) {
 
     expectConfigVersionLoad(clusterId);
 
-    future1.timed_get(kFutureTimeout);
-    future2.timed_get(kFutureTimeout);
-    future3.timed_get(kFutureTimeout);
+    future1.default_timed_get();
+    future2.default_timed_get();
+    future3.default_timed_get();
 }
 
 TEST_F(ClusterIdentityTest, BasicLoadFailureFollowedBySuccess) {
@@ -170,7 +170,7 @@ TEST_F(ClusterIdentityTest, BasicLoadFailureFollowedBySuccess) {
 
     expectConfigVersionLoad(Status(ErrorCodes::Interrupted, "interrupted"));
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 
     // After a failure to load the cluster ID, subsequent attempts to get the cluster ID should
     // retry loading it.
@@ -184,7 +184,7 @@ TEST_F(ClusterIdentityTest, BasicLoadFailureFollowedBySuccess) {
 
     expectConfigVersionLoad(clusterId);
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 }  // namespace

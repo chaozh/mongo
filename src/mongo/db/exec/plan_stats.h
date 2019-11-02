@@ -34,10 +34,10 @@
 #include <string>
 #include <vector>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/db/index/multikey_paths.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/query/stage_types.h"
+#include "mongo/util/container_size_helper.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
@@ -52,10 +52,14 @@ struct SpecificStats {
      * Make a deep copy.
      */
     virtual SpecificStats* clone() const = 0;
+
+    virtual uint64_t estimateObjectSizeInBytes() const = 0;
 };
 
 // Every stage has CommonStats.
 struct CommonStats {
+    CommonStats() = delete;
+
     CommonStats(const char* type)
         : stageTypeStr(type),
           works(0),
@@ -65,7 +69,12 @@ struct CommonStats {
           needTime(0),
           needYield(0),
           executionTimeMillis(0),
+          failed(false),
           isEOF(false) {}
+
+    uint64_t estimateObjectSizeInBytes() const {
+        return filter.objsize() + sizeof(*this);
+    }
     // String giving the type of the stage. Not owned.
     const char* stageTypeStr;
 
@@ -94,11 +103,8 @@ struct CommonStats {
 
     // TODO: keep track of the total yield time / fetch time done for a plan.
 
+    bool failed;
     bool isEOF;
-
-private:
-    // Default constructor is illegal.
-    CommonStats();
 };
 
 // The universal container for a stage's stats.
@@ -120,6 +126,20 @@ struct PlanStageStats {
         return stats;
     }
 
+    uint64_t estimateObjectSizeInBytes() const {
+        return  // Add size of each element in 'children' vector.
+            container_size_helper::estimateObjectSizeInBytes(
+                children,
+                [](const auto& child) { return child->estimateObjectSizeInBytes(); },
+                true) +
+            // Exclude the size of 'common' object since is being added later.
+            (common.estimateObjectSizeInBytes() - sizeof(common)) +
+            // Add 'specific' object size if exists.
+            (specific ? specific->estimateObjectSizeInBytes() : 0) +
+            // Add size of the object.
+            sizeof(*this);
+    }
+
     // See query/stage_type.h
     StageType stageType;
 
@@ -133,7 +153,8 @@ struct PlanStageStats {
     std::vector<std::unique_ptr<PlanStageStats>> children;
 
 private:
-    MONGO_DISALLOW_COPYING(PlanStageStats);
+    PlanStageStats(const PlanStageStats&) = delete;
+    PlanStageStats& operator=(const PlanStageStats&) = delete;
 };
 
 struct AndHashStats : public SpecificStats {
@@ -142,6 +163,10 @@ struct AndHashStats : public SpecificStats {
     SpecificStats* clone() const final {
         AndHashStats* specific = new AndHashStats(*this);
         return specific;
+    }
+
+    uint64_t estimateObjectSizeInBytes() const {
+        return container_size_helper::estimateObjectSizeInBytes(mapAfterChild) + sizeof(*this);
     }
 
     // How many entries are in the map after each child?
@@ -167,6 +192,10 @@ struct AndSortedStats : public SpecificStats {
         return specific;
     }
 
+    uint64_t estimateObjectSizeInBytes() const {
+        return container_size_helper::estimateObjectSizeInBytes(failedAnd) + sizeof(*this);
+    }
+
     // How many results from each child did not pass the AND?
     std::vector<size_t> failedAnd;
 };
@@ -176,6 +205,10 @@ struct CachedPlanStats : public SpecificStats {
 
     SpecificStats* clone() const final {
         return new CachedPlanStats(*this);
+    }
+
+    uint64_t estimateObjectSizeInBytes() const {
+        return sizeof(*this);
     }
 
     bool replanned;
@@ -189,6 +222,11 @@ struct CollectionScanStats : public SpecificStats {
         return specific;
     }
 
+    uint64_t estimateObjectSizeInBytes() const {
+        return sizeof(*this);
+    }
+
+
     // How many documents did we check against our filter?
     size_t docsTested;
 
@@ -196,9 +234,14 @@ struct CollectionScanStats : public SpecificStats {
     // backwards.
     int direction;
 
-    // If present, indicates that the collection scan will stop and return EOF the first time it
-    // sees a document that does not pass the filter and has a "ts" Timestamp field greater than
-    // 'maxTs'.
+    bool tailable{false};
+
+    // The start location of the scan. Must only be set on forward oplog scans.
+    boost::optional<Timestamp> minTs;
+
+    // Indicates that the collection scan will stop and return EOF the first time it sees a
+    // document that does not pass the filter and has a "ts" Timestamp field greater than 'maxTs'.
+    // Must only be set on forward oplog scans.
     boost::optional<Timestamp> maxTs;
 };
 
@@ -208,6 +251,10 @@ struct CountStats : public SpecificStats {
     SpecificStats* clone() const final {
         CountStats* specific = new CountStats(*this);
         return specific;
+    }
+
+    uint64_t estimateObjectSizeInBytes() const {
+        return sizeof(*this);
     }
 
     // The result of the count.
@@ -234,6 +281,18 @@ struct CountScanStats : public SpecificStats {
         specific->startKey = startKey.getOwned();
         specific->endKey = endKey.getOwned();
         return specific;
+    }
+
+    uint64_t estimateObjectSizeInBytes() const {
+        return container_size_helper::estimateObjectSizeInBytes(
+                   multiKeyPaths,
+                   [](const auto& keyPath) {
+                       // Calculate the size of each std::set in 'multiKeyPaths'.
+                       return container_size_helper::estimateObjectSizeInBytes(keyPath);
+                   },
+                   true) +
+            keyPattern.objsize() + collation.objsize() + startKey.objsize() + endKey.objsize() +
+            indexName.capacity() + sizeof(*this);
     }
 
     std::string indexName;
@@ -273,6 +332,10 @@ struct DeleteStats : public SpecificStats {
         return new DeleteStats(*this);
     }
 
+    uint64_t estimateObjectSizeInBytes() const {
+        return sizeof(*this);
+    }
+
     size_t docsDeleted = 0u;
 };
 
@@ -284,6 +347,18 @@ struct DistinctScanStats : public SpecificStats {
         specific->collation = collation.getOwned();
         specific->indexBounds = indexBounds.getOwned();
         return specific;
+    }
+
+    uint64_t estimateObjectSizeInBytes() const {
+        return container_size_helper::estimateObjectSizeInBytes(
+                   multiKeyPaths,
+                   [](const auto& keyPath) {
+                       // Calculate the size of each std::set in 'multiKeyPaths'.
+                       return container_size_helper::estimateObjectSizeInBytes(keyPath);
+                   },
+                   true) +
+            keyPattern.objsize() + collation.objsize() + indexBounds.objsize() +
+            indexName.capacity() + sizeof(*this);
     }
 
     // How many keys did we look at while distinct-ing?
@@ -322,6 +397,10 @@ struct EnsureSortedStats : public SpecificStats {
         return specific;
     }
 
+    uint64_t estimateObjectSizeInBytes() const {
+        return sizeof(*this);
+    }
+
     // The number of out-of-order results that were dropped.
     long long nDropped;
 };
@@ -332,6 +411,10 @@ struct FetchStats : public SpecificStats {
     SpecificStats* clone() const final {
         FetchStats* specific = new FetchStats(*this);
         return specific;
+    }
+
+    uint64_t estimateObjectSizeInBytes() const {
+        return sizeof(*this);
     }
 
     // Have we seen anything that already had an object?
@@ -349,6 +432,10 @@ struct IDHackStats : public SpecificStats {
         return specific;
     }
 
+    uint64_t estimateObjectSizeInBytes() const {
+        return indexName.capacity() + sizeof(*this);
+    }
+
     std::string indexName;
 
     // Number of entries retrieved from the index while executing the idhack.
@@ -356,6 +443,16 @@ struct IDHackStats : public SpecificStats {
 
     // Number of documents retrieved from the collection while executing the idhack.
     size_t docsExamined;
+};
+
+struct ReturnKeyStats : public SpecificStats {
+    SpecificStats* clone() const final {
+        return new ReturnKeyStats(*this);
+    }
+
+    uint64_t estimateObjectSizeInBytes() const {
+        return sizeof(*this);
+    }
 };
 
 struct IndexScanStats : public SpecificStats {
@@ -378,6 +475,18 @@ struct IndexScanStats : public SpecificStats {
         specific->collation = collation.getOwned();
         specific->indexBounds = indexBounds.getOwned();
         return specific;
+    }
+
+    uint64_t estimateObjectSizeInBytes() const {
+        return container_size_helper::estimateObjectSizeInBytes(
+                   multiKeyPaths,
+                   [](const auto& keyPath) {
+                       // Calculate the size of each std::set in 'multiKeyPaths'.
+                       return container_size_helper::estimateObjectSizeInBytes(keyPath);
+                   },
+                   true) +
+            keyPattern.objsize() + collation.objsize() + indexBounds.objsize() +
+            indexName.capacity() + indexType.capacity() + sizeof(*this);
     }
 
     // Index type being used.
@@ -429,6 +538,10 @@ struct LimitStats : public SpecificStats {
         return specific;
     }
 
+    uint64_t estimateObjectSizeInBytes() const {
+        return sizeof(*this);
+    }
+
     size_t limit;
 };
 
@@ -438,6 +551,10 @@ struct MockStats : public SpecificStats {
     SpecificStats* clone() const final {
         return new MockStats(*this);
     }
+
+    uint64_t estimateObjectSizeInBytes() const {
+        return sizeof(*this);
+    }
 };
 
 struct MultiPlanStats : public SpecificStats {
@@ -445,6 +562,10 @@ struct MultiPlanStats : public SpecificStats {
 
     SpecificStats* clone() const final {
         return new MultiPlanStats(*this);
+    }
+
+    uint64_t estimateObjectSizeInBytes() const {
+        return sizeof(*this);
     }
 };
 
@@ -454,6 +575,10 @@ struct OrStats : public SpecificStats {
     SpecificStats* clone() const final {
         OrStats* specific = new OrStats(*this);
         return specific;
+    }
+
+    uint64_t estimateObjectSizeInBytes() const {
+        return sizeof(*this);
     }
 
     size_t dupsTested = 0u;
@@ -468,6 +593,10 @@ struct ProjectionStats : public SpecificStats {
         return specific;
     }
 
+    uint64_t estimateObjectSizeInBytes() const {
+        return projObj.objsize() + sizeof(*this);
+    }
+
     // Object specifying the projection transformation to apply.
     BSONObj projObj;
 };
@@ -480,17 +609,28 @@ struct SortStats : public SpecificStats {
         return specific;
     }
 
-    // What's our current memory usage?
-    size_t memUsage = 0u;
-
-    // What's our memory limit?
-    size_t memLimit = 0u;
-
-    // The number of results to return from the sort.
-    size_t limit = 0u;
+    uint64_t estimateObjectSizeInBytes() const {
+        return sortPattern.objsize() + sizeof(*this);
+    }
 
     // The pattern according to which we are sorting.
     BSONObj sortPattern;
+
+    // The number of results to return from the sort.
+    uint64_t limit = 0u;
+
+    // The maximum number of bytes of memory we're willing to use during execution of the sort. If
+    // this limit is exceeded and 'allowDiskUse' is false, the query will fail at execution time. If
+    // 'allowDiskUse' is true, the data will be spilled to disk.
+    uint64_t maxMemoryUsageBytes = 0u;
+
+    // The amount of data we've sorted in bytes. At various times this data may be buffered in
+    // memory or disk-resident, depending on the configuration of 'maxMemoryUsageBytes' and whether
+    // disk use is allowed.
+    uint64_t totalDataSizeBytes = 0u;
+
+    // Whether we spilled data to disk during the execution of this query.
+    bool wasDiskUsed = false;
 };
 
 struct MergeSortStats : public SpecificStats {
@@ -499,6 +639,10 @@ struct MergeSortStats : public SpecificStats {
     SpecificStats* clone() const final {
         MergeSortStats* specific = new MergeSortStats(*this);
         return specific;
+    }
+
+    uint64_t estimateObjectSizeInBytes() const {
+        return sortPattern.objsize() + sizeof(*this);
     }
 
     size_t dupsTested = 0u;
@@ -516,6 +660,10 @@ struct ShardingFilterStats : public SpecificStats {
         return specific;
     }
 
+    uint64_t estimateObjectSizeInBytes() const {
+        return sizeof(*this);
+    }
+
     size_t chunkSkips;
 };
 
@@ -525,6 +673,10 @@ struct SkipStats : public SpecificStats {
     SpecificStats* clone() const final {
         SkipStats* specific = new SkipStats(*this);
         return specific;
+    }
+
+    uint64_t estimateObjectSizeInBytes() const {
+        return sizeof(*this);
     }
 
     size_t skip;
@@ -551,6 +703,11 @@ struct NearStats : public SpecificStats {
         return new NearStats(*this);
     }
 
+    uint64_t estimateObjectSizeInBytes() const {
+        return container_size_helper::estimateObjectSizeInBytes(intervalStats) +
+            keyPattern.objsize() + indexName.capacity() + sizeof(*this);
+    }
+
     std::vector<IntervalStats> intervalStats;
     std::string indexName;
     // btree index version, not geo index version
@@ -559,15 +716,14 @@ struct NearStats : public SpecificStats {
 };
 
 struct UpdateStats : public SpecificStats {
-    UpdateStats()
-        : nMatched(0),
-          nModified(0),
-          isDocReplacement(false),
-          fastmodinsert(false),
-          inserted(false) {}
+    UpdateStats() : nMatched(0), nModified(0), isModUpdate(false), inserted(false) {}
 
     SpecificStats* clone() const final {
         return new UpdateStats(*this);
+    }
+
+    uint64_t estimateObjectSizeInBytes() const {
+        return objInserted.objsize() + sizeof(*this);
     }
 
     // The number of documents which match the query part of the update.
@@ -576,13 +732,8 @@ struct UpdateStats : public SpecificStats {
     // The number of documents modified by this update.
     size_t nModified;
 
-    // True iff this is a doc-replacement style update, as opposed to a $mod update.
-    bool isDocReplacement;
-
-    // A 'fastmodinsert' is an insert resulting from an {upsert: true} update
-    // which is a doc-replacement style update. It's "fast" because we don't need
-    // to compute the document to insert based on the modifiers.
-    bool fastmodinsert;
+    // True iff this is a $mod update.
+    bool isModUpdate;
 
     // Is this an {upsert: true} update that did an insert?
     bool inserted;
@@ -597,6 +748,11 @@ struct TextStats : public SpecificStats {
     SpecificStats* clone() const final {
         TextStats* specific = new TextStats(*this);
         return specific;
+    }
+
+    uint64_t estimateObjectSizeInBytes() const {
+        return parsedTextQuery.objsize() + indexPrefix.objsize() + indexName.capacity() +
+            sizeof(*this);
     }
 
     std::string indexName;
@@ -618,6 +774,10 @@ struct TextMatchStats : public SpecificStats {
         return specific;
     }
 
+    uint64_t estimateObjectSizeInBytes() const {
+        return sizeof(*this);
+    }
+
     size_t docsRejected;
 };
 
@@ -629,6 +789,10 @@ struct TextOrStats : public SpecificStats {
         return specific;
     }
 
+    uint64_t estimateObjectSizeInBytes() const {
+        return sizeof(*this);
+    }
+
     size_t fetches;
 };
 
@@ -636,6 +800,10 @@ struct TrialStats : public SpecificStats {
     SpecificStats* clone() const final {
         TrialStats* specific = new TrialStats(*this);
         return specific;
+    }
+
+    uint64_t estimateObjectSizeInBytes() const {
+        return sizeof(*this);
     }
 
     size_t trialPeriodMaxWorks = 0;

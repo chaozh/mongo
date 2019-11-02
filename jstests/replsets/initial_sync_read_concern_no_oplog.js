@@ -1,33 +1,31 @@
 // Test that if an afterClusterTime query is issued to a node in initial sync that has not yet
 // created its oplog, the node returns an error rather than crashing.
 (function() {
-    'use strict';
-    load('jstests/libs/check_log.js');
+'use strict';
 
-    const replSet = new ReplSetTest({nodes: 1});
+load("jstests/libs/fail_point_util.js");
 
-    replSet.startSet();
-    replSet.initiate();
-    const primary = replSet.getPrimary();
-    const secondary = replSet.add();
+const replSet = new ReplSetTest({nodes: 1});
 
-    assert.commandWorked(secondary.adminCommand(
-        {configureFailPoint: 'initialSyncHangBeforeCreatingOplog', mode: 'alwaysOn'}));
-    replSet.reInitiate();
+replSet.startSet();
+replSet.initiate();
+const primary = replSet.getPrimary();
+const secondary = replSet.add();
 
-    checkLog.contains(secondary,
-                      'initial sync - initialSyncHangBeforeCreatingOplog fail point enabled');
+const failPoint = configureFailPoint(secondary, 'initialSyncHangBeforeCreatingOplog');
+replSet.reInitiate();
 
-    assert.commandFailedWithCode(
-        secondary.getDB('local').runCommand(
-            {find: 'coll', limit: 1, readConcern: {afterClusterTime: Timestamp(1, 1)}}),
-        ErrorCodes.NotYetInitialized);
+failPoint.wait();
 
-    assert.commandWorked(secondary.adminCommand(
-        {configureFailPoint: 'initialSyncHangBeforeCreatingOplog', mode: 'off'}));
+assert.commandFailedWithCode(
+    secondary.getDB('local').runCommand(
+        {find: 'coll', limit: 1, readConcern: {afterClusterTime: Timestamp(1, 1)}}),
+    ErrorCodes.NotYetInitialized);
 
-    replSet.awaitReplication();
-    replSet.awaitSecondaryNodes();
+failPoint.off();
 
-    replSet.stopSet();
+replSet.awaitReplication();
+replSet.awaitSecondaryNodes();
+
+replSet.stopSet();
 })();

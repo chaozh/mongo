@@ -51,8 +51,8 @@
 #include "mongo/base/string_data.h"
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
 #include "mongo/util/scopeguard.h"
+#include "mongo/util/str.h"
 #include "mongo/util/text.h"
 namespace mongo {
 
@@ -93,8 +93,8 @@ StatusWith<std::string> readFileAsString(StringData filename) {
     if (fd == -1) {
         int err = errno;
         return Status(ErrorCodes::FileOpenFailed,
-                      str::stream() << "Failed to open file " << filename << " with error: "
-                                    << errnoWithDescription(err));
+                      str::stream() << "Failed to open file " << filename
+                                    << " with error: " << errnoWithDescription(err));
     }
     auto scopedGuard = makeGuard([fd] { close(fd); });
 
@@ -122,8 +122,8 @@ StatusWith<std::string> readFileAsString(StringData filename) {
                 }
 
                 return Status(ErrorCodes::FileStreamFailed,
-                              str::stream() << "Failed to read file " << filename << " with error: "
-                                            << errnoWithDescription(err));
+                              str::stream() << "Failed to read file " << filename
+                                            << " with error: " << errnoWithDescription(err));
             }
 
             break;
@@ -263,7 +263,7 @@ Status parseProcStat(const std::vector<StringData>& keys,
 
                     uint64_t value;
 
-                    if (!parseNumberFromString(stringValue, &value).isOK()) {
+                    if (!NumberParser{}(stringValue, &value).isOK()) {
                         value = 0;
                     }
 
@@ -275,7 +275,7 @@ Status parseProcStat(const std::vector<StringData>& keys,
 
                 uint64_t value;
 
-                if (!parseNumberFromString(stringValue, &value).isOK()) {
+                if (!NumberParser{}(stringValue, &value).isOK()) {
                     value = 0;
                 }
 
@@ -368,7 +368,7 @@ Status parseProcMemInfo(const std::vector<StringData>& keys,
 
             uint64_t value;
 
-            if (!parseNumberFromString(stringValue, &value).isOK()) {
+            if (!NumberParser{}(stringValue, &value).isOK()) {
                 value = 0;
             }
 
@@ -432,11 +432,10 @@ Status parseProcNetstat(const std::vector<StringData>& keys,
 
     // Split the file by lines.
     uint32_t lineNum = 0;
-    for (string_split_iterator
-             lineIt = string_split_iterator(
-                 data.begin(),
-                 data.end(),
-                 boost::token_finder([](char c) { return c == '\n'; }, boost::token_compress_on));
+    for (string_split_iterator lineIt = string_split_iterator(
+             data.begin(),
+             data.end(),
+             boost::token_finder([](char c) { return c == '\n'; }, boost::token_compress_on));
          lineIt != string_split_iterator();
          ++lineIt, ++lineNum) {
 
@@ -478,7 +477,7 @@ Status parseProcNetstat(const std::vector<StringData>& keys,
                     StringData key((*keysIt).begin(), (*keysIt).end());
                     StringData stringValue((*valuesIt).begin(), (*valuesIt).end());
                     uint64_t value;
-                    if (parseNumberFromString(stringValue, &value).isOK()) {
+                    if (NumberParser{}(stringValue, &value).isOK()) {
                         builder->appendNumber(prefix.toString() + key.toString(),
                                               static_cast<long long>(value));
                         foundKeys = true;
@@ -600,7 +599,7 @@ Status parseProcDiskStats(const std::vector<StringData>& disks,
 
                 uint64_t value;
 
-                if (!parseNumberFromString(stringValue, &value).isOK()) {
+                if (!NumberParser{}(stringValue, &value).isOK()) {
                     value = 0;
                 }
 

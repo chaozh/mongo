@@ -33,7 +33,6 @@
 
 #include "mongo/bson/simple_bsonobj_comparator.h"
 #include "mongo/db/client.h"
-#include "mongo/db/client.h"
 #include "mongo/db/concurrency/deferred_writer.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
@@ -57,7 +56,7 @@ struct BSONObjCompare {
         return SimpleBSONObjComparator::kInstance.compare(lhs, rhs) < 0;
     }
 };
-}
+}  // namespace
 
 static const NamespaceString kTestNamespace("unittests", "deferred_writer_tests");
 
@@ -135,7 +134,7 @@ public:
      */
     RaiiWrapper getWriter(CollectionOptions options = CollectionOptions(),
                           int64_t maxSize = 200'000) {
-        return RaiiWrapper(stdx::make_unique<DeferredWriter>(kTestNamespace, options, maxSize));
+        return RaiiWrapper(std::make_unique<DeferredWriter>(kTestNamespace, options, maxSize));
     }
 
     virtual void run(void) = 0;
@@ -371,9 +370,9 @@ private:
     static const int kDocsPerWorker = 100;
 };
 
-class DeferredWriterTests : public Suite {
+class DeferredWriterTests : public OldStyleSuiteSpecification {
 public:
-    DeferredWriterTests() : Suite("deferred_writer_tests") {}
+    DeferredWriterTests() : OldStyleSuiteSpecification("deferred_writer_tests") {}
 
     void setupTests() {
         add<DeferredWriterTestEmpty>();
@@ -383,5 +382,8 @@ public:
         add<DeferredWriterTestCap>();
         add<DeferredWriterTestAsync>();
     }
-} deferredWriterTests;
-}
+};
+
+OldStyleSuiteInitializer<DeferredWriterTests> deferredWriterTests;
+
+}  // namespace deferred_writer_tests

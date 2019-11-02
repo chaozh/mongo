@@ -42,7 +42,7 @@
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/s/grid.h"
 #include "mongo/util/log.h"
-#include "mongo/util/stringutils.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 namespace {
@@ -106,7 +106,8 @@ public:
             result.appendTimestamp("mine", 0);
         }
 
-        AutoGetCollection autoColl(opCtx, nss, MODE_IS);
+        AutoGetCollection autoColl(
+            opCtx, nss, MODE_IS, AutoGetCollection::ViewMode::kViewsPermitted);
         auto* const css = CollectionShardingRuntime::get(opCtx, nss);
 
         const auto optMetadata = css->getCurrentMetadataIfKnown();

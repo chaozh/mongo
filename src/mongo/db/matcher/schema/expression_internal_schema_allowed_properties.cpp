@@ -35,7 +35,7 @@ namespace mongo {
 constexpr StringData InternalSchemaAllowedPropertiesMatchExpression::kName;
 
 InternalSchemaAllowedPropertiesMatchExpression::InternalSchemaAllowedPropertiesMatchExpression(
-    boost::container::flat_set<StringData> properties,
+    StringDataSet properties,
     StringData namePlaceholder,
     std::vector<PatternSchema> patternProperties,
     std::unique_ptr<ExpressionWithPlaceholder> otherwise)
@@ -54,8 +54,8 @@ InternalSchemaAllowedPropertiesMatchExpression::InternalSchemaAllowedPropertiesM
 }
 
 void InternalSchemaAllowedPropertiesMatchExpression::debugString(StringBuilder& debug,
-                                                                 int level) const {
-    _debugAddSpace(debug, level);
+                                                                 int indentationLevel) const {
+    _debugAddSpace(debug, indentationLevel);
 
     BSONObjBuilder builder;
     serialize(&builder);
@@ -130,11 +130,9 @@ void InternalSchemaAllowedPropertiesMatchExpression::serialize(BSONObjBuilder* b
     BSONObjBuilder expressionBuilder(
         builder->subobjStart(InternalSchemaAllowedPropertiesMatchExpression::kName));
 
-    BSONArrayBuilder propertiesBuilder(expressionBuilder.subarrayStart("properties"));
-    for (auto&& property : _properties) {
-        propertiesBuilder.append(property);
-    }
-    propertiesBuilder.doneFast();
+    std::vector<StringData> sortedProperties(_properties.begin(), _properties.end());
+    std::sort(sortedProperties.begin(), sortedProperties.end());
+    expressionBuilder.append("properties", sortedProperties);
 
     expressionBuilder.append("namePlaceholder", _namePlaceholder);
 
@@ -164,7 +162,7 @@ std::unique_ptr<MatchExpression> InternalSchemaAllowedPropertiesMatchExpression:
                                              constraint.second->shallowClone());
     }
 
-    auto clone = stdx::make_unique<InternalSchemaAllowedPropertiesMatchExpression>(
+    auto clone = std::make_unique<InternalSchemaAllowedPropertiesMatchExpression>(
         _properties,
         _namePlaceholder,
         std::move(clonedPatternProperties),

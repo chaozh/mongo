@@ -33,8 +33,10 @@
 
 #include "mongo/db/storage/journal_listener.h"
 #include "mongo/db/storage/kv/kv_engine.h"
+#include "mongo/db/storage/mobile/mobile_options.h"
 #include "mongo/db/storage/mobile/mobile_session_pool.h"
-#include "mongo/stdx/mutex.h"
+#include "mongo/platform/mutex.h"
+#include "mongo/util/periodic_runner.h"
 #include "mongo/util/string_map.h"
 
 namespace mongo {
@@ -43,7 +45,9 @@ class JournalListener;
 
 class MobileKVEngine : public KVEngine {
 public:
-    MobileKVEngine(const std::string& path);
+    MobileKVEngine(const std::string& path,
+                   const embedded::MobileOptions& options,
+                   ServiceContext* serviceContext);
 
     RecoveryUnit* newRecoveryUnit() override;
 
@@ -61,12 +65,12 @@ public:
                                                           StringData ident) override;
 
     Status createSortedDataInterface(OperationContext* opCtx,
+                                     const CollectionOptions& collOptions,
                                      StringData ident,
                                      const IndexDescriptor* desc) override;
 
-    SortedDataInterface* getSortedDataInterface(OperationContext* opCtx,
-                                                StringData ident,
-                                                const IndexDescriptor* desc) override;
+    std::unique_ptr<SortedDataInterface> getSortedDataInterface(
+        OperationContext* opCtx, StringData ident, const IndexDescriptor* desc) override;
 
     Status beginBackup(OperationContext* opCtx) override {
         return Status::OK();
@@ -113,18 +117,18 @@ public:
         return Status::OK();
     }
 
-    void cleanShutdown() override{};
+    void cleanShutdown() override;
 
     bool hasIdent(OperationContext* opCtx, StringData ident) const override;
 
     std::vector<std::string> getAllIdents(OperationContext* opCtx) const override;
 
     void setJournalListener(JournalListener* jl) override {
-        stdx::unique_lock<stdx::mutex> lk(_mutex);
+        stdx::unique_lock<Latch> lk(_mutex);
         _journalListener = jl;
     }
 
-    virtual Timestamp getAllCommittedTimestamp() const override {
+    virtual Timestamp getAllDurableTimestamp() const override {
         MONGO_UNREACHABLE;
     }
 
@@ -132,9 +136,16 @@ public:
         return Timestamp();
     }
 
+    boost::optional<Timestamp> getOplogNeededForCrashRecovery() const final {
+        return boost::none;
+    }
+
 private:
-    mutable stdx::mutex _mutex;
+    void maybeVacuum(Client* client, Date_t deadline);
+
+    mutable Mutex _mutex = MONGO_MAKE_LATCH("MobileKVEngine::_mutex");
     void _initDBPath(const std::string& path);
+    std::int32_t _setSQLitePragma(const std::string& pragma, sqlite3* session);
 
     std::unique_ptr<MobileSessionPool> _sessionPool;
 
@@ -142,5 +153,9 @@ private:
     JournalListener* _journalListener = &NoOpJournalListener::instance;
 
     std::string _path;
+    embedded::MobileOptions _options;
+
+    PeriodicJobAnchor _vacuumJob;
 };
+
 }  // namespace mongo

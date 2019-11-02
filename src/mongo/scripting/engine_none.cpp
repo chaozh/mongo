@@ -30,11 +30,11 @@
 #include "engine.h"
 
 namespace mongo {
-void ScriptEngine::setup() {
+void ScriptEngine::setup(bool disableLoadStored) {
     // noop
 }
 
 std::string ScriptEngine::getInterpreterVersionString() {
     return "";
 }
-}
+}  // namespace mongo

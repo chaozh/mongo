@@ -34,7 +34,7 @@
 #include "mongo/client/dbclient_base.h"
 #include "mongo/client/dbclient_cursor.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 namespace repl {
@@ -85,6 +85,12 @@ std::unique_ptr<OplogInterface::Iterator> OplogInterfaceRemote::makeIterator() c
     return std::unique_ptr<OplogInterface::Iterator>(
         new OplogIteratorRemote(_getConnection()->query(
             NamespaceString(_collectionName), query, 0, 0, &fields, 0, _batchSize)));
+}
+
+std::unique_ptr<TransactionHistoryIteratorBase>
+OplogInterfaceRemote::makeTransactionHistoryIterator(const OpTime&, bool permitYield) const {
+    // Should never ask for remote transaction history.
+    MONGO_UNREACHABLE;
 }
 
 HostAndPort OplogInterfaceRemote::hostAndPort() const {

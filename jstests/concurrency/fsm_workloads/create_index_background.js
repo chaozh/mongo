@@ -8,12 +8,11 @@
  * index has completed and the test no longer needs to execute more transitions.
  * The first thread (tid = 0) will be the one that creates the background index.
  *
- * @tags: [creates_background_indexes]
+ * @tags: [assumes_balancer_off, creates_background_indexes]
  */
 load('jstests/concurrency/fsm_workload_helpers/server_types.js');  // for isMongos
 
 var $config = (function() {
-
     var data = {
         nDocumentsToSeed: 1000,
         nDocumentsToCreate: 200,
@@ -46,7 +45,6 @@ var $config = (function() {
     };
 
     var states = (function() {
-
         function init(db, collName) {
             // Add thread-specific documents
             var bulk = db[collName].initializeUnorderedBulkOp();
@@ -55,7 +53,7 @@ var $config = (function() {
                 bulk.insert(this.extendDocument(doc));
             }
             var res = bulk.execute();
-            assertAlways.writeOK(res);
+            assertAlways.commandWorked(res);
             assertAlways.eq(this.nDocumentsToSeed, res.nInserted, tojson(res));
 
             // In the first thread create the background index.
@@ -88,7 +86,7 @@ var $config = (function() {
             for (var i = 0; i < this.nDocumentsToCreate; ++i) {
                 const doc = {x: i + highest + 1, tid: this.tid, crud: 1};
                 res = coll.insert(this.extendDocument(doc));
-                assertAlways.writeOK(res);
+                assertAlways.commandWorked(res);
                 assertAlways.eq(res.nInserted, 1, tojson(res));
             }
             assertWhenOwnColl.eq(coll.find({tid: this.tid}).itcount(),
@@ -135,7 +133,7 @@ var $config = (function() {
                     updateExpr = this.extendUpdateExpr(updateExpr);
 
                     res = coll.update({x: Random.randInt(highest), tid: this.tid}, updateExpr);
-                    assertAlways.writeOK(res);
+                    assertAlways.commandWorked(res);
                     if (db.getMongo().writeMode() === 'commands') {
                         assertWhenOwnColl.contains(res.nModified, [0, 1], tojson(res));
                     }
@@ -171,7 +169,7 @@ var $config = (function() {
                 // Do randomized deletes on index x. A document is not guaranteed
                 // to match the randomized 'x' predicate.
                 res = coll.remove({x: Random.randInt(highest), tid: this.tid});
-                assertAlways.writeOK(res);
+                assertAlways.commandWorked(res);
                 assertWhenOwnColl.contains(res.nRemoved, [0, 1], tojson(res));
                 nActualDeletes += res.nRemoved;
             }
@@ -187,7 +185,6 @@ var $config = (function() {
             updateDocs: updateDocs,
             deleteDocs: deleteDocs
         };
-
     })();
 
     var transitions = {
@@ -213,7 +210,7 @@ var $config = (function() {
             bulk.insert({x: i});
         }
         res = bulk.execute();
-        assertAlways.writeOK(res);
+        assertAlways.commandWorked(res);
         assertAlways.eq(nSetupDocs, res.nInserted, tojson(res));
 
         // Increase the following parameters to reduce the number of yields.
@@ -249,5 +246,4 @@ var $config = (function() {
         teardown: teardown,
         transitions: transitions,
     };
-
 })();

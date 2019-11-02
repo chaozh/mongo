@@ -56,7 +56,7 @@ void TLTypeFactory::shutdown() {
     // Stop any attempt to schedule timers in the future
     _inShutdown.store(true);
 
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
 
     log() << "Killing all outstanding egress activity.";
     for (auto collar : _collars) {
@@ -65,12 +65,12 @@ void TLTypeFactory::shutdown() {
 }
 
 void TLTypeFactory::fasten(Type* type) {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     _collars.insert(type);
 }
 
 void TLTypeFactory::release(Type* type) {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     _collars.erase(type);
 
     type->_wasReleased = true;
@@ -98,16 +98,19 @@ void TLTimer::setTimeout(Milliseconds timeoutVal, TimeoutCallback cb) {
         return;
     }
 
-    _timer->waitUntil(_reactor->now() + timeoutVal).getAsync([cb = std::move(cb)](Status status) {
-        // If we get canceled, then we don't worry about the timeout anymore
-        if (status == ErrorCodes::CallbackCanceled) {
-            return;
-        }
+    // Wait until our timeoutVal then run on the reactor
+    _timer->waitUntil(_reactor->now() + timeoutVal)
+        .thenRunOn(_reactor)
+        .getAsync([cb = std::move(cb)](Status status) {
+            // If we get canceled, then we don't worry about the timeout anymore
+            if (status == ErrorCodes::CallbackCanceled) {
+                return;
+            }
 
-        fassert(50475, status);
+            fassert(50475, status);
 
-        cb();
-    });
+            cb();
+        });
 }
 
 void TLTimer::cancelTimeout() {
@@ -136,7 +139,7 @@ AsyncDBClient* TLConnection::client() {
 
 void TLConnection::setTimeout(Milliseconds timeout, TimeoutCallback cb) {
     auto anchor = shared_from_this();
-    _timer->setTimeout(timeout, [ cb = std::move(cb), anchor = std::move(anchor) ] { cb(); });
+    _timer->setTimeout(timeout, [cb = std::move(cb), anchor = std::move(anchor)] { cb(); });
 }
 
 void TLConnection::cancelTimeout() {
@@ -209,15 +212,15 @@ void TLConnection::setup(Milliseconds timeout, SetupCallback cb) {
 
     auto pf = makePromiseFuture<void>();
     auto handler = std::make_shared<TimeoutHandler>(std::move(pf.promise));
-    std::move(pf.future).getAsync(
-        [ this, cb = std::move(cb), anchor ](Status status) { cb(this, std::move(status)); });
+    std::move(pf.future).thenRunOn(_reactor).getAsync(
+        [this, cb = std::move(cb), anchor](Status status) { cb(this, std::move(status)); });
 
     setTimeout(timeout, [this, handler, timeout] {
         if (handler->done.swap(true)) {
             return;
         }
-        std::string reason = str::stream() << "Timed out connecting to " << _peer << " after "
-                                           << timeout;
+        std::string reason = str::stream()
+            << "Timed out connecting to " << _peer << " after " << timeout;
         handler->promise.setError(
             Status(ErrorCodes::NetworkInterfaceExceededTimeLimit, std::move(reason)));
 
@@ -229,6 +232,7 @@ void TLConnection::setup(Milliseconds timeout, SetupCallback cb) {
     auto isMasterHook = std::make_shared<TLConnectionSetupHook>(_onConnectHook);
 
     AsyncDBClient::connect(_peer, _sslMode, _serviceContext, _reactor, timeout)
+        .thenRunOn(_reactor)
         .onError([](StatusWith<AsyncDBClient::Handle> swc) -> StatusWith<AsyncDBClient::Handle> {
             return Status(ErrorCodes::HostUnreachable, swc.getStatus().reason());
         })
@@ -237,6 +241,10 @@ void TLConnection::setup(Milliseconds timeout, SetupCallback cb) {
             return _client->initWireVersion("NetworkInterfaceTL", isMasterHook.get());
         })
         .then([this, isMasterHook] {
+            if (_skipAuth) {
+                return Future<void>::makeReady();
+            }
+
             boost::optional<std::string> mechanism;
             if (!isMasterHook->saslMechsForInternalAuth().empty())
                 mechanism = isMasterHook->saslMechsForInternalAuth().front();
@@ -277,8 +285,8 @@ void TLConnection::refresh(Milliseconds timeout, RefreshCallback cb) {
 
     auto pf = makePromiseFuture<void>();
     auto handler = std::make_shared<TimeoutHandler>(std::move(pf.promise));
-    std::move(pf.future).getAsync(
-        [ this, cb = std::move(cb), anchor ](Status status) { cb(this, status); });
+    std::move(pf.future).thenRunOn(_reactor).getAsync(
+        [this, cb = std::move(cb), anchor](Status status) { cb(this, status); });
 
     setTimeout(timeout, [this, handler] {
         if (handler->done.swap(true)) {
@@ -323,29 +331,34 @@ void TLConnection::cancelAsync() {
         _client->cancel();
 }
 
+auto TLTypeFactory::reactor() {
+    return checked_pointer_cast<transport::Reactor>(_executor);
+}
+
 std::shared_ptr<ConnectionPool::ConnectionInterface> TLTypeFactory::makeConnection(
     const HostAndPort& hostAndPort, transport::ConnectSSLMode sslMode, size_t generation) {
     auto conn = std::make_shared<TLConnection>(shared_from_this(),
-                                               _reactor,
+                                               reactor(),
                                                getGlobalServiceContext(),
                                                hostAndPort,
                                                sslMode,
                                                generation,
-                                               _onConnectHook.get());
+                                               _onConnectHook.get(),
+                                               _connPoolOptions.skipAuthentication);
     fasten(conn.get());
     return conn;
 }
 
 std::shared_ptr<ConnectionPool::TimerInterface> TLTypeFactory::makeTimer() {
-    auto timer = std::make_shared<TLTimer>(shared_from_this(), _reactor);
+    auto timer = std::make_shared<TLTimer>(shared_from_this(), reactor());
     fasten(timer.get());
     return timer;
 }
 
 Date_t TLTypeFactory::now() {
-    return _reactor->now();
+    return checked_cast<transport::Reactor*>(_executor.get())->now();
 }
 
 }  // namespace connection_pool_tl
 }  // namespace executor
-}  // namespace
+}  // namespace mongo

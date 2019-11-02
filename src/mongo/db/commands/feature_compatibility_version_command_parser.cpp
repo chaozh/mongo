@@ -56,10 +56,7 @@ StatusWith<std::string> FeatureCompatibilityVersionCommandParser::extractVersion
         return {ErrorCodes::TypeMismatch,
                 str::stream() << "Command argument must be of type "
                                  "String, but was of type "
-                              << typeName(versionElem.type())
-                              << " in: "
-                              << cmdObj
-                              << ". See "
+                              << typeName(versionElem.type()) << " in: " << cmdObj << ". See "
                               << feature_compatibility_version_documentation::kCompatibilityLink
                               << "."};
     }
@@ -73,27 +70,20 @@ StatusWith<std::string> FeatureCompatibilityVersionCommandParser::extractVersion
 
         uasserted(ErrorCodes::InvalidOptions,
                   str::stream() << "Unrecognized field found " << cmdElem.fieldNameStringData()
-                                << " in "
-                                << cmdObj
-                                << ". See "
+                                << " in " << cmdObj << ". See "
                                 << feature_compatibility_version_documentation::kCompatibilityLink
                                 << ".");
     }
 
     const std::string version = versionElem.String();
 
-    if (version != FeatureCompatibilityVersionParser::kVersion42 &&
-        version != FeatureCompatibilityVersionParser::kVersion40) {
+    if (version != FeatureCompatibilityVersionParser::kVersion44 &&
+        version != FeatureCompatibilityVersionParser::kVersion42) {
         return {ErrorCodes::BadValue,
                 str::stream() << "Invalid command argument. Expected '"
-                              << FeatureCompatibilityVersionParser::kVersion42
-                              << "' or '"
-                              << FeatureCompatibilityVersionParser::kVersion40
-                              << "', found "
-                              << version
-                              << " in: "
-                              << cmdObj
-                              << ". See "
+                              << FeatureCompatibilityVersionParser::kVersion44 << "' or '"
+                              << FeatureCompatibilityVersionParser::kVersion42 << "', found "
+                              << version << " in: " << cmdObj << ". See "
                               << feature_compatibility_version_documentation::kCompatibilityLink
                               << "."};
     }

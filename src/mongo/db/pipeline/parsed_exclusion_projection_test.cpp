@@ -38,11 +38,11 @@
 #include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/bson/json.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/document_value_test_util.h"
+#include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/pipeline/dependencies.h"
-#include "mongo/db/pipeline/document.h"
-#include "mongo/db/pipeline/document_value_test_util.h"
 #include "mongo/db/pipeline/expression_context_for_test.h"
-#include "mongo/db/pipeline/value.h"
 #include "mongo/unittest/death_test.h"
 #include "mongo/unittest/unittest.h"
 
@@ -50,45 +50,38 @@ namespace mongo {
 namespace parsed_aggregation_projection {
 namespace {
 
-using ProjectionPolicies = ParsedAggregationProjection::ProjectionPolicies;
-
 using std::vector;
 
 // Helper to simplify the creation of a ParsedExclusionProjection with default policies.
 ParsedExclusionProjection makeExclusionProjectionWithDefaultPolicies() {
     const boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    ParsedAggregationProjection::ProjectionPolicies defaultPolicies;
+    ProjectionPolicies defaultPolicies;
     return {expCtx, defaultPolicies};
 }
 
 // Helper to simplify the creation of a ParsedExclusionProjection which excludes _id by default.
 ParsedExclusionProjection makeExclusionProjectionWithDefaultIdExclusion() {
     const boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    ParsedAggregationProjection::ProjectionPolicies defaultExcludeId;
-    defaultExcludeId.idPolicy = ProjectionPolicies::DefaultIdPolicy::kExcludeId;
+    ProjectionPolicies defaultExcludeId{ProjectionPolicies::DefaultIdPolicy::kExcludeId,
+                                        ProjectionPolicies::kArrayRecursionPolicyDefault,
+                                        ProjectionPolicies::kComputedFieldsPolicyDefault};
     return {expCtx, defaultExcludeId};
 }
 
 // Helper to simplify the creation of a ParsedExclusionProjection which does not recurse arrays.
 ParsedExclusionProjection makeExclusionProjectionWithNoArrayRecursion() {
     const boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    ParsedAggregationProjection::ProjectionPolicies noArrayRecursion;
-    noArrayRecursion.arrayRecursionPolicy =
-        ProjectionPolicies::ArrayRecursionPolicy::kDoNotRecurseNestedArrays;
+    ProjectionPolicies noArrayRecursion{
+        ProjectionPolicies::kDefaultIdPolicyDefault,
+        ProjectionPolicies::ArrayRecursionPolicy::kDoNotRecurseNestedArrays,
+        ProjectionPolicies::kComputedFieldsPolicyDefault};
+
     return {expCtx, noArrayRecursion};
 }
 
 //
 // Errors.
 //
-
-DEATH_TEST(ExclusionProjectionExecutionTest,
-           ShouldRejectComputedField,
-           "Invariant failure fieldName[0] != '$'") {
-    // Top-level expression.
-    auto exclusion = makeExclusionProjectionWithDefaultPolicies();
-    exclusion.parse(BSON("a" << false << "b" << BSON("$literal" << 1)));
-}
 
 DEATH_TEST(ExclusionProjectionExecutionTest,
            ShouldFailWhenGivenIncludedNonIdField,
@@ -148,7 +141,7 @@ TEST(ExclusionProjectionExecutionTest, ShouldNotAddAnyDependencies) {
 
     ASSERT_EQ(deps.fields.size(), 0UL);
     ASSERT_FALSE(deps.needWholeDocument);
-    ASSERT_FALSE(deps.getNeedsMetadata(DepsTracker::MetadataType::TEXT_SCORE));
+    ASSERT_FALSE(deps.getNeedsMetadata(DocumentMetadataFields::kTextScore));
 }
 
 TEST(ExclusionProjectionExecutionTest, ShouldReportExcludedFieldsAsModified) {
@@ -339,8 +332,8 @@ TEST(ExclusionProjectionExecutionTest, ShouldAlwaysKeepMetadataFromOriginalDoc) 
     exclusion.parse(BSON("a" << false));
 
     MutableDocument inputDocBuilder(Document{{"_id", "ID"_sd}, {"a", 1}});
-    inputDocBuilder.setRandMetaField(1.0);
-    inputDocBuilder.setTextScore(10.0);
+    inputDocBuilder.metadata().setRandVal(1.0);
+    inputDocBuilder.metadata().setTextScore(10.0);
     Document inputDoc = inputDocBuilder.freeze();
 
     auto result = exclusion.applyProjection(inputDoc);
@@ -412,6 +405,18 @@ TEST(ExclusionProjectionExecutionTest, ShouldAllowExclusionOfIdSubfieldWithDefau
     auto result = exclusion.applyProjection(
         Document{{"_id", Document{{"id1", 1}, {"id2", 2}}}, {"a", 3}, {"b", 4}});
     auto expectedResult = Document{{"_id", Document{{"id2", 2}}}, {"b", 4}};
+
+    ASSERT_DOCUMENT_EQ(result, expectedResult);
+}
+
+TEST(ExclusionProjectionExecutionTest, ShouldAllowLimitedDollarPrefixedFields) {
+    auto exclusion = makeExclusionProjectionWithDefaultIdExclusion();
+    exclusion.parse(
+        BSON("$id" << false << "$db" << false << "$ref" << false << "$sortKey" << false));
+
+    auto result = exclusion.applyProjection(
+        Document{{"$id", 5}, {"$db", 3}, {"$ref", 4}, {"$sortKey", 5}, {"someField", 6}});
+    auto expectedResult = Document{{"someField", 6}};
 
     ASSERT_DOCUMENT_EQ(result, expectedResult);
 }

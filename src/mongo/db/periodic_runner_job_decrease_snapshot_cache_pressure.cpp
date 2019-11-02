@@ -43,35 +43,38 @@
 
 namespace mongo {
 
-void startPeriodicThreadToDecreaseSnapshotHistoryCachePressure(ServiceContext* serviceContext) {
-    // Enforce calling this function once, and only once.
-    static bool firstCall = true;
-    invariant(firstCall);
-    firstCall = false;
+auto PeriodicThreadToDecreaseSnapshotHistoryCachePressure::get(ServiceContext* serviceContext)
+    -> PeriodicThreadToDecreaseSnapshotHistoryCachePressure& {
+    auto& jobContainer = _serviceDecoration(serviceContext);
+    jobContainer._init(serviceContext);
+    return jobContainer;
+}
+
+auto PeriodicThreadToDecreaseSnapshotHistoryCachePressure::operator-> () const noexcept
+    -> PeriodicJobAnchor* {
+    stdx::lock_guard lk(_mutex);
+    return _anchor.get();
+}
+
+auto PeriodicThreadToDecreaseSnapshotHistoryCachePressure::operator*() const noexcept
+    -> PeriodicJobAnchor& {
+    stdx::lock_guard lk(_mutex);
+    return *_anchor;
+}
+
+void PeriodicThreadToDecreaseSnapshotHistoryCachePressure::_init(ServiceContext* serviceContext) {
+    stdx::lock_guard lk(_mutex);
+    if (_anchor) {
+        return;
+    }
 
     auto periodicRunner = serviceContext->getPeriodicRunner();
     invariant(periodicRunner);
 
-    // PeriodicRunner does not currently support altering the period of a job. So we are giving this
-    // job a 1 second period on PeriodicRunner and incrementing a static variable 'seconds' on each
-    // run until we reach checkCachePressurePeriodSeconds, at which point we run the code and reset
-    // 'seconds'. Etc.
     PeriodicRunner::PeriodicJob job(
-        "startPeriodicThreadToDecreaseSnapshotHistoryCachePressure",
+        "decreaseSnapshotHistoryCachePressure",
         [](Client* client) {
             try {
-                static int seconds = 0;
-                int checkPressurePeriod =
-                    snapshotWindowParams.checkCachePressurePeriodSeconds.load();
-
-                invariant(checkPressurePeriod >= 1);
-
-                if (++seconds <= checkPressurePeriod) {
-                    return;
-                }
-
-                seconds = 0;
-
                 // The opCtx destructor handles unsetting itself from the Client.
                 // (The PeriodicRunnerASIO's Client must be reset before returning.)
                 auto opCtx = client->makeOperationContext();
@@ -85,9 +88,20 @@ void startPeriodicThreadToDecreaseSnapshotHistoryCachePressure(ServiceContext* s
                 }
             }
         },
-        Seconds(1));
+        Seconds(snapshotWindowParams.checkCachePressurePeriodSeconds.load()));
 
-    periodicRunner->scheduleJob(std::move(job));
+    _anchor = std::make_shared<PeriodicJobAnchor>(periodicRunner->makeJob(std::move(job)));
+
+    SnapshotWindowParams::observeCheckCachePressurePeriodSeconds.addObserver([anchor = _anchor](
+                                                                                 const auto& secs) {
+        try {
+            anchor->setPeriod(Seconds(secs));
+        } catch (const DBException& ex) {
+            log() << "Failed to update the period of the thread which decreases data history cache "
+                     "target size if there is cache pressure."
+                  << ex.toStatus();
+        }
+    });
 }
 
 }  // namespace mongo

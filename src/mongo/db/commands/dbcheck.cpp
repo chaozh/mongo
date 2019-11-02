@@ -32,9 +32,9 @@
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/health_log.h"
-#include "mongo/db/catalog/uuid_catalog.h"
 #include "mongo/db/command_generic_argument.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/test_commands_enabled.h"
@@ -118,7 +118,7 @@ std::unique_ptr<DbCheckRun> singleCollectionRun(OperationContext* opCtx,
     auto maxSize = invocation.getMaxSize();
     auto maxRate = invocation.getMaxCountPerSecond();
     auto info = DbCheckCollectionInfo{nss, start, end, maxCount, maxSize, maxRate};
-    auto result = stdx::make_unique<DbCheckRun>();
+    auto result = std::make_unique<DbCheckRun>();
     result->push_back(info);
     return result;
 }
@@ -132,14 +132,19 @@ std::unique_ptr<DbCheckRun> fullDatabaseRun(OperationContext* opCtx,
     // Read the list of collections in a database-level lock.
     AutoGetDb agd(opCtx, StringData(dbName), MODE_S);
     auto db = agd.getDb();
-    auto result = stdx::make_unique<DbCheckRun>();
+    auto result = std::make_unique<DbCheckRun>();
 
     uassert(ErrorCodes::NamespaceNotFound, "Database " + dbName + " not found", agd.getDb());
 
     int64_t max = std::numeric_limits<int64_t>::max();
     auto rate = invocation.getMaxCountPerSecond();
 
-    for (Collection* coll : *db) {
+    for (auto collIt = db->begin(opCtx); collIt != db->end(opCtx); ++collIt) {
+        auto coll = *collIt;
+        if (!coll) {
+            break;
+        }
+
         DbCheckCollectionInfo info{coll->ns(), BSONKey::min(), BSONKey::max(), max, max, rate};
         result->push_back(info);
     }
@@ -329,18 +334,12 @@ private:
             return false;
         }
 
-        auto collection = db->getCollection(opCtx, info.nss);
+        auto collection = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(info.nss);
         if (!collection) {
             return false;
         }
 
-        auto uuid = collection->uuid();
-        // Check if UUID exists.
-        if (!uuid) {
-            return false;
-        }
-        auto prev = UUIDCatalog::get(opCtx).prev(_dbName, *uuid);
-        auto next = UUIDCatalog::get(opCtx).next(_dbName, *uuid);
+        auto [prev, next] = getPrevAndNextUUIDs(opCtx, collection);
 
         // Find and report collection metadata.
         auto indices = collectionIndexInfo(opCtx, collection);
@@ -348,7 +347,7 @@ private:
 
         DbCheckOplogCollection entry;
         entry.setNss(collection->ns());
-        entry.setUuid(*collection->uuid());
+        entry.setUuid(collection->uuid());
         if (prev) {
             entry.setPrev(*prev);
         }
@@ -370,7 +369,7 @@ private:
         collectionInfo.options = entry.getOptions();
 
         auto hle = dbCheckCollectionEntry(
-            collection->ns(), *collection->uuid(), collectionInfo, collectionInfo, optime);
+            collection->ns(), collection->uuid(), collectionInfo, collectionInfo, optime);
 
         HealthLog::get(opCtx).log(*hle);
 
@@ -462,26 +461,18 @@ private:
                         const NamespaceString& nss,
                         OptionalCollectionUUID uuid,
                         const BSONObj& obj) {
+        repl::MutableOplogEntry oplogEntry;
+        oplogEntry.setOpType(repl::OpTypeEnum::kCommand);
+        oplogEntry.setNss(nss);
+        oplogEntry.setUuid(uuid);
+        oplogEntry.setObject(obj);
         return writeConflictRetry(
             opCtx, "dbCheck oplog entry", NamespaceString::kRsOplogNamespace.ns(), [&] {
                 auto const clockSource = opCtx->getServiceContext()->getFastClockSource();
-                const auto wallClockTime = clockSource->now();
+                oplogEntry.setWallClockTime(clockSource->now());
 
                 WriteUnitOfWork uow(opCtx);
-                repl::OpTime result = repl::logOp(opCtx,
-                                                  "c",
-                                                  nss,
-                                                  uuid,
-                                                  obj,
-                                                  nullptr,
-                                                  false,
-                                                  wallClockTime,
-                                                  {},
-                                                  kUninitializedStmtId,
-                                                  {},
-                                                  false /* prepare */,
-                                                  false /* inTxn */,
-                                                  OplogSlot());
+                repl::OpTime result = repl::logOp(opCtx, &oplogEntry);
                 uow.commit();
                 return result;
             });
@@ -555,4 +546,4 @@ public:
 
 MONGO_REGISTER_TEST_COMMAND(DbCheckCmd);
 }  // namespace
-}
+}  // namespace mongo

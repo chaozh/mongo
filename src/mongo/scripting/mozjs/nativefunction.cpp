@@ -38,7 +38,7 @@
 #include "mongo/scripting/mozjs/valuereader.h"
 #include "mongo/scripting/mozjs/valuewriter.h"
 #include "mongo/scripting/mozjs/wrapconstrainedmethod.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 namespace mozjs {
@@ -47,7 +47,8 @@ const char* const NativeFunctionInfo::inheritFrom = "Function";
 const char* const NativeFunctionInfo::className = "NativeFunction";
 
 const JSFunctionSpec NativeFunctionInfo::methods[2] = {
-    MONGO_ATTACH_JS_CONSTRAINED_METHOD(toString, NativeFunctionInfo), JS_FS_END,
+    MONGO_ATTACH_JS_CONSTRAINED_METHOD(toString, NativeFunctionInfo),
+    JS_FS_END,
 };
 
 namespace {

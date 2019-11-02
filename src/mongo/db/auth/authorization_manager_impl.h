@@ -31,10 +31,11 @@
 
 #include "mongo/db/auth/authorization_manager.h"
 
+#include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/base/secure_allocator.h"
 #include "mongo/base/status.h"
 #include "mongo/bson/mutable/element.h"
@@ -49,9 +50,8 @@
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/server_options.h"
 #include "mongo/platform/atomic_word.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/stdx/condition_variable.h"
-#include "mongo/stdx/functional.h"
-#include "mongo/stdx/mutex.h"
 #include "mongo/stdx/unordered_map.h"
 #include "mongo/util/invalidating_lru_cache.h"
 
@@ -122,13 +122,21 @@ public:
                                                         const UserName& userName,
                                                         const User::UserId& uid) override;
 
+    /**
+     * Invalidate a user, and repin it if necessary.
+     */
     void invalidateUserByName(OperationContext* opCtx, const UserName& user) override;
 
     void invalidateUsersFromDB(OperationContext* opCtx, StringData dbname) override;
 
     Status initialize(OperationContext* opCtx) override;
 
+    /**
+     * Invalidate the user cache, and repin all pinned users.
+     */
     void invalidateUserCache(OperationContext* opCtx) override;
+
+    void updatePinnedUsersList(std::vector<UserName> names) override;
 
     Status _initializeUserFromPrivilegeDocument(User* user, const BSONObj& privDoc) override;
 
@@ -139,8 +147,6 @@ public:
                const BSONObj* patt) override;
 
     std::vector<CachedUserInfo> getUserCacheInfo() const override;
-
-    void setInUserManagementCommand(OperationContext* opCtx, bool val) override;
 
 private:
     /**
@@ -171,12 +177,7 @@ private:
      */
     void _updateCacheGeneration_inlock(const CacheGuard&);
 
-
-    void _recachePinnedUsers(CacheGuard& guard, OperationContext* opCtx);
-
-    StatusWith<UserHandle> _acquireUserSlowPath(CacheGuard& guard,
-                                                OperationContext* opCtx,
-                                                const UserName& userName);
+    void _pinnedUsersThreadRoutine() noexcept;
 
     /**
      * Fetches user information from a v2-schema user document for the named user,
@@ -230,13 +231,17 @@ private:
     };
 
     InvalidatingLRUCache<UserName, User, UserCacheInvalidator> _userCache;
-    std::vector<UserHandle> _pinnedUsers;
+
+    Mutex _pinnedUsersMutex = MONGO_MAKE_LATCH("AuthorizationManagerImpl::_pinnedUsersMutex");
+    stdx::condition_variable _pinnedUsersCond;
+    std::once_flag _pinnedThreadTrackerStarted;
+    boost::optional<std::vector<UserName>> _usersToPin;
 
     /**
      * Protects _cacheGeneration, _version and _isFetchPhaseBusy.  Manipulated
      * via CacheGuard.
      */
-    stdx::mutex _cacheWriteMutex;
+    Mutex _cacheWriteMutex = MONGO_MAKE_LATCH("AuthorizationManagerImpl::_cacheWriteMutex");
 
     /**
      * Current generation of cached data.  Updated every time part of the cache gets
@@ -250,15 +255,13 @@ private:
      *
      * Manipulated via CacheGuard.
      */
-    bool _isFetchPhaseBusy;
+    bool _isFetchPhaseBusy = false;
 
     /**
      * Condition used to signal that it is OK for another CacheGuard to enter a fetch phase.
      * Manipulated via CacheGuard.
      */
     stdx::condition_variable _fetchPhaseIsReady;
-
-    AtomicWord<bool> _inUserManagementCommand{false};
 };
 
 extern int authorizationManagerCacheSize;

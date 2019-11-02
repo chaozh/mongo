@@ -40,21 +40,22 @@
 namespace mongo {
 namespace biggie {
 
-RecoveryUnit::RecoveryUnit(KVEngine* parentKVEngine, stdx::function<void()> cb)
+RecoveryUnit::RecoveryUnit(KVEngine* parentKVEngine, std::function<void()> cb)
     : _waitUntilDurableCallback(cb), _KVEngine(parentKVEngine) {}
 
 RecoveryUnit::~RecoveryUnit() {
-    invariant(!_inUnitOfWork);
+    invariant(!_inUnitOfWork(), toString(_getState()));
     _abort();
 }
 
 void RecoveryUnit::beginUnitOfWork(OperationContext* opCtx) {
-    invariant(!_inUnitOfWork);
-    _inUnitOfWork = true;
+    invariant(!_inUnitOfWork(), toString(_getState()));
+    _setState(State::kInactiveInUnitOfWork);
 }
 
-void RecoveryUnit::commitUnitOfWork() {
-    invariant(_inUnitOfWork);
+void RecoveryUnit::doCommitUnitOfWork() {
+    invariant(_inUnitOfWork(), toString(_getState()));
+
     if (_dirty) {
         invariant(_forked);
         while (true) {
@@ -76,44 +77,29 @@ void RecoveryUnit::commitUnitOfWork() {
         _forked = false;
         _dirty = false;
     } else if (_forked) {
-        DEV invariant(_mergeBase == _workingCopy);
+        if (kDebugBuild)
+            invariant(_mergeBase == _workingCopy);
     }
 
-    try {
-        for (auto& change : _changes)
-            change->commit(boost::none);
-        _changes.clear();
-    } catch (...) {
-        std::terminate();
-    }
-
-    _inUnitOfWork = false;
+    _setState(State::kCommitting);
+    commitRegisteredChanges(boost::none);
+    _setState(State::kInactive);
 }
 
-void RecoveryUnit::abortUnitOfWork() {
-    invariant(_inUnitOfWork);
-    _inUnitOfWork = false;
+void RecoveryUnit::doAbortUnitOfWork() {
+    invariant(_inUnitOfWork(), toString(_getState()));
     _abort();
 }
 
-bool RecoveryUnit::waitUntilDurable() {
-    invariant(!_inUnitOfWork);
+bool RecoveryUnit::waitUntilDurable(OperationContext* opCtx) {
+    invariant(!_inUnitOfWork(), toString(_getState()));
     return true;  // This is an in-memory storage engine.
 }
 
-void RecoveryUnit::abandonSnapshot() {
-    invariant(!_inUnitOfWork);
+void RecoveryUnit::doAbandonSnapshot() {
+    invariant(!_inUnitOfWork(), toString(_getState()));
     _forked = false;
     _dirty = false;
-}
-
-void RecoveryUnit::registerChange(Change* change) {
-    invariant(_inUnitOfWork);
-    _changes.push_back(std::unique_ptr<Change>{change});
-}
-
-SnapshotId RecoveryUnit::getSnapshotId() const {
-    return SnapshotId();
 }
 
 bool RecoveryUnit::forkIfNeeded() {
@@ -137,18 +123,9 @@ void RecoveryUnit::setOrderedCommit(bool orderedCommit) {}
 void RecoveryUnit::_abort() {
     _forked = false;
     _dirty = false;
-    try {
-        for (Changes::const_reverse_iterator it = _changes.rbegin(), end = _changes.rend();
-             it != end;
-             ++it) {
-            Change* change = it->get();
-            LOG(2) << "CUSTOM ROLLBACK " << redact(demangleName(typeid(*change)));
-            change->rollback();
-        }
-        _changes.clear();
-    } catch (...) {
-        std::terminate();
-    }
+    _setState(State::kAborting);
+    abortRegisteredChanges();
+    _setState(State::kInactive);
 }
 
 RecoveryUnit* RecoveryUnit::get(OperationContext* opCtx) {

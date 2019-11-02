@@ -10,7 +10,6 @@ selector:
   # The following tests fail because a certain command or functionality is not supported by
   # mongos. This command or functionality is placed in a comment next to the failing test.
   - jstests/core/apitest_db.js  # serverStatus output doesn't have storageEngine.
-  - jstests/core/apitest_db_profile_level.js  # profiling.
   - jstests/core/apply_ops*.js  # applyOps, SERVER-1439.
   - jstests/core/awaitdata_getmore_cmd.js  # capped collections.
   - jstests/core/bypass_doc_validation.js  # sharded $out output not permitted
@@ -24,7 +23,6 @@ selector:
   - jstests/core/dbhash.js  # dbhash.
   - jstests/core/dbhash2.js  # dbhash.
   - jstests/core/diagdata.js # Command not supported in mongos
-  - jstests/core/do_txn*.js  # doTxn
   - jstests/core/dropdb_race.js  # syncdelay.
   - jstests/core/fsync.js  # uses fsync.
   - jstests/core/geo_haystack*.js  # geoSearch.
@@ -33,9 +31,7 @@ selector:
   - jstests/core/index_id_options.js  # "local" database.
   - jstests/core/index9.js  # "local" database.
   - jstests/core/max_time_ms.js  # sleep, SERVER-2212.
-  - jstests/core/mr_replaceIntoDB.js  # MapReduceResult, SERVER-20495.
   - jstests/core/notablescan.js  # notablescan.
-  - jstests/core/profile*.js  # profiling.
   - jstests/core/queryoptimizera.js  # "local" database.
   - jstests/core/rename*.js # renameCollection.
   - jstests/core/stages*.js  # stageDebug.
@@ -59,13 +55,13 @@ selector:
   - jstests/core/bad_index_plugin.js
   - jstests/core/create_indexes.js
   - jstests/core/list_indexes_non_existent_ns.js
+  - jstests/core/mr_preserve_indexes.js
   - jstests/core/rename6.js
   # The following tests fail because they expect no databases to be created. However a DB is created
   # automatically when we shard a collection.
   - jstests/core/dbcase.js
   - jstests/core/dbcase2.js
   - jstests/core/no_db_created.js
-  - jstests/core/ns_length.js
   - jstests/core/views/*.js # Views tests aren't expected to work when collections are implicitly sharded.
   - jstests/core/killop_drop_collection.js # Uses fsyncLock.
   # These tests fail because sharded clusters do not clean up correctly after failed index builds.
@@ -88,10 +84,11 @@ selector:
   - jstests/core/index_multikey.js
   - jstests/core/optimized_match_explain.js
   - jstests/core/sort_array.js
-  # TODO: SERVER-16605 MapReduce into sharded collection with hashed index fails
-  - jstests/core/mr1.js
-  - jstests/core/mr3.js
-  - jstests/core/mr4.js
+  # mapReduce requires sharded output collections to be sharded by {_id: 1}. {_id: "hashed"} is not
+  # supported.
+  - jstests/core/mr_correctness.js
+  - jstests/core/mr_fail_invalid_js.js
+  - jstests/core/mr_scope.js
 
   ##
   ## Limitations with the way the runner file injects transactions.
@@ -103,6 +100,8 @@ selector:
   - jstests/core/bulk_legacy_enforce_gle.js
   - jstests/core/capped5.js
   - jstests/core/commands_with_uuid.js
+  - jstests/core/dbcase.js
+  - jstests/core/dbcase2.js
   - jstests/core/explain_execution_error.js
   - jstests/core/expr.js
   - jstests/core/find9.js
@@ -151,29 +150,8 @@ selector:
   # SERVER-38096 Mongos opCounter doesn't increase when last op causes the transaction to implicitly abort
   - jstests/core/opcounters_write_cmd.js
 
-  # Consecutive writes totalling more than the size upper threshold will cause the txn to
-  # abort with a TransactionTooLarge error.
-  - jstests/core/batch_size.js
-  - jstests/core/single_batch.js
-  # For insert1.js, only Windows DEBUG builds are affected. We compute the in-memory size
-  # of the transaction, which uses the size of the oplog entry and is 8 bytes larger on
-  # Windows debug builds than other builds.
-  - jstests/core/insert1.js
-
   # TODO: SERVER-38207 Cannot insert document with MaxKey shard key.
   - jstests/core/type8.js
-
-  # TODO: SERVER-38326 mapReduce cleanup doesn't obey writeConcern, rendering
-  # txn_passthrough_cmd_massage.js ineffective for preventing 2 phase drops
-  # from contesting db/coll locks.
-  - jstests/core/function_string_representations.js
-  - jstests/core/geo_mapreduce2.js
-  - jstests/core/mr*.js
-  - jstests/core/or4.js
-  - jstests/core/temp_cleanup.js
-
-  # TODO: SERVER-38588 Hybrid index builds can miss documents during secondary replication.
-  - jstests/core/background_index_multikey.js
 
   ##
   ## Some aggregation stages don't support snapshot readconcern.
@@ -243,7 +221,6 @@ selector:
   - jstests/core/doc_validation_options.js
   - jstests/core/geo_multinest0.js
   - jstests/core/insert_illegal_doc.js
-  - jstests/core/ns_length.js
   - jstests/core/push2.js
   - jstests/core/remove6.js
   - jstests/core/removeb.js
@@ -320,9 +297,6 @@ selector:
   - jstests/core/max_time_ms.js
   - jstests/core/oro.js
 
-  # Expects certain number of operations in the system.profile collection.
-  - jstests/core/profile*.js
-
   # Parallel Shell - we do not signal the override to end a txn when a parallel shell closes.
   - jstests/core/awaitdata_getmore_cmd.js
   - jstests/core/compact_keeps_indexes.js
@@ -347,13 +321,27 @@ selector:
   # Command expects to see result from parallel operation.
   # E.g. Suppose the following sequence of events: op1, join() op2 in parallel shell, op3.
   # op3 will still be using the snapshot from op1, and not see op2 at all.
-  - jstests/core/cursora.js
   - jstests/core/bench_test1.js
+  - jstests/core/benchrun_pipeline_updates.js
+  - jstests/core/cursora.js
 
   # auto_retry_on_network_error.js will timeout with assert.soon and give a different error from
   # what test expects. Excluding from suite since it doesn't really do any database operations, so
   # it doesn't provide value here.
   - jstests/core/connection_string_validation.js
+
+  # The tests below use applyOps, SERVER-1439.
+  - jstests/core/list_collections1.js
+  - jstests/core/list_collections_filter.js
+  - jstests/core/rename_stayTemp.js
+  - jstests/core/txns/prepare_transaction_fails_on_temp_collections.js
+
+  # Does not support tojson of command objects.
+  - jstests/core/SERVER-23626.js
+
+  # Examines _id of upserted document.
+  - jstests/core/find_and_modify_server7660.js
+  - jstests/core/upsert_shell.js
 
   exclude_with_any_tags:
   ##
@@ -394,6 +382,9 @@ selector:
   # The next tag corresponds to long running-operations, as they may exhaust their number
   # of retries and result in a network error being thrown.
   - operations_longer_than_stepdown_interval
+  # This tag corresponds to operations which are run long enough to exceed the stepdown interval
+  # when grouped into transactions
+  - operations_longer_than_stepdown_interval_in_txns
 
   - assumes_against_mongod_not_mongos
   # Tests tagged with the following will fail because they assume collections are not sharded.
@@ -415,6 +406,11 @@ selector:
   - requires_collstats
   # "Cowardly fail if unbounded dataSize is run with a mongod that had an unclean shutdown: ..."
   - requires_datasize
+  # system.profile collection doesn't exist on mongos. Also, transactions are not allowed to operate
+  # on capped collections.
+  - requires_profiling
+  # Retrying a query can change whether a plan cache entry is active.
+  - inspects_whether_plan_cache_entry_is_active
 
 executor:
   archive:
@@ -431,8 +427,7 @@ executor:
       eval: >-
         var testingReplication = true;
         load("jstests/libs/override_methods/mongos_manual_intervention_actions.js");
-        load("jstests/libs/txns/txn_override.js");
-        load("jstests/libs/override_methods/auto_retry_on_network_error.js");
+        load('jstests/libs/override_methods/network_error_and_txn_override.js');
         db = connect(TestData.connectionString);
         load("jstests/libs/override_methods/enable_sessions.js");
         load("jstests/libs/override_methods/fail_unclean_shutdown_start_parallel_shell.js");
@@ -441,9 +436,10 @@ executor:
       global_vars:
         TestData:
           logRetryAttempts: true
+          networkErrorAndTxnOverrideConfig:
+            retryOnNetworkErrors: true
+            wrapCRUDinTransactions: true
           overrideRetryAttempts: 3
-          # TODO: SERVER-39702 remove once it's allowed to stepdown with prepare.
-          skipCheckingCatalogCacheConsistencyWithShardingCatalog: true
           sessionOptions:
             # Read your own writes is not guaranteed without causal consistency if all nodes are
             # electable.
@@ -458,10 +454,9 @@ executor:
   # so we need to allow time for at most 10 operations to be re-run and then re-committed. If
   # too many network errors occur when re-running a transaction we will run out of retries.
   - class: ContinuousStepdown
+    config_stepdown: false
     kill: true
     stepdown_interval_ms: 15000
-    # TODO: SERVER-39702 change to shard_stepdown true once it's allowed to stepdown with prepare.
-    shard_stepdown: false
 
   # The CheckReplDBHash hook waits until all operations have replicated to and have been applied
   # on the secondaries, so we run the ValidateCollections hook after it to ensure we're
@@ -480,9 +475,6 @@ executor:
     mongos_options:
       set_parameters:
         enableTestCommands: 1
-        # TODO: SERVER-39702 remove after stepdown with prepare works
-        "failpoint.sendCoordinateCommitToConfigServer":
-          mode: alwaysOn
     mongod_options:
       syncdelay: 5
       oplogSize: 1024
@@ -504,18 +496,9 @@ executor:
     num_shards: 2
     num_rs_nodes_per_shard: 3
     configsvr_options:
-      num_nodes: 3 # TODO: SERVER-39702 change to 1 node when we no longer make configsvr coordinator
-      all_nodes_electable: true
-      replset_config_options:
-        settings:
-          catchUpTimeoutMillis: 0
-      voting_secondaries: true
       mongod_options:
         set_parameters:
           enableTestCommands: 1
-          # TODO: SERVER-39702 remove after stepdown with prepare works
-          "failpoint.doNotForgetCoordinator":
-            mode: alwaysOn
     shard_options:
       all_nodes_electable: true
       replset_config_options:

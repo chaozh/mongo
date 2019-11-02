@@ -32,14 +32,14 @@
 #include "mongo/db/repl/repl_set_config.h"
 
 #include <algorithm>
+#include <functional>
 
 #include "mongo/bson/util/bson_check.h"
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/mongod_options.h"
 #include "mongo/db/server_options.h"
-#include "mongo/stdx/functional.h"
-#include "mongo/util/stringutils.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 namespace repl {
@@ -138,16 +138,17 @@ Status ReplSetConfig::_initialize(const BSONObj& cfg, bool forInitiate, OID defa
         if (memberElement.type() != Object) {
             return Status(ErrorCodes::TypeMismatch,
                           str::stream() << "Expected type of " << kMembersFieldName << "."
-                                        << memberElement.fieldName()
-                                        << " to be Object, but found "
+                                        << memberElement.fieldName() << " to be Object, but found "
                                         << typeName(memberElement.type()));
         }
-        _members.resize(_members.size() + 1);
         const auto& memberBSON = memberElement.Obj();
-        status = _members.back().initialize(memberBSON, &_tagConfig);
-        if (!status.isOK())
+        try {
+            _members.emplace_back(memberBSON, &_tagConfig);
+        } catch (const DBException& ex) {
             return Status(ErrorCodes::InvalidReplicaSetConfig,
-                          str::stream() << status.toString() << " for member:" << memberBSON);
+                          str::stream()
+                              << ex.toStatus().toString() << " for member:" << memberBSON);
+        }
     }
 
     //
@@ -324,8 +325,7 @@ Status ReplSetConfig::_parseSettingsSubdocument(const BSONObj& settings) {
             return status;
     } else if (status == ErrorCodes::NoSuchKey) {
         // Default write concern is w: 1.
-        _defaultWriteConcern.reset();
-        _defaultWriteConcern.wNumNodes = 1;
+        _defaultWriteConcern = WriteConcernOptions();
     } else {
         return status;
     }
@@ -346,43 +346,35 @@ Status ReplSetConfig::_parseSettingsSubdocument(const BSONObj& settings) {
         if (_customWriteConcernModes.find(modeElement.fieldNameStringData()) !=
             _customWriteConcernModes.end()) {
             return Status(ErrorCodes::Error(51001),
-                          str::stream() << kSettingsFieldName << '.' << kGetLastErrorModesFieldName
-                                        << " contains multiple fields named "
-                                        << modeElement.fieldName());
+                          str::stream()
+                              << kSettingsFieldName << '.' << kGetLastErrorModesFieldName
+                              << " contains multiple fields named " << modeElement.fieldName());
         }
         if (modeElement.type() != Object) {
             return Status(ErrorCodes::TypeMismatch,
-                          str::stream() << "Expected " << kSettingsFieldName << '.'
-                                        << kGetLastErrorModesFieldName
-                                        << '.'
-                                        << modeElement.fieldName()
-                                        << " to be an Object, not "
-                                        << typeName(modeElement.type()));
+                          str::stream()
+                              << "Expected " << kSettingsFieldName << '.'
+                              << kGetLastErrorModesFieldName << '.' << modeElement.fieldName()
+                              << " to be an Object, not " << typeName(modeElement.type()));
         }
         ReplSetTagPattern pattern = _tagConfig.makePattern();
         for (auto&& constraintElement : modeElement.Obj()) {
             if (!constraintElement.isNumber()) {
                 return Status(ErrorCodes::TypeMismatch,
-                              str::stream() << "Expected " << kSettingsFieldName << '.'
-                                            << kGetLastErrorModesFieldName
-                                            << '.'
-                                            << modeElement.fieldName()
-                                            << '.'
-                                            << constraintElement.fieldName()
-                                            << " to be a number, not "
-                                            << typeName(constraintElement.type()));
+                              str::stream()
+                                  << "Expected " << kSettingsFieldName << '.'
+                                  << kGetLastErrorModesFieldName << '.' << modeElement.fieldName()
+                                  << '.' << constraintElement.fieldName() << " to be a number, not "
+                                  << typeName(constraintElement.type()));
             }
             const int minCount = constraintElement.numberInt();
             if (minCount <= 0) {
                 return Status(ErrorCodes::BadValue,
-                              str::stream() << "Value of " << kSettingsFieldName << '.'
-                                            << kGetLastErrorModesFieldName
-                                            << '.'
-                                            << modeElement.fieldName()
-                                            << '.'
-                                            << constraintElement.fieldName()
-                                            << " must be positive, but found "
-                                            << minCount);
+                              str::stream()
+                                  << "Value of " << kSettingsFieldName << '.'
+                                  << kGetLastErrorModesFieldName << '.' << modeElement.fieldName()
+                                  << '.' << constraintElement.fieldName()
+                                  << " must be positive, but found " << minCount);
             }
             status = _tagConfig.addTagCountConstraintToPattern(
                 &pattern, constraintElement.fieldNameStringData(), minCount);
@@ -418,8 +410,7 @@ Status ReplSetConfig::validate() const {
     if (_replSetName.empty()) {
         return Status(ErrorCodes::BadValue,
                       str::stream() << "Replica set configuration must have non-empty "
-                                    << kIdFieldName
-                                    << " field");
+                                    << kIdFieldName << " field");
     }
     if (_heartbeatInterval < Milliseconds(0)) {
         return Status(ErrorCodes::BadValue,
@@ -439,11 +430,53 @@ Status ReplSetConfig::validate() const {
     size_t voterCount = 0;
     size_t arbiterCount = 0;
     size_t electableCount = 0;
+
+    auto extractHorizonMembers = [](const auto& replMember) {
+        std::vector<std::string> rv;
+        std::transform(replMember.getHorizonMappings().begin(),
+                       replMember.getHorizonMappings().end(),
+                       back_inserter(rv),
+                       [](auto&& mapping) { return mapping.first; });
+        std::sort(begin(rv), end(rv));
+        return rv;
+    };
+
+    const auto expectedHorizonNameMapping = extractHorizonMembers(_members[0]);
+
+    stdx::unordered_set<std::string> nonUniversalHorizons;
+    std::map<HostAndPort, int> horizonHostNameCounts;
     for (size_t i = 0; i < _members.size(); ++i) {
         const MemberConfig& memberI = _members[i];
         Status status = memberI.validate();
         if (!status.isOK())
             return status;
+
+        // Check the replica set configuration for errors in horizon specification:
+        //   * Check that all members have the same set of horizon names
+        //   * Check that no hostname:port appears more than once for any member
+        //   * Check that all hostname:port endpoints are unique for all members
+        const auto seenHorizonNameMapping = extractHorizonMembers(memberI);
+
+        if (expectedHorizonNameMapping != seenHorizonNameMapping) {
+            // Collect a list of horizons only seen on one side of the pair of horizon maps
+            // considered.  Names that are only on one side are non-universal, and should be
+            // reported -- the same set of horizon names must exist across all replica set members.
+            // We collect the list while parsing over ALL members, this way we can report all
+            // horizons which are not universally listed in the replica set configuration in a
+            // single error message.
+            std::set_symmetric_difference(
+                begin(expectedHorizonNameMapping),
+                end(expectedHorizonNameMapping),
+                begin(seenHorizonNameMapping),
+                end(seenHorizonNameMapping),
+                inserter(nonUniversalHorizons, end(nonUniversalHorizons)));
+        } else {
+            // Because "__default" always lives in the mappings, we don't have to get it separately
+            for (const auto& mapping : memberI.getHorizonMappings()) {
+                ++horizonHostNameCounts[mapping.second];
+            }
+        }
+
         if (memberI.getHostAndPort().isLocalHost()) {
             ++localhostCount;
         }
@@ -462,44 +495,67 @@ Status ReplSetConfig::validate() const {
             const MemberConfig& memberJ = _members[j];
             if (memberI.getId() == memberJ.getId()) {
                 return Status(ErrorCodes::BadValue,
-                              str::stream() << "Found two member configurations with same "
-                                            << MemberConfig::kIdFieldName
-                                            << " field, "
-                                            << kMembersFieldName
-                                            << "."
-                                            << i
-                                            << "."
-                                            << MemberConfig::kIdFieldName
-                                            << " == "
-                                            << kMembersFieldName
-                                            << "."
-                                            << j
-                                            << "."
-                                            << MemberConfig::kIdFieldName
-                                            << " == "
-                                            << memberI.getId());
+                              str::stream()
+                                  << "Found two member configurations with same "
+                                  << MemberConfig::kIdFieldName << " field, " << kMembersFieldName
+                                  << "." << i << "." << MemberConfig::kIdFieldName
+                                  << " == " << kMembersFieldName << "." << j << "."
+                                  << MemberConfig::kIdFieldName << " == " << memberI.getId());
             }
             if (memberI.getHostAndPort() == memberJ.getHostAndPort()) {
                 return Status(ErrorCodes::BadValue,
-                              str::stream() << "Found two member configurations with same "
-                                            << MemberConfig::kHostFieldName
-                                            << " field, "
-                                            << kMembersFieldName
-                                            << "."
-                                            << i
-                                            << "."
-                                            << MemberConfig::kHostFieldName
-                                            << " == "
-                                            << kMembersFieldName
-                                            << "."
-                                            << j
-                                            << "."
-                                            << MemberConfig::kHostFieldName
-                                            << " == "
-                                            << memberI.getHostAndPort().toString());
+                              str::stream()
+                                  << "Found two member configurations with same "
+                                  << MemberConfig::kHostFieldName << " field, " << kMembersFieldName
+                                  << "." << i << "." << MemberConfig::kHostFieldName
+                                  << " == " << kMembersFieldName << "." << j << "."
+                                  << MemberConfig::kHostFieldName
+                                  << " == " << memberI.getHostAndPort().toString());
             }
         }
     }
+
+    // If we found horizons that weren't universally present, list all non-universally present
+    // horizons for this replica set.
+    if (!nonUniversalHorizons.empty()) {
+        const auto missingHorizonList = [&] {
+            std::string rv;
+            for (const auto& horizonName : nonUniversalHorizons) {
+                rv += " " + horizonName + ",";
+            }
+            rv.pop_back();
+            return rv;
+        }();
+        return Status(ErrorCodes::BadValue,
+                      "Saw a replica set member with a different horizon mapping than the "
+                      "others.  The following horizons were not universally present:" +
+                          missingHorizonList);
+    }
+
+    const auto nonUniqueHostNameList = [&] {
+        std::vector<HostAndPort> rv;
+        for (const auto& host : horizonHostNameCounts) {
+            if (host.second > 1)
+                rv.push_back(host.first);
+        }
+        return rv;
+    }();
+
+    if (!nonUniqueHostNameList.empty()) {
+        const auto nonUniqueHostNames = [&] {
+            std::string rv;
+            for (const auto& hostName : nonUniqueHostNameList) {
+                rv += " " + hostName.toString() + ",";
+            }
+            rv.pop_back();
+            return rv;
+        }();
+        return Status(ErrorCodes::BadValue,
+                      "The following hostnames are not unique across all horizons and host "
+                      "specifications in the replica set:" +
+                          nonUniqueHostNames);
+    }
+
 
     if (localhostCount != 0 && localhostCount != _members.size()) {
         return Status(
@@ -507,9 +563,7 @@ Status ReplSetConfig::validate() const {
             str::stream()
                 << "Either all host names in a replica set configuration must be localhost "
                    "references, or none must be; found "
-                << localhostCount
-                << " out of "
-                << _members.size());
+                << localhostCount << " out of " << _members.size());
     }
 
     if (voterCount > kMaxVotingMembers || voterCount == 0) {
@@ -550,9 +604,9 @@ Status ReplSetConfig::validate() const {
     }
     if (_protocolVersion != 1) {
         return Status(ErrorCodes::BadValue,
-                      str::stream() << kProtocolVersionFieldName
-                                    << " of 1 is the only supported value. Found: "
-                                    << _protocolVersion);
+                      str::stream()
+                          << kProtocolVersionFieldName
+                          << " of 1 is the only supported value. Found: " << _protocolVersion);
     }
 
     if (_configServer) {
@@ -601,8 +655,7 @@ Status ReplSetConfig::validate() const {
 
 Status ReplSetConfig::checkIfWriteConcernCanBeSatisfied(
     const WriteConcernOptions& writeConcern) const {
-    if (!writeConcern.wMode.empty() && writeConcern.wMode != WriteConcernOptions::kMajority &&
-        writeConcern.wMode != WriteConcernOptions::kInternalMajorityNoSnapshot) {
+    if (!writeConcern.wMode.empty() && writeConcern.wMode != WriteConcernOptions::kMajority) {
         StatusWith<ReplSetTagPattern> tagPatternStatus = findCustomWriteMode(writeConcern.wMode);
         if (!tagPatternStatus.isOK()) {
             return tagPatternStatus.getStatus();
@@ -623,8 +676,7 @@ Status ReplSetConfig::checkIfWriteConcernCanBeSatisfied(
         // write concern mode.
         return Status(ErrorCodes::UnsatisfiableWriteConcern,
                       str::stream() << "Not enough nodes match write concern mode \""
-                                    << writeConcern.wMode
-                                    << "\"");
+                                    << writeConcern.wMode << "\"");
     } else {
         int nodesRemaining = writeConcern.wNumNodes;
         for (size_t j = 0; j < _members.size(); ++j) {
@@ -653,11 +705,11 @@ const MemberConfig& ReplSetConfig::getMemberAt(size_t i) const {
 const MemberConfig* ReplSetConfig::findMemberByID(int id) const {
     for (std::vector<MemberConfig>::const_iterator it = _members.begin(); it != _members.end();
          ++it) {
-        if (it->getId() == id) {
+        if (it->getId() == MemberId(id)) {
             return &(*it);
         }
     }
-    return NULL;
+    return nullptr;
 }
 
 int ReplSetConfig::findMemberIndexByHostAndPort(const HostAndPort& hap) const {
@@ -675,7 +727,7 @@ int ReplSetConfig::findMemberIndexByHostAndPort(const HostAndPort& hap) const {
 int ReplSetConfig::findMemberIndexByConfigId(long long configId) const {
     int x = 0;
     for (const auto& member : _members) {
-        if (member.getId() == configId) {
+        if (member.getId() == MemberId(configId)) {
             return x;
         }
         ++x;
@@ -685,7 +737,7 @@ int ReplSetConfig::findMemberIndexByConfigId(long long configId) const {
 
 const MemberConfig* ReplSetConfig::findMemberByHostAndPort(const HostAndPort& hap) const {
     int idx = findMemberIndexByHostAndPort(hap);
-    return idx != -1 ? &getMemberAt(idx) : NULL;
+    return idx != -1 ? &getMemberAt(idx) : nullptr;
 }
 
 Milliseconds ReplSetConfig::getHeartbeatInterval() const {
@@ -708,7 +760,7 @@ StatusWith<ReplSetTagPattern> ReplSetConfig::findCustomWriteMode(StringData patt
     if (iter == _customWriteConcernModes.end()) {
         return StatusWith<ReplSetTagPattern>(
             ErrorCodes::UnknownReplWriteConcern,
-            str::stream() << "No write concern mode named '" << escape(patternName.toString())
+            str::stream() << "No write concern mode named '" << str::escape(patternName.toString())
                           << "' found in replica set configuration");
     }
     return StatusWith<ReplSetTagPattern>(iter->second);

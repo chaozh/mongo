@@ -1,5 +1,4 @@
 """GDB commands for MongoDB."""
-from __future__ import print_function
 
 import os
 import re
@@ -22,11 +21,9 @@ except Exception as e:
     print("Failed to load the libstdc++ pretty printers: " + str(e))
 # pylint: enable=invalid-name,wildcard-import
 
-if sys.version_info[0] >= 3:
-    # GDB only permits converting a gdb.Value instance to its numerical address when using the
-    # long() constructor in Python 2 and not when using the int() constructor. We define the
-    # 'long' class as an alias for the 'int' class in Python 3 for compatibility.
-    long = int  # pylint: disable=redefined-builtin,invalid-name
+if sys.version_info[0] < 3:
+    raise gdb.GdbError(
+        "MongoDB gdb extensions only support Python 3. Your GDB was compiled against Python 2")
 
 
 def get_process_name():
@@ -104,7 +101,7 @@ def get_decorations(obj):
     decorable_t = decorable.type.template_argument(0)
     decinfo_t = gdb.lookup_type('mongo::DecorationRegistry<{}>::DecorationInfo'.format(
         str(decorable_t).replace("class", "").strip()))
-    count = long((long(finish) - long(start)) / decinfo_t.sizeof)
+    count = int((int(finish) - int(start)) / decinfo_t.sizeof)
 
     for i in range(count):
         descriptor = start[i]
@@ -251,7 +248,7 @@ class DumpMongoDSessionCatalog(gdb.Command):
         """Initialize DumpMongoDSessionCatalog."""
         RegisterMongoCommand.register(self, "mongod-dump-sessions", gdb.COMMAND_DATA)
 
-    def invoke(self, args, _from_tty):  # pylint: disable=unused-argument,no-self-use,too-many-locals,too-many-branches
+    def invoke(self, args, _from_tty):  # pylint: disable=unused-argument,no-self-use,too-many-locals,too-many-branches,too-many-statements
         """Invoke DumpMongoDSessionCatalog."""
         # See if a particular session id was specified.
         argarr = args.split(" ")
@@ -279,7 +276,7 @@ class DumpMongoDSessionCatalog(gdb.Command):
 
         for sess_kv in session_kv_pairs:
             # The Session is stored inside the SessionRuntimeInfo object.
-            session_runtime_info = sess_kv['second']['_M_ptr'].dereference()
+            session_runtime_info = get_unique_ptr(sess_kv['second']).dereference()  # pylint: disable=undefined-variable
             session = session_runtime_info['session']
             # TODO: Add a custom pretty printer for LogicalSessionId.
             lsid_str = str(session['_sessionId']['_id'])
@@ -301,7 +298,7 @@ class DumpMongoDSessionCatalog(gdb.Command):
             # the session is easily identifiable.
             print("Session (" + str(session.address) + "):")
             print("SessionId", "=", lsid_str)
-            session_fields_to_print = ['_sessionId', '_checkoutOpCtx', '_killsRequested']
+            session_fields_to_print = ['_checkoutOpCtx', '_killsRequested']
             for field in session_fields_to_print:
                 # Skip fields that aren't found on the object.
                 if field in get_field_names(session):
@@ -313,30 +310,37 @@ class DumpMongoDSessionCatalog(gdb.Command):
             # we just print the session's id and nothing else.
             txn_part_dec = get_decoration(session, "TransactionParticipant")
             if txn_part_dec:
-                # Only print the most interesting fields for debugging transactions issues.
+                # Only print the most interesting fields for debugging transactions issues. The
+                # TransactionParticipant class encapsulates internal state in two distinct
+                # structures: a 'PrivateState' type (stored in private field '_p') and an
+                # 'ObservableState' type (stored in private field '_o'). The information we care
+                # about here is all contained inside the 'ObservableState', so we extract fields
+                # from that object. If, in the future, we want to print fields from the
+                # 'PrivateState' object, we can inspect the TransactionParticipant's '_p' field.
                 txn_part = txn_part_dec[1]
-                fields_to_print = ['_txnState', '_activeTxnNumber']
+                txn_part_observable_state = txn_part['_o']
+                fields_to_print = ['txnState', 'activeTxnNumber']
                 print("TransactionParticipant (" + str(txn_part.address) + "):")
                 for field in fields_to_print:
                     # Skip fields that aren't found on the object.
-                    if field in get_field_names(txn_part):
-                        print(field, "=", txn_part[field])
+                    if field in get_field_names(txn_part_observable_state):
+                        print(field, "=", txn_part_observable_state[field])
                     else:
                         print("Could not find field '%s' on the TransactionParticipant" % field)
 
-                # The '_txnResourceStash' field is a boost::optional so we unpack it
-                # manually if it is non-empty. We are only interested in its Locker object for now.
-                # TODO: Load the boost pretty printers so the object will be printed clearly
-                # by default, without the need for special unpacking.
-                val = get_boost_optional(txn_part['_txnResourceStash'])
+                # The 'txnResourceStash' field is a boost::optional so we unpack it manually if it
+                # is non-empty. We are only interested in its Locker object for now. TODO: Load the
+                # boost pretty printers so the object will be printed clearly by default, without
+                # the need for special unpacking.
+                val = get_boost_optional(txn_part_observable_state['txnResourceStash'])
                 if val:
-                    locker_addr = val["_locker"]["_M_t"]['_M_head_impl']
+                    locker_addr = get_unique_ptr(val["_locker"])  # pylint: disable=undefined-variable
                     locker_obj = locker_addr.dereference().cast(
                         gdb.lookup_type("mongo::LockerImpl"))
-                    print('_txnResourceStash._locker', "@", locker_addr)
-                    print("_txnResourceStash._locker._id", "=", locker_obj["_id"])
+                    print('txnResourceStash._locker', "@", locker_addr)
+                    print("txnResourceStash._locker._id", "=", locker_obj["_id"])
                 else:
-                    print('_txnResourceStash', "=", None)
+                    print('txnResourceStash', "=", None)
             # Separate sessions by a newline.
             print("")
 
@@ -480,7 +484,7 @@ class MongoDBUniqueStack(gdb.Command):
             """Return the first tid."""
             return stack['threads'][0]['gdb_thread_num']
 
-        for stack in sorted(stacks.values(), key=first_tid, reverse=True):
+        for stack in sorted(list(stacks.values()), key=first_tid, reverse=True):
             for i, thread in enumerate(stack['threads']):
                 prefix = '' if i == 0 else 'Duplicate '
                 print(prefix + thread['header'])
@@ -519,6 +523,12 @@ class MongoDBJavaScriptStack(gdb.Command):
                     print("Ignoring invalid thread %d in javascript_stack" % thread.num)
                     continue
                 thread.switch()
+
+                # Switch frames so gdb actually knows about the mongo::mozjs namespace. It doesn't
+                # actually matter which frame so long as it isn't the top of the stack. This also
+                # enables gdb to know about the mongo::mozjs::kCurrentScope thread-local variable
+                # when using gdb.parse_and_eval().
+                gdb.selected_frame().older().select()
             except gdb.error as err:
                 print("Ignoring GDB error '%s' in javascript_stack" % str(err))
                 continue
@@ -527,9 +537,10 @@ class MongoDBJavaScriptStack(gdb.Command):
                 if gdb.parse_and_eval(
                         'mongo::mozjs::kCurrentScope && mongo::mozjs::kCurrentScope->_inOp'):
                     gdb.execute('thread', from_tty=False, to_string=False)
-                    gdb.execute('printf "%s\\n", ' +
-                                'mongo::mozjs::kCurrentScope->buildStackString().c_str()',
-                                from_tty=False, to_string=False)
+                    gdb.execute(
+                        'printf "%s\\n", ' +
+                        'mongo::mozjs::kCurrentScope->buildStackString().c_str()', from_tty=False,
+                        to_string=False)
             except gdb.error as err:
                 print("Ignoring GDB error '%s' in javascript_stack" % str(err))
                 continue

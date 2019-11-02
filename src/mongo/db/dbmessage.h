@@ -96,7 +96,7 @@ class OperationContext;
 namespace QueryResult {
 #pragma pack(1)
 /* see http://dochub.mongodb.org/core/mongowireprotocol
-*/
+ */
 struct Layout {
     MsgData::Layout msgdata;
     int64_t cursorId;
@@ -241,7 +241,7 @@ public:
 
     /* for insert and update msgs */
     bool moreJSObjs() const {
-        return _nextjsobj != 0 && _nextjsobj != _theEnd;
+        return _nextjsobj != nullptr && _nextjsobj != _theEnd;
     }
 
     BSONObj nextJsObj();
@@ -298,7 +298,7 @@ enum QueryOptions {
     QueryOption_CursorTailable = 1 << 1,
 
     /** allow query of replica slave.  normally these return an error except for namespace "local".
-    */
+     */
     QueryOption_SlaveOk = 1 << 2,
 
     // findingStart mode is used to find the first operation of interest when
@@ -319,7 +319,7 @@ enum QueryOptions {
 
     /** Use with QueryOption_CursorTailable.  If we are at the end of the data, block for a while
      * rather than returning no data. After a timeout period, we do return as normal.
-    */
+     */
     QueryOption_AwaitData = 1 << 5,
 
     /** Stream the data down full blast in multiple "more" packages, on the assumption that the
@@ -327,7 +327,7 @@ enum QueryOptions {
      * you want to pull it all down.  Note: it is not allowed to not read all the data unless you
      * close the connection.
 
-        Use the query( stdx::function<void(const BSONObj&)> f, ... ) version of the connection's
+        Use the query( std::function<void(const BSONObj&)> f, ... ) version of the connection's
         query()
         method, and it will take care of all the details for you.
     */
@@ -445,6 +445,9 @@ Message makeGetMoreMessage(StringData ns, long long cursorId, int nToReturn, int
 struct DbResponse {
     Message response;       // If empty, nothing will be returned to the client.
     std::string exhaustNS;  // Namespace of cursor if exhaust mode, else "".
+    // Cursor ID when running on exhaust mode. Defaults to '0', indicating
+    // that the cursor is exhausted.
+    long long exhaustCursorId = 0;
 };
 
 /**
@@ -452,7 +455,8 @@ struct DbResponse {
  * command responses that don't use the new dbMsg protocol.
  */
 class OpQueryReplyBuilder {
-    MONGO_DISALLOW_COPYING(OpQueryReplyBuilder);
+    OpQueryReplyBuilder(const OpQueryReplyBuilder&) = delete;
+    OpQueryReplyBuilder& operator=(const OpQueryReplyBuilder&) = delete;
 
 public:
     OpQueryReplyBuilder();

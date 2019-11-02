@@ -30,8 +30,7 @@
 #include "mongo/db/fts/fts_element_iterator.h"
 #include "mongo/db/fts/fts_spec.h"
 #include "mongo/db/fts/fts_util.h"
-#include "mongo/util/mongoutils/str.h"
-#include "mongo/util/stringutils.h"
+#include "mongo/util/str.h"
 
 #include <stack>
 
@@ -63,9 +62,9 @@ inline bool _matchPrefix(const string& dottedName, const string& weight) {
     if (weight == dottedName) {
         return true;
     }
-    return mongoutils::str::startsWith(weight, dottedName + '.');
+    return str::startsWith(weight, dottedName + '.');
 }
-}
+}  // namespace
 
 bool FTSElementIterator::more() {
     //_currentValue = advance();
@@ -114,9 +113,10 @@ FTSIteratorValue FTSElementIterator::advance() {
         // 1. parent path empty (top level): use the current field name
         // 2. parent path non-empty and obj is an array: use the parent path
         // 3. parent path non-empty and obj is a sub-doc: append field name to parent path
-        string dottedName = (_frame._parentPath.empty() ? fieldName : _frame._isArray
-                                     ? _frame._parentPath
-                                     : _frame._parentPath + '.' + fieldName);
+        string dottedName =
+            (_frame._parentPath.empty()
+                 ? fieldName
+                 : _frame._isArray ? _frame._parentPath : _frame._parentPath + '.' + fieldName);
 
         // Find lower bound of dottedName in _weights.  lower_bound leaves us at the first
         // weight that could possibly match or be a prefix of dottedName.  And if this

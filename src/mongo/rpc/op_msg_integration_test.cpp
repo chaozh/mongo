@@ -84,7 +84,7 @@ TEST(OpMsg, FireAndForgetInsertWorks) {
         ]
     })")));
 
-    ASSERT_EQ(conn->count("test.collection"), 1u);
+    ASSERT_EQ(conn->count(NamespaceString("test.collection")), 1u);
 }
 
 TEST(OpMsg, DocumentSequenceLargeDocumentMultiInsertWorks) {
@@ -117,7 +117,7 @@ TEST(OpMsg, DocumentSequenceLargeDocumentMultiInsertWorks) {
     Message reply;
     ASSERT_TRUE(conn->call(request, reply, false));
 
-    ASSERT_EQ(conn->count("test.collection"), 3u);
+    ASSERT_EQ(conn->count(NamespaceString("test.collection")), 3u);
     conn->dropCollection("test.collection");
 }
 
@@ -153,7 +153,7 @@ TEST(OpMsg, DocumentSequenceMaxWriteBatchWorks) {
     Message reply;
     ASSERT_TRUE(conn->call(request, reply, false));
 
-    ASSERT_EQ(conn->count("test.collection"), write_ops::kMaxWriteBatchSize);
+    ASSERT_EQ(conn->count(NamespaceString("test.collection")), write_ops::kMaxWriteBatchSize);
     conn->dropCollection("test.collection");
 }
 
@@ -181,7 +181,8 @@ TEST(OpMsg, CloseConnectionOnFireAndForgetNotMasterError) {
             documents: [
                 {a: 1}
             ]
-        })")).serialize();
+        })"))
+                           .serialize();
 
         // Round-trip command fails with NotMaster error. Note that this failure is in command
         // dispatch which ignores w:0.
@@ -196,6 +197,9 @@ TEST(OpMsg, CloseConnectionOnFireAndForgetNotMasterError) {
         // rather than say() so that we get an error back when the connection is closed. Normally
         // using call() if kMoreToCome set results in blocking forever.
         OpMsg::setFlag(&request, OpMsg::kMoreToCome);
+        // conn.call() calculated the request checksum, but setFlag() makes it invalid. Clear the
+        // checksum so the next conn.call() recalculates it.
+        OpMsg::removeChecksum(&request);
         ASSERT(!conn.call(request, reply, /*assertOK*/ false, nullptr));
 
         uassertStatusOK(conn.connect(host, "integration_test"));  // Reconnect.
@@ -224,6 +228,7 @@ TEST(OpMsg, CloseConnectionOnFireAndForgetNotMasterError) {
 
 
         // Round-trip command claims to succeed due to w:0.
+        OpMsg::removeChecksum(&request);
         OpMsg::replaceFlags(&request, 0);
         ASSERT(conn.call(request, reply, /*assertOK*/ true, nullptr));
         ASSERT_OK(getStatusFromCommandResult(
@@ -231,6 +236,7 @@ TEST(OpMsg, CloseConnectionOnFireAndForgetNotMasterError) {
 
         // Fire-and-forget should still close connection.
         OpMsg::setFlag(&request, OpMsg::kMoreToCome);
+        OpMsg::removeChecksum(&request);
         ASSERT(!conn.call(request, reply, /*assertOK*/ false, nullptr));
 
         break;
@@ -270,7 +276,19 @@ TEST(OpMsg, DocumentSequenceReturnsWork) {
                                   << "admin"));
 }
 
-TEST(OpMsg, ServerHandlesExhaustCorrectly) {
+constexpr auto kDisableChecksum = "dbClientConnectionDisableChecksum";
+
+void disableClientChecksum() {
+    auto failPoint = globalFailPointRegistry().find(kDisableChecksum);
+    failPoint->setMode(FailPoint::alwaysOn);
+}
+
+void enableClientChecksum() {
+    auto failPoint = globalFailPointRegistry().find(kDisableChecksum);
+    failPoint->setMode(FailPoint::off);
+}
+
+void exhaustTest(bool enableChecksum) {
     std::string errMsg;
     auto conn = std::unique_ptr<DBClientBase>(
         unittest::getFixtureConnectionString().connect("integration_test", errMsg));
@@ -280,6 +298,12 @@ TEST(OpMsg, ServerHandlesExhaustCorrectly) {
     if (conn->isReplicaSetMember() || conn->isMongos()) {
         return;
     }
+
+    if (!enableChecksum) {
+        disableClientChecksum();
+    }
+
+    ON_BLOCK_EXIT([&] { enableClientChecksum(); });
 
     NamespaceString nss("test", "coll");
 
@@ -301,6 +325,8 @@ TEST(OpMsg, ServerHandlesExhaustCorrectly) {
     const long long cursorId = res["cursor"]["id"].numberLong();
     ASSERT(res["cursor"]["firstBatch"].Array().empty());
     ASSERT(!OpMsg::isFlagSet(reply, OpMsg::kMoreToCome));
+    // Reply has checksum if and only if the request did.
+    ASSERT_EQ(OpMsg::isFlagSet(reply, OpMsg::kChecksumPresent), enableChecksum);
 
     // Construct getMore request with exhaust flag. Set batch size so we will need multiple batches
     // to exhaust the cursor.
@@ -314,6 +340,7 @@ TEST(OpMsg, ServerHandlesExhaustCorrectly) {
     ASSERT(conn->call(request, reply));
     auto lastRequestId = reply.header().getId();
     ASSERT(OpMsg::isFlagSet(reply, OpMsg::kMoreToCome));
+    ASSERT_EQ(OpMsg::isFlagSet(reply, OpMsg::kChecksumPresent), enableChecksum);
     res = OpMsg::parse(reply).body;
     ASSERT_OK(getStatusFromCommandResult(res));
     ASSERT_EQ(res["cursor"]["id"].numberLong(), cursorId);
@@ -326,6 +353,7 @@ TEST(OpMsg, ServerHandlesExhaustCorrectly) {
     conn->recv(reply, lastRequestId);
     lastRequestId = reply.header().getId();
     ASSERT(OpMsg::isFlagSet(reply, OpMsg::kMoreToCome));
+    ASSERT_EQ(OpMsg::isFlagSet(reply, OpMsg::kChecksumPresent), enableChecksum);
     res = OpMsg::parse(reply).body;
     ASSERT_OK(getStatusFromCommandResult(res));
     ASSERT_EQ(res["cursor"]["id"].numberLong(), cursorId);
@@ -337,12 +365,21 @@ TEST(OpMsg, ServerHandlesExhaustCorrectly) {
     // Receive terminal batch.
     ASSERT(conn->recv(reply, lastRequestId));
     ASSERT(!OpMsg::isFlagSet(reply, OpMsg::kMoreToCome));
+    ASSERT_EQ(OpMsg::isFlagSet(reply, OpMsg::kChecksumPresent), enableChecksum);
     res = OpMsg::parse(reply).body;
     ASSERT_OK(getStatusFromCommandResult(res));
     ASSERT_EQ(res["cursor"]["id"].numberLong(), 0);
     nextBatch = res["cursor"]["nextBatch"].Array();
     ASSERT_EQ(nextBatch.size(), 1U);
     ASSERT_BSONOBJ_EQ(nextBatch[0].embeddedObject(), BSON("_id" << 4));
+}
+
+TEST(OpMsg, ServerHandlesExhaustCorrectly) {
+    exhaustTest(false);
+}
+
+TEST(OpMsg, ServerHandlesExhaustCorrectlyWithChecksum) {
+    exhaustTest(true);
 }
 
 TEST(OpMsg, ExhaustWithDBClientCursorBehavesCorrectly) {
@@ -370,7 +407,7 @@ TEST(OpMsg, ExhaustWithDBClientCursorBehavesCorrectly) {
         conn->insert(nss.toString(), doc, 0);
     }
 
-    ASSERT_EQ(conn->count(nss.toString()), size_t(nDocs));
+    ASSERT_EQ(conn->count(nss), size_t(nDocs));
     unittest::log() << "Finished document insertion.";
 
     // Open an exhaust cursor.
@@ -399,5 +436,65 @@ TEST(OpMsg, ExhaustWithDBClientCursorBehavesCorrectly) {
     // Should have consumed all documents at this point.
     ASSERT(!cursor->more());
     ASSERT(cursor->isDead());
+}
+
+void checksumTest(bool enableChecksum) {
+    // The server replies with a checksum if and only if the request has a checksum.
+    std::string errMsg;
+    auto conn = std::unique_ptr<DBClientBase>(
+        unittest::getFixtureConnectionString().connect("integration_test", errMsg));
+    uassert(ErrorCodes::SocketException, errMsg, conn);
+
+    if (!enableChecksum) {
+        disableClientChecksum();
+    }
+
+    ON_BLOCK_EXIT([&] { enableClientChecksum(); });
+
+    auto opMsgRequest = OpMsgRequest::fromDBAndBody("admin", BSON("ping" << 1));
+    auto request = opMsgRequest.serialize();
+
+    Message reply;
+    ASSERT(conn->call(request, reply));
+
+    auto opMsgReply = OpMsg::parse(reply);
+    ASSERT_EQ(OpMsg::isFlagSet(reply, OpMsg::kChecksumPresent), enableChecksum);
+}
+
+TEST(OpMsg, ServerRepliesWithoutChecksumToRequestWithoutChecksum) {
+    checksumTest(true);
+}
+
+TEST(OpMsg, ServerRepliesWithChecksumToRequestWithChecksum) {
+    checksumTest(true);
+}
+
+TEST(OpMsg, ServerHandlesReallyLargeMessagesGracefully) {
+    std::string errMsg;
+    auto conn = unittest::getFixtureConnectionString().connect("integration_test", errMsg);
+    uassert(ErrorCodes::SocketException, errMsg, conn);
+
+    auto buildInfo = conn->runCommand(OpMsgRequest::fromDBAndBody("admin", BSON("buildInfo" << 1)))
+                         ->getCommandReply();
+    ASSERT_OK(getStatusFromCommandResult(buildInfo));
+    const auto maxBSONObjSizeFromServer =
+        static_cast<size_t>(buildInfo["maxBsonObjectSize"].Number());
+    const std::string bigData(maxBSONObjSizeFromServer * 2, ' ');
+
+    BSONObjBuilder bob;
+    bob << "ismaster" << 1 << "ignoredField" << bigData << "$db"
+        << "admin";
+    OpMsgRequest request;
+    request.body = bob.obj<BSONObj::LargeSizeTrait>();
+    ASSERT_GT(request.body.objsize(), BSONObjMaxInternalSize);
+    auto requestMsg = request.serialize();
+
+    Message replyMsg;
+    ASSERT(conn->call(requestMsg, replyMsg));
+
+    auto reply = OpMsg::parse(replyMsg);
+    auto replyStatus = getStatusFromCommandResult(reply.body);
+    ASSERT_NOT_OK(replyStatus);
+    ASSERT_EQ(replyStatus, ErrorCodes::BSONObjectTooLarge);
 }
 }  // namespace mongo

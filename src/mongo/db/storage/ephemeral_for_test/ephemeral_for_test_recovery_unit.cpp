@@ -29,6 +29,8 @@
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
 
+#include "mongo/platform/basic.h"
+
 #include "mongo/db/storage/ephemeral_for_test/ephemeral_for_test_recovery_unit.h"
 
 #include "mongo/db/storage/sorted_data_interface.h"
@@ -36,7 +38,19 @@
 
 namespace mongo {
 
-void EphemeralForTestRecoveryUnit::commitUnitOfWork() {
+EphemeralForTestRecoveryUnit::~EphemeralForTestRecoveryUnit() {
+    invariant(!_inUnitOfWork(), toString(_getState()));
+}
+
+void EphemeralForTestRecoveryUnit::beginUnitOfWork(OperationContext* opCtx) {
+    invariant(!_inUnitOfWork(), toString(_getState()));
+    _setState(State::kInactiveInUnitOfWork);
+}
+
+void EphemeralForTestRecoveryUnit::doCommitUnitOfWork() {
+    invariant(_inUnitOfWork(), toString(_getState()));
+    _setState(State::kCommitting);
+
     try {
         for (Changes::iterator it = _changes.begin(), end = _changes.end(); it != end; ++it) {
             (*it)->commit(boost::none);
@@ -49,14 +63,21 @@ void EphemeralForTestRecoveryUnit::commitUnitOfWork() {
     // This ensures that the journal listener gets called on each commit.
     // SERVER-22575: Remove this once we add a generic mechanism to periodically wait
     // for durability.
-    waitUntilDurable();
+    if (_waitUntilDurableCallback) {
+        _waitUntilDurableCallback();
+    }
+
+    _setState(State::kInactive);
 }
 
-void EphemeralForTestRecoveryUnit::abortUnitOfWork() {
+void EphemeralForTestRecoveryUnit::doAbortUnitOfWork() {
+    invariant(_inUnitOfWork(), toString(_getState()));
+    _setState(State::kAborting);
+
     try {
         for (Changes::reverse_iterator it = _changes.rbegin(), end = _changes.rend(); it != end;
              ++it) {
-            ChangePtr change = *it;
+            auto change = *it;
             LOG(2) << "CUSTOM ROLLBACK " << demangleName(typeid(*change));
             change->rollback();
         }
@@ -64,9 +85,30 @@ void EphemeralForTestRecoveryUnit::abortUnitOfWork() {
     } catch (...) {
         std::terminate();
     }
+
+    _setState(State::kInactive);
+}
+
+bool EphemeralForTestRecoveryUnit::waitUntilDurable(OperationContext* opCtx) {
+    if (_waitUntilDurableCallback) {
+        _waitUntilDurableCallback();
+    }
+    return true;
+}
+
+bool EphemeralForTestRecoveryUnit::inActiveTxn() const {
+    return _inUnitOfWork();
+}
+
+void EphemeralForTestRecoveryUnit::doAbandonSnapshot() {
+    invariant(!_inUnitOfWork(), toString(_getState()));
 }
 
 Status EphemeralForTestRecoveryUnit::obtainMajorityCommittedSnapshot() {
     return Status::OK();
 }
+
+void EphemeralForTestRecoveryUnit::registerChange(std::unique_ptr<Change> change) {
+    _changes.push_back(std::move(change));
 }
+}  // namespace mongo

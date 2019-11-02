@@ -10,12 +10,15 @@
  *
  * Uses the "replace" action to overwrite the entire contents of the
  * collection.
+ * @tags: [
+ *   # mapReduce does not support afterClusterTime.
+ *   does_not_support_causal_consistency,
+ * ]
  */
 load('jstests/concurrency/fsm_libs/extend_workload.js');         // for extendWorkload
 load('jstests/concurrency/fsm_workloads/map_reduce_inline.js');  // for $config
 
 var $config = extendWorkload($config, function($config, $super) {
-
     // Use the workload name as a prefix for the collection name,
     // since the workload name is assumed to be unique.
     var prefix = 'map_reduce_replace';

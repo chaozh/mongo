@@ -53,7 +53,7 @@
 #include "mongo/s/config_server_test_fixture.h"
 #include "mongo/s/database_version_helpers.h"
 #include "mongo/s/write_ops/batched_command_response.h"
-#include "mongo/util/fail_point_service.h"
+#include "mongo/util/fail_point.h"
 #include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
 
@@ -129,8 +129,9 @@ protected:
             ASSERT_EQ(request.target, target);
             ASSERT_EQ(request.dbname, nss.db());
             ASSERT_BSONOBJ_EQ(request.cmdObj,
-                              BSON("drop" << nss.coll() << "writeConcern" << BSON("w"
-                                                                                  << "majority")));
+                              BSON("drop" << nss.coll() << "writeConcern"
+                                          << BSON("w"
+                                                  << "majority")));
             ASSERT_BSONOBJ_EQ(rpc::makeEmptyMetadata(), request.metadata);
 
             return BSON("ok" << 1);
@@ -145,9 +146,8 @@ protected:
             ASSERT_EQ(request.dbname, "admin");
             ASSERT_BSONOBJ_EQ(request.cmdObj,
                               BSON("setFeatureCompatibilityVersion"
-                                   << "4.2"
-                                   << "writeConcern"
-                                   << writeConcern));
+                                   << "4.4"
+                                   << "writeConcern" << writeConcern));
 
             return response;
         });
@@ -228,7 +228,8 @@ protected:
                 ASSERT_EQ(itExpected->getUpsert(), itActual->getUpsert());
                 ASSERT_EQ(itExpected->getMulti(), itActual->getMulti());
                 ASSERT_BSONOBJ_EQ(itExpected->getQ(), itActual->getQ());
-                ASSERT_BSONOBJ_EQ(itExpected->getU(), itActual->getU());
+                ASSERT_BSONOBJ_EQ(itExpected->getU().getUpdateClassic(),
+                                  itActual->getU().getUpdateClassic());
             }
 
             BatchedCommandResponse response;
@@ -269,7 +270,8 @@ protected:
                 ASSERT_EQ(itExpected->getUpsert(), itActual->getUpsert());
                 ASSERT_EQ(itExpected->getMulti(), itActual->getMulti());
                 ASSERT_BSONOBJ_EQ(itExpected->getQ(), itActual->getQ());
-                ASSERT_BSONOBJ_EQ(itExpected->getU(), itActual->getU());
+                ASSERT_BSONOBJ_EQ(itExpected->getU().getUpdateClassic(),
+                                  itActual->getU().getUpdateClassic());
             }
 
             return statusToReturn;
@@ -313,18 +315,16 @@ protected:
      * describing the addShard request for 'addedShard'.
      */
     void assertChangeWasLogged(const ShardType& addedShard) {
-        auto response = assertGet(
-            getConfigShard()->exhaustiveFindOnConfig(operationContext(),
-                                                     ReadPreferenceSetting{
-                                                         ReadPreference::PrimaryOnly},
-                                                     repl::ReadConcernLevel::kLocalReadConcern,
-                                                     NamespaceString("config.changelog"),
-                                                     BSON("what"
-                                                          << "addShard"
-                                                          << "details.name"
-                                                          << addedShard.getName()),
-                                                     BSONObj(),
-                                                     1));
+        auto response = assertGet(getConfigShard()->exhaustiveFindOnConfig(
+            operationContext(),
+            ReadPreferenceSetting{ReadPreference::PrimaryOnly},
+            repl::ReadConcernLevel::kLocalReadConcern,
+            NamespaceString("config.changelog"),
+            BSON("what"
+                 << "addShard"
+                 << "details.name" << addedShard.getName()),
+            BSONObj(),
+            1));
         ASSERT_EQ(1U, response.docs.size());
         auto logEntryBSON = response.docs.front();
         auto logEntry = assertGet(ChangeLogType::fromBSON(logEntryBSON));
@@ -345,35 +345,24 @@ protected:
 TEST_F(AddShardTest, CreateShardIdentityUpsertForAddShard) {
     std::string shardName = "shardName";
 
-    BSONObj expectedBSON = BSON("update"
-                                << "system.version"
-                                << "bypassDocumentValidation"
-                                << false
-                                << "ordered"
-                                << true
-                                << "updates"
-                                << BSON_ARRAY(BSON(
-                                       "q"
-                                       << BSON("_id"
-                                               << "shardIdentity")
-                                       << "u"
-                                       << BSON("shardName" << shardName << "clusterId" << _clusterId
-                                                           << "configsvrConnectionString"
-                                                           << replicationCoordinator()
-                                                                  ->getConfig()
-                                                                  .getConnectionString()
-                                                                  .toString())
-                                       << "multi"
-                                       << false
-                                       << "upsert"
-                                       << true))
-                                << "writeConcern"
-                                << BSON("w"
-                                        << "majority"
-                                        << "wtimeout"
-                                        << 60000)
-                                << "allowImplicitCollectionCreation"
-                                << true);
+    BSONObj expectedBSON = BSON(
+        "update"
+        << "system.version"
+        << "bypassDocumentValidation" << false << "ordered" << true << "updates"
+        << BSON_ARRAY(BSON(
+               "q" << BSON("_id"
+                           << "shardIdentity")
+                   << "u"
+                   << BSON(
+                          "shardName"
+                          << shardName << "clusterId" << _clusterId << "configsvrConnectionString"
+                          << replicationCoordinator()->getConfig().getConnectionString().toString())
+                   << "multi" << false << "upsert" << true))
+        << "writeConcern"
+        << BSON("w"
+                << "majority"
+                << "wtimeout" << 60000)
+        << "allowImplicitCollectionCreation" << false);
     auto addShardCmd = add_shard_util::createAddShardCmd(operationContext(), shardName);
     auto actualBSON = add_shard_util::createShardIdentityUpsertForAddShard(addShardCmd);
     ASSERT_BSONOBJ_EQ(expectedBSON, actualBSON);
@@ -381,7 +370,7 @@ TEST_F(AddShardTest, CreateShardIdentityUpsertForAddShard) {
 
 TEST_F(AddShardTest, StandaloneBasicSuccess) {
     std::unique_ptr<RemoteCommandTargeterMock> targeter(
-        stdx::make_unique<RemoteCommandTargeterMock>());
+        std::make_unique<RemoteCommandTargeterMock>());
     HostAndPort shardTarget("StandaloneHost:12345");
     targeter->setConnectionStringReturnValue(ConnectionString(shardTarget));
     targeter->setFindHostReturnValue(shardTarget);
@@ -425,8 +414,7 @@ TEST_F(AddShardTest, StandaloneBasicSuccess) {
         shardTarget,
         std::vector<BSONObj>{BSON("name"
                                   << "local"
-                                  << "sizeOnDisk"
-                                  << 1000),
+                                  << "sizeOnDisk" << 1000),
                              BSON("name" << discoveredDB1.getName() << "sizeOnDisk" << 2000),
                              BSON("name" << discoveredDB2.getName() << "sizeOnDisk" << 5000)});
 
@@ -454,7 +442,7 @@ TEST_F(AddShardTest, StandaloneBasicSuccess) {
 
 TEST_F(AddShardTest, StandaloneGenerateName) {
     std::unique_ptr<RemoteCommandTargeterMock> targeter(
-        stdx::make_unique<RemoteCommandTargeterMock>());
+        std::make_unique<RemoteCommandTargeterMock>());
     HostAndPort shardTarget("StandaloneHost:12345");
     targeter->setConnectionStringReturnValue(ConnectionString(shardTarget));
     targeter->setFindHostReturnValue(shardTarget);
@@ -506,8 +494,7 @@ TEST_F(AddShardTest, StandaloneGenerateName) {
         shardTarget,
         std::vector<BSONObj>{BSON("name"
                                   << "local"
-                                  << "sizeOnDisk"
-                                  << 1000),
+                                  << "sizeOnDisk" << 1000),
                              BSON("name" << discoveredDB1.getName() << "sizeOnDisk" << 2000),
                              BSON("name" << discoveredDB2.getName() << "sizeOnDisk" << 5000)});
 
@@ -535,7 +522,7 @@ TEST_F(AddShardTest, StandaloneGenerateName) {
 
 TEST_F(AddShardTest, AddSCCCConnectionStringAsShard) {
     std::unique_ptr<RemoteCommandTargeterMock> targeter(
-        stdx::make_unique<RemoteCommandTargeterMock>());
+        std::make_unique<RemoteCommandTargeterMock>());
     auto invalidConn =
         ConnectionString("host1:12345,host2:12345,host3:12345", ConnectionString::INVALID);
     targeter->setConnectionStringReturnValue(invalidConn);
@@ -553,7 +540,7 @@ TEST_F(AddShardTest, AddSCCCConnectionStringAsShard) {
 
 TEST_F(AddShardTest, EmptyShardName) {
     std::unique_ptr<RemoteCommandTargeterMock> targeter(
-        stdx::make_unique<RemoteCommandTargeterMock>());
+        std::make_unique<RemoteCommandTargeterMock>());
     std::string expectedShardName = "";
 
     auto future = launchAsync([this, expectedShardName] {
@@ -572,7 +559,7 @@ TEST_F(AddShardTest, EmptyShardName) {
 // Host is unreachable, cannot verify host.
 TEST_F(AddShardTest, UnreachableHost) {
     std::unique_ptr<RemoteCommandTargeterMock> targeter(
-        stdx::make_unique<RemoteCommandTargeterMock>());
+        std::make_unique<RemoteCommandTargeterMock>());
     HostAndPort shardTarget("StandaloneHost:12345");
     targeter->setConnectionStringReturnValue(ConnectionString(shardTarget));
     targeter->setFindHostReturnValue(shardTarget);
@@ -599,7 +586,7 @@ TEST_F(AddShardTest, UnreachableHost) {
 // Cannot add mongos as a shard.
 TEST_F(AddShardTest, AddMongosAsShard) {
     std::unique_ptr<RemoteCommandTargeterMock> targeter(
-        stdx::make_unique<RemoteCommandTargeterMock>());
+        std::make_unique<RemoteCommandTargeterMock>());
     HostAndPort shardTarget("StandaloneHost:12345");
     targeter->setConnectionStringReturnValue(ConnectionString(shardTarget));
     targeter->setFindHostReturnValue(shardTarget);
@@ -626,7 +613,7 @@ TEST_F(AddShardTest, AddMongosAsShard) {
 // A replica set name was found for the host but no name was provided with the host.
 TEST_F(AddShardTest, AddReplicaSetShardAsStandalone) {
     std::unique_ptr<RemoteCommandTargeterMock> targeter(
-        stdx::make_unique<RemoteCommandTargeterMock>());
+        std::make_unique<RemoteCommandTargeterMock>());
     HostAndPort shardTarget = HostAndPort("host1:12345");
     targeter->setConnectionStringReturnValue(ConnectionString(shardTarget));
     targeter->setFindHostReturnValue(shardTarget);
@@ -646,8 +633,7 @@ TEST_F(AddShardTest, AddReplicaSetShardAsStandalone) {
 
     BSONObj commandResponse = BSON("ok" << 1 << "ismaster" << true << "setName"
                                         << "myOtherSet"
-                                        << "maxWireVersion"
-                                        << WireVersion::LATEST_WIRE_VERSION);
+                                        << "maxWireVersion" << WireVersion::LATEST_WIRE_VERSION);
     expectIsMaster(shardTarget, commandResponse);
 
     future.timed_get(kLongFutureTimeout);
@@ -656,7 +642,7 @@ TEST_F(AddShardTest, AddReplicaSetShardAsStandalone) {
 // A replica set name was provided with the host but no name was found for the host.
 TEST_F(AddShardTest, AddStandaloneHostShardAsReplicaSet) {
     std::unique_ptr<RemoteCommandTargeterMock> targeter(
-        stdx::make_unique<RemoteCommandTargeterMock>());
+        std::make_unique<RemoteCommandTargeterMock>());
     ConnectionString connString =
         assertGet(ConnectionString::parse("mySet/host1:12345,host2:12345"));
     HostAndPort shardTarget = connString.getServers().front();
@@ -684,7 +670,7 @@ TEST_F(AddShardTest, AddStandaloneHostShardAsReplicaSet) {
 // Provided replica set name does not match found replica set name.
 TEST_F(AddShardTest, ReplicaSetMistmatchedReplicaSetName) {
     std::unique_ptr<RemoteCommandTargeterMock> targeter(
-        stdx::make_unique<RemoteCommandTargeterMock>());
+        std::make_unique<RemoteCommandTargeterMock>());
     ConnectionString connString =
         assertGet(ConnectionString::parse("mySet/host1:12345,host2:12345"));
     targeter->setConnectionStringReturnValue(connString);
@@ -704,8 +690,7 @@ TEST_F(AddShardTest, ReplicaSetMistmatchedReplicaSetName) {
 
     BSONObj commandResponse = BSON("ok" << 1 << "ismaster" << true << "setName"
                                         << "myOtherSet"
-                                        << "maxWireVersion"
-                                        << WireVersion::LATEST_WIRE_VERSION);
+                                        << "maxWireVersion" << WireVersion::LATEST_WIRE_VERSION);
     expectIsMaster(shardTarget, commandResponse);
 
     future.timed_get(kLongFutureTimeout);
@@ -714,7 +699,7 @@ TEST_F(AddShardTest, ReplicaSetMistmatchedReplicaSetName) {
 // Cannot add config server as a shard.
 TEST_F(AddShardTest, ShardIsCSRSConfigServer) {
     std::unique_ptr<RemoteCommandTargeterMock> targeter(
-        stdx::make_unique<RemoteCommandTargeterMock>());
+        std::make_unique<RemoteCommandTargeterMock>());
     ConnectionString connString =
         assertGet(ConnectionString::parse("config/host1:12345,host2:12345"));
     targeter->setConnectionStringReturnValue(connString);
@@ -733,12 +718,10 @@ TEST_F(AddShardTest, ShardIsCSRSConfigServer) {
                                "as a shard since it is a config server");
     });
 
-    BSONObj commandResponse = BSON("ok" << 1 << "ismaster" << true << "setName"
-                                        << "config"
-                                        << "configsvr"
-                                        << true
-                                        << "maxWireVersion"
-                                        << WireVersion::LATEST_WIRE_VERSION);
+    BSONObj commandResponse =
+        BSON("ok" << 1 << "ismaster" << true << "setName"
+                  << "config"
+                  << "configsvr" << true << "maxWireVersion" << WireVersion::LATEST_WIRE_VERSION);
     expectIsMaster(shardTarget, commandResponse);
 
     future.timed_get(kLongFutureTimeout);
@@ -747,7 +730,7 @@ TEST_F(AddShardTest, ShardIsCSRSConfigServer) {
 // One of the hosts is not part of the found replica set.
 TEST_F(AddShardTest, ReplicaSetMissingHostsProvidedInSeedList) {
     std::unique_ptr<RemoteCommandTargeterMock> targeter(
-        stdx::make_unique<RemoteCommandTargeterMock>());
+        std::make_unique<RemoteCommandTargeterMock>());
     ConnectionString connString =
         assertGet(ConnectionString::parse("mySet/host1:12345,host2:12345"));
     targeter->setConnectionStringReturnValue(connString);
@@ -770,9 +753,7 @@ TEST_F(AddShardTest, ReplicaSetMissingHostsProvidedInSeedList) {
     hosts.append("host1:12345");
     BSONObj commandResponse = BSON("ok" << 1 << "ismaster" << true << "setName"
                                         << "mySet"
-                                        << "hosts"
-                                        << hosts.arr()
-                                        << "maxWireVersion"
+                                        << "hosts" << hosts.arr() << "maxWireVersion"
                                         << WireVersion::LATEST_WIRE_VERSION);
     expectIsMaster(shardTarget, commandResponse);
 
@@ -782,7 +763,7 @@ TEST_F(AddShardTest, ReplicaSetMissingHostsProvidedInSeedList) {
 // Cannot add a shard with the shard name "config".
 TEST_F(AddShardTest, AddShardWithNameConfigFails) {
     std::unique_ptr<RemoteCommandTargeterMock> targeter(
-        stdx::make_unique<RemoteCommandTargeterMock>());
+        std::make_unique<RemoteCommandTargeterMock>());
     ConnectionString connString =
         assertGet(ConnectionString::parse("mySet/host1:12345,host2:12345"));
     targeter->setConnectionStringReturnValue(connString);
@@ -806,9 +787,7 @@ TEST_F(AddShardTest, AddShardWithNameConfigFails) {
     hosts.append("host2:12345");
     BSONObj commandResponse = BSON("ok" << 1 << "ismaster" << true << "setName"
                                         << "mySet"
-                                        << "hosts"
-                                        << hosts.arr()
-                                        << "maxWireVersion"
+                                        << "hosts" << hosts.arr() << "maxWireVersion"
                                         << WireVersion::LATEST_WIRE_VERSION);
     expectIsMaster(shardTarget, commandResponse);
 
@@ -817,7 +796,7 @@ TEST_F(AddShardTest, AddShardWithNameConfigFails) {
 
 TEST_F(AddShardTest, ShardContainsExistingDatabase) {
     std::unique_ptr<RemoteCommandTargeterMock> targeter(
-        stdx::make_unique<RemoteCommandTargeterMock>());
+        std::make_unique<RemoteCommandTargeterMock>());
     ConnectionString connString =
         assertGet(ConnectionString::parse("mySet/host1:12345,host2:12345"));
     targeter->setConnectionStringReturnValue(connString);
@@ -853,9 +832,7 @@ TEST_F(AddShardTest, ShardContainsExistingDatabase) {
     hosts.append("host2:12345");
     BSONObj commandResponse = BSON("ok" << 1 << "ismaster" << true << "setName"
                                         << "mySet"
-                                        << "hosts"
-                                        << hosts.arr()
-                                        << "maxWireVersion"
+                                        << "hosts" << hosts.arr() << "maxWireVersion"
                                         << WireVersion::LATEST_WIRE_VERSION);
     expectIsMaster(shardTarget, commandResponse);
 
@@ -866,7 +843,7 @@ TEST_F(AddShardTest, ShardContainsExistingDatabase) {
 
 TEST_F(AddShardTest, SuccessfullyAddReplicaSet) {
     std::unique_ptr<RemoteCommandTargeterMock> targeter(
-        stdx::make_unique<RemoteCommandTargeterMock>());
+        std::make_unique<RemoteCommandTargeterMock>());
     ConnectionString connString =
         assertGet(ConnectionString::parse("mySet/host1:12345,host2:12345"));
     targeter->setConnectionStringReturnValue(connString);
@@ -898,9 +875,7 @@ TEST_F(AddShardTest, SuccessfullyAddReplicaSet) {
     hosts.append("host2:12345");
     BSONObj commandResponse = BSON("ok" << 1 << "ismaster" << true << "setName"
                                         << "mySet"
-                                        << "hosts"
-                                        << hosts.arr()
-                                        << "maxWireVersion"
+                                        << "hosts" << hosts.arr() << "maxWireVersion"
                                         << WireVersion::LATEST_WIRE_VERSION);
     expectIsMaster(shardTarget, commandResponse);
 
@@ -930,7 +905,7 @@ TEST_F(AddShardTest, SuccessfullyAddReplicaSet) {
 
 TEST_F(AddShardTest, ReplicaSetExtraHostsDiscovered) {
     std::unique_ptr<RemoteCommandTargeterMock> targeter(
-        stdx::make_unique<RemoteCommandTargeterMock>());
+        std::make_unique<RemoteCommandTargeterMock>());
     ConnectionString seedString =
         assertGet(ConnectionString::parse("mySet/host1:12345,host2:12345"));
     ConnectionString fullConnString =
@@ -964,9 +939,7 @@ TEST_F(AddShardTest, ReplicaSetExtraHostsDiscovered) {
     hosts.append("host2:12345");
     BSONObj commandResponse = BSON("ok" << 1 << "ismaster" << true << "setName"
                                         << "mySet"
-                                        << "hosts"
-                                        << hosts.arr()
-                                        << "maxWireVersion"
+                                        << "hosts" << hosts.arr() << "maxWireVersion"
                                         << WireVersion::LATEST_WIRE_VERSION);
     expectIsMaster(shardTarget, commandResponse);
 
@@ -999,7 +972,7 @@ TEST_F(AddShardTest, ReplicaSetExtraHostsDiscovered) {
 
 TEST_F(AddShardTest, AddShardSucceedsEvenIfAddingDBsFromNewShardFails) {
     std::unique_ptr<RemoteCommandTargeterMock> targeter(
-        stdx::make_unique<RemoteCommandTargeterMock>());
+        std::make_unique<RemoteCommandTargeterMock>());
     HostAndPort shardTarget("StandaloneHost:12345");
     targeter->setConnectionStringReturnValue(ConnectionString(shardTarget));
     targeter->setFindHostReturnValue(shardTarget);
@@ -1024,7 +997,7 @@ TEST_F(AddShardTest, AddShardSucceedsEvenIfAddingDBsFromNewShardFails) {
     // Enable fail point to cause all updates to fail.  Since we add the databases detected from
     // the shard being added with upserts, but we add the shard document itself via insert, this
     // will allow the shard to be added but prevent the databases from brought into the cluster.
-    auto failPoint = getGlobalFailPointRegistry()->getFailPoint("failAllUpdates");
+    auto failPoint = globalFailPointRegistry().find("failAllUpdates");
     ASSERT(failPoint);
     failPoint->setMode(FailPoint::alwaysOn);
     ON_BLOCK_EXIT([&] { failPoint->setMode(FailPoint::off); });
@@ -1047,8 +1020,7 @@ TEST_F(AddShardTest, AddShardSucceedsEvenIfAddingDBsFromNewShardFails) {
         shardTarget,
         std::vector<BSONObj>{BSON("name"
                                   << "local"
-                                  << "sizeOnDisk"
-                                  << 1000),
+                                  << "sizeOnDisk" << 1000),
                              BSON("name" << discoveredDB1.getName() << "sizeOnDisk" << 2000),
                              BSON("name" << discoveredDB2.getName() << "sizeOnDisk" << 5000)});
 
@@ -1090,14 +1062,14 @@ TEST_F(AddShardTest, AddShardSucceedsEvenIfAddingDBsFromNewShardFails) {
 TEST_F(AddShardTest, AddExistingShardStandalone) {
     HostAndPort shardTarget("StandaloneHost:12345");
     std::unique_ptr<RemoteCommandTargeterMock> standaloneTargeter(
-        stdx::make_unique<RemoteCommandTargeterMock>());
+        std::make_unique<RemoteCommandTargeterMock>());
     standaloneTargeter->setConnectionStringReturnValue(ConnectionString(shardTarget));
     standaloneTargeter->setFindHostReturnValue(shardTarget);
     targeterFactory()->addTargeterToReturn(ConnectionString(shardTarget),
                                            std::move(standaloneTargeter));
 
     std::unique_ptr<RemoteCommandTargeterMock> replsetTargeter(
-        stdx::make_unique<RemoteCommandTargeterMock>());
+        std::make_unique<RemoteCommandTargeterMock>());
     replsetTargeter->setConnectionStringReturnValue(
         ConnectionString::forReplicaSet("mySet", {shardTarget}));
     replsetTargeter->setFindHostReturnValue(shardTarget);
@@ -1201,7 +1173,7 @@ TEST_F(AddShardTest, AddExistingShardStandalone) {
 // with the *same* options succeeds.
 TEST_F(AddShardTest, AddExistingShardReplicaSet) {
     std::unique_ptr<RemoteCommandTargeterMock> replsetTargeter(
-        stdx::make_unique<RemoteCommandTargeterMock>());
+        std::make_unique<RemoteCommandTargeterMock>());
     ConnectionString connString = assertGet(ConnectionString::parse("mySet/host1:12345"));
     replsetTargeter->setConnectionStringReturnValue(connString);
     HostAndPort shardTarget = connString.getServers().front();
@@ -1322,7 +1294,7 @@ TEST_F(AddShardTest, AddExistingShardReplicaSet) {
     {
         // Add a targeter for the different seed string this addShard request will use.
         std::unique_ptr<RemoteCommandTargeterMock> otherHostTargeter(
-            stdx::make_unique<RemoteCommandTargeterMock>());
+            std::make_unique<RemoteCommandTargeterMock>());
         otherHostTargeter->setConnectionStringReturnValue(otherHostConnString);
         otherHostTargeter->setFindHostReturnValue(otherHost);
         targeterFactory()->addTargeterToReturn(otherHostConnString, std::move(otherHostTargeter));

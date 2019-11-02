@@ -29,18 +29,22 @@
 
 #pragma once
 
+#include <memory>
 #include <vector>
 
 #include "mongo/client/read_preference.h"
 #include "mongo/executor/task_executor.h"
 #include "mongo/executor/task_executor_pool.h"
-#include "mongo/s/grid.h"
+#include "mongo/s/client/shard.h"
 #include "mongo/s/shard_id.h"
 #include "mongo/util/concurrency/mutex.h"
 #include "mongo/util/future.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
+
+using OperationContextFn = std::function<void(OperationContext*)>;
+
 namespace txn {
 
 /**
@@ -74,24 +78,30 @@ public:
         auto pf = makePromiseFuture<ReturnType>();
         auto taskCompletionPromise = std::make_shared<Promise<ReturnType>>(std::move(pf.promise));
         try {
-            stdx::unique_lock<stdx::mutex> ul(_mutex);
+            stdx::unique_lock<Latch> ul(_mutex);
             uassertStatusOK(_shutdownStatus);
 
             auto scheduledWorkHandle = uassertStatusOK(_executor->scheduleWorkAt(
                 when,
                 [ this, task = std::forward<Callable>(task), taskCompletionPromise ](
-                    const executor::TaskExecutor::CallbackArgs&) mutable noexcept {
+                    const executor::TaskExecutor::CallbackArgs& args) mutable noexcept {
                     taskCompletionPromise->setWith([&] {
+                        {
+                            stdx::lock_guard lk(_mutex);
+                            uassertStatusOK(_shutdownStatus);
+                            uassertStatusOK(args.status);
+                        }
+
                         ThreadClient tc("TransactionCoordinator", _serviceContext);
-                        stdx::unique_lock<stdx::mutex> ul(_mutex);
-                        uassertStatusOK(_shutdownStatus);
 
-                        auto uniqueOpCtxIter = _activeOpContexts.emplace(
-                            _activeOpContexts.begin(), tc->makeOperationContext());
-                        ul.unlock();
+                        auto uniqueOpCtxIter = [&] {
+                            stdx::lock_guard lk(_mutex);
+                            return _activeOpContexts.emplace(_activeOpContexts.begin(),
+                                                             tc->makeOperationContext());
+                        }();
 
-                        auto scopedGuard = makeGuard([&] {
-                            ul.lock();
+                        ON_BLOCK_EXIT([&] {
+                            stdx::lock_guard lk(_mutex);
                             _activeOpContexts.erase(uniqueOpCtxIter);
                             // There is no need to call _notifyAllTasksComplete here, because we
                             // will still have an outstanding _activeHandles entry, so the scheduler
@@ -108,8 +118,8 @@ public:
             ul.unlock();
 
             return std::move(pf.future).tapAll(
-                [ this, it = std::move(it) ](StatusOrStatusWith<ReturnType> s) {
-                    stdx::lock_guard<stdx::mutex> lg(_mutex);
+                [this, it = std::move(it)](StatusOrStatusWith<ReturnType> s) {
+                    stdx::lock_guard<Latch> lg(_mutex);
                     _activeHandles.erase(it);
                     _notifyAllTasksComplete(lg);
                 });
@@ -124,7 +134,10 @@ public:
      * completes (with error or not).
      */
     Future<executor::TaskExecutor::ResponseStatus> scheduleRemoteCommand(
-        const ShardId& shardId, const ReadPreferenceSetting& readPref, const BSONObj& commandObj);
+        const ShardId& shardId,
+        const ReadPreferenceSetting& readPref,
+        const BSONObj& commandObj,
+        OperationContextFn operationContextFn = [](OperationContext*) {});
 
     /**
      * Allows sub-tasks on this scheduler to be grouped together and works-around the fact that
@@ -146,14 +159,37 @@ public:
      */
     void shutdown(Status status);
 
+    /**
+     * Blocking call, which will wait until any scheduled commands/tasks and child schedulers have
+     * drained.
+     *
+     * It is allowed to be called without calling shutdown, but in that case it the caller's
+     * responsibility to ensure that no new work gets scheduled.
+     */
+    void join();
+
 private:
     using ChildIteratorsList = std::list<AsyncWorkScheduler*>;
 
+    // A targeted host and the shard object used to target it. The shard object is passed through
+    // resolved so the caller can avoid a potentially blocking "ShardRegistry::getShard" call.
+    struct HostAndShard {
+        HostAndPort hostTargeted;
+        std::shared_ptr<Shard> shard;
+    };
+
     /**
-     * Finds the host and port for a shard.
+     * Finds the host and port for a shard id, returning it and the shard object used for targeting.
      */
-    Future<HostAndPort> _targetHostAsync(const ShardId& shardId,
-                                         const ReadPreferenceSetting& readPref);
+    Future<HostAndShard> _targetHostAsync(const ShardId& shardId,
+                                          const ReadPreferenceSetting& readPref,
+                                          OperationContextFn operationContextFn =
+                                              [](OperationContext*) {});
+
+    /**
+     * Returns true when all the registered child schedulers, op contexts and handles have joined.
+     */
+    bool _quiesced(WithLock) const;
 
     /**
      * Invoked every time a registered op context, handle or child scheduler is getting
@@ -165,8 +201,8 @@ private:
     // Service context under which this executor runs
     ServiceContext* const _serviceContext;
 
-    // Cached reference to the executor to use
-    executor::TaskExecutor* const _executor;
+    // Executor for performing async tasks.
+    std::shared_ptr<executor::TaskExecutor> _executor;
 
     // If this work scheduler was constructed through 'makeChildScheduler', points to the parent
     // scheduler and contains the iterator from the parent, which needs to be removed on destruction
@@ -174,7 +210,7 @@ private:
     ChildIteratorsList::iterator _itToRemove;
 
     // Mutex to protect the shared state below
-    stdx::mutex _mutex;
+    Mutex _mutex = MONGO_MAKE_LATCH("AsyncWorkScheduler::_mutex");
 
     // If shutdown() is called, this contains the first status that was passed to it and is an
     // indication that no more operations can be scheduled
@@ -193,6 +229,8 @@ private:
     // child scheduler has been unregistered.
     stdx::condition_variable _allListsEmptyCV;
 };
+
+ShardId getLocalShardId(ServiceContext* service);
 
 enum class ShouldStopIteration { kYes, kNo };
 
@@ -254,9 +292,9 @@ Future<GlobalResult> collect(std::vector<Future<IndividualResult>>&& futures,
               combiner(std::move(combiner)) {}
         /*****************************************************
          * The first few fields have fixed values.           *
-        ******************************************************/
+         ******************************************************/
         // Protects all state in the SharedBlock.
-        stdx::mutex mutex;
+        Mutex mutex = MONGO_MAKE_LATCH("SharedBlock::mutex");
 
         // If any response returns an error prior to a response setting shouldStopIteration to
         // ShouldStopIteration::kYes, the promise will be set with that error rather than the global
@@ -269,7 +307,7 @@ Future<GlobalResult> collect(std::vector<Future<IndividualResult>>&& futures,
 
         /*****************************************************
          * The below have initial values based on user input.*
-        ******************************************************/
+         ******************************************************/
         // The number of input futures that have not yet been resolved and processed.
         size_t numOutstandingResponses;
         // The variable where the intermediate results and final result is stored.
@@ -294,7 +332,7 @@ Future<GlobalResult> collect(std::vector<Future<IndividualResult>>&& futures,
     for (auto&& localFut : futures) {
         std::move(localFut)
             .then([sharedBlock](IndividualResult res) {
-                stdx::unique_lock<stdx::mutex> lk(sharedBlock->mutex);
+                stdx::unique_lock<Latch> lk(sharedBlock->mutex);
                 if (sharedBlock->shouldStopIteration == ShouldStopIteration::kNo &&
                     sharedBlock->status.isOK()) {
                     sharedBlock->shouldStopIteration =
@@ -302,14 +340,14 @@ Future<GlobalResult> collect(std::vector<Future<IndividualResult>>&& futures,
                 }
             })
             .onError([sharedBlock](Status s) {
-                stdx::unique_lock<stdx::mutex> lk(sharedBlock->mutex);
+                stdx::unique_lock<Latch> lk(sharedBlock->mutex);
                 if (sharedBlock->shouldStopIteration == ShouldStopIteration::kNo &&
                     sharedBlock->status.isOK()) {
                     sharedBlock->status = s;
                 }
             })
             .getAsync([sharedBlock](Status s) {
-                stdx::unique_lock<stdx::mutex> lk(sharedBlock->mutex);
+                stdx::unique_lock<Latch> lk(sharedBlock->mutex);
                 sharedBlock->numOutstandingResponses--;
                 if (sharedBlock->numOutstandingResponses == 0) {
                     // Unlock before emplacing the result in case any continuations do expensive
@@ -344,26 +382,25 @@ Future<FutureContinuationResult<LoopBodyFn>> doWhile(AsyncWorkScheduler& schedul
                                                      LoopBodyFn&& f) {
     using ReturnType = typename decltype(f())::value_type;
     auto future = f();
-    return std::move(future).onCompletion([
-        &scheduler,
-        backoff = std::move(backoff),
-        shouldRetryFn = std::forward<ShouldRetryFn>(shouldRetryFn),
-        f = std::forward<LoopBodyFn>(f)
-    ](StatusOrStatusWith<ReturnType> s) mutable {
-        if (!shouldRetryFn(s))
-            return Future<ReturnType>(std::move(s));
+    return std::move(future).onCompletion(
+        [&scheduler,
+         backoff = std::move(backoff),
+         shouldRetryFn = std::forward<ShouldRetryFn>(shouldRetryFn),
+         f = std::forward<LoopBodyFn>(f)](StatusOrStatusWith<ReturnType> s) mutable {
+            if (!shouldRetryFn(s))
+                return Future<ReturnType>(std::move(s));
 
-        // Retry after a delay.
-        const auto delayMillis = (backoff ? backoff->nextSleep() : Milliseconds(0));
-        return scheduler.scheduleWorkIn(delayMillis, [](OperationContext* opCtx) {}).then([
-            &scheduler,
-            backoff = std::move(backoff),
-            shouldRetryFn = std::move(shouldRetryFn),
-            f = std::move(f)
-        ]() mutable {
-            return doWhile(scheduler, std::move(backoff), std::move(shouldRetryFn), std::move(f));
+            // Retry after a delay.
+            const auto delayMillis = (backoff ? backoff->nextSleep() : Milliseconds(0));
+            return scheduler.scheduleWorkIn(delayMillis, [](OperationContext* opCtx) {})
+                .then([&scheduler,
+                       backoff = std::move(backoff),
+                       shouldRetryFn = std::move(shouldRetryFn),
+                       f = std::move(f)]() mutable {
+                    return doWhile(
+                        scheduler, std::move(backoff), std::move(shouldRetryFn), std::move(f));
+                });
         });
-    });
 }
 
 }  // namespace txn

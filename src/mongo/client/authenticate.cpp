@@ -42,9 +42,9 @@
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/sasl_command_constants.h"
 #include "mongo/db/server_options.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/rpc/op_msg_rpc_impls.h"
-#include "mongo/stdx/mutex.h"
 #include "mongo/util/log.h"
 #include "mongo/util/net/ssl_manager.h"
 #include "mongo/util/net/ssl_options.h"
@@ -119,8 +119,7 @@ StatusWith<OpMsgRequest> createX509AuthCmd(const BSONObj& params, StringData cli
     return OpMsgRequest::fromDBAndBody(db.getValue(),
                                        BSON("authenticate" << 1 << "mechanism"
                                                            << "MONGODB-X509"
-                                                           << "user"
-                                                           << username));
+                                                           << "user" << username));
 }
 
 // Use the MONGODB-X509 protocol to authenticate as "username." The certificate details
@@ -149,7 +148,7 @@ Future<void> authenticateClient(const BSONObj& params,
                                 const std::string& clientName,
                                 RunCommandHook runCommand) {
     auto errorHandler = [](Status status) {
-        if (serverGlobalParams.transitionToAuth && !status.isA<ErrorCategory::NetworkError>()) {
+        if (serverGlobalParams.transitionToAuth && !ErrorCodes::isNetworkError(status)) {
             // If auth failed in transitionToAuth, just pretend it succeeded.
             log() << "Failed to authenticate in transitionToAuth, falling back to no "
                      "authentication.";
@@ -187,13 +186,13 @@ Future<void> authenticateClient(const BSONObj& params,
 
 AuthMongoCRHandler authMongoCR = authMongoCRImpl;
 
-static stdx::mutex internalAuthKeysMutex;
+static auto internalAuthKeysMutex = MONGO_MAKE_LATCH();
 static bool internalAuthSet = false;
 static std::vector<std::string> internalAuthKeys;
 static BSONObj internalAuthParams;
 
 void setInternalAuthKeys(const std::vector<std::string>& keys) {
-    stdx::lock_guard<stdx::mutex> lk(internalAuthKeysMutex);
+    stdx::lock_guard<Latch> lk(internalAuthKeysMutex);
 
     internalAuthKeys = keys;
     fassert(50996, internalAuthKeys.size() > 0);
@@ -201,24 +200,24 @@ void setInternalAuthKeys(const std::vector<std::string>& keys) {
 }
 
 void setInternalUserAuthParams(BSONObj obj) {
-    stdx::lock_guard<stdx::mutex> lk(internalAuthKeysMutex);
+    stdx::lock_guard<Latch> lk(internalAuthKeysMutex);
     internalAuthParams = obj.getOwned();
     internalAuthKeys.clear();
     internalAuthSet = true;
 }
 
 bool hasMultipleInternalAuthKeys() {
-    stdx::lock_guard<stdx::mutex> lk(internalAuthKeysMutex);
+    stdx::lock_guard<Latch> lk(internalAuthKeysMutex);
     return internalAuthSet && internalAuthKeys.size() > 1;
 }
 
 bool isInternalAuthSet() {
-    stdx::lock_guard<stdx::mutex> lk(internalAuthKeysMutex);
+    stdx::lock_guard<Latch> lk(internalAuthKeysMutex);
     return internalAuthSet;
 }
 
 BSONObj getInternalAuthParams(size_t idx, const std::string& mechanism) {
-    stdx::lock_guard<stdx::mutex> lk(internalAuthKeysMutex);
+    stdx::lock_guard<Latch> lk(internalAuthKeysMutex);
     if (!internalAuthSet) {
         return BSONObj();
     }
@@ -241,14 +240,11 @@ BSONObj getInternalAuthParams(size_t idx, const std::string& mechanism) {
             internalSecurity.user->getName().getUser().toString(), password);
     }
 
-    return BSON(saslCommandMechanismFieldName << mechanism << saslCommandUserDBFieldName
-                                              << internalSecurity.user->getName().getDB()
-                                              << saslCommandUserFieldName
-                                              << internalSecurity.user->getName().getUser()
-                                              << saslCommandPasswordFieldName
-                                              << password
-                                              << saslCommandDigestPasswordFieldName
-                                              << false);
+    return BSON(saslCommandMechanismFieldName
+                << mechanism << saslCommandUserDBFieldName
+                << internalSecurity.user->getName().getDB() << saslCommandUserFieldName
+                << internalSecurity.user->getName().getUser() << saslCommandPasswordFieldName
+                << password << saslCommandDigestPasswordFieldName << false);
 }
 
 Future<std::string> negotiateSaslMechanism(RunCommandHook runCommand,
@@ -313,14 +309,10 @@ BSONObj buildAuthParams(StringData dbname,
                         StringData username,
                         StringData passwordText,
                         bool digestPassword) {
-    return BSON(saslCommandMechanismFieldName << "SCRAM-SHA-1" << saslCommandUserDBFieldName
-                                              << dbname
-                                              << saslCommandUserFieldName
-                                              << username
-                                              << saslCommandPasswordFieldName
-                                              << passwordText
-                                              << saslCommandDigestPasswordFieldName
-                                              << digestPassword);
+    return BSON(saslCommandMechanismFieldName
+                << "SCRAM-SHA-1" << saslCommandUserDBFieldName << dbname << saslCommandUserFieldName
+                << username << saslCommandPasswordFieldName << passwordText
+                << saslCommandDigestPasswordFieldName << digestPassword);
 }
 
 StringData getSaslCommandUserDBFieldName() {

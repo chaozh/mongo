@@ -41,31 +41,76 @@ namespace mongo {
 
 using boost::intrusive_ptr;
 using ParsedAggregationProjection = parsed_aggregation_projection::ParsedAggregationProjection;
-using ProjectionPolicies = ParsedAggregationProjection::ProjectionPolicies;
 
 REGISTER_DOCUMENT_SOURCE(project,
                          LiteParsedDocumentSourceDefault::parse,
                          DocumentSourceProject::createFromBson);
 
+REGISTER_DOCUMENT_SOURCE(unset,
+                         LiteParsedDocumentSourceDefault::parse,
+                         DocumentSourceProject::createFromBson);
+
+namespace {
+BSONObj buildExclusionProjectionSpecification(const std::vector<BSONElement>& unsetSpec) {
+    BSONObjBuilder objBuilder;
+    for (const auto& elem : unsetSpec) {
+        objBuilder << elem.valueStringData() << 0;
+    }
+    return objBuilder.obj();
+}
+}  // namespace
+
 intrusive_ptr<DocumentSource> DocumentSourceProject::create(
-    BSONObj projectSpec, const intrusive_ptr<ExpressionContext>& expCtx) {
+    BSONObj projectSpec, const intrusive_ptr<ExpressionContext>& expCtx, StringData specifiedName) {
     const bool isIndependentOfAnyCollection = false;
     intrusive_ptr<DocumentSource> project(new DocumentSourceSingleDocumentTransformation(
         expCtx,
-        ParsedAggregationProjection::create(
-            expCtx,
-            projectSpec,
-            {ProjectionPolicies::DefaultIdPolicy::kIncludeId,
-             ProjectionPolicies::ArrayRecursionPolicy::kRecurseNestedArrays}),
-        "$project",
+        [&]() {
+            // The ParsedAggregationProjection will internally perform a check to see if the
+            // provided specification is valid, and throw an exception if it was not. The exception
+            // is caught here so we can add the name that was actually specified by the user, be it
+            // $project or an alias.
+            try {
+                return ParsedAggregationProjection::create(
+                    expCtx,
+                    projectSpec,
+                    {ProjectionPolicies::DefaultIdPolicy::kIncludeId,
+                     ProjectionPolicies::ArrayRecursionPolicy::kRecurseNestedArrays});
+            } catch (DBException& ex) {
+                ex.addContext("Invalid " + specifiedName.toString());
+                throw;
+            }
+        }(),
+        kStageName,
         isIndependentOfAnyCollection));
     return project;
 }
 
 intrusive_ptr<DocumentSource> DocumentSourceProject::createFromBson(
     BSONElement elem, const intrusive_ptr<ExpressionContext>& expCtx) {
-    uassert(15969, "$project specification must be an object", elem.type() == Object);
-    return DocumentSourceProject::create(elem.Obj(), expCtx);
+    if (elem.fieldNameStringData() == kStageName) {
+        uassert(15969, "$project specification must be an object", elem.type() == BSONType::Object);
+        return DocumentSourceProject::create(elem.Obj(), expCtx, elem.fieldNameStringData());
+    }
+
+    invariant(elem.fieldNameStringData() == kAliasNameUnset);
+    uassert(31002,
+            "$unset specification must be a string or an array",
+            (elem.type() == BSONType::Array || elem.type() == BSONType::String));
+
+    const auto unsetSpec =
+        elem.type() == BSONType::Array ? elem.Array() : std::vector<mongo::BSONElement>{1, elem};
+    uassert(31119,
+            "$unset specification must be a string or an array with at least one field",
+            unsetSpec.size() > 0);
+
+    uassert(31120,
+            "$unset specification must be a string or an array containing only string values",
+            std::all_of(unsetSpec.cbegin(), unsetSpec.cend(), [](BSONElement elem) {
+                return elem.type() == BSONType::String;
+            }));
+    return DocumentSourceProject::create(
+        buildExclusionProjectionSpecification(unsetSpec), expCtx, elem.fieldNameStringData());
 }
 
 }  // namespace mongo

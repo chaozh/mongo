@@ -10,12 +10,15 @@
  *
  * Uses the "reduce" action to combine the results with the contents
  * of the output collection.
+ * @tags: [
+ *   # mapReduce does not support afterClusterTime.
+ *   does_not_support_causal_consistency,
+ * ]
  */
 load('jstests/concurrency/fsm_libs/extend_workload.js');         // for extendWorkload
 load('jstests/concurrency/fsm_workloads/map_reduce_inline.js');  // for $config
 
 var $config = extendWorkload($config, function($config, $super) {
-
     // Use the workload name as a prefix for the collection name,
     // since the workload name is assumed to be unique.
     var prefix = 'map_reduce_reduce';
@@ -25,6 +28,12 @@ var $config = extendWorkload($config, function($config, $super) {
     }
 
     $config.states.init = function init(db, collName) {
+        // TODO SERVER-44150: Cannot run MR with output 'reduce' in agg since the 'whenMatched'
+        // pipeline will always run which can cause unexpected failures in the user-specified reduce
+        // function.
+        assert.commandWorked(
+            db.adminCommand({setParameter: 1, internalQueryUseAggMapReduce: false}));
+
         $super.states.init.apply(this, arguments);
 
         this.outCollName = uniqueCollectionName(prefix, this.tid);
@@ -37,7 +46,6 @@ var $config = extendWorkload($config, function($config, $super) {
                      "output collection '" + fullName + "' should exist");
 
         var options = {finalize: this.finalizer, out: {reduce: this.outCollName}};
-
         var res = db[collName].mapReduce(this.mapper, this.reducer, options);
         assertAlways.commandWorked(res);
     };

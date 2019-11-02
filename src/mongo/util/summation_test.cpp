@@ -41,41 +41,41 @@ namespace mongo {
 
 namespace {
 using limits = std::numeric_limits<long long>;
-std::vector<long long> longValues = {
-    limits::min(),
-    limits::min() + 1,
-    limits::min() / 2,
-    -(1LL << 53),
-    -(1LL << 52),
-    -(1LL << 32),
-    -0x100,
-    -0xff,
-    -0xaa,
-    -0x55,
-    -1,
-    0,
-    1,
-    2,
-    0x55,
-    0x80,
-    0xaa,
-    0x100,
-    512,
-    1024,
-    2048,
-    1LL << 31,
-    1LL << 32,
-    1LL << 52,
-    1LL << 53,
-    limits::max() / 2,
+std::vector<long long> longValues = {limits::min(),
+                                     limits::min() + 1,
+                                     limits::min() / 2,
+                                     -(1LL << 53),
+                                     -(1LL << 52),
+                                     -(1LL << 32),
+                                     -0x100,
+                                     -0xff,
+                                     -0xaa,
+                                     -0x55,
+                                     -1,
+                                     0,
+                                     1,
+                                     2,
+                                     0x55,
+                                     0x80,
+                                     0xaa,
+                                     0x100,
+                                     512,
+                                     1024,
+                                     2048,
+                                     1LL << 31,
+                                     1LL << 32,
+                                     1LL << 52,
+                                     1LL << 53,
+                                     limits::max() / 2,
 
 #pragma warning(push)
 // C4308: negative integral constant converted to unsigned type
 #pragma warning(disable : 4308)
-    static_cast<long long>(1ULL << 63) - (1ULL << (63 - 53 - 1)),  // Halfway between two doubles
+                                     static_cast<long long>(1ULL << 63) -
+                                         (1ULL << (63 - 53 - 1)),  // Halfway between two doubles
 #pragma warning(pop)
-    limits::max() - 1,
-    limits::max()};
+                                     limits::max() - 1,
+                                     limits::max()};
 
 std::vector<double> doubleValues = {
     1.4831356930199802e-05, -3.121724665346865,     3041897608700.073,       1001318343149.7166,
@@ -203,5 +203,33 @@ TEST(Summation, AddDoubles) {
     }
     ASSERT_EQUALS(sum.getDouble(), doubleValuesSum);
     ASSERT(straightSum != sum.getDouble());
+}
+
+TEST(Summation, ConvertInfinityToDecimal) {
+    constexpr double infinity = std::numeric_limits<double>::infinity();
+    DoubleDoubleSummation sum;
+
+    sum.addDouble(infinity);
+    ASSERT_EQUALS(infinity, sum.getDouble());
+    ASSERT_TRUE(sum.getDecimal().isInfinite());
+    ASSERT_FALSE(sum.getDecimal().isNaN());
+
+    sum.addDouble(1);
+    ASSERT_EQUALS(infinity, sum.getDouble());
+    ASSERT_TRUE(sum.getDecimal().isInfinite());
+    ASSERT_FALSE(sum.getDecimal().isNaN());
+}
+
+TEST(Summation, ConvertNaNToDecimal) {
+    constexpr double nan = std::numeric_limits<double>::quiet_NaN();
+    DoubleDoubleSummation sum;
+
+    sum.addDouble(nan);
+    ASSERT_TRUE(sum.getDecimal().isNaN());
+    ASSERT_FALSE(sum.getDecimal().isInfinite());
+
+    sum.addDouble(1);
+    ASSERT_TRUE(sum.getDecimal().isNaN());
+    ASSERT_FALSE(sum.getDecimal().isInfinite());
 }
 }  // namespace mongo

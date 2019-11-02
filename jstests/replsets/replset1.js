@@ -2,8 +2,8 @@ var ssl_options1;
 var ssl_options2;
 var ssl_name;
 load("jstests/replsets/rslib.js");
+load('jstests/replsets/libs/election_metrics.js');
 var doTest = function(signal) {
-
     // Test basic replica set functionality.
     // -- Replication
     // -- Failover
@@ -28,6 +28,12 @@ var doTest = function(signal) {
     // Call getPrimary to return a reference to the node that's been
     // elected master.
     var master = replTest.getPrimary();
+
+    // Check that both the 'called' and 'successful' fields of the 'electionTimeout' election reason
+    // counter have been incremented in serverStatus.
+    const primaryStatus = assert.commandWorked(master.adminCommand({serverStatus: 1}));
+    verifyServerStatusElectionReasonCounterValue(
+        primaryStatus.electionMetrics, "electionTimeout", 1);
 
     // Ensure the primary logs an n-op to the oplog upon transitioning to primary.
     assert.gt(master.getDB("local").oplog.rs.count({op: 'n', o: {msg: 'new primary'}}), 0);
@@ -122,7 +128,8 @@ var doTest = function(signal) {
     var result = db.runCommand({getLastError: 1, w: 3, wtimeout: 30000});
     printjson(result);
     var lastOp = result.lastOp;
-    var lastOplogOp = master.getDB("local").oplog.rs.find().sort({$natural: -1}).limit(1).next();
+    const oplogEntries = replTest.dumpOplog(master);
+    const lastOplogOp = oplogEntries[0];
     assert.eq(lastOplogOp['ts'], lastOp['ts']);
     assert.eq(lastOplogOp['t'], lastOp['t']);
 

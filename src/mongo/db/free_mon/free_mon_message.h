@@ -33,8 +33,8 @@
 #include <vector>
 
 #include "mongo/db/free_mon/free_mon_protocol_gen.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/stdx/condition_variable.h"
-#include "mongo/stdx/mutex.h"
 #include "mongo/util/duration.h"
 #include "mongo/util/time_support.h"
 
@@ -67,8 +67,8 @@ enum class FreeMonMessageType {
     AsyncRegisterFail,
 
     /**
-    * Unregister server from server command.
-    */
+     * Unregister server from server command.
+     */
     UnregisterCommand,
 
     /**
@@ -117,24 +117,24 @@ enum class FreeMonMessageType {
  */
 enum class RegistrationType {
     /**
-    * Do not register on start because it was not configured via commandline/config file.
-    */
+     * Do not register on start because it was not configured via commandline/config file.
+     */
     DoNotRegister,
 
     /**
-    * Register immediately on start since we are a standalone.
-    */
+     * Register immediately on start since we are a standalone.
+     */
     RegisterOnStart,
 
     /**
-    * Register after transition to becoming primary because we are in a replica set,
-    * and Free Monitoring has been explicitly enabled.
-    */
+     * Register after transition to becoming primary because we are in a replica set,
+     * and Free Monitoring has been explicitly enabled.
+     */
     RegisterAfterOnTransitionToPrimary,
 
     /**
-    * As above, but only if we have been runtime enabled.
-    */
+     * As above, but only if we have been runtime enabled.
+     */
     RegisterAfterOnTransitionToPrimaryIfEnabled,
 };
 
@@ -292,7 +292,7 @@ public:
      * Set Status and signal waiter.
      */
     void set(Status status) {
-        stdx::lock_guard<stdx::mutex> lock(_mutex);
+        stdx::lock_guard<Latch> lock(_mutex);
 
         invariant(!_set);
         if (!_set) {
@@ -308,7 +308,7 @@ public:
      * Returns boost::none on timeout.
      */
     boost::optional<Status> wait_for(Milliseconds duration) {
-        stdx::unique_lock<stdx::mutex> lock(_mutex);
+        stdx::unique_lock<Latch> lock(_mutex);
 
         if (!_condvar.wait_for(lock, duration.toSystemDuration(), [this]() { return _set; })) {
             return {};
@@ -322,7 +322,7 @@ private:
     stdx::condition_variable _condvar;
 
     // Lock for condition variable and to protect state
-    stdx::mutex _mutex;
+    Mutex _mutex = MONGO_MAKE_LATCH("WaitableResult::_mutex");
 
     // Indicates whether _status has been set
     bool _set{false};
@@ -334,7 +334,7 @@ private:
 /**
  * For the messages that the caller needs to wait on, this provides a mechanism to wait on messages
  * to be processed.
-*/
+ */
 template <FreeMonMessageType typeT>
 struct FreeMonWaitablePayloadForMessage {
     using payload_type = void;

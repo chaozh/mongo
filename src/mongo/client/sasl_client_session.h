@@ -29,13 +29,12 @@
 
 #pragma once
 
+#include <functional>
 #include <memory>
 #include <string>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/base/status.h"
 #include "mongo/base/string_data.h"
-#include "mongo/stdx/functional.h"
 
 namespace mongo {
 
@@ -53,10 +52,11 @@ namespace mongo {
  * parameterPassword parameter is not constrained.
  */
 class SaslClientSession {
-    MONGO_DISALLOW_COPYING(SaslClientSession);
+    SaslClientSession(const SaslClientSession&) = delete;
+    SaslClientSession& operator=(const SaslClientSession&) = delete;
 
 public:
-    typedef stdx::function<SaslClientSession*(const std::string&)> SaslClientSessionFactoryFn;
+    typedef std::function<SaslClientSession*(const std::string&)> SaslClientSessionFactoryFn;
     static SaslClientSessionFactoryFn create;
 
     /**

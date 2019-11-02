@@ -38,39 +38,31 @@ namespace mongo {
 /**
  * This error is thrown when an update would cause a document to be owned by a different
  * shard. If the update is part of a multi statement transaction, we will attach the
- * query from the original update and the post image returned by the update stage. MongoS
- * will use these to delete the original doc and insert the new doc. If the update is a
- * retryable write, we will attach both the query and the update fields from the original
- * update command. MongoS will use these to start an internal transaction and re-run the
- * update command.
+ * pre image and the post image returned by the update stage. MongoS will use these to delete
+ * the original doc and insert the new doc. If the update is a retryable write, we will attach
+ * only the pre image.
  */
 class WouldChangeOwningShardInfo final : public ErrorExtraInfo {
 public:
     static constexpr auto code = ErrorCodes::WouldChangeOwningShard;
 
-    explicit WouldChangeOwningShardInfo(const BSONObj& originalQueryPredicate,
-                                        const boost::optional<BSONObj>& originalUpdate,
-                                        const boost::optional<BSONObj>& postImage)
-        : _originalQueryPredicate(originalQueryPredicate.getOwned()) {
-        invariant(!(originalUpdate && postImage));
-        invariant(originalUpdate || postImage);
+    explicit WouldChangeOwningShardInfo(const BSONObj& preImage,
+                                        const BSONObj& postImage,
+                                        const bool shouldUpsert)
+        : _preImage(preImage.getOwned()),
+          _postImage(postImage.getOwned()),
+          _shouldUpsert(shouldUpsert) {}
 
-        if (originalUpdate)
-            _originalUpdate = originalUpdate->getOwned();
-        if (postImage)
-            _postImage = postImage->getOwned();
-    }
-
-    const auto& getOriginalQueryPredicate() const {
-        return _originalQueryPredicate;
-    }
-
-    const auto& getOriginalUpdate() const {
-        return _originalUpdate;
+    const auto& getPreImage() const {
+        return _preImage;
     }
 
     const auto& getPostImage() const {
         return _postImage;
+    }
+
+    const auto& getShouldUpsert() const {
+        return _shouldUpsert;
     }
 
     BSONObj toBSON() const {
@@ -84,14 +76,14 @@ public:
     static WouldChangeOwningShardInfo parseFromCommandError(const BSONObj& commandError);
 
 private:
-    // the 'q' portion of the original update comamand
-    BSONObj _originalQueryPredicate;
-
-    // The 'u' portion of the original update command
-    boost::optional<BSONObj> _originalUpdate;
+    // The pre image of the document
+    BSONObj _preImage;
 
     // The post image returned by the update stage
-    boost::optional<BSONObj> _postImage;
+    BSONObj _postImage;
+
+    // True if {upsert: true} and the update stage did not match any docs
+    bool _shouldUpsert;
 };
 using WouldChangeOwningShardException = ExceptionFor<ErrorCodes::WouldChangeOwningShard>;
 

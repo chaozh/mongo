@@ -3,7 +3,6 @@
 
 load('./jstests/multiVersion/libs/multi_rs.js');
 load('./jstests/libs/test_background_ops.js');
-load('./jstests/libs/feature_compatibility_version.js');
 
 let newVersion = "latest";
 let oldVersion = "last-stable";
@@ -43,7 +42,7 @@ function runDowngradeTest() {
         let coll = new Mongo(rsURL).getCollection(collParam);
         let count = 10;
         while (!isFinished()) {
-            assert.writeOK(coll.insert({_id: count, str: "hello world"}));
+            assert.commandWorked(coll.insert({_id: count, str: "hello world"}));
             count++;
         }
     }

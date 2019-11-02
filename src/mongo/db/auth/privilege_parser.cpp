@@ -34,14 +34,14 @@
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/field_parser.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
 using std::string;
 using std::vector;
 
-using mongoutils::str::stream;
+using str::stream;
 
 const BSONField<bool> ParsedResource::anyResource("anyResource");
 const BSONField<bool> ParsedResource::cluster("cluster");
@@ -56,7 +56,7 @@ ParsedResource::~ParsedResource() {}
 
 bool ParsedResource::isValid(std::string* errMsg) const {
     std::string dummy;
-    if (errMsg == NULL) {
+    if (errMsg == nullptr) {
         errMsg = &dummy;
     }
 
@@ -273,7 +273,7 @@ ParsedPrivilege::~ParsedPrivilege() {}
 
 bool ParsedPrivilege::isValid(std::string* errMsg) const {
     std::string dummy;
-    if (errMsg == NULL) {
+    if (errMsg == nullptr) {
         errMsg = &dummy;
     }
 

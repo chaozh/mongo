@@ -1,15 +1,15 @@
 // @tags: [
-//     # Cannot implicitly shard accessed collections because the "splitVector" command cannot be
-//     # run on a sharded collection
-//     assumes_unsharded_collection,
-//     requires_fastcount,
-//     requires_collstats,
-//     # rollbacks make WT RecordStore dataSize go out of sync, which negatively impacts the
-//     # splitVector calculations.
-//     does_not_support_stepdowns,
-//
-//     # splitVector command is not available on embedded
-//     incompatible_with_embedded,
+//   assumes_superuser_permissions,
+//   # Cannot implicitly shard accessed collections because the "splitVector" command cannot be run
+//   # on a sharded collection
+//   assumes_unsharded_collection,
+//   # rollbacks make WT RecordStore dataSize go out of sync, which negatively impacts the
+//   # splitVector calculations.
+//   does_not_support_stepdowns,
+//   # splitVector command is not available on embedded
+//   incompatible_with_embedded,
+//   requires_collstats,
+//   requires_fastcount,
 // ]
 
 // -------------------------
@@ -73,7 +73,7 @@ let bulkInsertDocs = function(coll, numDocs, filler) {
     for (let i = 1; i <= numDocs; i++) {
         bulk.insert({x: i, y: filler});
     }
-    assert.writeOK(bulk.execute());
+    assert.commandWorked(bulk.execute());
 };
 
 // Inserts numDocs into the given collection using a bulk operation. Each document's x value is set
@@ -83,7 +83,7 @@ let bulkInsertDocsFixedX = function(coll, numDocs, filler, xVal) {
     for (let i = 1; i <= numDocs; i++) {
         bulk.insert({x: xVal, y: filler});
     }
-    assert.writeOK(bulk.execute());
+    assert.commandWorked(bulk.execute());
 };
 
 // -------------------------

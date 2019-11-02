@@ -44,8 +44,8 @@
 #include "mongo/db/startup_warnings_common.h"
 #include "mongo/db/storage/storage_options.h"
 #include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
 #include "mongo/util/processinfo.h"
+#include "mongo/util/str.h"
 #include "mongo/util/version.h"
 
 namespace mongo {
@@ -111,9 +111,9 @@ StatusWith<std::string> StartupWarningsMongod::readTransparentHugePagesParameter
 
         opMode = line.substr(posBegin + 1, posEnd - posBegin - 1);
         if (opMode.empty()) {
-            return StatusWith<std::string>(
-                ErrorCodes::BadValue,
-                str::stream() << "invalid mode in " << filename << ": '" << line << "'");
+            return StatusWith<std::string>(ErrorCodes::BadValue,
+                                           str::stream() << "invalid mode in " << filename << ": '"
+                                                         << line << "'");
         }
 
         // Check against acceptable values of opMode.
@@ -122,16 +122,12 @@ StatusWith<std::string> StartupWarningsMongod::readTransparentHugePagesParameter
                 ErrorCodes::BadValue,
                 str::stream()
                     << "** WARNING: unrecognized transparent Huge Pages mode of operation in "
-                    << filename
-                    << ": '"
-                    << opMode
-                    << "''");
+                    << filename << ": '" << opMode << "''");
         }
     } catch (const boost::filesystem::filesystem_error& err) {
         return StatusWith<std::string>(ErrorCodes::UnknownError,
                                        str::stream() << "Failed to probe \"" << err.path1().string()
-                                                     << "\": "
-                                                     << err.code().message());
+                                                     << "\": " << err.code().message());
     }
 
     return StatusWith<std::string>(opMode);
@@ -296,8 +292,8 @@ void logMongodStartupWarnings(const StorageGlobalParams& storageParams,
 #endif  // __linux__
 
 #ifndef _WIN32
-    // Check that # of files rlmit >= 1000
-    const unsigned int minNumFiles = 1000;
+    // Check that # of files rlmit >= 64000
+    const unsigned int minNumFiles = 64000;
     struct rlimit rlnofile;
 
     if (!getrlimit(RLIMIT_NOFILE, &rlnofile)) {
@@ -312,40 +308,19 @@ void logMongodStartupWarnings(const StorageGlobalParams& storageParams,
         log() << "** WARNING: getrlimit failed. " << errmsg << startupWarningsLog;
     }
 
-// Solaris does not have RLIMIT_NPROC & RLIMIT_MEMLOCK, these are exposed via getrctl(2) instead
+// Solaris does not have RLIMIT_MEMLOCK, these are exposed via getrctl(2) instead
 #ifndef __sun
-    // Check # of processes >= # of files/2
     // Check we can lock at least 16 pages for the SecureAllocator
-    const double filesToProcsRatio = 2.0;
     const unsigned int minLockedPages = 16;
 
     struct rlimit rlmemlock;
-    struct rlimit rlnproc;
 
-    if (!getrlimit(RLIMIT_NPROC, &rlnproc) && !getrlimit(RLIMIT_MEMLOCK, &rlmemlock)) {
+    if (!getrlimit(RLIMIT_MEMLOCK, &rlmemlock)) {
         if ((rlmemlock.rlim_cur / ProcessInfo::getPageSize()) < minLockedPages) {
             log() << startupWarningsLog;
             log() << "** WARNING: soft rlimits too low. The locked memory size is "
                   << rlmemlock.rlim_cur << " bytes, it should be at least "
                   << minLockedPages * ProcessInfo::getPageSize() << " bytes" << startupWarningsLog;
-        }
-
-        if (false) {
-            // juse to make things cleaner
-        }
-#ifdef __APPLE__
-        else if (rlnproc.rlim_cur >= 709) {
-            // os x doesn't make it easy to go higher
-            // ERH thinks its ok not to add the warning in this case 7/3/2012
-        }
-#endif
-        else if (rlnproc.rlim_cur < rlnofile.rlim_cur / filesToProcsRatio) {
-            log() << startupWarningsLog;
-            log() << "** WARNING: soft rlimits too low. rlimits set to " << rlnproc.rlim_cur
-                  << " processes, " << rlnofile.rlim_cur
-                  << " files. Number of processes should be at least "
-                  << rlnofile.rlim_cur / filesToProcsRatio << " : " << 1 / filesToProcsRatio
-                  << " times number of files." << startupWarningsLog;
         }
     } else {
         const auto errmsg = errnoWithDescription();

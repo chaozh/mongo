@@ -69,7 +69,7 @@ void mongo::audit::logQueryAuthzCheck(Client* client,
 void mongo::audit::logUpdateAuthzCheck(Client* client,
                                        const NamespaceString& ns,
                                        const BSONObj& query,
-                                       const BSONObj& updateObj,
+                                       const write_ops::UpdateModification& update,
                                        bool isUpsert,
                                        bool isMulti,
                                        ErrorCodes::Error result) {}
@@ -171,5 +171,9 @@ void mongo::audit::logShardCollection(Client* client,
                                       StringData ns,
                                       const BSONObj& keyPattern,
                                       bool unique) {}
+
+void mongo::audit::logRefineCollectionShardKey(Client* client,
+                                               StringData ns,
+                                               const BSONObj& keyPattern) {}
 
 #endif

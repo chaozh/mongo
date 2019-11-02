@@ -51,7 +51,8 @@ namespace mongo {
  * the database reference returned by this class should not be retained.
  */
 class AutoGetDb {
-    MONGO_DISALLOW_COPYING(AutoGetDb);
+    AutoGetDb(const AutoGetDb&) = delete;
+    AutoGetDb& operator=(const AutoGetDb&) = delete;
 
 public:
     AutoGetDb(OperationContext* opCtx,
@@ -72,8 +73,15 @@ private:
 };
 
 /**
- * RAII-style class, which acquires a locks on the specified database and collection in the
- * requested modes and obtains references to both.
+ * RAII-style class, which acquires global, database, and collection locks according to the chart
+ * below.
+ *
+ * | modeColl | Global Lock Result | DB Lock Result | Collection Lock Result |
+ * |----------+--------------------+----------------+------------------------|
+ * | MODE_IX  | MODE_IX            | MODE_IX        | MODE_IX                |
+ * | MODE_X   | MODE_IX            | MODE_IX        | MODE_X                 |
+ * | MODE_IS  | MODE_IS            | MODE_IS        | MODE_IS                |
+ * | MODE_S   | MODE_IS            | MODE_IS        | MODE_S                 |
  *
  * NOTE: Throws NamespaceNotFound if the collection UUID cannot be resolved to a name.
  *
@@ -81,32 +89,17 @@ private:
  * and the collection references returned by this class should not be retained.
  */
 class AutoGetCollection {
-    MONGO_DISALLOW_COPYING(AutoGetCollection);
+    AutoGetCollection(const AutoGetCollection&) = delete;
+    AutoGetCollection& operator=(const AutoGetCollection&) = delete;
 
 public:
     enum ViewMode { kViewsPermitted, kViewsForbidden };
 
     AutoGetCollection(OperationContext* opCtx,
                       const NamespaceStringOrUUID& nsOrUUID,
-                      LockMode modeAll,
-                      ViewMode viewMode = kViewsForbidden,
-                      Date_t deadline = Date_t::max())
-        : AutoGetCollection(opCtx, nsOrUUID, modeAll, modeAll, viewMode, deadline) {}
-
-    AutoGetCollection(OperationContext* opCtx,
-                      const NamespaceStringOrUUID& nsOrUUID,
-                      LockMode modeDB,
                       LockMode modeColl,
                       ViewMode viewMode = kViewsForbidden,
                       Date_t deadline = Date_t::max());
-
-    /**
-     * Without acquiring any locks resolves the given NamespaceStringOrUUID to an actual namespace.
-     * Throws NamespaceNotFound if the collection UUID cannot be resolved to a name, or if the UUID
-     * can be resolved, but the resulting collection is in the wrong database.
-     */
-    static NamespaceString resolveNamespaceStringOrUUID(OperationContext* opCtx,
-                                                        NamespaceStringOrUUID nsOrUUID);
 
     /**
      * Returns nullptr if the database didn't exist.
@@ -155,8 +148,7 @@ private:
  * RAII-style class, which acquires a lock on the specified database in the requested mode and
  * obtains a reference to the database, creating it was non-existing. Used as a shortcut for
  * calls to DatabaseHolder::get(opCtx)->openDb(), taking care of locking details. The
- * requested mode must be MODE_IX or MODE_X. If the database needs to be created, the lock will
- * automatically be reacquired as MODE_X.
+ * requested mode must be MODE_IX or MODE_X.
  *
  * Use this when you are about to perform a write, and want to create the database if it doesn't
  * already exist.
@@ -165,7 +157,8 @@ private:
  * the database reference returned by this class should not be retained.
  */
 class AutoGetOrCreateDb {
-    MONGO_DISALLOW_COPYING(AutoGetOrCreateDb);
+    AutoGetOrCreateDb(const AutoGetOrCreateDb&) = delete;
+    AutoGetOrCreateDb& operator=(const AutoGetOrCreateDb&) = delete;
 
 public:
     AutoGetOrCreateDb(OperationContext* opCtx,
@@ -182,36 +175,58 @@ public:
     }
 
 private:
-    boost::optional<AutoGetDb> _autoDb;
+    AutoGetDb _autoDb;
 
     Database* _db;
     bool _justCreated{false};
 };
 
 /**
- * RAII-style class. Hides changes to the UUIDCatalog For the life of the object so that calls to
- * UUIDCatalog::lookupNSSByUUID will return results as before the RAII object was instantiated.
+ * RAII-style class. Hides changes to the CollectionCatalog for the life of the object, so that
+ * calls to CollectionCatalog::lookupNSSByUUID will return results as before the RAII object was
+ * instantiated.
  *
  * The caller must hold the global exclusive lock for the life of the instance.
  */
-class ConcealUUIDCatalogChangesBlock {
-    MONGO_DISALLOW_COPYING(ConcealUUIDCatalogChangesBlock);
+class ConcealCollectionCatalogChangesBlock {
+    ConcealCollectionCatalogChangesBlock(const ConcealCollectionCatalogChangesBlock&) = delete;
+    ConcealCollectionCatalogChangesBlock& operator=(const ConcealCollectionCatalogChangesBlock&) =
+        delete;
 
 public:
     /**
-     * Conceals future UUIDCatalog changes and stashes a pointer to the opCtx for the destructor to
-     * use.
+     * Conceals future CollectionCatalog changes and stashes a pointer to the opCtx for the
+     * destructor to use.
      */
-    ConcealUUIDCatalogChangesBlock(OperationContext* opCtx);
+    ConcealCollectionCatalogChangesBlock(OperationContext* opCtx);
 
     /**
-     * Reveals UUIDCatalog changes.
+     * Reveals CollectionCatalog changes.
      */
-    ~ConcealUUIDCatalogChangesBlock();
+    ~ConcealCollectionCatalogChangesBlock();
 
 private:
-    // Needed for the destructor to access the UUIDCatalog in order to call onOpenCatalog.
+    // Needed for the destructor to access the CollectionCatalog in order to call onOpenCatalog.
     OperationContext* _opCtx;
+};
+
+/**
+ * RAII type to set and restore the timestamp read source on the recovery unit.
+ *
+ * Snapshot is abandoned in constructor and destructor, so it can only be used before
+ * the recovery unit becomes active or when the existing snapshot is no longer needed.
+ */
+class ReadSourceScope {
+public:
+    ReadSourceScope(OperationContext* opCtx,
+                    RecoveryUnit::ReadSource readSource = RecoveryUnit::ReadSource::kUnset,
+                    boost::optional<Timestamp> provided = boost::none);
+    ~ReadSourceScope();
+
+private:
+    OperationContext* _opCtx;
+    RecoveryUnit::ReadSource _originalReadSource;
+    Timestamp _originalReadTimestamp;
 };
 
 }  // namespace mongo

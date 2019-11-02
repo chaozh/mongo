@@ -37,9 +37,10 @@ namespace mongo {
 namespace fts {
 
 TEST(English, Basic1) {
-    const StopWords* englishStopWords = StopWords::getStopWords(&languageEnglishV2);
+    const FTSLanguage* lang = &FTSLanguage::make("english", TEXT_INDEX_VERSION_2);
+    const StopWords* englishStopWords = StopWords::getStopWords(lang);
     ASSERT(englishStopWords->isStopWord("the"));
     ASSERT(!englishStopWords->isStopWord("computer"));
 }
-}
-}
+}  // namespace fts
+}  // namespace mongo

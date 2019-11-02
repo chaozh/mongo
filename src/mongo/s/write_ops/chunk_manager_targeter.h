@@ -94,8 +94,11 @@ public:
 
     void noteCouldNotTarget() override;
 
-    void noteStaleResponse(const ShardEndpoint& endpoint,
-                           const StaleConfigInfo& staleInfo) override;
+    void noteStaleShardResponse(const ShardEndpoint& endpoint,
+                                const StaleConfigInfo& staleInfo) override;
+
+    void noteStaleDbResponse(const ShardEndpoint& endpoint,
+                             const StaleDbRoutingVersion& staleInfo) override;
 
     /**
      * Replaces the targeting information with the latest information from the cache.  If this
@@ -114,31 +117,12 @@ private:
     /**
      * Performs an actual refresh from the config server.
      */
-    Status _refreshNow(OperationContext* opCtx);
+    Status _refreshShardVersionNow(OperationContext* opCtx);
 
     /**
-     * Attempts to route an update operation by extracting an exact shard key from the given query
-     * and/or update expression. Should only be called on sharded collections, and with a valid
-     * updateType. Returns not-OK if the user's query is invalid, if the extracted shard key exceeds
-     * the maximum allowed length, or if the update could not be targeted by exact shard key.
+     * Performs an actual refresh from the config server.
      */
-    StatusWith<std::vector<ShardEndpoint>> _targetUpdateByShardKey(OperationContext* opCtx,
-                                                                   const UpdateType updateType,
-                                                                   const BSONObj query,
-                                                                   const BSONObj collation,
-                                                                   const BSONObj updateExpr,
-                                                                   const bool isUpsert) const;
-
-    /**
-     * Returns a vector of ShardEndpoints where a document might need to be placed.
-     *
-     * Returns !OK with message if replacement could not be targeted
-     *
-     * If 'collation' is empty, we use the collection default collation for targeting.
-     */
-    StatusWith<std::vector<ShardEndpoint>> _targetDoc(OperationContext* opCtx,
-                                                      const BSONObj& doc,
-                                                      const BSONObj& collation) const;
+    Status _refreshDbVersionNow(OperationContext* opCtx);
 
     /**
      * Returns a vector of ShardEndpoints for a potentially multi-shard query.
@@ -159,9 +143,9 @@ private:
      *
      * If 'collation' is empty, we use the collection default collation for targeting.
      */
-    ShardEndpoint _targetShardKey(const BSONObj& shardKey,
-                                  const BSONObj& collation,
-                                  long long estDataSize) const;
+    StatusWith<ShardEndpoint> _targetShardKey(const BSONObj& shardKey,
+                                              const BSONObj& collation,
+                                              long long estDataSize) const;
 
     // Full namespace of the collection for this targeter
     const NamespaceString _nss;
@@ -178,6 +162,9 @@ private:
 
     // Map of shard->remote shard version reported from stale errors
     ShardVersionMap _remoteShardVersions;
+
+    // remote db version reported from stale errors
+    boost::optional<DatabaseVersion> _remoteDbVersion;
 };
 
 }  // namespace mongo

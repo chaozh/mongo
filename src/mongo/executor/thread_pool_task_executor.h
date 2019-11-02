@@ -29,24 +29,21 @@
 
 #pragma once
 
+#include <list>
 #include <memory>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/executor/task_executor.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/stdx/condition_variable.h"
-#include "mongo/stdx/list.h"
-#include "mongo/stdx/mutex.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/transport/baton.h"
-#include "mongo/util/fail_point_service.h"
+#include "mongo/util/fail_point.h"
 
 namespace mongo {
 
 class ThreadPoolInterface;
 
 namespace executor {
-MONGO_FAIL_POINT_DECLARE(initialSyncFuzzerSynchronizationPoint1);
-MONGO_FAIL_POINT_DECLARE(initialSyncFuzzerSynchronizationPoint2);
 
 struct ConnectionPoolStats;
 class NetworkInterface;
@@ -55,7 +52,8 @@ class NetworkInterface;
  * Implementation of a TaskExecutor that uses a pool of threads to execute work items.
  */
 class ThreadPoolTaskExecutor final : public TaskExecutor {
-    MONGO_DISALLOW_COPYING(ThreadPoolTaskExecutor);
+    ThreadPoolTaskExecutor(const ThreadPoolTaskExecutor&) = delete;
+    ThreadPoolTaskExecutor& operator=(const ThreadPoolTaskExecutor&) = delete;
 
 public:
     /**
@@ -77,16 +75,17 @@ public:
     Date_t now() override;
     StatusWith<EventHandle> makeEvent() override;
     void signalEvent(const EventHandle& event) override;
-    StatusWith<CallbackHandle> onEvent(const EventHandle& event, CallbackFn work) override;
+    StatusWith<CallbackHandle> onEvent(const EventHandle& event, CallbackFn&& work) override;
     StatusWith<stdx::cv_status> waitForEvent(OperationContext* opCtx,
                                              const EventHandle& event,
                                              Date_t deadline) override;
     void waitForEvent(const EventHandle& event) override;
-    StatusWith<CallbackHandle> scheduleWork(CallbackFn work) override;
-    StatusWith<CallbackHandle> scheduleWorkAt(Date_t when, CallbackFn work) override;
-    StatusWith<CallbackHandle> scheduleRemoteCommand(const RemoteCommandRequest& request,
-                                                     const RemoteCommandCallbackFn& cb,
-                                                     const BatonHandle& baton = nullptr) override;
+    StatusWith<CallbackHandle> scheduleWork(CallbackFn&& work) override;
+    StatusWith<CallbackHandle> scheduleWorkAt(Date_t when, CallbackFn&& work) override;
+    StatusWith<CallbackHandle> scheduleRemoteCommandOnAny(
+        const RemoteCommandRequestOnAny& request,
+        const RemoteCommandOnAnyCallbackFn& cb,
+        const BatonHandle& baton = nullptr) override;
     void cancel(const CallbackHandle& cbHandle) override;
     void wait(const CallbackHandle& cbHandle,
               Interruptible* interruptible = Interruptible::notInterruptible()) override;
@@ -101,8 +100,8 @@ public:
 private:
     class CallbackState;
     class EventState;
-    using WorkQueue = stdx::list<std::shared_ptr<CallbackState>>;
-    using EventList = stdx::list<std::shared_ptr<EventState>>;
+    using WorkQueue = std::list<std::shared_ptr<CallbackState>>;
+    using EventList = std::list<std::shared_ptr<EventState>>;
 
     /**
      * Representation of the stage of life of a thread pool.
@@ -148,13 +147,13 @@ private:
     /**
      * Signals the given event.
      */
-    void signalEvent_inlock(const EventHandle& event, stdx::unique_lock<stdx::mutex> lk);
+    void signalEvent_inlock(const EventHandle& event, stdx::unique_lock<Latch> lk);
 
     /**
      * Schedules all items from "fromQueue" into the thread pool and moves them into
      * _poolInProgressQueue.
      */
-    void scheduleIntoPool_inlock(WorkQueue* fromQueue, stdx::unique_lock<stdx::mutex> lk);
+    void scheduleIntoPool_inlock(WorkQueue* fromQueue, stdx::unique_lock<Latch> lk);
 
     /**
      * Schedules the given item from "fromQueue" into the thread pool and moves it into
@@ -162,7 +161,7 @@ private:
      */
     void scheduleIntoPool_inlock(WorkQueue* fromQueue,
                                  const WorkQueue::iterator& iter,
-                                 stdx::unique_lock<stdx::mutex> lk);
+                                 stdx::unique_lock<Latch> lk);
 
     /**
      * Schedules entries from "begin" through "end" in "fromQueue" into the thread pool
@@ -171,7 +170,7 @@ private:
     void scheduleIntoPool_inlock(WorkQueue* fromQueue,
                                  const WorkQueue::iterator& begin,
                                  const WorkQueue::iterator& end,
-                                 stdx::unique_lock<stdx::mutex> lk);
+                                 stdx::unique_lock<Latch> lk);
 
     /**
      * Executes the callback specified by "cbState".
@@ -180,16 +179,16 @@ private:
 
     bool _inShutdown_inlock() const;
     void _setState_inlock(State newState);
-    stdx::unique_lock<stdx::mutex> _join(stdx::unique_lock<stdx::mutex> lk);
+    stdx::unique_lock<Latch> _join(stdx::unique_lock<Latch> lk);
 
     // The network interface used for remote command execution and waiting.
     std::shared_ptr<NetworkInterface> _net;
 
     // The thread pool that executes scheduled work items.
-    std::unique_ptr<ThreadPoolInterface> _pool;
+    std::shared_ptr<ThreadPoolInterface> _pool;
 
     // Mutex guarding all remaining fields.
-    mutable stdx::mutex _mutex;
+    mutable Mutex _mutex = MONGO_MAKE_LATCH("ThreadPoolTaskExecutor::_mutex");
 
     // Queue containing all items currently scheduled into the thread pool but not yet completed.
     WorkQueue _poolInProgressQueue;

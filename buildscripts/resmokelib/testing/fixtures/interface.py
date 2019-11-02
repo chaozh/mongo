@@ -1,7 +1,5 @@
 """Interface of the different fixtures for executing JSTests against."""
 
-from __future__ import absolute_import
-
 import os.path
 import time
 
@@ -25,14 +23,16 @@ def make_fixture(class_name, *args, **kwargs):
     return _FIXTURES[class_name](*args, **kwargs)
 
 
-class Fixture(object):
+class Fixture(object, metaclass=registry.make_registry_metaclass(_FIXTURES)):
     """Base class for all fixtures."""
-
-    __metaclass__ = registry.make_registry_metaclass(_FIXTURES)  # type: ignore
 
     # We explicitly set the 'REGISTERED_NAME' attribute so that PyLint realizes that the attribute
     # is defined for all subclasses of Fixture.
     REGISTERED_NAME = "Fixture"
+
+    _LAST_STABLE_FCV = "4.2"
+    _LATEST_FCV = "4.4"
+    _LAST_STABLE_BIN_VERSION = "4.2"
 
     def __init__(self, logger, job_num, dbpath_prefix=None):
         """Initialize the fixture with a logger instance."""
@@ -51,6 +51,10 @@ class Fixture(object):
         dbpath_prefix = utils.default_if_none(config.DBPATH_PREFIX, dbpath_prefix)
         dbpath_prefix = utils.default_if_none(dbpath_prefix, config.DEFAULT_DBPATH_PREFIX)
         self._dbpath_prefix = os.path.join(dbpath_prefix, "job{}".format(self.job_num))
+
+    def pids(self):
+        """Return any pids owned by this fixture."""
+        raise NotImplementedError("pids must be implemented by Fixture subclasses %s" % self)
 
     def setup(self):
         """Create the fixture."""
@@ -142,6 +146,7 @@ class ReplFixture(Fixture):
     REGISTERED_NAME = registry.LEAVE_UNREGISTERED  # type: ignore
 
     AWAIT_REPL_TIMEOUT_MINS = 5
+    AWAIT_REPL_TIMEOUT_FOREVER_MINS = 24 * 60
 
     def get_primary(self):
         """Return the primary of a replica set."""
@@ -195,6 +200,10 @@ class NoOpFixture(Fixture):
     """
 
     REGISTERED_NAME = "NoOpFixture"
+
+    def pids(self):
+        """:return: any pids owned by this fixture (none for NopFixture)."""
+        return []
 
     def mongo_client(self, read_preference=None, timeout_millis=None):
         """Return the mongo_client connection."""

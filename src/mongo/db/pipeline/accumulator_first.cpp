@@ -31,14 +31,14 @@
 
 #include "mongo/db/pipeline/accumulator.h"
 
+#include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/pipeline/accumulation_statement.h"
-#include "mongo/db/pipeline/value.h"
 
 namespace mongo {
 
 using boost::intrusive_ptr;
 
-REGISTER_ACCUMULATOR(first, AccumulatorFirst::create);
+REGISTER_ACCUMULATOR(first, genericParseSingleExpressionAccumulator<AccumulatorFirst>);
 
 const char* AccumulatorFirst::getOpName() const {
     return "$first";
@@ -74,4 +74,4 @@ intrusive_ptr<Accumulator> AccumulatorFirst::create(
     const boost::intrusive_ptr<ExpressionContext>& expCtx) {
     return new AccumulatorFirst(expCtx);
 }
-}
+}  // namespace mongo

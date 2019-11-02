@@ -41,8 +41,7 @@ protected:
                                                << "coll");
     const BSONObj kFindCmdTargeted = BSON("find"
                                           << "coll"
-                                          << "filter"
-                                          << BSON("_id" << 0));
+                                          << "filter" << BSON("_id" << 0));
 
     // The index of the shard expected to receive the response is used to prevent different shards
     // from returning documents with the same shard key. This is expected to be 0 for queries
@@ -53,7 +52,12 @@ protected:
 
             std::vector<BSONObj> batch = {BSON("_id" << shardIndex)};
             CursorResponse cursorResponse(kNss, CursorId(0), batch);
-            return cursorResponse.toBSON(CursorResponse::ResponseType::InitialResponse);
+
+            BSONObjBuilder bob;
+            bob.appendElementsUnique(
+                cursorResponse.toBSON(CursorResponse::ResponseType::InitialResponse));
+            appendTxnResponseMetadata(bob);
+            return bob.obj();
         });
     }
 
@@ -65,7 +69,12 @@ protected:
 
             std::vector<BSONObj> batch = {BSON("_id" << shardIndex)};
             CursorResponse cursorResponse(kNss, CursorId(0), batch);
-            return cursorResponse.toBSON(CursorResponse::ResponseType::InitialResponse);
+
+            BSONObjBuilder bob;
+            bob.appendElementsUnique(
+                cursorResponse.toBSON(CursorResponse::ResponseType::InitialResponse));
+            appendTxnResponseMetadata(bob);
+            return bob.obj();
         });
     }
 };

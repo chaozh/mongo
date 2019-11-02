@@ -1,18 +1,16 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 """Produce a report of all assertions in the MongoDB server codebase.
 
 Parses .cpp files for assertions and verifies assertion codes are distinct.
 Optionally replaces zero codes in source code with new distinct values.
 """
 
-from __future__ import absolute_import
-from __future__ import print_function
-
 import bisect
 import os.path
 import sys
 from collections import defaultdict, namedtuple
 from optparse import OptionParser
+from functools import reduce
 
 # Get relative imports to work when the package is not installed on the PYTHONPATH.
 if __name__ == "__main__" and __package__ is None:
@@ -23,7 +21,7 @@ from buildscripts import utils  # pylint: disable=wrong-import-position
 try:
     import regex as re
 except ImportError:
-    print("*** Run 'pip2 install --user regex' to speed up error code checking")
+    print("*** Run 'pip3 install --user regex' to speed up error code checking")
     import re  # type: ignore
 
 ASSERT_NAMES = ["uassert", "massert", "fassert", "fassertFailed"]
@@ -44,7 +42,7 @@ list_files = False  # pylint: disable=invalid-name
 def parse_source_files(callback):
     """Walk MongoDB sourcefiles and invoke a callback for each AssertLocation found."""
 
-    quick = ["assert", "Exception", "ErrorCodes::Error"]
+    quick = [r"assert", r"Exception", r"ErrorCodes::Error"]
 
     patterns = [
         re.compile(r"(?:u|m(?:sg)?)asser(?:t|ted)(?:NoTrace)?\s*\(\s*(\d+)", re.MULTILINE),
@@ -58,7 +56,7 @@ def parse_source_files(callback):
         if list_files:
             print('scanning file: ' + source_file)
 
-        with open(source_file) as fh:
+        with open(source_file, 'r', encoding='utf-8') as fh:
             text = fh.read()
 
             if not any([zz in text for zz in quick]):
@@ -168,7 +166,7 @@ def read_error_codes():
         print("EXCESSIVE SKIPPING OF ERROR CODES:")
         print("  %s:%d:%d:%s" % (loc.sourceFile, line, col, loc.lines))
 
-    for code, locations in dups.items():
+    for code, locations in list(dups.items()):
         print("DUPLICATE IDS: %s" % code)
         for loc in locations:
             line, col = get_line_and_column_for_position(loc)

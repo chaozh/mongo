@@ -1111,7 +1111,7 @@ var authCommandsLib = {
           command: function(state, args) {
               return {
                   aggregate: "foo",
-                  pipeline: [{$out: {db: args.targetDB, to: "foo_out", mode: "replaceCollection"}}],
+                  pipeline: [{$out: "foo_out"}],
                   cursor: {},
                   bypassDocumentValidation: args.bypassDocumentValidation,
               };
@@ -1119,7 +1119,7 @@ var authCommandsLib = {
           testcases: [
               {
                 runOnDb: firstDbName,
-                commandArgs: {targetDB: firstDbName, bypassDocumentValidation: false},
+                commandArgs: {bypassDocumentValidation: false},
                 roles: {readWrite: 1, readWriteAnyDatabase: 1, dbOwner: 1, root: 1, __system: 1},
                 privileges: [
                     {resource: {db: firstDbName, collection: "foo"}, actions: ["find"]},
@@ -1129,7 +1129,7 @@ var authCommandsLib = {
               },
               {
                 runOnDb: secondDbName,
-                commandArgs: {targetDB: secondDbName, bypassDocumentValidation: false},
+                commandArgs: {bypassDocumentValidation: false},
                 roles: {readWriteAnyDatabase: 1, root: 1, __system: 1},
                 privileges: [
                     {resource: {db: secondDbName, collection: "foo"}, actions: ["find"]},
@@ -1139,7 +1139,7 @@ var authCommandsLib = {
               },
               {
                 runOnDb: firstDbName,
-                commandArgs: {targetDB: firstDbName, bypassDocumentValidation: true},
+                commandArgs: {bypassDocumentValidation: true},
                 // Note that the built-in role must have 'bypassDocumentValidation' for this test.
                 roles: {dbOwner: 1, root: 1, __system: 1},
                 privileges: [
@@ -1150,15 +1150,21 @@ var authCommandsLib = {
                     },
                 ]
               },
-              // TODO SERVER-36832: Test with mode "replaceCollection" to a foreign database.
+              // TODO SERVER-36832: Test with a foreign database.
           ]
         },
         {
-          testname: "aggregate_out_insert_documents",
+          testname: "aggregate_merge_insert_documents",
           command: function(state, args) {
               return {
                   aggregate: "foo",
-                  pipeline: [{$out: {db: args.targetDB, to: "foo_out", mode: "insertDocuments"}}],
+                  pipeline: [{
+                      $merge: {
+                          into: {db: args.targetDB, coll: "foo_out"},
+                          whenMatched: "fail",
+                          whenNotMatched: "insert"
+                      }
+                  }],
                   cursor: {},
                   bypassDocumentValidation: args.bypassDocumentValidation,
               };
@@ -1222,11 +1228,17 @@ var authCommandsLib = {
           ]
         },
         {
-          testname: "aggregate_out_replace_documents",
+          testname: "aggregate_merge_replace_documents",
           command: function(state, args) {
               return {
                   aggregate: "foo",
-                  pipeline: [{$out: {db: args.targetDB, to: "foo_out", mode: "replaceDocuments"}}],
+                  pipeline: [{
+                      $merge: {
+                          into: {db: args.targetDB, coll: "foo_out"},
+                          whenMatched: "replace",
+                          whenNotMatched: "insert"
+                      }
+                  }],
                   cursor: {},
                   bypassDocumentValidation: args.bypassDocumentValidation,
               };
@@ -2022,39 +2034,12 @@ var authCommandsLib = {
           ]
         },
         {
-          testname: "cloneCollection_1",
-          command: {cloneCollection: firstDbName + ".x"},
-          skipSharded: true,
-          testcases: [{
-              runOnDb: firstDbName,
-              roles: roles_write,
-              privileges: [{
-                  resource: {db: firstDbName, collection: "x"},
-                  actions: ["insert", "createIndex"]
-              }],
-              expectFail: true
-          }]
-        },
-        {
-          testname: "cloneCollection_2",
-          command: {cloneCollection: secondDbName + ".x"},
-          skipSharded: true,
-          testcases: [{
-              runOnDb: secondDbName,
-              roles: {readWriteAnyDatabase: 1, restore: 1, root: 1, __system: 1},
-              privileges: [{
-                  resource: {db: secondDbName, collection: "x"},
-                  actions: ["insert", "createIndex"]
-              }],
-              expectFail: true
-          }]
-        },
-        {
           testname: "cloneCollectionAsCapped",
           command: {cloneCollectionAsCapped: "x", toCollection: "y", size: 1000},
           skipSharded: true,
           setup: function(db) {
               db.x.save({});
+              db.y.drop();
           },
           teardown: function(db) {
               db.x.drop();
@@ -2087,7 +2072,7 @@ var authCommandsLib = {
         },
         {
           testname: "collMod",
-          command: {collMod: "foo", usePowerOf2Sizes: true},
+          command: {collMod: "foo"},
           setup: function(db) {
               db.foo.save({});
           },
@@ -3084,8 +3069,7 @@ var authCommandsLib = {
         },
         {
           testname: "createIndexes",
-          command:
-              {createIndexes: "x", indexes: [{ns: firstDbName + ".x", key: {a: 1}, name: "a_1"}]},
+          command: {createIndexes: "x", indexes: [{key: {a: 1}, name: "a_1"}]},
           teardown: function(db) {
               db.x.drop();
           },
@@ -3149,6 +3133,12 @@ var authCommandsLib = {
         {
           testname: "dataSize_2",
           command: {dataSize: secondDbName + ".x"},
+          setup: function(db) {
+              db.x.insert({});
+          },
+          teardown: function(db) {
+              db.x.drop();
+          },
           testcases: [{
               runOnDb: secondDbName,
               roles: roles_readAny,
@@ -3233,435 +3223,6 @@ var authCommandsLib = {
                 privileges:
                     [{resource: {db: secondDbName, collection: "coll"}, actions: ["find"]}]
               }
-          ]
-        },
-        {
-          testname: "doTxn_precondition",
-          command: {
-              doTxn: [{
-                  "op": "i",
-                  "ns": firstDbName + ".x",
-                  "o": {"_id": ObjectId("57dc3d7da4fce4358afa85b8"), "data": 5}
-              }],
-              preCondition: [{ns: firstDbName + ".x", q: {x: 5}, res: []}],
-              txnNumber: NumberLong(0),
-              lsid: {id: UUID()}
-          },
-          skipSharded: true,
-          skipUnlessReplicaSet: true,
-          setup: function(db) {
-              db.getSisterDB(firstDbName).x.save({});
-          },
-          teardown: function(db) {
-              db.getSisterDB(firstDbName).x.drop();
-          },
-          testcases: [
-              {
-                runOnDb: adminDbName,
-                privileges: [
-                    {resource: {db: firstDbName, collection: "x"}, actions: ["find"]},
-                    {resource: {db: firstDbName, collection: "x"}, actions: ["insert"]},
-                ],
-              },
-          ]
-        },
-        {
-          testname: "doTxn_insert",
-          command: {
-              doTxn: [{
-                  "op": "i",
-                  "ns": firstDbName + ".x",
-                  "o": {"_id": ObjectId("57dc3d7da4fce4358afa85b8"), "data": 5}
-              }],
-              txnNumber: NumberLong(0),
-              lsid: {id: UUID()}
-          },
-          skipSharded: true,
-          skipUnlessReplicaSet: true,
-          setup: function(db) {
-              db.getSisterDB(firstDbName).x.save({});
-          },
-          teardown: function(db) {
-              db.getSisterDB(firstDbName).x.drop();
-          },
-          testcases: [
-              {
-                runOnDb: adminDbName,
-                roles: roles_write,
-                privileges: [
-                    {resource: {db: firstDbName, collection: "x"}, actions: ["insert"]},
-                ],
-              },
-          ]
-        },
-        {
-          testname: "doTxn_insert_UUID",
-          command: function(state) {
-              return {
-                  doTxn: [{
-                      "op": "i",
-                      "ns": state.collName,
-                      "ui": state.uuid,
-                      "o": {"_id": ObjectId("57dc3d7da4fce4358afa85b8"), "data": 5}
-                  }],
-                  txnNumber: NumberLong(0),
-                  lsid: {id: UUID()}
-              };
-          },
-          skipSharded: true,
-          skipUnlessReplicaSet: true,
-          setup: function(db) {
-              var sibling = db.getSisterDB(firstDbName);
-              sibling.runCommand({create: "x"});
-
-              return {
-                  collName: sibling.x.getFullName(),
-                  uuid: getUUIDFromListCollections(sibling, sibling.x.getName())
-              };
-          },
-          teardown: function(db) {
-              db.getSisterDB(firstDbName).x.drop();
-          },
-          testcases: [
-              {
-                runOnDb: adminDbName,
-                roles: {root: 1, restore: 1, __system: 1},
-                privileges: [
-                    {resource: {db: firstDbName, collection: "x"}, actions: ["insert"]},
-                    {resource: {cluster: true}, actions: ["useUUID"]}
-                ],
-              },
-          ]
-        },
-        {
-          testname: "doTxn_insert_with_nonexistent_UUID",
-          command: function(state) {
-              return {
-                  doTxn: [{
-                      "op": "i",
-                      "ns": state.collName,
-                      // Given a nonexistent UUID. The command should fail.
-                      "ui": UUID("71f1d1d7-68ca-493e-a7e9-f03c94e2e960"),
-                      "o": {"_id": ObjectId("57dc3d7da4fce4358afa85b8"), "data": 5}
-                  }],
-                  txnNumber: NumberLong(0),
-                  lsid: {id: UUID()}
-              };
-          },
-          skipSharded: true,
-          skipUnlessReplicaSet: true,
-          setup: function(db) {
-              var sibling = db.getSisterDB(firstDbName);
-              sibling.runCommand({create: "x"});
-
-              return {
-                  collName: sibling.x.getFullName(),
-                  uuid: getUUIDFromListCollections(sibling, sibling.x.getName())
-              };
-          },
-          teardown: function(db) {
-              db.getSisterDB(firstDbName).x.drop();
-          },
-          testcases: [
-              {
-                // It would be an sanity check failure rather than a auth check
-                // failure.
-                expectFail: true,
-                runOnDb: adminDbName,
-                roles: {root: 1, restore: 1, __system: 1},
-                privileges: [
-                    {resource: {db: firstDbName, collection: "x"}, actions: ["insert"]},
-                    {resource: {cluster: true}, actions: ["useUUID"]}
-                ],
-              },
-          ]
-        },
-        {
-          testname: "doTxn_insert_UUID_failure",
-          command: function(state) {
-              return {
-                  doTxn: [{
-                      "op": "i",
-                      "ns": state.collName,
-                      "ui": state.uuid,
-                      "o": {"_id": ObjectId("57dc3d7da4fce4358afa85b8"), "data": 5}
-                  }],
-                  txnNumber: NumberLong(0),
-                  lsid: {id: UUID()}
-              };
-          },
-          skipSharded: true,
-          skipUnlessReplicaSet: true,
-          setup: function(db) {
-              var sibling = db.getSisterDB(firstDbName);
-              sibling.runCommand({create: "x"});
-
-              return {
-                  collName: sibling.x.getFullName(),
-                  uuid: getUUIDFromListCollections(sibling, sibling.x.getName())
-              };
-          },
-          teardown: function(db) {
-              db.getSisterDB(firstDbName).x.drop();
-          },
-          testcases: [
-              {
-                expectAuthzFailure: true,
-                runOnDb: adminDbName,
-                privileges: [
-                    {resource: {db: firstDbName, collection: "x"}, actions: ["insert"]},
-                    // Don't have useUUID privilege.
-                ],
-              },
-          ]
-        },
-        {
-          testname: "doTxn_insert_UUID_with_wrong_ns",
-          command: function(state) {
-              return {
-                  doTxn: [{
-                      "op": "i",
-                      "ns":
-                          firstDbName + ".y",  // Specify wrong name but correct uuid. Should work.
-                      "ui": state.x_uuid,      // The insert should on x
-                      "o": {"_id": ObjectId("57dc3d7da4fce4358afa85b8"), "data": 5}
-                  }],
-                  txnNumber: NumberLong(0),
-                  lsid: {id: UUID()}
-              };
-          },
-          skipSharded: true,
-          skipUnlessReplicaSet: true,
-          setup: function(db) {
-              db.getSisterDB(firstDbName).x.drop();
-              db.getSisterDB(firstDbName).y.drop();
-              var sibling = db.getSisterDB(firstDbName);
-              sibling.runCommand({create: "x"});
-              sibling.runCommand({create: "y"});
-              return {x_uuid: getUUIDFromListCollections(sibling, sibling.x.getName())};
-          },
-          teardown: function(db) {
-              db.getSisterDB(firstDbName).x.drop();
-          },
-          testcases: [
-              {
-                runOnDb: adminDbName,
-                privileges: [
-                    {
-                      resource: {db: firstDbName, collection: "x"},
-                      actions: ["createCollection", "insert"]
-                    },
-                    {resource: {db: firstDbName, collection: "y"}, actions: ["createCollection"]},
-                    {resource: {cluster: true}, actions: ["useUUID", "forceUUID"]}
-                ],
-              },
-          ]
-        },
-        {
-          testname: "doTxn_insert_UUID_with_wrong_ns_failure",
-          command: function(state) {
-              return {
-                  doTxn: [{
-                      "op": "i",
-                      "ns":
-                          firstDbName + ".y",  // Specify wrong name but correct uuid. Should work.
-                      "ui": state.x_uuid,      // The insert should on x
-                      "o": {"_id": ObjectId("57dc3d7da4fce4358afa85b8"), "data": 5}
-                  }],
-                  txnNumber: NumberLong(0),
-                  lsid: {id: UUID()}
-              };
-          },
-          skipSharded: true,
-          skipUnlessReplicaSet: true,
-          setup: function(db) {
-              db.getSisterDB(firstDbName).x.drop();
-              db.getSisterDB(firstDbName).y.drop();
-              var sibling = db.getSisterDB(firstDbName);
-              sibling.runCommand({create: "x"});
-              sibling.runCommand({create: "y"});
-              return {x_uuid: getUUIDFromListCollections(sibling, sibling.x.getName())};
-          },
-          teardown: function(db) {
-              db.getSisterDB(firstDbName).x.drop();
-          },
-          testcases: [
-              {
-                expectAuthzFailure: true,
-                runOnDb: adminDbName,
-                privileges: [
-                    {resource: {db: firstDbName, collection: "x"}, actions: ["createCollection"]},
-                    {
-                      resource: {db: firstDbName, collection: "y"},
-                      actions: ["createCollection", "insert"]
-                    },
-                    {resource: {cluster: true}, actions: ["useUUID", "forceUUID"]}
-                ],
-              },
-          ]
-        },
-        {
-          testname: "doTxn_upsert",
-          command: {
-              doTxn: [{
-                  "op": "u",
-                  "ns": firstDbName + ".x",
-                  "o2": {"_id": 1},
-                  "o": {"_id": 1, "data": 8}
-              }],
-              txnNumber: NumberLong(0),
-              lsid: {id: UUID()}
-          },
-          skipSharded: true,
-          skipUnlessReplicaSet: true,
-          setup: function(db) {
-              db.getSisterDB(firstDbName).x.save({_id: 1, data: 1});
-          },
-          teardown: function(db) {
-              db.getSisterDB(firstDbName).x.drop();
-          },
-          testcases: [
-              {
-                runOnDb: adminDbName,
-                roles: Object.merge(roles_write, {restore: 0}, true),
-                privileges: [
-                    {resource: {db: firstDbName, collection: "x"}, actions: ["update", "insert"]},
-                ],
-              },
-          ]
-        },
-        {
-          testname: "doTxn_update",
-          command: {
-              doTxn: [{
-                  "op": "u",
-                  "ns": firstDbName + ".x",
-                  "o2": {"_id": 1},
-                  "o": {"_id": 1, "data": 8}
-              }],
-              txnNumber: NumberLong(0),
-              lsid: {id: UUID()}
-          },
-          skipSharded: true,
-          skipUnlessReplicaSet: true,
-          setup: function(db) {
-              db.getSisterDB(firstDbName).x.save({_id: 1, data: 1});
-          },
-          teardown: function(db) {
-              db.getSisterDB(firstDbName).x.drop();
-          },
-          testcases: [
-              {
-                runOnDb: adminDbName,
-                roles: Object.merge(roles_write, {restore: 0}, true),
-                privileges: [
-                    {resource: {db: firstDbName, collection: "x"}, actions: ["update"]},
-                ],
-              },
-          ]
-        },
-        {
-          testname: "doTxn_update_UUID",
-          command: function(state) {
-              return {
-                  doTxn: [{
-                      "op": "u",
-                      "ns": state.collName,
-                      "ui": state.uuid,
-                      "o2": {"_id": 1},
-                      "o": {"_id": 1, "data": 8}
-                  }],
-                  txnNumber: NumberLong(0),
-                  lsid: {id: UUID()}
-              };
-          },
-          skipSharded: true,
-          skipUnlessReplicaSet: true,
-          setup: function(db) {
-              var sibling = db.getSisterDB(firstDbName);
-              sibling.x.save({_id: 1, data: 1});
-
-              return {
-                  collName: sibling.x.getFullName(),
-                  uuid: getUUIDFromListCollections(sibling, sibling.x.getName())
-              };
-          },
-          teardown: function(db) {
-              db.getSisterDB(firstDbName).x.drop();
-          },
-          testcases: [
-              {
-                runOnDb: adminDbName,
-                roles: {root: 1, __system: 1},
-                privileges: [
-                    {resource: {db: firstDbName, collection: "x"}, actions: ["update"]},
-                    {resource: {cluster: true}, actions: ["useUUID"]}
-                ],
-              },
-          ]
-        },
-        {
-          testname: "doTxn_update_UUID_failure",
-          command: function(state) {
-              return {
-                  doTxn: [{
-                      "op": "u",
-                      "ns": state.collName,
-                      "ui": state.uuid,
-                      "o2": {"_id": 1},
-                      "o": {"_id": 1, "data": 8}
-                  }],
-                  txnNumber: NumberLong(0),
-                  lsid: {id: UUID()}
-              };
-          },
-          skipSharded: true,
-          skipUnlessReplicaSet: true,
-          setup: function(db) {
-              var sibling = db.getSisterDB(firstDbName);
-              sibling.x.save({_id: 1, data: 1});
-
-              return {
-                  collName: sibling.x.getFullName(),
-                  uuid: getUUIDFromListCollections(sibling, sibling.x.getName())
-              };
-          },
-          teardown: function(db) {
-              db.getSisterDB(firstDbName).x.drop();
-          },
-          testcases: [
-              {
-                expectAuthzFailure: true,
-                runOnDb: adminDbName,
-                privileges: [
-                    {resource: {db: firstDbName, collection: "x"}, actions: ["update"]},
-                ],
-              },
-          ]
-        },
-        {
-          testname: "doTxn_delete",
-          command: {
-              doTxn: [{"op": "d", "ns": firstDbName + ".x", "o": {"_id": 1}}],
-              txnNumber: NumberLong(0),
-              lsid: {id: UUID()}
-          },
-          skipSharded: true,
-          skipUnlessReplicaSet: true,
-          setup: function(db) {
-              db.getSisterDB(firstDbName).x.save({_id: 1, data: 1});
-          },
-          teardown: function(db) {
-              db.getSisterDB(firstDbName).x.drop();
-          },
-          testcases: [
-              {
-                runOnDb: adminDbName,
-                roles: Object.merge(roles_write, {restore: 0}, true),
-                privileges: [
-                    {resource: {db: firstDbName, collection: "x"}, actions: ["remove"]},
-                ],
-              },
           ]
         },
         {
@@ -4407,10 +3968,22 @@ var authCommandsLib = {
           command: {insert: "oplog.rs", documents: [{ts: Timestamp()}]},
           skipSharded: true,
           setup: function(db) {
-              db.createCollection("oplog.rs", {capped: true, size: 10000});
+              load("jstests/libs/storage_engine_utils.js");
+              if (!db.getCollectionNames().includes("oplog.rs")) {
+                  assert.commandWorked(
+                      db.runCommand({create: "oplog.rs", capped: true, size: 10000}));
+              } else {
+                  if (storageEngineIsWiredTigerOrInMemory()) {
+                      assert.commandWorked(db.adminCommand({replSetResizeOplog: 1, size: 10000}));
+                  } else {
+                      assert.commandWorked(db.runCommand({drop: "oplog.rs"}));
+                      assert.commandWorked(
+                          db.runCommand({create: "oplog.rs", capped: true, size: 10000}));
+                  }
+              }
           },
           teardown: function(db) {
-              db.oplog.rs.drop();
+              assert.commandWorked(db.oplog.rs.runCommand('emptycapped'));
           },
           testcases: [
               {
@@ -4616,14 +4189,14 @@ var authCommandsLib = {
           testname: "killAllSessionsByPattern",
           command: {killAllSessionsByPattern: []},
           testcases: [
-              {runOnDb: adminDbName, roles: roles_hostManager},
+              {runOnDb: adminDbName, roles: roles_hostManager, expectFail: true},
           ]
         },
         {
           testname: "listCommands",
           command: {listCommands: 1},
           testcases: [
-              {runOnDb: adminDbName, roles: roles_all, privileges: []},
+              {runOnDb: adminDbName, roles: roles_all, privileges: [], expectFail: true},
               {runOnDb: firstDbName, roles: roles_all, privileges: []},
               {runOnDb: secondDbName, roles: roles_all, privileges: []}
           ]
@@ -5193,6 +4766,40 @@ var authCommandsLib = {
           ]
         },
         {
+          testname: "refineCollectionShardKey",
+          command: {refineCollectionShardKey: "test.x", key: {aKey: 1}},
+          skipUnlessSharded: true,
+          testcases: [
+              {
+                runOnDb: adminDbName,
+                roles: Object.extend({enableSharding: 1}, roles_clusterManager),
+                privileges: [{
+                    resource: {db: "test", collection: "x"},
+                    actions: ["refineCollectionShardKey"]
+                }],
+                expectFail: true
+              },
+              {runOnDb: firstDbName, roles: {}},
+              {runOnDb: secondDbName, roles: {}}
+          ]
+        },
+        {
+          testname: "_configsvrRefineCollectionShardKey",
+          command:
+            {_configsvrRefineCollectionShardKey: "test.x", key: {aKey: 1}, epoch: ObjectId()},
+          skipSharded: true,
+          testcases: [
+              {
+                runOnDb: adminDbName,
+                roles: {__system: 1},
+                privileges: [{resource: {cluster: true}, actions: ["internal"]}],
+                expectFail: true
+              },
+              {runOnDb: firstDbName, roles: {}},
+              {runOnDb: secondDbName, roles: {}}
+          ]
+        },
+        {
           testname: "renameCollection_sameDb",
           command: {renameCollection: firstDbName + ".x", to: firstDbName + ".y", dropTarget: true},
           setup: function(db) {
@@ -5587,7 +5194,10 @@ var authCommandsLib = {
         {
           testname: "shutdown",
           command: {shutdown: 1},
-          testcases: [{runOnDb: firstDbName, roles: {}}, {runOnDb: secondDbName, roles: {}}]
+          testcases: [
+              {runOnDb: firstDbName, roles: {}, expectFail: true},
+              {runOnDb: secondDbName, roles: {}}
+          ]
         },
         {
           testname: "split",
@@ -5681,34 +5291,6 @@ var authCommandsLib = {
               },
               {runOnDb: firstDbName, roles: {}},
               {runOnDb: secondDbName, roles: {}}
-          ]
-        },
-        {
-          testname: "touch",
-          command: {touch: "x", data: true, index: false},
-          skipSharded: true,
-          setup: function(db) {
-              db.x.save({});
-          },
-          teardown: function(db) {
-              db.x.drop();
-          },
-          testcases: [
-              {
-                runOnDb: adminDbName,
-                roles: roles_hostManager,
-                privileges: [{resource: {cluster: true}, actions: ["touch"]}]
-              },
-              {
-                runOnDb: firstDbName,
-                roles: roles_hostManager,
-                privileges: [{resource: {cluster: true}, actions: ["touch"]}]
-              },
-              {
-                runOnDb: secondDbName,
-                roles: roles_hostManager,
-                privileges: [{resource: {cluster: true}, actions: ["touch"]}]
-              }
           ]
         },
         {
@@ -5933,11 +5515,6 @@ var authCommandsLib = {
           testcases: [{runOnDb: adminDbName, roles: roles_all}],
         },
         {
-          testname: "refreshSessionsInternal",
-          command: {refreshSessionsInternal: []},
-          testcases: [{runOnDb: adminDbName, roles: {__system: 1}}],
-        },
-        {
           testname: "_getNextSessionMods",
           command: {_getNextSessionMods: "a-b"},
           skipSharded: true,
@@ -5974,6 +5551,46 @@ var authCommandsLib = {
           }
         },
         {
+          testname: "aggregate_$searchBeta",
+          command: {
+              aggregate: "foo",
+              cursor: {},
+              pipeline: [{
+                  $searchBeta: {
+                      // empty query
+                  }
+              }]
+          },
+          skipSharded: false,
+          // Only enterprise knows of this aggregation stage.
+          skipTest:
+              (conn) =>
+                  !conn.getDB("admin").runCommand({buildInfo: 1}).modules.includes("enterprise"),
+          testcases: [
+              {
+                runOnDb: firstDbName,
+                roles: roles_read,
+                privileges: [{resource: {db: firstDbName, collection: "foo"}, actions: ["find"]}]
+              },
+              {
+                runOnDb: secondDbName,
+                roles: roles_readAny,
+                privileges:
+                    [{resource: {db: secondDbName, collection: "foo"}, actions: ["find"]}]
+              }
+          ],
+          setup: function(db) {
+              // Configure the $searchBeta stage to always return EOF so we can avoid the hassle
+              // of giving mongod a host and port for mongot.
+              const cmd = {configureFailPoint: "searchBetaReturnEofImmediately", mode: "alwaysOn"};
+              FixtureHelpers.runCommandOnEachPrimary({db: db.getSiblingDB("admin"), cmdObj: cmd});
+          },
+          teardown: function(db) {
+              const cmd = {configureFailPoint: "searchBetaReturnEofImmediately", mode: "off"};
+              FixtureHelpers.runCommandOnEachPrimary({db: db.getSiblingDB("admin"), cmdObj: cmd});
+          }
+        },
+        {
           testname: "startRecordingTraffic",
           command: {startRecordingTraffic: 1, filename: "notARealPath"},
           testcases: [
@@ -5994,6 +5611,35 @@ var authCommandsLib = {
           setup: function(db) {
               db.runCommand({startRecordingTraffic: 1, filename: "notARealPath"});
           }
+        },
+        {
+          testname: "clearJumboFlag",
+          command: {clearJumboFlag: "test.x"},
+          skipUnlessSharded: true,
+          testcases: [
+              {
+                runOnDb: adminDbName,
+                roles: roles_clusterManager,
+                privileges: [{resource: {db: "test", collection: "x"}, actions: ["clearJumboFlag"]}],
+                expectFail: true
+              },
+              {runOnDb: firstDbName, roles: {}},
+              {runOnDb: secondDbName, roles: {}}
+          ]
+        },
+        {
+          testname: "_configsvrClearJumboFlag",
+          command: {_configsvrClearJumboFlag: "x.y", epoch: ObjectId(), minKey: {x: 0}, maxKey: {x: 10}},
+          skipSharded: true,
+          expectFail: true,
+          testcases: [
+              {
+                runOnDb: adminDbName,
+                roles: {__system: 1},
+                privileges: [{resource: {cluster: true}, actions: ["internal"]}],
+                expectFail: true
+              },
+          ]
         },
     ],
 
@@ -6020,18 +5666,18 @@ var authCommandsLib = {
      *  An array of strings. Each string in the array reports
      *  a particular test error.
      */
-    runOneTest: function(conn, t, impls) {
+    runOneTest: function(conn, t, impls, isMongos) {
         jsTest.log("Running test: " + t.testname);
 
         if (t.skipTest && t.skipTest(conn)) {
             return [];
         }
         // some tests shouldn't run in a sharded environment
-        if (t.skipSharded && this.isMongos(conn)) {
+        if (t.skipSharded && isMongos) {
             return [];
         }
         // others shouldn't run in a standalone environment
-        if (t.skipUnlessSharded && !this.isMongos(conn)) {
+        if (t.skipUnlessSharded && !isMongos) {
             return [];
         }
         // some tests require replica sets to be enabled.
@@ -6084,8 +5730,9 @@ var authCommandsLib = {
 
         var failures = [];
 
+        const isMongos = this.isMongos(conn);
         for (var i = 0; i < this.tests.length; i++) {
-            res = this.runOneTest(conn, this.tests[i], impls);
+            res = this.runOneTest(conn, this.tests[i], impls, isMongos);
             failures = failures.concat(res);
         }
 

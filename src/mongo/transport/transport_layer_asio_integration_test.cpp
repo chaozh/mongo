@@ -42,7 +42,7 @@
 #include "mongo/transport/transport_layer_asio.h"
 #include "mongo/unittest/integration_test.h"
 #include "mongo/unittest/unittest.h"
-#include "mongo/util/fail_point_service.h"
+#include "mongo/util/fail_point.h"
 #include "mongo/util/log.h"
 
 #include "asio.hpp"
@@ -65,9 +65,10 @@ TEST(TransportLayerASIO, HTTPRequestGetsHTTPError) {
     log() << "Sending HTTP request";
     std::string httpReq = str::stream() << "GET /\r\n"
                                            "Host: "
-                                        << server << "\r\n"
-                                                     "User-Agent: MongoDB Integration test\r\n"
-                                                     "Accept: */*";
+                                        << server
+                                        << "\r\n"
+                                           "User-Agent: MongoDB Integration test\r\n"
+                                           "Accept: */*";
     asio::write(socket, asio::buffer(httpReq.data(), httpReq.size()));
 
     log() << "Waiting for response";

@@ -35,7 +35,6 @@
 #include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/parsed_aggregation_projection.h"
 #include "mongo/db/pipeline/parsed_aggregation_projection_node.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/stdx/unordered_map.h"
 #include "mongo/stdx/unordered_set.h"
 
@@ -91,11 +90,24 @@ protected:
 class ParsedInclusionProjection : public ParsedAggregationProjection {
 public:
     ParsedInclusionProjection(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                              ProjectionPolicies policies,
+                              std::unique_ptr<InclusionNode> root)
+        : ParsedAggregationProjection(expCtx, policies), _root(std::move(root)) {}
+
+    ParsedInclusionProjection(const boost::intrusive_ptr<ExpressionContext>& expCtx,
                               ProjectionPolicies policies)
-        : ParsedAggregationProjection(expCtx, policies), _root(new InclusionNode(policies)) {}
+        : ParsedInclusionProjection(expCtx, policies, std::make_unique<InclusionNode>(policies)) {}
 
     TransformerType getType() const final {
         return TransformerType::kInclusionProjection;
+    }
+
+    const InclusionNode* getRoot() const {
+        return _root.get();
+    }
+
+    InclusionNode* getRoot() {
+        return _root.get();
     }
 
     /**
@@ -120,15 +132,25 @@ public:
      * Optimize any computed expressions.
      */
     void optimize() final {
+        ParsedAggregationProjection::optimize();
         _root->optimize();
     }
 
     DepsTracker::State addDependencies(DepsTracker* deps) const final {
         _root->reportDependencies(deps);
+        if (_rootReplacementExpression) {
+            _rootReplacementExpression->addDependencies(deps);
+        }
         return DepsTracker::State::EXHAUSTIVE_FIELDS;
     }
 
     DocumentSource::GetModPathsReturn getModifiedPaths() const final {
+        // A root-replacement expression can replace the entire root document, so all paths are
+        // considered as modified.
+        if (_rootReplacementExpression) {
+            return {DocumentSource::GetModPathsReturn::Type::kAllPaths, {}, {}};
+        }
+
         std::set<std::string> preservedPaths;
         _root->reportProjectedPaths(&preservedPaths);
 
@@ -151,13 +173,6 @@ public:
      * each element in the array.
      */
     Document applyProjection(const Document& inputDoc) const final;
-
-    /*
-     * Checks whether the inclusion projection represented by the InclusionNode
-     * tree is a subset of the object passed in. Projections that have any
-     * computed or renamed fields are not considered a subset.
-     */
-    bool isSubsetOfProjection(const BSONObj& proj) const final;
 
 private:
     /**

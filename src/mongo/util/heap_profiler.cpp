@@ -151,7 +151,8 @@ using Hash = uint32_t;
 
 template <class Key, class Value>
 class HashTable {
-    MONGO_DISALLOW_COPYING(HashTable);
+    HashTable(const HashTable&) = delete;
+    HashTable& operator=(const HashTable&) = delete;
 
 private:
     struct Entry {
@@ -281,8 +282,10 @@ private:
     // >1: sample ever sampleIntervalBytes bytes allocated - less accurate but fast and small
     std::atomic_size_t sampleIntervalBytes;  // NOLINT
 
-    stdx::mutex hashtable_mutex;  // guards updates to both object and stack hash tables
-    stdx::mutex stackinfo_mutex;  // guards against races updating the StackInfo bson representation
+    // guards updates to both object and stack hash tables
+    stdx::mutex hashtable_mutex;  // NOLINT
+    // guards against races updating the StackInfo bson representation
+    stdx::mutex stackinfo_mutex;  // NOLINT
 
     // cumulative bytes allocated - determines when samples are taken
     std::atomic_size_t bytesAllocated{0};  // NOLINT
@@ -480,7 +483,7 @@ private:
             if (dladdr(stack.frames[j], &dli)) {
                 if (dli.dli_sname) {
                     int status;
-                    demangled = abi::__cxa_demangle(dli.dli_sname, 0, 0, &status);
+                    demangled = abi::__cxa_demangle(dli.dli_sname, nullptr, nullptr, &status);
                     if (demangled) {
                         // strip off function parameters as they are very verbose and not useful
                         char* p = strchr(demangled, '(');

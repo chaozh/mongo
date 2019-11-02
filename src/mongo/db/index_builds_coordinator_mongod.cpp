@@ -33,21 +33,24 @@
 
 #include "mongo/db/index_builds_coordinator_mongod.h"
 
-#include "mongo/db/catalog/uuid_catalog.h"
+#include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/index_build_entry_helpers.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/service_context.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/fail_point.h"
 #include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
 using namespace indexbuildentryhelpers;
 
 namespace {
+
+MONGO_FAIL_POINT_DEFINE(hangAfterInitializingIndexBuild);
 
 /**
  * Constructs the options for the loader thread pool.
@@ -77,8 +80,8 @@ void IndexBuildsCoordinatorMongod::shutdown() {
     // Stop new scheduling.
     _threadPool.shutdown();
 
-    // Signal active builds to stop and wait for them to stop.
-    interruptAllIndexBuilds("Index build interrupted due to shutdown.");
+    // Wait for all active builds to stop.
+    waitForAllIndexBuildsToStopForShutdown();
 
     // Wait for active threads to finish.
     _threadPool.join();
@@ -86,13 +89,14 @@ void IndexBuildsCoordinatorMongod::shutdown() {
 
 StatusWith<SharedSemiFuture<ReplIndexBuildState::IndexCatalogStats>>
 IndexBuildsCoordinatorMongod::startIndexBuild(OperationContext* opCtx,
+                                              StringData dbName,
                                               CollectionUUID collectionUUID,
                                               const std::vector<BSONObj>& specs,
                                               const UUID& buildUUID,
                                               IndexBuildProtocol protocol,
                                               IndexBuildOptions indexBuildOptions) {
     auto statusWithOptionalResult = _registerAndSetUpIndexBuild(
-        opCtx, collectionUUID, specs, buildUUID, protocol, indexBuildOptions.commitQuorum);
+        opCtx, dbName, collectionUUID, specs, buildUUID, protocol, indexBuildOptions.commitQuorum);
     if (!statusWithOptionalResult.isOK()) {
         return statusWithOptionalResult.getStatus();
     }
@@ -106,12 +110,7 @@ IndexBuildsCoordinatorMongod::startIndexBuild(OperationContext* opCtx,
         return statusWithOptionalResult.getValue().get();
     }
 
-    auto replState = [&]() {
-        stdx::unique_lock<stdx::mutex> lk(_mutex);
-        auto it = _allIndexBuilds.find(buildUUID);
-        invariant(it != _allIndexBuilds.end());
-        return it->second;
-    }();
+    auto replState = invariant(_getIndexBuild(buildUUID));
 
     // Run index build in-line if we are transitioning between replication modes.
     // While the RSTLExclusive is being held, an async thread in the thread pool would not be
@@ -121,7 +120,7 @@ IndexBuildsCoordinatorMongod::startIndexBuild(OperationContext* opCtx,
                  "replication states: "
               << buildUUID;
         // Sets up and runs the index build. Sets result and cleans up index build.
-        _runIndexBuild(opCtx, buildUUID);
+        _runIndexBuild(opCtx, buildUUID, indexBuildOptions);
         return replState->sharedPromise.getFuture();
     }
 
@@ -130,18 +129,6 @@ IndexBuildsCoordinatorMongod::startIndexBuild(OperationContext* opCtx,
     // Task in thread pool should retain the caller's deadline.
     const auto deadline = opCtx->getDeadline();
     const auto timeoutError = opCtx->getTimeoutError();
-
-    // TODO: SERVER-39484 Because both 'writesAreReplicated' and
-    // 'shouldNotConflictWithSecondaryBatchApplication' depend on the current replication state,
-    // just passing the state here is not resilient to member state changes like stepup/stepdown.
-
-    // If the calling thread is replicating oplog writes (primary), this state should be passed to
-    // the builder.
-    const bool writesAreReplicated = opCtx->writesAreReplicated();
-    // Index builds on secondaries can't hold the PBWM lock because it would conflict with
-    // replication.
-    const bool shouldNotConflictWithSecondaryBatchApplication =
-        !opCtx->lockState()->shouldConflictWithSecondaryBatchApplication();
 
     // Task in thread pool should have similar CurOp representation to the caller so that it can be
     // identified as a createIndexes operation.
@@ -154,30 +141,40 @@ IndexBuildsCoordinatorMongod::startIndexBuild(OperationContext* opCtx,
         opDesc = curOp->opDescription().getOwned();
     }
 
-    Status status = _threadPool.schedule([
+    _threadPool.schedule([
         this,
         buildUUID,
+        indexBuildOptions,
         deadline,
         timeoutError,
-        writesAreReplicated,
-        shouldNotConflictWithSecondaryBatchApplication,
         logicalOp,
-        opDesc
-    ]() noexcept {
+        opDesc,
+        replState
+    ](auto status) noexcept {
+        // Clean up the index build if we failed to schedule it.
+        if (!status.isOK()) {
+            stdx::unique_lock<Latch> lk(_mutex);
+
+            // Unregister the index build before setting the promises,
+            // so callers do not see the build again.
+            _unregisterIndexBuild(lk, replState);
+
+            // Set the promise in case another thread already joined the index build.
+            replState->sharedPromise.setError(status);
+
+            return;
+        }
+
+        hangAfterInitializingIndexBuild.pauseWhileSet();
+
         auto opCtx = Client::getCurrent()->makeOperationContext();
 
         opCtx->setDeadlineByDate(deadline, timeoutError);
 
-        boost::optional<repl::UnreplicatedWritesBlock> unreplicatedWrites;
-        if (!writesAreReplicated) {
-            unreplicatedWrites.emplace(opCtx.get());
-        }
-
-        // If the calling thread should not take the PBWM lock, neither should this thread.
-        boost::optional<ShouldNotConflictWithSecondaryBatchApplicationBlock> shouldNotConflictBlock;
-        if (shouldNotConflictWithSecondaryBatchApplication) {
-            shouldNotConflictBlock.emplace(opCtx->lockState());
-        }
+        // Index builds should never take the PBWM lock, even on a primary. This allows the index
+        // to continue running after the node steps down to a secondary.
+        ShouldNotConflictWithSecondaryBatchApplicationBlock shouldNotConflictBlock(
+            opCtx->lockState());
 
         {
             stdx::unique_lock<Client> lk(*opCtx->getClient());
@@ -187,46 +184,11 @@ IndexBuildsCoordinatorMongod::startIndexBuild(OperationContext* opCtx,
         }
 
         // Sets up and runs the index build. Sets result and cleans up index build.
-        _runIndexBuild(opCtx.get(), buildUUID);
+        _runIndexBuild(opCtx.get(), buildUUID, indexBuildOptions);
     });
 
-    // Clean up the index build if we failed to schedule it.
-    if (!status.isOK()) {
-        stdx::unique_lock<stdx::mutex> lk(_mutex);
-
-        // Unregister the index build before setting the promises, so callers do not see the build
-        // again.
-        _unregisterIndexBuild(lk, replState);
-
-        // Set the promise in case another thread already joined the index build.
-        replState->sharedPromise.setError(status);
-
-        return status;
-    }
 
     return replState->sharedPromise.getFuture();
-}
-
-Status IndexBuildsCoordinatorMongod::commitIndexBuild(OperationContext* opCtx,
-                                                      const std::vector<BSONObj>& specs,
-                                                      const UUID& buildUUID) {
-    // TODO: not yet implemented.
-    return Status::OK();
-}
-
-void IndexBuildsCoordinatorMongod::signalChangeToPrimaryMode() {
-    stdx::unique_lock<stdx::mutex> lk(_mutex);
-    _replMode = ReplState::Primary;
-}
-
-void IndexBuildsCoordinatorMongod::signalChangeToSecondaryMode() {
-    stdx::unique_lock<stdx::mutex> lk(_mutex);
-    _replMode = ReplState::Secondary;
-}
-
-void IndexBuildsCoordinatorMongod::signalChangeToInitialSyncMode() {
-    stdx::unique_lock<stdx::mutex> lk(_mutex);
-    _replMode = ReplState::InitialSync;
 }
 
 Status IndexBuildsCoordinatorMongod::voteCommitIndexBuild(const UUID& buildUUID,
@@ -243,8 +205,7 @@ Status IndexBuildsCoordinatorMongod::setCommitQuorum(OperationContext* opCtx,
         return Status(ErrorCodes::IndexNotFound,
                       str::stream()
                           << "Cannot set a new commit quorum on an index build in collection '"
-                          << nss
-                          << "' without providing any indexes.");
+                          << nss << "' without providing any indexes.");
     }
 
     AutoGetCollectionForRead autoColl(opCtx, nss);
@@ -254,9 +215,9 @@ Status IndexBuildsCoordinatorMongod::setCommitQuorum(OperationContext* opCtx,
                       str::stream() << "Collection '" << nss << "' was not found.");
     }
 
-    UUID collectionUUID = *collection->uuid();
+    UUID collectionUUID = collection->uuid();
 
-    stdx::unique_lock<stdx::mutex> lk(_mutex);
+    stdx::unique_lock<Latch> lk(_mutex);
     auto collectionIt = _collectionIndexBuilds.find(collectionUUID);
     if (collectionIt == _collectionIndexBuilds.end()) {
         return Status(ErrorCodes::IndexNotFound,
@@ -278,10 +239,9 @@ Status IndexBuildsCoordinatorMongod::setCommitQuorum(OperationContext* opCtx,
         buildState->indexNames.begin(), buildState->indexNames.end(), indexNames.begin());
     if (buildState->indexNames.size() != indexNames.size() || !equal) {
         return Status(ErrorCodes::IndexNotFound,
-                      str::stream() << "Provided indexes are not all being "
-                                    << "built by the same index builder in collection '"
-                                    << nss
-                                    << "'.");
+                      str::stream()
+                          << "Provided indexes are not all being "
+                          << "built by the same index builder in collection '" << nss << "'.");
     }
 
     // See if the new commit quorum is satisfiable.
@@ -293,8 +253,12 @@ Status IndexBuildsCoordinatorMongod::setCommitQuorum(OperationContext* opCtx,
 
     // Persist the new commit quorum for the index build and write it to the collection.
     buildState->commitQuorum = newCommitQuorum;
-    const UUID buildUUID = buildState->buildUUID;
-    return indexbuildentryhelpers::setCommitQuorum(opCtx, buildUUID, newCommitQuorum);
+    // TODO (SERVER-40807): disabling the following code for the v4.2 release so it does not have
+    // downstream impact.
+    /*
+    return indexbuildentryhelpers::setCommitQuorum(opCtx, buildState->buildUUID, newCommitQuorum);
+    */
+    return Status::OK();
 }
 
 Status IndexBuildsCoordinatorMongod::_finishScanningPhase() {

@@ -40,7 +40,6 @@ namespace mongo {
 
 class CollectionCatalogEntry;
 class Database;
-class DatabaseCatalogEntry;
 class OperationContext;
 class RecordStore;
 
@@ -81,7 +80,8 @@ public:
      * doesn't notify the replication subsystem or do any other consistency checks, so it should
      * not be used directly from user commands.
      *
-     * Must be called with the specified database locked in X mode.
+     * Must be called with the specified database locked in X mode. The caller must ensure no index
+     * builds are in progress on the database.
      */
     virtual void dropDb(OperationContext* opCtx, Database* db) = 0;
 
@@ -94,6 +94,8 @@ public:
     /**
      * Closes all opened databases. Must be called with the global lock acquired in X-mode.
      * Will uassert if any background jobs are running when this function is called.
+     *
+     * The caller must hold the global X lock and ensure there are no index builds in progress.
      */
     virtual void closeAll(OperationContext* opCtx) = 0;
 
@@ -103,16 +105,11 @@ public:
     virtual std::set<std::string> getNamesWithConflictingCasing(const StringData name) = 0;
 
     /**
-     * Returns a new Collection.
-     * This function supports rebuilding indexes during the repair process and should not be used
-     * for any other purpose.
+     * Returns all the database names (including those which are empty).
+     *
+     * Unlike CollectionCatalog::getAllDbNames(), this returns databases that are empty.
      */
-    virtual std::unique_ptr<Collection> makeCollection(OperationContext* const opCtx,
-                                                       const StringData fullNS,
-                                                       OptionalCollectionUUID uuid,
-                                                       CollectionCatalogEntry* const details,
-                                                       RecordStore* const recordStore,
-                                                       DatabaseCatalogEntry* const dbce) = 0;
+    virtual std::vector<std::string> getNames() = 0;
 };
 
 }  // namespace mongo

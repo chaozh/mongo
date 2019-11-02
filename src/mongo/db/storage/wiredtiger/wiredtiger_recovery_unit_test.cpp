@@ -54,12 +54,20 @@ public:
                   _dbpath.path(),         // .path
                   &_cs,                   // .cs
                   "",                     // .extraOpenOptions
-                  1,                      // .cacheSizeGB
+                  1,                      // .cacheSizeMB
+                  0,                      // .maxCacheOverflowFileSizeMB
                   false,                  // .durable
                   false,                  // .ephemeral
                   false,                  // .repair
                   false                   // .readOnly
-                  ) {
+          ) {
+        // Deliberately not calling _engine->startAsyncThreads() because it starts an asynchronous
+        // checkpointing thread that can interfere with unit tests manipulating checkpoints
+        // manually.
+        //
+        // Alternatively, we would have to start using wiredTigerGlobalOptions.checkpointDelaySecs
+        // to set a high enough value such that the async thread never runs during testing.
+
         repl::ReplicationCoordinator::set(
             getGlobalServiceContext(),
             std::unique_ptr<repl::ReplicationCoordinator>(new repl::ReplicationCoordinatorMock(
@@ -101,9 +109,10 @@ public:
         params.cappedMaxDocs = -1;
         params.cappedCallback = nullptr;
         params.sizeStorer = nullptr;
+        params.tracksSizeAdjustments = true;
         params.isReadOnly = false;
 
-        auto ret = stdx::make_unique<StandardWiredTigerRecordStore>(&_engine, opCtx, params);
+        auto ret = std::make_unique<StandardWiredTigerRecordStore>(&_engine, opCtx, params);
         ret->postConstructorInit(opCtx);
         return std::move(ret);
     }
@@ -118,12 +127,12 @@ private:
     WiredTigerKVEngine _engine;
 };
 
-std::unique_ptr<HarnessHelper> makeHarnessHelper() {
+std::unique_ptr<RecoveryUnitHarnessHelper> makeWTRUHarnessHelper() {
     return std::make_unique<WiredTigerRecoveryUnitHarnessHelper>();
 }
 
 MONGO_INITIALIZER(RegisterHarnessFactory)(InitializerContext* const) {
-    mongo::registerHarnessHelperFactory(makeHarnessHelper);
+    mongo::registerRecoveryUnitHarnessHelperFactory(makeWTRUHarnessHelper);
     return Status::OK();
 }
 
@@ -145,7 +154,7 @@ public:
     void getCursor(WiredTigerRecoveryUnit* ru, WT_CURSOR** cursor) {
         WT_SESSION* wt_session = ru->getSession()->getSession();
         invariantWTOK(wt_session->create(wt_session, wt_uri, wt_config));
-        invariantWTOK(wt_session->open_cursor(wt_session, wt_uri, NULL, NULL, cursor));
+        invariantWTOK(wt_session->open_cursor(wt_session, wt_uri, nullptr, nullptr, cursor));
     }
 
     void setUp() override {
@@ -225,9 +234,8 @@ TEST_F(WiredTigerRecoveryUnitTestFixture,
     ru1->setPrepareTimestamp({1, 1});
     ru1->prepareUnitOfWork();
 
-    // Transaction read that does not ignore prepare conflicts triggers WT_PREPARE_CONFLICT
+    // The transaction read default enforces prepare conflicts and triggers a WT_PREPARE_CONFLICT.
     ru2->beginUnitOfWork(clientAndCtx2.second.get());
-    ru2->setIgnorePrepared(false);
     getCursor(ru2, &cursor);
     cursor->set_key(cursor, "key");
     int ret = cursor->search(cursor);
@@ -249,13 +257,46 @@ TEST_F(WiredTigerRecoveryUnitTestFixture,
     ru1->setPrepareTimestamp({1, 1});
     ru1->prepareUnitOfWork();
 
-    // Transaction read default ignores prepare conflicts but should not be able to read
-    // data from the prepared transaction.
+    // A transaction that chooses to ignore prepare conflicts does not see the record instead of
+    // returning a prepare conflict.
     ru2->beginUnitOfWork(clientAndCtx2.second.get());
+    ru2->setPrepareConflictBehavior(PrepareConflictBehavior::kIgnoreConflicts);
     getCursor(ru2, &cursor);
     cursor->set_key(cursor, "key");
     int ret = cursor->search(cursor);
     ASSERT_EQ(WT_NOTFOUND, ret);
+
+    ru1->abortUnitOfWork();
+    ru2->abortUnitOfWork();
+}
+
+TEST_F(WiredTigerRecoveryUnitTestFixture, WriteAllowedWhileIgnorePrepareFalse) {
+    // Prepare but don't commit a transaction
+    ru1->beginUnitOfWork(clientAndCtx1.second.get());
+    WT_CURSOR* cursor;
+    getCursor(ru1, &cursor);
+    cursor->set_key(cursor, "key1");
+    cursor->set_value(cursor, "value1");
+    invariantWTOK(cursor->insert(cursor));
+    ru1->setPrepareTimestamp({1, 1});
+    ru1->prepareUnitOfWork();
+
+    // A transaction that chooses to ignore prepare conflicts with kIgnoreConflictsAllowWrites does
+    // not see the record
+    ru2->beginUnitOfWork(clientAndCtx2.second.get());
+    ru2->setPrepareConflictBehavior(PrepareConflictBehavior::kIgnoreConflictsAllowWrites);
+
+    // The prepared write is not visible.
+    getCursor(ru2, &cursor);
+    cursor->set_key(cursor, "key1");
+    ASSERT_EQ(WT_NOTFOUND, cursor->search(cursor));
+
+    getCursor(ru2, &cursor);
+    cursor->set_key(cursor, "key2");
+    cursor->set_value(cursor, "value2");
+
+    // The write is allowed.
+    invariantWTOK(cursor->insert(cursor));
 
     ru1->abortUnitOfWork();
     ru2->abortUnitOfWork();
@@ -532,6 +573,63 @@ TEST_F(WiredTigerRecoveryUnitTestFixture, CommitTimestampAfterSetTimestampOnAbor
     ASSERT(!commitTs);
 }
 
+TEST_F(WiredTigerRecoveryUnitTestFixture, CheckpointCursorsAreNotCached) {
+    auto opCtx = clientAndCtx1.second.get();
+    auto ru = WiredTigerRecoveryUnit::get(opCtx);
+
+    std::unique_ptr<RecordStore> rs(
+        harnessHelper->createRecordStore(opCtx, "test.checkpoint_not_cached"));
+    auto uri = dynamic_cast<WiredTigerRecordStore*>(rs.get())->getURI();
+
+    WiredTigerKVEngine* engine = harnessHelper->getEngine();
+
+    // Insert a record.
+    ru->beginUnitOfWork(opCtx);
+    StatusWith<RecordId> s = rs->insertRecord(opCtx, "data", 4, Timestamp());
+    ASSERT_TRUE(s.isOK());
+    ASSERT_EQUALS(1, rs->numRecords(opCtx));
+    ru->commitUnitOfWork();
+
+    // Test 1: A normal read should create a new cursor and release it into the session cache.
+
+    // Close all cached cursors to establish a 'before' state.
+    ru->getSession()->closeAllCursors(uri);
+    int cachedCursorsBefore = ru->getSession()->cachedCursors();
+
+    RecordData rd;
+    ASSERT_TRUE(rs->findRecord(opCtx, s.getValue(), &rd));
+
+    // A cursor should have been checked out and released into the cache.
+    ASSERT_GT(ru->getSession()->cachedCursors(), cachedCursorsBefore);
+    // All opened cursors are returned.
+    ASSERT_EQ(0, ru->getSession()->cursorsOut());
+
+    ru->abandonSnapshot();
+
+    // Force a checkpoint.
+    ASSERT_EQUALS(1, engine->flushAllFiles(opCtx, true));
+
+    // Test 2: Checkpoint cursors are not expected to be cached, they
+    // should be immediately closed when destructed.
+    ru->setTimestampReadSource(WiredTigerRecoveryUnit::ReadSource::kCheckpoint);
+
+    // Close any cached cursors to establish a new 'before' state.
+    ru->getSession()->closeAllCursors(uri);
+    cachedCursorsBefore = ru->getSession()->cachedCursors();
+
+    // Will search the checkpoint cursor for the record, then close the checkpoint cursor.
+    ASSERT_TRUE(rs->findRecord(opCtx, s.getValue(), &rd));
+
+    // No new cursors should have been released into the cache, with the exception of a metadata
+    // cursor that is opened to determine if the table is LSM. Metadata cursors are cached.
+    ASSERT_EQ(ru->getSession()->cachedCursors(), cachedCursorsBefore + 1);
+
+    // All opened cursors are closed.
+    ASSERT_EQ(0, ru->getSession()->cursorsOut());
+
+    ASSERT_EQ(ru->getTimestampReadSource(), WiredTigerRecoveryUnit::ReadSource::kCheckpoint);
+}
+
 TEST_F(WiredTigerRecoveryUnitTestFixture, ReadOnceCursorsAreNotCached) {
     auto opCtx = clientAndCtx1.second.get();
     auto ru = WiredTigerRecoveryUnit::get(opCtx);
@@ -580,6 +678,62 @@ TEST_F(WiredTigerRecoveryUnitTestFixture, ReadOnceCursorsAreNotCached) {
     ASSERT_EQ(0, ru->getSession()->cursorsOut());
 
     ASSERT(ru->getReadOnce());
+}
+
+TEST_F(WiredTigerRecoveryUnitTestFixture, CheckpointCursorNotChanged) {
+    auto opCtx = clientAndCtx1.second.get();
+    auto opCtx2 = clientAndCtx2.second.get();
+    auto ru = WiredTigerRecoveryUnit::get(opCtx);
+    auto ru2 = WiredTigerRecoveryUnit::get(opCtx2);
+
+    std::unique_ptr<RecordStore> rs(
+        harnessHelper->createRecordStore(opCtx, "test.checkpoint_stable"));
+
+    WiredTigerKVEngine* engine = harnessHelper->getEngine();
+
+    // Insert a record.
+    ru->beginUnitOfWork(opCtx);
+    StatusWith<RecordId> s1 = rs->insertRecord(opCtx, "data", 4, Timestamp());
+    ASSERT_TRUE(s1.isOK());
+    ASSERT_EQUALS(1, rs->numRecords(opCtx));
+    ru->commitUnitOfWork();
+
+    // Force a checkpoint.
+    ASSERT_EQUALS(1, engine->flushAllFiles(opCtx, true));
+
+    // Test 1: Open a checkpoint cursor and ensure it has the first record.
+    ru2->setTimestampReadSource(WiredTigerRecoveryUnit::ReadSource::kCheckpoint);
+    auto originalCheckpointCursor = rs->getCursor(opCtx2, true);
+    ASSERT(originalCheckpointCursor->seekExact(s1.getValue()));
+
+    // Insert a new record.
+    ru->beginUnitOfWork(opCtx);
+    StatusWith<RecordId> s2 = rs->insertRecord(opCtx, "data_2", 6, Timestamp());
+    ASSERT_TRUE(s2.isOK());
+    ASSERT_EQUALS(2, rs->numRecords(opCtx));
+    ru->commitUnitOfWork();
+
+    // Test 2: New record does not appear in original checkpoint cursor.
+    ASSERT(!originalCheckpointCursor->seekExact(s2.getValue()));
+    ASSERT(originalCheckpointCursor->seekExact(s1.getValue()));
+
+    // Test 3: New record does not appear in new checkpoint cursor since no new checkpoint was
+    // created.
+    ru->setTimestampReadSource(WiredTigerRecoveryUnit::ReadSource::kCheckpoint);
+    auto checkpointCursor = rs->getCursor(opCtx, true);
+    ASSERT(!checkpointCursor->seekExact(s2.getValue()));
+
+    // Force a checkpoint.
+    ASSERT_EQUALS(1, engine->flushAllFiles(opCtx, true));
+
+    // Test 4: Old and new record should appear in new checkpoint cursor. Only old record
+    // should appear in the original checkpoint cursor
+    ru->setTimestampReadSource(WiredTigerRecoveryUnit::ReadSource::kCheckpoint);
+    auto newCheckpointCursor = rs->getCursor(opCtx, true);
+    ASSERT(newCheckpointCursor->seekExact(s1.getValue()));
+    ASSERT(newCheckpointCursor->seekExact(s2.getValue()));
+    ASSERT(originalCheckpointCursor->seekExact(s1.getValue()));
+    ASSERT(!originalCheckpointCursor->seekExact(s2.getValue()));
 }
 
 TEST_F(WiredTigerRecoveryUnitTestFixture, CommitWithDurableTimestamp) {

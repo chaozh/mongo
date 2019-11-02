@@ -30,6 +30,7 @@
 #pragma once
 
 #include <map>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
@@ -39,7 +40,6 @@
 #include "mongo/db/matcher/expression_with_placeholder.h"
 #include "mongo/db/update/modifier_table.h"
 #include "mongo/db/update/update_internal_node.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/stdx/unordered_map.h"
 
 namespace mongo {
@@ -82,7 +82,7 @@ public:
     UpdateObjectNode() : UpdateInternalNode(Type::Object) {}
 
     std::unique_ptr<UpdateNode> clone() const final {
-        return stdx::make_unique<UpdateObjectNode>(*this);
+        return std::make_unique<UpdateObjectNode>(*this);
     }
 
     void setCollator(const CollatorInterface* collator) final {
@@ -94,7 +94,8 @@ public:
         }
     }
 
-    ApplyResult apply(ApplyParams applyParams) const final;
+    ApplyResult apply(ApplyParams applyParams,
+                      UpdateNodeApplyParams updateNodeApplyParams) const final;
 
     UpdateNode* getChild(const std::string& field) const final;
 
@@ -110,15 +111,23 @@ public:
         FieldRef* currentPath,
         std::map<std::string, std::vector<std::pair<std::string, BSONObj>>>*
             operatorOrientedUpdates) const final {
-        for (const auto & [ pathSuffix, child ] : _children) {
-            FieldRefTempAppend tempAppend(*currentPath, pathSuffix);
+        for (const auto& [pathSuffix, child] : _children) {
+            FieldRef::FieldRefTempAppend tempAppend(*currentPath, pathSuffix);
             child->produceSerializationMap(currentPath, operatorOrientedUpdates);
         }
         // Object nodes have a positional child that must be accounted for.
         if (_positionalChild) {
-            FieldRefTempAppend tempAppend(*currentPath, "$");
+            FieldRef::FieldRefTempAppend tempAppend(*currentPath, "$");
             _positionalChild->produceSerializationMap(currentPath, operatorOrientedUpdates);
         }
+    }
+
+    void acceptVisitor(UpdateNodeVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    const std::map<std::string, clonable_ptr<UpdateNode>>& getChildren() const {
+        return _children;
     }
 
 private:

@@ -39,11 +39,10 @@
 #include "mongo/base/init.h"
 #include "mongo/bson/util/builder.h"
 #include "mongo/db/service_context.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/duration.h"
 #include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -180,9 +179,7 @@ void TimeZoneDatabase::loadTimeZoneInfo(
                 40475,
                 {ErrorCodes::FailedToParse,
                  str::stream() << "failed to parse time zone file for time zone identifier \""
-                               << entry.id
-                               << "\": "
-                               << timelib_get_error_message(errorCode)});
+                               << entry.id << "\": " << timelib_get_error_message(errorCode)});
         }
 
         invariant(errorCode == TIMELIB_ERROR_NO_ERROR);
@@ -276,8 +273,7 @@ Date_t TimeZoneDatabase::fromString(StringData dateString,
         uasserted(ErrorCodes::ConversionFailure,
                   str::stream()
                       << "an incomplete date/time string has been found, with elements missing: \""
-                      << dateString
-                      << "\"");
+                      << dateString << "\"");
     }
 
     if (!tz.isUtcZone()) {
@@ -295,8 +291,7 @@ Date_t TimeZoneDatabase::fromString(StringData dateString,
                     ErrorCodes::ConversionFailure,
                     str::stream()
                         << "you cannot pass in a date/time string with time zone information ('"
-                        << parsedTime.get()->tz_abbr
-                        << "') together with a timezone argument");
+                        << parsedTime.get()->tz_abbr << "') together with a timezone argument");
                 break;
             default:  // should technically not be possible to reach
                 uasserted(ErrorCodes::ConversionFailure,
@@ -321,7 +316,7 @@ boost::optional<Seconds> TimeZoneDatabase::parseUtcOffset(StringData offsetSpec)
         // ±HH
         if (offsetSpec.size() == 3 && isdigit(offsetSpec[1]) && isdigit(offsetSpec[2])) {
             int offset;
-            if (parseNumberFromStringWithBase(offsetSpec.substr(1, 2), 10, &offset).isOK()) {
+            if (NumberParser().base(10)(offsetSpec.substr(1, 2), &offset).isOK()) {
                 return duration_cast<Seconds>(Hours(bias * offset));
             }
             return boost::none;
@@ -331,7 +326,7 @@ boost::optional<Seconds> TimeZoneDatabase::parseUtcOffset(StringData offsetSpec)
         if (offsetSpec.size() == 5 && isdigit(offsetSpec[1]) && isdigit(offsetSpec[2]) &&
             isdigit(offsetSpec[3]) && isdigit(offsetSpec[4])) {
             int offset;
-            if (parseNumberFromStringWithBase(offsetSpec.substr(1, 4), 10, &offset).isOK()) {
+            if (NumberParser().base(10)(offsetSpec.substr(1, 4), &offset).isOK()) {
                 return duration_cast<Seconds>(Hours(bias * (offset / 100L)) +
                                               Minutes(bias * (offset % 100)));
             }
@@ -342,10 +337,10 @@ boost::optional<Seconds> TimeZoneDatabase::parseUtcOffset(StringData offsetSpec)
         if (offsetSpec.size() == 6 && isdigit(offsetSpec[1]) && isdigit(offsetSpec[2]) &&
             offsetSpec[3] == ':' && isdigit(offsetSpec[4]) && isdigit(offsetSpec[5])) {
             int hourOffset, minuteOffset;
-            if (!parseNumberFromStringWithBase(offsetSpec.substr(1, 2), 10, &hourOffset).isOK()) {
+            if (!NumberParser().base(10)(offsetSpec.substr(1, 2), &hourOffset).isOK()) {
                 return boost::none;
             }
-            if (!parseNumberFromStringWithBase(offsetSpec.substr(4, 2), 10, &minuteOffset).isOK()) {
+            if (!NumberParser().base(10)(offsetSpec.substr(4, 2), &minuteOffset).isOK()) {
                 return boost::none;
             }
             return duration_cast<Seconds>(Hours(bias * hourOffset) + Minutes(bias * minuteOffset));
@@ -367,6 +362,16 @@ TimeZone TimeZoneDatabase::getTimeZone(StringData timeZoneId) const {
 
     uasserted(40485,
               str::stream() << "unrecognized time zone identifier: \"" << timeZoneId << "\"");
+}
+
+std::vector<std::string> TimeZoneDatabase::getTimeZoneStrings() const {
+    std::vector<std::string> timeZoneStrings = {};
+
+    for (auto const& timezone : _timeZones) {
+        timeZoneStrings.push_back(timezone.first);
+    }
+
+    return timeZoneStrings;
 }
 
 void TimeZone::adjustTimeZone(timelib_time* timelibTime) const {

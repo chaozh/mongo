@@ -54,7 +54,7 @@
 #include "mongo/db/pipeline/lite_parsed_pipeline.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -184,17 +184,6 @@ RoleNameIterator AuthorizationSessionImpl::getAuthenticatedRoleNames() {
     return makeRoleNameIterator(_authenticatedRoleNames.begin(), _authenticatedRoleNames.end());
 }
 
-std::string AuthorizationSessionImpl::getAuthenticatedUserNamesToken() {
-    std::string ret;
-    for (UserNameIterator nameIter = getAuthenticatedUserNames(); nameIter.more();
-         nameIter.next()) {
-        ret += '\0';  // Using a NUL byte which isn't valid in usernames to separate them.
-        ret += nameIter->getFullName();
-    }
-
-    return ret;
-}
-
 void AuthorizationSessionImpl::grantInternalAuthorization(Client* client) {
     stdx::lock_guard<Client> lk(*client);
     _authenticatedUsers.add(internalSecurity.user);
@@ -256,7 +245,7 @@ StatusWith<PrivilegeVector> AuthorizationSessionImpl::getPrivilegesForAggregate(
     const NamespaceString& nss, const BSONObj& cmdObj, bool isMongos) {
     if (!nss.isValid()) {
         return Status(ErrorCodes::InvalidNamespace,
-                      mongoutils::str::stream() << "Invalid input namespace, " << nss.ns());
+                      str::stream() << "Invalid input namespace, " << nss.ns());
     }
 
     PrivilegeVector privileges;
@@ -364,7 +353,7 @@ Status AuthorizationSessionImpl::checkAuthForInsert(OperationContext* opCtx,
 Status AuthorizationSessionImpl::checkAuthForUpdate(OperationContext* opCtx,
                                                     const NamespaceString& ns,
                                                     const BSONObj& query,
-                                                    const BSONObj& update,
+                                                    const write_ops::UpdateModification& update,
                                                     bool upsert) {
     ActionSet required{ActionType::update};
     StringData operationType = "update"_sd;
@@ -493,8 +482,7 @@ Status AuthorizationSessionImpl::checkAuthorizedToGrantPrivilege(const Privilege
                 ActionType::grantRole)) {
             return Status(ErrorCodes::Unauthorized,
                           str::stream() << "Not authorized to grant privileges on the "
-                                        << resource.databaseToMatch()
-                                        << "database");
+                                        << resource.databaseToMatch() << "database");
         }
     } else if (!isAuthorizedForActionsOnResource(ResourcePattern::forDatabaseName("admin"),
                                                  ActionType::grantRole)) {
@@ -514,8 +502,7 @@ Status AuthorizationSessionImpl::checkAuthorizedToRevokePrivilege(const Privileg
                 ActionType::revokeRole)) {
             return Status(ErrorCodes::Unauthorized,
                           str::stream() << "Not authorized to revoke privileges on the "
-                                        << resource.databaseToMatch()
-                                        << "database");
+                                        << resource.databaseToMatch() << "database");
         }
     } else if (!isAuthorizedForActionsOnResource(ResourcePattern::forDatabaseName("admin"),
                                                  ActionType::revokeRole)) {
@@ -1001,9 +988,7 @@ bool AuthorizationSessionImpl::isImpersonating() const {
 auto AuthorizationSessionImpl::checkCursorSessionPrivilege(
     OperationContext* const opCtx, const boost::optional<LogicalSessionId> cursorSessionId)
     -> Status {
-    auto nobodyIsLoggedIn = [authSession = this] {
-        return !authSession->isAuthenticated();
-    };
+    auto nobodyIsLoggedIn = [authSession = this] { return !authSession->isAuthenticated(); };
 
     auto authHasImpersonatePrivilege = [authSession = this] {
         return authSession->isAuthorizedForPrivilege(
@@ -1037,13 +1022,12 @@ auto AuthorizationSessionImpl::checkCursorSessionPrivilege(
                                         // Operation Context (which implies a background job
         !authHasImpersonatePrivilege()  // Or if the user has an impersonation privilege, in which
                                         // case, the user gets to sidestep certain checks.
-        ) {
+    ) {
         return Status{ErrorCodes::Unauthorized,
-                      str::stream() << "Cursor session id ("
-                                    << sessionIdToStringOrNone(cursorSessionId)
-                                    << ") is not the same as the operation context's session id ("
-                                    << sessionIdToStringOrNone(opCtx->getLogicalSessionId())
-                                    << ")"};
+                      str::stream()
+                          << "Cursor session id (" << sessionIdToStringOrNone(cursorSessionId)
+                          << ") is not the same as the operation context's session id ("
+                          << sessionIdToStringOrNone(opCtx->getLogicalSessionId()) << ")"};
     }
 
     return Status::OK();

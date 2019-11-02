@@ -21,6 +21,7 @@
 "changeStream",
 "checkFreeMonitoringStatus",
 "cleanupOrphaned",
+"clearJumboFlag",
 "closeAllDatabases",  # Deprecated, needs to stay around for backwards compatibility
 "collMod",
 "collStats",
@@ -85,11 +86,13 @@
 "planCacheIndexFilter", # view/update index filters
 "planCacheRead", # view contents of plan cache
 "planCacheWrite", # clear cache, drop cache entry, pin/unpin/shun plans
+"refineCollectionShardKey",
 "reIndex",
 "remove",
 "removeShard",
 "renameCollection",  # Not used for permissions checks, but to id the event in logs.
 "renameCollectionSameDB",
+"repairDatabase",   # Deprecated, needs to stay around for backwards compatibility
 "replSetConfigure",
 "replSetGetConfig",
 "replSetGetStatus",
@@ -102,6 +105,7 @@
 "revokePrivilegesFromRole",  # Not used for permissions checks, but to id the event in logs.
 "revokeRolesFromRole",  # Not used for permissions checks, but to id the event in logs.
 "revokeRolesFromUser",  # Not used for permissions checks, but to id the event in logs.
+"runAsLessPrivilegedUser",
 "serverStatus",
 "setAuthenticationRestriction",
 "setFeatureCompatibilityVersion",

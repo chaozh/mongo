@@ -23,21 +23,20 @@ function reconnect(db) {
 
 function _getErrorWithCode(codeOrObj, message) {
     var e = new Error(message);
-    if (codeOrObj != undefined) {
-        if (codeOrObj.writeError || codeOrObj.code) {
-            if (codeOrObj.writeError) {
-                e.code = codeOrObj.writeError.code;
-            } else if (codeOrObj.code) {
-                e.code = codeOrObj.code;
-            }
-
-            if (codeOrObj.hasOwnProperty("errorLabels")) {
-                e.errorLabels = codeOrObj.errorLabels;
-            }
-        } else {
-            // At this point assume codeOrObj is a number type
-            e.code = codeOrObj;
+    if (typeof codeOrObj === "object" && codeOrObj !== null) {
+        if (codeOrObj.hasOwnProperty("code")) {
+            e.code = codeOrObj.code;
         }
+
+        if (codeOrObj.hasOwnProperty("writeErrors")) {
+            e.writeErrors = codeOrObj.writeErrors;
+        }
+
+        if (codeOrObj.hasOwnProperty("errorLabels")) {
+            e.errorLabels = codeOrObj.errorLabels;
+        }
+    } else if (typeof codeOrObj === "number") {
+        e.code = codeOrObj;
     }
 
     return e;
@@ -86,7 +85,7 @@ function isRetryableError(error) {
     const retryableErrors = [
         "Interrupted",
         "InterruptedAtShutdown",
-        "InterruptedDueToStepDown",
+        "InterruptedDueToReplStateChange",
         "ExceededTimeLimit",
         "MaxTimeMSExpired",
         "CursorKilled",
@@ -99,7 +98,6 @@ function isRetryableError(error) {
         "NotMaster",
         "NotMasterNoSlaveOk",
         "NotMasterOrSecondary",
-        "InterruptedDueToStepDown",
         "PrimarySteppedDown",
         "WriteConcernFailed",
         "WriteConcernLegacyOK",
@@ -215,7 +213,7 @@ print.captureAllOutput = function(fn, args) {
 };
 
 var indentStr = function(indent, s) {
-    if (typeof(s) === "undefined") {
+    if (typeof (s) === "undefined") {
         s = indent;
         indent = 0;
     }
@@ -337,7 +335,17 @@ jsTestOptions = function() {
             disableImplicitSessions: TestData.disableImplicitSessions || false,
             setSkipShardingPartsOfPrepareTransactionFailpoint:
                 TestData.setSkipShardingPartsOfPrepareTransactionFailpoint || false,
-            retryingOnNetworkError: TestData.retryingOnNetworkError,
+            roleGraphInvalidationIsFatal: TestData.roleGraphInvalidationIsFatal || false,
+            networkErrorAndTxnOverrideConfig: TestData.networkErrorAndTxnOverrideConfig || {},
+            // When useRandomBinVersionsWithinReplicaSet is true, randomly assign the binary
+            // versions of each node in the replica set to 'latest' or 'last-stable'.
+            // This flag is currently a placeholder and only sets the replica set to last-stable
+            // FCV.
+            useRandomBinVersionsWithinReplicaSet:
+                TestData.useRandomBinVersionsWithinReplicaSet || false,
+            // Set a specific random seed to be used when useRandomBinVersionsWithinReplicaSet is
+            // true.
+            seed: TestData.seed || undefined,
         });
     }
     return _jsTestOptions;
@@ -351,7 +359,7 @@ jsTestLog = function(msg) {
     if (typeof msg === "object") {
         msg = tojson(msg);
     }
-    assert.eq(typeof(msg), "string", "Received: " + msg);
+    assert.eq(typeof (msg), "string", "Received: " + msg);
     const msgs = ["----", ...msg.split("\n"), "----"].map(s => `[jsTest] ${s}`);
     print(`\n\n${msgs.join("\n")}\n\n`);
 };
@@ -597,10 +605,10 @@ if (typeof _shouldUseImplicitSessions === 'undefined') {
 }
 
 shellPrintHelper = function(x) {
-    if (typeof(x) == "undefined") {
+    if (typeof (x) == "undefined") {
         // Make sure that we have a db var before we use it
         // TODO: This implicit calling of GLE can cause subtle, hard to track issues - remove?
-        if (__callLastError && typeof(db) != "undefined" && db.getMongo &&
+        if (__callLastError && typeof (db) != "undefined" && db.getMongo &&
             db.getMongo().writeMode() == "legacy") {
             __callLastError = false;
             // explicit w:1 so that replset getLastErrorDefaults aren't used here which would be bad
@@ -639,7 +647,6 @@ shellPrintHelper = function(x) {
 
 shellAutocomplete = function(
     /*prefix*/) {  // outer scope function called on init. Actual function at end
-
     var universalMethods =
         "constructor prototype toString valueOf toLocaleString hasOwnProperty propertyIsEnumerable"
             .split(' ');
@@ -744,7 +751,7 @@ shellAutocomplete = function(
             {};  // see http://dreaminginjavascript.wordpress.com/2008/08/22/eliminating-duplicates/
         for (var i = 0; i < possibilities.length; i++) {
             var p = possibilities[i];
-            if (typeof(curObj[p]) == "undefined" && curObj != global)
+            if (typeof (curObj[p]) == "undefined" && curObj != global)
                 continue;  // extraGlobals aren't in the global object
             if (p.length == 0 || p.length < lastPrefix.length)
                 continue;
@@ -830,7 +837,7 @@ shellHelper.set = function(str) {
 };
 
 shellHelper.it = function() {
-    if (typeof(___it___) == "undefined" || ___it___ == null) {
+    if (typeof (___it___) == "undefined" || ___it___ == null) {
         print("no cursor");
         return;
     }
@@ -863,7 +870,7 @@ shellHelper.show = function(what) {
                             continue;
 
                         var val = x[z];
-                        var mytype = typeof(val);
+                        var mytype = typeof (val);
 
                         if (mytype == "string" || mytype == "number")
                             l += z + ":" + val + " ";
@@ -892,8 +899,8 @@ shellHelper.show = function(what) {
     }
 
     if (what == "collections" || what == "tables") {
-        db.getCollectionNames().forEach(function(x) {
-            print(x);
+        db.getCollectionInfos({}, true, true).forEach(function(infoObj) {
+            print(infoObj.name);
         });
         return "";
     }
@@ -928,6 +935,7 @@ shellHelper.show = function(what) {
             dbinfo.push({
                 name: x.name,
                 size: x.sizeOnDisk,
+                empty: x.empty,
                 size_str: sizeStr,
                 name_size: nameLength,
                 gb_digits: gbDigits
@@ -941,8 +949,10 @@ shellHelper.show = function(what) {
             var padding = Array(namePadding + sizePadding + 3).join(" ");
             if (db.size > 1) {
                 print(db.name + padding + db.size_str + "GB");
-            } else {
+            } else if (db.empty) {
                 print(db.name + padding + "(empty)");
+            } else {
+                print(db.name);
             }
         });
 
@@ -1089,8 +1099,53 @@ shellHelper.show = function(what) {
         }
     }
 
-    throw Error("don't know how to show [" + what + "]");
+    if (what == "nonGenuineMongoDBCheck") {
+        let matchesKnownImposterSignature = false;
 
+        // A MongoDB emulation service offered by a company
+        // responsible for a certain disk operating system.
+        try {
+            const buildInfo = db.runCommand({buildInfo: 1});
+            if (buildInfo.hasOwnProperty('_t')) {
+                matchesKnownImposterSignature = true;
+            }
+        } catch (e) {
+            // Don't do anything here. Just throw the error away.
+        }
+
+        // A MongoDB emulation service offered by a company named
+        // after some sort of minor river or something.
+        if (!matchesKnownImposterSignature) {
+            try {
+                const cmdLineOpts = db.adminCommand({getCmdLineOpts: 1});
+                if (cmdLineOpts.hasOwnProperty('errmsg') &&
+                    cmdLineOpts.errmsg.indexOf('not supported') !== -1) {
+                    matchesKnownImposterSignature = true;
+                }
+            } catch (e) {
+                // Don't do anything here. Just throw the error away.
+            }
+        }
+
+        if (matchesKnownImposterSignature) {
+            print("\n" +
+                  "Warning: Non-Genuine MongoDB Detected\n\n" +
+
+                  "This server or service appears to be an emulation of MongoDB " +
+                  "rather than an official MongoDB product.\n\n" +
+
+                  "Some documented MongoDB features may work differently, " +
+                  "be entirely missing or incomplete, " +
+                  "or have unexpected performance characteristics.\n\n" +
+
+                  "To learn more please visit: " +
+                  "https://dochub.mongodb.org/core/non-genuine-mongodb-server-warning.\n");
+        }
+
+        return "";
+    }
+
+    throw Error("don't know how to show [" + what + "]");
 };
 
 __promptWrapper__ = function(promptFunction) {
@@ -1126,8 +1181,8 @@ Math.sigFig = function(x, N) {
 
 var Random = (function() {
     var initialized = false;
-    var errorMsg =
-        "The random number generator hasn't been seeded yet; " + "call Random.setRandomSeed()";
+    var errorMsg = "The random number generator hasn't been seeded yet; " +
+        "call Random.setRandomSeed()";
 
     // Set the random generator seed.
     function srand(s) {
@@ -1201,7 +1256,6 @@ var Random = (function() {
         setRandomSeed: setRandomSeed,
         srand: srand,
     };
-
 })();
 
 /**
@@ -1304,7 +1358,8 @@ _awaitRSHostViaRSMonitor = function(hostAddr, desiredState, rsName, timeout) {
         desiredState = {ok: true};
     }
 
-    print("Awaiting " + hostAddr + " to be " + tojson(desiredState) + " in " + " rs " + rsName);
+    print("Awaiting " + hostAddr + " to be " + tojson(desiredState) + " in " +
+          " rs " + rsName);
 
     var tests = 0;
     assert.soon(
@@ -1340,8 +1395,8 @@ _awaitRSHostViaRSMonitor = function(hostAddr, desiredState, rsName, timeout) {
             }
             return false;
         },
-        "timed out waiting for replica set member: " + hostAddr + " to reach state: " +
-            tojson(desiredState),
+        "timed out waiting for replica set member: " + hostAddr +
+            " to reach state: " + tojson(desiredState),
         timeout);
 };
 
@@ -1539,20 +1594,19 @@ rs.debug.getLastOpWritten = function(server) {
     return s.oplog.rs.find().sort({$natural: -1}).limit(1).next();
 };
 
+rs.isValidOpTime = function(opTime) {
+    let timestampIsValid = (opTime.hasOwnProperty("ts") && (opTime.ts !== Timestamp(0, 0)));
+    let termIsValid = (opTime.hasOwnProperty("t") && (opTime.t != -1));
+
+    return timestampIsValid && termIsValid;
+};
+
 /**
  * Compares OpTimes in the format {ts:Timestamp, t:NumberLong}.
  * Returns -1 if ot1 is 'earlier' than ot2, 1 if 'later' and 0 if equal.
  */
 rs.compareOpTimes = function(ot1, ot2) {
-
-    function _isValidOptime(opTime) {
-        let timestampIsValid = (opTime.hasOwnProperty("ts") && (opTime.ts !== Timestamp(0, 0)));
-        let termIsValid = (opTime.hasOwnProperty("t") && (opTime.t != -1));
-
-        return timestampIsValid && termIsValid;
-    }
-
-    if (!_isValidOptime(ot1) || !_isValidOptime(ot2)) {
+    if (!rs.isValidOpTime(ot1) || !rs.isValidOpTime(ot2)) {
         throw Error("invalid optimes, received: " + tojson(ot1) + " and " + tojson(ot2));
     }
 
@@ -1654,35 +1708,52 @@ help = shellHelper.help = function(x) {
         print("\t                              returns a connection to the new server");
         return;
     } else if (x == "") {
-        print("\t" + "db.help()                    help on db methods");
-        print("\t" + "db.mycoll.help()             help on collection methods");
-        print("\t" + "sh.help()                    sharding helpers");
-        print("\t" + "rs.help()                    replica set helpers");
-        print("\t" + "help admin                   administrative help");
-        print("\t" + "help connect                 connecting to a db help");
-        print("\t" + "help keys                    key shortcuts");
-        print("\t" + "help misc                    misc things to know");
-        print("\t" + "help mr                      mapreduce");
+        print("\t" +
+              "db.help()                    help on db methods");
+        print("\t" +
+              "db.mycoll.help()             help on collection methods");
+        print("\t" +
+              "sh.help()                    sharding helpers");
+        print("\t" +
+              "rs.help()                    replica set helpers");
+        print("\t" +
+              "help admin                   administrative help");
+        print("\t" +
+              "help connect                 connecting to a db help");
+        print("\t" +
+              "help keys                    key shortcuts");
+        print("\t" +
+              "help misc                    misc things to know");
+        print("\t" +
+              "help mr                      mapreduce");
         print();
-        print("\t" + "show dbs                     show database names");
-        print("\t" + "show collections             show collections in current database");
-        print("\t" + "show users                   show users in current database");
+        print("\t" +
+              "show dbs                     show database names");
+        print("\t" +
+              "show collections             show collections in current database");
+        print("\t" +
+              "show users                   show users in current database");
         print(
             "\t" +
             "show profile                 show most recent system.profile entries with time >= 1ms");
-        print("\t" + "show logs                    show the accessible logger names");
+        print("\t" +
+              "show logs                    show the accessible logger names");
         print(
             "\t" +
             "show log [name]              prints out the last segment of log in memory, 'global' is default");
-        print("\t" + "use <db_name>                set current database");
-        print("\t" + "db.foo.find()                list objects in collection foo");
-        print("\t" + "db.foo.find( { a : 1 } )     list objects in foo where a == 1");
+        print("\t" +
+              "use <db_name>                set current database");
+        print("\t" +
+              "db.foo.find()                list objects in collection foo");
+        print("\t" +
+              "db.foo.find( { a : 1 } )     list objects in foo where a == 1");
         print(
             "\t" +
             "it                           result of the last line evaluated; use to further iterate");
         print("\t" +
               "DBQuery.shellBatchSize = x   set default number of items to display on shell");
-        print("\t" + "exit                         quit the mongo shell");
+        print("\t" +
+              "exit                         quit the mongo shell");
     } else
         print("unknown help option");
 };

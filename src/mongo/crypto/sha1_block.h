@@ -29,29 +29,28 @@
 
 #pragma once
 
-#include "mongo/crypto/sha_block.h"
+#include "mongo/crypto/hash_block.h"
 
 #include "mongo/util/make_array_type.h"
 
 namespace mongo {
 
 /**
- * A Traits type for adapting SHABlock to sha256 hashes.
+ * A Traits type for adapting HashBlock to sha1 hashes.
  */
 struct SHA1BlockTraits {
     using HashType = MakeArrayType<std::uint8_t, 20, SHA1BlockTraits>;
 
     static constexpr StringData name = "SHA1Block"_sd;
 
-    static HashType computeHash(std::initializer_list<ConstDataRange> input);
+    static void computeHash(std::initializer_list<ConstDataRange> input, HashType* const output);
 
     static void computeHmac(const uint8_t* key,
                             size_t keyLen,
-                            const uint8_t* input,
-                            size_t inputLen,
+                            std::initializer_list<ConstDataRange> input,
                             HashType* const output);
 };
 
-using SHA1Block = SHABlock<SHA1BlockTraits>;
+using SHA1Block = HashBlock<SHA1BlockTraits>;
 
 }  // namespace mongo

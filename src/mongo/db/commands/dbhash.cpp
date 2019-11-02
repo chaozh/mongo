@@ -33,11 +33,12 @@
 
 #include <boost/optional.hpp>
 #include <map>
+#include <set>
 #include <string>
 
 #include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/collection_catalog_helper.h"
 #include "mongo/db/catalog/database.h"
-#include "mongo/db/catalog/database_catalog_entry.h"
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/test_commands_enabled.h"
@@ -49,7 +50,7 @@
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/storage/storage_engine.h"
 #include "mongo/db/transaction_participant.h"
-#include "mongo/stdx/mutex.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/util/log.h"
 #include "mongo/util/md5.hpp"
 #include "mongo/util/net/socket_utils.h"
@@ -65,6 +66,14 @@ public:
 
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
+    }
+
+    bool allowsAfterClusterTime(const BSONObj& cmd) const override {
+        return false;
+    }
+
+    bool canIgnorePrepareConflicts() const override {
+        return true;
     }
 
     ReadWriteType getReadWriteType() const override {
@@ -132,6 +141,11 @@ public:
 
             auto targetClusterTime = elem.timestamp();
 
+            uassert(ErrorCodes::InvalidOptions,
+                    str::stream() << "$_internalReadAtClusterTime value must not be a null"
+                                     " timestamp.",
+                    !targetClusterTime.isNull());
+
             // We aren't holding the global lock in intent mode, so it is possible after comparing
             // 'targetClusterTime' to 'lastAppliedOpTime' for the last applied opTime to go
             // backwards or for the term to change due to replication rollback. This isn't an actual
@@ -143,8 +157,7 @@ public:
                     str::stream() << "$_internalReadAtClusterTime value must not be greater"
                                      " than the last applied opTime. Requested clusterTime: "
                                   << targetClusterTime.toString()
-                                  << "; last applied opTime: "
-                                  << lastAppliedOpTime.toString(),
+                                  << "; last applied opTime: " << lastAppliedOpTime.toString(),
                     lastAppliedOpTime.getTimestamp() >= targetClusterTime);
 
             // We aren't holding the global lock in intent mode, so it is possible for the global
@@ -152,16 +165,15 @@ public:
             // down. This isn't an actual concern because the testing infrastructure won't use the
             // $_internalReadAtClusterTime option in any test suite where clean shutdown is expected
             // to occur concurrently with tests running.
-            auto allCommittedTime = storageEngine->getAllCommittedTimestamp();
-            invariant(!allCommittedTime.isNull());
+            auto allDurableTime = storageEngine->getAllDurableTimestamp();
+            invariant(!allDurableTime.isNull());
 
             uassert(ErrorCodes::InvalidOptions,
                     str::stream() << "$_internalReadAtClusterTime value must not be greater"
-                                     " than the all-committed timestamp. Requested clusterTime: "
+                                     " than the all_durable timestamp. Requested clusterTime: "
                                   << targetClusterTime.toString()
-                                  << "; all-committed timestamp: "
-                                  << allCommittedTime.toString(),
-                    allCommittedTime >= targetClusterTime);
+                                  << "; all_durable timestamp: " << allDurableTime.toString(),
+                    allDurableTime >= targetClusterTime);
 
             // The $_internalReadAtClusterTime option causes any storage-layer cursors created
             // during plan execution to read from a consistent snapshot of data at the supplied
@@ -170,89 +182,131 @@ public:
                                                           targetClusterTime);
 
             // The $_internalReadAtClusterTime option also causes any storage-layer cursors created
-            // during plan execution to block on prepared transactions.
-            opCtx->recoveryUnit()->setIgnorePrepared(false);
+            // during plan execution to block on prepared transactions. Since the dbhash command
+            // ignores prepare conflicts by default, change the behavior.
+            opCtx->recoveryUnit()->setPrepareConflictBehavior(PrepareConflictBehavior::kEnforce);
         }
 
         // We lock the entire database in S-mode in order to ensure that the contents will not
         // change for the snapshot.
         auto lockMode = LockMode::MODE_S;
+        boost::optional<ShouldNotConflictWithSecondaryBatchApplicationBlock> shouldNotConflictBlock;
         if (opCtx->recoveryUnit()->getTimestampReadSource() ==
             RecoveryUnit::ReadSource::kProvided) {
             // However, if we are performing a read at a timestamp, then we only need to lock the
-            // database in intent mode to ensure that none of the collections get dropped.
+            // database in intent mode and then collection in intent mode as well to ensure that
+            // none of the collections get dropped.
             lockMode = LockMode::MODE_IS;
+
+            // Additionally, if we are performing a read at a timestamp, then we allow oplog
+            // application to proceed concurrently with the dbHash command. This is done
+            // to ensure a prepare conflict is able to eventually be resolved by processing a
+            // later commitTransaction or abortTransaction oplog entry.
+            shouldNotConflictBlock.emplace(opCtx->lockState());
         }
         AutoGetDb autoDb(opCtx, ns, lockMode);
         Database* db = autoDb.getDb();
-        std::list<std::string> colls;
-        if (db) {
-            db->getDatabaseCatalogEntry()->getCollectionNamespaces(&colls);
-            colls.sort();
-        }
 
         result.append("host", prettyHostName());
 
         md5_state_t globalState;
         md5_init(&globalState);
 
-        // A set of 'system' collections that are replicated, and therefore included in the db hash.
-        const std::set<StringData> replicatedSystemCollections{"system.backup_users",
-                                                               "system.js",
-                                                               "system.new_users",
-                                                               "system.roles",
-                                                               "system.users",
-                                                               "system.version",
-                                                               "system.views"};
+        std::map<std::string, std::string> collectionToHashMap;
+        std::map<std::string, OptionalCollectionUUID> collectionToUUIDMap;
+        std::set<std::string> cappedCollectionSet;
 
-        BSONArrayBuilder cappedCollections;
-        BSONObjBuilder collectionsByUUID;
-
-        BSONObjBuilder bb(result.subobjStart("collections"));
-        for (const auto& collectionName : colls) {
-
-            NamespaceString collNss(collectionName);
+        bool noError = true;
+        catalog::forEachCollectionFromDb(opCtx, dbname, MODE_IS, [&](const Collection* collection) {
+            auto collNss = collection->ns();
 
             if (collNss.size() - 1 <= dbname.size()) {
                 errmsg = str::stream() << "weird fullCollectionName [" << collNss.toString() << "]";
+                noError = false;
                 return false;
             }
 
-            // Only include 'system' collections that are replicated.
-            bool isReplicatedSystemColl =
-                (replicatedSystemCollections.count(collNss.coll().toString()) > 0);
-            if (collNss.isSystem() && !isReplicatedSystemColl)
-                continue;
+            // Only hash replicated collections. In 4.4 we use a more general way of choosing what
+            // collections are replicated. This means that mixed 4.2-4.4 replica sets could hash the
+            // same database differently, even when all nodes are up-to-date. We only use the new
+            // method for choosing collections to hash in FCV 4.4 so that when all nodes are
+            // up-to-date, it is guaranteed that they hash the same set of collections.
+            if (serverGlobalParams.featureCompatibility.getVersion() ==
+                ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo44) {
+                if (repl::ReplicationCoordinator::isOplogDisabledForNS(collNss)) {
+                    return true;
+                }
+            } else {
+                // A set of 'system' collections that are replicated, and therefore included in the
+                // db hash.
+                const std::set<StringData> replicatedSystemCollections{"system.backup_users",
+                                                                       "system.js",
+                                                                       "system.new_users",
+                                                                       "system.roles",
+                                                                       "system.users",
+                                                                       "system.version",
+                                                                       "system.views"};
+                // Only include 'system' collections that are replicated.
+                bool isReplicatedSystemColl =
+                    (replicatedSystemCollections.count(collNss.coll().toString()) > 0);
+                if (collNss.isSystem() && !isReplicatedSystemColl) {
+                    return true;
+                }
+            }
 
             if (collNss.coll().startsWith("tmp.mr.")) {
-                // We skip any incremental map reduce collections as they also aren't replicated.
-                continue;
+                // We skip any incremental map reduce collections as they also aren't
+                // replicated.
+                return true;
             }
 
             if (desiredCollections.size() > 0 &&
                 desiredCollections.count(collNss.coll().toString()) == 0)
-                continue;
+                return true;
 
             // Don't include 'drop pending' collections.
             if (collNss.isDropPendingNamespace())
-                continue;
+                return true;
 
-            if (Collection* collection = db->getCollection(opCtx, collectionName)) {
-                if (collection->isCapped()) {
-                    cappedCollections.append(collNss.coll());
-                }
+            if (collection->isCapped()) {
+                cappedCollectionSet.insert(collNss.coll().toString());
+            }
 
-                if (OptionalCollectionUUID uuid = collection->uuid()) {
-                    uuid->appendToBuilder(&collectionsByUUID, collNss.coll());
-                }
+            if (OptionalCollectionUUID uuid = collection->uuid()) {
+                collectionToUUIDMap[collNss.coll().toString()] = uuid;
             }
 
             // Compute the hash for this collection.
-            std::string hash = _hashCollection(opCtx, db, collNss.toString());
+            std::string hash = _hashCollection(opCtx, db, collNss);
 
-            bb.append(collNss.coll(), hash);
+            collectionToHashMap[collNss.coll().toString()] = hash;
+
+            return true;
+        });
+        if (!noError)
+            return false;
+
+        BSONObjBuilder bb(result.subobjStart("collections"));
+        BSONArrayBuilder cappedCollections;
+        BSONObjBuilder collectionsByUUID;
+
+        for (auto elem : cappedCollectionSet) {
+            cappedCollections.append(elem);
+        }
+
+        for (auto entry : collectionToUUIDMap) {
+            auto collName = entry.first;
+            auto uuid = entry.second;
+            uuid->appendToBuilder(&collectionsByUUID, collName);
+        }
+
+        for (auto entry : collectionToHashMap) {
+            auto collName = entry.first;
+            auto hash = entry.second;
+            bb.append(collName, hash);
             md5_append(&globalState, (const md5_byte_t*)hash.c_str(), hash.size());
         }
+
         bb.done();
 
         result.append("capped", BSONArray(cappedCollections.done()));
@@ -269,15 +323,10 @@ public:
     }
 
 private:
-    std::string _hashCollection(OperationContext* opCtx,
-                                Database* db,
-                                const std::string& fullCollectionName) {
+    std::string _hashCollection(OperationContext* opCtx, Database* db, const NamespaceString& nss) {
 
-        NamespaceString ns(fullCollectionName);
-
-        Collection* collection = db->getCollection(opCtx, ns);
-        if (!collection)
-            return "";
+        Collection* collection = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(nss);
+        invariant(collection);
 
         boost::optional<Lock::CollectionLock> collLock;
         if (opCtx->recoveryUnit()->getTimestampReadSource() ==
@@ -286,8 +335,7 @@ private:
             // intent mode. We need to also acquire the collection lock in intent mode to ensure
             // reading from the consistent snapshot doesn't overlap with any catalog operations on
             // the collection.
-            invariant(opCtx->lockState()->isDbLockedForMode(db->name(), MODE_IS));
-            collLock.emplace(opCtx->lockState(), fullCollectionName, MODE_IS);
+            invariant(opCtx->lockState()->isCollectionLockedForMode(nss, MODE_IS));
 
             auto minSnapshot = collection->getMinimumVisibleSnapshot();
             auto mySnapshot = opCtx->recoveryUnit()->getPointInTimeReadTimestamp();
@@ -297,8 +345,7 @@ private:
                     str::stream() << "Unable to read from a snapshot due to pending collection"
                                      " catalog changes; please retry the operation. Snapshot"
                                      " timestamp is "
-                                  << mySnapshot->toString()
-                                  << ". Collection minimum timestamp is "
+                                  << mySnapshot->toString() << ". Collection minimum timestamp is "
                                   << minSnapshot->toString(),
                     !minSnapshot || *mySnapshot >= *minSnapshot);
         } else {
@@ -320,9 +367,9 @@ private:
                                               InternalPlanner::IXSCAN_FETCH);
         } else if (collection->isCapped()) {
             exec = InternalPlanner::collectionScan(
-                opCtx, fullCollectionName, collection, PlanExecutor::NO_YIELD);
+                opCtx, nss.ns(), collection, PlanExecutor::NO_YIELD);
         } else {
-            log() << "can't find _id index for: " << fullCollectionName;
+            log() << "can't find _id index for: " << nss;
             return "no _id _index";
         }
 
@@ -332,13 +379,13 @@ private:
         long long n = 0;
         PlanExecutor::ExecState state;
         BSONObj c;
-        verify(NULL != exec.get());
-        while (PlanExecutor::ADVANCED == (state = exec->getNext(&c, NULL))) {
+        verify(nullptr != exec.get());
+        while (PlanExecutor::ADVANCED == (state = exec->getNext(&c, nullptr))) {
             md5_append(&st, (const md5_byte_t*)c.objdata(), c.objsize());
             n++;
         }
         if (PlanExecutor::IS_EOF != state) {
-            warning() << "error while hashing, db dropped? ns=" << fullCollectionName;
+            warning() << "error while hashing, db dropped? ns=" << nss;
             uasserted(34371,
                       "Plan executor error while running dbHash command: " +
                           WorkingSetCommon::toStatusString(c));

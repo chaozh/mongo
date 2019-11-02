@@ -11,9 +11,6 @@ selector:
   - jstests/core/opcounters_write_cmd.js
   - jstests/core/read_after_optime.js
   - jstests/core/capped_update.js
-  # These tests attempt to read from the "system.profile" collection, which may be missing entries
-  # if a write was performed on the primary of the replica set instead.
-  - jstests/core/*profile*.js
 
   # Tests that fail for Causal Consistency with default injected readPreference 'secondary'
   # "TODO SERVER-30384: These tests assume that documents are returned in the same order they are
@@ -37,6 +34,8 @@ selector:
   - jstests/core/sort4.js
   - jstests/core/ord.js
   # Parallel shell is not causally consistent
+  - jstests/core/benchrun_pipeline_updates.js
+  - jstests/core/crud_ops_do_not_throw_locktimeout.js
   - jstests/core/cursora.js
   - jstests/core/find_and_modify_concurrent_update.js
   - jstests/core/shellstartparallel.js
@@ -44,6 +43,7 @@ selector:
   - jstests/core/fsync.js
   # benchRun cannot be overridden to be causally consistent
   - jstests/core/bench_test*.js
+  - jstests/core/benchrun_pipeline_updates.js
   # getMore is not causal consistent because afterClusterTime has been specified
   # by the preceding find command which establishes the cursor. Therefore,
   # getMore cannot be guaranteed to get executed after commands in between find
@@ -52,14 +52,7 @@ selector:
   - jstests/core/ord.js
   - jstests/core/tailable_cursor_invalidation.js
   - jstests/core/tailable_skip_limit.js
-  # doTxn uses a different session so the operationTime of the default session
-  # will not be advanced by doTxn. Therefore, operations in the default
-  # session cannot be guaranteed to get executed after doTxn.
-  - jstests/core/bypass_doc_validation.js
   - jstests/core/collation.js
-  # This test runs very slow operations which take a long time to replicate in a 5 node linear
-  # chain. This can lead to awaitReplication timeouts when doing consistency checks.
-  - jstests/core/text_index_limits.js
 
   exclude_with_any_tags:
   ##
@@ -71,10 +64,14 @@ selector:
   # "Cowardly refusing to run test with overridden read preference when it reads from a
   #  non-replicated collection: ..."
   - assumes_read_preference_unchanged
+  - does_not_support_causal_consistency
   ##
   # collStats and dbStats are not causally consistent
   - requires_collstats
   - requires_dbstats
+  # These tests attempt to read from the "system.profile" collection, which may be missing entries
+  # if a write was performed on the primary of the replica set instead.
+  - requires_profiling
 
 executor:
   archive:

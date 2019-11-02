@@ -34,10 +34,12 @@
 #include <set>
 #include <yaml-cpp/yaml.h>
 
+#include "mongo/base/initializer.h"
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/json.h"
 #include "mongo/db/server_options.h"
+#include "mongo/db/storage/mobile/mobile_options.h"
 #include "mongo/embedded/mongo_embedded/mongo_embedded_test_gen.h"
 #include "mongo/rpc/message.h"
 #include "mongo/rpc/op_msg.h"
@@ -50,6 +52,7 @@
 #include "mongo/util/quick_exit.h"
 #include "mongo/util/shared_buffer.h"
 #include "mongo/util/signal_handlers_synchronous.h"
+#include "mongo/util/text.h"
 
 namespace moe = mongo::optionenvironment;
 
@@ -107,6 +110,9 @@ protected:
         params.log_callback = nullptr;
         params.log_user_data = nullptr;
 
+        // Set a parameter that lives in mobileGlobalOptions to verify it can be set using YAML.
+        uint32_t vacuumCheckIntervalMinutes = 1;
+
         YAML::Emitter yaml;
         yaml << YAML::BeginMap;
 
@@ -114,6 +120,10 @@ protected:
         yaml << YAML::Value << YAML::BeginMap;
         yaml << YAML::Key << "dbPath";
         yaml << YAML::Value << globalTempDir->path();
+        yaml << YAML::Key << "mobile" << YAML::BeginMap;
+        yaml << YAML::Key << "vacuumCheckIntervalMinutes" << YAML::Value
+             << vacuumCheckIntervalMinutes;
+        yaml << YAML::EndMap;  // mobile
         yaml << YAML::EndMap;  // storage
 
         yaml << YAML::EndMap;
@@ -125,6 +135,8 @@ protected:
 
         db = mongo_embedded_v1_instance_create(lib, yaml.c_str(), status);
         ASSERT(db != nullptr) << mongo_embedded_v1_status_get_explanation(status);
+        ASSERT(mongo::embedded::mobileGlobalOptions.vacuumCheckIntervalMinutes ==
+               vacuumCheckIntervalMinutes);
     }
 
     void tearDown() {
@@ -227,7 +239,7 @@ TEST_F(MongodbCAPITest, CreateIndex) {
     mongo::BSONObj inputObj = mongo::fromjson(
         R"raw_delimiter({
             createIndexes: 'items',
-            indexes: 
+            indexes:
             [
                 {
                     key: {
@@ -254,7 +266,7 @@ TEST_F(MongodbCAPITest, CreateBackgroundIndex) {
     mongo::BSONObj inputObj = mongo::fromjson(
         R"raw_delimiter({
             createIndexes: 'items',
-            indexes: 
+            indexes:
             [
                 {
                     key: {
@@ -280,7 +292,7 @@ TEST_F(MongodbCAPITest, CreateTTLIndex) {
     mongo::BSONObj inputObj = mongo::fromjson(
         R"raw_delimiter({
             createIndexes: 'items',
-            indexes: 
+            indexes:
             [
                 {
                     key: {
@@ -550,69 +562,68 @@ TEST_F(MongodbCAPITest, InsertAndUpdate) {
 TEST_F(MongodbCAPITest, RunListCommands) {
     auto client = createClient();
 
-    std::vector<std::string> whitelist = {
-        "_hashBSONElement",
-        "aggregate",
-        "buildInfo",
-        "collMod",
-        "collStats",
-        "configureFailPoint",
-        "count",
-        "create",
-        "createIndexes",
-        "currentOp",
-        "dataSize",
-        "dbStats",
-        "delete",
-        "distinct",
-        "drop",
-        "dropDatabase",
-        "dropIndexes",
-        "echo",
-        "endSessions",
-        "explain",
-        "find",
-        "findAndModify",
-        "getLastError",
-        "getMore",
-        "getParameter",
-        "httpClientRequest",
-        "insert",
-        "isMaster",
-        "killCursors",
-        "killOp",
-        "killSessions",
-        "killAllSessions",
-        "killAllSessionsByPattern",
-        "listCollections",
-        "listCommands",
-        "listDatabases",
-        "listIndexes",
-        "lockInfo",
-        "ping",
-        "planCacheClear",
-        "planCacheClearFilters",
-        "planCacheListFilters",
-        "planCacheListPlans",
-        "planCacheListQueryShapes",
-        "planCacheSetFilter",
-        "reIndex",
-        "refreshLogicalSessionCacheNow",
-        "refreshSessions",
-        "renameCollection",
-        "repairCursor",
-        "repairDatabase",
-        "resetError",
-        "serverStatus",
-        "setBatteryLevel",
-        "setParameter",
-        "sleep",
-        "startSession",
-        "trimMemory",
-        "twoPhaseCreateIndexes",
-        "update",
-        "validate",
-    };
+    std::vector<std::string> whitelist = {"_hashBSONElement",
+                                          "aggregate",
+                                          "buildInfo",
+                                          "collMod",
+                                          "collStats",
+                                          "configureFailPoint",
+                                          "count",
+                                          "create",
+                                          "createIndexes",
+                                          "currentOp",
+                                          "dataSize",
+                                          "dbStats",
+                                          "delete",
+                                          "distinct",
+                                          "drop",
+                                          "dropDatabase",
+                                          "dropIndexes",
+                                          "echo",
+                                          "endSessions",
+                                          "explain",
+                                          "find",
+                                          "findAndModify",
+                                          "getLastError",
+                                          "getMore",
+                                          "getParameter",
+                                          "httpClientRequest",
+                                          "insert",
+                                          "isMaster",
+                                          "killCursors",
+                                          "killOp",
+                                          "killSessions",
+                                          "killAllSessions",
+                                          "killAllSessionsByPattern",
+                                          "listCollections",
+                                          "listCommands",
+                                          "listDatabases",
+                                          "listIndexes",
+                                          "lockInfo",
+                                          "ping",
+                                          "planCacheClear",
+                                          "planCacheClearFilters",
+                                          "planCacheListFilters",
+                                          "planCacheListPlans",
+                                          "planCacheListQueryShapes",
+                                          "planCacheSetFilter",
+                                          "reIndex",
+                                          "refreshLogicalSessionCacheNow",
+                                          "refreshSessions",
+                                          "renameCollection",
+                                          "repairDatabase",
+                                          "resetError",
+                                          "serverStatus",
+                                          "setBatteryLevel",
+                                          "setParameter",
+                                          "sleep",
+                                          "startSession",
+                                          "trimMemory",
+                                          "update",
+                                          "validate",
+                                          "waitForFailPoint",
+                                          "whatsmysni"};
+
     std::sort(whitelist.begin(), whitelist.end());
 
     mongo::BSONObj listCommandsObj = mongo::fromjson("{ listCommands: 1 }");
@@ -651,8 +662,8 @@ TEST_F(MongodbCAPITest, RunListCommands) {
         std::cout << cmd << "\n";
     }
 
-    ASSERT(missing.empty());
-    ASSERT(unsupported.empty());
+    ASSERT(missing.empty()) << mongo::StringSplitter::join(missing, ", ");
+    ASSERT(unsupported.empty()) << mongo::StringSplitter::join(unsupported, ", ");
 }
 
 // This test is temporary to make sure that only one database can be created
@@ -695,12 +706,29 @@ int main(const int argc, const char* const* const argv) {
     ::mongo::clearSignalMask();
     ::mongo::setupSynchronousSignalHandlers();
     ::mongo::serverGlobalParams.noUnixSocket = true;
-    ::mongo::unittest::setupTestLogger();
 
     // Allocate an error descriptor for use in non-configured tests
     const auto status = makeStatusPtr();
 
     mongo::setTestCommandsEnabled(true);
+
+    // Perform one cycle of global initialization/deinitialization before running test. This will
+    // make sure everything that is needed is setup for the unittest infrastructure.
+    // The reason this works is that the unittest system relies on other systems being initialized
+    // through global init and deinitialize just deinitializes systems that explicitly supports
+    // deinit leaving the systems unittest needs initialized.
+    const char* null_argv[1] = {nullptr};
+    ret = mongo::runGlobalInitializers(0, null_argv, nullptr);
+    if (!ret.isOK()) {
+        std::cerr << "Global initilization failed";
+        return EXIT_FAILURE;
+    }
+
+    ret = mongo::runGlobalDeinitializers();
+    if (!ret.isOK()) {
+        std::cerr << "Global deinitilization failed";
+        return EXIT_FAILURE;
+    }
 
     // Check so we can initialize the library without providing init params
     mongo_embedded_v1_lib* lib = mongo_embedded_v1_lib_init(nullptr, status.get());
@@ -742,6 +770,13 @@ int main(const int argc, const char* const* const argv) {
                   << mongo_embedded_v1_status_get_explanation(status.get()) << std::endl;
     }
 
+    // Attempt to create an embedded instance to make sure something gets logged. This will probably
+    // fail but that's fine.
+    mongo_embedded_v1_instance* instance = mongo_embedded_v1_instance_create(lib, nullptr, nullptr);
+    if (instance) {
+        mongo_embedded_v1_instance_destroy(instance, nullptr);
+    }
+
     if (mongo_embedded_v1_lib_fini(lib, nullptr) != MONGO_EMBEDDED_V1_SUCCESS) {
         std::cerr << "mongo_embedded_v1_fini() failed with "
                   << mongo_embedded_v1_status_get_error(status.get()) << ": "
@@ -750,6 +785,7 @@ int main(const int argc, const char* const* const argv) {
 
     if (!receivedCallback) {
         std::cerr << "Did not get a log callback." << std::endl;
+        return EXIT_FAILURE;
     }
 
     const auto result = ::mongo::unittest::Suite::run(std::vector<std::string>(), "", 1);
