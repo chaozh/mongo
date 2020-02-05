@@ -81,7 +81,7 @@ TEST_F(CatalogCacheRefreshTest, FullLoad) {
     const OID epoch = OID::gen();
     const ShardKeyPattern shardKeyPattern(BSON("_id" << 1));
 
-    auto future = scheduleRoutingInfoRefresh(kNss);
+    auto future = scheduleRoutingInfoUnforcedRefresh(kNss);
 
     expectGetDatabase();
     expectGetCollection(epoch, shardKeyPattern);
@@ -125,6 +125,19 @@ TEST_F(CatalogCacheRefreshTest, FullLoad) {
     ASSERT_EQ(4, cm->numChunks());
 }
 
+TEST_F(CatalogCacheRefreshTest, NoLoadIfShardNotMarkedStaleInOperationContext) {
+    const ShardKeyPattern shardKeyPattern(BSON("_id" << 1));
+    auto initialRoutingInfo(
+        makeChunkManager(kNss, shardKeyPattern, nullptr, true, {BSON("_id" << 0)}));
+    ASSERT_EQ(2, initialRoutingInfo->numChunks());
+
+    auto futureNoRefresh = scheduleRoutingInfoUnforcedRefresh(kNss);
+    auto routingInfo = futureNoRefresh.default_timed_get();
+    ASSERT(routingInfo->cm());
+    auto cm = routingInfo->cm();
+    ASSERT_EQ(2, cm->numChunks());
+}
+
 class MockLockerAlwaysReportsToBeLocked : public LockerNoop {
 public:
     using LockerNoop::LockerNoop;
@@ -136,11 +149,11 @@ public:
 
 DEATH_TEST_F(CatalogCacheRefreshTest, ShouldFailToRefreshWhenLocksAreHeld, "Invariant") {
     operationContext()->setLockState(std::make_unique<MockLockerAlwaysReportsToBeLocked>());
-    scheduleRoutingInfoRefresh(kNss);
+    scheduleRoutingInfoUnforcedRefresh(kNss);
 }
 
 TEST_F(CatalogCacheRefreshTest, DatabaseNotFound) {
-    auto future = scheduleRoutingInfoRefresh(kNss);
+    auto future = scheduleRoutingInfoUnforcedRefresh(kNss);
 
     // Return an empty database (need to return it twice because for missing databases, the
     // CatalogClient tries twice)
@@ -160,7 +173,7 @@ TEST_F(CatalogCacheRefreshTest, DatabaseNotFound) {
 }
 
 TEST_F(CatalogCacheRefreshTest, DatabaseBSONCorrupted) {
-    auto future = scheduleRoutingInfoRefresh(kNss);
+    auto future = scheduleRoutingInfoUnforcedRefresh(kNss);
 
     // Return a corrupted database entry
     expectFindSendBSONObjVector(kConfigHostAndPort,
@@ -181,7 +194,7 @@ TEST_F(CatalogCacheRefreshTest, DatabaseBSONCorrupted) {
 }
 
 TEST_F(CatalogCacheRefreshTest, CollectionNotFound) {
-    auto future = scheduleRoutingInfoRefresh(kNss);
+    auto future = scheduleRoutingInfoUnforcedRefresh(kNss);
 
     expectGetDatabase();
 
@@ -195,7 +208,7 @@ TEST_F(CatalogCacheRefreshTest, CollectionNotFound) {
 }
 
 TEST_F(CatalogCacheRefreshTest, CollectionBSONCorrupted) {
-    auto future = scheduleRoutingInfoRefresh(kNss);
+    auto future = scheduleRoutingInfoUnforcedRefresh(kNss);
 
     expectGetDatabase();
 
@@ -221,7 +234,7 @@ TEST_F(CatalogCacheRefreshTest, NoChunksFoundForCollection) {
     const OID epoch = OID::gen();
     const ShardKeyPattern shardKeyPattern(BSON("_id" << 1));
 
-    auto future = scheduleRoutingInfoRefresh(kNss);
+    auto future = scheduleRoutingInfoUnforcedRefresh(kNss);
 
     expectGetDatabase();
     expectGetCollection(epoch, shardKeyPattern);
@@ -252,7 +265,7 @@ TEST_F(CatalogCacheRefreshTest, ChunksBSONCorrupted) {
     const OID epoch = OID::gen();
     const ShardKeyPattern shardKeyPattern(BSON("_id" << 1));
 
-    auto future = scheduleRoutingInfoRefresh(kNss);
+    auto future = scheduleRoutingInfoUnforcedRefresh(kNss);
 
     expectGetDatabase();
     expectGetCollection(epoch, shardKeyPattern);
@@ -286,7 +299,7 @@ TEST_F(CatalogCacheRefreshTest, IncompleteChunksFoundForCollection) {
     const OID epoch = OID::gen();
     const ShardKeyPattern shardKeyPattern(BSON("_id" << 1));
 
-    auto future = scheduleRoutingInfoRefresh(kNss);
+    auto future = scheduleRoutingInfoUnforcedRefresh(kNss);
 
     expectGetDatabase();
     expectGetCollection(epoch, shardKeyPattern);
@@ -347,7 +360,7 @@ TEST_F(CatalogCacheRefreshTest, ChunkEpochChangeDuringIncrementalLoad) {
     auto initialRoutingInfo(makeChunkManager(kNss, shardKeyPattern, nullptr, true, {}));
     ASSERT_EQ(1, initialRoutingInfo->numChunks());
 
-    auto future = scheduleRoutingInfoRefresh(kNss);
+    auto future = scheduleRoutingInfoForcedRefresh(kNss);
 
     ChunkVersion version = initialRoutingInfo->getVersion();
 
@@ -397,7 +410,7 @@ TEST_F(CatalogCacheRefreshTest, ChunkEpochChangeDuringIncrementalLoadRecoveryAft
 
     setupNShards(2);
 
-    auto future = scheduleRoutingInfoRefresh(kNss);
+    auto future = scheduleRoutingInfoForcedRefresh(kNss);
 
     ChunkVersion oldVersion = initialRoutingInfo->getVersion();
     const OID newEpoch = OID::gen();
@@ -484,7 +497,7 @@ TEST_F(CatalogCacheRefreshTest, IncrementalLoadAfterCollectionEpochChange) {
 
     setupNShards(2);
 
-    auto future = scheduleRoutingInfoRefresh(kNss);
+    auto future = scheduleRoutingInfoForcedRefresh(kNss);
 
     ChunkVersion newVersion(1, 0, OID::gen());
 
@@ -533,7 +546,7 @@ TEST_F(CatalogCacheRefreshTest, IncrementalLoadAfterSplit) {
 
     ChunkVersion version = initialRoutingInfo->getVersion();
 
-    auto future = scheduleRoutingInfoRefresh(kNss);
+    auto future = scheduleRoutingInfoForcedRefresh(kNss);
 
     expectGetCollection(version.epoch(), shardKeyPattern);
 
@@ -579,7 +592,7 @@ TEST_F(CatalogCacheRefreshTest, IncrementalLoadAfterMove) {
 
     ChunkVersion version = initialRoutingInfo->getVersion();
 
-    auto future = scheduleRoutingInfoRefresh(kNss);
+    auto future = scheduleRoutingInfoForcedRefresh(kNss);
 
     ChunkVersion expectedDestShardVersion;
 
@@ -621,7 +634,7 @@ TEST_F(CatalogCacheRefreshTest, IncrementalLoadAfterMoveLastChunk) {
 
     ChunkVersion version = initialRoutingInfo->getVersion();
 
-    auto future = scheduleRoutingInfoRefresh(kNss);
+    auto future = scheduleRoutingInfoForcedRefresh(kNss);
 
     expectGetCollection(version.epoch(), shardKeyPattern);
 

@@ -64,6 +64,7 @@
 #include "mongo/db/repl/drop_pending_collection_reaper.h"
 #include "mongo/db/repl/isself.h"
 #include "mongo/db/repl/last_vote.h"
+#include "mongo/db/repl/local_oplog_info.h"
 #include "mongo/db/repl/member_state.h"
 #include "mongo/db/repl/noop_writer.h"
 #include "mongo/db/repl/oplog.h"
@@ -78,6 +79,7 @@
 #include "mongo/db/s/balancer/balancer.h"
 #include "mongo/db/s/chunk_splitter.h"
 #include "mongo/db/s/config/sharding_catalog_manager.h"
+#include "mongo/db/s/migration_util.h"
 #include "mongo/db/s/periodic_balancer_config_refresher.h"
 #include "mongo/db/s/sharding_initialization_mongod.h"
 #include "mongo/db/s/sharding_state_recovery.h"
@@ -137,8 +139,9 @@ ServerStatusMetricField<Counter64> displayBufferMaxSize("repl.buffer.maxSizeByte
 /**
  * Returns new thread pool for thread pool task executor.
  */
-auto makeThreadPool(const std::string& poolName) {
+auto makeThreadPool(const std::string& poolName, const std::string& threadName) {
     ThreadPool::Options threadPoolOptions;
+    threadPoolOptions.threadNamePrefix = threadName + "-";
     threadPoolOptions.poolName = poolName;
     threadPoolOptions.onCreateThread = [](const std::string& threadName) {
         Client::initThread(threadName.c_str());
@@ -150,12 +153,15 @@ auto makeThreadPool(const std::string& poolName) {
 /**
  * Returns a new thread pool task executor.
  */
-auto makeTaskExecutor(ServiceContext* service, const std::string& poolName) {
+auto makeTaskExecutor(ServiceContext* service,
+                      const std::string& poolName,
+                      const std::string& threadName) {
     auto hookList = std::make_unique<rpc::EgressMetadataHookList>();
     hookList->addHook(std::make_unique<rpc::LogicalTimeMetadataHook>(service));
+    auto networkName = threadName + "Network";
     return std::make_unique<executor::ThreadPoolTaskExecutor>(
-        makeThreadPool(poolName),
-        executor::makeNetworkInterface("RS", nullptr, std::move(hookList)));
+        makeThreadPool(poolName, threadName),
+        executor::makeNetworkInterface(networkName, nullptr, std::move(hookList)));
 }
 
 /**
@@ -315,15 +321,17 @@ void ReplicationCoordinatorExternalStateImpl::startThreads(const ReplSettings& s
     }
     if (_inShutdown) {
         log() << "Not starting replication storage threads because replication is shutting down.";
+        return;
     }
 
     log() << "Starting replication storage threads";
     _service->getStorageEngine()->setJournalListener(this);
 
-    _oplogApplierTaskExecutor = makeTaskExecutor(_service, "rsSync");
+    _oplogApplierTaskExecutor =
+        makeTaskExecutor(_service, "OplogApplierThreadPool", "OplogApplier");
     _oplogApplierTaskExecutor->startup();
 
-    _taskExecutor = makeTaskExecutor(_service, "replication");
+    _taskExecutor = makeTaskExecutor(_service, "ReplCoordExternThreadPool", "ReplCoordExtern");
     _taskExecutor->startup();
 
     _writerPool = makeReplWriterPool();
@@ -331,34 +339,20 @@ void ReplicationCoordinatorExternalStateImpl::startThreads(const ReplSettings& s
     _startedThreads = true;
 }
 
-void ReplicationCoordinatorExternalStateImpl::shutdown(OperationContext* opCtx) {
-    stdx::unique_lock<Latch> lk(_threadMutex);
-    _inShutdown = true;
-    if (!_startedThreads) {
-        return;
+void ReplicationCoordinatorExternalStateImpl::clearAppliedThroughIfCleanShutdown(
+    OperationContext* opCtx) {
+    {
+        stdx::lock_guard<Latch> lk(_threadMutex);
+        if (!_startedThreads) {
+            return;
+        }
+        invariant(_inShutdown);
     }
 
-    _stopDataReplication_inlock(opCtx, lk);
-
-    if (_noopWriter) {
-        LOG(1) << "Stopping noop writer";
-        _noopWriter->stopWritingPeriodicNoops();
-    }
-
-    log() << "Stopping replication storage threads";
-    _taskExecutor->shutdown();
-    _oplogApplierTaskExecutor->shutdown();
-
-    _oplogApplierTaskExecutor->join();
-    lk.unlock();
-
-    // Perform additional shutdown steps below that must be done outside _threadMutex.
-
-    // We must wait for _taskExecutor outside of _threadMutex, since _taskExecutor is used to run
-    // the dropPendingCollectionReaper, which takes database locks. It is safe to access
-    // _taskExecutor outside of _threadMutex because once _startedThreads is set to true, the
-    // _taskExecutor pointer never changes.
-    _taskExecutor->join();
+    // Ensure that all writes are visible before reading. If we failed mid-batch, it would be
+    // possible to read from a kLastApplied ReadSource where not all writes to the minValid document
+    // are visible, generating a writeConflict that would not resolve.
+    opCtx->recoveryUnit()->setTimestampReadSource(RecoveryUnit::ReadSource::kNoTimestamp);
 
     auto loadLastOpTimeAndWallTimeResult = loadLastOpTimeAndWallTime(opCtx);
     if (_replicationProcess->getConsistencyMarkers()->getOplogTruncateAfterPoint(opCtx).isNull() &&
@@ -370,9 +364,45 @@ void ReplicationCoordinatorExternalStateImpl::shutdown(OperationContext* opCtx) 
         // checkpoints being taken, they should only reflect this write if they see all writes up
         // to our 'lastAppliedOpTime'.
         auto lastAppliedOpTime = repl::ReplicationCoordinator::get(opCtx)->getMyLastAppliedOpTime();
+
+        invariant(opCtx->lockState()->isRSTLExclusive());
+        // Since we acquired RSTL in mode X, there can't be any active readers. So, it's safe to
+        // write the minvalid document to the storage.
         _replicationProcess->getConsistencyMarkers()->clearAppliedThrough(
             opCtx, lastAppliedOpTime.getTimestamp());
     }
+}
+
+void ReplicationCoordinatorExternalStateImpl::shutdown(OperationContext* opCtx) {
+    stdx::unique_lock<Latch> lk(_threadMutex);
+    _inShutdown = true;
+    if (!_startedThreads) {
+        return;
+    }
+
+    _stopDataReplication_inlock(opCtx, lk);
+
+    log() << "Stopping replication storage threads";
+    _taskExecutor->shutdown();
+    _oplogApplierTaskExecutor->shutdown();
+
+    _oplogApplierTaskExecutor->join();
+    lk.unlock();
+
+    // Perform additional shutdown steps below that must be done outside _threadMutex.
+
+    // Stop the NoOpWriter before grabbing the mutex to avoid creating a deadlock as the NoOpWriter
+    // itself can block on the ReplicationCoordinator mutex. It is safe to access _noopWriter
+    // outside of _threadMutex because _noopWriter is protected by its own mutex.
+    invariant(_noopWriter);
+    LOG(1) << "Stopping noop writer";
+    _noopWriter->stopWritingPeriodicNoops();
+
+    // We must wait for _taskExecutor outside of _threadMutex, since _taskExecutor is used to run
+    // the dropPendingCollectionReaper, which takes database locks. It is safe to access
+    // _taskExecutor outside of _threadMutex because once _startedThreads is set to true, the
+    // _taskExecutor pointer never changes.
+    _taskExecutor->join();
 }
 
 executor::TaskExecutor* ReplicationCoordinatorExternalStateImpl::getTaskExecutor() const {
@@ -396,8 +426,7 @@ Status ReplicationCoordinatorExternalStateImpl::initializeReplSetStorage(Operati
 
                                WriteUnitOfWork wuow(opCtx);
                                Helpers::putSingleton(opCtx, configCollectionName, config);
-                               const auto msgObj = BSON("msg"
-                                                        << "initiating set");
+                               const auto msgObj = BSON("msg" << kInitiatingSetMsg);
                                _service->getOpObserver()->onOpMessage(opCtx, msgObj);
                                wuow.commit();
                                // ReplSetTest assumes that immediately after the replSetInitiate
@@ -412,6 +441,7 @@ Status ReplicationCoordinatorExternalStateImpl::initializeReplSetStorage(Operati
     } catch (const DBException& ex) {
         return ex.toStatus();
     }
+
     return Status::OK();
 }
 
@@ -629,8 +659,8 @@ Timestamp ReplicationCoordinatorExternalStateImpl::getGlobalTimestamp(ServiceCon
 }
 
 bool ReplicationCoordinatorExternalStateImpl::oplogExists(OperationContext* opCtx) {
-    AutoGetCollection oplog(opCtx, NamespaceString::kRsOplogNamespace, MODE_IS);
-    return oplog.getCollection() != nullptr;
+    auto oplog = LocalOplogInfo::get(opCtx)->getCollection();
+    return oplog != nullptr;
 }
 
 StatusWith<OpTimeAndWallTime> ReplicationCoordinatorExternalStateImpl::loadLastOpTimeAndWallTime(
@@ -696,6 +726,26 @@ void ReplicationCoordinatorExternalStateImpl::shardingOnStepDownHook() {
             validator->enableKeyGenerator(opCtxPtr.get(), false);
         }
     }
+}
+
+void ReplicationCoordinatorExternalStateImpl::clearOplogVisibilityStateForStepDown() {
+    auto opCtx = cc().getOperationContext();
+    // Temporarily turn off flow control ticketing. Getting a ticket can stall on a ticket being
+    // available, which may have to wait for the ticket refresher to run, which in turn blocks on
+    // the repl _mutex to check whether we are primary or not: this is a deadlock because stepdown
+    // already holds the repl _mutex!
+    auto originalFlowControlSetting = opCtx->shouldParticipateInFlowControl();
+    ON_BLOCK_EXIT([&] { opCtx->setShouldParticipateInFlowControl(originalFlowControlSetting); });
+    opCtx->setShouldParticipateInFlowControl(false);
+
+    // We can clear the oplogTruncateAfterPoint because we know there are no concurrent user writes
+    // during stepdown and therefore presently no oplog holes.
+    //
+    // This value is updated periodically while in PRIMARY mode to protect against oplog holes on
+    // unclean shutdown. The value must then be cleared on stepdown because stepup expects the value
+    // to be unset. Batch application, in mode SECONDARY, also uses the value to protect against
+    // unclean shutdown, and will handle both setting AND unsetting the value.
+    _replicationProcess->getConsistencyMarkers()->setOplogTruncateAfterPoint(opCtx, Timestamp());
 }
 
 void ReplicationCoordinatorExternalStateImpl::_shardingOnTransitionToPrimaryHook(
@@ -767,6 +817,13 @@ void ReplicationCoordinatorExternalStateImpl::_shardingOnTransitionToPrimaryHook
         ChunkSplitter::get(_service).onStepUp();
         PeriodicBalancerConfigRefresher::get(_service).onStepUp(_service);
         TransactionCoordinatorService::get(_service)->onStepUp(opCtx);
+
+        // Note, these must be done after the configOpTime is recovered via
+        // ShardingStateRecovery::recover above, because they may trigger filtering metadata
+        // refreshes which should use the recovered configOpTime.
+        migrationutil::resubmitRangeDeletionsOnStepUp(_service);
+        migrationutil::resumeMigrationCoordinationsOnStepUp(_service);
+
     } else {  // unsharded
         if (auto validator = LogicalTimeValidator::get(_service)) {
             validator->enableKeyGenerator(opCtx, true);

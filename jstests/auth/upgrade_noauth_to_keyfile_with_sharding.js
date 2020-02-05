@@ -7,6 +7,9 @@ load('jstests/ssl/libs/ssl_helpers.js');
 (function() {
 'use strict';
 
+// IndexConsistencyCheck requires auth which ttA/ttA fails at.
+TestData.skipCheckingIndexesConsistentAcrossCluster = true;
+
 // Disable auth explicitly
 var noAuthOptions = {noauth: ''};
 var transitionToAuthOptions = {clusterAuthMode: 'keyFile', keyFile: KEYFILE, transitionToAuth: ''};

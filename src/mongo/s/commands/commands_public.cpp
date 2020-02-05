@@ -56,13 +56,13 @@ MONGO_FAIL_POINT_DEFINE(useRenameCollectionPathThroughConfigsvr);
 
 namespace {
 
-bool cursorCommandPassthrough(OperationContext* opCtx,
-                              StringData dbName,
-                              const CachedDatabaseInfo& dbInfo,
-                              const BSONObj& cmdObj,
-                              const NamespaceString& nss,
-                              BSONObjBuilder* out,
-                              const PrivilegeVector& privileges) {
+bool cursorCommandPassthroughPrimaryShard(OperationContext* opCtx,
+                                          StringData dbName,
+                                          const CachedDatabaseInfo& dbInfo,
+                                          const BSONObj& cmdObj,
+                                          const NamespaceString& nss,
+                                          BSONObjBuilder* out,
+                                          const PrivilegeVector& privileges) {
     auto response = executeCommandAgainstDatabasePrimary(
         opCtx,
         dbName,
@@ -75,6 +75,35 @@ bool cursorCommandPassthrough(OperationContext* opCtx,
     auto transformedResponse = uassertStatusOK(
         storePossibleCursor(opCtx,
                             dbInfo.primaryId(),
+                            *response.shardHostAndPort,
+                            cmdResponse.data,
+                            nss,
+                            Grid::get(opCtx)->getExecutorPool()->getArbitraryExecutor(),
+                            Grid::get(opCtx)->getCursorManager(),
+                            privileges));
+
+    CommandHelpers::filterCommandReplyForPassthrough(transformedResponse, out);
+    return true;
+}
+
+bool cursorCommandPassthroughShardWithMinKeyChunk(OperationContext* opCtx,
+                                                  const NamespaceString& nss,
+                                                  const CachedCollectionRoutingInfo& routingInfo,
+                                                  const BSONObj& cmdObj,
+                                                  BSONObjBuilder* out,
+                                                  const PrivilegeVector& privileges) {
+    auto response = executeCommandAgainstShardWithMinKeyChunk(
+        opCtx,
+        nss,
+        routingInfo,
+        CommandHelpers::filterCommandRequestForPassthrough(cmdObj),
+        ReadPreferenceSetting::get(opCtx),
+        Shard::RetryPolicy::kIdempotent);
+    const auto cmdResponse = uassertStatusOK(std::move(response.swResponse));
+
+    auto transformedResponse = uassertStatusOK(
+        storePossibleCursor(opCtx,
+                            response.shardId,
                             *response.shardHostAndPort,
                             cmdResponse.data,
                             nss,
@@ -144,7 +173,8 @@ protected:
 
         // Here, we first filter the command before appending an UNSHARDED shardVersion, because
         // "shardVersion" is one of the fields that gets filtered out.
-        BSONObj filteredCmdObj(CommandHelpers::filterCommandRequestForPassthrough(cmdObj));
+        BSONObj filteredCmdObj(applyReadWriteConcern(
+            opCtx, this, CommandHelpers::filterCommandRequestForPassthrough(cmdObj)));
         BSONObj filteredCmdObjWithVersion(
             appendShardVersion(filteredCmdObj, ChunkVersion::UNSHARDED()));
 
@@ -235,8 +265,8 @@ public:
                 opCtx,
                 ReadPreferenceSetting(ReadPreference::PrimaryOnly),
                 "admin",
-                configsvrRenameCollectionRequest.toBSON(
-                    CommandHelpers::filterCommandRequestForPassthrough(cmdObj)),
+                configsvrRenameCollectionRequest.toBSON(applyReadWriteConcern(
+                    opCtx, this, CommandHelpers::filterCommandRequestForPassthrough(cmdObj))),
                 Shard::RetryPolicy::kIdempotent));
 
             uassertStatusOK(cmdResponse.commandStatus);
@@ -260,8 +290,8 @@ public:
             NamespaceString::kAdminDb,
             fromNss,
             fromRoutingInfo,
-            appendAllowImplicitCreate(CommandHelpers::filterCommandRequestForPassthrough(cmdObj),
-                                      true),
+            applyReadWriteConcern(
+                opCtx, this, CommandHelpers::filterCommandRequestForPassthrough(cmdObj)),
             Shard::RetryPolicy::kNoRetry,
             &result);
     }
@@ -310,7 +340,8 @@ public:
             dbName,
             nss,
             routingInfo,
-            CommandHelpers::filterCommandRequestForPassthrough(cmdObj),
+            applyReadWriteConcern(
+                opCtx, this, CommandHelpers::filterCommandRequestForPassthrough(cmdObj)),
             Shard::RetryPolicy::kIdempotent,
             &result);
     }
@@ -490,11 +521,11 @@ public:
             return appendEmptyResultSet(opCtx, result, dbInfoStatus.getStatus(), nss.ns());
         }
 
-        return cursorCommandPassthrough(
+        return cursorCommandPassthroughPrimaryShard(
             opCtx,
             dbName,
             dbInfoStatus.getValue(),
-            newCmd,
+            applyReadWriteConcern(opCtx, this, newCmd),
             nss,
             &result,
             uassertStatusOK(AuthorizationSession::get(opCtx->getClient())
@@ -550,12 +581,11 @@ public:
         const auto routingInfo =
             uassertStatusOK(Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfo(opCtx, nss));
 
-        return cursorCommandPassthrough(
+        return cursorCommandPassthroughShardWithMinKeyChunk(
             opCtx,
-            nss.db(),
-            routingInfo.db(),
-            cmdObj,
             nss,
+            routingInfo,
+            applyReadWriteConcern(opCtx, this, cmdObj),
             &result,
             {Privilege(ResourcePattern::forExactNamespace(nss), ActionType::listIndexes)});
     }

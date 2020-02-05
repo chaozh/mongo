@@ -71,7 +71,7 @@ protected:
         const bool isMultikey = !multikeyPathSet.empty();
         BSONObj infoObj = BSON("wildcardProjection" << wildcardProjection);
 
-        _projExec = WildcardKeyGenerator::createProjectionExec(keyPattern, wildcardProjection);
+        _proj = WildcardKeyGenerator::createProjectionExecutor(keyPattern, wildcardProjection);
 
         params.indices.push_back({std::move(keyPattern),
                                   IndexType::INDEX_WILDCARD,
@@ -84,10 +84,10 @@ protected:
                                   partialFilterExpr,
                                   std::move(infoObj),
                                   collator,
-                                  _projExec.get()});
+                                  _proj.get_ptr()});
     }
 
-    std::unique_ptr<ProjectionExecAgg> _projExec;
+    boost::optional<WildcardProjection> _proj;
 };
 
 //
@@ -1022,8 +1022,8 @@ TEST_F(QueryPlannerWildcardTest, QueryNotInWildcardIndexHint) {
     addWildcardIndex(BSON("a.$**" << 1));
     addIndex(BSON("x" << 1));
 
-    runQueryHint(fromjson("{x: {$eq: 1}}"), BSON("a.$**" << 1));
-    assertNumSolutions(0U);
+    runInvalidQueryHint(fromjson("{x: {$eq: 1}}"), BSON("a.$**" << 1));
+    assertNoSolutions();
 }
 
 TEST_F(QueryPlannerWildcardTest, WildcardIndexDoesNotExist) {
@@ -1037,8 +1037,8 @@ TEST_F(QueryPlannerWildcardTest, WildcardIndexHintWithPartialFilter) {
     auto filterExpr = QueryPlannerTest::parseMatchExpression(filterObj);
     addWildcardIndex(BSON("$**" << 1), {}, {}, filterExpr.get());
 
-    runQueryHint(fromjson("{a: {$eq: 1}}"), BSON("$**" << 1));
-    assertNumSolutions(0U);
+    runInvalidQueryHint(fromjson("{a: {$eq: 1}}"), BSON("$**" << 1));
+    assertNoSolutions();
 }
 
 TEST_F(QueryPlannerWildcardTest, MultipleWildcardIndexesHintWithPartialFilter) {
@@ -1046,8 +1046,8 @@ TEST_F(QueryPlannerWildcardTest, MultipleWildcardIndexesHintWithPartialFilter) {
     auto filterExpr = QueryPlannerTest::parseMatchExpression(filterObj);
     addWildcardIndex(BSON("$**" << 1), {}, {}, filterExpr.get());
 
-    runQueryHint(fromjson("{a: {$eq: 1}, b: {$eq: 1}}"), BSON("$**" << 1));
-    assertNumSolutions(0U);
+    runInvalidQueryHint(fromjson("{a: {$eq: 1}, b: {$eq: 1}}"), BSON("$**" << 1));
+    assertNoSolutions();
 }
 
 //
@@ -1943,6 +1943,43 @@ TEST_F(QueryPlannerWildcardTest, StringComparisonWithEqualCollatorsAndWildcardIn
         "{fetch: {filter: null, collation: {locale: 'reverse'}, node: "
         "{ixscan: {filter: null, pattern: {'$_path': 1, a: 1},"
         "bounds: {'$_path': [['a','a',true,true]], 'a': [['','oof',true,false]]}}}}}");
+}
+
+TEST_F(QueryPlannerWildcardTest, CanUseWildcardIndexAndPushProjectionBeneathSort) {
+    addWildcardIndex(BSON("$**" << 1));
+    runQueryAsCommand(fromjson(
+        "{find: 'testns', filter: {a: 1, b: {$gt: 0}}, projection: {_id: 0, b: 1}, sort: {b: 1}}"));
+
+    assertNumSolutions(2U);
+    assertSolutionExists(
+        "{proj: {spec: {_id: 0, b: 1}, node: {fetch: {filter: {a: 1}, node:"
+        "{ixscan: {filter: null, pattern: {$_path: 1, b: 1}, bounds: "
+        "{$_path: [['b','b',true,true]], b: [[0,Infinity,false,true]]}}}}}}}");
+    assertSolutionExists(
+        "{sort: {pattern: {b: 1}, limit: 0, node: {sortKeyGen: {node:"
+        "{proj: {spec: {_id: 0, b: 1}, node: {fetch: {filter: {b: {$gt: 0}}, node:"
+        "{ixscan: {filter: null, pattern: {$_path: 1, a: 1}, bounds:"
+        "{$_path: [['a','a',true,true]], a: [[1,1,true,true]]}}}}}}}}}}}");
+}
+
+TEST_F(QueryPlannerWildcardTest, CanPushProjectionBeneathSortWithExistsPredicate) {
+    addWildcardIndex(BSON("$**" << 1));
+    runQueryAsCommand(
+        fromjson("{find: 'testns', filter: {a: 1, b: {$exists: true}}, projection: {_id: 0, b: 1}, "
+                 "sort: {b: 1}}"));
+
+    assertNumSolutions(2U);
+    assertSolutionExists(
+        "{sort: {pattern: {b: 1}, limit: 0, node: {sortKeyGen: {node:"
+        "{proj: {spec: {_id: 0, b: 1}, node: {fetch: {filter: {a: {$eq: 1}}, node:"
+        "{ixscan: {filter: null, pattern: {$_path: 1, b: 1}, bounds:"
+        "{$_path: [['b','b',true,true], ['b.', 'b/', true, false]],"
+        "b: [['MinKey','MaxKey',true,true]]}}}}}}}}}}}");
+    assertSolutionExists(
+        "{sort: {pattern: {b: 1}, limit: 0, node: {sortKeyGen: {node:"
+        "{proj: {spec: {_id: 0, b: 1}, node: {fetch: {filter: {b: {$exists: true}}, node:"
+        "{ixscan: {filter: null, pattern: {$_path: 1, a: 1}, bounds:"
+        "{$_path: [['a','a',true,true]], a: [[1,1,true,true]]}}}}}}}}}}}");
 }
 
 }  // namespace mongo

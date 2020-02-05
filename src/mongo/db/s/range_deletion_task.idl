@@ -31,44 +31,42 @@
 
 global:
     cpp_namespace: "mongo"
-    cpp_includes : "mongo/s/catalog/type_chunk.h"
 
 imports:
     - "mongo/idl/basic_types.idl"
-
-types:
-    chunkRangeType: 
-        description: "Represents the bounds of a chunk range. See ChunkRange for the semantics of
-                      the bounds."
-        bson_serialization_type: object
-        cpp_type: "mongo::ChunkRange"
-        serializer: "mongo::ChunkRange::toBSON"
-        deserializer: "mongo::ChunkRange::fromBSONThrowing"
+    - "mongo/s/sharding_types.idl"
+    - "mongo/db/logical_session_id.idl"
+    - "mongo/s/chunk_range.idl"
 
 enums:
-  CleanWhen:
-    description: "When to cleanup ranges."
-    type: string
-    values:
-      kNow: "now"
-      kDelayed: "delayed"
+    CleanWhen:
+        description: "When to cleanup ranges."
+        type: string
+        values:
+            kNow: "now"
+            kDelayed: "delayed"
 
 structs:
     rangeDeletionTask:
         description: "Represents a chunk range to be deleted by the range deleter."
         strict: false
         fields:
+            _id:
+                type: uuid
+                description: "A unique identifier for the migration."
+                cpp_name: id
             nss:
                 type: namespacestring
                 description: "The namespace of the collection that the chunk belongs to."
             collectionUuid:
-                type: namespacestring
+                type: uuid
                 description: "The UUID of the collection that the chunk belongs to."
+            donorShardId:
+                type: shard_id
+                description: "The shard from which the chunk was migrated."
             range:
-                type: chunkRangeType
-                description: "The range to be deleted. Needs to be optional since ChunkRange
-                              doesn't have a default constructor."
-                optional: true
+                type: chunk_range
+                description: "The range to be deleted."
             pending:
                 type: bool
                 description: "Flag that is present if the range is not yet ready for deletion"

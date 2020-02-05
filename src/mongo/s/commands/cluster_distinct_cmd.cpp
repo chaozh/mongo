@@ -72,11 +72,9 @@ public:
         return false;
     }
 
-    ReadConcernSupportResult supportsReadConcern(const std::string& dbName,
-                                                 const BSONObj& cmdObj,
+    ReadConcernSupportResult supportsReadConcern(const BSONObj& cmdObj,
                                                  repl::ReadConcernLevel level) const final {
-        return {ReadConcernSupportResult::ReadConcern::kSupported,
-                ReadConcernSupportResult::DefaultReadConcern::kPermitted};
+        return ReadConcernSupportResult::allSupportedAndDefaultPermitted();
     }
 
     void addRequiredPrivileges(const std::string& dbname,
@@ -186,7 +184,8 @@ public:
                 nss.db(),
                 nss,
                 routingInfo,
-                CommandHelpers::filterCommandRequestForPassthrough(cmdObj),
+                applyReadWriteConcern(
+                    opCtx, this, CommandHelpers::filterCommandRequestForPassthrough(cmdObj)),
                 ReadPreferenceSetting::get(opCtx),
                 Shard::RetryPolicy::kIdempotent,
                 query,

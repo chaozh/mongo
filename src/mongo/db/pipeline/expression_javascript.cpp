@@ -30,8 +30,8 @@
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/auth/authorization_session.h"
-#include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/pipeline/expression_javascript.h"
+#include "mongo/db/pipeline/make_js_function.h"
 #include "mongo/db/query/query_knobs_gen.h"
 
 namespace mongo {
@@ -42,16 +42,15 @@ REGISTER_EXPRESSION(_internalJs, ExpressionInternalJs::parse);
 namespace {
 
 /**
- * This function is called from the JavaScript function provided to the expression. Objects are
- * converted from BSON to Document/Value after JS engine has run completely.
+ * This function is called from the JavaScript function provided to the expression.
  */
 BSONObj emitFromJS(const BSONObj& args, void* data) {
     uassert(31220, "emit takes 2 args", args.nFields() == 2);
-    auto emitted = static_cast<std::vector<BSONObj>*>(data);
+    auto emitState = static_cast<ExpressionInternalJsEmit::EmitState*>(data);
     if (args.firstElement().type() == Undefined) {
-        emitted->push_back(BSON("k" << BSONNULL << "v" << args["1"]));
+        emitState->emit(DOC("k" << BSONNULL << "v" << args["1"]));
     } else {
-        emitted->push_back(BSON("k" << args["0"] << "v" << args["1"]));
+        emitState->emit(DOC("k" << args["0"] << "v" << args["1"]));
     }
     return BSONObj();
 }
@@ -62,9 +61,9 @@ ExpressionInternalJsEmit::ExpressionInternalJsEmit(
     boost::intrusive_ptr<Expression> thisRef,
     std::string funcSource)
     : Expression(expCtx, {std::move(thisRef)}),
+      _emitState{{}, internalQueryMaxJsEmitBytes.load(), 0},
       _thisRef(_children[0]),
-      _funcSource(std::move(funcSource)),
-      _byteLimit(internalQueryMaxJsEmitBytes.load()) {}
+      _funcSource(std::move(funcSource)) {}
 
 void ExpressionInternalJsEmit::_doAddDependencies(mongo::DepsTracker* deps) const {
     _children[0]->addDependencies(deps);
@@ -74,10 +73,6 @@ boost::intrusive_ptr<Expression> ExpressionInternalJsEmit::parse(
     const boost::intrusive_ptr<ExpressionContext>& expCtx,
     BSONElement expr,
     const VariablesParseState& vps) {
-
-    uassert(ErrorCodes::BadValue,
-            str::stream() << kExpressionName << " not allowed without enabling test commands.",
-            getTestCommandsEnabled());
 
     uassert(31221,
             str::stream() << kExpressionName
@@ -107,46 +102,32 @@ Value ExpressionInternalJsEmit::serialize(bool explain) const {
 }
 
 Value ExpressionInternalJsEmit::evaluate(const Document& root, Variables* variables) const {
-    uassert(31246,
-            "Cannot run server-side javascript without the javascript engine enabled",
-            getGlobalScriptEngine());
-
     Value thisVal = _thisRef->evaluate(root, variables);
     uassert(31225, "'this' must be an object.", thisVal.getType() == BSONType::Object);
 
     // If the scope does not exist and is created by the following call, then make sure to
     // re-bind emit() and the given function to the new scope.
     auto expCtx = getExpressionContext();
+
     auto jsExec = expCtx->getJsExecWithScope();
+    // Inject the native "emit" function to be called from the user-defined map function. This
+    // particular Expression/ExpressionContext may be reattached to a new OperationContext (and thus
+    // a new JS Scope) when used across getMore operations, so this method will handle that case for
+    // us by only injecting if we haven't already.
+    jsExec->injectEmitIfNecessary(emitFromJS, &_emitState);
 
     // Although inefficient to "create" a new function every time we evaluate, this will usually end
     // up being a simple cache lookup. This is needed because the JS Scope may have been recreated
     // on a new thread if the expression is evaluated across getMores.
-    auto func = jsExec->getScope()->createFunction(_funcSource.c_str());
-    uassert(31226, "The map function failed to parse in the javascript engine", func);
-
-    // For a given invocation of the user-defined function, this vector holds the results of each
-    // call to emit().
-    std::vector<BSONObj> emittedObjects;
-    jsExec->getScope()->injectNative("emit", emitFromJS, &emittedObjects);
+    auto func = makeJsFunc(expCtx, _funcSource.c_str());
 
     BSONObj thisBSON = thisVal.getDocument().toBson();
     BSONObj params;
     jsExec->callFunctionWithoutReturn(func, params, thisBSON);
 
-    std::vector<Value> output;
-
-    size_t bytesUsed = 0;
-    for (const auto& obj : emittedObjects) {
-        bytesUsed += obj.objsize();
-        uassert(31292,
-                str::stream() << "Size of emitted values exceeds the set size limit of "
-                              << _byteLimit << " bytes",
-                bytesUsed < _byteLimit);
-        output.push_back(Value(obj));
-    }
-
-    return Value{std::move(output)};
+    auto returnValue = Value(std::move(_emitState.emittedObjects));
+    _emitState.reset();
+    return returnValue;
 }
 
 ExpressionInternalJs::ExpressionInternalJs(const boost::intrusive_ptr<ExpressionContext>& expCtx,
@@ -171,10 +152,6 @@ boost::intrusive_ptr<Expression> ExpressionInternalJs::parse(
     BSONElement expr,
     const VariablesParseState& vps) {
 
-    uassert(ErrorCodes::BadValue,
-            str::stream() << kExpressionName << " not allowed without enabling test commands.",
-            getTestCommandsEnabled());
-
     uassert(31260,
             str::stream() << kExpressionName
                           << " requires an object as an argument, found: " << expr.type(),
@@ -196,10 +173,6 @@ boost::intrusive_ptr<Expression> ExpressionInternalJs::parse(
 
 Value ExpressionInternalJs::evaluate(const Document& root, Variables* variables) const {
     auto& expCtx = getExpressionContext();
-    uassert(31264,
-            str::stream() << kExpressionName
-                          << " can't be run on this process. Javascript is disabled.",
-            getGlobalScriptEngine());
 
     auto jsExec = expCtx->getJsExecWithScope();
 

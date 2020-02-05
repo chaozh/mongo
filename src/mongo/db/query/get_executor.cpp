@@ -48,12 +48,14 @@
 #include "mongo/db/exec/idhack.h"
 #include "mongo/db/exec/multi_plan.h"
 #include "mongo/db/exec/projection.h"
+#include "mongo/db/exec/projection_executor_utils.h"
 #include "mongo/db/exec/record_store_fast_count.h"
 #include "mongo/db/exec/return_key.h"
 #include "mongo/db/exec/shard_filter.h"
 #include "mongo/db/exec/sort_key_generator.h"
 #include "mongo/db/exec/subplan.h"
 #include "mongo/db/exec/update_stage.h"
+#include "mongo/db/exec/upsert_stage.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/index/wildcard_access_method.h"
 #include "mongo/db/index_names.h"
@@ -164,17 +166,19 @@ IndexEntry indexEntryFromIndexCatalogEntry(OperationContext* opCtx,
 
     const bool isMultikey = desc->isMultikey();
 
-    const ProjectionExecAgg* projExec = nullptr;
+    const WildcardProjection* wildcardProjection = nullptr;
     std::set<FieldRef> multikeyPathSet;
     if (desc->getIndexType() == IndexType::INDEX_WILDCARD) {
-        projExec = static_cast<const WildcardAccessMethod*>(accessMethod)->getProjectionExec();
+        wildcardProjection =
+            static_cast<const WildcardAccessMethod*>(accessMethod)->getWildcardProjection();
         if (isMultikey) {
             MultikeyMetadataAccessStats mkAccessStats;
 
             if (canonicalQuery) {
                 stdx::unordered_set<std::string> fields;
                 QueryPlannerIXSelect::getFields(canonicalQuery->root(), &fields);
-                const auto projectedFields = projExec->applyProjectionToFields(fields);
+                const auto projectedFields = projection_executor_utils::applyProjectionToFields(
+                    wildcardProjection->exec(), fields);
 
                 multikeyPathSet =
                     accessMethod->getMultikeyPathSet(opCtx, projectedFields, &mkAccessStats);
@@ -204,7 +208,7 @@ IndexEntry indexEntryFromIndexCatalogEntry(OperationContext* opCtx,
             ice.getFilterExpression(),
             desc->infoObj(),
             ice.getCollator(),
-            projExec};
+            wildcardProjection};
 }
 
 /**
@@ -385,7 +389,7 @@ StatusWith<PrepareExecutionResult> prepareExecution(OperationContext* opCtx,
             root = std::make_unique<ShardFilterStage>(
                 opCtx,
                 CollectionShardingState::get(opCtx, canonicalQuery->nss())
-                    ->getOrphansFilter(opCtx, collection),
+                    ->getOwnershipFilter(opCtx, collection),
                 ws,
                 std::move(root));
         }
@@ -412,6 +416,7 @@ StatusWith<PrepareExecutionResult> prepareExecution(OperationContext* opCtx,
                     ? QueryPlannerCommon::extractSortKeyMetaFieldsFromProjection(*cqProjection)
                     : std::vector<FieldPath>{},
                 ws,
+                canonicalQuery->getExpCtx()->sortKeyFormat,
                 std::move(root));
         } else if (cqProjection) {
             // There might be a projection. The idhack stage will always fetch the full
@@ -427,7 +432,11 @@ StatusWith<PrepareExecutionResult> prepareExecution(OperationContext* opCtx,
                     std::move(root));
             } else {
                 root = std::make_unique<ProjectionStageSimple>(
-                    opCtx, canonicalQuery->getQueryRequest().getProj(), ws, std::move(root));
+                    canonicalQuery->getExpCtx(),
+                    canonicalQuery->getQueryRequest().getProj(),
+                    canonicalQuery->getProj(),
+                    ws,
+                    std::move(root));
             }
         }
 
@@ -504,14 +513,8 @@ StatusWith<PrepareExecutionResult> prepareExecution(OperationContext* opCtx,
                           << " planner returned error");
     }
     auto solutions = std::move(statusWithSolutions.getValue());
-
-    // We cannot figure out how to answer the query.  Perhaps it requires an index
-    // we do not have?
-    if (0 == solutions.size()) {
-        return Status(ErrorCodes::NoQueryExecutionPlans,
-                      str::stream() << "error processing query: " << canonicalQuery->toString()
-                                    << " No query solutions");
-    }
+    // The planner should have returned an error status if there are no solutions.
+    invariant(solutions.size() > 0);
 
     // See if one of our solutions is a fast count hack in disguise.
     if (plannerParams.options & QueryPlannerParams::IS_COUNT) {
@@ -686,7 +689,11 @@ StatusWith<unique_ptr<PlanStage>> applyProjection(OperationContext* opCtx,
 //
 
 StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorDelete(
-    OperationContext* opCtx, OpDebug* opDebug, Collection* collection, ParsedDelete* parsedDelete) {
+    OperationContext* opCtx,
+    OpDebug* opDebug,
+    Collection* collection,
+    ParsedDelete* parsedDelete,
+    boost::optional<ExplainOptions::Verbosity> verbosity) {
     const DeleteRequest* request = parsedDelete->getRequest();
 
     const NamespaceString& nss(request->getNamespaceString());
@@ -772,6 +779,9 @@ StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorDelete(
     // This is the regular path for when we have a CanonicalQuery.
     unique_ptr<CanonicalQuery> cq(parsedDelete->releaseParsedQuery());
 
+    // Transfer the explain verbosity level into the expression context.
+    cq->getExpCtx()->explain = verbosity;
+
     const size_t defaultPlannerOptions = 0;
     StatusWith<PrepareExecutionResult> executionResult =
         prepareExecution(opCtx, collection, ws.get(), std::move(cq), defaultPlannerOptions);
@@ -816,7 +826,11 @@ StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorDelete(
 //
 
 StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorUpdate(
-    OperationContext* opCtx, OpDebug* opDebug, Collection* collection, ParsedUpdate* parsedUpdate) {
+    OperationContext* opCtx,
+    OpDebug* opDebug,
+    Collection* collection,
+    ParsedUpdate* parsedUpdate,
+    boost::optional<ExplainOptions::Verbosity> verbosity) {
     const UpdateRequest* request = parsedUpdate->getRequest();
     UpdateDriver* driver = parsedUpdate->getDriver();
 
@@ -913,6 +927,9 @@ StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorUpdate(
     // This is the regular path for when we have a CanonicalQuery.
     unique_ptr<CanonicalQuery> cq(parsedUpdate->releaseParsedQuery());
 
+    // Transfer the explain verbosity level into the expression context.
+    cq->getExpCtx()->explain = verbosity;
+
     const size_t defaultPlannerOptions = 0;
     StatusWith<PrepareExecutionResult> executionResult =
         prepareExecution(opCtx, collection, ws.get(), std::move(cq), defaultPlannerOptions);
@@ -926,8 +943,11 @@ StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorUpdate(
     invariant(root);
     updateStageParams.canonicalQuery = cq.get();
 
-    root = std::make_unique<UpdateStage>(
-        opCtx, updateStageParams, ws.get(), collection, root.release());
+    const bool isUpsert = updateStageParams.request->isUpsert();
+    root = (isUpsert ? std::make_unique<UpsertStage>(
+                           opCtx, updateStageParams, ws.get(), collection, root.release())
+                     : std::make_unique<UpdateStage>(
+                           opCtx, updateStageParams, ws.get(), collection, root.release()));
 
     if (!request->getProj().isEmpty()) {
         invariant(request->shouldReturnAnyDocs());
@@ -1030,8 +1050,8 @@ bool turnIxscanIntoCount(QuerySolution* soln) {
  * Returns true if indices contains an index that can be used with DistinctNode (the "fast distinct
  * hack" node, which can be used only if there is an empty query predicate).  Sets indexOut to the
  * array index of PlannerParams::indices.  Look for the index for the fewest fields.  Criteria for
- * suitable index is that the index cannot be special (geo, hashed, text, ...), and the index cannot
- * be a partial index.
+ * suitable index is that the index should be of type BTREE or HASHED and the index cannot be a
+ * partial index.
  *
  * Multikey indices are not suitable for DistinctNode when the projection is on an array element.
  * Arrays are flattened in a multikey index which makes it impossible for the distinct scan stage
@@ -1052,18 +1072,34 @@ bool getDistinctNodeIndex(const std::vector<IndexEntry>& indices,
         if (!CollatorInterface::collatorsMatch(indices[i].collator, collator)) {
             continue;
         }
-        // Skip special indices.
-        if (!IndexNames::findPluginName(indices[i].keyPattern).empty()) {
-            continue;
-        }
         // Skip partial indices.
         if (indices[i].filterExpr) {
             continue;
         }
-        // Skip indices where the first key is not field.
-        if (indices[i].keyPattern.firstElement().fieldNameStringData() != StringData(field)) {
+        // Skip indices where the first key is not 'field'.
+        auto firstIndexField = indices[i].keyPattern.firstElement();
+        if (firstIndexField.fieldNameStringData() != StringData(field)) {
             continue;
         }
+        // Skip the index if the first key is a "plugin" such as "hashed", "2dsphere", and so on.
+        if (!firstIndexField.isNumber()) {
+            continue;
+        }
+        // Compound hashed indexes can use distinct scan if the first field is 1 or -1. For the
+        // other special indexes, the 1 or -1 index fields may be stored as a function of the data
+        // rather than the raw data itself. Storing f(d) instead of 'd' precludes the distinct_scan
+        // due to the possibility that f(d1) == f(d2).  Therefore, after fetching the base data,
+        // either d1 or d2 would be incorrectly missing from the result set.
+        auto indexPluginName = IndexNames::findPluginName(indices[i].keyPattern);
+        switch (IndexNames::nameToType(indexPluginName)) {
+            case IndexType::INDEX_BTREE:
+            case IndexType::INDEX_HASHED:
+                break;
+            default:
+                // All other index types are not eligible.
+                continue;
+        }
+
         int nFields = indices[i].keyPattern.nFields();
         // Pick the index with the lowest number of fields.
         if (nFields < minFields) {
@@ -1373,9 +1409,11 @@ QueryPlannerParams fillOutPlannerParamsForDistinct(OperationContext* opCtx,
                 indexEntryFromIndexCatalogEntry(opCtx, *ice, parsedDistinct.getQuery()));
         } else if (desc->getIndexType() == IndexType::INDEX_WILDCARD && !query.isEmpty()) {
             // Check whether the $** projection captures the field over which we are distinct-ing.
-            const auto* proj =
-                static_cast<const WildcardAccessMethod*>(ice->accessMethod())->getProjectionExec();
-            if (proj->applyProjectionToOneField(parsedDistinct.getKey())) {
+            auto* proj = static_cast<const WildcardAccessMethod*>(ice->accessMethod())
+                             ->getWildcardProjection()
+                             ->exec();
+            if (projection_executor_utils::applyProjectionToOneField(proj,
+                                                                     parsedDistinct.getKey())) {
                 plannerParams.indices.push_back(
                     indexEntryFromIndexCatalogEntry(opCtx, *ice, parsedDistinct.getQuery()));
             }

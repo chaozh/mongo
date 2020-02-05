@@ -466,7 +466,7 @@ std::shared_ptr<CappedInsertNotifier> PlanExecutorImpl::_getCappedInsertNotifier
     auto databaseHolder = DatabaseHolder::get(_opCtx);
     auto db = databaseHolder->getDb(_opCtx, _nss.db());
     invariant(db);
-    auto collection = CollectionCatalog::get(_opCtx).lookupCollectionByNamespace(_nss);
+    auto collection = CollectionCatalog::get(_opCtx).lookupCollectionByNamespace(_opCtx, _nss);
     invariant(collection);
 
     return collection->getCappedInsertNotifier();
@@ -627,7 +627,14 @@ PlanExecutor::ExecState PlanExecutorImpl::_getNextImpl(Snapshotted<Document>* ob
         } else if (PlanStage::NEED_TIME == code) {
             // Fall through to yield check at end of large conditional.
         } else if (PlanStage::IS_EOF == code) {
-            if (MONGO_unlikely(planExecutorHangBeforeShouldWaitForInserts.shouldFail())) {
+            if (MONGO_unlikely(planExecutorHangBeforeShouldWaitForInserts.shouldFail(
+                    [this](const BSONObj& data) {
+                        if (data.hasField("namespace") &&
+                            _nss != NamespaceString(data.getStringField("namespace"))) {
+                            return false;
+                        }
+                        return true;
+                    }))) {
                 log() << "PlanExecutor - planExecutorHangBeforeShouldWaitForInserts fail point "
                          "enabled. Blocking until fail point is disabled.";
                 planExecutorHangBeforeShouldWaitForInserts.pauseWhileSet();
@@ -728,16 +735,21 @@ bool PlanExecutorImpl::isDetached() const {
 }
 
 Timestamp PlanExecutorImpl::getLatestOplogTimestamp() const {
-    if (auto changeStreamProxy = getStageByType(_root.get(), STAGE_CHANGE_STREAM_PROXY))
+    if (auto changeStreamProxy = getStageByType(_root.get(), STAGE_CHANGE_STREAM_PROXY)) {
         return static_cast<ChangeStreamProxyStage*>(changeStreamProxy)->getLatestOplogTimestamp();
-    if (auto collectionScan = getStageByType(_root.get(), STAGE_COLLSCAN))
+    }
+    if (auto collectionScan = getStageByType(_root.get(), STAGE_COLLSCAN)) {
         return static_cast<CollectionScan*>(collectionScan)->getLatestOplogTimestamp();
+    }
     return Timestamp();
 }
 
 BSONObj PlanExecutorImpl::getPostBatchResumeToken() const {
     if (auto changeStreamProxy = getStageByType(_root.get(), STAGE_CHANGE_STREAM_PROXY))
         return static_cast<ChangeStreamProxyStage*>(changeStreamProxy)->getPostBatchResumeToken();
+    if (auto collectionScan = getStageByType(_root.get(), STAGE_COLLSCAN)) {
+        return static_cast<CollectionScan*>(collectionScan)->getResumeToken();
+    }
     return {};
 }
 

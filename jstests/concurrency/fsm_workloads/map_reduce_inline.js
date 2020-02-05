@@ -10,7 +10,7 @@
  * Used as the base workload for the other map-reduce workloads.
  * @tags: [
  *   # mapReduce does not support afterClusterTime.
- *   does_not_support_causal_consistency,
+ *   does_not_support_causal_consistency
  * ]
  */
 var $config = (function() {
@@ -75,9 +75,6 @@ var $config = (function() {
         var res = bulk.execute();
         assertAlways.commandWorked(res);
         assertAlways.eq(this.numDocs, res.nInserted);
-
-        assert.commandWorked(
-            db.adminCommand({setParameter: 1, internalQueryUseAggMapReduce: true}));
     }
 
     return {

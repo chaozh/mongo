@@ -41,6 +41,7 @@
 
 #include "mongo/base/status.h"
 #include "mongo/db/lasterror.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/service_context.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/util/concurrency/thread_name.h"
@@ -145,6 +146,12 @@ Client* Client::getCurrent() {
     return currentClient.get();
 }
 
+std::unique_ptr<Locker> Client::swapLockState(std::unique_ptr<Locker> locker) {
+    scoped_spinlock scopedLock(_lock);
+    invariant(_opCtx);
+    return _opCtx->swapLockState(std::move(locker), scopedLock);
+}
+
 Client& cc() {
     invariant(haveClient());
     return *Client::getCurrent();
@@ -162,6 +169,18 @@ ServiceContext::UniqueClient Client::releaseCurrent() {
 void Client::setCurrent(ServiceContext::UniqueClient client) {
     invariantNoCurrentClient();
     currentClient = std::move(client);
+}
+
+/**
+ * User connections are listed active so long as they are associated with an opCtx.
+ * Non-user connections are listed active if they have an opCtx and not waiting on a condvar.
+ */
+bool Client::hasAnyActiveCurrentOp() const {
+    if (!_opCtx)
+        return false;
+    if (isFromUserConnection() || !_opCtx->isWaitingForConditionOrInterrupt())
+        return true;
+    return false;
 }
 
 ThreadClient::ThreadClient(ServiceContext* serviceContext)

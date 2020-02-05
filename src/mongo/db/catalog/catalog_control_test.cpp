@@ -86,17 +86,23 @@ public:
                       "The current storage engine doesn't support backup mode");
     }
     void endBackup(OperationContext* opCtx) final {}
-    StatusWith<std::vector<StorageEngine::BackupBlock>> beginNonBlockingBackup(
-        OperationContext* opCtx) final {
+    Status disableIncrementalBackup(OperationContext* opCtx) {
         return Status(ErrorCodes::CommandNotSupported,
-                      "The current storage engine does not support a concurrent mode.");
+                      "The current storage engine doesn't support backup mode");
+    }
+    StatusWith<StorageEngine::BackupInformation> beginNonBlockingBackup(
+        OperationContext* opCtx, const StorageEngine::BackupOptions& options) final {
+        return Status(ErrorCodes::CommandNotSupported,
+                      "The current storage engine doesn't support backup mode");
     }
     void endNonBlockingBackup(OperationContext* opCtx) final {}
     StatusWith<std::vector<std::string>> extendBackupCursor(OperationContext* opCtx) final {
         return Status(ErrorCodes::CommandNotSupported,
-                      "The current storage engine does not support a concurrent mode.");
+                      "The current storage engine doesn't support backup mode");
     }
-    Status repairRecordStore(OperationContext* opCtx, const NamespaceString& ns) final {
+    Status repairRecordStore(OperationContext* opCtx,
+                             RecordId catalogId,
+                             const NamespaceString& ns) final {
         return Status::OK();
     }
     std::unique_ptr<TemporaryRecordStore> makeTemporaryRecordStore(OperationContext* opCtx) final {
@@ -126,6 +132,9 @@ public:
         return false;
     }
     void clearDropPendingState() final {}
+    bool supportsTwoPhaseIndexBuild() const final {
+        return false;
+    }
     StatusWith<Timestamp> recoverToStableTimestamp(OperationContext* opCtx) final {
         fassertFailed(40547);
     }
@@ -145,10 +154,10 @@ public:
         return false;
     }
     void setCachePressureForTest(int pressure) final {}
-    void replicationBatchIsComplete() const final {}
-    StatusWith<std::vector<CollectionIndexNamePair>> reconcileCatalogAndIdents(
+    void triggerJournalFlush() const final {}
+    StatusWith<StorageEngine::ReconcileResult> reconcileCatalogAndIdents(
         OperationContext* opCtx) final {
-        return std::vector<CollectionIndexNamePair>();
+        return ReconcileResult{};
     }
     Timestamp getAllDurableTimestamp() const final {
         return {};

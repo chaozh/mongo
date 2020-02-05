@@ -79,37 +79,40 @@ Status checkFieldType(const BSONElement& el, BSONType type) {
     return Status::OK();
 }
 
+}  // namespace
+
 // Find command field names.
-const char kFilterField[] = "filter";
-const char kProjectionField[] = "projection";
-const char kSortField[] = "sort";
-const char kHintField[] = "hint";
-const char kCollationField[] = "collation";
-const char kSkipField[] = "skip";
-const char kLimitField[] = "limit";
-const char kBatchSizeField[] = "batchSize";
-const char kNToReturnField[] = "ntoreturn";
-const char kSingleBatchField[] = "singleBatch";
-const char kMaxField[] = "max";
-const char kMinField[] = "min";
-const char kReturnKeyField[] = "returnKey";
-const char kShowRecordIdField[] = "showRecordId";
-const char kTailableField[] = "tailable";
-const char kOplogReplayField[] = "oplogReplay";
-const char kNoCursorTimeoutField[] = "noCursorTimeout";
-const char kAwaitDataField[] = "awaitData";
-const char kPartialResultsField[] = "allowPartialResults";
-const char kRuntimeConstantsField[] = "runtimeConstants";
-const char kTermField[] = "term";
-const char kOptionsField[] = "options";
-const char kReadOnceField[] = "readOnce";
-const char kAllowSpeculativeMajorityReadField[] = "allowSpeculativeMajorityRead";
-const char kInternalReadAtClusterTimeField[] = "$_internalReadAtClusterTime";
+const char QueryRequest::kFilterField[] = "filter";
+const char QueryRequest::kProjectionField[] = "projection";
+const char QueryRequest::kSortField[] = "sort";
+const char QueryRequest::kHintField[] = "hint";
+const char QueryRequest::kCollationField[] = "collation";
+const char QueryRequest::kSkipField[] = "skip";
+const char QueryRequest::kLimitField[] = "limit";
+const char QueryRequest::kBatchSizeField[] = "batchSize";
+const char QueryRequest::kNToReturnField[] = "ntoreturn";
+const char QueryRequest::kSingleBatchField[] = "singleBatch";
+const char QueryRequest::kMaxField[] = "max";
+const char QueryRequest::kMinField[] = "min";
+const char QueryRequest::kReturnKeyField[] = "returnKey";
+const char QueryRequest::kShowRecordIdField[] = "showRecordId";
+const char QueryRequest::kTailableField[] = "tailable";
+const char QueryRequest::kOplogReplayField[] = "oplogReplay";
+const char QueryRequest::kNoCursorTimeoutField[] = "noCursorTimeout";
+const char QueryRequest::kAwaitDataField[] = "awaitData";
+const char QueryRequest::kPartialResultsField[] = "allowPartialResults";
+const char QueryRequest::kRuntimeConstantsField[] = "runtimeConstants";
+const char QueryRequest::kTermField[] = "term";
+const char QueryRequest::kOptionsField[] = "options";
+const char QueryRequest::kReadOnceField[] = "readOnce";
+const char QueryRequest::kAllowSpeculativeMajorityReadField[] = "allowSpeculativeMajorityRead";
+const char QueryRequest::kInternalReadAtClusterTimeField[] = "$_internalReadAtClusterTime";
+const char QueryRequest::kRequestResumeTokenField[] = "$_requestResumeToken";
+const char QueryRequest::kResumeAfterField[] = "$_resumeAfter";
+const char QueryRequest::kUse44SortKeys[] = "_use44SortKeys";
 
 // Field names for sorting options.
-const char kNaturalSortField[] = "$natural";
-
-}  // namespace
+const char QueryRequest::kNaturalSortField[] = "$natural";
 
 const char QueryRequest::kFindCommandName[] = "find";
 const char QueryRequest::kShardVersionField[] = "shardVersion";
@@ -120,7 +123,7 @@ QueryRequest::QueryRequest(NamespaceStringOrUUID nssOrUuid)
 void QueryRequest::refreshNSS(OperationContext* opCtx) {
     if (_uuid) {
         const CollectionCatalog& catalog = CollectionCatalog::get(opCtx);
-        auto foundColl = catalog.lookupCollectionByUUID(_uuid.get());
+        auto foundColl = catalog.lookupCollectionByUUID(opCtx, _uuid.get());
         uassert(ErrorCodes::NamespaceNotFound,
                 str::stream() << "UUID " << _uuid.get() << " specified in query request not found",
                 foundColl);
@@ -397,6 +400,24 @@ StatusWith<unique_ptr<QueryRequest>> QueryRequest::parseFromFindCommand(unique_p
                 return status;
             }
             qr->_internalReadAtClusterTime = el.timestamp();
+        } else if (fieldName == kResumeAfterField) {
+            Status status = checkFieldType(el, Object);
+            if (!status.isOK()) {
+                return status;
+            }
+            qr->_resumeAfter = el.embeddedObject();
+        } else if (fieldName == kRequestResumeTokenField) {
+            Status status = checkFieldType(el, Bool);
+            if (!status.isOK()) {
+                return status;
+            }
+            qr->_requestResumeToken = el.boolean();
+        } else if (fieldName == kUse44SortKeys) {
+            Status status = checkFieldType(el, Bool);
+            if (!status.isOK()) {
+                return status;
+            }
+            qr->_use44SortKeys = el.boolean();
         } else if (!isGenericArgument(fieldName)) {
             return Status(ErrorCodes::FailedToParse,
                           str::stream() << "Failed to parse: " << cmdObj.toString() << ". "
@@ -473,8 +494,8 @@ void QueryRequest::asFindCommandInternal(BSONObjBuilder* cmdBuilder) const {
         cmdBuilder->append(kHintField, _hint);
     }
 
-    if (!_readConcern.isEmpty()) {
-        cmdBuilder->append(repl::ReadConcernArgs::kReadConcernFieldName, _readConcern);
+    if (_readConcern) {
+        cmdBuilder->append(repl::ReadConcernArgs::kReadConcernFieldName, *_readConcern);
     }
 
     if (!_collation.isEmpty()) {
@@ -573,6 +594,18 @@ void QueryRequest::asFindCommandInternal(BSONObjBuilder* cmdBuilder) const {
     if (_internalReadAtClusterTime) {
         cmdBuilder->append(kInternalReadAtClusterTimeField, *_internalReadAtClusterTime);
     }
+
+    if (_requestResumeToken) {
+        cmdBuilder->append(kRequestResumeTokenField, _requestResumeToken);
+    }
+
+    if (!_resumeAfter.isEmpty()) {
+        cmdBuilder->append(kResumeAfterField, _resumeAfter);
+    }
+
+    if (_use44SortKeys) {
+        cmdBuilder->append(kUse44SortKeys, true);
+    }
 }
 
 void QueryRequest::addShowRecordIdMetaProj() {
@@ -596,41 +629,10 @@ Status QueryRequest::validate() const {
         }
     }
 
-    // Can't combine a normal sort and a $meta projection on the same field.
-    BSONObjIterator projIt(_proj);
-    while (projIt.more()) {
-        BSONElement projElt = projIt.next();
-        if (isTextScoreMeta(projElt)) {
-            BSONElement sortElt = _sort[projElt.fieldName()];
-            if (!sortElt.eoo() && !isTextScoreMeta(sortElt)) {
-                return Status(ErrorCodes::BadValue,
-                              "can't have a non-$meta sort on a $meta projection");
-            }
-        }
-    }
-
-    if (!isValidSortOrder(_sort)) {
-        return Status(ErrorCodes::BadValue, "bad sort specification");
-    }
-
-    // All fields with a $meta sort must have a corresponding $meta projection.
-    BSONObjIterator sortIt(_sort);
-    while (sortIt.more()) {
-        BSONElement sortElt = sortIt.next();
-        if (isTextScoreMeta(sortElt)) {
-            BSONElement projElt = _proj[sortElt.fieldName()];
-            if (projElt.eoo() || !isTextScoreMeta(projElt)) {
-                return Status(ErrorCodes::BadValue,
-                              "must have $meta projection for all $meta sort keys");
-            }
-        }
-    }
-
     if ((_limit || _batchSize) && _ntoreturn) {
         return Status(ErrorCodes::BadValue,
                       "'limit' or 'batchSize' fields can not be set with 'ntoreturn' field.");
     }
-
 
     if (_skip && *_skip < 0) {
         return Status(ErrorCodes::BadValue,
@@ -677,6 +679,29 @@ Status QueryRequest::validate() const {
         }
     }
 
+    if (_requestResumeToken) {
+        if (SimpleBSONObjComparator::kInstance.evaluate(_hint != BSON(kNaturalSortField << 1))) {
+            return Status(ErrorCodes::BadValue,
+                          "hint must be {$natural:1} if 'requestResumeToken' is enabled");
+        }
+        if (!_sort.isEmpty() &&
+            SimpleBSONObjComparator::kInstance.evaluate(_sort != BSON(kNaturalSortField << 1))) {
+            return Status(ErrorCodes::BadValue,
+                          "sort must be unset or {$natural:1} if 'requestResumeToken' is enabled");
+        }
+        if (!_resumeAfter.isEmpty()) {
+            if (_resumeAfter.nFields() != 1 ||
+                _resumeAfter["$recordId"].type() != BSONType::NumberLong) {
+                return Status(ErrorCodes::BadValue,
+                              "Malformed resume token: the '_resumeAfter' object must contain"
+                              " exactly one field named '$recordId', of type NumberLong.");
+            }
+        }
+    } else if (!_resumeAfter.isEmpty()) {
+        return Status(ErrorCodes::BadValue,
+                      "'requestResumeToken' must be true if 'resumeAfter' is"
+                      " specified");
+    }
     return Status::OK();
 }
 
@@ -703,7 +728,6 @@ StatusWith<int> QueryRequest::parseMaxTimeMS(BSONElement maxTimeMSElt) {
     return StatusWith<int>(static_cast<int>(maxTimeMSLongLong));
 }
 
-// static
 bool QueryRequest::isTextScoreMeta(BSONElement elt) {
     // elt must be foo: {$meta: "textScore"}
     if (mongo::Object != elt.type()) {
@@ -728,27 +752,6 @@ bool QueryRequest::isTextScoreMeta(BSONElement elt) {
     // must have exactly 1 element
     if (metaIt.more()) {
         return false;
-    }
-    return true;
-}
-
-// static
-bool QueryRequest::isValidSortOrder(const BSONObj& sortObj) {
-    BSONObjIterator i(sortObj);
-    while (i.more()) {
-        BSONElement e = i.next();
-        // fieldNameSize() includes NULL terminator. For empty field name,
-        // we should be checking for 1 instead of 0.
-        if (1 == e.fieldNameSize()) {
-            return false;
-        }
-        if (isTextScoreMeta(e)) {
-            continue;
-        }
-        long long n = e.safeNumberLong();
-        if (!(e.isNumber() && (n == -1LL || n == 1LL))) {
-            return false;
-        }
     }
     return true;
 }
@@ -1055,6 +1058,18 @@ StatusWith<BSONObj> QueryRequest::asAggregationCommand() const {
                               << " not supported in aggregation."};
     }
 
+    if (_requestResumeToken) {
+        return {ErrorCodes::InvalidPipelineOperator,
+                str::stream() << "Option " << kRequestResumeTokenField
+                              << " not supported in aggregation."};
+    }
+
+    if (!_resumeAfter.isEmpty()) {
+        return {ErrorCodes::InvalidPipelineOperator,
+                str::stream() << "Option " << kResumeAfterField
+                              << " not supported in aggregation."};
+    }
+
     // Now that we've successfully validated this QR, begin building the aggregation command.
     aggregationBuilder.append("aggregate", _nss.coll());
 
@@ -1102,8 +1117,8 @@ StatusWith<BSONObj> QueryRequest::asAggregationCommand() const {
     if (!_hint.isEmpty()) {
         aggregationBuilder.append("hint", _hint);
     }
-    if (!_readConcern.isEmpty()) {
-        aggregationBuilder.append("readConcern", _readConcern);
+    if (_readConcern) {
+        aggregationBuilder.append("readConcern", *_readConcern);
     }
     if (!_unwrappedReadPref.isEmpty()) {
         aggregationBuilder.append(QueryRequest::kUnwrappedReadPrefField, _unwrappedReadPref);

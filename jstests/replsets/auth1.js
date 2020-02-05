@@ -1,7 +1,7 @@
 // check replica set authentication
 //
 // This test requires users to persist across a restart.
-// @tags: [requires_persistence]
+// @tags: [requires_persistence, multiversion_incompatible]
 
 load("jstests/replsets/rslib.js");
 
@@ -30,16 +30,22 @@ assert.eq(m.getDB("local").auth("__system", ""), 0);
 
 MongoRunner.stopMongod(m);
 
-print("reset permissions");
-run("chmod", "644", key1_644);
+if (!_isWindows()) {
+    print("reset permissions");
+    run("chmod", "644", key1_644);
 
-print("try starting mongod");
-m = runMongoProgram(
-    "mongod", "--keyFile", key1_644, "--port", port[0], "--dbpath", MongoRunner.dataPath + name);
+    print("try starting mongod");
+    m = runMongoProgram("mongod",
+                        "--keyFile",
+                        key1_644,
+                        "--port",
+                        port[0],
+                        "--dbpath",
+                        MongoRunner.dataPath + name);
 
-print("should fail with wrong permissions");
-assert.eq(
-    m, _isWindows() ? 100 : 1, "mongod should exit w/ 1 (EXIT_FAILURE): permissions too open");
+    print("should fail with wrong permissions");
+    assert.eq(m, 1, "mongod should exit w/ 1 (EXIT_FAILURE): permissions too open");
+}
 
 // Pre-populate the data directory for the first replica set node, to be started later, with
 // a user's credentials.

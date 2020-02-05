@@ -1,5 +1,4 @@
-// @tags: [requires_getmore]
-
+// @tags: [requires_getmore, requires_fcv_44]
 // Tests for $elemMatch projections and $ positional operator projection.
 (function() {
 "use strict";
@@ -65,6 +64,18 @@ for (let i = 0; i < 100; i++) {
     bulk.insert({_id: nextId(), group: 12, x: {y: [{a: 1, b: 1}, {a: 1, b: 2}]}});
     bulk.insert({_id: nextId(), group: 13, x: [{a: 1, b: 1}, {a: 1, b: 2}]});
     bulk.insert({_id: nextId(), group: 13, x: [{a: 1, b: 2}, {a: 1, b: 1}]});
+
+    // Array of DBRefs. Don't actually try to dereference them, though, as they point to
+    // non-existing collections.
+    bulk.insert({
+        _id: nextId(),
+        group: 14,
+        x: [
+            new DBRef("otherCollection", "id0", db.getName()),
+            new DBRef("otherCollection", "id1", db.getName()),
+            new DBRef("otherCollection2", "id2", db.getName())
+        ]
+    });
 }
 assert.commandWorked(bulk.execute());
 
@@ -110,14 +121,6 @@ assert.eq({aa: 1, dd: 5},
           "single object match (value match)");
 
 assert.throws(function() {
-    coll.find({group: 3, 'x.a': 2}, {'y.$': 1}).toArray();
-}, [], "throw on invalid projection (field mismatch)");
-
-assert.throws(function() {
-    coll.find({group: 3, 'x.a': 2}, {'y.$': 1}).sort({x: 1}).toArray();
-}, [], "throw on invalid sorted projection (field mismatch)");
-
-assert.throws(function() {
     coll.find({group: 3, 'x.a': 2}, {'x.$': 1, group: 0}).sort({x: 1}).toArray();
 }, [], "throw on invalid projection combination (include and exclude)");
 
@@ -125,9 +128,8 @@ assert.throws(function() {
     coll.find({group: 3, 'x.a': 1, 'y.aa': 1}, {'x.$': 1, 'y.$': 1}).toArray();
 }, [], "throw on multiple projections");
 
-assert.throws(function() {
-    coll.find({group: 3}, {'g.$': 1}).toArray();
-}, [], "throw on invalid projection (non-array field)");
+// Positional projection on non-existent field
+assert.eq(Object.hasOwnProperty(coll.find({group: 3}, {'g.$': 1}).toArray()[0], "g"), false);
 
 assert.eq({aa: 1, dd: 5},
           coll.find({group: 11, 'covered.dd': 5}, {'covered.$': 1}).toArray()[0].covered[0],
@@ -216,6 +218,16 @@ assert.eq({"x": [{"a": 1, "b": 2}], "y": [{"c": 3, "d": 4}]},
               .sort({_id: 1})
               .toArray()[0],
           "multiple $elemMatch on unique fields 1");
+
+// Perform a $elemMatch on a DBRef field.
+assert.eq(coll.find({group: 14}, {x: {$elemMatch: {$id: "id0"}}}).toArray()[0].x,
+          [new DBRef("otherCollection", "id0", db.getName())]);
+
+assert.eq(coll.find({group: 14}, {x: {$elemMatch: {$ref: "otherCollection2"}}}).toArray()[0].x,
+          [new DBRef("otherCollection2", "id2", db.getName())]);
+
+assert.eq(coll.find({group: 14}, {x: {$elemMatch: {$db: db.getName()}}}).toArray()[0].x,
+          [new DBRef("otherCollection", "id0", db.getName())]);
 
 // Tests involving getMore. Test the $-positional operator across multiple batches.
 let a = coll.find({group: 3, 'x.b': 2}, {'x.$': 1}).sort({_id: 1}).batchSize(1);

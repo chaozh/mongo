@@ -117,7 +117,8 @@ struct Cloner::Fun {
         bool createdCollection = false;
         Collection* collection = nullptr;
 
-        collection = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(to_collection);
+        collection =
+            CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, to_collection);
         if (!collection) {
             massert(17321,
                     str::stream() << "collection dropped during clone [" << to_collection.ns()
@@ -139,7 +140,7 @@ struct Cloner::Fun {
                                         << to_collection.ns() << "]");
                 wunit.commit();
                 collection =
-                    CollectionCatalog::get(opCtx).lookupCollectionByNamespace(to_collection);
+                    CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, to_collection);
                 invariant(collection,
                           str::stream()
                               << "Missing collection during clone [" << to_collection.ns() << "]");
@@ -174,14 +175,13 @@ struct Cloner::Fun {
                                 opCtx, to_collection));
                 }
 
-                // TODO: SERVER-16598 abort if original db or collection is gone.
                 db = databaseHolder->getDb(opCtx, _dbName);
                 uassert(28593,
                         str::stream() << "Database " << _dbName << " dropped while cloning",
                         db != nullptr);
 
                 collection =
-                    CollectionCatalog::get(opCtx).lookupCollectionByNamespace(to_collection);
+                    CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, to_collection);
                 uassert(28594,
                         str::stream()
                             << "Collection " << to_collection.ns() << " dropped while cloning",
@@ -329,7 +329,7 @@ void Cloner::copyIndexes(OperationContext* opCtx,
     auto db = databaseHolder->openDb(opCtx, toDBName);
 
     Collection* collection =
-        CollectionCatalog::get(opCtx).lookupCollectionByNamespace(to_collection);
+        CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, to_collection);
     if (!collection) {
         writeConflictRetry(opCtx, "createCollection", to_collection.ns(), [&] {
             opCtx->checkForInterrupt();
@@ -347,7 +347,8 @@ void Cloner::copyIndexes(OperationContext* opCtx,
                           << "Collection creation failed while copying indexes from "
                           << from_collection.ns() << " to " << to_collection.ns() << " (Cloner)");
             wunit.commit();
-            collection = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(to_collection);
+            collection =
+                CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, to_collection);
             invariant(collection,
                       str::stream() << "Missing collection " << to_collection.ns() << " (Cloner)");
         });
@@ -403,7 +404,7 @@ void Cloner::copyIndexes(OperationContext* opCtx,
                            // If two phase index builds are enabled, the index build will be
                            // coordinated using startIndexBuild and commitIndexBuild oplog entries.
                            if (opCtx->writesAreReplicated() &&
-                               !IndexBuildsCoordinator::get(opCtx)->supportsTwoPhaseIndexBuild()) {
+                               !IndexBuildsCoordinator::supportsTwoPhaseIndexBuild()) {
                                opObserver->onCreateIndex(
                                    opCtx, collection->ns(), collection->uuid(), spec, fromMigrate);
                            }
@@ -586,7 +587,8 @@ Status Cloner::createCollectionsForDb(
             opCtx->checkForInterrupt();
             WriteUnitOfWork wunit(opCtx);
 
-            Collection* collection = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(nss);
+            Collection* collection =
+                CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, nss);
             if (collection) {
                 if (!params.shardedColl) {
                     // If the collection is unsharded then we want to fail when a collection
@@ -600,8 +602,8 @@ Status Cloner::createCollectionsForDb(
                 // exists on the target, we check if the existing collection's UUID matches
                 // that of the one we're trying to create. If it does, we treat the create
                 // as a no-op; if it doesn't match, we return an error.
-                auto existingOpts =
-                    DurableCatalog::get(opCtx)->getCollectionOptions(opCtx, collection->ns());
+                auto existingOpts = DurableCatalog::get(opCtx)->getCollectionOptions(
+                    opCtx, collection->getCatalogId());
                 const UUID clonedUUID =
                     uassertStatusOK(UUID::parse(params.collectionInfo["info"]["uuid"]));
 

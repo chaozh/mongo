@@ -51,6 +51,8 @@ public:
 
     void shutdown(OperationContext* opCtx) override;
 
+    void markAsCleanShutdownIfPossible(OperationContext* opCtx) override;
+
     // Returns the ServiceContext where this instance runs.
     ServiceContext* getServiceContext() override {
         return _service;
@@ -163,9 +165,6 @@ public:
 
     Status processReplSetGetStatus(BSONObjBuilder*, ReplSetGetStatusResponseStyle) override;
 
-    void fillIsMasterForReplSet(repl::IsMasterResponse*,
-                                const repl::SplitHorizon::Parameters& horizon) override;
-
     void appendSlaveInfoData(BSONObjBuilder*) override;
 
     repl::ReplSetConfig getConfig() const override;
@@ -227,7 +226,7 @@ public:
 
     void dropAllSnapshots() override;
 
-    long long getTerm() override;
+    long long getTerm() const override;
 
     Status updateTerm(OperationContext*, long long) override;
 
@@ -263,6 +262,18 @@ public:
         const ReplicationCoordinator::OpsKillingStateTransitionEnum stateTransition,
         const size_t numOpsKilled,
         const size_t numOpsRunning) const override;
+
+    TopologyVersion getTopologyVersion() const override;
+
+    void incrementTopologyVersion(OperationContext* opCtx) override;
+
+    std::shared_ptr<const repl::IsMasterResponse> awaitIsMasterResponse(
+        OperationContext* opCtx,
+        const repl::SplitHorizon::Parameters& horizonParams,
+        boost::optional<TopologyVersion> previous,
+        boost::optional<Date_t> deadline) const override;
+
+    repl::OpTime getLatestWriteOpTime(OperationContext* opCtx) const override;
 
 private:
     // Back pointer to the ServiceContext that has started the instance.

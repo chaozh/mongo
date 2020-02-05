@@ -102,6 +102,15 @@ public:
     virtual void shutdown(OperationContext* opCtx) = 0;
 
     /**
+     * Clears appliedThrough to indicate that the dataset is consistent with top of the
+     * oplog on shutdown.
+     * This should be called after calling shutdown() and should be called holding RSTL
+     * in mode X to make sure that that are no active readers while executing this method
+     * as this does perform timestamped minvalid writes at lastAppliedTimestamp.
+     */
+    virtual void clearAppliedThroughIfCleanShutdown(OperationContext* opCtx) = 0;
+
+    /**
      * Returns task executor for scheduling tasks to be run asynchronously.
      */
     virtual executor::TaskExecutor* getTaskExecutor() const = 0;
@@ -216,6 +225,12 @@ public:
      * primary again in the future it will recover its state from a clean slate.
      */
     virtual void shardingOnStepDownHook() = 0;
+
+    /**
+     * Clears oplog visibility state. All of the oplog is safely visible because there are no oplog
+     * writes during stepdown.
+     */
+    virtual void clearOplogVisibilityStateForStepDown() = 0;
 
     /**
      * Notifies the bgsync and syncSourceFeedback threads to choose a new sync source.

@@ -144,9 +144,11 @@ Status configureSession(SaslClientSession* session,
     session->setParameter(SaslClientSession::parameterServiceHostAndPort, hostname.toString());
 
     status = bsonExtractStringField(saslParameters, saslCommandUserFieldName, &value);
-    if (!status.isOK())
+    if (status.isOK()) {
+        session->setParameter(SaslClientSession::parameterUser, value);
+    } else if ((targetDatabase != "$external") || (mechanism != "MONGODB-IAM")) {
         return status;
-    session->setParameter(SaslClientSession::parameterUser, value);
+    }
 
     const bool digestPasswordDefault = (mechanism == "SCRAM-SHA-1");
     bool digestPassword;
@@ -161,6 +163,11 @@ Status configureSession(SaslClientSession* session,
     } else if (!(status == ErrorCodes::NoSuchKey && targetDatabase == "$external")) {
         // $external users do not have passwords, hence NoSuchKey is expected
         return status;
+    }
+
+    status = bsonExtractStringField(saslParameters, saslCommandIamSessionToken, &value);
+    if (status.isOK()) {
+        session->setParameter(SaslClientSession::parameterIamSessionToken, value);
     }
 
     return session->initialize();
@@ -188,6 +195,12 @@ Future<void> asyncSaslConversation(auth::RunCommandHook runCommand,
         return status;
 
     LOG(saslLogLevel) << "sasl client output: " << base64::encode(responsePayload) << endl;
+
+    // Handle a done from the server which comes before the client is complete.
+    const bool serverDone = inputObj[saslCommandDoneFieldName].trueValue();
+    if (serverDone && responsePayload.empty() && session->isSuccess()) {
+        return Status::OK();
+    }
 
     // Build command using our new payload and conversationId
     BSONObjBuilder commandBuilder;
@@ -261,9 +274,11 @@ Future<void> saslClientAuthenticateImpl(auth::RunCommandHook runCommand,
     if (!status.isOK())
         return status;
 
+    auto mechanismName = session->getParameter(SaslClientSession::parameterMechanism);
     BSONObj saslFirstCommandPrefix =
-        BSON(saslStartCommandName << 1 << saslCommandMechanismFieldName
-                                  << session->getParameter(SaslClientSession::parameterMechanism));
+        BSON(saslStartCommandName << 1 << saslCommandMechanismFieldName << mechanismName
+                                  << "options" << BSON(saslCommandOptionSkipEmptyExchange << true));
+
     BSONObj inputObj = BSON(saslCommandPayloadFieldName << "");
     return asyncSaslConversation(runCommand,
                                  session,

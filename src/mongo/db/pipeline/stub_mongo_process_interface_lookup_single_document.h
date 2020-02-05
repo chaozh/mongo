@@ -43,7 +43,10 @@ namespace mongo {
 
 class StubShardFilterer : public ShardFilterer {
 public:
-    DocumentBelongsResult documentBelongsToMe(const MatchableDocument& doc) const override {
+    DocumentBelongsResult documentBelongsToMe(const WorkingSetMember& wsm) const override {
+        MONGO_UNREACHABLE;
+    }
+    DocumentBelongsResult documentBelongsToMe(const Document& doc) const override {
         MONGO_UNREACHABLE;
     }
 
@@ -71,7 +74,9 @@ public:
         const MakePipelineOptions opts = MakePipelineOptions{}) final;
 
     std::unique_ptr<Pipeline, PipelineDeleter> attachCursorSourceToPipeline(
-        const boost::intrusive_ptr<ExpressionContext>& expCtx, Pipeline* ownedPipeline) final;
+        const boost::intrusive_ptr<ExpressionContext>& expCtx,
+        Pipeline* ownedPipeline,
+        bool allowTargetingShards = true) final;
     std::unique_ptr<Pipeline, PipelineDeleter> attachCursorSourceToPipelineForLocalRead(
         const boost::intrusive_ptr<ExpressionContext>& expCtx, Pipeline* ownedPipeline) final;
 

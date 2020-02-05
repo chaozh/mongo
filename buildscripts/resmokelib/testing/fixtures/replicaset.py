@@ -25,16 +25,15 @@ class ReplicaSetFixture(interface.ReplFixture):  # pylint: disable=too-many-inst
     def __init__(  # pylint: disable=too-many-arguments, too-many-locals
             self, logger, job_num, mongod_options=None, dbpath_prefix=None, preserve_dbpath=False,
             num_nodes=2, start_initial_sync_node=False, write_concern_majority_journal_default=None,
-            auth_options=None, replset_config_options=None, voting_secondaries=None,
+            auth_options=None, replset_config_options=None, voting_secondaries=True,
             all_nodes_electable=False, use_replica_set_connection_string=None, linear_chain=False,
-            mixed_bin_versions=None):
+            mixed_bin_versions=None, default_read_concern=None, default_write_concern=None):
         """Initialize ReplicaSetFixture."""
 
         interface.ReplFixture.__init__(self, logger, job_num, dbpath_prefix=dbpath_prefix)
 
         self.mongod_options = utils.default_if_none(mongod_options, {})
         self.preserve_dbpath = preserve_dbpath
-        self.num_nodes = num_nodes
         self.start_initial_sync_node = start_initial_sync_node
         self.write_concern_majority_journal_default = write_concern_majority_journal_default
         self.auth_options = auth_options
@@ -42,9 +41,17 @@ class ReplicaSetFixture(interface.ReplFixture):  # pylint: disable=too-many-inst
         self.voting_secondaries = voting_secondaries
         self.all_nodes_electable = all_nodes_electable
         self.use_replica_set_connection_string = use_replica_set_connection_string
-        self.linear_chain = linear_chain
+        self.default_read_concern = default_read_concern
+        self.default_write_concern = default_write_concern
         self.mixed_bin_versions = utils.default_if_none(mixed_bin_versions,
                                                         config.MIXED_BIN_VERSIONS)
+
+        # Use the values given from the command line if they exist for linear_chain and num_nodes.
+        linear_chain_option = utils.default_if_none(config.LINEAR_CHAIN, linear_chain)
+        self.linear_chain = linear_chain_option if linear_chain_option else linear_chain
+        num_replset_nodes = config.NUM_REPLSET_NODES
+        self.num_nodes = num_replset_nodes if num_replset_nodes else num_nodes
+
         if self.mixed_bin_versions is not None:
             mongod_executable = utils.default_if_none(config.MONGOD_EXECUTABLE,
                                                       config.DEFAULT_MONGOD_EXECUTABLE)
@@ -63,20 +70,23 @@ class ReplicaSetFixture(interface.ReplFixture):  # pylint: disable=too-many-inst
                 # server nodes will always be fully upgraded before shard nodes.
                 self.mixed_bin_versions = [latest_mongod, latest_mongod]
             num_versions = len(self.mixed_bin_versions)
-            if num_versions != num_nodes and not is_config_svr:
+            if num_versions != self.num_nodes and not is_config_svr:
                 msg = (("The number of binary versions specified: {} do not match the number of"\
-                        " nodes in the replica set: {}.")).format(num_versions, num_nodes)
+                        " nodes in the replica set: {}.")).format(num_versions, self.num_nodes)
                 raise errors.ServerFailure(msg)
-
-        # If voting_secondaries has not been set, set a default. By default, secondaries have zero
-        # votes unless they are also nodes capable of being elected primary.
-        if self.voting_secondaries is None:
-            self.voting_secondaries = self.all_nodes_electable
 
         # By default, we only use a replica set connection string if all nodes are capable of being
         # elected primary.
         if self.use_replica_set_connection_string is None:
             self.use_replica_set_connection_string = self.all_nodes_electable
+
+        if self.default_write_concern is True:
+            self.default_write_concern = {
+                "w": "majority",
+                # Use a "signature" value that won't typically match a value assigned in normal use.
+                # This way the wtimeout set by this override is distinguishable in the server logs.
+                "wtimeout": 5 * 60 * 1000 + 321,  # 300321ms
+            }
 
         # Set the default oplogSize to 511MB.
         self.mongod_options.setdefault("oplogSize", 511)
@@ -167,9 +177,9 @@ class ReplicaSetFixture(interface.ReplFixture):  # pylint: disable=too-many-inst
             replset_settings = self.replset_config_options["settings"]
             repl_config["settings"] = replset_settings
 
-        # If secondaries vote and no election timeout was specified, then we increase the election
-        # timeout to 24 hours to prevent spurious elections.
-        if self.voting_secondaries:
+        # If not all nodes are electable and no election timeout was specified, then we increase
+        # the election timeout to 24 hours to prevent spurious elections.
+        if not self.all_nodes_electable:
             repl_config.setdefault("settings", {})
             if "electionTimeoutMillis" not in repl_config["settings"]:
                 repl_config["settings"]["electionTimeoutMillis"] = 24 * 60 * 60 * 1000
@@ -207,7 +217,8 @@ class ReplicaSetFixture(interface.ReplFixture):  # pylint: disable=too-many-inst
             repl_config["version"] = 2
             repl_config["members"] = members
             self.logger.info("Issuing replSetReconfig command: %s", repl_config)
-            self._configure_repl_set(client, {"replSetReconfig": repl_config})
+            # Temporarily use 'force: true' to allow multi-node reconfig.
+            self._configure_repl_set(client, {"replSetReconfig": repl_config, "force": True})
             self._await_secondaries()
 
     def pids(self):
@@ -255,13 +266,7 @@ class ReplicaSetFixture(interface.ReplFixture):  # pylint: disable=too-many-inst
 
         def check_rcmaj_optime(client, node):
             """Return True if all nodes have caught up with the primary."""
-            # TODO SERVER-40078: The server is reporting invalid
-            # dates in its response to the replSetGetStatus
-            # command
-            try:
-                res = client.admin.command({"replSetGetStatus": 1})
-            except bson.errors.InvalidBSON:
-                return False
+            res = client.admin.command({"replSetGetStatus": 1})
             read_concern_majority_optime = res["optimes"]["readConcernMajorityOpTime"]
 
             if (read_concern_majority_optime["t"] == primary_optime["t"]
@@ -278,6 +283,7 @@ class ReplicaSetFixture(interface.ReplFixture):  # pylint: disable=too-many-inst
         self._await_secondaries()
         self._await_stable_recovery_timestamp()
         self._setup_sessions_collection()
+        self._setup_cwrwc_defaults()
 
     def _await_primary(self):
         # Wait for the primary to be elected.
@@ -358,14 +364,7 @@ class ReplicaSetFixture(interface.ReplFixture):  # pylint: disable=too-many-inst
             client_admin = client["admin"]
 
             while True:
-                # TODO SERVER-40078: The server is reporting invalid
-                # dates in its response to the replSetGetStatus
-                # command
-                try:
-                    status = client_admin.command("replSetGetStatus")
-                except bson.errors.InvalidBSON:
-                    time.sleep(0.1)
-                    continue
+                status = client_admin.command("replSetGetStatus")
 
                 # The `lastStableRecoveryTimestamp` field contains a stable timestamp guaranteed to
                 # exist on storage engine recovery to a stable timestamp.
@@ -390,7 +389,19 @@ class ReplicaSetFixture(interface.ReplFixture):  # pylint: disable=too-many-inst
         primary = self.nodes[0]
         primary.mongo_client().admin.command({"refreshLogicalSessionCacheNow": 1})
 
-    def _do_teardown(self):
+    def _setup_cwrwc_defaults(self):
+        """Set up the cluster-wide read/write concern defaults."""
+        if self.default_read_concern is None and self.default_write_concern is None:
+            return
+        cmd = {"setDefaultRWConcern": 1}
+        if self.default_read_concern is not None:
+            cmd["defaultReadConcern"] = self.default_read_concern
+        if self.default_write_concern is not None:
+            cmd["defaultWriteConcern"] = self.default_write_concern
+        primary = self.nodes[0]
+        primary.mongo_client().admin.command(cmd)
+
+    def _do_teardown(self, mode=None):
         self.logger.info("Stopping all members of the replica set...")
 
         running_at_start = self.is_running()
@@ -401,11 +412,11 @@ class ReplicaSetFixture(interface.ReplFixture):  # pylint: disable=too-many-inst
         teardown_handler = interface.FixtureTeardownHandler(self.logger)
 
         if self.initial_sync_node:
-            teardown_handler.teardown(self.initial_sync_node, "initial sync node")
+            teardown_handler.teardown(self.initial_sync_node, "initial sync node", mode=mode)
 
         # Terminate the secondaries first to reduce noise in the logs.
         for node in reversed(self.nodes):
-            teardown_handler.teardown(node, "replica set member on port %d" % node.port)
+            teardown_handler.teardown(node, "replica set member on port %d" % node.port, mode=mode)
 
         if teardown_handler.was_successful():
             self.logger.info("Successfully stopped all members of the replica set.")

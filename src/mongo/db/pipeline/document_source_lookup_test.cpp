@@ -206,10 +206,7 @@ TEST_F(DocumentSourceLookUpTest, LiteParsedDocumentSourceLookupContainsExpectedN
 
     NamespaceString nss("test.test");
     std::vector<BSONObj> pipeline;
-    AggregationRequest aggRequest(nss, pipeline);
-    auto liteParsedLookup =
-        DocumentSourceLookUp::LiteParsed::parse(aggRequest, stageSpec.firstElement());
-
+    auto liteParsedLookup = DocumentSourceLookUp::LiteParsed::parse(nss, stageSpec.firstElement());
     auto namespaceSet = liteParsedLookup->getInvolvedNamespaces();
 
     ASSERT_EQ(1ul, namespaceSet.count(NamespaceString("test.namespace1")));
@@ -507,14 +504,16 @@ public:
         }
 
         if (opts.attachCursorSource) {
-            pipeline = attachCursorSourceToPipeline(expCtx, pipeline.release());
+            pipeline = attachCursorSourceToPipeline(expCtx, pipeline.release(), false);
         }
 
         return pipeline;
     }
 
     std::unique_ptr<Pipeline, PipelineDeleter> attachCursorSourceToPipeline(
-        const boost::intrusive_ptr<ExpressionContext>& expCtx, Pipeline* ownedPipeline) final {
+        const boost::intrusive_ptr<ExpressionContext>& expCtx,
+        Pipeline* ownedPipeline,
+        bool allowTargetingShards = true) final {
         std::unique_ptr<Pipeline, PipelineDeleter> pipeline(ownedPipeline,
                                                             PipelineDeleter(expCtx->opCtx));
 
@@ -756,8 +755,8 @@ TEST_F(DocumentSourceLookUpTest,
     auto expectedPipe = fromjson(
         str::stream() << "[{mock: {}}, {$match: {x:{$eq: 1}}}, {$sort: {sortKey: {x: 1}}}, "
                       << sequentialCacheStageObj()
-                      << ", {$facet: {facetPipe: [{$group: {_id: '$_id'}}, {$match: {$and: "
-                         "[{_id: {$_internalExprEq: 5}}, {$expr: {$eq: "
+                      << ", {$facet: {facetPipe: [{$teeConsumer: {}},{$group: {_id: '$_id'}}, "
+                         "{$match: {$and: [{_id: {$_internalExprEq: 5}}, {$expr: {$eq: "
                          "['$_id', {$const: 5}]}}]}}]}}]");
 
     ASSERT_VALUE_EQ(Value(subPipeline->writeExplainOps(kExplain)), Value(BSONArray(expectedPipe)));
@@ -813,8 +812,9 @@ TEST_F(DocumentSourceLookUpTest,
     // Verify that the $project is identified as non-correlated and the cache is placed after it.
     auto docSource = DocumentSourceLookUp::createFromBson(
         fromjson("{$lookup: {let: {var1: '$_id'}, pipeline: [{$match: {x: 1}}, {$sort: {x: 1}}, "
-                 "{$project: {_id: false, projectedField: {$let: {vars: {var1: 'abc'}, in: "
-                 "'$$var1'}}}}, {$addFields: {varField: {$sum: ['$x', '$$var1']}}}], from: 'coll', "
+                 "{$project: {projectedField: {$let: {vars: {var1: 'abc'}, in: "
+                 "'$$var1'}}, _id: false}}, {$addFields: {varField: {$sum: ['$x', '$$var1']}}}], "
+                 "from: 'coll', "
                  "as: 'as'}}")
             .firstElement(),
         expCtx);
@@ -830,8 +830,8 @@ TEST_F(DocumentSourceLookUpTest,
 
     auto expectedPipe = fromjson(
         str::stream() << "[{mock: {}}, {$match: {x: {$eq: 1}}}, {$sort: {sortKey: {x: 1}}}, "
-                         "{$project: {_id: false, "
-                         "projectedField: {$let: {vars: {var1: {$const: 'abc'}}, in: '$$var1'}}}},"
+                         "{$project: {projectedField: {$let: {vars: {var1: {$const: 'abc'}}, "
+                         "in: '$$var1'}}, _id: false}},"
                       << sequentialCacheStageObj()
                       << ", {$addFields: {varField: {$sum: ['$x', {$const: 5}]}}}]");
 

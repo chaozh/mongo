@@ -27,8 +27,6 @@ selector:
   - jstests/core/geo_update_btree2.js  # notablescan.
   - jstests/core/index_id_options.js  # "local" database.
   - jstests/core/index9.js  # "local" database.
-  - jstests/core/max_time_ms.js  # sleep, SERVER-2212.
-  - jstests/core/notablescan.js  # notablescan.
   - jstests/core/queryoptimizera.js  # "local" database.
   - jstests/core/stages*.js  # stageDebug.
   - jstests/core/startup_log.js  # "local" database.
@@ -40,8 +38,6 @@ selector:
   - jstests/core/geo_s2explain.js  # inputStage in different spot in explain().
   - jstests/core/geo_s2sparse.js  # keysPerIndex in different spot in validate().
   - jstests/core/operation_latency_histogram.js  # Stats are counted differently on mongos, SERVER-24880.
-  # TODO: SERVER-27269: mongos can't establish cursor if view has $collStats and views another view.
-  - jstests/core/views/views_coll_stats.js
   - jstests/core/killop_drop_collection.js # Uses fsyncLock.
   # The following tests fail because of divergent dropCollection behavior between standalones and
   # sharded clusters. These tests expect a second drop command to error, whereas in sharded clusters
@@ -77,6 +73,7 @@ selector:
   - jstests/core/in.js
   - jstests/core/index8.js # No explicit check for failed command.
   - jstests/core/index_decimal.js
+  - jstests/core/index_large_and_small_dates.js
   - jstests/core/index_multiple_compatibility.js
   - jstests/core/index_partial_write_ops.js
   - jstests/core/indexa.js # No explicit check for failed command.
@@ -85,7 +82,6 @@ selector:
   - jstests/core/json_schema/json_schema.js
   - jstests/core/mr_bigobject.js
   - jstests/core/not2.js
-  - jstests/core/notablescan.js
   - jstests/core/null_query_semantics.js
   - jstests/core/or1.js
   - jstests/core/or2.js
@@ -149,51 +145,27 @@ selector:
   - jstests/core/views/views_coll_stats.js
   - jstests/core/views/views_stats.js
 
-  ##
-  ## SERVER-39175 WriteErrors get converted to WriteCommandErrors if part of a txn.
-  ##
-
-  # The same error code, but with ok:0.
-  - jstests/core/json_schema/additional_items.js
-  - jstests/core/json_schema/additional_properties.js
-  - jstests/core/json_schema/bsontype.js
-  - jstests/core/json_schema/dependencies.js
-  - jstests/core/json_schema/encrypt.js
-  - jstests/core/json_schema/items.js
-  - jstests/core/json_schema/logical_keywords.js
-  - jstests/core/json_schema/min_max_items.js
-  - jstests/core/json_schema/min_max_properties.js
-  - jstests/core/json_schema/pattern_properties.js
-  - jstests/core/json_schema/required.js
-  - jstests/core/json_schema/unique_items.js
-
-  - jstests/core/field_name_validation.js
-  - jstests/core/fts_array.js
-  - jstests/core/inc-SERVER-7446.js
-  - jstests/core/invalid_db_name.js
-  - jstests/core/push_sort.js
-
-  # Checks for "WriteErrors" explicitly from the response of db.runCommand()
-  - jstests/core/max_doc_size.js
-
-  # Calls res.getWriteError() or res.hasWriteError().
+  # Errors expected to happen in tests, which can cause transactions to get aborted.
+  # So when the test tries to inspect the documents it can be out of sync (relative
+  # to test run without multi statement transactions).
   - jstests/core/bulk_api_ordered.js
   - jstests/core/bulk_api_unordered.js
   - jstests/core/bulk_legacy_enforce_gle.js
+  - jstests/core/cappeda.js
   - jstests/core/doc_validation.js
   - jstests/core/doc_validation_options.js
-  - jstests/core/geo_multinest0.js
+  - jstests/core/field_name_validation.js
   - jstests/core/insert_illegal_doc.js
-  - jstests/core/push2.js
-  - jstests/core/remove6.js
-  - jstests/core/removeb.js
+  - jstests/core/push_sort.js
   - jstests/core/rename4.js
-  - jstests/core/shell_writeconcern.js
-  - jstests/core/storefunc.js
   - jstests/core/update_arrayFilters.js
   - jstests/core/update_dbref.js
   - jstests/core/updatel.js
   - jstests/core/write_result.js
+
+  # Trick for bypassing mongo shell validation in the test doesn't work because txn_override
+  # retry logic will hit the shell validation.
+  - jstests/core/invalid_db_name.js
 
   # Multiple writes in a txn, some of which fail because the collection doesn't exist.
   # We create the collection and retry the last write, but previous writes would have
@@ -255,7 +227,6 @@ selector:
   - jstests/core/kill_cursors.js
   - jstests/core/list_collections1.js
   - jstests/core/list_indexes.js
-  - jstests/core/max_time_ms.js
   - jstests/core/oro.js
 
   # Parallel Shell - we do not signal the override to end a txn when a parallel shell closes.
@@ -272,7 +243,6 @@ selector:
   - jstests/core/killop_drop_collection.js
   - jstests/core/loadserverscripts.js
   - jstests/core/mr_killop.js
-  - jstests/core/queryoptimizer3.js
   - jstests/core/remove9.js
   - jstests/core/removeb.js
   - jstests/core/removec.js

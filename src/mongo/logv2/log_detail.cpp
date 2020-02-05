@@ -42,13 +42,14 @@ namespace mongo {
 namespace logv2 {
 namespace detail {
 
-void doLogImpl(LogSeverity const& severity,
-               StringData stable_id,
+void doLogImpl(int32_t id,
+               LogSeverity const& severity,
                LogOptions const& options,
                StringData message,
-               AttributeArgumentSet const& attrs) {
+               TypeErasedAttributeStorage const& attrs) {
+    dassert(options.component() != LogComponent::kNumLogComponents);
     auto& source = options.domain().internal().source();
-    auto record = source.open_record(severity, options.component(), options.tags(), stable_id);
+    auto record = source.open_record(id, severity, options.component(), options.tags());
     if (record) {
         record.attribute_values().insert(
             attributes::message(),
@@ -58,7 +59,8 @@ void doLogImpl(LogSeverity const& severity,
         record.attribute_values().insert(
             attributes::attributes(),
             boost::log::attribute_value(
-                new boost::log::attributes::attribute_value_impl<AttributeArgumentSet>(attrs)));
+                new boost::log::attributes::attribute_value_impl<TypeErasedAttributeStorage>(
+                    attrs)));
 
         source.push_record(std::move(record));
     }

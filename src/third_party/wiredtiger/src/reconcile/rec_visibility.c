@@ -86,10 +86,9 @@ __rec_append_orig_value(
 
     /*
      * If we're saving the original value for a birthmark, transfer over the transaction ID and
-     * clear out the birthmark update.
-     *
-     * Else, set the entry's transaction information to the lowest possible value. Cleared memory
-     * matches the lowest possible transaction ID and timestamp, do nothing.
+     * clear out the birthmark update. Else, set the entry's transaction information to the lowest
+     * possible value (as cleared memory matches the lowest possible transaction ID and timestamp,
+     * do nothing).
      */
     if (upd->type == WT_UPDATE_BIRTHMARK) {
         append->txnid = upd->txnid;
@@ -100,12 +99,14 @@ __rec_append_orig_value(
 
     /* Append the new entry into the update list. */
     WT_PUBLISH(upd->next, append);
-    __wt_cache_page_inmem_incr(session, page, size);
 
+    /* Replace the birthmark with an aborted transaction. */
     if (upd->type == WT_UPDATE_BIRTHMARK) {
-        upd->type = WT_UPDATE_STANDARD;
-        upd->txnid = WT_TXN_ABORTED;
+        WT_ORDERED_WRITE(upd->txnid, WT_TXN_ABORTED);
+        WT_ORDERED_WRITE(upd->type, WT_UPDATE_STANDARD);
     }
+
+    __wt_cache_page_inmem_incr(session, page, size);
 
 err:
     __wt_scr_free(session, &tmp);
@@ -189,6 +190,13 @@ __wt_rec_upd_select(WT_SESSION_IMPL *session, WT_RECONCILE *r, WT_INSERT *ins, v
                 list_prepared = true;
                 if (upd->start_ts > max_ts)
                     max_ts = upd->start_ts;
+
+                /*
+                 * Track the oldest update not on the page, used to decide whether reads can use the
+                 * page image, hence using the start rather than the durable timestamp.
+                 */
+                if (upd->start_ts < r->min_skipped_ts)
+                    r->min_skipped_ts = upd->start_ts;
                 continue;
             }
         }
@@ -231,10 +239,8 @@ __wt_rec_upd_select(WT_SESSION_IMPL *session, WT_RECONCILE *r, WT_INSERT *ins, v
                 skipped_birthmark = true;
 
             /*
-             * Track the oldest update not on the page.
-             *
-             * This is used to decide whether reads can use the page image, hence using the start
-             * rather than the durable timestamp.
+             * Track the oldest update not on the page, used to decide whether reads can use the
+             * page image, hence using the start rather than the durable timestamp.
              */
             if (upd_select->upd == NULL && upd->start_ts < r->min_skipped_ts)
                 r->min_skipped_ts = upd->start_ts;

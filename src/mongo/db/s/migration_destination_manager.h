@@ -59,6 +59,13 @@ namespace repl {
 class OpTime;
 }
 
+struct CollectionOptionsAndIndexes {
+    UUID uuid;
+    std::vector<BSONObj> indexSpecs;
+    BSONObj idIndexSpec;
+    BSONObj options;
+};
+
 /**
  * Drives the receiving side of the MongoD migration process. One instance exists per shard.
  */
@@ -74,8 +81,6 @@ public:
 
     /**
      * Returns the singleton instance of the migration destination manager.
-     *
-     * TODO (SERVER-25333): This should become per-collection instance instead of singleton.
      */
     static MigrationDestinationManager* get(OperationContext* opCtx);
 
@@ -104,7 +109,7 @@ public:
     Status start(OperationContext* opCtx,
                  const NamespaceString& nss,
                  ScopedReceiveChunk scopedReceiveChunk,
-                 StartChunkCloneRequest cloneRequest,
+                 const StartChunkCloneRequest& cloneRequest,
                  const OID& epoch,
                  const WriteConcernOptions& writeConcern);
 
@@ -131,11 +136,19 @@ public:
     Status startCommit(const MigrationSessionId& sessionId);
 
     /**
-     * Creates the collection nss on the shard and clones the indexes and options from fromShardId.
+     * Gets the collection uuid, options and indexes from fromShardId.
      */
-    static void cloneCollectionIndexesAndOptions(OperationContext* opCtx,
-                                                 const NamespaceString& nss,
-                                                 const ShardId& fromShardId);
+    static CollectionOptionsAndIndexes getCollectionIndexesAndOptions(OperationContext* opCtx,
+                                                                      const NamespaceString& nss,
+                                                                      const ShardId& fromShardId);
+
+    /**
+     * Creates the collection on the shard and clones the indexes and options.
+     */
+    static void cloneCollectionIndexesAndOptions(
+        OperationContext* opCtx,
+        const NamespaceString& nss,
+        const CollectionOptionsAndIndexes& collectionOptionsAndIndexes);
 
 private:
     /**
@@ -162,8 +175,7 @@ private:
      * it schedules deletion of any documents in the range, so that process must be seen to be
      * complete before migrating any new documents in.
      */
-    CollectionShardingRuntime::CleanupNotification _notePending(OperationContext*,
-                                                                ChunkRange const&);
+    SharedSemiFuture<void> _notePending(OperationContext*, ChunkRange const&);
 
     /**
      * Stops tracking a chunk range between 'min' and 'max' that previously was having data
@@ -190,6 +202,13 @@ private:
 
     stdx::thread _migrateThreadHandle;
 
+    // Whether to use the resumable range deleter. This decision is based on whether the FCV 4.2 or
+    // FCV 4.4 protocol are in use and the disableResumableRangeDeleter option is off.
+    bool _enableResumableRangeDeleter{true};
+
+    UUID _migrationId;
+    LogicalSessionId _lsid;
+    TxnNumber _txnNumber;
     NamespaceString _nss;
     ConnectionString _fromShardConnString;
     ShardId _fromShard;

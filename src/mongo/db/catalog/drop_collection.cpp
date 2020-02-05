@@ -35,6 +35,7 @@
 
 #include "mongo/db/background.h"
 #include "mongo/db/catalog/index_catalog.h"
+#include "mongo/db/catalog/uncommitted_collections.h"
 #include "mongo/db/client.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/curop.h"
@@ -81,7 +82,7 @@ Status _dropView(OperationContext* opCtx,
     AutoStatsTracker statsTracker(opCtx,
                                   collectionName,
                                   Top::LockType::NotLocked,
-                                  AutoStatsTracker::LogMode::kUpdateTopAndCurop,
+                                  AutoStatsTracker::LogMode::kUpdateCurOp,
                                   db->getProfilingLevel());
 
     if (opCtx->writesAreReplicated() &&
@@ -108,7 +109,8 @@ Status _dropCollection(OperationContext* opCtx,
                        DropCollectionSystemCollectionMode systemCollectionMode,
                        BSONObjBuilder& result) {
     Lock::CollectionLock collLock(opCtx, collectionName, MODE_X);
-    Collection* coll = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(collectionName);
+    Collection* coll =
+        CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, collectionName);
     if (!coll) {
         return Status(ErrorCodes::NamespaceNotFound, "ns not found");
     }
@@ -122,7 +124,7 @@ Status _dropCollection(OperationContext* opCtx,
     AutoStatsTracker statsTracker(opCtx,
                                   collectionName,
                                   Top::LockType::NotLocked,
-                                  AutoStatsTracker::LogMode::kUpdateTopAndCurop,
+                                  AutoStatsTracker::LogMode::kUpdateCurOp,
                                   db->getProfilingLevel());
 
     if (opCtx->writesAreReplicated() &&
@@ -173,7 +175,7 @@ Status dropCollection(OperationContext* opCtx,
         }
 
         Collection* coll =
-            CollectionCatalog::get(opCtx).lookupCollectionByNamespace(collectionName);
+            CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, collectionName);
         if (!coll) {
             return _dropView(opCtx, db, collectionName, result);
         } else {

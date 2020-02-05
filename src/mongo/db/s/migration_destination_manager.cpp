@@ -42,6 +42,7 @@
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/index_builds_coordinator.h"
+#include "mongo/db/logical_session_id_helpers.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/op_observer.h"
 #include "mongo/db/operation_context.h"
@@ -52,18 +53,21 @@
 #include "mongo/db/s/collection_sharding_state.h"
 #include "mongo/db/s/migration_util.h"
 #include "mongo/db/s/move_timing_helper.h"
+#include "mongo/db/s/persistent_task_store.h"
+#include "mongo/db/s/range_deletion_task_gen.h"
 #include "mongo/db/s/sharding_runtime_d_params_gen.h"
 #include "mongo/db/s/sharding_statistics.h"
 #include "mongo/db/s/start_chunk_clone_request.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/service_context.h"
+#include "mongo/db/session_catalog_mongod.h"
 #include "mongo/db/storage/remove_saver.h"
+#include "mongo/db/transaction_participant.h"
 #include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/shard_key_pattern.h"
 #include "mongo/stdx/chrono.h"
-#include "mongo/util/concurrency/notification.h"
 #include "mongo/util/fail_point.h"
 #include "mongo/util/log.h"
 #include "mongo/util/producer_consumer_queue.h"
@@ -211,7 +215,7 @@ MONGO_FAIL_POINT_DEFINE(migrateThreadHangAtStep4);
 MONGO_FAIL_POINT_DEFINE(migrateThreadHangAtStep5);
 MONGO_FAIL_POINT_DEFINE(migrateThreadHangAtStep6);
 
-MONGO_FAIL_POINT_DEFINE(failMigrationLeaveOrphans);
+MONGO_FAIL_POINT_DEFINE(failMigrationOnRecipient);
 MONGO_FAIL_POINT_DEFINE(failMigrationReceivedOutOfRangeOperation);
 
 }  // namespace
@@ -326,16 +330,39 @@ BSONObj MigrationDestinationManager::getMigrationStatusReport() {
 Status MigrationDestinationManager::start(OperationContext* opCtx,
                                           const NamespaceString& nss,
                                           ScopedReceiveChunk scopedReceiveChunk,
-                                          const StartChunkCloneRequest cloneRequest,
+                                          const StartChunkCloneRequest& cloneRequest,
                                           const OID& epoch,
                                           const WriteConcernOptions& writeConcern) {
     stdx::lock_guard<Latch> lk(_mutex);
     invariant(!_sessionId);
     invariant(!_scopedReceiveChunk);
 
+    auto fcvVersion = serverGlobalParams.featureCompatibility.getVersion();
+    if (fcvVersion == ServerGlobalParams::FeatureCompatibility::Version::kUpgradingTo44 ||
+        fcvVersion == ServerGlobalParams::FeatureCompatibility::Version::kDowngradingTo42)
+        return Status(ErrorCodes::ConflictingOperationInProgress,
+                      "Can't receive chunk while FCV is upgrading/downgrading");
+
+    // Note: It is expected that the FCV cannot change while the node is donating or receiving a
+    // chunk. This is guaranteed by the setFCV command serializing with donating and receiving
+    // chunks via the ActiveMigrationsRegistry.
+    _enableResumableRangeDeleter =
+        fcvVersion == ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo44 &&
+        !disableResumableRangeDeleter.load();
+
     _state = READY;
     _stateChangedCV.notify_all();
     _errmsg = "";
+
+    if (_enableResumableRangeDeleter) {
+        uassert(ErrorCodes::ConflictingOperationInProgress,
+                "Missing migrationId in FCV 4.4",
+                cloneRequest.hasMigrationId());
+
+        _migrationId = cloneRequest.getMigrationId();
+        _lsid = cloneRequest.getLsid();
+        _txnNumber = cloneRequest.getTxnNumber();
+    }
 
     _nss = nss;
     _fromShard = cloneRequest.getFromShardId();
@@ -510,82 +537,136 @@ Status MigrationDestinationManager::startCommit(const MigrationSessionId& sessio
     return Status::OK();
 }
 
-void MigrationDestinationManager::cloneCollectionIndexesAndOptions(OperationContext* opCtx,
-                                                                   const NamespaceString& nss,
-                                                                   const ShardId& fromShardId) {
+CollectionOptionsAndIndexes MigrationDestinationManager::getCollectionIndexesAndOptions(
+    OperationContext* opCtx, const NamespaceString& nss, const ShardId& fromShardId) {
     auto fromShard =
         uassertStatusOK(Grid::get(opCtx)->shardRegistry()->getShard(opCtx, fromShardId));
 
-    auto const serviceContext = opCtx->getServiceContext();
     DisableDocumentValidation validationDisabler(opCtx);
 
     std::vector<BSONObj> donorIndexSpecs;
     BSONObj donorIdIndexSpec;
     BSONObj donorOptions;
-    {
-        // 0. Get the collection indexes and options from the donor shard.
 
-        // Do not hold any locks while issuing remote calls.
-        invariant(!opCtx->lockState()->isLocked());
+    // Get the collection indexes and options from the donor shard.
 
-        // Get indexes by calling listIndexes against the donor.
-        auto indexes = uassertStatusOK(fromShard->runExhaustiveCursorCommand(
-            opCtx,
-            ReadPreferenceSetting(ReadPreference::PrimaryOnly),
-            nss.db().toString(),
-            BSON("listIndexes" << nss.coll().toString()),
-            Milliseconds(-1)));
+    // Do not hold any locks while issuing remote calls.
+    invariant(!opCtx->lockState()->isLocked());
 
-        for (auto&& spec : indexes.docs) {
-            donorIndexSpecs.push_back(spec);
-            if (auto indexNameElem = spec[IndexDescriptor::kIndexNameFieldName]) {
-                if (indexNameElem.type() == BSONType::String &&
-                    indexNameElem.valueStringData() == "_id_"_sd) {
-                    donorIdIndexSpec = spec;
+    // Get indexes by calling listIndexes against the donor.
+    auto indexes = uassertStatusOK(
+        fromShard->runExhaustiveCursorCommand(opCtx,
+                                              ReadPreferenceSetting(ReadPreference::PrimaryOnly),
+                                              nss.db().toString(),
+                                              BSON("listIndexes" << nss.coll().toString()),
+                                              Milliseconds(-1)));
+
+    for (auto&& spec : indexes.docs) {
+        donorIndexSpecs.push_back(spec);
+        if (auto indexNameElem = spec[IndexDescriptor::kIndexNameFieldName]) {
+            if (indexNameElem.type() == BSONType::String &&
+                indexNameElem.valueStringData() == "_id_"_sd) {
+                donorIdIndexSpec = spec;
+            }
+        }
+    }
+
+    // Get collection options by calling listCollections against the donor.
+    auto infosRes = uassertStatusOK(fromShard->runExhaustiveCursorCommand(
+        opCtx,
+        ReadPreferenceSetting(ReadPreference::PrimaryOnly),
+        nss.db().toString(),
+        BSON("listCollections" << 1 << "filter" << BSON("name" << nss.coll())),
+        Milliseconds(-1)));
+
+    auto infos = infosRes.docs;
+    uassert(ErrorCodes::NamespaceNotFound,
+            str::stream() << "expected listCollections against the primary shard for "
+                          << nss.toString() << " to return 1 entry, but got " << infos.size()
+                          << " entries",
+            infos.size() == 1);
+
+
+    BSONObj entry = infos.front();
+
+    // The entire options include both the settable options under the 'options' field in the
+    // listCollections response, and the UUID under the 'info' field.
+    BSONObjBuilder donorOptionsBob;
+
+    if (entry["options"].isABSONObj()) {
+        donorOptionsBob.appendElements(entry["options"].Obj());
+    }
+
+    BSONObj info;
+    if (entry["info"].isABSONObj()) {
+        info = entry["info"].Obj();
+    }
+
+    uassert(ErrorCodes::InvalidUUID,
+            str::stream() << "The donor shard did not return a UUID for collection " << nss.ns()
+                          << " as part of its listCollections response: " << entry
+                          << ", but this node expects to see a UUID.",
+            !info["uuid"].eoo());
+
+    auto donorUUID = info["uuid"].uuid();
+
+    donorOptionsBob.append(info["uuid"]);
+    donorOptions = donorOptionsBob.obj();
+
+    return {donorUUID, donorIndexSpecs, donorIdIndexSpec, donorOptions};
+}
+
+void MigrationDestinationManager::cloneCollectionIndexesAndOptions(
+    OperationContext* opCtx,
+    const NamespaceString& nss,
+    const CollectionOptionsAndIndexes& collectionOptionsAndIndexes) {
+    // 0. If this shard doesn't own any chunks for the collection to be cloned and the collection
+    // exists locally, we drop its indexes to guarantee that no stale indexes carry over.
+    bool dropNonDonorIndexes = [&]() -> bool {
+        AutoGetCollection autoColl(opCtx, nss, MODE_IS);
+        auto* const css = CollectionShardingRuntime::get(opCtx, nss);
+        const auto optMetadata = css->getCurrentMetadataIfKnown();
+
+        // Only attempt to drop a collection's indexes if we have valid metadata and the
+        // collection is sharded.
+        if (optMetadata) {
+            const auto& metadata = optMetadata->get();
+            if (metadata.isSharded()) {
+                auto chunks = metadata.getChunks();
+                if (chunks.empty()) {
+                    return true;
                 }
             }
         }
+        return false;
+    }();
 
-        // Get collection options by calling listCollections against the donor.
-        auto infosRes = uassertStatusOK(fromShard->runExhaustiveCursorCommand(
-            opCtx,
-            ReadPreferenceSetting(ReadPreference::PrimaryOnly),
-            nss.db().toString(),
-            BSON("listCollections" << 1 << "filter" << BSON("name" << nss.coll())),
-            Milliseconds(-1)));
-
-        auto infos = infosRes.docs;
-        uassert(ErrorCodes::NamespaceNotFound,
-                str::stream() << "expected listCollections against the primary shard for "
-                              << nss.toString() << " to return 1 entry, but got " << infos.size()
-                              << " entries",
-                infos.size() == 1);
-
-
-        BSONObj entry = infos.front();
-
-        // The entire options include both the settable options under the 'options' field in the
-        // listCollections response, and the UUID under the 'info' field.
-        BSONObjBuilder donorOptionsBob;
-
-        if (entry["options"].isABSONObj()) {
-            donorOptionsBob.appendElements(entry["options"].Obj());
+    if (dropNonDonorIndexes) {
+        // Determine which indexes exist on the local collection that don't exist on the donor's
+        // collection.
+        DBDirectClient client(opCtx);
+        auto indexes = client.getIndexSpecs(nss);
+        for (auto&& recipientIndex : indexes) {
+            bool dropIndex = true;
+            for (auto&& donorIndex : collectionOptionsAndIndexes.indexSpecs) {
+                if (recipientIndex.woCompare(donorIndex) == 0) {
+                    dropIndex = false;
+                    break;
+                }
+            }
+            // If the local index doesn't exist on the donor and isn't the _id index, drop it.
+            auto indexNameElem = recipientIndex[IndexDescriptor::kIndexNameFieldName];
+            if (indexNameElem.type() == BSONType::String && dropIndex &&
+                !IndexDescriptor::isIdIndexPattern(
+                    recipientIndex[IndexDescriptor::kKeyPatternFieldName].Obj())) {
+                BSONObj info;
+                if (!client.runCommand(
+                        nss.db().toString(),
+                        BSON("dropIndexes" << nss.coll() << "index" << indexNameElem),
+                        info))
+                    uassertStatusOK(getStatusFromCommandResult(info));
+            }
         }
-
-        BSONObj info;
-        if (entry["info"].isABSONObj()) {
-            info = entry["info"].Obj();
-        }
-
-        uassert(ErrorCodes::InvalidUUID,
-                str::stream() << "The donor shard did not return a UUID for collection " << nss.ns()
-                              << " as part of its listCollections response: " << entry
-                              << ", but this node expects to see a UUID.",
-                !info["uuid"].eoo());
-
-        donorOptionsBob.append(info["uuid"]);
-
-        donorOptions = donorOptionsBob.obj();
     }
 
     {
@@ -599,28 +680,24 @@ void MigrationDestinationManager::cloneCollectionIndexesAndOptions(OperationCont
                                   << " because the node is not primary",
                     repl::ReplicationCoordinator::get(opCtx)->canAcceptWritesFor(opCtx, nss));
 
-            boost::optional<UUID> donorUUID;
-            if (!donorOptions["uuid"].eoo()) {
-                donorUUID.emplace(UUID::parse(donorOptions));
-            }
-
             uassert(ErrorCodes::InvalidUUID,
                     str::stream()
                         << "Cannot create collection " << nss.ns()
                         << " because we already have an identically named collection with UUID "
                         << collection->uuid() << ", which differs from the donor's UUID "
-                        << (donorUUID ? donorUUID->toString() : "(none)")
+                        << collectionOptionsAndIndexes.uuid
                         << ". Manually drop the collection on this shard if it contains data from "
                            "a previous incarnation of "
                         << nss.ns(),
-                    collection->uuid() == donorUUID);
+                    collection->uuid() == collectionOptionsAndIndexes.uuid);
         };
 
         // Gets the missing indexes and checks if the collection is empty (auto-healing is
         // possible).
         auto checkEmptyOrGetMissingIndexesFromDonor = [&](Collection* collection) {
             auto indexCatalog = collection->getIndexCatalog();
-            auto indexSpecs = indexCatalog->removeExistingIndexesNoChecks(opCtx, donorIndexSpecs);
+            auto indexSpecs = indexCatalog->removeExistingIndexesNoChecks(
+                opCtx, collectionOptionsAndIndexes.indexSpecs);
             if (!indexSpecs.empty()) {
                 // Only allow indexes to be copied if the collection does not have any documents.
                 uassert(ErrorCodes::CannotCreateCollection,
@@ -651,66 +728,32 @@ void MigrationDestinationManager::cloneCollectionIndexesAndOptions(OperationCont
         AutoGetOrCreateDb autoCreateDb(opCtx, nss.db(), MODE_X);
         auto db = autoCreateDb.getDb();
 
-        auto collection = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(nss);
+        auto collection = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, nss);
         if (collection) {
             checkUUIDsMatch(collection);
         } else {
             // We do not have a collection by this name. Create the collection with the donor's
             // options.
             WriteUnitOfWork wuow(opCtx);
-            CollectionOptions collectionOptions = uassertStatusOK(CollectionOptions::parse(
-                donorOptions, CollectionOptions::ParseKind::parseForStorage));
+            CollectionOptions collectionOptions = uassertStatusOK(
+                CollectionOptions::parse(collectionOptionsAndIndexes.options,
+                                         CollectionOptions::ParseKind::parseForStorage));
             const bool createDefaultIndexes = true;
-            uassertStatusOK(db->userCreateNS(
-                opCtx, nss, collectionOptions, createDefaultIndexes, donorIdIndexSpec));
+            uassertStatusOK(db->userCreateNS(opCtx,
+                                             nss,
+                                             collectionOptions,
+                                             createDefaultIndexes,
+                                             collectionOptionsAndIndexes.idIndexSpec));
             wuow.commit();
-            collection = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(nss);
+            collection = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, nss);
         }
 
         auto indexSpecs = checkEmptyOrGetMissingIndexesFromDonor(collection);
         if (!indexSpecs.empty()) {
             WriteUnitOfWork wunit(opCtx);
-
-            // Emit startIndexBuild and commitIndexBuild oplog entries if supported by the
-            // current FCV.
-            auto opObserver = serviceContext->getOpObserver();
             auto fromMigrate = true;
-            auto buildUUID = serverGlobalParams.featureCompatibility.isVersionInitialized() &&
-                    serverGlobalParams.featureCompatibility.getVersion() ==
-                        ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo44
-                ? boost::make_optional(UUID::gen())
-                : boost::none;
-
-            if (buildUUID) {
-                opObserver->onStartIndexBuild(
-                    opCtx, nss, collection->uuid(), *buildUUID, indexSpecs, fromMigrate);
-            }
-
-            for (const auto& spec : indexSpecs) {
-                // Make sure to create index on secondaries as well. Oplog entry must be written
-                // before the index is added to the index catalog for correct rollback operation.
-                // See SERVER-35780 and SERVER-35070.
-
-                // If two phase index builds is enabled, index build will be coordinated using
-                // startIndexBuild and commitIndexBuild oplog entries.
-                if (!IndexBuildsCoordinator::get(opCtx)->supportsTwoPhaseIndexBuild()) {
-                    opObserver->onCreateIndex(opCtx, nss, collection->uuid(), spec, fromMigrate);
-                }
-
-                // Since the collection is empty, we can add and commit the index catalog entry
-                // within a single WUOW.
-                auto indexCatalog = collection->getIndexCatalog();
-                uassertStatusOKWithContext(indexCatalog->createIndexOnEmptyCollection(opCtx, spec),
-                                           str::stream()
-                                               << "failed to create index before migrating data: "
-                                               << redact(spec));
-            }
-
-            if (buildUUID) {
-                opObserver->onCommitIndexBuild(
-                    opCtx, nss, collection->uuid(), *buildUUID, indexSpecs, fromMigrate);
-            }
-
+            IndexBuildsCoordinator::get(opCtx)->createIndexesOnEmptyCollection(
+                opCtx, collection->uuid(), indexSpecs, fromMigrate);
             wunit.commit();
         }
     }
@@ -718,20 +761,43 @@ void MigrationDestinationManager::cloneCollectionIndexesAndOptions(OperationCont
 
 void MigrationDestinationManager::_migrateThread() {
     Client::initKillableThread("migrateThread", getGlobalServiceContext());
-    auto opCtx = Client::getCurrent()->makeOperationContext();
+    auto uniqueOpCtx = Client::getCurrent()->makeOperationContext();
+    auto opCtx = uniqueOpCtx.get();
 
     if (AuthorizationManager::get(opCtx->getServiceContext())->isAuthEnabled()) {
-        AuthorizationSession::get(opCtx->getClient())->grantInternalAuthorization(opCtx.get());
+        AuthorizationSession::get(opCtx->getClient())->grantInternalAuthorization(opCtx);
     }
 
     try {
-        _migrateDriver(opCtx.get());
+        // The outer OperationContext is used to hold the session checked out for the
+        // duration of the recipient's side of the migration. This guarantees that if the
+        // donor shard has failed over, then the new donor primary cannot bump the
+        // txnNumber on this session while this node is still executing the recipient side
+        //(which is important because otherwise, this node may create orphans after the
+        // range deletion task on this node has been processed).
+        if (_enableResumableRangeDeleter) {
+            opCtx->setLogicalSessionId(_lsid);
+            opCtx->setTxnNumber(_txnNumber);
+
+            MongoDOperationContextSession sessionTxnState(opCtx);
+
+            auto txnParticipant = TransactionParticipant::get(opCtx);
+            txnParticipant.beginOrContinue(opCtx,
+                                           *opCtx->getTxnNumber(),
+                                           boost::none /* autocommit */,
+                                           boost::none /* startTransaction */);
+            _migrateDriver(opCtx);
+        } else {
+            _migrateDriver(opCtx);
+        }
     } catch (...) {
         _setStateFail(str::stream() << "migrate failed: " << redact(exceptionToStatus()));
     }
 
-    if (getState() != DONE && !MONGO_unlikely(failMigrationLeaveOrphans.shouldFail())) {
-        _forgetPending(opCtx.get(), ChunkRange(_min, _max));
+    if (!_enableResumableRangeDeleter) {
+        if (getState() != DONE) {
+            _forgetPending(opCtx, ChunkRange(_min, _max));
+        }
     }
 
     stdx::lock_guard<Latch> lk(_mutex);
@@ -740,7 +806,7 @@ void MigrationDestinationManager::_migrateThread() {
     _isActiveCV.notify_all();
 }
 
-void MigrationDestinationManager::_migrateDriver(OperationContext* opCtx) {
+void MigrationDestinationManager::_migrateDriver(OperationContext* outerOpCtx) {
     invariant(isActive());
     invariant(_sessionId);
     invariant(_scopedReceiveChunk);
@@ -752,7 +818,7 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* opCtx) {
           << " at epoch " << _epoch.toString() << " with session id " << *_sessionId;
 
     MoveTimingHelper timing(
-        opCtx, "to", _nss.ns(), _min, _max, 6 /* steps */, &_errmsg, ShardId(), ShardId());
+        outerOpCtx, "to", _nss.ns(), _min, _max, 6 /* steps */, &_errmsg, ShardId(), ShardId());
 
     const auto initialState = getState();
 
@@ -763,34 +829,93 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* opCtx) {
 
     invariant(initialState == READY);
 
+    auto donorCollectionOptionsAndIndexes =
+        getCollectionIndexesAndOptions(outerOpCtx, _nss, _fromShard);
+
+    auto fromShard =
+        uassertStatusOK(Grid::get(outerOpCtx)->shardRegistry()->getShard(outerOpCtx, _fromShard));
+
     {
-        cloneCollectionIndexesAndOptions(opCtx, _nss, _fromShard);
+        const ChunkRange range(_min, _max);
+
+        // 2. Ensure any data which might have been left orphaned in the range being moved has been
+        // deleted.
+        if (_enableResumableRangeDeleter) {
+            while (migrationutil::checkForConflictingDeletions(
+                outerOpCtx, range, donorCollectionOptionsAndIndexes.uuid)) {
+                LOG(0) << "Migration paused because range overlaps with a "
+                          "range that is scheduled for deletion: collection: "
+                       << _nss.ns() << " range: " << redact(range.toString());
+
+                auto status = CollectionShardingRuntime::waitForClean(
+                    outerOpCtx, _nss, donorCollectionOptionsAndIndexes.uuid, range);
+
+                if (!status.isOK()) {
+                    _setStateFail(redact(status.reason()));
+                    return;
+                }
+
+                outerOpCtx->sleepFor(Milliseconds(1000));
+            }
+
+            RangeDeletionTask recipientDeletionTask(_migrationId,
+                                                    _nss,
+                                                    donorCollectionOptionsAndIndexes.uuid,
+                                                    _fromShard,
+                                                    range,
+                                                    CleanWhenEnum::kNow);
+            recipientDeletionTask.setPending(true);
+
+            migrationutil::persistRangeDeletionTaskLocally(outerOpCtx, recipientDeletionTask);
+        } else {
+            // Synchronously delete any data which might have been left orphaned in the range
+            // being moved, and wait for completion
+
+            auto cleanupCompleteFuture = _notePending(outerOpCtx, range);
+            auto cleanupStatus = cleanupCompleteFuture.getNoThrow(outerOpCtx);
+            // Wait for the range deletion to report back. Swallow
+            // RangeDeletionAbandonedBecauseCollectionWithUUIDDoesNotExist error since the
+            // collection could either never exist or get dropped directly from the shard after the
+            // range deletion task got scheduled.
+            if (!cleanupStatus.isOK() &&
+                cleanupStatus !=
+                    ErrorCodes::RangeDeletionAbandonedBecauseCollectionWithUUIDDoesNotExist) {
+                _setStateFail(redact(cleanupStatus.reason()));
+                return;
+            }
+
+            // Wait for any other, overlapping queued deletions to drain
+            cleanupStatus = CollectionShardingRuntime::waitForClean(
+                outerOpCtx, _nss, donorCollectionOptionsAndIndexes.uuid, range);
+            if (!cleanupStatus.isOK()) {
+                _setStateFail(redact(cleanupStatus.reason()));
+                return;
+            }
+        }
 
         timing.done(1);
         migrateThreadHangAtStep1.pauseWhileSet();
     }
 
-    auto fromShard =
-        uassertStatusOK(Grid::get(opCtx)->shardRegistry()->getShard(opCtx, _fromShard));
+    // The conventional usage of retryable writes is to assign statement id's to all of
+    // the writes done as part of the data copying so that _recvChunkStart is
+    // conceptually a retryable write batch. However, we are using an alternate approach to do those
+    // writes under an AlternativeClientRegion because 1) threading the
+    // statement id's through to all the places where they are needed would make this code more
+    // complex, and 2) some of the operations, like creating the collection or building indexes, are
+    // not currently supported in retryable writes.
+    auto newClient = outerOpCtx->getServiceContext()->makeClient("MigrationCoordinator");
+    {
+        stdx::lock_guard<Client> lk(*newClient.get());
+        newClient->setSystemOperationKillable(lk);
+    }
+
+    AlternativeClientRegion acr(newClient);
+    auto newOpCtxPtr = cc().makeOperationContext();
+    auto opCtx = newOpCtxPtr.get();
 
     {
-        // 2. Synchronously delete any data which might have been left orphaned in the range
-        // being moved, and wait for completion
-
-        const ChunkRange footprint(_min, _max);
-        auto notification = _notePending(opCtx, footprint);
-        // Wait for the range deletion to report back
-        if (!notification.waitStatus(opCtx).isOK()) {
-            _setStateFail(redact(notification.waitStatus(opCtx).reason()));
-            return;
-        }
-
-        // Wait for any other, overlapping queued deletions to drain
-        auto status = CollectionShardingRuntime::waitForClean(opCtx, _nss, _epoch, footprint);
-        if (!status.isOK()) {
-            _setStateFail(redact(status.reason()));
-            return;
-        }
+        cloneCollectionIndexesAndOptions(opCtx, _nss, donorCollectionOptionsAndIndexes);
 
         timing.done(2);
         migrateThreadHangAtStep2.pauseWhileSet();
@@ -892,9 +1017,9 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* opCtx) {
         timing.done(3);
         migrateThreadHangAtStep3.pauseWhileSet();
 
-        if (MONGO_unlikely(failMigrationLeaveOrphans.shouldFail())) {
+        if (MONGO_unlikely(failMigrationOnRecipient.shouldFail())) {
             _setStateFail(str::stream() << "failing migration after cloning " << _numCloned
-                                        << " docs due to failMigrationLeaveOrphans failpoint");
+                                        << " docs due to failMigrationOnRecipient failpoint");
             return;
         }
     }
@@ -1164,8 +1289,8 @@ bool MigrationDestinationManager::_flushPendingWrites(OperationContext* opCtx,
     return true;
 }
 
-CollectionShardingRuntime::CleanupNotification MigrationDestinationManager::_notePending(
-    OperationContext* opCtx, ChunkRange const& range) {
+SharedSemiFuture<void> MigrationDestinationManager::_notePending(OperationContext* opCtx,
+                                                                 ChunkRange const& range) {
 
     AutoGetCollection autoColl(opCtx, _nss, MODE_X);
     auto* const css = CollectionShardingRuntime::get(opCtx, _nss);
@@ -1182,13 +1307,13 @@ CollectionShardingRuntime::CleanupNotification MigrationDestinationManager::_not
     }
 
     // Start clearing any leftovers that would be in the new chunk
-    auto notification = css->beginReceive(range);
-    if (notification.ready() && !notification.waitStatus(opCtx).isOK()) {
-        return notification.waitStatus(opCtx).withContext(
+    auto cleanupCompleteFuture = css->beginReceive(range);
+    if (cleanupCompleteFuture.isReady() && !cleanupCompleteFuture.getNoThrow(opCtx).isOK()) {
+        return cleanupCompleteFuture.getNoThrow(opCtx).withContext(
             str::stream() << "Collection " << _nss.ns() << " range " << redact(range.toString())
                           << " migration aborted");
     }
-    return notification;
+    return cleanupCompleteFuture;
 }
 
 void MigrationDestinationManager::_forgetPending(OperationContext* opCtx, ChunkRange const& range) {

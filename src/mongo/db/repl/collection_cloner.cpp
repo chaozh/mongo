@@ -37,6 +37,7 @@
 #include "mongo/db/repl/collection_cloner.h"
 #include "mongo/db/repl/database_cloner_gen.h"
 #include "mongo/db/repl/repl_server_parameters_gen.h"
+#include "mongo/db/wire_version.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/log.h"
 
@@ -57,10 +58,8 @@ CollectionCloner::CollectionCloner(const NamespaceString& sourceNss,
                                    const HostAndPort& source,
                                    DBClientConnection* client,
                                    StorageInterface* storageInterface,
-                                   ThreadPool* dbPool,
-                                   ClockSource* clock)
-    : BaseCloner(
-          "CollectionCloner"_sd, sharedData, source, client, storageInterface, dbPool, clock),
+                                   ThreadPool* dbPool)
+    : BaseCloner("CollectionCloner"_sd, sharedData, source, client, storageInterface, dbPool),
       _sourceNss(sourceNss),
       _collectionOptions(collectionOptions),
       _sourceDbAndUuid(NamespaceString("UNINITIALIZED")),
@@ -74,7 +73,6 @@ CollectionCloner::CollectionCloner(const NamespaceString& sourceNss,
                      kProgressMeterCheckInterval,
                      "documents copied",
                      str::stream() << _sourceNss.toString() << " collection clone progress"),
-      _dbWorkTaskRunner(dbPool),
       _scheduleDbWorkFn([this](executor::TaskExecutor::CallbackFn work) {
           auto task = [ this, work = std::move(work) ](
                           OperationContext * opCtx,
@@ -88,17 +86,31 @@ CollectionCloner::CollectionCloner(const NamespaceString& sourceNss,
           };
           _dbWorkTaskRunner.schedule(std::move(task));
           return executor::TaskExecutor::CallbackHandle();
-      }) {
+      }),
+      _dbWorkTaskRunner(dbPool) {
     invariant(sourceNss.isValid());
     invariant(collectionOptions.uuid);
     _sourceDbAndUuid = NamespaceStringOrUUID(sourceNss.db().toString(), *collectionOptions.uuid);
     _stats.ns = _sourceNss.ns();
+
+    // Find out whether the sync source supports resumable queries.
+    _resumeSupported = (getClient()->getMaxWireVersion() == WireVersion::PLACEHOLDER_FOR_44);
 }
 
 BaseCloner::ClonerStages CollectionCloner::getStages() {
     return {&_countStage, &_listIndexesStage, &_createCollectionStage, &_queryStage};
 }
 
+
+void CollectionCloner::preStage() {
+    stdx::lock_guard<Latch> lk(_mutex);
+    _stats.start = getSharedData()->getClock()->now();
+}
+
+void CollectionCloner::postStage() {
+    stdx::lock_guard<Latch> lk(_mutex);
+    _stats.end = getSharedData()->getClock()->now();
+}
 
 // Collection cloner stages exit normally if the collection is not found.
 BaseCloner::AfterStageBehavior CollectionCloner::CollectionClonerStage::run() {
@@ -108,7 +120,11 @@ BaseCloner::AfterStageBehavior CollectionCloner::CollectionClonerStage::run() {
         log() << "CollectionCloner ns: '" << getCloner()->getSourceNss() << "' uuid: UUID(\""
               << getCloner()->getSourceUuid()
               << "\") stopped because collection was dropped on source.";
+        getCloner()->waitForDatabaseWorkToComplete();
         return kSkipRemainingStages;
+    } catch (const DBException&) {
+        getCloner()->waitForDatabaseWorkToComplete();
+        throw;
     }
 }
 
@@ -167,18 +183,82 @@ BaseCloner::AfterStageBehavior CollectionCloner::createCollectionStage() {
 }
 
 BaseCloner::AfterStageBehavior CollectionCloner::queryStage() {
-    getClient()->query([this](DBClientCursorBatchIterator& iter) { handleNextBatch(iter); },
-                       _sourceDbAndUuid,
-                       QUERY("query" << BSONObj() << "$readOnce" << true),
-                       nullptr /* fieldsToReturn */,
-                       QueryOption_NoCursorTimeout | QueryOption_SlaveOk |
-                           (collectionClonerUsesExhaust ? QueryOption_Exhaust : 0),
-                       _collectionClonerBatchSize);
-    _dbWorkTaskRunner.join();
+    // Attempt to clean up cursor from the last retry (if applicable).
+    killOldQueryCursor();
+    runQuery();
+    waitForDatabaseWorkToComplete();
     // We want to free the _collLoader regardless of whether the commit succeeds.
     std::unique_ptr<CollectionBulkLoader> loader = std::move(_collLoader);
     uassertStatusOK(loader->commit());
     return kContinueNormally;
+}
+
+void CollectionCloner::runQuery() {
+    // Non-resumable query.
+    Query query = QUERY("query" << BSONObj() << "$readOnce" << true);
+
+    if (_resumeSupported) {
+        if (_resumeToken) {
+            // Resume the query from where we left off.
+            LOG(1) << "Collection cloner will resume the last successful query";
+            query = QUERY("query" << BSONObj() << "$readOnce" << true << "$_requestResumeToken"
+                                  << true << "$_resumeAfter" << _resumeToken.get());
+        } else {
+            // New attempt at a resumable query.
+            LOG(1) << "Collection cloner will run a new query";
+            query = QUERY("query" << BSONObj() << "$readOnce" << true << "$_requestResumeToken"
+                                  << true);
+        }
+        query.hint(BSON("$natural" << 1));
+    }
+
+    // We reset this every time we retry or resume a query.
+    // We distinguish the first batch from the rest so that we only store the remote cursor id
+    // the first time we get it.
+    _firstBatchOfQueryRound = true;
+
+    try {
+        getClient()->query([this](DBClientCursorBatchIterator& iter) { handleNextBatch(iter); },
+                           _sourceDbAndUuid,
+                           query,
+                           nullptr /* fieldsToReturn */,
+                           QueryOption_NoCursorTimeout | QueryOption_SlaveOk |
+                               (collectionClonerUsesExhaust ? QueryOption_Exhaust : 0),
+                           _collectionClonerBatchSize);
+    } catch (...) {
+        auto status = exceptionToStatus();
+
+        // If the collection was dropped at any point, we can just move on to the next cloner.
+        // This applies to both resumable (4.4) and non-resumable (4.2) queries.
+        if (status == ErrorCodes::NamespaceNotFound) {
+            throw;  // This will re-throw the NamespaceNotFound, resulting in a clean exit.
+        }
+
+        // Wire version 4.2 only.
+        if (!_resumeSupported) {
+            // If we lost our cursor last round, the only time we can can continue is if we find out
+            // this round that the collection was dropped on the source (that scenario is covered
+            // right above). If that is not the case, then the cloner would have more work to do,
+            // but since we cannot resume the query, we must abort initial sync.
+            if (_lostNonResumableCursor) {
+                abortNonResumableClone(status);
+            }
+
+            // Collection has changed upstream. This will trigger the code block above next round,
+            // (unless we find out the collection was dropped via getting a NamespaceNotFound).
+            if (_queryStage.isCursorError(status)) {
+                log() << "Lost cursor during non-resumable query: " << status;
+                _lostNonResumableCursor = true;
+                throw;
+            }
+            // Any other errors (including network errors, but excluding NamespaceNotFound) result
+            // in immediate failure.
+            abortNonResumableClone(status);
+        }
+
+        // Re-throw all query errors for resumable (4.4) queries.
+        throw;
+    }
 }
 
 void CollectionCloner::handleNextBatch(DBClientCursorBatchIterator& iter) {
@@ -192,6 +272,20 @@ void CollectionCloner::handleNextBatch(DBClientCursorBatchIterator& iter) {
             uasserted(ErrorCodes::CallbackCanceled, message);
         }
     }
+
+    // If this is 'true', it means that something happened to our remote cursor for a reason other
+    // than the collection being dropped, all while we were running a non-resumable (4.2) clone.
+    // We must abort initial sync in that case.
+    if (_lostNonResumableCursor) {
+        // This will be caught in runQuery().
+        uasserted(ErrorCodes::InitialSyncFailure, "Lost remote cursor");
+    }
+
+    if (_firstBatchOfQueryRound && _resumeSupported) {
+        // Store the cursorId of the remote cursor.
+        _remoteCursorId = iter.getCursorId();
+    }
+    _firstBatchOfQueryRound = false;
 
     {
         stdx::lock_guard<Latch> lk(_mutex);
@@ -210,6 +304,11 @@ void CollectionCloner::handleNextBatch(DBClientCursorBatchIterator& iter) {
             str::stream() << "Error cloning collection '" << _sourceNss.ns() << "'");
         // We must throw an exception to terminate query.
         uassertStatusOK(newStatus);
+    }
+
+    if (_resumeSupported) {
+        // Store the resume token for this batch.
+        _resumeToken = iter.getPostBatchResumeToken();
     }
 
     initialSyncHangCollectionClonerAfterHandlingBatchResponse.executeIf(
@@ -233,21 +332,24 @@ void CollectionCloner::handleNextBatch(DBClientCursorBatchIterator& iter) {
 void CollectionCloner::insertDocumentsCallback(const executor::TaskExecutor::CallbackArgs& cbd) {
     uassertStatusOK(cbd.status);
 
-    std::vector<BSONObj> docs;
     {
         stdx::lock_guard<Latch> lk(_mutex);
+        std::vector<BSONObj> docs;
         if (_documentsToInsert.size() == 0) {
-            warning() << "_insertDocumentsCallback, but no documents to insert for ns:"
+            warning() << "insertDocumentsCallback, but no documents to insert for ns:"
                       << _sourceNss;
             return;
         }
         _documentsToInsert.swap(docs);
         _stats.documentsCopied += docs.size();
         ++_stats.fetchedBatches;
+        _progressMeter.hit(int(docs.size()));
+        invariant(_collLoader);
+
+        // The insert must be done within the lock, because CollectionBulkLoader is not
+        // thread safe.
+        uassertStatusOK(_collLoader->insertDocuments(docs.cbegin(), docs.cend()));
     }
-    _progressMeter.hit(int(docs.size()));
-    invariant(_collLoader);
-    uassertStatusOK(_collLoader->insertDocuments(docs.cbegin(), docs.cend()));
 
     initialSyncHangDuringCollectionClone.executeIf(
         [&](const BSONObj&) {
@@ -267,6 +369,45 @@ void CollectionCloner::insertDocumentsCallback(const executor::TaskExecutor::Cal
 bool CollectionCloner::isMyFailPoint(const BSONObj& data) const {
     auto nss = data["nss"].str();
     return (nss.empty() || nss == _sourceNss.toString()) && BaseCloner::isMyFailPoint(data);
+}
+
+void CollectionCloner::waitForDatabaseWorkToComplete() {
+    _dbWorkTaskRunner.join();
+}
+
+void CollectionCloner::killOldQueryCursor() {
+    // No cursor stored. Do nothing.
+    if (_remoteCursorId == -1) {
+        return;
+    }
+
+    BSONObj infoObj;
+    auto nss = _sourceNss;
+    auto id = _remoteCursorId;
+
+    auto cmdObj = BSON("killCursors" << nss.coll() << "cursors" << BSON_ARRAY(id));
+    LOG(1) << "Attempting to kill old remote cursor with id: " << id;
+    try {
+        getClient()->runCommand(nss.db().toString(), cmdObj, infoObj);
+    } catch (...) {
+        log() << "Error while trying to kill remote cursor after transient query error";
+    }
+
+    // Clear the stored cursorId on success.
+    _remoteCursorId = -1;
+}
+
+void CollectionCloner::forgetOldQueryCursor() {
+    _remoteCursorId = -1;
+}
+
+// Throws.
+void CollectionCloner::abortNonResumableClone(const Status& status) {
+    invariant(!_resumeSupported);
+    log() << "Error during non-resumable clone: " << status;
+    std::string message = str::stream()
+        << "Collection clone failed and is not resumable. nss: " << _sourceNss;
+    uasserted(ErrorCodes::InitialSyncFailure, message);
 }
 
 CollectionCloner::Stats CollectionCloner::getStats() const {

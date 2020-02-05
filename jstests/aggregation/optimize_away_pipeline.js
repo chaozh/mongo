@@ -6,7 +6,10 @@
 // Relies on the pipeline stages to be collapsed into a single $cursor stage, so pipelines cannot be
 // wrapped into a facet stage to not prevent this optimization. Also, this test is not prepared to
 // handle explain output for sharded collections.
-// @tags: [do_not_wrap_aggregations_in_facets, assumes_unsharded_collection]
+// This test makes assumptions about how the explain output will be formatted, so cannot be run when
+// pipeline optimization is disabled.
+// @tags: [do_not_wrap_aggregations_in_facets, assumes_unsharded_collection,
+//         requires_pipeline_optimization]
 (function() {
 "use strict";
 
@@ -228,12 +231,12 @@ assertPipelineUsesAggregation({
     expectedResult: [{_id: "null", s: 50}]
 });
 
-// TODO SERVER-40253: We cannot optimize away text search queries.
+// Test that we can optimize away a pipeline with a $text search predicate.
 assert.commandWorked(coll.createIndex({y: "text"}));
-assertPipelineUsesAggregation(
+assertPipelineDoesNotUseAggregation(
     {pipeline: [{$match: {$text: {$search: "abc"}}}], expectedStages: ["IXSCAN"]});
 // Test that $match, $sort, and $project all get answered by the PlanStage layer for a $text query.
-assertPipelineUsesAggregation({
+assertPipelineDoesNotUseAggregation({
     pipeline:
         [{$match: {$text: {$search: "abc"}}}, {$sort: {sortField: 1}}, {$project: {a: 1, b: 1}}],
     expectedStages: ["TEXT", "SORT", "PROJECTION_SIMPLE"],

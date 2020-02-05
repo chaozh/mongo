@@ -12,6 +12,7 @@
 //         migration and is sent to the recipient via the transfer logs.
 //      #5 fromMigrate is NOT set on donor shard and IS set on the recipient shard when real
 //         delete op is done during chunk migration within the chunk range.
+//  @tags: [requires_fcv_44]
 //
 
 load('./jstests/libs/chunk_manipulation_util.js');
@@ -57,12 +58,11 @@ jsTest.log('Inserting 5 docs into donor shard, ensuring one orphan on the recipi
 assert.commandWorked(coll.insert({_id: 2}));
 assert.eq(1, donorColl.count());
 assert.commandWorked(
-    recipient.adminCommand({configureFailPoint: "failMigrationLeaveOrphans", mode: "alwaysOn"}));
+    recipient.adminCommand({configureFailPoint: "failMigrationOnRecipient", mode: "alwaysOn"}));
 assert.commandFailed(
     admin.runCommand({moveChunk: coll.getFullName(), find: {_id: 2}, to: st.shard1.shardName}));
-assert.eq(1, recipientColl.count());
 assert.commandWorked(
-    recipient.adminCommand({configureFailPoint: "failMigrationLeaveOrphans", mode: "off"}));
+    recipient.adminCommand({configureFailPoint: "failMigrationOnRecipient", mode: "off"}));
 
 // Insert the remaining documents into the collection.
 assert.commandWorked(coll.insert({_id: 0}));
@@ -157,7 +157,7 @@ assertEqAndDumpOpLog(1,
                      "Real delete of {_id: 4} on donor shard incorrectly set the " +
                          "fromMigrate flag in the oplog! Test #5 failed.");
 
-// Expect to see two oplog entries for {_id: 2} with 'fromMigrate: true', because this doc was
+// Expect to see two oplog entries for {_id: 2} with 'fromMigrate: true' because this doc was
 // cloned as part of the first failed migration as well as the second successful migration.
 var recipientOplogRes =
     recipientLocal.oplog.rs.find({op: 'i', fromMigrate: true, 'o._id': 2}).count();

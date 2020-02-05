@@ -31,6 +31,7 @@
 
 #include "mongo/db/curop.h"
 #include "mongo/db/pipeline/document_source_check_resume_token.h"
+#include "mongo/db/repl/oplog_entry.h"
 
 using boost::intrusive_ptr;
 namespace mongo {
@@ -173,9 +174,10 @@ const char* DocumentSourceEnsureResumeTokenPresent::getSourceName() const {
 
 Value DocumentSourceEnsureResumeTokenPresent::serialize(
     boost::optional<ExplainOptions::Verbosity> explain) const {
-    // This stage is created by the DocumentSourceChangeStream stage, so serializing it here
-    // would result in it being created twice.
-    return Value();
+    // We only serialize this stage in the context of explain.
+    return explain
+        ? Value(DOC(kStageName << DOC("resumeToken" << ResumeToken(_tokenFromClient).toDocument())))
+        : Value();
 }
 
 intrusive_ptr<DocumentSourceEnsureResumeTokenPresent>
@@ -243,7 +245,7 @@ DocumentSourceEnsureResumeTokenPresent::_checkNextDocAndSwallowResumeToken(
         case ResumeStatus::kSurpassedToken:
             // If we have surpassed the point in the stream where the resume token should have
             // been and we did not see the token itself, then this stream cannot be resumed.
-            uassert(40585,
+            uassert(ErrorCodes::ChangeStreamFatalError,
                     str::stream() << "cannot resume stream; the resume token was not found. "
                                   << nextInput.getDocument()["_id"].getDocument().toString(),
                     _resumeStatus == ResumeStatus::kFoundToken);
@@ -259,9 +261,10 @@ const char* DocumentSourceShardCheckResumability::getSourceName() const {
 
 Value DocumentSourceShardCheckResumability::serialize(
     boost::optional<ExplainOptions::Verbosity> explain) const {
-    // This stage is created by the DocumentSourceChangeStream stage, so serializing it here
-    // would result in it being created twice.
-    return Value();
+    // We only serialize this stage in the context of explain.
+    return explain
+        ? Value(DOC(kStageName << DOC("resumeToken" << ResumeToken(_tokenFromClient).toDocument())))
+        : Value();
 }
 
 intrusive_ptr<DocumentSourceShardCheckResumability> DocumentSourceShardCheckResumability::create(
@@ -331,17 +334,18 @@ void DocumentSourceShardCheckResumability::_assertOplogHasEnoughHistory(
         // if its timestamp is later than the resume token. No events earlier than the token can
         // have fallen off this oplog, and it is therefore safe to resume. Otherwise, verify that
         // the timestamp of the first oplog entry is earlier than that of the resume token.
+        using repl::kInitiatingSetMsg;
         const bool isNewRS =
-            Value::compare(firstOplogEntry["o"]["msg"], Value("initiating set"_sd), nullptr) == 0 &&
+            Value::compare(firstOplogEntry["o"]["msg"], Value(kInitiatingSetMsg), nullptr) == 0 &&
             Value::compare(firstOplogEntry["op"], Value("n"_sd), nullptr) == 0;
-        uassert(40576,
+        uassert(ErrorCodes::ChangeStreamFatalError,
                 "Resume of change stream was not possible, as the resume point may no longer be in "
                 "the oplog. ",
                 isNewRS || firstOplogEntry["ts"].getTimestamp() < _tokenFromClient.clusterTime);
     } else {
         // Very unusual case: the oplog is empty.  We can always resume. However, it should never be
         // possible to have obtained a document that matched the filter if the oplog is empty.
-        uassert(51087,
+        uassert(ErrorCodes::ChangeStreamFatalError,
                 "Oplog was empty but found an event in the change stream pipeline. It should not "
                 "be possible for this to happen",
                 nextInput.isEOF());

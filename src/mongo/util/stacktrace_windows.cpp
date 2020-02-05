@@ -57,7 +57,8 @@
 
 namespace mongo {
 namespace {
-const auto kPathBufferSize = 1024;
+
+const size_t kPathBufferSize = 1024;
 
 // On Windows the symbol handler must be initialized at process startup and cleaned up at shutdown.
 // This class wraps up that logic and gives access to the process handle associated with the
@@ -135,8 +136,6 @@ MONGO_INITIALIZER(IntializeSymbolHandler)(::mongo::InitializerContext* ctx) {
     // Initializing the symbol handler is not a fatal error, so we always return Status::OK() here.
     return Status::OK();
 }
-
-}  // namespace
 
 /**
  * Get the display name of the executable module containing the specified address.
@@ -231,34 +230,16 @@ struct TraceItem {
     std::string symbolAndOffset;
 };
 
-static const int maxBackTraceFrames = 100;
+}  // namespace
+
 
 /**
- * Print a stack backtrace for the current thread to the specified ostream.
- */
-void printStackTrace(std::ostream& os) {
-    CONTEXT context;
-    memset(&context, 0, sizeof(context));
-    context.ContextFlags = CONTEXT_CONTROL;
-    RtlCaptureContext(&context);
-    printWindowsStackTrace(context, os);
-}
-
-/**
- * Print a stack backtrace for the current thread to the specified ostream, signal-safe variant.
- * (Currently the same as printStackTrace.)
- */
-void printStackTraceFromSignal(std::ostream& os) {
-    printStackTrace(os);
-}
-
-/**
- * Print stack trace (using a specified stack context) to "os"
+ * Print stack trace (using a specified stack context) to `sink`>
  *
- * @param context   CONTEXT record for stack trace
- * @param os        ostream& to receive printed stack backtrace
+ * @param context   execution state that produces the stack trace
+ * @param sink      receives printed stack backtrace
  */
-void printWindowsStackTrace(CONTEXT& context, std::ostream& os) {
+void printWindowsStackTrace(CONTEXT& context, StackTraceSink& sink) {
     auto& symbolHandler = SymbolHandler::instance();
     stdx::lock_guard<SymbolHandler> lk(symbolHandler);
 
@@ -300,7 +281,7 @@ void printWindowsStackTrace(CONTEXT& context, std::ostream& os) {
     TraceItem traceItem;
     size_t moduleWidth = 0;
     size_t sourceWidth = 0;
-    for (size_t i = 0; i < maxBackTraceFrames; ++i) {
+    for (size_t i = 0; i < kStackTraceFrameMax; ++i) {
         BOOL ret = StackWalk64(imageType,
                                symbolHandler.getHandle(),
                                GetCurrentThread(),
@@ -334,20 +315,47 @@ void printWindowsStackTrace(CONTEXT& context, std::ostream& os) {
     ++sourceWidth;
     size_t frameCount = traceList.size();
     for (size_t i = 0; i < frameCount; ++i) {
-        os << traceList[i].moduleName << ' ';
+        sink << traceList[i].moduleName << " ";
         size_t width = traceList[i].moduleName.length();
         while (width < moduleWidth) {
-            os << ' ';
+            sink << " ";
             ++width;
         }
-        os << traceList[i].sourceAndLine << ' ';
+        sink << traceList[i].sourceAndLine << " ";
         width = traceList[i].sourceAndLine.length();
         while (width < sourceWidth) {
-            os << ' ';
+            sink << " ";
             ++width;
         }
-        os << traceList[i].symbolAndOffset << '\n';
+        sink << traceList[i].symbolAndOffset << "\n";
     }
+}
+
+void printWindowsStackTrace(CONTEXT& context, std::ostream& os) {
+    OstreamStackTraceSink sink{os};
+    printWindowsStackTrace(context, sink);
+}
+
+void printWindowsStackTrace(CONTEXT& context) {
+    printWindowsStackTrace(context, log(logger::LogComponent::kDefault).stream());
+}
+
+void printStackTrace(StackTraceSink& sink) {
+    CONTEXT context;
+    memset(&context, 0, sizeof(context));
+    context.ContextFlags = CONTEXT_CONTROL;
+    RtlCaptureContext(&context);
+    printWindowsStackTrace(context, sink);
+}
+
+void printStackTrace(std::ostream& os) {
+    OstreamStackTraceSink sink{os};
+    printStackTrace(sink);
+}
+
+void printStackTrace() {
+    // Disable truncation to accomodate our large JSON representation.
+    printStackTrace(log(logger::LogComponent::kDefault).setIsTruncatable(false).stream());
 }
 
 }  // namespace mongo

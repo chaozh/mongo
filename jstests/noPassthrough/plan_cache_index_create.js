@@ -6,6 +6,8 @@
 (function() {
 "use strict";
 
+load('jstests/noPassthrough/libs/index_build.js');
+
 const dbName = "test";
 const collName = "coll";
 
@@ -23,17 +25,19 @@ function indexBuildIsRunning(testDB, indexName) {
 
 // Returns whether a cached plan exists for 'query'.
 function assertDoesNotHaveCachedPlan(coll, query) {
-    const key = {query: query};
-    const cmdRes = assert.commandWorked(coll.runCommand('planCacheListPlans', key));
-    assert(cmdRes.hasOwnProperty('plans') && cmdRes.plans.length == 0, tojson(cmdRes));
+    const match = {"createdFromQuery.query": query};
+    assert.eq([], coll.getPlanCache().list([{$match: match}]), coll.getPlanCache().list());
 }
 
 // Returns the cached plan for 'query'.
 function getIndexNameForCachedPlan(coll, query) {
-    const key = {query: query};
-    const cmdRes = assert.commandWorked(coll.runCommand('planCacheListPlans', key));
-    assert(Array.isArray(cmdRes.plans) && cmdRes.plans.length > 0, tojson(cmdRes));
-    return cmdRes.plans[0].reason.stats.inputStage.indexName;
+    const match = {"createdFromQuery.query": query};
+    const plans = coll.getPlanCache().list([{$match: match}]);
+    assert.eq(plans.length, 1, coll.getPlanCache().list());
+    assert(plans[0].hasOwnProperty("cachedPlan"), plans);
+    assert(plans[0].cachedPlan.hasOwnProperty("inputStage"), plans);
+    assert(plans[0].cachedPlan.inputStage.hasOwnProperty("indexName"), plans);
+    return plans[0].cachedPlan.inputStage.indexName;
 }
 
 function runTest({rst, readDB, writeDB}) {
@@ -74,6 +78,16 @@ function runTest({rst, readDB, writeDB}) {
     assert.commandWorked(
         readDB.adminCommand({configureFailPoint: 'hangAfterStartingIndexBuild', mode: 'alwaysOn'}));
 
+    // The commitIndexBuild oplog entry may block $planCacheStats on the secondary during oplog
+    // application because it will hold the PBWM while waiting for the index build to complete in
+    // the backgroud. Therefore, we get the primary to hold off on writing the commitIndexBuild
+    // oplog entry until we are ready to resume index builds on the secondary.
+    if (writeDB.getMongo().host != readDB.getMongo().host &&
+        IndexBuildTest.supportsTwoPhaseIndexBuild(writeDB.getMongo())) {
+        assert.commandWorked(writeDB.adminCommand(
+            {configureFailPoint: 'hangAfterStartingIndexBuild', mode: 'alwaysOn'}));
+    }
+
     // Build a "most selective" index in the background.
     TestData.dbName = dbName;
     TestData.collName = collName;
@@ -100,6 +114,11 @@ function runTest({rst, readDB, writeDB}) {
     // Disable the hang and wait for the index build to complete.
     assert.commandWorked(
         readDB.adminCommand({configureFailPoint: 'hangAfterStartingIndexBuild', mode: 'off'}));
+
+    // No effect if the fail point is already disabled.
+    assert.commandWorked(
+        writeDB.adminCommand({configureFailPoint: 'hangAfterStartingIndexBuild', mode: 'off'}));
+
     assert.soon(() => !indexBuildIsRunning(readDB, "most_selective"));
     createIdxShell({checkExitSuccess: true});
 

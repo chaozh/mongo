@@ -1,5 +1,7 @@
 // Test TransientTransactionErrors error label in mongos write commands.
-// @tags: [uses_transactions, uses_multi_shard_transaction]
+//
+// Remove requires_fcv_44 tag if SERVER-43941 is backported or 4.4 becomes last-stable.
+// @tags: [uses_transactions, uses_multi_shard_transaction, requires_fcv_44]
 (function() {
 "use strict";
 
@@ -119,6 +121,20 @@ const runCommitTests = function(commandSentToShard) {
     checkMongosResponse(res, ErrorCodes.NoSuchTransaction, "TransientTransactionError", null);
     turnOffFailCommand(st.rs0);
 
+    jsTest.log("failCommand with errorLabels but without errorCode or writeConcernError should " +
+               "not interfere with mongos' error labels attaching");
+    assert.commandWorked(st.s.adminCommand({
+        configureFailPoint: "failCommand",
+        mode: "alwaysOn",
+        data: {failCommands: ["insert"], errorLabels: ["foo"]}
+    }));
+    assert.commandWorked(startTransaction(mongosSession, dbName, collName));
+    abortTransactionDirectlyOnParticipant(
+        st.rs0, mongosSession.getSessionId(), mongosSession.getTxnNumber_forTesting());
+    res = mongosSession.commitTransaction_forTesting();
+    checkMongosResponse(res, ErrorCodes.NoSuchTransaction, "TransientTransactionError", null);
+    assert.commandWorked(st.s.adminCommand({configureFailPoint: "failCommand", mode: "off"}));
+
     jsTest.log("Mongos does not attach any error label if " + commandSentToShard +
                " returns NoSuchTransaction with writeConcern error.");
     failCommandWithWriteConcernError(st.rs0, commandSentToShard);
@@ -151,6 +167,7 @@ assert.commandWorked(st.s.adminCommand({enableSharding: dbName}));
 assert.commandWorked(st.s.adminCommand({movePrimary: dbName, to: st.shard0.shardName}));
 assert.commandWorked(st.s.adminCommand({shardCollection: ns, key: {_id: 1}}));
 assert.commandWorked(st.s.adminCommand({split: ns, middle: {_id: 0}}));
+st.refreshCatalogCacheForNs(st.s, ns);
 
 // These forced refreshes are not strictly necessary; they just prevent extra TXN log lines
 // from the shards starting, aborting, and restarting the transaction due to needing to
@@ -171,6 +188,43 @@ failCommandWithError(
 res = startTransaction(mongosSession, dbName, collName);
 checkMongosResponse(res, ErrorCodes.WriteConflict, "TransientTransactionError", null);
 turnOffFailCommand(st.rs0);
+assert.commandFailedWithCode(mongosSession.abortTransaction_forTesting(),
+                             ErrorCodes.NoSuchTransaction);
+
+jsTest.log("'TransientTransactionError' label is attached if write statement returns " +
+           "WriteConflict via failCommand on mongos");
+assert.commandWorked(st.s.adminCommand({
+    configureFailPoint: "failCommand",
+    mode: "alwaysOn",
+    data: {failCommands: ["insert"], errorCode: ErrorCodes.WriteConflict}
+}));
+res = startTransaction(mongosSession, dbName, collName);
+checkMongosResponse(res, ErrorCodes.WriteConflict, "TransientTransactionError", null);
+assert.commandWorked(st.s.adminCommand({configureFailPoint: "failCommand", mode: "off"}));
+assert.commandFailedWithCode(mongosSession.abortTransaction_forTesting(),
+                             ErrorCodes.NoSuchTransaction);
+
+jsTest.log("failCommand with errorLabels should override labels attached by mongos");
+assert.commandWorked(st.s.adminCommand({
+    configureFailPoint: "failCommand",
+    mode: "alwaysOn",
+    data: {failCommands: ["insert"], errorCode: ErrorCodes.WriteConflict, errorLabels: ["foo"]}
+}));
+res = startTransaction(mongosSession, dbName, collName);
+checkMongosResponse(res, ErrorCodes.WriteConflict, "foo", null);
+assert.commandWorked(st.s.adminCommand({configureFailPoint: "failCommand", mode: "off"}));
+assert.commandFailedWithCode(mongosSession.abortTransaction_forTesting(),
+                             ErrorCodes.NoSuchTransaction);
+
+jsTest.log("failCommand with empty errorLabels should suppress labels attached by mongos");
+assert.commandWorked(st.s.adminCommand({
+    configureFailPoint: "failCommand",
+    mode: "alwaysOn",
+    data: {failCommands: ["insert"], errorCode: ErrorCodes.WriteConflict, errorLabels: []}
+}));
+res = startTransaction(mongosSession, dbName, collName);
+checkMongosResponse(res, ErrorCodes.WriteConflict, null, null);
+assert.commandWorked(st.s.adminCommand({configureFailPoint: "failCommand", mode: "off"}));
 assert.commandFailedWithCode(mongosSession.abortTransaction_forTesting(),
                              ErrorCodes.NoSuchTransaction);
 

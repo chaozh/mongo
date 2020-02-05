@@ -133,7 +133,8 @@ StatusWith<std::unique_ptr<CanonicalQuery>> CanonicalQuery::canonicalize(
     std::unique_ptr<QueryRequest> qr,
     const boost::intrusive_ptr<ExpressionContext>& expCtx,
     const ExtensionsCallback& extensionsCallback,
-    MatchExpressionParser::AllowedFeatureSet allowedFeatures) {
+    MatchExpressionParser::AllowedFeatureSet allowedFeatures,
+    const ProjectionPolicies& projectionPolicies) {
     auto qrStatus = qr->validate();
     if (!qrStatus.isOK()) {
         return qrStatus;
@@ -174,7 +175,8 @@ StatusWith<std::unique_ptr<CanonicalQuery>> CanonicalQuery::canonicalize(
                  std::move(qr),
                  parsingCanProduceNoopMatchNodes(extensionsCallback, allowedFeatures),
                  std::move(me),
-                 std::move(collator));
+                 std::move(collator),
+                 projectionPolicies);
 
     if (!initStatus.isOK()) {
         return initStatus;
@@ -187,7 +189,7 @@ StatusWith<std::unique_ptr<CanonicalQuery>> CanonicalQuery::canonicalize(
     OperationContext* opCtx, const CanonicalQuery& baseQuery, MatchExpression* root) {
     auto qr = std::make_unique<QueryRequest>(baseQuery.nss());
     BSONObjBuilder builder;
-    root->serialize(&builder);
+    root->serialize(&builder, true);
     qr->setFilter(builder.obj());
     qr->setProj(baseQuery.getQueryRequest().getProj());
     qr->setSort(baseQuery.getQueryRequest().getSort());
@@ -210,7 +212,8 @@ StatusWith<std::unique_ptr<CanonicalQuery>> CanonicalQuery::canonicalize(
                                  std::move(qr),
                                  baseQuery.canHaveNoopMatchNodes(),
                                  root->shallowClone(),
-                                 std::move(collator));
+                                 std::move(collator),
+                                 ProjectionPolicies::findProjectionPolicies());
 
     if (!initStatus.isOK()) {
         return initStatus;
@@ -223,7 +226,8 @@ Status CanonicalQuery::init(OperationContext* opCtx,
                             std::unique_ptr<QueryRequest> qr,
                             bool canHaveNoopMatchNodes,
                             std::unique_ptr<MatchExpression> root,
-                            std::unique_ptr<CollatorInterface> collator) {
+                            std::unique_ptr<CollatorInterface> collator,
+                            const ProjectionPolicies& projectionPolicies) {
     _expCtx = expCtx;
     _qr = std::move(qr);
     _collator = std::move(collator);
@@ -233,19 +237,20 @@ Status CanonicalQuery::init(OperationContext* opCtx,
     // Normalize, sort and validate tree.
     _root = MatchExpression::optimize(std::move(root));
     sortTree(_root.get());
-    Status validStatus = isValid(_root.get(), *_qr);
+    auto validStatus = isValid(_root.get(), *_qr);
     if (!validStatus.isOK()) {
-        return validStatus;
+        return validStatus.getStatus();
     }
+    auto unavailableMetadata = validStatus.getValue();
 
     // Validate the projection if there is one.
     if (!_qr->getProj().isEmpty()) {
         try {
-            _proj.emplace(projection_ast::parse(expCtx,
-                                                _qr->getProj(),
-                                                _root.get(),
-                                                _qr->getFilter(),
-                                                ProjectionPolicies::findProjectionPolicies()));
+            _proj.emplace(projection_ast::parse(
+                expCtx, _qr->getProj(), _root.get(), _qr->getFilter(), projectionPolicies));
+
+            // Fail if any of the projection's dependencies are unavailable.
+            DepsTracker{unavailableMetadata}.requestMetadata(_proj->metadataDeps());
         } catch (const DBException& e) {
             return e.toStatus();
         }
@@ -258,7 +263,34 @@ Status CanonicalQuery::init(OperationContext* opCtx,
         return Status(ErrorCodes::BadValue, "cannot use sortKey $meta projection without a sort");
     }
 
+    // If there is a sort, parse it and add any metadata dependencies it induces.
+    try {
+        initSortPattern(unavailableMetadata);
+    } catch (const DBException& ex) {
+        return ex.toStatus();
+    }
+
     return Status::OK();
+}
+
+void CanonicalQuery::initSortPattern(QueryMetadataBitSet unavailableMetadata) {
+    if (_qr->getSort().isEmpty()) {
+        return;
+    }
+
+    // A $natural sort is really a hint, and should be handled as such. Furthermore, the downstream
+    // sort handling code may not expect a $natural sort.
+    //
+    // We have already validated that if there is a $natural sort and a hint, that the hint
+    // also specifies $natural with the same direction. Therefore, it is safe to clear the $natural
+    // sort and rewrite it as a $natural hint.
+    if (_qr->getSort()["$natural"]) {
+        _qr->setHint(_qr->getSort());
+        _qr->setSort(BSONObj{});
+    }
+
+    _sortPattern = SortPattern{_qr->getSort(), _expCtx};
+    _metadataDeps |= _sortPattern->metadataDeps(unavailableMetadata);
 }
 
 void CanonicalQuery::setCollator(std::unique_ptr<CollatorInterface> collator) {
@@ -308,8 +340,7 @@ void CanonicalQuery::sortTree(MatchExpression* tree) {
     for (size_t i = 0; i < tree->numChildren(); ++i) {
         sortTree(tree->getChild(i));
     }
-    std::vector<MatchExpression*>* children = tree->getChildVector();
-    if (nullptr != children) {
+    if (auto&& children = tree->getChildVector()) {
         std::stable_sort(children->begin(), children->end(), matchExpressionLessThan);
     }
 }
@@ -343,9 +374,9 @@ bool hasNodeInSubtree(MatchExpression* root,
     return false;
 }
 
-// static
-Status CanonicalQuery::isValid(MatchExpression* root, const QueryRequest& parsed) {
-    // Analysis below should be done after squashing the tree to make it clearer.
+StatusWith<QueryMetadataBitSet> CanonicalQuery::isValid(MatchExpression* root,
+                                                        const QueryRequest& request) {
+    QueryMetadataBitSet unavailableMetadata{};
 
     // There can only be one TEXT.  If there is a TEXT, it cannot appear inside a NOR.
     //
@@ -358,6 +389,9 @@ Status CanonicalQuery::isValid(MatchExpression* root, const QueryRequest& parsed
         if (hasNodeInSubtree(root, MatchExpression::TEXT, MatchExpression::NOR)) {
             return Status(ErrorCodes::BadValue, "text expression not allowed in nor");
         }
+    } else {
+        // Text metadata is not available.
+        unavailableMetadata.set(DocumentMetadataFields::kTextScore);
     }
 
     // There can only be one NEAR.  If there is a NEAR, it must be either the root or the root
@@ -380,13 +414,27 @@ Status CanonicalQuery::isValid(MatchExpression* root, const QueryRequest& parsed
         if (!topLevel) {
             return Status(ErrorCodes::BadValue, "geoNear must be top-level expr");
         }
+    } else {
+        // Geo distance and geo point metadata are unavailable.
+        unavailableMetadata |= DepsTracker::kAllGeoNearData;
+    }
+
+    const BSONObj& sortObj = request.getSort();
+    BSONElement sortNaturalElt = sortObj["$natural"];
+    const BSONObj& hintObj = request.getHint();
+    BSONElement hintNaturalElt = hintObj["$natural"];
+
+    if (sortNaturalElt && sortObj.nFields() != 1) {
+        return Status(ErrorCodes::BadValue,
+                      str::stream() << "Cannot include '$natural' in compound sort: " << sortObj);
+    }
+
+    if (hintNaturalElt && hintObj.nFields() != 1) {
+        return Status(ErrorCodes::BadValue,
+                      str::stream() << "Cannot include '$natural' in compound hint: " << hintObj);
     }
 
     // NEAR cannot have a $natural sort or $natural hint.
-    const BSONObj& sortObj = parsed.getSort();
-    BSONElement sortNaturalElt = sortObj["$natural"];
-    const BSONObj& hintObj = parsed.getHint();
-    BSONElement hintNaturalElt = hintObj["$natural"];
     if (numGeoNear > 0) {
         if (sortNaturalElt) {
             return Status(ErrorCodes::BadValue,
@@ -415,7 +463,7 @@ Status CanonicalQuery::isValid(MatchExpression* root, const QueryRequest& parsed
     }
 
     // TEXT and tailable are incompatible.
-    if (numText > 0 && parsed.isTailable()) {
+    if (numText > 0 && request.isTailable()) {
         return Status(ErrorCodes::BadValue, "text and tailable cursor not allowed in same query");
     }
 
@@ -432,7 +480,7 @@ Status CanonicalQuery::isValid(MatchExpression* root, const QueryRequest& parsed
         }
     }
 
-    return Status::OK();
+    return unavailableMetadata;
 }
 
 std::string CanonicalQuery::toString() const {

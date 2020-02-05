@@ -34,7 +34,6 @@
 #include <memory>
 
 #include "mongo/base/checked_cast.h"
-#include "mongo/base/transaction_error.h"
 #include "mongo/db/audit.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/catalog/collection.h"
@@ -46,6 +45,7 @@
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/curop_failpoint_helpers.h"
 #include "mongo/db/curop_metrics.h"
+#include "mongo/db/error_labels.h"
 #include "mongo/db/exec/delete.h"
 #include "mongo/db/exec/update_stage.h"
 #include "mongo/db/introspect.h"
@@ -97,6 +97,7 @@ MONGO_FAIL_POINT_DEFINE(hangAfterAllChildRemoveOpsArePopped);
 MONGO_FAIL_POINT_DEFINE(hangDuringBatchInsert);
 MONGO_FAIL_POINT_DEFINE(hangDuringBatchUpdate);
 MONGO_FAIL_POINT_DEFINE(hangDuringBatchRemove);
+MONGO_FAIL_POINT_DEFINE(hangAndFailAfterDocumentInsertsReserveOpTimes);
 // The withLock fail points are for testing interruptability of these operations, so they will not
 // themselves check for interrupt.
 MONGO_FAIL_POINT_DEFINE(hangWithLockDuringBatchInsert);
@@ -166,7 +167,7 @@ public:
             // here. No-op updates will not generate a new lastOp, so we still need the
             // guard to fire in that case. Operations on the local DB aren't replicated, so they
             // don't need to bump the lastOp.
-            replClientInfo().setLastOpToSystemLastOpTime(_opCtx);
+            replClientInfo().setLastOpToSystemLastOpTimeIgnoringInterrupt(_opCtx);
             LOG(5) << "Set last op to system time: " << replClientInfo().getLastOp().getTimestamp();
         }
     }
@@ -210,11 +211,12 @@ void makeCollection(OperationContext* opCtx, const NamespaceString& ns) {
 
     writeConflictRetry(opCtx, "implicit collection creation", ns.ns(), [&opCtx, &ns] {
         AutoGetOrCreateDb db(opCtx, ns.db(), MODE_IX);
-        Lock::CollectionLock collLock(opCtx, ns, MODE_X);
+        Lock::CollectionLock collLock(opCtx, ns, MODE_IX);
 
         assertCanWrite_inlock(
-            opCtx, ns, CollectionCatalog::get(opCtx).lookupCollectionByNamespace(ns));
+            opCtx, ns, CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, ns));
         if (!CollectionCatalog::get(opCtx).lookupCollectionByNamespace(
+                opCtx,
                 ns)) {  // someone else may have beat us to it.
             uassertStatusOK(userAllowedCreateNS(ns.db(), ns.coll()));
             WriteUnitOfWork wuow(opCtx);
@@ -248,7 +250,7 @@ bool handleError(OperationContext* opCtx,
     auto txnParticipant = TransactionParticipant::get(opCtx);
     if (txnParticipant && opCtx->inMultiDocumentTransaction()) {
         if (isTransientTransactionError(
-                ex.code(), false /* hasWriteConcernError */, false /* isCommitTransaction */)) {
+                ex.code(), false /* hasWriteConcernError */, false /* isCommitOrAbort */)) {
             // Tell the client to try the whole txn again, by returning ok: 0 with errorLabels.
             throw;
         }
@@ -316,6 +318,17 @@ void insertDocuments(OperationContext* opCtx,
             }
         }
     }
+
+    hangAndFailAfterDocumentInsertsReserveOpTimes.executeIf(
+        [&](const BSONObj& data) {
+            hangAndFailAfterDocumentInsertsReserveOpTimes.pauseWhileSet(opCtx);
+            uasserted(51269, "hangAndFailAfterDocumentInsertsReserveOpTimes fail point enabled");
+        },
+        [&](const BSONObj& data) {
+            // Check if the failpoint specifies no collection or matches the existing one.
+            const auto collElem = data["collectionNS"];
+            return !collElem || collection->ns().ns() == collElem.str();
+        });
 
     uassertStatusOK(
         collection->insertDocuments(opCtx, begin, end, &CurOp::get(opCtx)->debug(), fromMigrate));
@@ -636,8 +649,11 @@ static SingleWriteResult performSingleUpdateOp(OperationContext* opCtx,
 
     assertCanWrite_inlock(opCtx, ns, collection->getCollection());
 
-    auto exec = uassertStatusOK(
-        getExecutorUpdate(opCtx, &curOp.debug(), collection->getCollection(), &parsedUpdate));
+    auto exec = uassertStatusOK(getExecutorUpdate(opCtx,
+                                                  &curOp.debug(),
+                                                  collection->getCollection(),
+                                                  &parsedUpdate,
+                                                  boost::none /* verbosity */));
 
     {
         stdx::lock_guard<Client> lk(*opCtx->getClient());
@@ -709,6 +725,7 @@ static SingleWriteResult performSingleUpdateOpWithDupKeyRetry(OperationContext* 
     request.setArrayFilters(write_ops::arrayFiltersOf(op));
     request.setMulti(op.getMulti());
     request.setUpsert(op.getUpsert());
+    request.setUpsertSuppliedDocument(op.getUpsertSupplied());
     request.setHint(op.getHint());
 
     request.setYieldPolicy(opCtx->inMultiDocumentTransaction() ? PlanExecutor::INTERRUPT_ONLY
@@ -865,8 +882,11 @@ static SingleWriteResult performSingleDeleteOp(OperationContext* opCtx,
     CurOpFailpointHelpers::waitWhileFailPointEnabled(
         &hangWithLockDuringBatchRemove, opCtx, "hangWithLockDuringBatchRemove");
 
-    auto exec = uassertStatusOK(
-        getExecutorDelete(opCtx, &curOp.debug(), collection.getCollection(), &parsedDelete));
+    auto exec = uassertStatusOK(getExecutorDelete(opCtx,
+                                                  &curOp.debug(),
+                                                  collection.getCollection(),
+                                                  &parsedDelete,
+                                                  boost::none /* verbosity */));
 
     {
         stdx::lock_guard<Client> lk(*opCtx->getClient());

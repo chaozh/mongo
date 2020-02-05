@@ -1,6 +1,6 @@
 // Tests that change streams is able to find and return results from new shards which are added
 // during cursor establishment.
-// @tags: [uses_change_streams]
+// @tags: [uses_change_streams, requires_fcv_44]
 (function() {
 'use strict';
 
@@ -44,7 +44,6 @@ assert.commandWorked(mongos.adminCommand(
 
 // While opening the cursor, wait for the failpoint and add the new shard.
 const awaitNewShard = startParallelShell(`
-        load("jstests/libs/check_log.js");
         checkLog.contains(db,
             "shardedAggregateHangBeforeEstablishingShardCursors fail point enabled");
         assert.commandWorked(

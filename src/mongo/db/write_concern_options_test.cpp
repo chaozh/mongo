@@ -37,34 +37,37 @@ namespace mongo {
 namespace {
 
 TEST(WriteConcernOptionsTest, ParseReturnsFailedToParseOnEmptyDocument) {
-    auto status = WriteConcernOptions().parse({});
+    auto status = WriteConcernOptions::parse({}).getStatus();
     ASSERT_EQUALS(ErrorCodes::FailedToParse, status);
     ASSERT_EQUALS("write concern object cannot be empty", status.reason());
 }
 
 TEST(WriteConcernOptionsTest, ParseReturnsFailedToParseOnInvalidJValue) {
-    auto status = WriteConcernOptions().parse(BSON("j"
-                                                   << "abc"));
+    auto status = WriteConcernOptions::parse(BSON("j"
+                                                  << "abc"))
+                      .getStatus();
     ASSERT_EQUALS(ErrorCodes::FailedToParse, status);
     ASSERT_EQUALS("j must be numeric or a boolean value", status.reason());
 }
 
 TEST(WriteConcernOptionsTest, ParseReturnsFailedToParseOnInvalidFSyncValue) {
-    auto status = WriteConcernOptions().parse(BSON("fsync"
-                                                   << "abc"));
+    auto status = WriteConcernOptions::parse(BSON("fsync"
+                                                  << "abc"))
+                      .getStatus();
     ASSERT_EQUALS(ErrorCodes::FailedToParse, status);
     ASSERT_EQUALS("fsync must be numeric or a boolean value", status.reason());
 }
 
 TEST(WriteConcernOptionsTest, ParseReturnsFailedToParseIfBothJAndFSyncAreTrue) {
-    auto status = WriteConcernOptions().parse(BSON("j" << true << "fsync" << true));
+    auto status = WriteConcernOptions::parse(BSON("j" << true << "fsync" << true)).getStatus();
     ASSERT_EQUALS(ErrorCodes::FailedToParse, status);
     ASSERT_EQUALS("fsync and j options cannot be used together", status.reason());
 }
 
 TEST(WriteConcernOptionsTest, ParseSetsSyncModeToJournelIfJIsTrue) {
-    WriteConcernOptions options;
-    ASSERT_OK(options.parse(BSON("j" << true)));
+    auto sw = WriteConcernOptions::parse(BSON("j" << true));
+    ASSERT_OK(sw.getStatus());
+    WriteConcernOptions options = sw.getValue();
     ASSERT_TRUE(WriteConcernOptions::SyncMode::JOURNAL == options.syncMode);
     ASSERT_EQUALS(1, options.wNumNodes);
     ASSERT_EQUALS("", options.wMode);
@@ -72,8 +75,9 @@ TEST(WriteConcernOptionsTest, ParseSetsSyncModeToJournelIfJIsTrue) {
 }
 
 TEST(WriteConcernOptionsTest, ParseSetsSyncModeToFSyncIfFSyncIsTrue) {
-    WriteConcernOptions options;
-    ASSERT_OK(options.parse(BSON("fsync" << true)));
+    auto sw = WriteConcernOptions::parse(BSON("fsync" << true));
+    ASSERT_OK(sw.getStatus());
+    WriteConcernOptions options = sw.getValue();
     ASSERT_TRUE(WriteConcernOptions::SyncMode::FSYNC == options.syncMode);
     ASSERT_EQUALS(1, options.wNumNodes);
     ASSERT_EQUALS("", options.wMode);
@@ -81,8 +85,9 @@ TEST(WriteConcernOptionsTest, ParseSetsSyncModeToFSyncIfFSyncIsTrue) {
 }
 
 TEST(WriteConcernOptionsTest, ParseSetsSyncModeToNoneIfJIsFalse) {
-    WriteConcernOptions options;
-    ASSERT_OK(options.parse(BSON("j" << false)));
+    auto sw = WriteConcernOptions::parse(BSON("j" << false));
+    ASSERT_OK(sw.getStatus());
+    WriteConcernOptions options = sw.getValue();
     ASSERT_TRUE(WriteConcernOptions::SyncMode::NONE == options.syncMode);
     ASSERT_EQUALS(1, options.wNumNodes);
     ASSERT_EQUALS("", options.wMode);
@@ -90,8 +95,9 @@ TEST(WriteConcernOptionsTest, ParseSetsSyncModeToNoneIfJIsFalse) {
 }
 
 TEST(WriteConcernOptionsTest, ParseLeavesSyncModeAsUnsetIfFSyncIsFalse) {
-    WriteConcernOptions options;
-    ASSERT_OK(options.parse(BSON("fsync" << false)));
+    auto sw = WriteConcernOptions::parse(BSON("fsync" << false));
+    ASSERT_OK(sw.getStatus());
+    WriteConcernOptions options = sw.getValue();
     ASSERT_TRUE(WriteConcernOptions::SyncMode::UNSET == options.syncMode);
     ASSERT_EQUALS(1, options.wNumNodes);
     ASSERT_EQUALS("", options.wMode);
@@ -99,14 +105,24 @@ TEST(WriteConcernOptionsTest, ParseLeavesSyncModeAsUnsetIfFSyncIsFalse) {
 }
 
 TEST(WriteConcernOptionsTest, ParseReturnsFailedToParseIfWIsNotNumberOrString) {
-    auto status = WriteConcernOptions().parse(BSON("w" << BSONObj()));
+    auto status = WriteConcernOptions::parse(BSON("w" << BSONObj())).getStatus();
     ASSERT_EQUALS(ErrorCodes::FailedToParse, status);
     ASSERT_EQUALS("w has to be a number or a string", status.reason());
 }
 
+TEST(WriteConcernOptionsTest, ParseReturnsFailedToParseIfWIsNegativeOrExceedsMaxMembers) {
+    auto st1 = WriteConcernOptions::parse(BSON("w" << 123)).getStatus();
+    ASSERT_EQUALS(ErrorCodes::FailedToParse, st1);
+
+    auto st2 = WriteConcernOptions::parse(BSON("w" << -1)).getStatus();
+    ASSERT_EQUALS(ErrorCodes::FailedToParse, st2);
+    ASSERT_EQUALS(st1.reason(), st2.reason());
+}
+
 TEST(WriteConcernOptionsTest, ParseSetsWNumNodesIfWIsANumber) {
-    WriteConcernOptions options;
-    ASSERT_OK(options.parse(BSON("w" << 3)));
+    auto sw = WriteConcernOptions::parse(BSON("w" << 3));
+    ASSERT_OK(sw.getStatus());
+    WriteConcernOptions options = sw.getValue();
     ASSERT_TRUE(WriteConcernOptions::SyncMode::UNSET == options.syncMode);
     ASSERT_EQUALS(3, options.wNumNodes);
     ASSERT_EQUALS("", options.wMode);
@@ -114,9 +130,10 @@ TEST(WriteConcernOptionsTest, ParseSetsWNumNodesIfWIsANumber) {
 }
 
 TEST(WriteConcernOptionsTest, ParseSetsWTimeoutToZeroIfWTimeoutIsNotANumber) {
-    WriteConcernOptions options;
-    ASSERT_OK(options.parse(BSON("wtimeout"
-                                 << "abc")));
+    auto sw = WriteConcernOptions::parse(BSON("wtimeout"
+                                              << "abc"));
+    ASSERT_OK(sw.getStatus());
+    WriteConcernOptions options = sw.getValue();
     ASSERT_TRUE(WriteConcernOptions::SyncMode::UNSET == options.syncMode);
     ASSERT_EQUALS("", options.wMode);
     ASSERT_EQUALS(1, options.wNumNodes);
@@ -124,23 +141,47 @@ TEST(WriteConcernOptionsTest, ParseSetsWTimeoutToZeroIfWTimeoutIsNotANumber) {
 }
 
 TEST(WriteConcernOptionsTest, ParseWTimeoutAsNumber) {
-    WriteConcernOptions options;
-    ASSERT_OK(options.parse(BSON("wtimeout" << 123)));
+    auto sw = WriteConcernOptions::parse(BSON("wtimeout" << 123));
+    ASSERT_OK(sw.getStatus());
+    WriteConcernOptions options = sw.getValue();
     ASSERT_TRUE(WriteConcernOptions::SyncMode::UNSET == options.syncMode);
     ASSERT_EQUALS("", options.wMode);
     ASSERT_EQUALS(1, options.wNumNodes);
     ASSERT_EQUALS(123, options.wTimeout);
 }
 
+TEST(WriteConcernOptionsTest, ParseWTimeoutAsNaNDouble) {
+    const double nan = std::nan("1");
+    auto sw = WriteConcernOptions::parse(BSON("wtimeout" << nan));
+    ASSERT_OK(sw.getStatus());
+    WriteConcernOptions options = sw.getValue();
+    ASSERT_TRUE(WriteConcernOptions::SyncMode::UNSET == options.syncMode);
+    ASSERT_EQUALS("", options.wMode);
+    ASSERT_EQUALS(1, options.wNumNodes);
+    ASSERT_EQUALS(0, options.wTimeout);
+}
+
+TEST(WriteConcernOptionsTest, ParseWTimeoutAsDoubleLargerThanInt) {
+    // Set wtimeout to a double with value larger than INT_MAX.
+    auto sw = WriteConcernOptions::parse(BSON("wtimeout" << 2999999999.0));
+    ASSERT_OK(sw.getStatus());
+    WriteConcernOptions options = sw.getValue();
+    ASSERT_TRUE(WriteConcernOptions::SyncMode::UNSET == options.syncMode);
+    ASSERT_EQUALS("", options.wMode);
+    ASSERT_EQUALS(1, options.wNumNodes);
+    ASSERT_LESS_THAN(options.wTimeout, 0);
+}
+
 TEST(WriteConcernOptionsTest, ParseReturnsFailedToParseOnUnknownField) {
-    auto status = WriteConcernOptions().parse(BSON("x" << 123));
+    auto status = WriteConcernOptions::parse(BSON("x" << 123)).getStatus();
     ASSERT_EQUALS(ErrorCodes::FailedToParse, status);
     ASSERT_EQUALS("unrecognized write concern field: x", status.reason());
 }
 
 void _testIgnoreWriteConcernField(const char* fieldName) {
-    WriteConcernOptions options;
-    ASSERT_OK(options.parse(BSON(fieldName << 1)));
+    auto sw = WriteConcernOptions::parse(BSON(fieldName << 1));
+    ASSERT_OK(sw.getStatus());
+    WriteConcernOptions options = sw.getValue();
     ASSERT_TRUE(WriteConcernOptions::SyncMode::UNSET == options.syncMode);
     ASSERT_EQUALS("", options.wMode);
     ASSERT_EQUALS(1, options.wNumNodes);

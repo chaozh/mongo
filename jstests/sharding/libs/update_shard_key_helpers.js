@@ -14,38 +14,21 @@ function shardCollectionMoveChunks(
 
     if (docsToInsert.length > 0) {
         assert.commandWorked(st.s.adminCommand({split: ns, find: splitDoc}));
-        assert.commandWorked(
-            st.s.adminCommand({moveChunk: ns, find: moveChunkDoc, to: st.shard1.shardName}));
+        assert.commandWorked(st.s.adminCommand(
+            {moveChunk: ns, find: moveChunkDoc, to: st.shard1.shardName, _waitForDelete: true}));
     }
 
     assert.commandWorked(st.shard0.adminCommand({_flushDatabaseCacheUpdates: kDbName}));
     assert.commandWorked(st.shard0.adminCommand({_flushRoutingTableCacheUpdates: ns}));
     assert.commandWorked(st.shard1.adminCommand({_flushDatabaseCacheUpdates: kDbName}));
     assert.commandWorked(st.shard1.adminCommand({_flushRoutingTableCacheUpdates: ns}));
-}
-
-function cleanupOrphanedDocs(st, ns) {
-    st._rs.forEach((rs) => {
-        var nextKey = {};
-        var result;
-
-        while (nextKey != null) {
-            result =
-                rs.test.getPrimary().adminCommand({cleanupOrphaned: ns, startingFromKey: nextKey});
-
-            if (result.ok != 1)
-                print("Unable to complete at this time: failure or timeout.");
-
-            printjson(result);
-
-            nextKey = result.stoppedAtKey;
-        }
-    });
+    st.refreshCatalogCacheForNs(st.s, ns);
 }
 
 function assertUpdateSucceeds(st, session, sessionDB, inTxn, query, update, upsert) {
     let res;
     if (inTxn) {
+        st.refreshCatalogCacheForNs(st.s, sessionDB.foo.getFullName());
         session.startTransaction();
         res = assert.commandWorked(sessionDB.foo.update(query, update, {"upsert": upsert}));
         assert.commandWorked(session.commitTransaction_forTesting());
@@ -111,6 +94,7 @@ function runFindAndModifyCmdSuccess(st,
         }
 
         if (inTxn) {
+            st.refreshCatalogCacheForNs(st.s, sessionDB.foo.getFullName());
             session.startTransaction();
             res = sessionDB.foo.findAndModify(
                 {query: queries[i], update: updates[i], "upsert": upsert, "new": returnNew});
@@ -158,6 +142,7 @@ function runUpdateCmdFail(st,
                           pipelineUpdateResult) {
     let res;
     if (inTxn) {
+        st.refreshCatalogCacheForNs(st.s, sessionDB.foo.getFullName());
         session.startTransaction();
         res = sessionDB.foo.update(query, update, {multi: multiParamSet});
         assert.writeError(res);
@@ -223,7 +208,6 @@ function assertCanUpdatePrimitiveShardKey(st,
     let splitDoc = {"x": 100};
 
     shardCollectionMoveChunks(st, kDbName, ns, {"x": 1}, docsToInsert, splitDoc, {"x": 300});
-    cleanupOrphanedDocs(st, ns);
 
     if (isFindAndModify) {
         // Run once with {new: false} and once with {new: true} to make sure findAndModify
@@ -242,7 +226,6 @@ function assertCanUpdatePrimitiveShardKey(st,
         sessionDB.foo.drop();
 
         shardCollectionMoveChunks(st, kDbName, ns, {"x": 1}, docsToInsert, splitDoc, {"x": 300});
-        cleanupOrphanedDocs(st, ns);
         runFindAndModifyCmdSuccess(st,
                                    kDbName,
                                    session,
@@ -289,7 +272,6 @@ function assertCanUpdateDottedPath(st,
     ];
     let splitDoc = {"x": {"a": 100}};
     shardCollectionMoveChunks(st, kDbName, ns, {"x.a": 1}, docsToInsert, splitDoc, {"x.a": 300});
-    cleanupOrphanedDocs(st, ns);
 
     if (isFindAndModify) {
         // Run once with {new: false} and once with {new: true} to make sure findAndModify
@@ -309,7 +291,6 @@ function assertCanUpdateDottedPath(st,
 
         shardCollectionMoveChunks(
             st, kDbName, ns, {"x.a": 1}, docsToInsert, splitDoc, {"x.a": 300});
-        cleanupOrphanedDocs(st, ns);
 
         runFindAndModifyCmdSuccess(st,
                                    kDbName,
@@ -355,7 +336,6 @@ function assertCanUpdatePartialShardKey(st,
     let splitDoc = {"x": 100, "y": 50};
     shardCollectionMoveChunks(
         st, kDbName, ns, {"x": 1, "y": 1}, docsToInsert, splitDoc, {"x": 300, "y": 80});
-    cleanupOrphanedDocs(st, ns);
 
     if (isFindAndModify) {
         // Run once with {new: false} and once with {new: true} to make sure findAndModify
@@ -380,7 +360,6 @@ function assertCanUpdatePartialShardKey(st,
                                   docsToInsert,
                                   {"x": 100, "y": 50},
                                   {"x": 300, "y": 80});
-        cleanupOrphanedDocs(st, ns);
 
         runFindAndModifyCmdSuccess(st,
                                    kDbName,
@@ -459,7 +438,6 @@ function assertCannotUpdate_id(st,
         [{"_id": 4, "a": 3}, {"_id": 100}, {"_id": 300, "a": 3}, {"_id": 500, "a": 6}];
     shardCollectionMoveChunks(
         st, kDbName, ns, {"_id": 1}, docsToInsert, {"_id": 100}, {"_id": 300});
-    cleanupOrphanedDocs(st, ns);
 
     if (isFindAndModify) {
         runFindAndModifyCmdFail(
@@ -498,7 +476,6 @@ function assertCannotUpdate_idDottedPath(st,
     ];
     shardCollectionMoveChunks(
         st, kDbName, ns, {"_id.a": 1}, docsToInsert, {"_id.a": 100}, {"_id.a": 300});
-    cleanupOrphanedDocs(st, ns);
 
     if (isFindAndModify) {
         runFindAndModifyCmdFail(
@@ -523,7 +500,6 @@ function assertCannotUpdateWithMultiTrue(
     st, kDbName, ns, session, sessionDB, inTxn, query, update, pipelineUpdateResult) {
     let docsToInsert = [{"x": 4, "a": 3}, {"x": 100}, {"x": 300, "a": 3}, {"x": 500, "a": 6}];
     shardCollectionMoveChunks(st, kDbName, ns, {"x": 1}, docsToInsert, {"x": 100}, {"x": 300});
-    cleanupOrphanedDocs(st, ns);
 
     runUpdateCmdFail(
         st, kDbName, session, sessionDB, inTxn, query, update, true, null, pipelineUpdateResult);
@@ -535,7 +511,6 @@ function assertCannotUpdateSKToArray(
     st, kDbName, ns, session, sessionDB, inTxn, isFindAndModify, query, update) {
     let docsToInsert = [{"x": 4, "a": 3}, {"x": 100}, {"x": 300, "a": 3}, {"x": 500, "a": 6}];
     shardCollectionMoveChunks(st, kDbName, ns, {"x": 1}, docsToInsert, {"x": 100}, {"x": 300});
-    cleanupOrphanedDocs(st, ns);
 
     if (isFindAndModify) {
         runFindAndModifyCmdFail(st, kDbName, session, sessionDB, inTxn, query, update);
@@ -555,7 +530,6 @@ function assertCanUpdateInBulkOpWhenDocsRemainOnSameShard(
 
     // Update multiple documents on different shards
     shardCollectionMoveChunks(st, kDbName, ns, {"x": 1}, docsToInsert, {"x": 100}, {"x": 300});
-    cleanupOrphanedDocs(st, ns);
     if (inTxn) {
         session.startTransaction();
     }
@@ -586,7 +560,6 @@ function assertCanUpdateInBulkOpWhenDocsRemainOnSameShard(
     // for doc A. The outcome should be the same for both ordered and unordered bulk ops because
     // the doc will not change shards, so both udpates will be targeted to the same shard.
     shardCollectionMoveChunks(st, kDbName, ns, {"x": 1}, docsToInsert, {"x": 100}, {"x": 300});
-    cleanupOrphanedDocs(st, ns);
     if (inTxn) {
         session.startTransaction();
     }
@@ -617,7 +590,6 @@ function assertCanUpdateInBulkOpWhenDocsRemainOnSameShard(
     // unordered bulk ops because the doc will not change shards, so both udpates will be
     // targeted to the same shard.
     shardCollectionMoveChunks(st, kDbName, ns, {"x": 1}, docsToInsert, {"x": 100}, {"x": 300});
-    cleanupOrphanedDocs(st, ns);
     if (inTxn) {
         session.startTransaction();
     }
@@ -657,7 +629,6 @@ function assertCannotUpdateInBulkOpWhenDocsMoveShards(
 
     // Multiple updates - one updates the shard key and the other updates a different field.
     shardCollectionMoveChunks(st, kDbName, ns, {"x": 1}, docsToInsert, {"x": 100}, {"x": 300});
-    cleanupOrphanedDocs(st, ns);
 
     if (inTxn) {
         session.startTransaction();
@@ -709,7 +680,6 @@ function assertCannotUpdateInBulkOpWhenDocsMoveShards(
 
     // Multiple updates - one updates the shard key and the other updates a different field.
     shardCollectionMoveChunks(st, kDbName, ns, {"x": 1}, docsToInsert, {"x": 100}, {"x": 300});
-    cleanupOrphanedDocs(st, ns);
     if (inTxn) {
         session.startTransaction();
     }
@@ -754,7 +724,6 @@ function assertCannotUpdateInBulkOpWhenDocsMoveShards(
 
     // Update multiple documents on different shards
     shardCollectionMoveChunks(st, kDbName, ns, {"x": 1}, docsToInsert, {"x": 100}, {"x": 300});
-    cleanupOrphanedDocs(st, ns);
     if (inTxn) {
         session.startTransaction();
     }
@@ -789,7 +758,6 @@ function assertCannotUpdateInBulkOpWhenDocsMoveShards(
 
     // Update multiple documents on the same shard
     shardCollectionMoveChunks(st, kDbName, ns, {"x": 1}, docsToInsert, {"x": 100}, {"x": 300});
-    cleanupOrphanedDocs(st, ns);
     if (inTxn) {
         session.startTransaction();
     }
@@ -854,7 +822,6 @@ function assertCanUpdatePrimitiveShardKeyHashedChangeShards(
         [{"x": 4, "a": 3}, {"x": 78}, {"x": 100}, {"x": 300, "a": 3}, {"x": 500, "a": 6}];
     shardCollectionMoveChunks(
         st, kDbName, ns, {"x": "hashed"}, docsToInsert, {"x": 100}, {"x": 300});
-    cleanupOrphanedDocs(st, ns);
 
     // Because this collection is hash sharded, we need to figure out which values of x belong to
     // which shard.
@@ -909,7 +876,6 @@ function assertCanUpdatePrimitiveShardKeyHashedSameShards(
         [{"x": 4, "a": 3}, {"x": 78}, {"x": 100}, {"x": 300, "a": 3}, {"x": 500, "a": 6}];
     shardCollectionMoveChunks(
         st, kDbName, ns, {"x": "hashed"}, docsToInsert, {"x": 100}, {"x": 300});
-    cleanupOrphanedDocs(st, ns);
 
     // Because this collection is hash sharded, we need to figure out which values of x belong to
     // which shard.

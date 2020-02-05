@@ -193,7 +193,7 @@ public:
      * Waits until all commits that happened before this call are durable in the journal. Returns
      * true, unless the storage engine cannot guarantee durability, which should never happen when
      * isDurable() returned true. This cannot be called from inside a unit of work, and should
-     * fail if it is.
+     * fail if it is. This method invariants if the caller holds any locks, except for repair.
      */
     virtual bool waitUntilDurable(OperationContext* opCtx) = 0;
 
@@ -349,6 +349,29 @@ public:
     }
 
     /**
+     * Sets catalog conflicting timestamp.
+     * This cannot be called after WiredTigerRecoveryUnit::_txnOpen.
+     *
+     * This value must be set when both of the following conditions are true:
+     * - A storage engine snapshot is opened without a read timestamp
+     * (RecoveryUnit::ReadSource::kNoTimestamp).
+     * - The transaction may touch collections it does not yet have locks for.
+     * In this circumstance, the catalog conflicting timestamp serves as a substitute for a read
+     * timestamp. This value must be set to a valid (i.e: no-holes) read timestamp prior to
+     * acquiring a storage engine snapshot. This timestamp will be used to determine if any changes
+     * had happened to the in-memory catalog after a storage engine snapshot got opened for that
+     * transaction.
+     */
+    virtual void setCatalogConflictingTimestamp(Timestamp timestamp) {}
+
+    /**
+     * Returns the catalog conflicting timestamp.
+     */
+    virtual Timestamp getCatalogConflictingTimestamp() const {
+        return {};
+    }
+
+    /**
      * Fetches the storage level statistics.
      */
     virtual std::shared_ptr<StorageStats> getOperationStatistics() const {
@@ -429,6 +452,15 @@ public:
      * is called and before either commitUnitOfWork or abortUnitOfWork gets called.
      */
     virtual bool inActiveTxn() const = 0;
+
+    /**
+     * Registers a callback to be called prior to a WriteUnitOfWork committing the storage
+     * transaction. This callback may throw a WriteConflictException which will abort the
+     * transaction.
+     */
+    virtual void registerPreCommitHook(std::function<void(OperationContext*)> callback);
+
+    virtual void runPreCommitHooks(OperationContext* opCtx);
 
     /**
      * A Change is an action that is registerChange()'d while a WriteUnitOfWork exists. The
@@ -555,7 +587,6 @@ public:
         kAborting,
         kCommitting,
     };
-    State getState_forTest() const;
 
     std::string toString(State state) const {
         switch (state) {
@@ -626,6 +657,8 @@ private:
     virtual void doAbandonSnapshot() = 0;
     virtual void doCommitUnitOfWork() = 0;
     virtual void doAbortUnitOfWork() = 0;
+
+    std::vector<std::function<void(OperationContext*)>> _preCommitHooks;
 
     typedef std::vector<std::unique_ptr<Change>> Changes;
     Changes _changes;

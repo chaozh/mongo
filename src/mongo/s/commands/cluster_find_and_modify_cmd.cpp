@@ -153,11 +153,12 @@ public:
         return true;
     }
 
-    ReadConcernSupportResult supportsReadConcern(const std::string& dbName,
-                                                 const BSONObj& cmdObj,
+    ReadConcernSupportResult supportsReadConcern(const BSONObj& cmdObj,
                                                  repl::ReadConcernLevel level) const final {
-        return {ReadConcernSupportResult::ReadConcern::kSupported,
-                ReadConcernSupportResult::DefaultReadConcern::kPermitted};
+        return {{level != repl::ReadConcernLevel::kLocalReadConcern &&
+                     level != repl::ReadConcernLevel::kSnapshotReadConcern,
+                 {ErrorCodes::InvalidOptions, "read concern not supported"}},
+                {{ErrorCodes::InvalidOptions, "default read concern not permitted"}}};
     }
 
     void addRequiredPrivileges(const std::string& dbname,
@@ -207,7 +208,7 @@ public:
                         chunkMgr->getVersion(shard->getId()),
                         boost::none,
                         nss,
-                        explainCmd,
+                        applyReadWriteConcern(opCtx, false, false, explainCmd),
                         &bob);
         } else {
             _runCommand(opCtx,
@@ -215,7 +216,7 @@ public:
                         ChunkVersion::UNSHARDED(),
                         routingInfo.db().databaseVersion(),
                         nss,
-                        explainCmd,
+                        applyReadWriteConcern(opCtx, false, false, explainCmd),
                         &bob);
         }
 
@@ -254,7 +255,7 @@ public:
                         ChunkVersion::UNSHARDED(),
                         routingInfo.db().databaseVersion(),
                         nss,
-                        cmdObjForShard,
+                        applyReadWriteConcern(opCtx, this, cmdObjForShard),
                         &result);
             return true;
         }
@@ -271,7 +272,7 @@ public:
                     chunkMgr->getVersion(chunk.getShardId()),
                     boost::none,
                     nss,
-                    cmdObjForShard,
+                    applyReadWriteConcern(opCtx, this, cmdObjForShard),
                     &result);
 
         return true;
@@ -288,8 +289,7 @@ private:
         bool isRetryableWrite = opCtx->getTxnNumber() && !TransactionRouter::get(opCtx);
         const auto response = [&] {
             std::vector<AsyncRequestsSender::Request> requests;
-            BSONObj filteredCmdObj = appendAllowImplicitCreate(
-                CommandHelpers::filterCommandRequestForPassthrough(cmdObj), false);
+            BSONObj filteredCmdObj = CommandHelpers::filterCommandRequestForPassthrough(cmdObj);
             BSONObj cmdObjWithVersions(std::move(filteredCmdObj));
             if (dbVersion) {
                 cmdObjWithVersions = appendDbVersionIfPresent(cmdObjWithVersions, *dbVersion);
@@ -331,9 +331,18 @@ private:
                     // Re-run the findAndModify command that will change the shard key value in a
                     // transaction. We call _runCommand recursively, and this second time through
                     // since it will be run as a transaction it will take the other code path to
-                    // updateShardKeyValueOnWouldChangeOwningShardError.
+                    // updateShardKeyValueOnWouldChangeOwningShardError.  We ensure the retried
+                    // operation does not include WC inside the transaction by stripping it from the
+                    // cmdObj.  The transaction commit will still use the WC, because it uses the WC
+                    // from the opCtx (which has been set previously in Strategy).
                     documentShardKeyUpdateUtil::startTransactionForShardKeyUpdate(opCtx);
-                    _runCommand(opCtx, shardId, shardVersion, dbVersion, nss, cmdObj, result);
+                    _runCommand(opCtx,
+                                shardId,
+                                shardVersion,
+                                dbVersion,
+                                nss,
+                                stripWriteConcern(cmdObj),
+                                result);
                     uassertStatusOK(getStatusFromCommandResult(result->asTempObj()));
                     auto commitResponse =
                         documentShardKeyUpdateUtil::commitShardKeyUpdateTransaction(opCtx);

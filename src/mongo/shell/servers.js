@@ -103,6 +103,10 @@ function pathJoin(...parts) {
     return parts.join(separator);
 }
 
+// Internal state to determine if the hang analyzer should be enabled or not.
+// Accessible via global setter/getter defined below.
+let _hangAnalyzerEnabled = true;
+
 /**
  * Run `./buildscripts/hang_analyzer.py`.
  *
@@ -118,6 +122,12 @@ function runHangAnalyzer(pids) {
         print("Skipping runHangAnalyzer: no TestData (not running from resmoke)");
         return;
     }
+
+    if (!_hangAnalyzerEnabled) {
+        print('Skipping runHangAnalyzer: manually disabled');
+        return;
+    }
+
     if (typeof pids === 'undefined') {
         pids = getPids();
     }
@@ -130,10 +140,18 @@ function runHangAnalyzer(pids) {
     pids = pids.map(p => p + 0).join(',');
     print(`Running hang_analyzer.py for pids [${pids}]`);
     const scriptPath = pathJoin('.', 'buildscripts', 'hang_analyzer.py');
-    runProgram('python', scriptPath, '-c', '-d', pids);
+    return runProgram('python', scriptPath, '-c', '-d', pids);
 }
 
 MongoRunner.runHangAnalyzer = runHangAnalyzer;
+
+MongoRunner.runHangAnalyzer.enable = function() {
+    _hangAnalyzerEnabled = true;
+};
+
+MongoRunner.runHangAnalyzer.disable = function() {
+    _hangAnalyzerEnabled = false;
+};
 })();
 
 /**
@@ -624,8 +642,21 @@ var _removeSetParameterIfBeforeVersion = function(opts, parameterName, requiredV
  *     oplogSize
  *   }
  */
-MongoRunner.mongodOptions = function(opts) {
+MongoRunner.mongodOptions = function(opts = {}) {
     opts = MongoRunner.mongoOptions(opts);
+
+    if (jsTestOptions().alwaysUseLogFiles) {
+        if (opts.cleanData || opts.startClean || opts.noCleanData === false ||
+            opts.useLogFiles === false) {
+            throw new Error("Always using log files, but received conflicting option.");
+        }
+
+        opts.cleanData = false;
+        opts.startClean = false;
+        opts.noCleanData = true;
+        opts.useLogFiles = true;
+        opts.logappend = "";
+    }
 
     opts.dbpath = MongoRunner.toRealDir(opts.dbpath || "$dataDir/mongod-$port", opts.pathOpts);
 
@@ -707,6 +738,15 @@ MongoRunner.mongosOptions = function(opts) {
     // Normalize configdb option to be host string if currently a host
     if (opts.configdb && opts.configdb.getDB) {
         opts.configdb = opts.configdb.host;
+    }
+
+    if (jsTestOptions().alwaysUseLogFiles) {
+        if (opts.useLogFiles === false) {
+            throw new Error("Always using log files, but received conflicting option.");
+        }
+
+        opts.useLogFiles = true;
+        opts.logappend = "";
     }
 
     opts.pathOpts = Object.merge(opts.pathOpts, {configdb: opts.configdb.replace(/:|\/|,/g, "-")});
@@ -918,11 +958,12 @@ MongoRunner.validateCollectionsCallback = function(port) {};
  *      skipValidation: <bool>,
  *      allowedExitCode: <int>
  *    }
+ * @param {boolean} waitpid should we wait for the process to terminate after stopping it.
  *
  * Note: The auth option is required in a authenticated mongod running in Windows since
  *  it uses the shutdown command, which requires admin credentials.
  */
-MongoRunner.stopMongod = function(conn, signal, opts) {
+MongoRunner.stopMongod = function(conn, signal, opts, waitpid) {
     if (!conn.pid) {
         throw new Error("first arg must have a `pid` property; " +
                         "it is usually the object returned from MongoRunner.runMongod/s");
@@ -935,6 +976,7 @@ MongoRunner.stopMongod = function(conn, signal, opts) {
 
     signal = parseInt(signal) || 15;
     opts = opts || {};
+    waitpid = (waitpid === undefined) ? true : waitpid;
 
     var allowedExitCode = MongoRunner.EXIT_CLEAN;
 
@@ -965,7 +1007,12 @@ MongoRunner.stopMongod = function(conn, signal, opts) {
             MongoRunner.validateCollectionsCallback(port);
         }
 
-        returnCode = _stopMongoProgram(port, signal, opts);
+        returnCode = _stopMongoProgram(port, signal, opts, waitpid);
+    }
+
+    // If we are not waiting for shutdown, then there is no exit code to check.
+    if (!waitpid) {
+        return 0;
     }
     if (allowedExitCode !== returnCode) {
         throw new MongoRunner.StopError(returnCode);
@@ -978,83 +1025,6 @@ MongoRunner.stopMongod = function(conn, signal, opts) {
 };
 
 MongoRunner.stopMongos = MongoRunner.stopMongod;
-
-/**
- * Starts an instance of the specified mongo tool
- *
- * @param {String} binaryName - The name of the tool to run.
- * @param {Object} [opts={}] - Options of the form --flag or --key=value to pass to the tool.
- * @param {string} [opts.binVersion] - The version of the tool to run.
- *
- * @param {...string} positionalArgs - Positional arguments to pass to the tool after all
- * options have been specified. For example,
- * MongoRunner.runMongoTool("executable", {key: value}, arg1, arg2) would invoke
- * ./executable --key value arg1 arg2.
- *
- * @see MongoRunner.arrOptions
- */
-MongoRunner.runMongoTool = function(binaryName, opts, ...positionalArgs) {
-    var opts = opts || {};
-
-    // Normalize and get the binary version to use
-    if (opts.binVersion instanceof MongoRunner.versionIterator.iterator) {
-        // Advance the version iterator so that subsequent calls to MongoRunner.runMongoTool()
-        // use the next version in the list.
-        const iterator = opts.binVersion;
-        opts.binVersion = iterator.current();
-        iterator.advance();
-    }
-    opts.binVersion = MongoRunner.getBinVersionFor(opts.binVersion);
-
-    // Recent versions of the mongo tools support a --dialTimeout flag to set for how
-    // long they retry connecting to a mongod or mongos process. We have them retry
-    // connecting for up to 30 seconds to handle when the tests are run on a
-    // resource-constrained host machine.
-    //
-    // The bsondump tool doesn't accept the --dialTimeout flag because it doesn't connect to a
-    // mongod or mongos process.
-    if (!opts.hasOwnProperty('dialTimeout') && binaryName !== 'bsondump' &&
-        _toolVersionSupportsDialTimeout(opts.binVersion)) {
-        opts['dialTimeout'] = '30';
-    }
-
-    // Convert 'opts' into an array of arguments.
-    var argsArray = MongoRunner.arrOptions(binaryName, opts);
-
-    // Append any positional arguments that were specified.
-    argsArray.push(...positionalArgs);
-
-    return runMongoProgram.apply(null, argsArray);
-};
-
-var _toolVersionSupportsDialTimeout = function(version) {
-    if (version === "latest" || version === "") {
-        return true;
-    }
-    var versionParts =
-        convertVersionStringToArray(version).slice(0, 3).map(part => parseInt(part, 10));
-    if (versionParts.length === 2) {
-        versionParts.push(Infinity);
-    }
-
-    if (versionParts[0] > 3 || (versionParts[0] === 3 && versionParts[1] > 3)) {
-        // The --dialTimeout command line option is supported by the tools
-        // with a major version newer than 3.3.
-        return true;
-    }
-
-    for (var supportedVersion of ["3.3.4", "3.2.5", "3.0.12"]) {
-        var supportedVersionParts = convertVersionStringToArray(supportedVersion)
-                                        .slice(0, 3)
-                                        .map(part => parseInt(part, 10));
-        if (versionParts[0] === supportedVersionParts[0] &&
-            versionParts[1] === supportedVersionParts[1] &&
-            versionParts[2] >= supportedVersionParts[2]) {
-            return true;
-        }
-    }
-    return false;
-};
 
 // Given a test name figures out a directory for that test to use for dump files and makes sure
 // that directory exists and is empty.
@@ -1144,6 +1114,15 @@ function appendSetParameterArgs(argArray) {
             argArray.push(...['--setParameter', "disableLogicalSessionCacheRefresh=true"]);
         }
 
+        // New options in 4.3.x
+        if (!programMajorMinorVersion || programMajorMinorVersion >= 403) {
+            if (jsTest.options().logFormat) {
+                if (!argArrayContains("--logFormat")) {
+                    argArray.push(...["--logFormat", jsTest.options().logFormat]);
+                }
+            }
+        }
+
         // Since options may not be backward compatible, mongos options are not
         // set on older versions, e.g., mongos-3.0.
         if (programName.endsWith('mongos')) {
@@ -1202,9 +1181,7 @@ function appendSetParameterArgs(argArray) {
                 }
             }
 
-            // Since options may not be backward compatible, mongod options are not
-            // set on older versions, e.g., mongod-3.0.
-            if (programName.endsWith('mongod')) {
+            if (!programMajorMinorVersion || programMajorMinorVersion >= 306) {
                 if (jsTest.options().storageEngine === "wiredTiger" ||
                     !jsTest.options().storageEngine) {
                     if (jsTest.options().enableMajorityReadConcern !== undefined &&
@@ -1212,6 +1189,14 @@ function appendSetParameterArgs(argArray) {
                         argArray.push(...['--enableMajorityReadConcern',
                                           jsTest.options().enableMajorityReadConcern.toString()]);
                     }
+                }
+            }
+
+            // Since options may not be backward compatible, mongod options are not
+            // set on older versions, e.g., mongod-3.0.
+            if (programName.endsWith('mongod')) {
+                if (jsTest.options().storageEngine === "wiredTiger" ||
+                    !jsTest.options().storageEngine) {
                     if (jsTest.options().storageEngineCacheSizeGB &&
                         !argArrayContains('--wiredTigerCacheSizeGB')) {
                         argArray.push(...['--wiredTigerCacheSizeGB',
@@ -1387,7 +1372,7 @@ runMongoProgram = function() {
     var progName = args[0];
 
     // The bsondump tool doesn't support these auth related command line flags.
-    if (jsTestOptions().auth && progName != 'mongod' && progName != 'bsondump') {
+    if (jsTestOptions().auth && progName != 'mongod') {
         args = args.slice(1);
         args.unshift(progName,
                      '-u',

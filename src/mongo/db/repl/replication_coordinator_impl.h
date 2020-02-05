@@ -108,6 +108,8 @@ public:
 
     virtual void shutdown(OperationContext* opCtx) override;
 
+    void markAsCleanShutdownIfPossible(OperationContext* opCtx) override;
+
     virtual const ReplSettings& getSettings() const override;
 
     virtual Mode getReplicationMode() const override;
@@ -210,9 +212,6 @@ public:
     virtual Status processReplSetGetStatus(BSONObjBuilder* result,
                                            ReplSetGetStatusResponseStyle responseStyle) override;
 
-    virtual void fillIsMasterForReplSet(IsMasterResponse* result,
-                                        const SplitHorizon::Parameters& horizonParams) override;
-
     virtual void appendSlaveInfoData(BSONObjBuilder* result) override;
 
     virtual ReplSetConfig getConfig() const override;
@@ -292,7 +291,7 @@ public:
     /**
      * Get current term from topology coordinator
      */
-    virtual long long getTerm() override;
+    virtual long long getTerm() const override;
 
     // Returns the ServiceContext where this instance runs.
     virtual ServiceContext* getServiceContext() override {
@@ -337,6 +336,18 @@ public:
         const ReplicationCoordinator::OpsKillingStateTransitionEnum stateTransition,
         const size_t numOpsKilled,
         const size_t numOpsRunning) const override;
+
+    virtual TopologyVersion getTopologyVersion() const override;
+
+    virtual void incrementTopologyVersion(OperationContext* opCtx) override;
+
+    virtual std::shared_ptr<const IsMasterResponse> awaitIsMasterResponse(
+        OperationContext* opCtx,
+        const SplitHorizon::Parameters& horizonParams,
+        boost::optional<TopologyVersion> clientTopologyVersion,
+        boost::optional<Date_t> deadline) const override;
+
+    virtual OpTime getLatestWriteOpTime(OperationContext* opCtx) const override;
 
     // ================== Test support API ===================
 
@@ -439,6 +450,8 @@ private:
 
     using ScheduleFn = std::function<StatusWith<executor::TaskExecutor::CallbackHandle>(
         const executor::TaskExecutor::CallbackFn& work)>;
+
+    using SharedPromiseOfIsMasterResponse = SharedPromise<std::shared_ptr<const IsMasterResponse>>;
 
     class LoseElectionGuardV1;
     class LoseElectionDryRunGuardV1;
@@ -956,6 +969,12 @@ private:
     void _setConfigState_inlock(ConfigState newState);
 
     /**
+     * Fulfills the promises that are waited on by awaitable isMaster requests. This increments the
+     * server TopologyVersion.
+     */
+    void _fulfillTopologyChangePromise(OperationContext* opCtx, WithLock);
+
+    /**
      * Updates the cached value, _memberState, to match _topCoord's reported
      * member state, from getMemberState().
      *
@@ -1096,6 +1115,12 @@ private:
     void _heartbeatReconfigFinish(const executor::TaskExecutor::CallbackArgs& cbData,
                                   const ReplSetConfig& newConfig,
                                   StatusWith<int> myIndex);
+
+    /**
+     * Fills an IsMasterResponse with the appropriate replication related fields.
+     */
+    std::shared_ptr<IsMasterResponse> _makeIsMasterResponse(const StringData horizonString,
+                                                            WithLock) const;
 
     /**
      * Utility method that schedules or performs actions specified by a HeartbeatResponseAction
@@ -1288,12 +1313,18 @@ private:
     executor::TaskExecutor::EventHandle _cancelElectionIfNeeded_inlock();
 
     /**
-     * Waits until the optime of the current node is at least the 'opTime'.
+     * Waits until the lastApplied opTime is at least the 'targetOpTime'.
      */
     Status _waitUntilOpTime(OperationContext* opCtx,
-                            bool isMajorityReadConcern,
-                            OpTime opTime,
+                            OpTime targetOpTime,
                             boost::optional<Date_t> deadline = boost::none);
+
+    /**
+     * Waits until the majority committed snapshot is at least the 'targetOpTime'.
+     */
+    Status _waitUntilMajorityOpTime(OperationContext* opCtx,
+                                    OpTime targetOpTime,
+                                    boost::optional<Date_t> deadline = boost::none);
 
     /**
      * Waits until the optime of the current node is at least the opTime specified in 'readConcern'.
@@ -1311,6 +1342,13 @@ private:
     Status _waitUntilClusterTimeForRead(OperationContext* opCtx,
                                         const ReadConcernArgs& readConcern,
                                         boost::optional<Date_t> deadline);
+
+    /**
+     * Initializes a horizon name to promise mapping. Each awaitable isMaster request will block on
+     * the promise mapped to by the horizon name determined from this map. This map should be
+     * cleared and reinitialized after any reconfig that will change the SplitHorizon.
+     */
+    void _createHorizonTopologyChangePromiseMapping(WithLock);
 
     /**
      * Returns a pseudorandom number no less than 0 and less than limit (which must be positive).
@@ -1367,6 +1405,9 @@ private:
     // list of information about clients waiting for a particular lastApplied opTime.
     // Waiters in this list are checked and notified on self's lastApplied opTime updates.
     WaiterList _opTimeWaiterList;  // (M)
+
+    // Maps a horizon name to the promise waited on by exhaust isMaster requests.
+    StringMap<std::shared_ptr<SharedPromiseOfIsMasterResponse>> _horizonToPromiseMap;  // (M)
 
     // Set to true when we are in the process of shutting down replication.
     bool _inShutdown;  // (M)
@@ -1436,6 +1477,9 @@ private:
     // This set should also be cleared if a rollback occurs.
     std::set<OpTimeAndWallTime> _stableOpTimeCandidates;  // (M)
 
+    // A flag that enables/disables advancement of the stable timestamp for storage.
+    bool _shouldSetStableTimestamp = true;  // (M)
+
     // Used to signal threads that are waiting for new committed snapshots.
     stdx::condition_variable _currentCommittedSnapshotCond;  // (M)
 
@@ -1497,6 +1541,9 @@ private:
 
     // If we're in terminal shutdown.  If true, we'll refuse to vote in elections.
     bool _inTerminalShutdown = false;  // (M)
+
+    // The cached value of the 'counter' field in the server's TopologyVersion.
+    AtomicWord<int64_t> _cachedTopologyVersionCounter;  // (S)
 };
 
 }  // namespace repl

@@ -86,7 +86,8 @@ protected:
      */
     auto fromBSONForAPI(const uint8_t* bson) {
         return mongo::tojson(
-            mongo::BSONObj(static_cast<const char*>(static_cast<const void*>(bson))));
+            mongo::BSONObj(static_cast<const char*>(static_cast<const void*>(bson))),
+            mongo::JsonStringFormat::LegacyStrict);
     }
 
     auto checkMatch(const char* filterJSON,
@@ -409,7 +410,7 @@ TEST_F(StitchSupportTest, CheckProjectionWorksWithDefaults) {
     ASSERT_EQ("{ \"_id\" : 1, \"a\" : 200 }", results[1]);
 
     std::tie(results, needsMatch) =
-        checkProjection("{'a.$.c': 1}",
+        checkProjection("{'a.$': 1}",
                         {"{_id: 1, a: [{b: 2, c: 100}, {b: 1, c: 200}]}",
                          "{_id: 1, a: [{b: 1, c: 100, d: 45}, {b: 2, c: 200}]}"},
                         "{'a.b': 1}");
@@ -428,9 +429,8 @@ TEST_F(StitchSupportTest, CheckProjectionWorksWithDefaults) {
 }
 
 TEST_F(StitchSupportTest, CheckProjectionProducesExpectedStatus) {
-    ASSERT_EQ(
-        "Projections with a positional operator require a matcher",
-        checkProjectionStatus("{'a.$.c': 1}", "{_id: 1, a: [{b: 2, c: 100}, {b: 1, c: 200}]}"));
+    ASSERT_EQ("Projections with a positional operator require a matcher",
+              checkProjectionStatus("{'a.$': 1}", "{_id: 1, a: [{b: 2, c: 100}, {b: 1, c: 200}]}"));
     ASSERT_EQ("$textScore, $sortKey, $recordId and $geoNear are not allowed in this context",
               checkProjectionStatus("{a: {$meta: 'textScore'}}", "{_id: 1, a: 100, b: 200}"));
 
@@ -476,6 +476,35 @@ TEST_F(StitchSupportTest, TestReplacementStyleUpdateReportsNoModifiedPaths) {
 
 TEST_F(StitchSupportTest, TestReplacementStyleUpdatePreservesId) {
     ASSERT_EQ("{ \"_id\" : 123, \"b\" : 789 }", checkUpdate("{b: 789}", "{_id: 123, a: 456}"));
+}
+
+TEST_F(StitchSupportTest, TestReplacementZeroTimestamp) {
+    auto result =
+        mongo::fromjson(checkUpdate("{b: Timestamp(0, 0)}", "{_id: 123, a: 456}").c_str());
+    auto elemB = result["b"];
+    ASSERT_TRUE(elemB.ok());
+    ASSERT_EQUALS(elemB.type(), mongo::BSONType::bsonTimestamp);
+    auto ts = elemB.timestamp();
+    ASSERT_NOT_EQUALS(0U, ts.getSecs());
+    ASSERT_NOT_EQUALS(0U, ts.getInc());
+}
+
+TEST_F(StitchSupportTest, TestUpdateCurrentDateTimestamp) {
+    auto result = mongo::fromjson(
+        checkUpdate("{$currentDate: {b: {$type: 'timestamp'}}}", "{_id: 123, a: 456}").c_str());
+    auto elemB = result["b"];
+    ASSERT_TRUE(elemB.ok());
+    ASSERT_EQUALS(elemB.type(), mongo::BSONType::bsonTimestamp);
+    auto ts = elemB.timestamp();
+    ASSERT_NOT_EQUALS(0U, ts.getSecs());
+    ASSERT_NOT_EQUALS(0U, ts.getInc());
+}
+
+TEST_F(StitchSupportTest, TestUpdatePipelineClusterTime) {
+    auto result = mongo::fromjson(
+        checkUpdate("[{$set: {b: '$$CLUSTER_TIME'}}]", "{_id: 123, a: 456}").c_str());
+    auto elemB = result["b"];
+    ASSERT_FALSE(elemB.ok());
 }
 
 TEST_F(StitchSupportTest, TestUpdateArrayElement) {
@@ -619,7 +648,7 @@ int main(const int argc, const char* const* const argv) {
         return EXIT_FAILURE;
     }
 
-    const auto result = ::mongo::unittest::Suite::run(std::vector<std::string>(), "", 1);
+    const auto result = ::mongo::unittest::Suite::run(std::vector<std::string>(), "", "", 1);
 
     // This is the standard exit path for Mongo processes. See the mongo::quickExit() declaration
     // for more information.

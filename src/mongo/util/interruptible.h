@@ -129,6 +129,24 @@ protected:
 class Interruptible : public InterruptibleBase {
 private:
     /**
+     * Helper class to properly set _isWaiting for Interruptible instances.
+     * Every call sequence that waits on a condition/interrupt must hold an instance of WaitContext.
+     */
+    class WaitContext {
+    public:
+        WaitContext(Interruptible* interruptible) : _interruptible(interruptible) {
+            _interruptible->_isWaiting.store(true);
+        }
+
+        ~WaitContext() {
+            _interruptible->_isWaiting.store(false);
+        }
+
+    private:
+        Interruptible* const _interruptible;
+    };
+
+    /**
      * A deadline guard provides a subsidiary deadline to the parent.
      */
     class DeadlineGuard {
@@ -206,6 +224,17 @@ private:
 
 public:
     class WaitListener;
+
+    Interruptible() : _isWaiting(false) {}
+
+    /**
+     * Returns true if currently waiting for a condition/interrupt.
+     * This function relies on instances of WaitContext to properly set _isWaiting.
+     * Note that _isWaiting remains true until waitForConditionOrInterruptUntil() returns.
+     */
+    bool isWaitingForConditionOrInterrupt() const {
+        return _isWaiting.loadRelaxed();
+    }
 
     /**
      * Enum to convey why an Interruptible woke up
@@ -319,14 +348,50 @@ public:
     bool waitForConditionOrInterruptUntil(stdx::condition_variable& cv,
                                           LockT& m,
                                           Date_t finalDeadline,
-                                          PredicateT pred) {
+                                          PredicateT pred,
+                                          AtomicWord<Microseconds::rep>* waitTimer = nullptr) {
+        WaitContext waitContext(this);
         auto latchName = getLatchName(m);
+
+        /**
+         * Apparatus to measure the approximate time spent in this function (waiting time).
+         * The waiting duration is incrementally added to the atomic word upon:
+         * * Waking from a condition wait (i.e., return from
+         *   waitForConditionOrInterruptNoAssertUntil).
+         * * Returning from the function.
+         */
+        boost::optional<Microseconds::rep> timeOfLastReport;
+        auto advanceWaitTimer = [&]() {
+            invariant(timeOfLastReport);
+            auto now = mongo::curTimeMicros64();
+            auto inc = now - timeOfLastReport.get();
+            waitTimer->fetchAndAdd(inc);
+            timeOfLastReport = now;
+        };
+        ON_BLOCK_EXIT([&]() {
+            if (!waitTimer)
+                return;
+
+            // Never called `waitUntil()`, so waitTime == 0
+            if (!timeOfLastReport)
+                return;
+
+            advanceWaitTimer();
+        });
 
         auto waitUntil = [&](Date_t deadline, WakeSpeed speed) -> boost::optional<WakeReason> {
             // If the result of waitForConditionOrInterruptNoAssertUntil() is non-spurious, return
             // a WakeReason. Otherwise, return boost::none
 
+            if (!timeOfLastReport)
+                timeOfLastReport = mongo::curTimeMicros64();
+
             auto swResult = waitForConditionOrInterruptNoAssertUntil(cv, m, deadline);
+
+            if (MONGO_unlikely(waitTimer)) {
+                advanceWaitTimer();
+            }
+
             if (!swResult.isOK()) {
                 _onWake(latchName, WakeReason::kInterrupt, speed);
                 uassertStatusOK(std::move(swResult));
@@ -393,8 +458,11 @@ public:
      * deadline expiration.
      */
     template <typename LockT, typename PredicateT>
-    void waitForConditionOrInterrupt(stdx::condition_variable& cv, LockT& m, PredicateT pred) {
-        waitForConditionOrInterruptUntil(cv, m, Date_t::max(), std::move(pred));
+    void waitForConditionOrInterrupt(stdx::condition_variable& cv,
+                                     LockT& m,
+                                     PredicateT pred,
+                                     AtomicWord<Microseconds::rep>* waitTimer = nullptr) {
+        waitForConditionOrInterruptUntil(cv, m, Date_t::max(), std::move(pred), waitTimer);
     }
 
     /**
@@ -405,9 +473,10 @@ public:
     bool waitForConditionOrInterruptFor(stdx::condition_variable& cv,
                                         LockT& m,
                                         Milliseconds ms,
-                                        PredicateT pred) {
+                                        PredicateT pred,
+                                        AtomicWord<Microseconds::rep>* waitTimer = nullptr) {
         return waitForConditionOrInterruptUntil(
-            cv, m, getExpirationDateForWaitForValue(ms), std::move(pred));
+            cv, m, getExpirationDateForWaitForValue(ms), std::move(pred), waitTimer);
     }
 
     /**
@@ -447,6 +516,9 @@ protected:
         static State state;
         return state;
     }
+
+private:
+    AtomicWord<bool> _isWaiting;
 };
 
 /**

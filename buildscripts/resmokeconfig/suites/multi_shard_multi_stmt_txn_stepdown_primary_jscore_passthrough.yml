@@ -30,8 +30,6 @@ selector:
   - jstests/core/geo_update_btree2.js  # notablescan.
   - jstests/core/index_id_options.js  # "local" database.
   - jstests/core/index9.js  # "local" database.
-  - jstests/core/max_time_ms.js  # sleep, SERVER-2212.
-  - jstests/core/notablescan.js  # notablescan.
   - jstests/core/queryoptimizera.js  # "local" database.
   - jstests/core/rename*.js # renameCollection.
   - jstests/core/stages*.js  # stageDebug.
@@ -67,7 +65,7 @@ selector:
   # These tests fail because sharded clusters do not clean up correctly after failed index builds.
   # See SERVER-33207 as an example.
   - jstests/core/geo_borders.js
-  # TODO: Remove after fixing SERVER-32555. executionStats.nReturned is incorrect for sharded
+  # TODO: Remove after fixing SERVER-29449. executionStats.nReturned is incorrect for sharded
   # queries with a limit or for distinct commands.
   - jstests/core/distinct_index1.js
   - jstests/core/explain1.js
@@ -76,19 +74,11 @@ selector:
   # TODO: Remove after fixing SERVER-32563. The implementation of explain for the count command is
   # incorrect on sharded collections.
   - jstests/core/explain_count.js
-  # TODO: Remove after fixing SERVER-14324. mapReduce behaves unpredictably when the out collection
-  # is sharded on anything other than {_id: 1}.
-  - jstests/core/mr_undef.js
   # TODO SERVER-32311: These tests use plan stage helpers which can't handle sharded explain output.
   - jstests/core/expr_index_use.js
   - jstests/core/index_multikey.js
   - jstests/core/optimized_match_explain.js
   - jstests/core/sort_array.js
-  # mapReduce requires sharded output collections to be sharded by {_id: 1}. {_id: "hashed"} is not
-  # supported.
-  - jstests/core/mr_correctness.js
-  - jstests/core/mr_fail_invalid_js.js
-  - jstests/core/mr_scope.js
 
   ##
   ## Limitations with the way the runner file injects transactions.
@@ -113,6 +103,7 @@ selector:
   - jstests/core/in.js
   - jstests/core/index8.js # No explicit check for failed command.
   - jstests/core/index_decimal.js
+  - jstests/core/index_large_and_small_dates.js
   - jstests/core/index_multiple_compatibility.js
   - jstests/core/index_partial_write_ops.js
   - jstests/core/indexa.js # No explicit check for failed command.
@@ -121,7 +112,6 @@ selector:
   - jstests/core/json_schema/json_schema.js
   - jstests/core/mr_bigobject.js
   - jstests/core/not2.js
-  - jstests/core/notablescan.js
   - jstests/core/null_query_semantics.js
   - jstests/core/or1.js
   - jstests/core/or2.js
@@ -152,14 +142,6 @@ selector:
 
   # TODO: SERVER-38207 Cannot insert document with MaxKey shard key.
   - jstests/core/type8.js
-
-  # TODO: SERVER-38326 mapReduce cleanup doesn't obey writeConcern, rendering
-  # txn_passthrough_cmd_massage.js ineffective for preventing 2 phase drops
-  # from contesting db/coll locks.
-  - jstests/core/function_string_representations.js
-  - jstests/core/geo_mapreduce2.js
-  - jstests/core/mr*.js
-  - jstests/core/or4.js
 
   ##
   ## Some aggregation stages don't support snapshot readconcern.
@@ -194,51 +176,27 @@ selector:
   - jstests/core/views/views_coll_stats.js
   - jstests/core/views/views_stats.js
 
-  ##
-  ## SERVER-39175 WriteErrors get converted to WriteCommandErrors if part of a txn.
-  ##
-
-  # The same error code, but with ok:0.
-  - jstests/core/json_schema/additional_items.js
-  - jstests/core/json_schema/additional_properties.js
-  - jstests/core/json_schema/bsontype.js
-  - jstests/core/json_schema/dependencies.js
-  - jstests/core/json_schema/items.js
-  - jstests/core/json_schema/logical_keywords.js
-  - jstests/core/json_schema/min_max_items.js
-  - jstests/core/json_schema/min_max_properties.js
-  - jstests/core/json_schema/pattern_properties.js
-  - jstests/core/json_schema/required.js
-  - jstests/core/json_schema/unique_items.js
-
-  - jstests/core/field_name_validation.js
-  - jstests/core/fts_array.js
-  - jstests/core/inc-SERVER-7446.js
-  - jstests/core/invalid_db_name.js
-  - jstests/core/push_sort.js
-
-  # Checks for "WriteErrors" explicitly from the response of db.runCommand()
-  - jstests/core/max_doc_size.js
-
-  # Calls res.getWriteError() or res.hasWriteError().
+  # Errors expected to happen in tests, which can cause transactions to get aborted.
+  # So when the test tries to inspect the documents it can be out of sync (relative
+  # to test run without multi statement transactions).
   - jstests/core/bulk_api_ordered.js
   - jstests/core/bulk_api_unordered.js
   - jstests/core/bulk_legacy_enforce_gle.js
   - jstests/core/cappeda.js
   - jstests/core/doc_validation.js
   - jstests/core/doc_validation_options.js
-  - jstests/core/geo_multinest0.js
+  - jstests/core/field_name_validation.js
   - jstests/core/insert_illegal_doc.js
-  - jstests/core/push2.js
-  - jstests/core/remove6.js
-  - jstests/core/removeb.js
+  - jstests/core/push_sort.js
   - jstests/core/rename4.js
-  - jstests/core/shell_writeconcern.js
-  - jstests/core/storefunc.js
   - jstests/core/update_arrayFilters.js
   - jstests/core/update_dbref.js
   - jstests/core/updatel.js
   - jstests/core/write_result.js
+
+  # Trick for bypassing mongo shell validation in the test doesn't work because txn_override
+  # retry logic will hit the shell validation.
+  - jstests/core/invalid_db_name.js
 
   # Multiple writes in a txn, some of which fail because the collection doesn't exist.
   # We create the collection and retry the last write, but previous writes would have
@@ -302,7 +260,6 @@ selector:
   - jstests/core/kill_cursors.js
   - jstests/core/list_collections1.js
   - jstests/core/list_indexes.js
-  - jstests/core/max_time_ms.js
   - jstests/core/oro.js
 
   # Parallel Shell - we do not signal the override to end a txn when a parallel shell closes.
@@ -319,7 +276,6 @@ selector:
   - jstests/core/killop_drop_collection.js
   - jstests/core/loadserverscripts.js
   - jstests/core/mr_killop.js
-  - jstests/core/queryoptimizer3.js
   - jstests/core/remove9.js
   - jstests/core/removeb.js
   - jstests/core/removec.js
@@ -510,4 +466,3 @@ executor:
       replset_config_options:
         settings:
           catchUpTimeoutMillis: 0
-      voting_secondaries: true

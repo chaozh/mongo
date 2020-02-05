@@ -8,6 +8,8 @@ env.Library(
     target='sharding_client',
     source=[
         'shard_remote.cpp',
+        'hedging_metrics.cpp',
+        'num_hosts_targeted_metrics.cpp',
          env.Idlc('shard_remote.idl')[0],
     ],
     LIBDEPS=[
@@ -58,6 +60,14 @@ env.Library(
         '$BUILD_DIR/mongo/db/repl/repl_coordinator_interface',
         'rs_local_client',
         'shard_interface',
+    ],
+    LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/db/catalog/collection_catalog',
+        '$BUILD_DIR/mongo/db/catalog_raii',
+        '$BUILD_DIR/mongo/db/concurrency/write_conflict_exception',
+        '$BUILD_DIR/mongo/db/db_raii',
+        '$BUILD_DIR/mongo/db/index_builds_coordinator_interface',
+        '$BUILD_DIR/mongo/db/server_options_core',
     ],
 )
 

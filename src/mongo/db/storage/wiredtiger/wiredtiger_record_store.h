@@ -137,6 +137,8 @@ public:
                                 BSONObjBuilder* extraInfo = nullptr,
                                 int infoLevel = 0) const;
 
+    virtual int64_t freeStorageSize(OperationContext* opCtx) const;
+
     // CRUD related
 
     virtual bool findRecord(OperationContext* opCtx, const RecordId& id, RecordData* out) const;
@@ -546,8 +548,8 @@ private:
 extern FailPoint WTWriteConflictException;
 extern FailPoint WTWriteConflictExceptionForReads;
 
-// Prevents oplog writes from being considered durable on the primary. Once activated, new writes
-// will not be considered durable until deactivated. It is unspecified whether writes that commit
-// before activation will become visible while active.
+// Prevents oplog writes from becoming visible asynchronously. Once activated, new writes will not
+// be seen by regular readers until deactivated. It is unspecified whether writes that commit before
+// activation will become visible while active.
 extern FailPoint WTPausePrimaryOplogDurabilityLoop;
 }  // namespace mongo

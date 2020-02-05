@@ -106,11 +106,6 @@ public:
         : _client(&_opCtx),
           _defaultReplSettings(
               ReplicationCoordinator::get(getGlobalServiceContext())->getSettings()) {
-        // Replication is not supported by mobile SE.
-        if (mongo::storageGlobalParams.engine == "mobile") {
-            return;
-        }
-
         transport::TransportLayerASIO::Options opts;
         opts.mode = transport::TransportLayerASIO::Options::kEgress;
         auto sc = getGlobalServiceContext();
@@ -141,7 +136,7 @@ public:
         dbtests::WriteContextForTests ctx(&_opCtx, ns());
         WriteUnitOfWork wuow(&_opCtx);
 
-        Collection* c = CollectionCatalog::get(&_opCtx).lookupCollectionByNamespace(nss());
+        Collection* c = CollectionCatalog::get(&_opCtx).lookupCollectionByNamespace(&_opCtx, nss());
         if (!c) {
             c = ctx.db()->createCollection(&_opCtx, nss());
         }
@@ -155,10 +150,6 @@ public:
         deleteAll(cllNS());
     }
     ~Base() {
-        // Replication is not supported by mobile SE.
-        if (mongo::storageGlobalParams.engine == "mobile") {
-            return;
-        }
         try {
             deleteAll(ns());
             deleteAll(cllNS());
@@ -211,7 +202,8 @@ protected:
         Lock::GlobalWrite lk(&_opCtx);
         OldClientContext ctx(&_opCtx, ns());
         Database* db = ctx.db();
-        Collection* coll = CollectionCatalog::get(&_opCtx).lookupCollectionByNamespace(nss());
+        Collection* coll =
+            CollectionCatalog::get(&_opCtx).lookupCollectionByNamespace(&_opCtx, nss());
         if (!coll) {
             WriteUnitOfWork wunit(&_opCtx);
             coll = db->createCollection(&_opCtx, nss());
@@ -268,7 +260,8 @@ protected:
             OldClientContext ctx(&_opCtx, ns);
             WriteUnitOfWork wunit(&_opCtx);
             Database* db = ctx.db();
-            Collection* coll = CollectionCatalog::get(&_opCtx).lookupCollectionByNamespace(nss);
+            Collection* coll =
+                CollectionCatalog::get(&_opCtx).lookupCollectionByNamespace(&_opCtx, nss);
             if (!coll) {
                 coll = db->createCollection(&_opCtx, nss);
             }
@@ -282,7 +275,8 @@ protected:
         OldClientContext ctx(&_opCtx, ns());
         WriteUnitOfWork wunit(&_opCtx);
         Database* db = ctx.db();
-        Collection* coll = CollectionCatalog::get(&_opCtx).lookupCollectionByNamespace(nss());
+        Collection* coll =
+            CollectionCatalog::get(&_opCtx).lookupCollectionByNamespace(&_opCtx, nss());
         if (!coll) {
             coll = db->createCollection(&_opCtx, nss());
         }
@@ -333,10 +327,6 @@ protected:
 class LogBasic : public Base {
 public:
     void run() {
-        // Replication is not supported by mobile SE.
-        if (mongo::storageGlobalParams.engine == "mobile") {
-            return;
-        }
         ASSERT_EQUALS(0, opCount());
         _client.insert(ns(), fromjson("{\"a\":\"b\"}"));
         ASSERT_EQUALS(1, opCount());
@@ -349,10 +339,6 @@ class Base : public ReplTests::Base {
 public:
     virtual ~Base() {}
     void run() {
-        // Replication is not supported by mobile SE.
-        if (mongo::storageGlobalParams.engine == "mobile") {
-            return;
-        }
         reset();
         doIt();
         int nOps = opCount();
@@ -1305,11 +1291,6 @@ public:
 class DeleteOpIsIdBased : public Base {
 public:
     void run() {
-        // Replication is not supported by mobile SE.
-        if (mongo::storageGlobalParams.engine == "mobile") {
-            return;
-        }
-
         // These inserts don't write oplog entries.
         insert(BSON("_id" << 0 << "a" << 10));
         insert(BSON("_id" << 1 << "a" << 11));

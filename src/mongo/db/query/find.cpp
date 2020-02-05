@@ -289,6 +289,8 @@ Message getMore(OperationContext* opCtx,
     uassertStatusOK(statusWithCursorPin.getStatus());
     auto cursorPin = std::move(statusWithCursorPin.getValue());
 
+    opCtx->setExhaust(cursorPin->queryOptions() & QueryOption_Exhaust);
+
     if (cursorPin->lockPolicy() == ClientCursorParams::LockPolicy::kLocksInternally) {
         if (!nss.isCollectionlessCursorNamespace()) {
             AutoGetDb autoDb(opCtx, nss.db(), MODE_IS);
@@ -298,7 +300,7 @@ Message getMore(OperationContext* opCtx,
             statsTracker.emplace(opCtx,
                                  nss,
                                  Top::LockType::NotLocked,
-                                 AutoStatsTracker::LogMode::kUpdateTopAndCurop,
+                                 AutoStatsTracker::LogMode::kUpdateTopAndCurOp,
                                  profilingLevel);
             auto view = autoDb.getDb() ? ViewCatalog::get(autoDb.getDb())->lookup(opCtx, nss.ns())
                                        : nullptr;
@@ -316,7 +318,7 @@ Message getMore(OperationContext* opCtx,
         statsTracker.emplace(opCtx,
                              nss,
                              Top::LockType::ReadLocked,
-                             AutoStatsTracker::LogMode::kUpdateTopAndCurop,
+                             AutoStatsTracker::LogMode::kUpdateTopAndCurOp,
                              readLock->getDb() ? readLock->getDb()->getProfilingLevel()
                                                : doNotChangeProfilingLevel);
 
@@ -534,7 +536,8 @@ Message getMore(OperationContext* opCtx,
         exec->detachFromOperationContext();
         LOG(5) << "getMore saving client cursor ended with state " << PlanExecutor::statestr(state);
 
-        *exhaust = cursorPin->queryOptions() & QueryOption_Exhaust;
+        // Set 'exhaust' if the client requested exhaust and the cursor is not exhausted.
+        *exhaust = opCtx->isExhaust();
 
         // We assume that cursors created through a DBDirectClient are always used from their
         // original OperationContext, so we do not need to move time to and from the cursor.
@@ -568,10 +571,10 @@ Message getMore(OperationContext* opCtx,
     return Message(bb.release());
 }
 
-std::string runQuery(OperationContext* opCtx,
-                     QueryMessage& q,
-                     const NamespaceString& nss,
-                     Message& result) {
+bool runQuery(OperationContext* opCtx,
+              QueryMessage& q,
+              const NamespaceString& nss,
+              Message& result) {
     CurOp& curOp = *CurOp::get(opCtx);
     curOp.ensureStarted();
 
@@ -591,7 +594,8 @@ std::string runQuery(OperationContext* opCtx,
     beginQueryOp(opCtx, nss, upconvertedQuery, q.ntoreturn, q.ntoskip);
 
     // Parse the qm into a CanonicalQuery.
-    const boost::intrusive_ptr<ExpressionContext> expCtx;
+    const boost::intrusive_ptr<ExpressionContext> expCtx =
+        make_intrusive<ExpressionContext>(opCtx, nullptr /* collator */);
     auto cq = uassertStatusOKWithContext(
         CanonicalQuery::canonicalize(opCtx,
                                      q,
@@ -607,10 +611,11 @@ std::string runQuery(OperationContext* opCtx,
     // Parse, canonicalize, plan, transcribe, and get a plan executor.
     AutoGetCollectionForReadCommand ctx(opCtx, nss, AutoGetCollection::ViewMode::kViewsForbidden);
     Collection* const collection = ctx.getCollection();
+    const QueryRequest& qr = cq->getQueryRequest();
+
+    opCtx->setExhaust(qr.isExhaust());
 
     {
-        const QueryRequest& qr = cq->getQueryRequest();
-
         // Allow the query to run on secondaries if the read preference permits it. If no read
         // preference was specified, allow the query to run iff slaveOk has been set.
         const bool slaveOK = qr.hasReadPref()
@@ -622,9 +627,9 @@ std::string runQuery(OperationContext* opCtx,
     }
 
     // Get the execution plan for the query.
+    constexpr auto verbosity = ExplainOptions::Verbosity::kExecAllPlans;
+    expCtx->explain = qr.isExplain() ? boost::make_optional(verbosity) : boost::none;
     auto exec = uassertStatusOK(getExecutorLegacyFind(opCtx, collection, std::move(cq)));
-
-    const QueryRequest& qr = exec->getCanonicalQuery()->getQueryRequest();
 
     // If it's actually an explain, do the explain and return rather than falling through
     // to the normal query execution loop.
@@ -633,11 +638,7 @@ std::string runQuery(OperationContext* opCtx,
         bb.skip(sizeof(QueryResult::Value));
 
         BSONObjBuilder explainBob;
-        Explain::explainStages(exec.get(),
-                               collection,
-                               ExplainOptions::Verbosity::kExecAllPlans,
-                               BSONObj(),
-                               &explainBob);
+        Explain::explainStages(exec.get(), collection, verbosity, BSONObj(), &explainBob);
 
         // Add the resulting object to the return buffer.
         BSONObj explainObj = explainBob.obj();
@@ -653,7 +654,7 @@ std::string runQuery(OperationContext* opCtx,
         qr.setStartingFrom(0);
         qr.setNReturned(1);
         result.setData(bb.release());
-        return "";
+        return false;
     }
 
     // Handle query option $maxTimeMS (not used with commands).
@@ -748,8 +749,9 @@ std::string runQuery(OperationContext* opCtx,
         LOG(5) << "caching executor with cursorid " << ccId << " after returning " << numResults
                << " results";
 
-        // TODO document
-        if (qr.isExhaust()) {
+        // Set curOp.debug().exhaust if the client requested exhaust and the cursor is not
+        // exhausted.
+        if (opCtx->isExhaust()) {
             curOp.debug().exhaust = true;
         }
 
@@ -782,8 +784,9 @@ std::string runQuery(OperationContext* opCtx,
     // Add the results from the query into the output buffer.
     result.setData(bb.release());
 
-    // curOp.debug().exhaust is set above.
-    return curOp.debug().exhaust ? nss.ns() : "";
+    // curOp.debug().exhaust is set above if the client requested exhaust and the cursor is not
+    // exhausted.
+    return curOp.debug().exhaust;
 }
 
 }  // namespace mongo

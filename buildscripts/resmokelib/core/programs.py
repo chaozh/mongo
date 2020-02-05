@@ -45,8 +45,7 @@ def make_process(*args, **kwargs):
     if config.SPAWN_USING == "jasper":
         process_cls = jasper_process.Process
     # Add the current working directory and /data/multiversion to the PATH.
-    process_kwargs = kwargs.get("process_kwargs", {}).copy()
-    env_vars = process_kwargs.get("env_vars", {}).copy()
+    env_vars = kwargs.get("env_vars", {}).copy()
     path = [env_vars.get("PATH", os.environ.get("PATH", ""))]
     path = [os.getcwd(), config.DEFAULT_MULTIVERSION_DIR] + path
     env_vars["PATH"] = os.pathsep.join(path)
@@ -139,6 +138,7 @@ def mongod_program(  # pylint: disable=too-many-branches
 
     shortcut_opts = {
         "enableMajorityReadConcern": config.MAJORITY_READ_CONCERN,
+        "logFormat": config.LOG_FORMAT,
         "nojournal": config.NO_JOURNAL,
         "serviceExecutor": config.SERVICE_EXECUTOR,
         "storageEngine": config.STORAGE_ENGINE,
@@ -156,7 +156,7 @@ def mongod_program(  # pylint: disable=too-many-branches
         shortcut_opts["wiredTigerCacheSizeGB"] = config.STORAGE_ENGINE_CACHE_SIZE
 
     # These options are just flags, so they should not take a value.
-    opts_without_vals = ("nojournal", )
+    opts_without_vals = ("nojournal", "logappend")
 
     # Have the --nojournal command line argument to resmoke.py unset the journal option.
     if shortcut_opts["nojournal"] and "journal" in kwargs:
@@ -214,6 +214,9 @@ def mongos_program(logger, executable=None, process_kwargs=None, **kwargs):
 
     _apply_set_parameters(args, suite_set_parameters)
 
+    if config.LOG_FORMAT is not None:
+        kwargs["logFormat"] = config.LOG_FORMAT
+
     # Apply the rest of the command line arguments.
     _apply_kwargs(args, kwargs)
 
@@ -244,6 +247,7 @@ def mongo_shell_program(  # pylint: disable=too-many-branches,too-many-locals,to
         test_name = None
     shortcut_opts = {
         "enableMajorityReadConcern": (config.MAJORITY_READ_CONCERN, True),
+        "logFormat": (config.LOG_FORMAT, ""),
         "mixedBinVersions": (config.MIXED_BIN_VERSIONS, ""),
         "noJournal": (config.NO_JOURNAL, False),
         "serviceExecutor": (config.SERVICE_EXECUTOR, ""),
@@ -319,7 +323,7 @@ def mongo_shell_program(  # pylint: disable=too-many-branches,too-many-locals,to
         connection_string = None
 
     for var_name in global_vars:
-        _format_shell_vars(eval_sb, var_name, global_vars[var_name])
+        _format_shell_vars(eval_sb, [var_name], global_vars[var_name])
 
     if "eval" in kwargs:
         eval_sb.append(str(kwargs.pop("eval")))
@@ -330,6 +334,10 @@ def mongo_shell_program(  # pylint: disable=too-many-branches,too-many-locals,to
     # Load a callback to check UUID consistency before shutting down a ShardingTest.
     eval_sb.append(
         "load('jstests/libs/override_methods/check_uuids_consistent_across_cluster.js');")
+
+    # Load a callback to check index consistency before shutting down a ShardingTest.
+    eval_sb.append(
+        "load('jstests/libs/override_methods/check_indexes_consistent_across_cluster.js');")
 
     # Load this file to retry operations that fail due to in-progress background operations.
     eval_sb.append(
@@ -355,6 +363,9 @@ def mongo_shell_program(  # pylint: disable=too-many-branches,too-many-locals,to
         if "host" in kwargs:
             kwargs.pop("host")
 
+    if config.LOG_FORMAT is not None:
+        kwargs["logFormat"] = config.LOG_FORMAT
+
     # Apply the rest of the command line arguments.
     _apply_kwargs(args, kwargs)
 
@@ -371,24 +382,30 @@ def mongo_shell_program(  # pylint: disable=too-many-branches,too-many-locals,to
     return make_process(logger, args, **process_kwargs)
 
 
-def _format_shell_vars(sb, path, value):
-    """Format 'value' in a way that can be passed to --eval.
-
-    If 'value' is a dictionary, then it is unrolled into the creation of
-    a new JSON object with properties assigned for each key of the
-    dictionary.
+def _format_shell_vars(sb, paths, value):
     """
+    Format 'value' in a way that can be passed to --eval.
+
+    :param sb: string builder array for the output string.
+    :param paths: path of keys represented as a list.
+    :param value: value in the object corresponding to the keys in `paths`
+    :return: Nothing.
+    """
+
+    # Convert the list ["a", "b", "c"] into the string 'a["b"]["c"]'
+    def bracketize(lst):
+        return lst[0] + ''.join(f'["{i}"]' for i in lst[1:])
 
     # Only need to do special handling for JSON objects.
     if not isinstance(value, dict):
-        sb.append("%s = %s" % (path, json.dumps(value)))
+        sb.append("%s = %s" % (bracketize(paths), json.dumps(value)))
         return
 
     # Avoid including curly braces and colons in output so that the command invocation can be
     # copied and run through bash.
-    sb.append("%s = new Object()" % (path))
+    sb.append("%s = new Object()" % bracketize(paths))
     for subkey in value:
-        _format_shell_vars(sb, ".".join((path, subkey)), value[subkey])
+        _format_shell_vars(sb, paths + [subkey], value[subkey])
 
 
 def dbtest_program(logger, executable=None, suites=None, process_kwargs=None, **kwargs):

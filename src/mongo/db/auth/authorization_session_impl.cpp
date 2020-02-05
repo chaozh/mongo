@@ -36,6 +36,7 @@
 #include <string>
 #include <vector>
 
+#include "mongo/base/shim.h"
 #include "mongo/base/status.h"
 #include "mongo/db/auth/action_set.h"
 #include "mongo/db/auth/action_type.h"
@@ -61,14 +62,18 @@ namespace mongo {
 namespace dps = ::mongo::dotted_path_support;
 using std::vector;
 
-MONGO_REGISTER_SHIM(AuthorizationSession::create)
-(AuthorizationManager* authzManager)->std::unique_ptr<AuthorizationSession> {
+namespace {
+
+std::unique_ptr<AuthorizationSession> authorizationSessionCreateImpl(
+    AuthorizationManager* authzManager) {
     return std::make_unique<AuthorizationSessionImpl>(
         AuthzSessionExternalState::create(authzManager),
         AuthorizationSessionImpl::InstallMockForTestingOrAuthImpl{});
 }
 
-namespace {
+auto authorizationSessionCreateRegistration =
+    MONGO_WEAK_FUNCTION_REGISTRATION(AuthorizationSession::create, authorizationSessionCreateImpl);
+
 constexpr StringData ADMIN_DBNAME = "admin"_sd;
 
 // Checks if this connection has the privileges necessary to create or modify the view 'viewNs'
@@ -150,7 +155,8 @@ Status AuthorizationSessionImpl::addAndAuthorizeUser(OperationContext* opCtx,
 }
 
 User* AuthorizationSessionImpl::lookupUser(const UserName& name) {
-    return _authenticatedUsers.lookup(name).get();
+    auto user = _authenticatedUsers.lookup(name);
+    return user ? user.get() : nullptr;
 }
 
 User* AuthorizationSessionImpl::getSingleUser() {
@@ -274,7 +280,7 @@ StatusWith<PrivilegeVector> AuthorizationSessionImpl::getPrivilegesForAggregate(
 
     // If the first stage of the pipeline is not an initial source, the pipeline is implicitly
     // reading documents from the underlying collection. The client must be authorized to do so.
-    auto liteParsedDocSource = LiteParsedDocumentSource::parse(aggRequest, pipeline[0]);
+    auto liteParsedDocSource = LiteParsedDocumentSource::parse(nss, pipeline[0]);
     if (!liteParsedDocSource->isInitialSource()) {
         Privilege currentPriv =
             Privilege(ResourcePattern::forExactNamespace(nss), ActionType::find);
@@ -283,8 +289,9 @@ StatusWith<PrivilegeVector> AuthorizationSessionImpl::getPrivilegesForAggregate(
 
     // Confirm privileges for the pipeline.
     for (auto&& pipelineStage : pipeline) {
-        liteParsedDocSource = LiteParsedDocumentSource::parse(aggRequest, pipelineStage);
-        PrivilegeVector currentPrivs = liteParsedDocSource->requiredPrivileges(isMongos);
+        liteParsedDocSource = LiteParsedDocumentSource::parse(nss, pipelineStage);
+        PrivilegeVector currentPrivs = liteParsedDocSource->requiredPrivileges(
+            isMongos, aggRequest.shouldBypassDocumentValidation());
         Privilege::addPrivilegesToPrivilegeVector(&privileges, currentPrivs);
     }
     return privileges;
@@ -607,6 +614,15 @@ static const int resourceSearchListCapacity = 5;
 /**
  * Builds from "target" an exhaustive list of all ResourcePatterns that match "target".
  *
+ * Some resources are considered to be "normal resources", and are matched by the
+ * forAnyNormalResource pattern. Collections which are not prefixed with "system.",
+ * and which do not belong inside of the "local" or "config" databases are "normal".
+ * Database other than "local" and "config" are normal.
+ *
+ * Most collections are matched by their database's resource. Collections prefixed with "system."
+ * are not. Neither are collections on the "local" database, whose name are prefixed with "replset."
+ *
+ *
  * Stores the resulting list into resourceSearchList, and returns the length.
  *
  * The seach lists are as follows, depending on the type of "target":
@@ -635,15 +651,19 @@ static int buildResourceSearchList(const ResourcePattern& target,
     int size = 0;
     resourceSearchList[size++] = ResourcePattern::forAnyResource();
     if (target.isExactNamespacePattern()) {
-        if (!target.ns().isSystem()) {
-            // Some databases should not be matchable with ResourcePattern::forAnyNormalResource.
-            // 'local' and 'config' are used to store special system collections, which user level
+        // Normal collections can be matched by anyNormalResource, or their database's resource.
+        if (target.ns().isNormalCollection()) {
+            // But even normal collections in non-normal databases should not be matchable with
+            // ResourcePattern::forAnyNormalResource. 'local' and 'config' are
+            // used to store special system collections, which user level
             // administrators should not be able to manipulate.
             if (target.ns().db() != "local" && target.ns().db() != "config") {
                 resourceSearchList[size++] = ResourcePattern::forAnyNormalResource();
             }
             resourceSearchList[size++] = ResourcePattern::forDatabaseName(target.ns().db());
         }
+
+        // All collections can be matched by a collection resource for their name
         resourceSearchList[size++] = ResourcePattern::forCollectionName(target.ns().coll());
     } else if (target.isDatabasePattern()) {
         if (target.ns().db() != "local" && target.ns().db() != "config") {
@@ -718,7 +738,7 @@ void AuthorizationSessionImpl::_refreshUserInfoAsNeeded(OperationContext* opCtx)
 
     while (it != _authenticatedUsers.end()) {
         auto& user = *it;
-        if (!user->isValid()) {
+        if (!user.isValid()) {
             // Make a good faith effort to acquire an up-to-date user object, since the one
             // we've cached is marked "out-of-date."
             UserName name = user->getName();

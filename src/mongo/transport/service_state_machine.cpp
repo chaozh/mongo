@@ -67,9 +67,17 @@ Message makeLegacyExhaustMessage(Message* m, const DbResponse& dbresponse) {
     // OP_QUERY responses are always of type OP_REPLY.
     invariant(dbresponse.response.operation() == opReply);
 
-    if (dbresponse.exhaustNS.empty()) {
+    if (!dbresponse.shouldRunAgainForExhaust) {
         return Message();
     }
+
+    // Legacy find operations via the OP_QUERY/OP_GET_MORE network protocol never provide the next
+    // invocation for exhaust.
+    invariant(!dbresponse.nextInvocation);
+
+    DbMessage dbmsg(*m);
+    invariant(dbmsg.messageShouldHaveNs());
+    const char* ns = dbmsg.getns();
 
     MsgData::View header = dbresponse.response.header();
     QueryResult::View qr = header.view2ptr();
@@ -86,7 +94,7 @@ Message makeLegacyExhaustMessage(Message* m, const DbResponse& dbresponse) {
     b.appendNum(header.getResponseToMsgId());  // in response to
     b.appendNum(static_cast<int>(dbGetMore));  // opCode is OP_GET_MORE
     b.appendNum(static_cast<int>(0));          // Must be ZERO (reserved)
-    b.appendStr(dbresponse.exhaustNS);         // Namespace
+    b.appendStr(StringData(ns));               // Namespace
     b.appendNum(static_cast<int>(0));          // ntoreturn
     b.appendNum(cursorid);                     // cursor id from the OP_REPLY
 
@@ -97,12 +105,9 @@ Message makeLegacyExhaustMessage(Message* m, const DbResponse& dbresponse) {
 
 /**
  * Given a request and its already generated response, checks for exhaust flags. If exhaust is
- * allowed, modifies the given request message to produce the subsequent exhaust message, and
- * modifies the response message to indicate it is part of an exhaust stream. Returns the modified
- * request message for it to be used as the subsequent, 'synthetic' exhaust request. Returns an
- * empty message if exhaust is not allowed.
- *
- * Currently only supports exhaust for 'getMore' commands.
+ * allowed, produces the subsequent request message, and modifies the response message to indicate
+ * it is part of an exhaust stream. Returns the subsequent request message, which is known as a
+ * 'synthetic' exhaust request. Returns an empty message if exhaust is not allowed.
  */
 Message makeExhaustMessage(Message requestMsg, DbResponse* dbresponse) {
     if (requestMsg.operation() == dbQuery) {
@@ -113,19 +118,33 @@ Message makeExhaustMessage(Message requestMsg, DbResponse* dbresponse) {
         return Message();
     }
 
-    // Only support exhaust for 'getMore' commands.
-    auto request = OpMsgRequest::parse(requestMsg);
-    if (request.getCommandName() != "getMore"_sd) {
-        return Message();
-    }
-
-    // A returned cursor id of '0' indicates that the cursor is exhausted and so the exhaust stream
-    // should be terminated. Also make sure the cursor namespace is valid.
-    if (dbresponse->exhaustCursorId == 0 || dbresponse->exhaustNS.empty()) {
+    if (!dbresponse->shouldRunAgainForExhaust) {
         return Message();
     }
 
     const bool checksumPresent = OpMsg::isFlagSet(requestMsg, OpMsg::kChecksumPresent);
+    Message exhaustMessage;
+
+    if (auto nextInvocation = dbresponse->nextInvocation) {
+        // The command provided a new BSONObj for the next invocation.
+        OpMsgBuilder builder;
+        builder.setBody(*nextInvocation);
+        exhaustMessage = builder.finish();
+    } else {
+        // Reuse the previous invocation for the next invocation.
+        OpMsg::removeChecksum(&requestMsg);
+        exhaustMessage = requestMsg;
+    }
+
+    // The id of the response is used as the request id of this 'synthetic' request. Re-checksum
+    // if needed.
+    exhaustMessage.header().setId(dbresponse->response.header().getId());
+    exhaustMessage.header().setResponseToMsgId(dbresponse->response.header().getResponseToMsgId());
+    OpMsg::setFlag(&exhaustMessage, OpMsg::kExhaustSupported);
+    if (checksumPresent) {
+        OpMsg::appendChecksum(&exhaustMessage);
+    }
+
     OpMsg::removeChecksum(&dbresponse->response);
     // Indicate that the response is part of an exhaust stream. Re-checksum if needed.
     OpMsg::setFlag(&dbresponse->response, OpMsg::kMoreToCome);
@@ -133,16 +152,7 @@ Message makeExhaustMessage(Message requestMsg, DbResponse* dbresponse) {
         OpMsg::appendChecksum(&dbresponse->response);
     }
 
-    // Return an augmented form of the initial request, which is to be used as the next request to
-    // be processed by the database. The id of the response is used as the request id of this
-    // 'synthetic' request. Re-checksum if needed.
-    OpMsg::removeChecksum(&requestMsg);
-    requestMsg.header().setId(dbresponse->response.header().getId());
-    requestMsg.header().setResponseToMsgId(dbresponse->response.header().getResponseToMsgId());
-    if (checksumPresent) {
-        OpMsg::appendChecksum(&requestMsg);
-    }
-    return requestMsg;
+    return exhaustMessage;
 }
 
 }  // namespace
@@ -436,6 +446,9 @@ void ServiceStateMachine::_processMessage(ThreadGuard guard) {
 
     // Pass sourced Message to handler to generate response.
     auto opCtx = Client::getCurrent()->makeOperationContext();
+    if (_inExhaust) {
+        opCtx->markKillOnClientDisconnect();
+    }
 
     // The handleRequest is implemented in a subclass for mongod/mongos and actually all the
     // database work for this request.
@@ -464,12 +477,11 @@ void ServiceStateMachine::_processMessage(ThreadGuard guard) {
 #endif
         }
 
-        // If the incoming message has the exhaust flag set and is a 'getMore' command, then we
-        // bypass the normal RPC behavior. We will sink the response to the network, but we also
-        // synthesize a new 'getMore' request, as if we sourced a new message from the network. This
-        // new request is sent to the database once again to be processed. This cycle repeats as
-        // long as the associated cursor is not exhausted. Once it is exhausted, we will send a
-        // final response, terminating the exhaust stream.
+        // If the incoming message has the exhaust flag set, then we bypass the normal RPC behavior.
+        // We will sink the response to the network, but we also synthesize a new request, as if we
+        // sourced a new message from the network. This new request is sent to the database once
+        // again to be processed. This cycle repeats as long as the command indicates the exhaust
+        // stream should continue.
         _inMessage = makeExhaustMessage(_inMessage, &dbresponse);
         _inExhaust = !_inMessage.empty();
 
@@ -615,7 +627,27 @@ void ServiceStateMachine::_terminateAndLogIfError(Status status) {
     }
 }
 
+void ServiceStateMachine::_cleanupExhaustResources() noexcept try {
+    if (!_inExhaust) {
+        return;
+    }
+    auto request = OpMsgRequest::parse(_inMessage);
+    // Clean up cursor for exhaust getMore request.
+    if (request.getCommandName() == "getMore"_sd) {
+        auto cursorId = request.body["getMore"].Long();
+        auto opCtx = Client::getCurrent()->makeOperationContext();
+        // Fire and forget. This is a best effort attempt to immediately clean up the exhaust
+        // cursor. If the killCursors request fails here for any reasons, it will still be
+        // cleaned up once the cursor times out.
+        _sep->handleRequest(opCtx.get(), makeKillCursorsMessage(cursorId));
+    }
+} catch (const DBException& e) {
+    log() << "Error cleaning up resources for exhaust requests: " << e.toStatus();
+}
+
 void ServiceStateMachine::_cleanupSession(ThreadGuard guard) {
+    _cleanupExhaustResources();
+
     _state.store(State::Ended);
 
     _inMessage.reset();

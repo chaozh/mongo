@@ -34,13 +34,14 @@
 #include <boost/optional.hpp>
 #include <boost/smart_ptr/intrusive_ptr.hpp>
 
+#include "mongo/db/exec/projection_executor.h"
+#include "mongo/db/exec/projection_executor_builder.h"
 #include "mongo/db/pipeline/lite_parsed_document_source.h"
-#include "mongo/db/pipeline/parsed_aggregation_projection.h"
+#include "mongo/db/query/projection_parser.h"
 
 namespace mongo {
 
 using boost::intrusive_ptr;
-using ParsedAggregationProjection = parsed_aggregation_projection::ParsedAggregationProjection;
 
 REGISTER_DOCUMENT_SOURCE(project,
                          LiteParsedDocumentSourceDefault::parse,
@@ -66,16 +67,27 @@ intrusive_ptr<DocumentSource> DocumentSourceProject::create(
     intrusive_ptr<DocumentSource> project(new DocumentSourceSingleDocumentTransformation(
         expCtx,
         [&]() {
-            // The ParsedAggregationProjection will internally perform a check to see if the
-            // provided specification is valid, and throw an exception if it was not. The exception
-            // is caught here so we can add the name that was actually specified by the user, be it
-            // $project or an alias.
+            // The ProjectionExecutor will internally perform a check to see if the provided
+            // specification is valid, and throw an exception if it was not. The exception is caught
+            // here so we can add the name that was actually specified by the user, be it $project
+            // or an alias.
             try {
-                return ParsedAggregationProjection::create(
-                    expCtx,
-                    projectSpec,
-                    {ProjectionPolicies::DefaultIdPolicy::kIncludeId,
-                     ProjectionPolicies::ArrayRecursionPolicy::kRecurseNestedArrays});
+                auto policies = ProjectionPolicies::aggregateProjectionPolicies();
+                auto projection = projection_ast::parse(expCtx, projectSpec, policies);
+                // We won't optimize the executor on creation, and will do it as part of the
+                // pipeline optimization process when requested via the 'optimize()' method on
+                // 'DocumentSourceSingleDocumentTransformation', so we won't pass the
+                // 'kOptimzeExecutor' flag to the projection executor builder.
+                //
+                // Note that this is also important for $lookup inner pipelines to not being
+                // optimized too early, as it may lead to incorrect positioning of the caching
+                // stage due to missing dependencies on certain variables, as they could have been
+                // optimized away.
+                auto builderParams = projection_executor::BuilderParamsBitSet{
+                    projection_executor::kDefaultBuilderParams};
+                builderParams.reset(projection_executor::kOptimizeExecutor);
+                return projection_executor::buildProjectionExecutor(
+                    expCtx, &projection, policies, builderParams);
             } catch (DBException& ex) {
                 ex.addContext("Invalid " + specifiedName.toString());
                 throw;

@@ -44,6 +44,7 @@
 #include "mongo/s/request_types/set_shard_version_request.h"
 #include "mongo/s/stale_exception.h"
 #include "mongo/s/transaction_router.h"
+#include "mongo/util/hierarchical_acquisition.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
@@ -96,7 +97,8 @@ public:
 
 private:
     // protects _map
-    Mutex _mutex = MONGO_MAKE_LATCH("ConnectionShardStatus::_mutex");
+    Mutex _mutex =
+        MONGO_MAKE_LATCH(HierarchicalAcquisitionLevel(0), "ConnectionShardStatus::_mutex");
 
     // a map from a connection into ChunkManager's sequence number for each namespace
     typedef map<unsigned long long, map<string, unsigned long long>> SequenceMap;
@@ -265,7 +267,7 @@ bool checkShardVersion(OperationContext* opCtx,
     auto const catalogCache = Grid::get(opCtx)->catalogCache();
 
     if (authoritative) {
-        Grid::get(opCtx)->catalogCache()->invalidateShardedCollection(nss);
+        Grid::get(opCtx)->catalogCache()->onEpochChange(nss);
     }
 
     auto routingInfoStatus = catalogCache->getCollectionRoutingInfo(opCtx, nss);
@@ -310,7 +312,7 @@ bool checkShardVersion(OperationContext* opCtx,
                        << "on shard " << shard->getId() << " (" << shard->getConnString().toString()
                        << ")");
 
-            uasserted(StaleConfigInfo(nss, refVersion, currentVersion), msg);
+            uasserted(StaleConfigInfo(nss, refVersion, currentVersion, shard->getId()), msg);
         }
     } else if (refManager) {
         string msg(str::stream() << "not sharded ("
@@ -321,9 +323,11 @@ bool checkShardVersion(OperationContext* opCtx,
                                  << "on conn " << conn->getServerAddress() << " ("
                                  << conn_in->getServerAddress() << ")");
 
-        uasserted(
-            StaleConfigInfo(nss, refManager->getVersion(shard->getId()), ChunkVersion::UNSHARDED()),
-            msg);
+        uasserted(StaleConfigInfo(nss,
+                                  refManager->getVersion(shard->getId()),
+                                  ChunkVersion::UNSHARDED(),
+                                  shard->getId()),
+                  msg);
     }
 
     // Has the ChunkManager been reloaded since the last time we updated the shard version over
@@ -376,7 +380,7 @@ bool checkShardVersion(OperationContext* opCtx,
         return true;
     }
 
-    Grid::get(opCtx)->catalogCache()->onStaleShardVersion(std::move(routingInfo));
+    Grid::get(opCtx)->catalogCache()->onEpochChange(nss);
 
     const int maxNumTries = 7;
     if (tryNumber < maxNumTries) {

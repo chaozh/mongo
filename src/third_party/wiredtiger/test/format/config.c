@@ -33,13 +33,13 @@ static void config_cache(void);
 static void config_checkpoint(void);
 static void config_checksum(void);
 static void config_compression(const char *);
+static void config_directio(void);
 static void config_encryption(void);
 static const char *config_file_type(u_int);
 static bool config_fix(void);
 static void config_in_memory(void);
 static void config_in_memory_reset(void);
 static int config_is_perm(const char *);
-static void config_lrt(void);
 static void config_lsm_reset(void);
 static void config_map_checkpoint(const char *, u_int *);
 static void config_map_checksum(const char *, u_int *);
@@ -50,6 +50,12 @@ static void config_map_isolation(const char *, u_int *);
 static void config_pct(void);
 static void config_reset(void);
 static void config_transaction(void);
+
+/*
+ * We currently disable random LSM testing, that is, it can be specified explicitly but we won't
+ * randomly choose LSM as a data_source configuration.
+ */
+#define DISABLE_RANDOM_LSM_TESTING 1
 
 /*
  * config_setup --
@@ -106,14 +112,15 @@ config_setup(void)
             config_single("data_source=file", false);
             break;
         case 2: /* 20% */
-                /*
-                 * LSM requires a row-store and backing disk.
-                 *
-                 * Configuring truncation or timestamps results in LSM cache problems, don't
-                 * configure LSM if those set.
-                 *
-                 * XXX Remove the timestamp test when WT-4162 resolved.
-                 */
+#if !defined(DISABLE_RANDOM_LSM_TESTING)
+            /*
+             * LSM requires a row-store and backing disk.
+             *
+             * Configuring truncation or timestamps results in LSM cache problems, don't configure
+             * LSM if those set.
+             *
+             * XXX Remove the timestamp test when WT-4162 resolved.
+             */
             if (g.type != ROW || g.c_in_memory)
                 break;
             if (config_is_perm("transaction_timestamps") && g.c_txn_timestamps)
@@ -121,6 +128,7 @@ config_setup(void)
             if (config_is_perm("truncate") && g.c_truncate)
                 break;
             config_single("data_source=lsm", false);
+#endif
             break;
         case 3:
         case 4:
@@ -176,9 +184,9 @@ config_setup(void)
     config_compression("compression");
     config_compression("logging_compression");
     config_encryption();
-    config_lrt();
 
     /* Configuration based on the configuration already chosen. */
+    config_directio();
     config_pct();
     config_cache();
 
@@ -238,7 +246,7 @@ config_setup(void)
 static void
 config_cache(void)
 {
-    uint32_t required;
+    uint32_t required, workers;
 
     /* Page sizes are powers-of-two for bad historic reasons. */
     g.intl_page_max = 1U << g.c_intl_page_max;
@@ -248,9 +256,7 @@ config_cache(void)
     if (config_is_perm("cache")) {
         if (config_is_perm("cache_minimum") && g.c_cache_minimum != 0 &&
           g.c_cache < g.c_cache_minimum)
-            testutil_die(EINVAL,
-              "minimum cache set larger than cache "
-              "(%" PRIu32 " > %" PRIu32 ")",
+            testutil_die(EINVAL, "minimum cache set larger than cache (%" PRIu32 " > %" PRIu32 ")",
               g.c_cache_minimum, g.c_cache);
         return;
     }
@@ -269,7 +275,8 @@ config_cache(void)
      * This code is what dramatically increases the cache size when there are lots of threads, it
      * grows the cache to several megabytes per thread.
      */
-    g.c_cache = WT_MAX(g.c_cache, 2 * g.c_threads * g.c_memory_page_max);
+    workers = g.c_threads + (g.c_random_cursor ? 1 : 0);
+    g.c_cache = WT_MAX(g.c_cache, 2 * workers * g.c_memory_page_max);
 
     /*
      * Ensure cache size sanity for LSM runs. An LSM tree open requires 3
@@ -281,7 +288,7 @@ config_cache(void)
      */
     if (DATASOURCE("lsm")) {
         required = WT_LSM_TREE_MINIMUM_SIZE(
-          g.c_chunk_size * WT_MEGABYTE, g.c_threads * g.c_merge_max, g.c_threads * g.leaf_page_max);
+          g.c_chunk_size * WT_MEGABYTE, workers * g.c_merge_max, workers * g.leaf_page_max);
         required = (required + (WT_MEGABYTE - 1)) / WT_MEGABYTE;
         if (g.c_cache < required)
             g.c_cache = required;
@@ -411,6 +418,48 @@ config_compression(const char *conf_name)
 }
 
 /*
+ * config_directio
+ *     Direct I/O configuration.
+ */
+static void
+config_directio(void)
+{
+    /*
+     * We don't roll the dice and set direct I/O, it has to be set explicitly. For that reason, any
+     * incompatible "permanent" option set with direct I/O is a configuration error.
+     */
+    if (!g.c_direct_io)
+        return;
+
+    /*
+     * Direct I/O may not work with backups, doing copies through the buffer cache after configuring
+     * direct I/O in Linux won't work. If direct I/O is configured, turn off backups.
+     */
+    if (g.c_backups) {
+        if (config_is_perm("backups"))
+            testutil_die(EINVAL, "backups are incompatible with direct I/O");
+        config_single("backups=off", false);
+    }
+
+    /*
+     * Turn off all external programs. Direct I/O is really, really slow on some machines and it can
+     * take hours for a job to run. External programs don't have timers running so it looks like
+     * format just hung, and the 15-minute timeout isn't effective. We could play games to handle
+     * child process termination, but it's not worth the effort.
+     */
+    if (g.c_rebalance) {
+        if (config_is_perm("rebalance"))
+            testutil_die(EINVAL, "rebalance is incompatible with direct I/O");
+        config_single("rebalance=off", false);
+    }
+    if (g.c_salvage) {
+        if (config_is_perm("salvage"))
+            testutil_die(EINVAL, "salvage is incompatible with direct I/O");
+        config_single("salvage=off", false);
+    }
+}
+
+/*
  * config_encryption --
  *     Encryption configuration.
  */
@@ -451,12 +500,7 @@ config_encryption(void)
 static bool
 config_fix(void)
 {
-    /*
-     * Fixed-length column stores don't support the lookaside table (so, no long running
-     * transactions), or modify operations.
-     */
-    if (config_is_perm("long_running_txn"))
-        return (false);
+    /* Fixed-length column stores don't support the lookaside table, so no modify operations. */
     if (config_is_perm("modify_pct"))
         return (false);
     return (true);
@@ -573,25 +617,6 @@ config_lsm_reset(void)
 }
 
 /*
- * config_lrt --
- *     Long-running transaction configuration.
- */
-static void
-config_lrt(void)
-{
-    /*
-     * WiredTiger doesn't support a lookaside file for fixed-length column stores.
-     */
-    if (g.type == FIX && g.c_long_running_txn) {
-        if (config_is_perm("long_running_txn"))
-            testutil_die(EINVAL,
-              "long_running_txn not supported with fixed-length "
-              "column store");
-        config_single("long_running_txn=off", false);
-    }
-}
-
-/*
  * config_pct --
  *     Configure operation percentages.
  */
@@ -626,9 +651,7 @@ config_pct(void)
     /* Cursor modify isn't possible for fixed-length column store. */
     if (g.type == FIX) {
         if (config_is_perm("modify_pct") && g.c_modify_pct != 0)
-            testutil_die(EINVAL,
-              "WT_CURSOR.modify not supported by fixed-length "
-              "column store");
+            testutil_die(EINVAL, "WT_CURSOR.modify not supported by fixed-length column store");
         list[CONFIG_MODIFY_ENTRY].order = 0;
         *list[CONFIG_MODIFY_ENTRY].vp = 0;
     }
@@ -642,9 +665,8 @@ config_pct(void)
     if (g.c_isolation_flag == ISOLATION_READ_COMMITTED ||
       g.c_isolation_flag == ISOLATION_READ_UNCOMMITTED) {
         if (config_is_perm("isolation") && config_is_perm("modify_pct") && g.c_modify_pct != 0)
-            testutil_die(EINVAL,
-              "WT_CURSOR.modify only supported with "
-              "snapshot isolation transactions");
+            testutil_die(
+              EINVAL, "WT_CURSOR.modify only supported with snapshot isolation transactions");
 
         list[CONFIG_MODIFY_ENTRY].order = 0;
         *list[CONFIG_MODIFY_ENTRY].vp = 0;
@@ -718,13 +740,11 @@ config_transaction(void)
     if (g.c_txn_timestamps) {
         if (prepare_requires_ts || config_is_perm("transaction_timestamps")) {
             if (g.c_isolation_flag != ISOLATION_SNAPSHOT && config_is_perm("isolation"))
-                testutil_die(EINVAL,
-                  "transaction_timestamps or prepare require "
-                  "isolation=snapshot");
+                testutil_die(
+                  EINVAL, "transaction_timestamps or prepare require isolation=snapshot");
             if (g.c_txn_freq != 100 && config_is_perm("transaction-frequency"))
-                testutil_die(EINVAL,
-                  "transaction_timestamps or prepare require "
-                  "transaction-frequency=100");
+                testutil_die(
+                  EINVAL, "transaction_timestamps or prepare require transaction-frequency=100");
         } else if ((g.c_isolation_flag != ISOLATION_SNAPSHOT && config_is_perm("isolation")) ||
           (g.c_txn_freq != 100 && config_is_perm("transaction-frequency")))
             config_single("transaction_timestamps=off", false);

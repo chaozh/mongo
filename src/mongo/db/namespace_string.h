@@ -95,6 +95,9 @@ public:
     // Namespace for storing the persisted state of transaction coordinators.
     static const NamespaceString kTransactionCoordinatorsNamespace;
 
+    // Namespace for storing the persisted state of migration coordinators.
+    static const NamespaceString kMigrationCoordinatorsNamespace;
+
     // Namespace for replica set configuration settings.
     static const NamespaceString kSystemReplSetNamespace;
 
@@ -103,6 +106,9 @@ public:
 
     // Namespace for pending range deletions.
     static const NamespaceString kRangeDeletionNamespace;
+
+    // Namespace for balancer settings and default read and write concerns.
+    static const NamespaceString kConfigSettingsNamespace;
 
     /**
      * Constructs an empty NamespaceString.
@@ -205,6 +211,9 @@ public:
     }
     bool isSystem() const {
         return coll().startsWith("system.");
+    }
+    bool isNormalCollection() const {
+        return !isSystem() && !(isLocal() && coll().startsWith("replset."));
     }
     bool isAdminDB() const {
         return db() == kAdminDb;

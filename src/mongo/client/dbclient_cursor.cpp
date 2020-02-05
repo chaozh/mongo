@@ -131,6 +131,22 @@ Message DBClientCursor::_assembleInit() {
                 // Legacy queries don't handle readOnce.
                 qr.getValue()->setReadOnce(true);
             }
+            if (query.getBoolField("$_requestResumeToken")) {
+                // Legacy queries don't handle requestResumeToken.
+                qr.getValue()->setRequestResumeToken(true);
+            }
+            if (query.hasField("$_resumeAfter")) {
+                // Legacy queries don't handle resumeAfter.
+                qr.getValue()->setResumeAfter(query.getObjectField("$_resumeAfter"));
+            }
+            if (auto replTerm = query[QueryRequest::kTermField]) {
+                // Legacy queries don't handle term.
+                qr.getValue()->setReplicationTerm(replTerm.numberLong());
+            }
+            if (auto readConcern = query[repl::ReadConcernArgs::kReadConcernFieldName]) {
+                // Legacy queries don't handle readConcern.
+                qr.getValue()->setReadConcern(readConcern.Obj());
+            }
             BSONObj cmd = _nsOrUuid.uuid() ? qr.getValue()->asFindCommandWithUuid()
                                            : qr.getValue()->asFindCommand();
             if (auto readPref = query["$readPreference"]) {
@@ -162,9 +178,10 @@ Message DBClientCursor::_assembleGetMore() {
         auto gmr = GetMoreRequest(ns,
                                   cursorId,
                                   boost::make_optional(batchSize != 0, batchSize),
-                                  boost::none,   // awaitDataTimeout
-                                  boost::none,   // term
-                                  boost::none);  // lastKnownCommittedOptime
+                                  boost::make_optional(tailableAwaitData(),
+                                                       _awaitDataTimeout),  // awaitDataTimeout
+                                  _term,
+                                  _lastKnownCommittedOpTime);
         auto msg = assembleCommandRequest(_client, ns.db(), opts, gmr.toBSON());
         // Set the exhaust flag if needed.
         if (opts & QueryOption_Exhaust && msg.operation() == dbMsg) {
@@ -182,10 +199,13 @@ bool DBClientCursor::init() {
     Message toSend = _assembleInit();
     verify(_client);
     Message reply;
-    if (!_client->call(toSend, reply, false, &_originalHost)) {
+    try {
+        _client->call(toSend, reply, true, &_originalHost);
+    } catch (const DBException&) {
         // log msg temp?
         log() << "DBClientCursor::init call() failed" << endl;
-        return false;
+        // We always want to throw on network exceptions.
+        throw;
     }
     if (reply.empty()) {
         // log msg temp?
@@ -209,13 +229,13 @@ void DBClientCursor::initLazy(bool isRetry) {
 bool DBClientCursor::initLazyFinish(bool& retry) {
     invariant(_connectionHasPendingReplies);
     Message reply;
-    bool recvd = _client->recv(reply, _lastRequestId);
+    Status recvStatus = _client->recv(reply, _lastRequestId);
     _connectionHasPendingReplies = false;
 
     // If we get a bad response, return false
-    if (!recvd || reply.empty()) {
-        if (!recvd)
-            log() << "DBClientCursor::init lazy say() failed" << endl;
+    if (!recvStatus.isOK() || reply.empty()) {
+        if (!recvStatus.isOK())
+            log() << "DBClientCursor::init lazy say() failed: " << redact(recvStatus) << endl;
         if (reply.empty())
             log() << "DBClientCursor::init message from say() was empty" << endl;
 
@@ -272,9 +292,8 @@ void DBClientCursor::exhaustReceiveMore() {
     uassert(40675, "Cannot have limit for exhaust query", !haveLimit);
     Message response;
     verify(_client);
-    if (!_client->recv(response, _lastRequestId)) {
-        uasserted(16465, "recv failed while exhausting cursor");
-    }
+    uassertStatusOK(
+        _client->recv(response, _lastRequestId).withContext("recv failed while exhausting cursor"));
     dataReceived(response);
 }
 
@@ -299,12 +318,6 @@ BSONObj DBClientCursor::commandDataReceived(const Message& reply) {
         wasError = true;
     }
 
-    auto opCtx = haveClient() ? cc().getOperationContext() : nullptr;
-    if (_client->getReplyMetadataReader()) {
-        uassertStatusOK(_client->getReplyMetadataReader()(
-            opCtx, commandReply->getCommandReply(), _client->getServerAddress()));
-    }
-
     return commandReply->getCommandReply().getOwned();
 }
 
@@ -327,6 +340,8 @@ void DBClientCursor::dataReceived(const Message& reply, bool& retry, string& hos
                 !(_connectionHasPendingReplies && cursorId == 0));
 
         ns = cr.getNSS();  // Unlike OP_REPLY, find command can change the ns to use for getMores.
+        // Store the resume token, if we got one.
+        _postBatchResumeToken = cr.getPostBatchResumeToken();
         batch.objs = cr.releaseBatch();
         return;
     }

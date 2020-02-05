@@ -42,6 +42,8 @@
 #include "mongo/db/pipeline/expression.h"
 #include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/query/query_knobs_gen.h"
+#include "mongo/platform/overflow_arithmetic.h"
+#include "mongo/util/fail_point.h"
 
 namespace mongo {
 
@@ -115,7 +117,7 @@ DocumentSourceLookUp::DocumentSourceLookUp(NamespaceString fromNs,
 }
 
 std::unique_ptr<DocumentSourceLookUp::LiteParsed> DocumentSourceLookUp::LiteParsed::parse(
-    const AggregationRequest& request, const BSONElement& spec) {
+    const NamespaceString& nss, const BSONElement& spec) {
     uassert(ErrorCodes::FailedToParse,
             str::stream() << "the $lookup stage specification must be an object, but found "
                           << typeName(spec.type()),
@@ -131,29 +133,46 @@ std::unique_ptr<DocumentSourceLookUp::LiteParsed> DocumentSourceLookUp::LitePars
                           << typeName(specObj["from"].type()),
             fromElement.type() == BSONType::String);
 
-    NamespaceString fromNss(request.getNamespaceString().db(), fromElement.valueStringData());
+    NamespaceString fromNss(nss.db(), fromElement.valueStringData());
     uassert(ErrorCodes::InvalidNamespace,
             str::stream() << "invalid $lookup namespace: " << fromNss.ns(),
             fromNss.isValid());
-
-    stdx::unordered_set<NamespaceString> foreignNssSet;
 
     // Recursively lite parse the nested pipeline, if one exists.
     auto pipelineElem = specObj["pipeline"];
     boost::optional<LiteParsedPipeline> liteParsedPipeline;
     if (pipelineElem) {
         auto pipeline = uassertStatusOK(AggregationRequest::parsePipelineFromBSON(pipelineElem));
-        AggregationRequest foreignAggReq(fromNss, std::move(pipeline));
-        liteParsedPipeline = LiteParsedPipeline(foreignAggReq);
-
-        auto pipelineInvolvedNamespaces = liteParsedPipeline->getInvolvedNamespaces();
-        foreignNssSet.insert(pipelineInvolvedNamespaces.begin(), pipelineInvolvedNamespaces.end());
+        liteParsedPipeline = LiteParsedPipeline(fromNss, pipeline);
     }
 
-    foreignNssSet.insert(fromNss);
+    return std::make_unique<DocumentSourceLookUp::LiteParsed>(std::move(fromNss),
+                                                              std::move(liteParsedPipeline));
+}
 
-    return std::make_unique<DocumentSourceLookUp::LiteParsed>(
-        std::move(fromNss), std::move(foreignNssSet), std::move(liteParsedPipeline));
+PrivilegeVector DocumentSourceLookUp::LiteParsed::requiredPrivileges(
+    bool isMongos, bool bypassDocumentValidation) const {
+    PrivilegeVector requiredPrivileges;
+    invariant(_pipelines.size() <= 1);
+    invariant(_foreignNss);
+
+    // If no pipeline is specified or the local/foreignField syntax was used, then assume that we're
+    // reading directly from the collection.
+    if (_pipelines.empty() || !_pipelines[0].startsWithInitialSource()) {
+        Privilege::addPrivilegeToPrivilegeVector(
+            &requiredPrivileges,
+            Privilege(ResourcePattern::forExactNamespace(*_foreignNss), ActionType::find));
+    }
+
+    // Add the sub-pipeline privileges, if one was specified.
+    if (!_pipelines.empty()) {
+        const LiteParsedPipeline& pipeline = _pipelines[0];
+        Privilege::addPrivilegesToPrivilegeVector(
+            &requiredPrivileges,
+            std::move(pipeline.requiredPrivileges(isMongos, bypassDocumentValidation)));
+    }
+
+    return requiredPrivileges;
 }
 
 REGISTER_DOCUMENT_SOURCE(lookup,
@@ -201,6 +220,7 @@ StageConstraints DocumentSourceLookUp::constraints(Pipeline::SplitState) const {
                                  LookupRequirement::kAllowed);
 
     constraints.canSwapWithMatch = true;
+    constraints.canSwapWithLimitAndSample = !_unwindSrc;
     return constraints;
 }
 
@@ -223,6 +243,16 @@ BSONObj buildEqualityOrQuery(const std::string& fieldName, const BSONArray& valu
         }
     }
     return orBuilder.obj();
+}
+
+void assertIsValidCollectionState(const boost::intrusive_ptr<ExpressionContext>& expCtx) {
+    if (expCtx->mongoProcessInterface->isSharded(expCtx->opCtx, expCtx->ns)) {
+        const bool foreignShardedAllowed =
+            getTestCommandsEnabled() && internalQueryAllowShardedLookup.load();
+        if (!foreignShardedAllowed) {
+            uasserted(51069, "Cannot run $lookup with sharded foreign collection");
+        }
+    }
 }
 
 }  // namespace
@@ -253,16 +283,19 @@ DocumentSource::GetNextResult DocumentSourceLookUp::doGetNext() {
     auto pipeline = buildPipeline(inputDoc);
 
     std::vector<Value> results;
-    int objsize = 0;
+    long long objsize = 0;
     const auto maxBytes = internalLookupStageIntermediateDocumentMaxSizeBytes.load();
+
     while (auto result = pipeline->getNext()) {
-        objsize += result->getApproximateSize();
+        long long safeSum = 0;
+        bool hasOverflowed = overflow::add(objsize, result->getApproximateSize(), &safeSum);
         uassert(4568,
                 str::stream() << "Total size of documents in " << _fromNs.coll()
                               << " matching pipeline's $lookup stage exceeds " << maxBytes
                               << " bytes",
 
-                objsize <= maxBytes);
+                !hasOverflowed && objsize <= maxBytes);
+        objsize = safeSum;
         results.emplace_back(std::move(*result));
     }
     _usedDisk = _usedDisk || pipeline->usedDisk();
@@ -277,12 +310,20 @@ std::unique_ptr<Pipeline, PipelineDeleter> DocumentSourceLookUp::buildPipeline(
     // Copy all 'let' variables into the foreign pipeline's expression context.
     copyVariablesToExpCtx(_variables, _variablesParseState, _fromExpCtx.get());
 
+    assertIsValidCollectionState(_fromExpCtx);
+
     // Resolve the 'let' variables to values per the given input document.
     resolveLetVariables(inputDoc, &_fromExpCtx->variables);
 
     // If we don't have a cache, build and return the pipeline immediately.
     if (!_cache || _cache->isAbandoned()) {
-        return pExpCtx->mongoProcessInterface->makePipeline(_resolvedPipeline, _fromExpCtx);
+        MongoProcessInterface::MakePipelineOptions pipelineOpts;
+        pipelineOpts.optimize = true;
+        pipelineOpts.attachCursorSource = true;
+        // By default, $lookup doesnt support sharded 'from' collections.
+        pipelineOpts.allowTargetingShards = internalQueryAllowShardedLookup.load();
+        return pExpCtx->mongoProcessInterface->makePipeline(
+            _resolvedPipeline, _fromExpCtx, pipelineOpts);
     }
 
     // Tailor the pipeline construction for our needs. We want a non-optimized pipeline without a
@@ -297,16 +338,23 @@ std::unique_ptr<Pipeline, PipelineDeleter> DocumentSourceLookUp::buildPipeline(
 
     // Add the cache stage at the end and optimize. During the optimization process, the cache will
     // either move itself to the correct position in the pipeline, or will abandon itself if no
-    // suitable cache position exists.
-    pipeline->addFinalSource(
-        DocumentSourceSequentialDocumentCache::create(_fromExpCtx, _cache.get_ptr()));
+    // suitable cache position exists. Do it only if pipeline optimization is enabled, otherwise
+    // Pipeline::optimizePipeline() will exit early and correct placement of the cache will not
+    // occur.
+    if (auto fp = globalFailPointRegistry().find("disablePipelineOptimization");
+        fp && fp->shouldFail()) {
+        _cache->abandon();
+    } else {
+        pipeline->addFinalSource(
+            DocumentSourceSequentialDocumentCache::create(_fromExpCtx, _cache.get_ptr()));
+    }
 
     pipeline->optimizePipeline();
 
     if (!_cache->isServing()) {
         // The cache has either been abandoned or has not yet been built. Attach a cursor.
-        pipeline = pExpCtx->mongoProcessInterface->attachCursorSourceToPipeline(_fromExpCtx,
-                                                                                pipeline.release());
+        pipeline = pExpCtx->mongoProcessInterface->attachCursorSourceToPipeline(
+            _fromExpCtx, pipeline.release(), internalQueryAllowShardedLookup.load());
     }
 
     // If the cache has been abandoned, release it.
@@ -716,12 +764,12 @@ DepsTracker::State DocumentSourceLookUp::getDependencies(DepsTracker* deps) cons
         // We will use the introspection pipeline which we prebuilt during construction.
         invariant(_resolvedIntrospectionPipeline);
 
-        // We are not attempting to enforce that any referenced metadata are in fact available,
+        // We are not attempting to enforce that any referenced metadata are in fact unavailable,
         // this is done elsewhere. We only need to know what variable dependencies exist in the
         // subpipeline for the top-level pipeline. So without knowledge of what metadata is in fact
-        // available, we "lie" and say that all metadata is available to avoid tripping any
+        // unavailable, we "lie" and say that all metadata is available to avoid tripping any
         // assertions.
-        DepsTracker subDeps(DepsTracker::kAllMetadata);
+        DepsTracker subDeps(DepsTracker::kNoMetadata);
 
         // Get the subpipeline dependencies. Subpipeline stages may reference both 'let' variables
         // declared by this $lookup and variables declared externally.

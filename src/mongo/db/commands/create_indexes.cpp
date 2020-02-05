@@ -38,10 +38,12 @@
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/background.h"
 #include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/create_collection.h"
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/catalog/index_key_validate.h"
 #include "mongo/db/catalog/multi_index_block.h"
+#include "mongo/db/catalog/uncommitted_collections.h"
 #include "mongo/db/command_generic_argument.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/concurrency/d_concurrency.h"
@@ -68,6 +70,14 @@
 namespace mongo {
 
 namespace {
+// This failpoint simulates a WriteConflictException during createIndexes where the collection is
+// implicitly created.
+MONGO_FAIL_POINT_DEFINE(createIndexesWriteConflict);
+
+// This failpoint causes createIndexes with an implicit collection creation to hang before the
+// collection is created.
+MONGO_FAIL_POINT_DEFINE(hangBeforeCreateIndexesCollectionCreate);
+MONGO_FAIL_POINT_DEFINE(hangBeforeIndexBuildAbortOnInterrupt);
 
 constexpr auto kIndexesFieldName = "indexes"_sd;
 constexpr auto kCommandName = "createIndexes"_sd;
@@ -182,6 +192,23 @@ StatusWith<std::vector<BSONObj>> parseAndValidateIndexSpecs(
     return indexSpecs;
 }
 
+void appendFinalIndexFieldsToResult(int numIndexesBefore,
+                                    int numIndexesAfter,
+                                    BSONObjBuilder& result,
+                                    int numSpecs,
+                                    boost::optional<CommitQuorumOptions> commitQuorum) {
+    result.append(kNumIndexesBeforeFieldName, numIndexesBefore);
+    result.append(kNumIndexesAfterFieldName, numIndexesAfter);
+    if (numIndexesAfter == numIndexesBefore) {
+        result.append(kNoteFieldName, "all indexes already exist");
+    } else if (numIndexesAfter < numIndexesBefore + numSpecs) {
+        result.append(kNoteFieldName, "index already exists");
+    }
+
+    commitQuorum->append("commitQuorum", &result);
+}
+
+
 /**
  * Ensures that the options passed in for TTL indexes are valid.
  */
@@ -247,14 +274,18 @@ Status validateTTLOptions(OperationContext* opCtx, const BSONObj& cmdObj) {
  */
 boost::optional<CommitQuorumOptions> parseAndGetCommitQuorum(OperationContext* opCtx,
                                                              const BSONObj& cmdObj) {
+    auto replCoord = repl::ReplicationCoordinator::get(opCtx);
+
     if (cmdObj.hasField(kCommitQuorumFieldName)) {
+        uassert(ErrorCodes::BadValue,
+                str::stream() << "Standalones can't specify commitQuorum",
+                replCoord->isReplEnabled());
         CommitQuorumOptions commitQuorum;
         uassertStatusOK(commitQuorum.parse(cmdObj.getField(kCommitQuorumFieldName)));
         return commitQuorum;
     } else {
         // Retrieve the default commit quorum if one wasn't passed in, which consists of all
         // data-bearing nodes.
-        auto replCoord = repl::ReplicationCoordinator::get(opCtx);
         int numDataBearingMembers =
             replCoord->isReplEnabled() ? replCoord->getConfig().getNumDataBearingMembers() : 1;
         return CommitQuorumOptions(numDataBearingMembers);
@@ -341,309 +372,97 @@ void checkDatabaseShardingState(OperationContext* opCtx, StringData dbName) {
 }
 
 /**
- * Opens or creates database for index creation.
- * On database creation, the lock will be made exclusive.
+ * Checks collection sharding state. Throws exception on error.
  */
-Database* getOrCreateDatabase(OperationContext* opCtx, StringData dbName, Lock::DBLock* dbLock) {
-    auto databaseHolder = DatabaseHolder::get(opCtx);
-
-    if (auto db = databaseHolder->getDb(opCtx, dbName)) {
-        return db;
-    }
-
-    // Temporarily release the Database lock while holding a Global IX lock. This prevents
-    // replication state from changing. Abandon the current snapshot to see changed metadata.
-    opCtx->recoveryUnit()->abandonSnapshot();
-    dbLock->relockWithMode(MODE_X);
-
-    checkDatabaseShardingState(opCtx, dbName);
-    return databaseHolder->openDb(opCtx, dbName);
+void checkCollectionShardingState(OperationContext* opCtx, const NamespaceString& ns) {
+    CollectionShardingState::get(opCtx, ns)->checkShardVersionOrThrow(opCtx, true);
 }
 
 /**
- * Gets or creates collection to hold indexes.
- * Appends field to command result to indicate if the collection already exists.
+ * Attempts to create indexes in `specs` on a non-existent collection (or empty collection created
+ * in the same multi-document transaction) with namespace `ns`. In the former case, the collection
+ * is implicitly created.
+ * Returns a BSONObj containing fields to be appended to the result of the calling function.
+ * `commitQuorum` is passed only to be appended to the result, for completeness. It is otherwise
+ * unused.
+ * Expects to be run at the end of a larger writeConflictRetry loop.
  */
-Collection* getOrCreateCollection(OperationContext* opCtx,
-                                  Database* db,
-                                  const NamespaceString& ns,
-                                  const BSONObj& cmdObj,
-                                  std::string* errmsg,
-                                  BSONObjBuilder* result) {
-    if (auto collection = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(ns)) {
-        result->appendBool(kCreateCollectionAutomaticallyFieldName, false);
-        return collection;
-    }
+BSONObj runCreateIndexesOnNewCollection(OperationContext* opCtx,
+                                        const NamespaceString& ns,
+                                        const std::vector<BSONObj>& specs,
+                                        boost::optional<CommitQuorumOptions> commitQuorum,
+                                        bool createCollImplicitly) {
+    BSONObjBuilder createResult;
 
-    result->appendBool(kCreateCollectionAutomaticallyFieldName, true);
-
-    if (ViewCatalog::get(db)->lookup(opCtx, ns.ns())) {
-        *errmsg = "Cannot create indexes on a view";
-        uasserted(ErrorCodes::CommandNotSupportedOnView, *errmsg);
-    }
-
-    uassertStatusOK(userAllowedCreateNS(ns.db(), ns.coll()));
-
-    CollectionOptions options;
-    options.uuid = UUID::gen();
-    return writeConflictRetry(opCtx, kCommandName, ns.ns(), [&] {
-        WriteUnitOfWork wunit(opCtx);
-        auto collection = db->createCollection(opCtx, ns, options);
-        invariant(collection,
-                  str::stream() << "Failed to create collection " << ns.ns()
-                                << " during index creation: " << redact(cmdObj));
-        wunit.commit();
-        return collection;
-    });
-}
-
-/**
- * Creates indexes using the given specs for the mobile storage engine.
- * TODO(SERVER-42513): Remove this function.
- */
-bool runCreateIndexesForMobile(OperationContext* opCtx,
-                               const std::string& dbname,
-                               const BSONObj& cmdObj,
-                               std::string& errmsg,
-                               BSONObjBuilder& result) {
-    NamespaceString ns(CommandHelpers::parseNsCollectionRequired(dbname, cmdObj));
-    uassertStatusOK(userAllowedWriteNS(ns));
-
-    // Disallow users from creating new indexes on config.transactions since the sessions code
-    // was optimized to not update indexes
-    uassert(ErrorCodes::IllegalOperation,
-            str::stream() << "not allowed to create index on " << ns.ns(),
-            ns != NamespaceString::kSessionTransactionsTableNamespace);
-
-    auto specs = uassertStatusOK(
-        parseAndValidateIndexSpecs(opCtx, ns, cmdObj, serverGlobalParams.featureCompatibility));
-
-    MONGO_COMPILER_VARIABLE_UNUSED auto commitQuorum = parseAndGetCommitQuorum(opCtx, cmdObj);
-
-    Status validateTTL = validateTTLOptions(opCtx, cmdObj);
-    uassertStatusOK(validateTTL);
-
-    // Do not use AutoGetOrCreateDb because we may relock the database in mode X.
-    Lock::DBLock dbLock(opCtx, ns.db(), MODE_IX);
-    checkDatabaseShardingState(opCtx, ns.db());
-    if (!repl::ReplicationCoordinator::get(opCtx)->canAcceptWritesFor(opCtx, ns)) {
-        uasserted(ErrorCodes::NotMaster,
-                  str::stream() << "Not primary while creating indexes in " << ns.ns());
-    }
-
-    if (indexesAlreadyExist(opCtx, ns, specs, &result)) {
-        return true;
-    }
-
-    auto db = getOrCreateDatabase(opCtx, ns.db(), &dbLock);
-
-    opCtx->recoveryUnit()->abandonSnapshot();
-    boost::optional<Lock::CollectionLock> exclusiveCollectionLock(
-        boost::in_place_init, opCtx, ns, MODE_X);
-
-    // Index builds can safely ignore prepare conflicts and perform writes. On primaries, an
-    // exclusive lock in the final drain phase conflicts with prepared transactions.
-    opCtx->recoveryUnit()->setPrepareConflictBehavior(
-        PrepareConflictBehavior::kIgnoreConflictsAllowWrites);
-
-    Collection* collection = getOrCreateCollection(opCtx, db, ns, cmdObj, &errmsg, &result);
-    // Save the db name and collection uuid so we can correctly relock even across a
-    // concurrent rename collection operation. We allow rename collection while an
-    // index is in progress iff the rename is within the same database.
-    const std::string dbName = ns.db().toString();
-    const UUID collectionUUID = collection->uuid();
-
-    // Use AutoStatsTracker to update Top.
-    boost::optional<AutoStatsTracker> statsTracker;
-    const boost::optional<int> dbProfilingLevel = boost::none;
-    statsTracker.emplace(opCtx,
-                         ns,
-                         Top::LockType::WriteLocked,
-                         AutoStatsTracker::LogMode::kUpdateTopAndCurop,
-                         dbProfilingLevel);
-
-    MultiIndexBlock indexer;
-
-    const size_t origSpecsSize = specs.size();
-    specs = resolveDefaultsAndRemoveExistingIndexes(opCtx, collection, std::move(specs));
-
-    const int numIndexesBefore = collection->getIndexCatalog()->numIndexesTotal(opCtx);
-    if (specs.size() == 0) {
-        fillCommandResultWithIndexesAlreadyExistInfo(numIndexesBefore, &result);
-        return true;
-    }
-
-    result.append("numIndexesBefore", numIndexesBefore);
-
-    if (specs.size() != origSpecsSize) {
-        result.append("note", "index already exists");
-    }
-
-    for (size_t i = 0; i < specs.size(); i++) {
-        const BSONObj& spec = specs[i];
-        if (spec["unique"].trueValue()) {
-            checkUniqueIndexConstraints(opCtx, ns, spec["key"].Obj());
-        }
-    }
-
-    // The 'indexer' can throw, so ensure the build cleanup occurs.
-    ON_BLOCK_EXIT([&] {
-        opCtx->recoveryUnit()->abandonSnapshot();
-        if (MONGO_unlikely(leaveIndexBuildUnfinishedForShutdown.shouldFail())) {
-            // Set a flag to leave the persisted index build state intact when cleanUpAfterBuild()
-            // is called below. The index build will be found on server startup.
-            //
-            // Note: this failpoint has two parts, the first to make the index build error and the
-            // second to catch it here: the index build must error before commit(), otherwise
-            // commit() clears the state.
-            indexer.abortWithoutCleanup(opCtx);
-        }
-
-        if (!indexer.isCommitted()) {
-            opCtx->recoveryUnit()->abandonSnapshot();
-            exclusiveCollectionLock.reset();
-            UninterruptibleLockGuard noInterrupt(opCtx->lockState());
-            Lock::DBLock dbLock(opCtx, ns.db(), MODE_IX);
-            Lock::CollectionLock colLock(opCtx, {dbName, collectionUUID}, MODE_X);
-            indexer.cleanUpAfterBuild(opCtx, collection, MultiIndexBlock::kNoopOnCleanUpFn);
-        } else {
-            indexer.cleanUpAfterBuild(opCtx, collection, MultiIndexBlock::kNoopOnCleanUpFn);
-        }
-    });
-
-    std::vector<BSONObj> indexInfoObjs =
-        writeConflictRetry(opCtx, kCommandName, ns.ns(), [opCtx, collection, &indexer, &specs] {
-            return uassertStatusOK(
-                indexer.init(opCtx,
-                             collection,
-                             specs,
-                             MultiIndexBlock::makeTimestampedIndexOnInitFn(opCtx, collection)));
-        });
-
-    // Don't hold an exclusive collection lock during background indexing, so that other readers
-    // and writers can proceed during this phase. A BackgroundOperation has been registered on the
-    // namespace, so the collection cannot be removed after yielding the lock.
-    if (indexer.isBackgroundBuilding()) {
-        invariant(BackgroundOperation::inProgForNs(ns));
-        opCtx->recoveryUnit()->abandonSnapshot();
-        exclusiveCollectionLock.reset();
-    }
-
-    // Collection scan and insert into index, followed by a drain of writes received in the
-    // background.
-    {
-        Lock::CollectionLock colLock(opCtx, {dbName, collectionUUID}, MODE_IS);
-
-        // Reaquire the collection pointer because we momentarily released the collection lock.
-        collection = CollectionCatalog::get(opCtx).lookupCollectionByUUID(collectionUUID);
-        invariant(collection);
-
-        // Reaquire the 'ns' string in case the collection was renamed while we momentarily released
-        // the collection lock.
-        ns = collection->ns();
-
-        uassertStatusOK(indexer.insertAllDocumentsInCollection(opCtx, collection));
-    }
-
-    if (MONGO_unlikely(hangAfterIndexBuildDumpsInsertsFromBulk.shouldFail())) {
-        log() << "Hanging after dumping inserts from bulk builder";
-        hangAfterIndexBuildDumpsInsertsFromBulk.pauseWhileSet();
-    }
-
-    // Perform the first drain while holding an intent lock.
-    {
-        opCtx->recoveryUnit()->abandonSnapshot();
-        Lock::CollectionLock colLock(opCtx, {dbName, collectionUUID}, MODE_IS);
-
-        // Reaquire the collection pointer because we momentarily released the collection lock.
-        collection = CollectionCatalog::get(opCtx).lookupCollectionByUUID(collectionUUID);
-        invariant(collection);
-
-        // Reaquire the 'ns' string in case the collection was renamed while we momentarily released
-        // the collection lock.
-        ns = collection->ns();
-
-        uassertStatusOK(
-            indexer.drainBackgroundWrites(opCtx,
-                                          RecoveryUnit::ReadSource::kUnset,
-                                          IndexBuildInterceptor::DrainYieldPolicy::kYield));
-    }
-
-    if (MONGO_unlikely(hangAfterIndexBuildFirstDrain.shouldFail())) {
-        log() << "Hanging after index build first drain";
-        hangAfterIndexBuildFirstDrain.pauseWhileSet();
-    }
-
-    // Perform the second drain while stopping writes on the collection.
-    {
-        opCtx->recoveryUnit()->abandonSnapshot();
-        Lock::CollectionLock colLock(opCtx, {dbName, collectionUUID}, MODE_S);
-
-        // Reaquire the collection pointer because we momentarily released the collection lock.
-        collection = CollectionCatalog::get(opCtx).lookupCollectionByUUID(collectionUUID);
-        invariant(collection);
-
-        // Reaquire the 'ns' string in case the collection was renamed while we momentarily released
-        // the collection lock.
-        ns = collection->ns();
-
-        uassertStatusOK(
-            indexer.drainBackgroundWrites(opCtx,
-                                          RecoveryUnit::ReadSource::kUnset,
-                                          IndexBuildInterceptor::DrainYieldPolicy::kNoYield));
-    }
-
-    if (MONGO_unlikely(hangAfterIndexBuildSecondDrain.shouldFail())) {
-        log() << "Hanging after index build second drain";
-        hangAfterIndexBuildSecondDrain.pauseWhileSet();
-    }
-
-    // Need to get exclusive collection lock back to complete the index build.
-    if (indexer.isBackgroundBuilding()) {
-        opCtx->recoveryUnit()->abandonSnapshot();
-        exclusiveCollectionLock.emplace(
-            opCtx, NamespaceStringOrUUID(dbName, collectionUUID), MODE_X);
-
-        // Reaquire the collection pointer because we momentarily released the collection lock.
-        collection = CollectionCatalog::get(opCtx).lookupCollectionByUUID(collectionUUID);
-        invariant(collection);
-
-        // Reaquire the 'ns' string in case the collection was renamed while we momentarily released
-        // the collection lock.
-        ns = collection->ns();
-    }
+    WriteUnitOfWork wunit(opCtx);
 
     auto databaseHolder = DatabaseHolder::get(opCtx);
-    db = databaseHolder->getDb(opCtx, ns.db());
-    invariant(CollectionCatalog::get(opCtx).lookupCollectionByNamespace(ns));
+    auto db = databaseHolder->getDb(opCtx, ns.db());
+    uassert(ErrorCodes::CommandNotSupportedOnView,
+            "Cannot create indexes on a view",
+            !db || !ViewCatalog::get(db)->lookup(opCtx, ns.ns()));
 
-    // Perform the third and final drain while holding the exclusive collection lock.
-    uassertStatusOK(
-        indexer.drainBackgroundWrites(opCtx,
-                                      RecoveryUnit::ReadSource::kUnset,
-                                      IndexBuildInterceptor::DrainYieldPolicy::kNoYield));
+    if (createCollImplicitly) {
+        // We need to create the collection.
+        BSONObjBuilder builder;
+        builder.append("create", ns.coll());
+        CollectionOptions options;
+        builder.appendElements(options.toBSON());
+        BSONObj idIndexSpec;
 
-    // This is required before completion.
-    uassertStatusOK(indexer.checkConstraints(opCtx));
+        if (MONGO_unlikely(hangBeforeCreateIndexesCollectionCreate.shouldFail())) {
+            // Simulate a scenario where a conflicting collection creation occurs
+            // mid-index build.
+            log() << "Hanging create collection due to failpoint "
+                     "'hangBeforeCreateIndexesCollectionCreate'";
+            hangBeforeCreateIndexesCollectionCreate.pauseWhileSet();
+        }
 
-    writeConflictRetry(opCtx, kCommandName, ns.ns(), [&] {
-        WriteUnitOfWork wunit(opCtx);
+        auto createStatus =
+            createCollection(opCtx, ns.db().toString(), builder.obj().getOwned(), idIndexSpec);
 
-        uassertStatusOK(
-            indexer.commit(opCtx,
-                           collection,
-                           [opCtx, &ns, collection](const BSONObj& spec) {
-                               opCtx->getServiceContext()->getOpObserver()->onCreateIndex(
-                                   opCtx, ns, collection->uuid(), spec, false);
-                           },
-                           MultiIndexBlock::kNoopOnCommitFn));
+        if (createStatus == ErrorCodes::NamespaceExists) {
+            throw WriteConflictException();
+        }
 
-        wunit.commit();
-    });
+        uassertStatusOK(createStatus);
+    }
 
-    result.append("numIndexesAfter", collection->getIndexCatalog()->numIndexesTotal(opCtx));
+    // By this point, we have exclusive access to our collection, either because we created the
+    // collection implicitly as part of createIndexes or because the collection was created earlier
+    // in the same multi-document transaction.
+    auto collection = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, ns);
+    UncommittedCollections::get(opCtx).invariantHasExclusiveAccessToCollection(opCtx,
+                                                                               collection->ns());
+    invariant(opCtx->inMultiDocumentTransaction() || createCollImplicitly);
 
-    return true;
+    uassert(ErrorCodes::OperationNotSupportedInTransaction,
+            str::stream() << "Cannot create new indexes on non-empty collection " << ns
+                          << " in a multi-document transaction.",
+            collection->numRecords(opCtx) == 0);
+
+    const int numIndexesBefore = IndexBuildsCoordinator::getNumIndexesTotal(opCtx, collection);
+    auto filteredSpecs =
+        IndexBuildsCoordinator::prepareSpecListForCreate(opCtx, collection, ns, specs);
+    // It's possible for 'filteredSpecs' to be empty if we receive a createIndexes request for the
+    // _id index and also create the collection implicitly. By this point, the _id index has already
+    // been created, and there is no more work to be done.
+    if (!filteredSpecs.empty()) {
+        IndexBuildsCoordinator::createIndexesOnEmptyCollection(
+            opCtx, collection->uuid(), filteredSpecs, false);
+    }
+
+    const int numIndexesAfter = IndexBuildsCoordinator::getNumIndexesTotal(opCtx, collection);
+
+    if (MONGO_unlikely(createIndexesWriteConflict.shouldFail())) {
+        throw WriteConflictException();
+    }
+    wunit.commit();
+
+    appendFinalIndexFieldsToResult(
+        numIndexesBefore, numIndexesAfter, createResult, int(specs.size()), commitQuorum);
+
+    return createResult.obj();
 }
 
 bool runCreateIndexesWithCoordinator(OperationContext* opCtx,
@@ -652,6 +471,10 @@ bool runCreateIndexesWithCoordinator(OperationContext* opCtx,
                                      std::string& errmsg,
                                      BSONObjBuilder& result) {
     const NamespaceString ns(CommandHelpers::parseNsCollectionRequired(dbname, cmdObj));
+
+    // Disallows drops and renames on this namespace.
+    BackgroundOperation backgroundOp(ns.ns());
+
     uassertStatusOK(userAllowedWriteNS(ns));
 
     // Disallow users from creating new indexes on config.transactions since the sessions code
@@ -670,10 +493,9 @@ bool runCreateIndexesWithCoordinator(OperationContext* opCtx,
     // Preliminary checks before handing control over to IndexBuildsCoordinator:
     // 1) We are in a replication mode that allows for index creation.
     // 2) Check sharding state.
-    // 3) Create the collection to hold the index(es) if necessary.
+    // 3) Check if we can create the index without handing control to the IndexBuildsCoordinator.
     OptionalCollectionUUID collectionUUID;
     {
-        // Do not use AutoGetOrCreateDb because we may relock the database in mode X.
         Lock::DBLock dbLock(opCtx, ns.db(), MODE_IX);
         checkDatabaseShardingState(opCtx, ns.db());
         if (!repl::ReplicationCoordinator::get(opCtx)->canAcceptWritesFor(opCtx, ns)) {
@@ -681,17 +503,44 @@ bool runCreateIndexesWithCoordinator(OperationContext* opCtx,
                       str::stream() << "Not primary while creating indexes in " << ns.ns());
         }
 
-        if (indexesAlreadyExist(opCtx, ns, specs, &result)) {
+        bool indexExists = writeConflictRetry(opCtx, "createCollectionWithIndexes", ns.ns(), [&] {
+            if (indexesAlreadyExist(opCtx, ns, specs, &result)) {
+                return true;
+            }
+
+            auto collection = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, ns);
+            if (collection &&
+                !UncommittedCollections::get(opCtx).isUncommittedCollection(opCtx, ns)) {
+                // The collection exists and was not created in the same multi-document transaction
+                // as the createIndexes.
+                collectionUUID = collection->uuid();
+                result.appendBool(kCreateCollectionAutomaticallyFieldName, false);
+                return false;
+            }
+
+            bool createCollImplicitly = collection ? false : true;
+
+            auto createIndexesResult = runCreateIndexesOnNewCollection(
+                opCtx, ns, specs, commitQuorum, createCollImplicitly);
+            // No further sources of WriteConflicts can occur at this point, so it is safe to
+            // append elements to `result` inside the writeConflictRetry loop.
+            result.appendBool(kCreateCollectionAutomaticallyFieldName, true);
+            result.appendElements(createIndexesResult);
+            return true;
+        });
+
+        if (indexExists) {
+            // No need to proceed if the index either already existed or has just been built.
             return true;
         }
 
-        auto db = getOrCreateDatabase(opCtx, ns.db(), &dbLock);
-
-        opCtx->recoveryUnit()->abandonSnapshot();
-        Lock::CollectionLock collLock(opCtx, ns, MODE_X);
-
-        auto collection = getOrCreateCollection(opCtx, db, ns, cmdObj, &errmsg, &result);
-        collectionUUID = collection->uuid();
+        // If the index does not exist by this point, the index build must go through the index
+        // builds coordinator and take an exclusive lock. We should not take exclusive locks inside
+        // of transactions, so we fail early here if we are inside of a transaction.
+        uassert(ErrorCodes::OperationNotSupportedInTransaction,
+                str::stream() << "Cannot create new indexes on existing collection " << ns
+                              << " in a multi-document transaction.",
+                !opCtx->inMultiDocumentTransaction());
     }
 
     // Use AutoStatsTracker to update Top.
@@ -700,12 +549,12 @@ bool runCreateIndexesWithCoordinator(OperationContext* opCtx,
     statsTracker.emplace(opCtx,
                          ns,
                          Top::LockType::WriteLocked,
-                         AutoStatsTracker::LogMode::kUpdateTopAndCurop,
+                         AutoStatsTracker::LogMode::kUpdateTopAndCurOp,
                          dbProfilingLevel);
 
     auto indexBuildsCoord = IndexBuildsCoordinator::get(opCtx);
     auto buildUUID = UUID::gen();
-    auto protocol = indexBuildsCoord->supportsTwoPhaseIndexBuild()
+    auto protocol = IndexBuildsCoordinator::supportsTwoPhaseIndexBuild()
         ? IndexBuildProtocol::kTwoPhase
         : IndexBuildProtocol::kSinglePhase;
     log() << "Registering index build: " << buildUUID;
@@ -731,13 +580,32 @@ bool runCreateIndexesWithCoordinator(OperationContext* opCtx,
         } catch (const ExceptionForCat<ErrorCategory::Interruption>& interruptionEx) {
             log() << "Index build interrupted: " << buildUUID << ": " << interruptionEx;
 
-            // If this node is no longer a primary, the index build will continue to run in the
-            // background and will complete when this node receives a commitIndexBuild oplog entry
-            // from the new primary.
-            if (indexBuildsCoord->supportsTwoPhaseIndexBuild() &&
-                ErrorCodes::InterruptedDueToReplStateChange == interruptionEx.code()) {
-                log() << "Index build continuing in background: " << buildUUID;
-                throw;
+            hangBeforeIndexBuildAbortOnInterrupt.pauseWhileSet();
+
+            boost::optional<Lock::GlobalLock> globalLock;
+            if (IndexBuildProtocol::kTwoPhase == protocol) {
+                // If this node is no longer a primary, the index build will continue to run in the
+                // background and will complete when this node receives a commitIndexBuild oplog
+                // entry from the new primary.
+                if (ErrorCodes::InterruptedDueToReplStateChange == interruptionEx.code()) {
+                    log() << "Index build continuing in background: " << buildUUID;
+                    throw;
+                }
+
+                // If we are using two-phase index builds and are no longer primary after receiving
+                // an interrupt, we cannot replicate an abortIndexBuild oplog entry. Rely on the new
+                // primary to finish the index build. Acquire the global lock to check the
+                // replication state and to prevent any state transitions from happening while
+                // aborting the index build.
+                UninterruptibleLockGuard noInterrupt(opCtx->lockState());
+                globalLock.emplace(opCtx, MODE_IS);
+                if (!repl::ReplicationCoordinator::get(opCtx)->canAcceptWritesFor(opCtx, ns)) {
+                    uassertStatusOK(
+                        {ErrorCodes::NotMaster,
+                         str::stream()
+                             << "Unable to abort index build because we are no longer primary: "
+                             << buildUUID});
+                }
             }
 
             // It is unclear whether the interruption originated from the current opCtx instance
@@ -745,9 +613,12 @@ bool runCreateIndexesWithCoordinator(OperationContext* opCtx,
             // independently of this command invocation. We'll defensively abort the index build
             // with the assumption that if the index build was already in the midst of tearing down,
             // this be a no-op.
-            indexBuildsCoord->abortIndexBuildByBuildUUID(
+            // Use a null abort timestamp because the index build will generate its own timestamp
+            // on cleanup.
+            indexBuildsCoord->abortIndexBuildByBuildUUIDNoWait(
                 opCtx,
                 buildUUID,
+                Timestamp(),
                 str::stream() << "Index build interrupted: " << buildUUID << ": "
                               << interruptionEx.toString());
             log() << "Index build aborted: " << buildUUID;
@@ -759,14 +630,18 @@ bool runCreateIndexesWithCoordinator(OperationContext* opCtx,
 
             // The index build will continue to run in the background and will complete when this
             // node receives a commitIndexBuild oplog entry from the new primary.
+
             if (indexBuildsCoord->supportsTwoPhaseIndexBuild()) {
                 log() << "Index build continuing in background: " << buildUUID;
                 throw;
             }
 
-            indexBuildsCoord->abortIndexBuildByBuildUUID(
+            // Use a null abort timestamp because the index build will generate a ghost timestamp
+            // for the single-phase build on cleanup.
+            indexBuildsCoord->abortIndexBuildByBuildUUIDNoWait(
                 opCtx,
                 buildUUID,
+                Timestamp(),
                 str::stream() << "Index build interrupted due to change in replication state: "
                               << buildUUID << ": " << ex.toString());
             log() << "Index build aborted due to NotMaster error: " << buildUUID;
@@ -802,15 +677,8 @@ bool runCreateIndexesWithCoordinator(OperationContext* opCtx,
     // getLastError results as the previous non-IndexBuildsCoordinator behavior.
     repl::ReplClientInfo::forClient(opCtx->getClient()).setLastOpToSystemLastOpTime(opCtx);
 
-    result.append(kNumIndexesBeforeFieldName, stats.numIndexesBefore);
-    result.append(kNumIndexesAfterFieldName, stats.numIndexesAfter);
-    if (stats.numIndexesAfter == stats.numIndexesBefore) {
-        result.append(kNoteFieldName, "all indexes already exist");
-    } else if (stats.numIndexesAfter < stats.numIndexesBefore + int(specs.size())) {
-        result.append(kNoteFieldName, "index already exists");
-    }
-
-    commitQuorum->append("commitQuorum", &result);
+    appendFinalIndexFieldsToResult(
+        stats.numIndexesBefore, stats.numIndexesAfter, result, int(specs.size()), commitQuorum);
 
     return true;
 }
@@ -849,19 +717,19 @@ public:
                    std::string& errmsg,
                    BSONObjBuilder& result) override {
         // If we encounter an IndexBuildAlreadyInProgress error for any of the requested index
-        // specs, then we will wait for the build(s) to finish before trying again.
+        // specs, then we will wait for the build(s) to finish before trying again unless we are in
+        // a multi-document transaction.
         const NamespaceString nss(CommandHelpers::parseNsCollectionRequired(dbname, cmdObj));
         bool shouldLogMessageOnAlreadyBuildingError = true;
         while (true) {
             try {
-                // TODO(SERVER-42513): Remove runCreateIndexesForMobile() when the mobile storage
-                // engine is supported by runCreateIndexesWithCoordinator().
-                if (storageGlobalParams.engine == "mobile") {
-                    return runCreateIndexesForMobile(opCtx, dbname, cmdObj, errmsg, result);
-                }
                 return runCreateIndexesWithCoordinator(opCtx, dbname, cmdObj, errmsg, result);
             } catch (const DBException& ex) {
-                if (ex.toStatus() != ErrorCodes::IndexBuildAlreadyInProgress) {
+                // We can only wait for an existing index build to finish if we are able to release
+                // our locks, in order to allow the existing index build to proceed. We cannot
+                // release locks in transactions, so we bypass the below logic in transactions.
+                if (ex.toStatus() != ErrorCodes::IndexBuildAlreadyInProgress ||
+                    opCtx->inMultiDocumentTransaction()) {
                     throw;
                 }
                 if (shouldLogMessageOnAlreadyBuildingError) {
@@ -877,8 +745,8 @@ public:
                 // Unset the response fields so we do not write duplicate fields.
                 errmsg = "";
                 result.resetToEmpty();
-                // Reset the snapshot because we have released locks and may reacquire them again
-                // later.
+                // Reset the snapshot because we have released locks and need a fresh snapshot
+                // if we reacquire the locks again later.
                 opCtx->recoveryUnit()->abandonSnapshot();
                 // This is a bit racy since we are not holding a lock across discovering an
                 // in-progress build and starting to listen for completion. It is good enough,

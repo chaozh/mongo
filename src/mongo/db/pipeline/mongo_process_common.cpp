@@ -80,7 +80,8 @@ std::vector<BSONObj> MongoProcessCommon::getCurrentOps(
         }
 
         // Ignore inactive connections unless 'idleConnections' is true.
-        if (!client->getOperationContext() && connMode == CurrentOpConnectionsMode::kExcludeIdle) {
+        if (connMode == CurrentOpConnectionsMode::kExcludeIdle &&
+            !client->hasAnyActiveCurrentOp()) {
             continue;
         }
 
@@ -193,6 +194,10 @@ std::set<FieldPath> MongoProcessCommon::_convertToFieldPaths(
                 res.second);
     }
     return fieldPaths;
+}
+
+std::string MongoProcessCommon::getHostAndPort(OperationContext* opCtx) const {
+    return getHostNameCachedAndPort();
 }
 
 }  // namespace mongo

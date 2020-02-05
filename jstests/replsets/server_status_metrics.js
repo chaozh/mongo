@@ -1,14 +1,22 @@
+/**
+ * Tests metrics in serverStatus related to replication.
+ *
+ * The test for metrics.repl.network.oplogGetMoresProcessed requires a storage engine that supports
+ * document-level locking because it uses the planExecutorHangBeforeShouldWaitForInserts failpoint
+ * to block oplog fetching getMores while trying to do oplog writes. Thus we need a document-level
+ * locking storage engine so that oplog writes would not conflict with oplog reads.
+ * @tags: [requires_document_locking, requires_fcv_44]
+ */
 
 (function() {
 "use strict";
 
-load("jstests/libs/check_log.js");
 load("jstests/libs/write_concern_util.js");
 
 /**
  * Test replication metrics
  */
-function testSecondaryMetrics(secondary, opCount, baseOpsApplied, baseOpsReceived) {
+function _testSecondaryMetricsHelper(secondary, opCount, baseOpsApplied, baseOpsReceived) {
     var ss = secondary.getDB("test").serverStatus();
     jsTestLog(`Secondary ${secondary.host} metrics: ${tojson(ss.metrics)}`);
 
@@ -27,6 +35,15 @@ function testSecondaryMetrics(secondary, opCount, baseOpsApplied, baseOpsReceive
 
     assert.gt(
         ss.metrics.repl.network.replSetUpdatePosition.num, 0, "no update position commands sent");
+
+    // Under a two-node replica set setting, the secondary should not have received or processed any
+    // oplog getMore requests from the primary.
+    assert.eq(
+        ss.metrics.repl.network.oplogGetMoresProcessed.num, 0, "non-zero oplog getMore processed");
+    assert.eq(ss.metrics.repl.network.oplogGetMoresProcessed.totalMillis,
+              0,
+              "non-zero oplog getMore process time");
+
     assert.gt(ss.metrics.repl.syncSource.numSelections, 0, "num selections not incremented");
     assert.gt(ss.metrics.repl.syncSource.numTimesChoseDifferent, 0, "no new sync source chosen");
 
@@ -42,15 +59,29 @@ function testSecondaryMetrics(secondary, opCount, baseOpsApplied, baseOpsReceive
     assert.eq(ss.metrics.repl.apply.ops, opCount + baseOpsApplied, "wrong number of applied ops");
 }
 
+// Metrics are racy, e.g. repl.buffer.count could over- or under-reported briefly. Retry on error.
+function testSecondaryMetrics(secondary, opCount, baseOpsApplied, baseOpsReceived) {
+    assert.soon(() => {
+        try {
+            _testSecondaryMetricsHelper(secondary, opCount, baseOpsApplied, baseOpsReceived);
+            return true;
+        } catch (exc) {
+            jsTestLog(`Caught ${exc}, retrying`);
+            return false;
+        }
+    });
+}
+
 var rt = new ReplSetTest({
     name: "server_status_metrics",
     nodes: 2,
     oplogSize: 100,
-    // Write periodic noops to aid sync source selection. ReplSetTest.initiate() requires at least a
-    // 2 second noop writer interval to converge on a lastApplied optime.
-    nodeOptions: {setParameter: {writePeriodicNoops: true, periodicNoopIntervalSecs: 2}}
+    // Set a smaller periodicNoopIntervalSecs to aid sync source selection later in the test. Only
+    // enable periodic noop writes when we actually need it to avoid races in other metrics tests.
+    nodeOptions: {setParameter: {writePeriodicNoops: false, periodicNoopIntervalSecs: 2}}
 });
 rt.startSet();
+// Initiate the replica set with high election timeout to avoid accidental elections.
 rt.initiateWithHighElectionTimeout();
 
 rt.awaitSecondaryNodes();
@@ -58,6 +89,23 @@ rt.awaitSecondaryNodes();
 var secondary = rt.getSecondary();
 var primary = rt.getPrimary();
 var testDB = primary.getDB("test");
+
+// Hang oplog getMore before awaitData to avoid races on the oplog metrics between primary and
+// secondary.
+var hangOplogGetMore = configureFailPoint(
+    primary, 'planExecutorHangBeforeShouldWaitForInserts', {namespace: "local.oplog.rs"});
+// Do a dummy write to unblock the oplog getMore that is currently waiting for inserts (if any)
+// after enabling the failpoint so the next oplog getMore that waits for inserts will block.
+assert.commandWorked(testDB.dummy.insert({a: "dummy"}));
+hangOplogGetMore.wait();
+
+// Record the base oplogGetMoresProcessed on primary and the base oplog getmores on secondary.
+const primaryBaseOplogGetMoresProcessedNum =
+    primary.getDB("test").serverStatus().metrics.repl.network.oplogGetMoresProcessed.num;
+const secondaryBaseGetMoresNum =
+    secondary.getDB("test").serverStatus().metrics.repl.network.getmores.num;
+
+hangOplogGetMore.off();
 
 assert.commandWorked(testDB.createCollection('a'));
 assert.commandWorked(testDB.b.insert({}, {writeConcern: {w: 2}}));
@@ -83,6 +131,39 @@ assert.commandWorked(testDB.a.update({}, {$set: {d: new Date()}}, options));
 
 testSecondaryMetrics(secondary, 2000, secondaryBaseOplogOpsApplied, secondaryBaseOplogOpsReceived);
 
+const localDB = primary.getDB("local");
+const oplogCursorId =
+    assert.commandWorked(localDB.runCommand({"find": "oplog.rs", batchSize: 0})).cursor.id;
+// Do an external oplog getMore.
+assert.commandWorked(
+    localDB.runCommand({"getMore": oplogCursorId, collection: "oplog.rs", batchSize: 1}));
+
+// Hang oplog getMore before awaitData to avoid races on the oplog metrics between primary and
+// secondary.
+var hangOplogGetMore = configureFailPoint(
+    primary, 'planExecutorHangBeforeShouldWaitForInserts', {namespace: "local.oplog.rs"});
+// Do a dummy write to unblock the oplog getMore that is currently waiting for inserts (if any)
+// after enabling the failpoint so the next oplog getMore that waits for inserts will block.
+assert.commandWorked(testDB.dummy.insert({a: "dummy"}));
+hangOplogGetMore.wait();
+
+// Test that the number of oplog getMore requested by the secondary since the beginning of the test
+// is equal to the number of oplog getMore processed by the primary since the beginning of the test.
+// This will also imply that the external oplog getMore done above is excluded from the
+// oplogGetMoresProcessed.num metrics.
+const primaryOplogGetMoresProcessedNum =
+    primary.getDB("test").serverStatus().metrics.repl.network.oplogGetMoresProcessed.num;
+const secondaryGetMoresNum =
+    secondary.getDB("test").serverStatus().metrics.repl.network.getmores.num;
+assert.eq(
+    primaryOplogGetMoresProcessedNum - primaryBaseOplogGetMoresProcessedNum,
+    secondaryGetMoresNum - secondaryBaseGetMoresNum,
+    `primary and secondary oplog getmore count mismatch: primary ${
+        primaryOplogGetMoresProcessedNum}:${primaryBaseOplogGetMoresProcessedNum}, secondary ${
+        secondaryGetMoresNum}:${secondaryBaseGetMoresNum}`);
+
+hangOplogGetMore.off();
+
 // Test getLastError.wtime and that it only records stats for w > 1, see SERVER-9005
 var startMillis = testDB.serverStatus().metrics.getLastError.wtime.totalMillis;
 var startNum = testDB.serverStatus().metrics.getLastError.wtime.num;
@@ -94,7 +175,8 @@ assert.commandWorked(testDB.a.insert({x: 1}, {writeConcern: {w: 1, wtimeout: 500
 assert.eq(testDB.serverStatus().metrics.getLastError.wtime.totalMillis, startMillis);
 assert.eq(testDB.serverStatus().metrics.getLastError.wtime.num, startNum);
 
-assert.commandWorked(testDB.a.insert({x: 1}, {writeConcern: {w: -11, wtimeout: 5000}}));
+assert.commandFailedWithCode(testDB.a.insert({x: 1}, {writeConcern: {w: -11, wtimeout: 5000}}),
+                             ErrorCodes.FailedToParse);
 assert.eq(testDB.serverStatus().metrics.getLastError.wtime.totalMillis, startMillis);
 assert.eq(testDB.serverStatus().metrics.getLastError.wtime.num, startNum);
 
@@ -111,6 +193,9 @@ jsTestLog(
 
 let ssOld = secondary.getDB("test").serverStatus().metrics.repl.syncSource;
 jsTestLog(`Secondary ${secondary.host} metrics before restarting replication: ${tojson(ssOld)}`);
+
+// Enable periodic noops to aid sync source selection.
+assert.commandWorked(primary.adminCommand({setParameter: 1, writePeriodicNoops: true}));
 
 // Repeatedly restart replication and wait for the sync source to be rechosen. If the sync source
 // gets set to empty between stopping and restarting replication, then the secondary won't

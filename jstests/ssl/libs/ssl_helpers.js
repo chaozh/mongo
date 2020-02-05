@@ -59,7 +59,14 @@ var replShouldFail = function(name, opt1, opt2) {
     ssl_options1 = opt1;
     ssl_options2 = opt2;
     ssl_name = name;
-    assert.throws(load, [replSetTestFile], "This setup should have failed");
+    // This will cause an assert.soon() in ReplSetTest to fail. This normally triggers the hang
+    // analyzer, but since we do not want to run it on expected timeouts, we temporarily disable it.
+    MongoRunner.runHangAnalyzer.disable();
+    try {
+        assert.throws(load, [replSetTestFile], "This setup should have failed");
+    } finally {
+        MongoRunner.runHangAnalyzer.enable();
+    }
     // Note: this leaves running mongod processes.
 };
 
@@ -103,7 +110,7 @@ function testShardedLookup(shardingTest) {
  * Takes in two mongod/mongos configuration options and runs a basic
  * sharding test to see if they can work together...
  */
-function mixedShardTest(options1, options2, shouldSucceed) {
+function mixedShardTest(options1, options2, shouldSucceed, disableResumableRangeDeleter) {
     let authSucceeded = false;
     try {
         // Start ShardingTest with enableBalancer because ShardingTest attempts to turn
@@ -116,12 +123,19 @@ function mixedShardTest(options1, options2, shouldSucceed) {
         //
         // Once SERVER-14017 is fixed the "enableBalancer" line can be removed.
         // TODO: SERVER-43899 Make sharding_with_x509.js and mixed_mode_sharded_transition.js start
-        // shards as replica sets.
+        // shards as replica sets and remove disableResumableRangeDeleter parameter.
+        let otherOptions = {enableBalancer: true};
+
+        if (disableResumableRangeDeleter) {
+            otherOptions.shardAsReplicaSet = false;
+            otherOptions.shardOptions = {setParameter: {"disableResumableRangeDeleter": true}};
+        }
+
         var st = new ShardingTest({
             mongos: [options1],
             config: [options1],
             shards: [options1, options2],
-            other: {enableBalancer: true, shardAsReplicaSet: false}
+            other: otherOptions
         });
 
         // Create admin user in case the options include auth
@@ -180,9 +194,18 @@ function mixedShardTest(options1, options2, shouldSucceed) {
                 node.getDB('admin').auth('admin', 'pwd');
             });
         }
+
         // This has to be done in order for failure
         // to not prevent future tests from running...
         if (st) {
+            if (st.s.fullOptions.clusterAuthMode === 'x509') {
+                // Index consistency check during shutdown needs a privileged user to auth as.
+                const x509User =
+                    'CN=client,OU=KernelUser,O=MongoDB,L=New York City,ST=New York,C=US';
+                st.s.getDB('$external')
+                    .createUser({user: x509User, roles: [{role: '__system', db: 'admin'}]});
+            }
+
             st.stop();
         }
     }
@@ -274,18 +297,58 @@ function isRHEL8() {
     return false;
 }
 
-function sslProviderSupportsTLS1_0() {
-    if (isRHEL8()) {
+function isDebian10() {
+    if (_isWindows()) {
         return false;
     }
 
-    return true;
+    // Debian 10 disables TLS 1.0 and TLS 1.1 as part their default crypto policy
+    // We skip tests on Debian 10 that require these versions as a result.
+    try {
+        // this file exists on systemd-based systems, necessary to avoid mischaracterizing debian
+        // derivatives as stock debian
+        const releaseFile = cat("/etc/os-release").toLowerCase();
+        const prettyName = releaseFile.split('\n').find(function(line) {
+            return line.startsWith("pretty_name");
+        });
+        return prettyName.includes("debian") &&
+            (prettyName.includes("10") || prettyName.includes("buster") ||
+             prettyName.includes("bullseye"));
+    } catch (e) {
+        return false;
+    }
+}
+
+function sslProviderSupportsTLS1_0() {
+    if (isRHEL8()) {
+        const cryptoPolicy = cat("/etc/crypto-policies/config");
+        return cryptoPolicy.includes("LEGACY");
+    }
+    return !isDebian10();
 }
 
 function sslProviderSupportsTLS1_1() {
     if (isRHEL8()) {
-        return false;
+        const cryptoPolicy = cat("/etc/crypto-policies/config");
+        return cryptoPolicy.includes("LEGACY");
+    }
+    return !isDebian10();
+}
+
+function opensslVersionAsInt() {
+    const opensslInfo = getBuildInfo().openssl;
+    if (!opensslInfo) {
+        return null;
     }
 
-    return true;
+    const matches = opensslInfo.running.match(/OpenSSL\s+(\d+)\.(\d+)\.(\d+)([a-z]?)/);
+    assert.neq(matches, null);
+
+    let version = (matches[1] << 24) | (matches[2] << 16) | (matches[3] << 8);
+
+    return version;
+}
+
+function supportsStapling() {
+    return opensslVersionAsInt() >= 0x01000200;
 }

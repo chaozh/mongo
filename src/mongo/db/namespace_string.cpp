@@ -66,6 +66,9 @@ const NamespaceString NamespaceString::kSessionTransactionsTableNamespace(
 const NamespaceString NamespaceString::kTransactionCoordinatorsNamespace(
     NamespaceString::kConfigDb, "transaction_coordinators");
 
+const NamespaceString NamespaceString::kMigrationCoordinatorsNamespace(NamespaceString::kConfigDb,
+                                                                       "migrationCoordinators");
+
 const NamespaceString NamespaceString::kShardConfigCollectionsNamespace(NamespaceString::kConfigDb,
                                                                         "cache.collections");
 const NamespaceString NamespaceString::kShardConfigDatabasesNamespace(NamespaceString::kConfigDb,
@@ -79,6 +82,8 @@ const NamespaceString NamespaceString::kIndexBuildEntryNamespace(NamespaceString
                                                                  "system.indexBuilds");
 const NamespaceString NamespaceString::kRangeDeletionNamespace(NamespaceString::kConfigDb,
                                                                "rangeDeletions");
+const NamespaceString NamespaceString::kConfigSettingsNamespace(NamespaceString::kConfigDb,
+                                                                "settings");
 
 bool NamespaceString::isListCollectionsCursorNS() const {
     return coll() == listCollectionsCursorCol;

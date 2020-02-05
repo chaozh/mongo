@@ -256,7 +256,7 @@ ChunkVersion getShardVersion(const CachedCollectionRoutingInfo& routingInfo,
  * ChunkManager or is implicit in the primary shard of the collection.
  */
 CompareResult compareAllShardVersions(const CachedCollectionRoutingInfo& routingInfo,
-                                      const ShardVersionMap& remoteShardVersions) {
+                                      const StaleShardVersionMap& remoteShardVersions) {
     CompareResult finalResult = CompareResult_GTE;
 
     for (const auto& shardVersionEntry : remoteShardVersions) {
@@ -322,7 +322,7 @@ bool isMetadataDifferent(const std::shared_ptr<ChunkManager>& managerA,
         return managerA->getVersion() != managerB->getVersion();
     }
 
-    return databaseVersion::equal(dbVersionA, dbVersionB);
+    return !databaseVersion::equal(dbVersionA, dbVersionB);
 }
 
 /**
@@ -385,6 +385,13 @@ StatusWith<ShardEndpoint> ChunkManagerTargeter::targetInsert(OperationContext* o
 
     if (_routingInfo->cm()) {
         shardKey = _routingInfo->cm()->getShardKeyPattern().extractShardKeyFromDoc(doc);
+        // The shard key would only be empty after extraction if we encountered an error case,
+        // such as the shard key possessing an array value or array descendants. If the shard key
+        // presented to the targeter was empty, we would emplace the missing fields, and the
+        // extracted key here would *not* be empty.
+        uassert(ErrorCodes::ShardKeyNotFound,
+                "Shard key cannot contain array values or array descendants.",
+                !shardKey.isEmpty());
     }
 
     // Target the shard key or database primary
@@ -687,7 +694,7 @@ void ChunkManagerTargeter::noteStaleShardResponse(const ShardEndpoint& endpoint,
         remoteShardVersion = *staleInfo.getVersionWanted();
     }
 
-    ShardVersionMap::iterator it = _remoteShardVersions.find(endpoint.shardName);
+    StaleShardVersionMap::iterator it = _remoteShardVersions.find(endpoint.shardName);
     if (it == _remoteShardVersions.end()) {
         _remoteShardVersions.insert(std::make_pair(endpoint.shardName, remoteShardVersion));
     } else {
@@ -839,8 +846,20 @@ Status ChunkManagerTargeter::refreshIfNeeded(OperationContext* opCtx, bool* wasC
     MONGO_UNREACHABLE;
 }
 
+int ChunkManagerTargeter::getNShardsOwningChunks() const {
+    if (_routingInfo->cm()) {
+        return _routingInfo->cm()->getNShardsOwningChunks();
+    }
+
+    return 0;
+}
+
 Status ChunkManagerTargeter::_refreshShardVersionNow(OperationContext* opCtx) {
-    Grid::get(opCtx)->catalogCache()->onStaleShardVersion(std::move(*_routingInfo));
+    auto routingInfoStatus =
+        Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfoWithRefresh(opCtx, _nss, true);
+    if (!routingInfoStatus.isOK()) {
+        return routingInfoStatus.getStatus();
+    }
 
     return init(opCtx);
 }

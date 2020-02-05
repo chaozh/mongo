@@ -76,6 +76,9 @@ class UUID {
     friend class LogicalSessionToClient;
     friend class LogicalSessionIdToClient;
     friend class LogicalSessionFromClient;
+    friend class MigrationCoordinatorDocument;
+    friend class MigrationDestinationManager;
+    friend class RangeDeletionTask;
     friend class ResolvedKeyId;
     friend class repl::CollectionInfo;
     friend class repl::OplogEntryBase;

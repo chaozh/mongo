@@ -29,6 +29,8 @@
 
 #pragma once
 
+#include <boost/optional.hpp>
+
 #include "mongo/bson/unordered_fields_bsonobj_comparator.h"
 #include "mongo/db/matcher/expression.h"
 
@@ -67,7 +69,7 @@ public:
 
     void debugString(StringBuilder& debug, int indentationLevel = 0) const final;
 
-    void serialize(BSONObjBuilder* out) const final;
+    void serialize(BSONObjBuilder* out, bool includePath) const final;
 
     bool equivalent(const MatchExpression* other) const final;
 
@@ -79,8 +81,8 @@ public:
         MONGO_UNREACHABLE;
     }
 
-    std::vector<MatchExpression*>* getChildVector() final {
-        return nullptr;
+    boost::optional<std::vector<MatchExpression*>&> getChildVector() final {
+        return boost::none;
     }
 
     MatchCategory getCategory() const final {

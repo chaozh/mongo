@@ -60,6 +60,7 @@
 #include "mongo/db/logical_time_metadata_hook.h"
 #include "mongo/db/logical_time_validator.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/read_write_concern_defaults_cache_lookup_mongos.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/service_liaison_mongos.h"
@@ -101,7 +102,9 @@
 #include "mongo/util/exception_filter_win32.h"
 #include "mongo/util/exit.h"
 #include "mongo/util/fast_clock_source_factory.h"
+#include "mongo/util/latch_analyzer.h"
 #include "mongo/util/log.h"
+#include "mongo/util/net/ocsp/ocsp_manager.h"
 #include "mongo/util/net/socket_exception.h"
 #include "mongo/util/net/socket_utils.h"
 #include "mongo/util/net/ssl_manager.h"
@@ -342,6 +345,8 @@ void cleanupTask(ServiceContext* serviceContext) {
     }
 
     audit::logShutdown(Client::getCurrent());
+
+    LatchAnalyzer::get(serviceContext).dump();
 }
 
 Status initializeSharding(OperationContext* opCtx) {
@@ -426,6 +431,11 @@ Status initializeSharding(OperationContext* opCtx) {
         return status;
     }
 
+    status = preWarmConnectionPool(opCtx);
+    if (!status.isOK()) {
+        return status;
+    }
+
     Grid::get(opCtx)->setShardingInitialized();
 
     return Status::OK();
@@ -448,9 +458,9 @@ public:
         : _serviceContext(serviceContext) {}
     ~ShardingReplicaSetChangeListener() final = default;
 
-    void onFoundSet(const Key& key) final {}
+    void onFoundSet(const Key& key) noexcept final {}
 
-    void onConfirmedSet(const State& state) final {
+    void onConfirmedSet(const State& state) noexcept final {
         auto connStr = state.connStr;
 
         auto fun = [serviceContext = _serviceContext, connStr](auto args) {
@@ -482,11 +492,15 @@ public:
         uassertStatusOK(schedStatus);
     }
 
-    void onPossibleSet(const State& state) final {
-        Grid::get(_serviceContext)->shardRegistry()->updateReplSetHosts(state.connStr);
+    void onPossibleSet(const State& state) noexcept final {
+        try {
+            Grid::get(_serviceContext)->shardRegistry()->updateReplSetHosts(state.connStr);
+        } catch (const DBException& ex) {
+            LOG(2) << "Unable to update sharding state with possible set due to " << ex;
+        }
     }
 
-    void onDroppedSet(const Key& key) final {}
+    void onDroppedSet(const Key& key) noexcept final {}
 
 private:
     ServiceContext* _serviceContext;
@@ -497,6 +511,8 @@ ExitCode runMongosServer(ServiceContext* serviceContext) {
     printShardingVersionInfo(false);
 
     initWireSpec();
+
+    OCSPManager::get()->startThreadPool();
 
     serviceContext->setServiceEntryPoint(std::make_unique<ServiceEntryPointMongos>(serviceContext));
 
@@ -545,6 +561,8 @@ ExitCode runMongosServer(ServiceContext* serviceContext) {
 
     LogicalClock::set(serviceContext, std::make_unique<LogicalClock>(serviceContext));
 
+    ReadWriteConcernDefaults::create(serviceContext, readWriteConcernDefaultsCacheLookupMongoS);
+
     auto opCtxHolder = tc->makeOperationContext();
     auto const opCtx = opCtxHolder.get();
 
@@ -564,6 +582,13 @@ ExitCode runMongosServer(ServiceContext* serviceContext) {
             ->getBalancerConfiguration()
             ->refreshAndCheck(opCtx)
             .transitional_ignore();
+
+        try {
+            ReadWriteConcernDefaults::get(serviceContext).refreshIfNecessary(opCtx);
+        } catch (const DBException& ex) {
+            warning() << "Failed to load read and write concern defaults at startup"
+                      << causedBy(redact(ex.toStatus()));
+        }
     }
 
     startMongoSFTDC();

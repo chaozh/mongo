@@ -1,8 +1,11 @@
 /* Tests the "failCommand" failpoint.
- * @tags: [assumes_read_concern_unchanged, assumes_read_preference_unchanged]
+ * @tags: [assumes_read_concern_unchanged, assumes_read_preference_unchanged, requires_fcv_44]
  */
 (function() {
 "use strict";
+
+load("jstests/libs/fixture_helpers.js");
+load("jstests/libs/retryable_writes_util.js");
 
 const testDB = db.getSiblingDB("test_failcommand");
 const adminDB = db.getSiblingDB("admin");
@@ -15,6 +18,61 @@ const getThreadName = function() {
 };
 
 let threadName = getThreadName();
+
+// Test failpoint with extraErrorInfo
+assert.commandWorked(adminDB.runCommand({
+    configureFailPoint: "failCommand",
+    mode: "alwaysOn",
+    data: {
+        errorCode: ErrorCodes.CannotImplicitlyCreateCollection,
+        failCommands: ["create"],
+        threadName: threadName,
+        errorExtraInfo: {
+            "ns": "namespace",
+        }
+    }
+}));
+
+{
+    let result = testDB.runCommand({create: "collection"});
+    assert(result.ok == 0);
+    assert(result.code == ErrorCodes.CannotImplicitlyCreateCollection);
+    assert(result.ns == "namespace");
+}
+assert.commandWorked(adminDB.runCommand({configureFailPoint: "failCommand", mode: "off"}));
+
+// Test failpoint with extraErrorInfo and no error code
+assert.commandWorked(adminDB.runCommand({
+    configureFailPoint: "failCommand",
+    mode: "alwaysOn",
+    data: {
+        failCommands: ["ping"],
+        threadName: threadName,
+        errorExtraInfo: {
+            "desc": "some description",
+        }
+    }
+}));
+assert.commandWorked(testDB.runCommand({ping: 1}));
+assert.commandWorked(adminDB.runCommand({configureFailPoint: "failCommand", mode: "off"}));
+
+// Test failpoint for command aliases
+assert.commandWorked(adminDB.runCommand({
+    configureFailPoint: "failCommand",
+    mode: "alwaysOn",
+    data: {
+        errorCode: ErrorCodes.BadValue,
+        failCommands: ["dropIndexes"],
+        threadName: threadName,
+    }
+}));
+assert.commandFailedWithCode(testDB.runCommand({dropIndexes: 'collection', index: '*'}),
+                             ErrorCodes.BadValue);
+assert.commandWorked(testDB.runCommand({buildInfo: 1}));
+assert.commandFailedWithCode(testDB.runCommand({deleteIndexes: 'collection', index: '*'}),
+                             ErrorCodes.BadValue);
+assert.commandWorked(testDB.runCommand({buildinfo: 1}));
+assert.commandWorked(adminDB.runCommand({configureFailPoint: "failCommand", mode: "off"}));
 
 // Test failing with a particular error code.
 assert.commandWorked(adminDB.runCommand({
@@ -328,4 +386,161 @@ assert.commandWorked(
 res = assert.commandWorkedIgnoringWriteConcernErrors(testDB.runCommand(
     {insert: "foo", documents: [{x: "doc_for_namespace_case_should_trigger_wce"}]}));
 assert.eq(res.writeConcernError, {code: ErrorCodes.InternalError, errmsg: "foo"});
+
+// Test failing with error labels will not make `times` decrement twice.
+assert.commandWorked(adminDB.runCommand({
+    configureFailPoint: "failCommand",
+    mode: {times: 1},
+    data: {
+        errorCode: ErrorCodes.BadValue,
+        failCommands: ["ping"],
+        errorLabels: ["Foo", "Bar"],
+        threadName: threadName
+    }
+}));
+res = assert.commandFailedWithCode(testDB.runCommand({ping: 1}), ErrorCodes.BadValue);
+assert.eq(res.errorLabels, ["Foo", "Bar"], res);
+assert.commandWorked(testDB.runCommand({ping: 1}));
+
+// Test specifying both writeConcernError and errorLabels.
+assert.commandWorked(adminDB.runCommand({
+    configureFailPoint: "failCommand",
+    mode: {times: 1},
+    data: {
+        writeConcernError: {code: 12345, errmsg: "hello"},
+        failCommands: ["insert"],
+        errorLabels: ["Foo", "Bar"],
+        threadName: threadName
+    }
+}));
+res = testDB.runCommand({insert: "c", documents: [{}]});
+assert.eq(res.writeConcernError, {code: 12345, errmsg: "hello"});
+assert.eq(res.errorLabels, ["Foo", "Bar"], res);
+
+// Test failCommand with empty errorLabels.
+assert.commandWorked(adminDB.runCommand({
+    configureFailPoint: "failCommand",
+    mode: {times: 1},
+    data: {
+        errorCode: ErrorCodes.BadValue,
+        failCommands: ["ping"],
+        errorLabels: [],
+        threadName: threadName
+    }
+}));
+res = assert.commandFailedWithCode(testDB.runCommand({ping: 1}), ErrorCodes.BadValue);
+// There should be no errorLabels field if no error labels provided in failCommand.
+assert(!res.hasOwnProperty("errorLabels"));
+
+// Test specifying both writeConcernError and empty errorLabels.
+assert.commandWorked(adminDB.runCommand({
+    configureFailPoint: "failCommand",
+    mode: {times: 1},
+    data: {
+        writeConcernError: {code: 12345, errmsg: "hello"},
+        failCommands: ["insert"],
+        errorLabels: [],
+        threadName: threadName
+    }
+}));
+res = testDB.runCommand({insert: "c", documents: [{}]});
+assert.eq(res.writeConcernError, {code: 12345, errmsg: "hello"});
+// There should be no errorLabels field if no error labels provided in failCommand.
+assert(!res.hasOwnProperty("errorLabels"));
+
+// Test specifying errorLabels without errorCode or writeConcernError.
+assert.commandWorked(adminDB.runCommand({
+    configureFailPoint: "failCommand",
+    mode: {times: 1},
+    data: {failCommands: ["ping"], errorLabels: ["Foo", "Bar"], threadName: threadName}
+}));
+// The command should not fail if no errorCode or writeConcernError specified.
+res = assert.commandWorked(testDB.runCommand({ping: 1}));
+// As the command does not fail, there should not be any error labels even if errorLabels is
+// specified in the failCommand.
+assert(!res.hasOwnProperty("errorLabels"), res);
+assert.commandWorked(adminDB.runCommand({configureFailPoint: "failCommand", mode: "off"}));
+
+// Only run error labels override tests for replica set if storage engine supports document-level
+// locking because the tests require retryable writes.
+// And mongos doesn't return RetryableWriteError labels.
+if (!FixtureHelpers.isReplSet(adminDB) ||
+    !RetryableWritesUtil.storageEngineSupportsRetryableWrites(jsTest.options().storageEngine)) {
+    jsTestLog("Skipping error labels override tests");
+    return;
+}
+
+// Test error labels override.
+assert.commandWorked(adminDB.runCommand({
+    configureFailPoint: "failCommand",
+    mode: {times: 1},
+    data: {
+        errorCode: ErrorCodes.NotMaster,
+        failCommands: ["insert"],
+        errorLabels: ["Foo"],
+        threadName: threadName
+    }
+}));
+// This normally fails with RetryableWriteError label.
+res = assert.commandFailedWithCode(
+    testDB.runCommand(
+        {insert: "test", documents: [{x: "retryable_write"}], txnNumber: NumberLong(0)}),
+    ErrorCodes.NotMaster);
+// Test that failCommand overrides the error label to "Foo".
+assert.eq(res.errorLabels, ["Foo"], res);
+
+// Test error labels override while specifying writeConcernError.
+assert.commandWorked(adminDB.runCommand({
+    configureFailPoint: "failCommand",
+    mode: {times: 1},
+    data: {
+        writeConcernError: {code: ErrorCodes.NotMaster, errmsg: "hello"},
+        failCommands: ["insert"],
+        errorLabels: ["Foo"],
+        threadName: threadName
+    }
+}));
+// This normally fails with RetryableWriteError label.
+res = testDB.runCommand(
+    {insert: "test", documents: [{x: "retryable_write"}], txnNumber: NumberLong(0)});
+assert.eq(res.writeConcernError, {code: ErrorCodes.NotMaster, errmsg: "hello"});
+// Test that failCommand overrides the error label to "Foo".
+assert.eq(res.errorLabels, ["Foo"], res);
+
+// Test error labels override with empty errorLabels.
+assert.commandWorked(adminDB.runCommand({
+    configureFailPoint: "failCommand",
+    mode: {times: 1},
+    data: {
+        errorCode: ErrorCodes.NotMaster,
+        failCommands: ["insert"],
+        errorLabels: [],
+        threadName: threadName
+    }
+}));
+// This normally fails with RetryableWriteError label.
+res = assert.commandFailedWithCode(
+    testDB.runCommand(
+        {insert: "test", documents: [{x: "retryable_write"}], txnNumber: NumberLong(0)}),
+    ErrorCodes.NotMaster);
+// There should be no errorLabels field if no error labels provided in failCommand.
+assert(!res.hasOwnProperty("errorLabels"), res);
+
+// Test error labels override with empty errorLabels while specifying writeConcernError.
+assert.commandWorked(adminDB.runCommand({
+    configureFailPoint: "failCommand",
+    mode: {times: 1},
+    data: {
+        writeConcernError: {code: ErrorCodes.NotMaster, errmsg: "hello"},
+        failCommands: ["insert"],
+        errorLabels: [],
+        threadName: threadName
+    }
+}));
+// This normally fails with RetryableWriteError label.
+res = testDB.runCommand(
+    {insert: "test", documents: [{x: "retryable_write"}], txnNumber: NumberLong(0)});
+assert.eq(res.writeConcernError, {code: ErrorCodes.NotMaster, errmsg: "hello"});
+// There should be no errorLabels field if no error labels provided in failCommand.
+assert(!res.hasOwnProperty("errorLabels"), res);
 }());

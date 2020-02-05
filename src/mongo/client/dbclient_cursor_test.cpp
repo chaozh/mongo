@@ -71,9 +71,9 @@ public:
         return true;
     }
 
-    bool recv(Message& m, int lastRequestId) override {
+    Status recv(Message& m, int lastRequestId) override {
         m = _mockRecvResponse;
-        return true;
+        return Status::OK();
     }
 
     // No-op.
@@ -145,6 +145,51 @@ protected:
         return BSON("_id" << id);
     }
 };
+
+TEST_F(DBClientCursorTest, DBClientCursorCallsMetaDataReaderOncePerBatch) {
+    // Set up the DBClientCursor and a mock client connection.
+    DBClientConnectionForTest conn;
+    const NamespaceString nss("test", "coll");
+    DBClientCursor cursor(&conn, NamespaceStringOrUUID(nss), Query().obj, 0, 0, nullptr, 0, 0);
+    cursor.setBatchSize(2);
+
+    // Set up mock 'find' response.
+    const long long cursorId = 42;
+    Message findResponseMsg = mockFindResponse(nss, cursorId, {docObj(1), docObj(2)});
+    conn.setCallResponse(findResponseMsg);
+
+    int numMetaRead = 0;
+    conn.setReplyMetadataReader(
+        [&](OperationContext* opCtx, const BSONObj& metadataObj, StringData target) {
+            numMetaRead++;
+            return Status::OK();
+        });
+
+    // Trigger a find command.
+    ASSERT(cursor.init());
+
+    // First batch from the initial find command.
+    ASSERT_BSONOBJ_EQ(docObj(1), cursor.next());
+    ASSERT_BSONOBJ_EQ(docObj(2), cursor.next());
+    ASSERT_FALSE(cursor.moreInCurrentBatch());
+    // Test that the metadata reader callback is called once.
+    ASSERT_EQ(1, numMetaRead);
+
+    // Set a terminal getMore response with cursorId 0.
+    auto getMoreResponseMsg = mockGetMoreResponse(nss, 0, {docObj(3), docObj(4)});
+    conn.setCallResponse(getMoreResponseMsg);
+
+    // Trigger a subsequent getMore command.
+    ASSERT_TRUE(cursor.more());
+
+    // Second batch from the getMore command.
+    ASSERT_BSONOBJ_EQ(docObj(3), cursor.next());
+    ASSERT_BSONOBJ_EQ(docObj(4), cursor.next());
+    ASSERT_FALSE(cursor.moreInCurrentBatch());
+    ASSERT_TRUE(cursor.isDead());
+    // Test that the metadata reader callback is called twice.
+    ASSERT_EQ(2, numMetaRead);
+}
 
 TEST_F(DBClientCursorTest, DBClientCursorHandlesOpMsgExhaustCorrectly) {
 
@@ -439,6 +484,441 @@ TEST_F(DBClientCursorTest, DBClientCursorPassesReadOnceFlag) {
     ASSERT_EQ(msg.body.getStringField("find"), nss.coll());
     ASSERT_EQ(msg.body["batchSize"].number(), 0);
     ASSERT_TRUE(msg.body.getBoolField("readOnce")) << msg.body;
+}
+
+// "Resume fields" refers to $_requestResumeToken and $_resumeAfter.
+TEST_F(DBClientCursorTest, DBClientCursorPassesResumeFields) {
+    // Set up the DBClientCursor and a mock client connection.
+    DBClientConnectionForTest conn;
+    const NamespaceString nss("test", "coll");
+    DBClientCursor cursor(&conn,
+                          NamespaceStringOrUUID(nss),
+                          QUERY("query" << BSONObj() << "$_requestResumeToken" << true
+                                        << "$_resumeAfter" << BSON("$recordId" << 5LL))
+                              .obj,
+                          0,
+                          0,
+                          nullptr,
+                          /*QueryOption*/ 0,
+                          0);
+    cursor.setBatchSize(0);
+
+    // Set up mock 'find' response.
+    const long long cursorId = 42;
+    Message findResponseMsg = mockFindResponse(nss, cursorId, {});
+
+    conn.setCallResponse(findResponseMsg);
+    ASSERT(cursor.init());
+
+    // Verify that the 'find' request was sent with $_requestResumeToken and $_resumeAfter.
+    auto m = conn.getLastSentMessage();
+    ASSERT(!m.empty());
+    auto msg = OpMsg::parse(m);
+    ASSERT_EQ(OpMsg::flags(m), OpMsg::kChecksumPresent);
+    ASSERT_EQ(msg.body.getStringField("find"), nss.coll());
+    ASSERT_EQ(msg.body["batchSize"].number(), 0);
+    ASSERT_TRUE(msg.body.getBoolField("$_requestResumeToken")) << msg.body;
+    ASSERT_TRUE(msg.body.hasField("$_resumeAfter")) << msg.body;
+    ASSERT_TRUE(msg.body.getObjectField("$_resumeAfter").hasField("$recordId")) << msg.body;
+    ASSERT_EQ(msg.body.getObjectField("$_resumeAfter")["$recordId"].numberLong(), 5LL) << msg.body;
+}
+
+TEST_F(DBClientCursorTest, DBClientCursorTailable) {
+    // This tests DBClientCursor in tailable mode. Cases to test are:
+    // 1. Initial find command has {tailable: true} set.
+    // 2. A getMore can handle a normal batch correctly.
+    // 3. A getMore can handle an empty batch correctly.
+    // 4. The tailable cursor is not dead until the cursorId is 0 in the response.
+
+    // Set up the DBClientCursor and a mock client connection.
+    DBClientConnectionForTest conn;
+    const NamespaceString nss("test", "coll");
+    DBClientCursor cursor(&conn,
+                          NamespaceStringOrUUID(nss),
+                          Query().obj,
+                          0,
+                          0,
+                          nullptr,
+                          QueryOption_CursorTailable,
+                          0);
+    cursor.setBatchSize(0);
+
+    // Set up mock 'find' response.
+    const long long cursorId = 42;
+    Message findResponseMsg = mockFindResponse(nss, cursorId, {});
+
+    conn.setCallResponse(findResponseMsg);
+    ASSERT(cursor.init());
+
+    // --- Test 1 ---
+    // Verify that the initial 'find' request was sent.
+    auto m = conn.getLastSentMessage();
+    ASSERT_FALSE(m.empty());
+    auto msg = OpMsg::parse(m);
+    ASSERT_EQ(OpMsg::flags(m), OpMsg::kChecksumPresent);
+    ASSERT_EQ(msg.body.getStringField("find"), nss.coll());
+    ASSERT_EQ(msg.body["batchSize"].number(), 0);
+    ASSERT_TRUE(msg.body.getBoolField("tailable")) << msg.body;
+
+    // --- Test 2 ---
+    // Create a 'getMore' response with two documents and set it as the mock response.
+    cursor.setBatchSize(2);
+    auto getMoreResponseMsg = mockGetMoreResponse(nss, cursorId, {docObj(1), docObj(2)});
+    conn.setCallResponse(getMoreResponseMsg);
+
+    // Request more results. This call should trigger the first 'getMore' request.
+    conn.clearLastSentMessage();
+    ASSERT_TRUE(cursor.more());
+    m = conn.getLastSentMessage();
+    ASSERT_FALSE(m.empty());
+    msg = OpMsg::parse(m);
+    ASSERT_EQ(StringData(msg.body.firstElement().fieldName()), "getMore");
+    ASSERT_EQ(msg.body["getMore"].type(), BSONType::NumberLong);
+    ASSERT_EQ(msg.body["getMore"].numberLong(), cursorId);
+    ASSERT_BSONOBJ_EQ(docObj(1), cursor.next());
+    ASSERT_BSONOBJ_EQ(docObj(2), cursor.next());
+    ASSERT_FALSE(cursor.moreInCurrentBatch());
+    ASSERT_FALSE(cursor.isDead());
+
+    // --- Test 3 ---
+    // Create a 'getMore' response with an empty batch and set it as the mock response.
+    getMoreResponseMsg = mockGetMoreResponse(nss, cursorId, {});
+    conn.setCallResponse(getMoreResponseMsg);
+
+    // Request more results. This call should trigger the second 'getMore' request.
+    // more() should return false on an empty batch.
+    conn.clearLastSentMessage();
+    ASSERT_FALSE(cursor.more());
+    m = conn.getLastSentMessage();
+    ASSERT_FALSE(m.empty());
+    msg = OpMsg::parse(m);
+    ASSERT_EQ(StringData(msg.body.firstElement().fieldName()), "getMore");
+    ASSERT_EQ(msg.body["getMore"].type(), BSONType::NumberLong);
+    ASSERT_EQ(msg.body["getMore"].numberLong(), cursorId);
+    ASSERT_FALSE(cursor.moreInCurrentBatch());
+    // But the cursor should be still valid.
+    ASSERT_FALSE(cursor.isDead());
+
+    // --- Test 4 ---
+    // Create a 'getMore' response with cursorId = 0 and set it as the mock response.
+    getMoreResponseMsg = mockGetMoreResponse(nss, 0, {docObj(3)});
+    conn.setCallResponse(getMoreResponseMsg);
+
+    // Request more results. This call should trigger the third 'getMore' request.
+    conn.clearLastSentMessage();
+    ASSERT_TRUE(cursor.more());
+    m = conn.getLastSentMessage();
+    ASSERT_FALSE(m.empty());
+    msg = OpMsg::parse(m);
+    ASSERT_EQ(StringData(msg.body.firstElement().fieldName()), "getMore");
+    ASSERT_EQ(msg.body["getMore"].type(), BSONType::NumberLong);
+    ASSERT_EQ(msg.body["getMore"].numberLong(), cursorId);
+    ASSERT_BSONOBJ_EQ(docObj(3), cursor.next());
+    ASSERT_FALSE(cursor.moreInCurrentBatch());
+    // Cursor is dead if the cursorId is 0.
+    ASSERT_TRUE(cursor.isDead());
+
+    // Request more results. This should not trigger a new 'getMore' request as the cursor is dead.
+    conn.clearLastSentMessage();
+    ASSERT_FALSE(cursor.more());
+    ASSERT_TRUE(conn.getLastSentMessage().empty());
+}
+
+TEST_F(DBClientCursorTest, DBClientCursorTailableAwaitData) {
+    // This tests DBClientCursor in tailable awaitData mode. Cases to test are:
+    // 1. Initial find command has {tailable: true} and {awaitData: true} set.
+    // 2. A subsequent getMore command sets awaitData timeout correctly.
+
+    // Set up the DBClientCursor and a mock client connection.
+    DBClientConnectionForTest conn;
+    const NamespaceString nss("test", "coll");
+    DBClientCursor cursor(&conn,
+                          NamespaceStringOrUUID(nss),
+                          Query().obj,
+                          0,
+                          0,
+                          nullptr,
+                          QueryOption_CursorTailable | QueryOption_AwaitData,
+                          0);
+    cursor.setBatchSize(0);
+
+    // Set up mock 'find' response.
+    const long long cursorId = 42;
+    Message findResponseMsg = mockFindResponse(nss, cursorId, {});
+
+    conn.setCallResponse(findResponseMsg);
+    ASSERT(cursor.init());
+
+    // --- Test 1 ---
+    // Verify that the initial 'find' request was sent.
+    auto m = conn.getLastSentMessage();
+    ASSERT_FALSE(m.empty());
+    auto msg = OpMsg::parse(m);
+    ASSERT_EQ(OpMsg::flags(m), OpMsg::kChecksumPresent);
+    ASSERT_EQ(msg.body.getStringField("find"), nss.coll());
+    ASSERT_EQ(msg.body["batchSize"].number(), 0);
+    ASSERT_TRUE(msg.body.getBoolField("tailable")) << msg.body;
+    ASSERT_TRUE(msg.body.getBoolField("awaitData")) << msg.body;
+
+    cursor.setAwaitDataTimeoutMS(Milliseconds{5000});
+    ASSERT_EQ(cursor.getAwaitDataTimeoutMS(), Milliseconds{5000});
+
+    // --- Test 2 ---
+    // Create a 'getMore' response with two documents and set it as the mock response.
+    cursor.setBatchSize(2);
+    auto getMoreResponseMsg = mockGetMoreResponse(nss, cursorId, {docObj(1), docObj(2)});
+    conn.setCallResponse(getMoreResponseMsg);
+
+    // Request more results. This call should trigger the first 'getMore' request.
+    conn.clearLastSentMessage();
+    ASSERT_TRUE(cursor.more());
+    m = conn.getLastSentMessage();
+    ASSERT_FALSE(m.empty());
+    msg = OpMsg::parse(m);
+    ASSERT_EQ(StringData(msg.body.firstElement().fieldName()), "getMore");
+    ASSERT_EQ(msg.body["getMore"].type(), BSONType::NumberLong);
+    ASSERT_EQ(msg.body["getMore"].numberLong(), cursorId);
+    // Make sure the correct awaitData timeout is sent.
+    ASSERT_EQ(msg.body["maxTimeMS"].number(), 5000);
+    ASSERT_BSONOBJ_EQ(docObj(1), cursor.next());
+    ASSERT_BSONOBJ_EQ(docObj(2), cursor.next());
+    ASSERT_FALSE(cursor.moreInCurrentBatch());
+    ASSERT_FALSE(cursor.isDead());
+}
+
+TEST_F(DBClientCursorTest, DBClientCursorTailableAwaitDataExhaust) {
+    // This tests DBClientCursor in tailable awaitData exhaust mode. Cases to test are:
+    // 1. Initial find command has {tailable: true} and {awaitData: true} set.
+    // 2. The first getMore command sets awaitData timeout correctly and has kExhaustSupported flag.
+    // 3. Exhaust receive can handle a normal batch correctly.
+    // 4. Exhaust receive can handle an empty batch correctly.
+    // 5. Cursor resends a new 'getMore' command if the previous response had no 'moreToCome' flag.
+    // 6. The tailable cursor is not dead until the cursorId is 0 in the response.
+
+    // Set up the DBClientCursor and a mock client connection.
+    DBClientConnectionForTest conn;
+    const NamespaceString nss("test", "coll");
+    DBClientCursor cursor(&conn,
+                          NamespaceStringOrUUID(nss),
+                          Query().obj,
+                          0,
+                          0,
+                          nullptr,
+                          QueryOption_CursorTailable | QueryOption_AwaitData | QueryOption_Exhaust,
+                          0);
+    cursor.setBatchSize(0);
+
+    // Set up mock 'find' response.
+    const long long cursorId = 42;
+    Message findResponseMsg = mockFindResponse(nss, cursorId, {});
+
+    conn.setCallResponse(findResponseMsg);
+    ASSERT(cursor.init());
+
+    // --- Test 1 ---
+    // Verify that the initial 'find' request was sent.
+    auto m = conn.getLastSentMessage();
+    ASSERT_FALSE(m.empty());
+    auto msg = OpMsg::parse(m);
+    ASSERT_EQ(OpMsg::flags(m), OpMsg::kChecksumPresent);
+    ASSERT_EQ(msg.body.getStringField("find"), nss.coll());
+    ASSERT_EQ(msg.body["batchSize"].number(), 0);
+    ASSERT_TRUE(msg.body.getBoolField("tailable")) << msg.body;
+    ASSERT_TRUE(msg.body.getBoolField("awaitData")) << msg.body;
+    ASSERT_FALSE(cursor.moreInCurrentBatch());
+    ASSERT_FALSE(cursor.isDead());
+    ASSERT_FALSE(cursor.connectionHasPendingReplies());
+
+    // --- Test 2 ---
+    cursor.setAwaitDataTimeoutMS(Milliseconds{5000});
+    ASSERT_EQ(cursor.getAwaitDataTimeoutMS(), Milliseconds{5000});
+
+    // Create a 'getMore' response and set it as the mock response. The 'moreToCome' flag is set on
+    // the response to indicate this is an exhaust message.
+    cursor.setBatchSize(2);
+    std::vector<BSONObj> docs = {docObj(1), docObj(2)};
+    auto getMoreResponseMsg = mockGetMoreResponse(nss, cursorId, docs);
+    OpMsg::setFlag(&getMoreResponseMsg, OpMsg::kMoreToCome);
+    conn.setCallResponse(getMoreResponseMsg);
+
+    // Request more results. This call should trigger the first 'getMore' request with exhaust
+    // flag set.
+    conn.clearLastSentMessage();
+    ASSERT_TRUE(cursor.more());
+    m = conn.getLastSentMessage();
+    ASSERT_FALSE(m.empty());
+    msg = OpMsg::parse(m);
+    ASSERT_EQ(StringData(msg.body.firstElement().fieldName()), "getMore");
+    ASSERT_EQ(msg.body["getMore"].type(), BSONType::NumberLong);
+    ASSERT_EQ(msg.body["getMore"].numberLong(), cursorId);
+    ASSERT_EQ(msg.body["maxTimeMS"].number(), 5000);
+    ASSERT_TRUE(OpMsg::isFlagSet(m, OpMsg::kExhaustSupported));
+    ASSERT_BSONOBJ_EQ(docObj(1), cursor.next());
+    ASSERT_BSONOBJ_EQ(docObj(2), cursor.next());
+    ASSERT_FALSE(cursor.moreInCurrentBatch());
+    ASSERT_FALSE(cursor.isDead());
+    ASSERT_TRUE(cursor.connectionHasPendingReplies());
+
+    // --- Test 3 ---
+    // Create a 'getMore' response with the 'moreToCome' flag set and set it as the mock response.
+    getMoreResponseMsg = mockGetMoreResponse(nss, cursorId, {docObj(3)});
+    OpMsg::setFlag(&getMoreResponseMsg, OpMsg::kMoreToCome);
+    conn.setRecvResponse(getMoreResponseMsg);
+
+    // Request more results. But this should not trigger a new 'getMore' request because the
+    // previous response had the 'moreToCome' flag set.
+    conn.clearLastSentMessage();
+    ASSERT_TRUE(cursor.more());
+    ASSERT_TRUE(conn.getLastSentMessage().empty());
+    ASSERT_BSONOBJ_EQ(docObj(3), cursor.next());
+    ASSERT_FALSE(cursor.moreInCurrentBatch());
+    ASSERT_FALSE(cursor.isDead());
+    ASSERT_TRUE(cursor.connectionHasPendingReplies());
+
+    // --- Test 4 ---
+    // Create a 'getMore' response with an empty batch and the 'moreToCome' flag set and set it as
+    // the mock response.
+    getMoreResponseMsg = mockGetMoreResponse(nss, cursorId, {});
+    OpMsg::setFlag(&getMoreResponseMsg, OpMsg::kMoreToCome);
+    conn.setRecvResponse(getMoreResponseMsg);
+
+    // Request more results. But this should not trigger a new 'getMore' request because the
+    // previous response had the 'moreToCome' flag set.
+    conn.clearLastSentMessage();
+    // more() should return false on an empty batch.
+    ASSERT_FALSE(cursor.more());
+    ASSERT_TRUE(conn.getLastSentMessage().empty());
+    ASSERT_FALSE(cursor.moreInCurrentBatch());
+    // But the cursor should be still valid.
+    ASSERT_FALSE(cursor.isDead());
+    ASSERT_TRUE(cursor.connectionHasPendingReplies());
+
+    // --- Test 5 ---
+    // Create a 'getMore' response without the 'moreToCome' flag and set it as the mock response.
+    getMoreResponseMsg = mockGetMoreResponse(nss, cursorId, {docObj(4)});
+    conn.setRecvResponse(getMoreResponseMsg);
+
+    // Request more results. But this should not trigger a new 'getMore' request because the
+    // previous response had the 'moreToCome' flag set.
+    conn.clearLastSentMessage();
+    ASSERT_TRUE(cursor.more());
+    ASSERT_TRUE(conn.getLastSentMessage().empty());
+    ASSERT_BSONOBJ_EQ(docObj(4), cursor.next());
+    ASSERT_FALSE(cursor.moreInCurrentBatch());
+    ASSERT_FALSE(cursor.isDead());
+    ASSERT_FALSE(cursor.connectionHasPendingReplies());
+
+    // --- Test 6 ---
+    // Create a 'getMore' response with cursorId 0 and set it as the mock response.
+    getMoreResponseMsg = mockGetMoreResponse(nss, 0, {docObj(5)});
+    conn.setCallResponse(getMoreResponseMsg);
+
+    // Request more results. This should trigger a new 'getMore' request because the previous
+    // response had no 'moreToCome' flag.
+    conn.clearLastSentMessage();
+    ASSERT_TRUE(cursor.more());
+    m = conn.getLastSentMessage();
+    ASSERT_FALSE(m.empty());
+    msg = OpMsg::parse(m);
+    ASSERT_EQ(StringData(msg.body.firstElement().fieldName()), "getMore");
+    ASSERT_EQ(msg.body["getMore"].type(), BSONType::NumberLong);
+    ASSERT_EQ(msg.body["getMore"].numberLong(), cursorId);
+    ASSERT_EQ(msg.body["maxTimeMS"].number(), 5000);
+    ASSERT_BSONOBJ_EQ(docObj(5), cursor.next());
+    ASSERT_FALSE(cursor.moreInCurrentBatch());
+    // Cursor is dead if the cursorId is 0.
+    ASSERT_TRUE(cursor.isDead());
+    ASSERT_FALSE(cursor.connectionHasPendingReplies());
+
+    // Request more results. This should not trigger a new 'getMore' request as the cursor is dead.
+    conn.clearLastSentMessage();
+    ASSERT_FALSE(cursor.more());
+    ASSERT_TRUE(conn.getLastSentMessage().empty());
+}
+
+TEST_F(DBClientCursorTest, DBClientCursorOplogQuery) {
+    // This tests DBClientCursor supports oplog query with special fields in the command request.
+    // 1. Initial find command has "filter", "tailable", "awaitData", "oplogReplay", "maxTimeMS",
+    //    "batchSize", "term" and "readConcern" fields set.
+    // 2. A subsequent getMore command sets awaitData timeout and lastKnownCommittedOpTime
+    //    correctly.
+
+    // Set up the DBClientCursor and a mock client connection.
+    DBClientConnectionForTest conn;
+    const NamespaceString nss = NamespaceString::kRsOplogNamespace;
+    const BSONObj filterObj = BSON("ts" << BSON("$gte" << Timestamp(123, 4)));
+    const BSONObj readConcernObj = BSON("afterClusterTime" << Timestamp(0, 1));
+    const long long maxTimeMS = 5000LL;
+    const long long term = 5;
+    const auto oplogQuery = QUERY("query" << filterObj << "readConcern" << readConcernObj
+                                          << "$maxTimeMS" << maxTimeMS << "term" << term);
+
+    DBClientCursor cursor(&conn,
+                          NamespaceStringOrUUID(nss),
+                          oplogQuery.obj,
+                          0,
+                          0,
+                          nullptr,
+                          QueryOption_CursorTailable | QueryOption_AwaitData |
+                              QueryOption_OplogReplay,
+                          0);
+    cursor.setBatchSize(0);
+
+    // Set up mock 'find' response.
+    const long long cursorId = 42;
+    Message findResponseMsg = mockFindResponse(nss, cursorId, {});
+
+    conn.setCallResponse(findResponseMsg);
+    ASSERT(cursor.init());
+
+    // --- Test 1 ---
+    // Verify that the initial 'find' request was sent.
+    auto m = conn.getLastSentMessage();
+    ASSERT_FALSE(m.empty());
+    auto msg = OpMsg::parse(m);
+    ASSERT_EQ(OpMsg::flags(m), OpMsg::kChecksumPresent);
+    ASSERT_EQ(msg.body.getStringField("find"), nss.coll()) << msg.body;
+    ASSERT_BSONOBJ_EQ(msg.body["filter"].Obj(), filterObj);
+    ASSERT_TRUE(msg.body.getBoolField("tailable")) << msg.body;
+    ASSERT_TRUE(msg.body.getBoolField("awaitData")) << msg.body;
+    ASSERT_TRUE(msg.body.getBoolField("oplogReplay")) << msg.body;
+    ASSERT_EQ(msg.body["maxTimeMS"].numberLong(), maxTimeMS) << msg.body;
+    ASSERT_EQ(msg.body["batchSize"].number(), 0) << msg.body;
+    ASSERT_EQ(msg.body["term"].numberLong(), term) << msg.body;
+    ASSERT_BSONOBJ_EQ(msg.body["readConcern"].Obj(), readConcernObj);
+
+    cursor.setAwaitDataTimeoutMS(Milliseconds{5000});
+    ASSERT_EQ(cursor.getAwaitDataTimeoutMS(), Milliseconds{5000});
+
+    cursor.setCurrentTermAndLastCommittedOpTime(term, repl::OpTime(Timestamp(123, 4), term));
+
+    // --- Test 2 ---
+    // Create a 'getMore' response with two documents and set it as the mock response.
+    cursor.setBatchSize(2);
+    auto getMoreResponseMsg = mockGetMoreResponse(nss, cursorId, {docObj(1), docObj(2)});
+    conn.setCallResponse(getMoreResponseMsg);
+
+    // Request more results. This call should trigger the first 'getMore' request.
+    conn.clearLastSentMessage();
+    ASSERT_TRUE(cursor.more());
+    m = conn.getLastSentMessage();
+    ASSERT_FALSE(m.empty());
+    msg = OpMsg::parse(m);
+    ASSERT_EQ(StringData(msg.body.firstElement().fieldName()), "getMore") << msg.body;
+    ASSERT_EQ(msg.body["getMore"].type(), BSONType::NumberLong) << msg.body;
+    ASSERT_EQ(msg.body["getMore"].numberLong(), cursorId) << msg.body;
+    // Make sure the correct awaitData timeout is sent.
+    ASSERT_EQ(msg.body["maxTimeMS"].number(), 5000) << msg.body;
+    // Make sure the correct term is sent.
+    ASSERT_EQ(msg.body["term"].numberLong(), term) << msg.body;
+    // Make sure the correct lastKnownCommittedOpTime is sent.
+    ASSERT_EQ(msg.body["lastKnownCommittedOpTime"]["ts"].timestamp(), Timestamp(123, 4))
+        << msg.body;
+    ASSERT_EQ(msg.body["lastKnownCommittedOpTime"]["t"].numberLong(), term) << msg.body;
+    ASSERT_BSONOBJ_EQ(docObj(1), cursor.next());
+    ASSERT_BSONOBJ_EQ(docObj(2), cursor.next());
+    ASSERT_FALSE(cursor.moreInCurrentBatch());
+    ASSERT_FALSE(cursor.isDead());
 }
 
 }  // namespace

@@ -145,8 +145,8 @@ BSONCollectionCatalogEntry::IndexMetaData getIndexMetaData(
 
 class DoNothingOplogApplierObserver : public repl::OplogApplier::Observer {
 public:
-    void onBatchBegin(const repl::OplogApplier::Operations&) final {}
-    void onBatchEnd(const StatusWith<repl::OpTime>&, const repl::OplogApplier::Operations&) final {}
+    void onBatchBegin(const std::vector<repl::OplogEntry>&) final {}
+    void onBatchEnd(const StatusWith<repl::OpTime>&, const std::vector<repl::OplogEntry>&) final {}
 };
 
 class StorageTimestampTest {
@@ -316,10 +316,10 @@ public:
     }
 
     BSONCollectionCatalogEntry::MetaData getMetaDataAtTime(DurableCatalog* durableCatalog,
-                                                           NamespaceString ns,
+                                                           RecordId catalogId,
                                                            const Timestamp& ts) {
         OneOffRead oor(_opCtx, ts);
-        return durableCatalog->getMetaData(_opCtx, ns);
+        return durableCatalog->getMetaData(_opCtx, catalogId);
     }
 
     StatusWith<BSONObj> doAtomicApplyOps(const std::string& dbName,
@@ -479,7 +479,8 @@ public:
         // getAllIdents() actually looks in the RecordStore for a list of all idents, and is thus
         // versioned by timestamp. We can expect a namespace to have a consistent ident across
         // timestamps, provided the collection does not get renamed.
-        auto expectedIdent = durableCatalog->getCollectionIdent(nss);
+        auto expectedIdent =
+            durableCatalog->getEntry(autoColl.getCollection()->getCatalogId()).ident;
         auto idents = durableCatalog->getAllIdents(_opCtx);
         auto found = std::find(idents.begin(), idents.end(), expectedIdent);
 
@@ -669,11 +670,11 @@ public:
         MultikeyPaths actualMultikeyPaths;
         if (!shouldBeMultikey) {
             ASSERT_FALSE(durableCatalog->isIndexMultikey(
-                opCtx, collection->ns(), indexName, &actualMultikeyPaths))
+                opCtx, collection->getCatalogId(), indexName, &actualMultikeyPaths))
                 << "index " << indexName << " should not be multikey at timestamp " << ts;
         } else {
             ASSERT(durableCatalog->isIndexMultikey(
-                opCtx, collection->ns(), indexName, &actualMultikeyPaths))
+                opCtx, collection->getCatalogId(), indexName, &actualMultikeyPaths))
                 << "index " << indexName << " should be multikey at timestamp " << ts;
         }
 
@@ -1625,7 +1626,7 @@ public:
         expectedMinValidWithUnsetFlag.setAppliedThrough(repl::OpTime(presentTs, presentTerm));
 
         assertMinValidDocumentAtTimestamp(nss, nullTs, expectedMinValidWithUnsetFlag);
-        assertMinValidDocumentAtTimestamp(nss, pastTs, expectedMinValidWithSetFlag);
+        assertMinValidDocumentAtTimestamp(nss, pastTs, expectedMinValidWithUnsetFlag);
         assertMinValidDocumentAtTimestamp(nss, presentTs, expectedMinValidWithUnsetFlag);
         assertMinValidDocumentAtTimestamp(nss, futureTs, expectedMinValidWithUnsetFlag);
     }
@@ -1848,6 +1849,7 @@ public:
         reset(nss);
 
         AutoGetCollection autoColl(_opCtx, nss, LockMode::MODE_X);
+        RecordId catalogId = autoColl.getCollection()->getCatalogId();
 
         const LogicalTime insertTimestamp = _clock->reserveTicks(1);
         {
@@ -1937,15 +1939,16 @@ public:
         {
             ASSERT_FALSE(
                 getIndexMetaData(
-                    getMetaDataAtTime(durableCatalog, nss, afterIndexInit.asTimestamp()), "a_1")
+                    getMetaDataAtTime(durableCatalog, catalogId, afterIndexInit.asTimestamp()),
+                    "a_1")
                     .ready);
         }
 
         // After the build completes, assert that the index is `ready: true` and multikey.
         assertIdentsExistAtTimestamp(durableCatalog, "", indexIdent, afterIndexBuild);
         {
-            auto indexMetaData =
-                getIndexMetaData(getMetaDataAtTime(durableCatalog, nss, afterIndexBuild), "a_1");
+            auto indexMetaData = getIndexMetaData(
+                getMetaDataAtTime(durableCatalog, catalogId, afterIndexBuild), "a_1");
             ASSERT(indexMetaData.ready);
             ASSERT(indexMetaData.multikey);
 
@@ -2154,61 +2157,79 @@ public:
             client.createIndexes(nss.ns(), indexes);
         }
 
-        const Timestamp indexCreateInitTs = queryOplog(BSON("op"
-                                                            << "c"
-                                                            << "o.startIndexBuild" << nss.coll()
-                                                            << "o.indexes.0.name"
-                                                            << "a_1"))["ts"]
-                                                .timestamp();
-
         // Two phase index builds do not emit an createIndexes oplog entry for each index.
+        Timestamp indexCreateInitTs;
         Timestamp indexAComplete;
-        if (!IndexBuildsCoordinator::get(_opCtx)->supportsTwoPhaseIndexBuild()) {
+        Timestamp indexBComplete;
+        if (IndexBuildsCoordinator::supportsTwoPhaseIndexBuild()) {
+            indexCreateInitTs =
+                queryOplog(BSON("op"
+                                << "c"
+                                << "o.startIndexBuild" << nss.coll() << "o.indexes.0.name"
+                                << "a_1"))["ts"]
+                    .timestamp();
+            auto commitIndexBuildTs =
+                queryOplog(BSON("op"
+                                << "c"
+                                << "o.commitIndexBuild" << nss.coll() << "o.indexes.0.name"
+                                << "a_1"))["ts"]
+                    .timestamp();
+            indexBComplete = commitIndexBuildTs;
+        } else {
+            indexCreateInitTs =
+                queryOplog(BSON("op"
+                                << "n"
+                                << "ns"
+                                << ""
+                                << "o.msg"
+                                << std::string(str::stream()
+                                               << "Creating indexes. Coll: " << nss)))["ts"]
+                    .timestamp();
             indexAComplete = queryOplog(BSON("op"
                                              << "c"
                                              << "o.createIndexes" << nss.coll() << "o.name"
                                              << "a_1"))["ts"]
                                  .timestamp();
+            indexBComplete = queryOplog(BSON("op"
+                                             << "c"
+                                             << "o.createIndexes" << nss.coll() << "o.name"
+                                             << "b_1"))["ts"]
+                                 .timestamp();
         }
 
-        auto commitIndexBuildTs = queryOplog(BSON("op"
-                                                  << "c"
-                                                  << "o.commitIndexBuild" << nss.coll()
-                                                  << "o.indexes.0.name"
-                                                  << "a_1"))["ts"]
-                                      .timestamp();
-        const auto indexBComplete = commitIndexBuildTs;
-
         AutoGetCollection autoColl(_opCtx, nss, LockMode::MODE_S);
+        RecordId catalogId = autoColl.getCollection()->getCatalogId();
 
-        // The idents are created and persisted with the "ready: false" write. There should be two
-        // new index idents visible at this time.
+        // The idents are created and persisted with the "ready: false" write.
+        // There should be two new index idents visible at this time.
         const std::vector<std::string> indexes =
             getNewIndexIdentsAtTime(durableCatalog, origIdents, indexCreateInitTs);
         ASSERT_EQ(static_cast<std::size_t>(2), indexes.size()) << " Num idents: " << indexes.size();
 
         ASSERT_FALSE(
-            getIndexMetaData(getMetaDataAtTime(durableCatalog, nss, indexCreateInitTs), "a_1")
+            getIndexMetaData(getMetaDataAtTime(durableCatalog, catalogId, indexCreateInitTs), "a_1")
                 .ready);
         ASSERT_FALSE(
-            getIndexMetaData(getMetaDataAtTime(durableCatalog, nss, indexCreateInitTs), "b_1")
+            getIndexMetaData(getMetaDataAtTime(durableCatalog, catalogId, indexCreateInitTs), "b_1")
                 .ready);
 
         // Assert the `a_1` index becomes ready at the next oplog entry time.
         if (!indexAComplete.isNull()) {
-            ASSERT_TRUE(
-                getIndexMetaData(getMetaDataAtTime(durableCatalog, nss, indexAComplete), "a_1")
-                    .ready);
-            ASSERT_FALSE(
-                getIndexMetaData(getMetaDataAtTime(durableCatalog, nss, indexAComplete), "b_1")
-                    .ready);
+            ASSERT_TRUE(getIndexMetaData(
+                            getMetaDataAtTime(durableCatalog, catalogId, indexAComplete), "a_1")
+                            .ready);
+            ASSERT_FALSE(getIndexMetaData(
+                             getMetaDataAtTime(durableCatalog, catalogId, indexAComplete), "b_1")
+                             .ready);
         }
 
         // Assert the `b_1` index becomes ready at the last oplog entry time.
         ASSERT_TRUE(
-            getIndexMetaData(getMetaDataAtTime(durableCatalog, nss, indexBComplete), "a_1").ready);
+            getIndexMetaData(getMetaDataAtTime(durableCatalog, catalogId, indexBComplete), "a_1")
+                .ready);
         ASSERT_TRUE(
-            getIndexMetaData(getMetaDataAtTime(durableCatalog, nss, indexBComplete), "b_1").ready);
+            getIndexMetaData(getMetaDataAtTime(durableCatalog, catalogId, indexBComplete), "b_1")
+                .ready);
     }
 };
 
@@ -2265,28 +2286,23 @@ public:
             BSON("renameCollection" << nss.ns() << "to" << renamedNss.ns() << "dropTarget" << true),
             renameResult);
 
-        const auto commitIndexBuildDocument = queryOplog(
-            BSON("ns" << renamedNss.db() + ".$cmd"
-                      << "o.commitIndexBuild" << BSON("$exists" << true) << "o.indexes.0.name"
-                      << "a_1"
-                      << "o.indexes.1.name"
-                      << "b_1"));
-
-        // Find index creation timestamps.
-        const auto commitIndexBuildString =
-            commitIndexBuildDocument["o"].embeddedObject()["commitIndexBuild"].toString();
-        const std::string filterString = "commitIndexBuild: \"";
-        const NamespaceString tmpName(
-            renamedNss.db(),
-            commitIndexBuildString.substr(filterString.size(),
-                                          commitIndexBuildString.size() - filterString.size() - 1));
-
+        NamespaceString tmpName;
+        Timestamp indexCommitTs;
+        // Empty temporary collections generate createIndexes oplog entry even if the node
+        // supports 2 phase index build.
+        const auto createIndexesDocument =
+            queryOplog(BSON("ns" << renamedNss.db() + ".$cmd"
+                                 << "o.createIndexes" << BSON("$exists" << true) << "o.name"
+                                 << "b_1"));
+        const auto tmpCollName =
+            createIndexesDocument.getObjectField("o").getStringField("createIndexes");
+        tmpName = NamespaceString(renamedNss.db(), tmpCollName);
+        indexCommitTs = createIndexesDocument["ts"].timestamp();
         const Timestamp indexCreateInitTs = queryOplog(BSON("op"
                                                             << "c"
                                                             << "o.create" << tmpName.coll()))["ts"]
                                                 .timestamp();
 
-        const Timestamp indexCommitTs = commitIndexBuildDocument["ts"].timestamp();
 
         // We expect one new collection ident and one new index ident (the _id index) during this
         // rename.
@@ -2300,12 +2316,15 @@ public:
             durableCatalog, origIdents, /*expectedNewIndexIdents*/ 3, indexCommitTs);
 
         // Assert the 'a_1' and `b_1` indexes becomes ready at the last oplog entry time.
-        ASSERT_TRUE(
-            getIndexMetaData(getMetaDataAtTime(durableCatalog, renamedNss, indexCommitTs), "a_1")
-                .ready);
-        ASSERT_TRUE(
-            getIndexMetaData(getMetaDataAtTime(durableCatalog, renamedNss, indexCommitTs), "b_1")
-                .ready);
+        RecordId renamedCatalogId = CollectionCatalog::get(_opCtx)
+                                        .lookupCollectionByNamespace(_opCtx, renamedNss)
+                                        ->getCatalogId();
+        ASSERT_TRUE(getIndexMetaData(
+                        getMetaDataAtTime(durableCatalog, renamedCatalogId, indexCommitTs), "a_1")
+                        .ready);
+        ASSERT_TRUE(getIndexMetaData(
+                        getMetaDataAtTime(durableCatalog, renamedCatalogId, indexCommitTs), "b_1")
+                        .ready);
     }
 };
 
@@ -2365,31 +2384,61 @@ public:
 
         // Confirm that startIndexBuild and abortIndexBuild oplog entries have been written to the
         // oplog.
-        auto indexStartDocument =
-            queryOplog(BSON("ns" << nss.db() + ".$cmd"
-                                 << "o.startIndexBuild" << nss.coll() << "o.indexes.0.name"
-                                 << "a_1"));
-        auto indexStartTs = indexStartDocument["ts"].timestamp();
-        auto indexAbortDocument =
-            queryOplog(BSON("ns" << nss.db() + ".$cmd"
-                                 << "o.abortIndexBuild" << nss.coll() << "o.indexes.0.name"
-                                 << "a_1"));
-        auto indexAbortTs = indexAbortDocument["ts"].timestamp();
+        Timestamp indexStartTs;
+        Timestamp indexAbortTs;
+        if (IndexBuildsCoordinator::supportsTwoPhaseIndexBuild()) {
+            auto indexStartDocument =
+                queryOplog(BSON("ns" << nss.db() + ".$cmd"
+                                     << "o.startIndexBuild" << nss.coll() << "o.indexes.0.name"
+                                     << "a_1"));
+            indexStartTs = indexStartDocument["ts"].timestamp();
+            auto indexAbortDocument =
+                queryOplog(BSON("ns" << nss.db() + ".$cmd"
+                                     << "o.abortIndexBuild" << nss.coll() << "o.indexes.0.name"
+                                     << "a_1"));
+            indexAbortTs = indexAbortDocument["ts"].timestamp();
+
+        } else {
+            auto indexStartDocument =
+                queryOplog(BSON("op"
+                                << "n"
+                                << "ns"
+                                << ""
+                                << "o.msg"
+                                << std::string(str::stream()
+                                               << "Creating indexes. Coll: " << nss)));
+            indexStartTs = indexStartDocument["ts"].timestamp();
+            // Set abort timestamp to some future value greater than the ghost timestamp used to
+            // remove the index from the mdb catalog.
+            indexAbortTs = _clock->reserveTicks(1).asTimestamp();
+        }
 
         // Check index state in catalog at oplog entry times for both startIndexBuild and
         // abortIndexBuild.
         AutoGetCollection autoColl(_opCtx, nss, LockMode::MODE_X);
+        RecordId catalogId = autoColl.getCollection()->getCatalogId();
 
-        // We expect one new one new index ident during this index build.
-        assertRenamedCollectionIdentsAtTimestamp(
-            durableCatalog, origIdents, /*expectedNewIndexIdents*/ 1, indexStartTs);
-        ASSERT_FALSE(
-            getIndexMetaData(getMetaDataAtTime(durableCatalog, nss, indexStartTs), "a_1").ready);
+        if (IndexBuildsCoordinator::supportsTwoPhaseIndexBuild()) {
+            // We expect one new one new index ident during this index build.
+            assertRenamedCollectionIdentsAtTimestamp(
+                durableCatalog, origIdents, /*expectedNewIndexIdents*/ 1, indexStartTs);
+            ASSERT_FALSE(
+                getIndexMetaData(getMetaDataAtTime(durableCatalog, catalogId, indexStartTs), "a_1")
+                    .ready);
+        } else {
+            // In the absence of an abortIndexBuild oplog entry, the index entry will be removed
+            // from the mdb catalog using a ghost timestamp which should be equal to 'indexStartTs'.
+            // In this case, we won't be able to determine if the index entry is present with
+            // ready: false.
+            assertRenamedCollectionIdentsAtTimestamp(
+                durableCatalog, origIdents, /*expectedNewIndexIdents*/ 0, indexStartTs);
+        }
 
         // We expect all new idents to be removed after the index build has aborted.
         assertRenamedCollectionIdentsAtTimestamp(
             durableCatalog, origIdents, /*expectedNewIndexIdents*/ 0, indexAbortTs);
-        assertIndexMetaDataMissing(getMetaDataAtTime(durableCatalog, nss, indexAbortTs), "a_1");
+        assertIndexMetaDataMissing(getMetaDataAtTime(durableCatalog, catalogId, indexAbortTs),
+                                   "a_1");
     }
 };
 
@@ -2502,7 +2551,7 @@ public:
           _taskFuture(taskFuture) {}
 
     Status applyOplogBatchPerWorker(OperationContext* opCtx,
-                                    repl::MultiApplier::OperationPtrs* operationsToApply,
+                                    std::vector<const repl::OplogEntry*>* operationsToApply,
                                     WorkerMultikeyPathInfo* pathInfo) override;
 
 private:
@@ -2519,7 +2568,7 @@ private:
 // and this test case fails without crashing the entire suite.
 Status SecondaryReadsDuringBatchApplicationAreAllowedApplier::applyOplogBatchPerWorker(
     OperationContext* opCtx,
-    repl::MultiApplier::OperationPtrs* operationsToApply,
+    std::vector<const repl::OplogEntry*>* operationsToApply,
     WorkerMultikeyPathInfo* pathInfo) {
     if (!_testOpCtx->lockState()->isLockHeldForMode(resourceIdParallelBatchWriterMode, MODE_X)) {
         return {ErrorCodes::BadValue, "Batch applied was not holding PBWM lock in MODE_X"};
@@ -2540,6 +2589,162 @@ Status SecondaryReadsDuringBatchApplicationAreAllowedApplier::applyOplogBatchPer
     }
     return Status::OK();
 }
+
+class IndexBuildsResolveErrorsDuringStateChangeToPrimary : public StorageTimestampTest {
+public:
+    void run() {
+
+        NamespaceString nss("unittests.timestampIndexBuilds");
+        reset(nss);
+
+        AutoGetCollection autoColl(_opCtx, nss, LockMode::MODE_X);
+        auto collection = autoColl.getCollection();
+
+        // Indexing of parallel arrays is not allowed, so these are deemed "bad".
+        const auto badDoc1 =
+            BSON("_id" << 0 << "a" << BSON_ARRAY(0 << 1) << "b" << BSON_ARRAY(0 << 1));
+        const auto badDoc2 =
+            BSON("_id" << 1 << "a" << BSON_ARRAY(2 << 3) << "b" << BSON_ARRAY(2 << 3));
+        const auto badDoc3 =
+            BSON("_id" << 2 << "a" << BSON_ARRAY(4 << 5) << "b" << BSON_ARRAY(4 << 5));
+
+        // NOTE: This test does not test any timestamp reads.
+        const LogicalTime insert1 = _clock->reserveTicks(1);
+        {
+            log() << "inserting " << badDoc1;
+            WriteUnitOfWork wuow(_opCtx);
+            insertDocument(autoColl.getCollection(),
+                           InsertStatement(badDoc1, insert1.asTimestamp(), presentTerm));
+            wuow.commit();
+        }
+
+        const LogicalTime insert2 = _clock->reserveTicks(1);
+        {
+            log() << "inserting " << badDoc2;
+            WriteUnitOfWork wuow(_opCtx);
+            insertDocument(autoColl.getCollection(),
+                           InsertStatement(badDoc2, insert2.asTimestamp(), presentTerm));
+            wuow.commit();
+        }
+
+        const IndexCatalogEntry* buildingIndex = nullptr;
+        MultiIndexBlock indexer;
+        ON_BLOCK_EXIT([&] {
+            indexer.cleanUpAfterBuild(_opCtx, collection, MultiIndexBlock::kNoopOnCleanUpFn);
+        });
+
+        // Provide a build UUID, indicating that this is a two-phase index build.
+        const auto buildUUID = UUID::gen();
+        indexer.setTwoPhaseBuildUUID(buildUUID);
+
+        const LogicalTime indexInit = _clock->reserveTicks(3);
+
+        // First, simulate being a secondary. Indexing errors are ignored.
+        {
+            ASSERT_OK(_coordinatorMock->setFollowerMode({repl::MemberState::MS::RS_SECONDARY}));
+            _coordinatorMock->alwaysAllowWrites(false);
+            repl::UnreplicatedWritesBlock unreplicatedWrites(_opCtx);
+
+            {
+                TimestampBlock tsBlock(_opCtx, indexInit.asTimestamp());
+
+                auto swSpecs =
+                    indexer.init(_opCtx,
+                                 collection,
+                                 {BSON("v" << 2 << "name"
+                                           << "a_1_b_1"
+                                           << "ns" << collection->ns().ns() << "key"
+                                           << BSON("a" << 1 << "b" << 1))},
+                                 MultiIndexBlock::makeTimestampedIndexOnInitFn(_opCtx, collection));
+                ASSERT_OK(swSpecs.getStatus());
+            }
+
+            auto indexCatalog = collection->getIndexCatalog();
+            buildingIndex = indexCatalog->getEntry(
+                indexCatalog->findIndexByName(_opCtx, "a_1_b_1", /* includeUnfinished */ true));
+            ASSERT(buildingIndex);
+
+            ASSERT_OK(indexer.insertAllDocumentsInCollection(_opCtx, collection));
+
+            ASSERT_TRUE(buildingIndex->indexBuildInterceptor()->areAllWritesApplied(_opCtx));
+
+            // There should be one skipped record from the collection scan.
+            ASSERT_FALSE(buildingIndex->indexBuildInterceptor()
+                             ->getSkippedRecordTracker()
+                             ->areAllRecordsApplied(_opCtx));
+        }
+
+        // As a primary, stop ignoring indexing errors.
+        ASSERT_OK(_coordinatorMock->setFollowerMode({repl::MemberState::MS::RS_PRIMARY}));
+
+        {
+            // This write will not succeed because the node is a primary and the document is not
+            // indexable.
+            log() << "attempting to insert " << badDoc3;
+            WriteUnitOfWork wuow(_opCtx);
+            ASSERT_THROWS_CODE(
+                collection->insertDocument(
+                    _opCtx,
+                    InsertStatement(badDoc3, indexInit.addTicks(1).asTimestamp(), presentTerm),
+                    /* opDebug */ nullptr,
+                    /* noWarn */ false),
+                DBException,
+                ErrorCodes::CannotIndexParallelArrays);
+            wuow.commit();
+        }
+
+        // There should skipped records from failed collection scans and writes.
+        ASSERT_FALSE(
+            buildingIndex->indexBuildInterceptor()->getSkippedRecordTracker()->areAllRecordsApplied(
+                _opCtx));
+        // This fails because the bad record is still invalid.
+        auto status = indexer.retrySkippedRecords(_opCtx, collection);
+        ASSERT_EQ(status.code(), ErrorCodes::CannotIndexParallelArrays);
+
+        ASSERT_FALSE(
+            buildingIndex->indexBuildInterceptor()->getSkippedRecordTracker()->areAllRecordsApplied(
+                _opCtx));
+        ASSERT_TRUE(buildingIndex->indexBuildInterceptor()->areAllWritesApplied(_opCtx));
+
+        // Update one documents to be valid, and delete the other. These modifications are written
+        // to the side writes table and must be drained.
+        Helpers::upsert(_opCtx, collection->ns().ns(), BSON("_id" << 0 << "a" << 1 << "b" << 1));
+        {
+            RecordId badRecord =
+                Helpers::findOne(_opCtx, collection, BSON("_id" << 1), false /* requireIndex */);
+            WriteUnitOfWork wuow(_opCtx);
+            collection->deleteDocument(_opCtx, kUninitializedStmtId, badRecord, nullptr);
+            wuow.commit();
+        }
+
+        ASSERT_FALSE(buildingIndex->indexBuildInterceptor()->areAllWritesApplied(_opCtx));
+        ASSERT_OK(indexer.drainBackgroundWrites(_opCtx,
+                                                RecoveryUnit::ReadSource::kUnset,
+                                                IndexBuildInterceptor::DrainYieldPolicy::kNoYield));
+
+
+        // This succeeds because the bad documents are now either valid or removed.
+        ASSERT_OK(indexer.retrySkippedRecords(_opCtx, collection));
+        ASSERT_TRUE(
+            buildingIndex->indexBuildInterceptor()->getSkippedRecordTracker()->areAllRecordsApplied(
+                _opCtx));
+        ASSERT_TRUE(buildingIndex->indexBuildInterceptor()->areAllWritesApplied(_opCtx));
+        ASSERT_OK(indexer.checkConstraints(_opCtx));
+
+        {
+            WriteUnitOfWork wuow(_opCtx);
+            ASSERT_OK(indexer.commit(
+                _opCtx,
+                collection,
+                [&](const BSONObj& indexSpec) {
+                    _opCtx->getServiceContext()->getOpObserver()->onCreateIndex(
+                        _opCtx, collection->ns(), collection->uuid(), indexSpec, false);
+                },
+                MultiIndexBlock::kNoopOnCommitFn));
+            wuow.commit();
+        }
+    }
+};
 
 class SecondaryReadsDuringBatchApplicationAreAllowed : public StorageTimestampTest {
 public:
@@ -2684,6 +2889,7 @@ public:
             ASSERT_OK(doAtomicApplyOps(nss.db().toString(), {createIndexOp}));
 
             AutoGetCollection autoColl(_opCtx, nss, LockMode::MODE_IS);
+            RecordId catalogId = autoColl.getCollection()->getCatalogId();
             const std::string indexIdent =
                 getNewIndexIdentAtTime(durableCatalog, origIdents, Timestamp::min());
             assertIdentsMissingAtTimestamp(
@@ -2692,9 +2898,9 @@ public:
 
             // On a primary, the index build should start and finish at `startBuildTs` because it is
             // built in the foreground.
-            ASSERT_TRUE(
-                getIndexMetaData(getMetaDataAtTime(durableCatalog, nss, startBuildTs), "field_1")
-                    .ready);
+            ASSERT_TRUE(getIndexMetaData(getMetaDataAtTime(durableCatalog, catalogId, startBuildTs),
+                                         "field_1")
+                            .ready);
         }
     }
 };
@@ -2730,16 +2936,18 @@ public:
 
         {
             Lock::GlobalRead read(_opCtx);
+            AutoGetCollection autoColl(_opCtx, systemViewsNss, LockMode::MODE_IS);
+            RecordId catalogId = autoColl.getCollection()->getCatalogId();
+
             auto systemViewsMd = getMetaDataAtTime(
-                durableCatalog, systemViewsNss, Timestamp(systemViewsCreateTs.asULL() - 1));
+                durableCatalog, catalogId, Timestamp(systemViewsCreateTs.asULL() - 1));
             ASSERT_EQ("", systemViewsMd.ns)
                 << systemViewsNss
                 << " incorrectly exists before creation. CreateTs: " << systemViewsCreateTs;
 
-            systemViewsMd = getMetaDataAtTime(durableCatalog, systemViewsNss, systemViewsCreateTs);
+            systemViewsMd = getMetaDataAtTime(durableCatalog, catalogId, systemViewsCreateTs);
             ASSERT_EQ(systemViewsNss.ns(), systemViewsMd.ns);
 
-            AutoGetCollection autoColl(_opCtx, systemViewsNss, LockMode::MODE_IS);
             assertDocumentAtTimestamp(autoColl.getCollection(), systemViewsCreateTs, BSONObj());
             assertDocumentAtTimestamp(autoColl.getCollection(),
                                       viewCreateTs,
@@ -2765,7 +2973,12 @@ public:
 
         ASSERT_OK(createCollection(_opCtx, nss.db().toString(), BSON("create" << nss.coll())));
 
-        { ASSERT(AutoGetCollectionForReadCommand(_opCtx, nss).getCollection()); }
+        RecordId catalogId;
+        {
+            AutoGetCollectionForReadCommand coll(_opCtx, nss);
+            ASSERT(coll.getCollection());
+            catalogId = coll.getCollection()->getCatalogId();
+        }
 
         BSONObj result = queryOplog(BSON("op"
                                          << "c"
@@ -2778,30 +2991,20 @@ public:
         ASSERT_EQ(op.getTimestamp(), futureTs) << op.toBSON();
 
         // The index build emits three oplog entries.
-        auto indexStartTs = repl::OplogEntry(queryOplog(BSON("op"
-                                                             << "c"
-                                                             << "ns" << nss.getCommandNS().ns()
-                                                             << "o.startIndexBuild" << nss.coll()
-                                                             << "o.indexes.0.name"
-                                                             << "user_1_db_1")))
-                                .getTimestamp();
+        Timestamp indexStartTs;
         Timestamp indexCreateTs;
-        if (!IndexBuildsCoordinator::get(_opCtx)->supportsTwoPhaseIndexBuild()) {
-            indexCreateTs =
-                repl::OplogEntry(queryOplog(BSON("op"
-                                                 << "c"
-                                                 << "ns" << nss.getCommandNS().ns()
-                                                 << "o.createIndexes" << nss.coll() << "o.name"
-                                                 << "user_1_db_1")))
-                    .getTimestamp();
-        }
-        auto indexCompleteTs = repl::OplogEntry(queryOplog(BSON("op"
-                                                                << "c"
-                                                                << "ns" << nss.getCommandNS().ns()
-                                                                << "o.commitIndexBuild"
-                                                                << nss.coll() << "o.indexes.0.name"
-                                                                << "user_1_db_1")))
-                                   .getTimestamp();
+        Timestamp indexCompleteTs;
+        // Empty collections generate createIndexes oplog entry even if the node
+        // supports 2 phase index build.
+        indexStartTs = op.getTimestamp();
+        indexCreateTs =
+            repl::OplogEntry(queryOplog(BSON("op"
+                                             << "c"
+                                             << "ns" << nss.getCommandNS().ns() << "o.createIndexes"
+                                             << nss.coll() << "o.name"
+                                             << "user_1_db_1")))
+                .getTimestamp();
+        indexCompleteTs = indexCreateTs;
 
         assertNamespaceInIdents(nss, pastTs, false);
         assertNamespaceInIdents(nss, presentTs, false);
@@ -2817,7 +3020,7 @@ public:
         AutoGetCollection autoColl(_opCtx, nss, LockMode::MODE_IS);
         auto storageEngine = _opCtx->getServiceContext()->getStorageEngine();
         auto durableCatalog = storageEngine->getCatalog();
-        auto indexIdent = durableCatalog->getIndexIdent(_opCtx, nss, "user_1_db_1");
+        auto indexIdent = durableCatalog->getIndexIdent(_opCtx, catalogId, "user_1_db_1");
         assertIdentsMissingAtTimestamp(durableCatalog, "", indexIdent, pastTs);
         assertIdentsMissingAtTimestamp(durableCatalog, "", indexIdent, presentTs);
         assertIdentsMissingAtTimestamp(durableCatalog, "", indexIdent, futureTs);
@@ -3649,6 +3852,7 @@ public:
         addIf<AbortPreparedMultiOplogEntryTransaction>();
         addIf<PreparedMultiDocumentTransaction>();
         addIf<AbortedPreparedMultiDocumentTransaction>();
+        addIf<IndexBuildsResolveErrorsDuringStateChangeToPrimary>();
     }
 };
 

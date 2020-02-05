@@ -36,6 +36,7 @@
 #include <vector>
 
 #include "mongo/bson/util/builder.h"
+#include "mongo/db/exec/projection_executor_utils.h"
 #include "mongo/db/index/wildcard_key_generator.h"
 #include "mongo/db/query/index_bounds.h"
 #include "mongo/util/log.h"
@@ -355,13 +356,14 @@ void expandWildcardIndexEntry(const IndexEntry& wildcardIndex,
     invariant(wildcardIndex.multikeyPaths.empty());
 
     // Obtain the projection executor from the parent wildcard IndexEntry.
-    const auto* projExec = wildcardIndex.wildcardProjection;
-    invariant(projExec);
+    auto* wildcardProjection = wildcardIndex.wildcardProjection;
+    invariant(wildcardProjection);
 
-    const auto projectedFields = projExec->applyProjectionToFields(fields);
+    const auto projectedFields =
+        projection_executor_utils::applyProjectionToFields(wildcardProjection->exec(), fields);
 
-    const auto& includedPaths = projExec->getExhaustivePaths();
-
+    std::set<FieldRef> includedPaths =
+        wildcardProjection->exhaustivePaths().value_or(std::set<FieldRef>{});
     out->reserve(out->size() + projectedFields.size());
     for (auto&& fieldName : projectedFields) {
         // Convert string 'fieldName' into a FieldRef, to better facilitate the subsequent checks.

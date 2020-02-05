@@ -136,7 +136,8 @@ public:
                            const ShardId& newShardId,
                            uint64_t maxChunkSizeBytes,
                            const MigrationSecondaryThrottleOptions& secondaryThrottle,
-                           bool waitForDelete);
+                           bool waitForDelete,
+                           bool forceJumbo);
 
     /**
      * Appends the runtime state of the balancer instance to the specified builder.
@@ -148,13 +149,23 @@ public:
      */
     void notifyPersistedBalancerSettingsChanged();
 
+    struct BalancerStatus {
+        bool balancerCompliant;
+        boost::optional<std::string> firstComplianceViolation;
+    };
+    /**
+     * Returns if a given collection is draining due to a removed shard, has chunks on an invalid
+     * zone or the number of chunks is imbalanced across the cluster
+     */
+    BalancerStatus getBalancerStatusForNs(OperationContext* opCtx, const NamespaceString& nss);
+
 private:
     /**
      * Possible runtime states of the balancer. The comments indicate the allowed next state.
      */
     enum State {
         kStopped,   // kRunning
-        kRunning,   // kStopping
+        kRunning,   // kStopping | kStopped
         kStopping,  // kStopped
     };
 
@@ -215,6 +226,7 @@ private:
 
     // The main balancer thread
     stdx::thread _thread;
+    stdx::condition_variable _joinCond;
 
     // The operation context of the main balancer thread. This value may only be available in the
     // kRunning state and is used to force interrupt of any blocking calls made by the balancer

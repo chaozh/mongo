@@ -1,7 +1,9 @@
 """The unittest.TestCase instances for setting up and tearing down fixtures."""
+
 from buildscripts.resmokelib import errors
 from buildscripts.resmokelib.testing.testcases import interface
 from buildscripts.resmokelib.utils import registry
+from buildscripts.resmokelib.testing.fixtures import interface as fixture_interface
 
 
 class FixtureTestCase(interface.TestCase):  # pylint: disable=abstract-method
@@ -22,9 +24,11 @@ class FixtureSetupTestCase(FixtureTestCase):
     REGISTERED_NAME = registry.LEAVE_UNREGISTERED
     PHASE = "setup"
 
-    def __init__(self, logger, fixture, job_name):
+    def __init__(self, logger, fixture, job_name, times_set_up):
         """Initialize the FixtureSetupTestCase."""
-        FixtureTestCase.__init__(self, logger, job_name, self.PHASE)
+        specific_phase = "{phase}_{times_set_up}".format(phase=self.PHASE,
+                                                         times_set_up=times_set_up)
+        FixtureTestCase.__init__(self, logger, job_name, specific_phase)
         self.fixture = fixture
 
     def run_test(self):
@@ -69,4 +73,34 @@ class FixtureTeardownTestCase(FixtureTestCase):
             raise
         except:
             self.logger.exception("An error occurred during the teardown of %s.", self.fixture)
+            raise
+
+
+class FixtureAbortTestCase(FixtureTestCase):
+    """TestCase for killing a fixture. Intended for use before archiving a failed test."""
+
+    REGISTERED_NAME = registry.LEAVE_UNREGISTERED
+    PHASE = "abort"
+
+    def __init__(self, logger, fixture, job_name, times_set_up):
+        """Initialize the FixtureAbortTestCase."""
+        specific_phase = "{phase}_{times_set_up}".format(phase=self.PHASE,
+                                                         times_set_up=times_set_up)
+        FixtureTestCase.__init__(self, logger, job_name, specific_phase)
+        self.fixture = fixture
+
+    def run_test(self):
+        """Tear down the fixture."""
+        try:
+            self.return_code = 2  # Test return code of 2 is used for fixture failures.
+            self.logger.info("Aborting the fixture %s due to test failure.", self.fixture)
+            self.fixture.teardown(finished=False, mode=fixture_interface.TeardownMode.ABORT)
+            self.logger.info("Finished aborting %s.", self.fixture)
+            self.return_code = 0
+        except errors.ServerFailure:
+            # If the server wasn't already running, we can't exactly fail to abort it.
+            self.logger.info("Finished aborting %s.", self.fixture)
+            self.return_code = 0
+        except:
+            self.logger.exception("An error occurred while aborting %s.", self.fixture)
             raise

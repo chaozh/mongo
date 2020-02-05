@@ -78,12 +78,16 @@ class TransportLayerASIO::ASIOSession final : public Session {
     ASIOSession& operator=(const ASIOSession&) = delete;
 
 public:
+    using Endpoint = asio::generic::stream_protocol::endpoint;
+
     // If the socket is disconnected while any of these options are being set, this constructor
     // may throw, but it is guaranteed to throw a mongo DBException.
-    ASIOSession(TransportLayerASIO* tl, GenericSocket socket, bool isIngressSession) try
-        : _socket(std::move(socket)),
-          _tl(tl),
-          _isIngressSession(isIngressSession) {
+    ASIOSession(TransportLayerASIO* tl,
+                GenericSocket socket,
+                bool isIngressSession,
+                Endpoint endpoint = Endpoint()) try : _socket(std::move(socket)),
+                                                      _tl(tl),
+                                                      _isIngressSession(isIngressSession) {
         auto family = endpointToSockAddr(_socket.local_endpoint()).getType();
         if (family == AF_INET || family == AF_INET6) {
             _socket.set_option(asio::ip::tcp::no_delay(true));
@@ -92,7 +96,16 @@ public:
         }
 
         _localAddr = endpointToSockAddr(_socket.local_endpoint());
-        _remoteAddr = endpointToSockAddr(_socket.remote_endpoint());
+
+        if (endpoint == Endpoint()) {
+            // Inbound connection, query socket for remote.
+            _remoteAddr = endpointToSockAddr(_socket.remote_endpoint());
+        } else {
+            // Outbound connection, get remote from resolved endpoint.
+            // Necessary for TCP_FASTOPEN where the remote isn't connected yet.
+            _remoteAddr = endpointToSockAddr(endpoint);
+        }
+
         _local = HostAndPort(_localAddr.toString(true));
         _remote = HostAndPort(_remoteAddr.toString(true));
     } catch (const DBException&) {
@@ -245,9 +258,12 @@ protected:
         return doHandshake().then([this, target] {
             _ranHandshake = true;
 
-            SSLPeerInfo::forSession(shared_from_this()) =
-                uassertStatusOK(getSSLManager()->parseAndValidatePeerCertificate(
-                    _sslSocket->native_handle(), _sslSocket->get_sni(), target.host(), target));
+            return getSSLManager()
+                ->parseAndValidatePeerCertificate(
+                    _sslSocket->native_handle(), _sslSocket->get_sni(), target.host(), target)
+                .then([this](SSLPeerInfo info) {
+                    SSLPeerInfo::forSession(shared_from_this()) = info;
+                });
         });
     }
 
@@ -621,13 +637,17 @@ private:
                 }
             };
             return doHandshake().then([this](size_t size) {
-                auto& sslPeerInfo = SSLPeerInfo::forSession(shared_from_this());
-
-                if (sslPeerInfo.subjectName.empty()) {
-                    sslPeerInfo = uassertStatusOK(getSSLManager()->parseAndValidatePeerCertificate(
-                        _sslSocket->native_handle(), _sslSocket->get_sni(), "", _remote));
+                if (SSLPeerInfo::forSession(shared_from_this()).subjectName.empty()) {
+                    return getSSLManager()
+                        ->parseAndValidatePeerCertificate(
+                            _sslSocket->native_handle(), _sslSocket->get_sni(), "", _remote)
+                        .then([this](SSLPeerInfo info) -> bool {
+                            SSLPeerInfo::forSession(shared_from_this()) = info;
+                            return true;
+                        });
                 }
-                return true;
+
+                return Future<bool>::makeReady(true);
             });
         } else if (_tl->_sslMode() == SSLParams::SSLMode_requireSSL) {
             uasserted(ErrorCodes::SSLHandshakeFailed,

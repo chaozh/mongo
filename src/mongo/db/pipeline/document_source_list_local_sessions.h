@@ -56,7 +56,7 @@ public:
 
     class LiteParsed final : public LiteParsedDocumentSource {
     public:
-        static std::unique_ptr<LiteParsed> parse(const AggregationRequest& request,
+        static std::unique_ptr<LiteParsed> parse(const NamespaceString& nss,
                                                  const BSONElement& spec) {
 
             return std::make_unique<LiteParsed>(
@@ -69,7 +69,8 @@ public:
             return stdx::unordered_set<NamespaceString>();
         }
 
-        PrivilegeVector requiredPrivileges(bool isMongos) const final {
+        PrivilegeVector requiredPrivileges(bool isMongos,
+                                           bool bypassDocumentValidation) const final {
             return listSessionsRequiredPrivileges(_spec);
         }
 
@@ -81,8 +82,8 @@ public:
             return false;
         }
 
-        void assertSupportsReadConcern(const repl::ReadConcernArgs& readConcern) const {
-            onlyReadConcernLocalSupported(DocumentSourceListLocalSessions::kStageName, readConcern);
+        ReadConcernSupportResult supportsReadConcern(repl::ReadConcernLevel level) const {
+            return onlyReadConcernLocalSupported(kStageName, level);
         }
 
         void assertSupportsMultiDocumentTransaction() const {

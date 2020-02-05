@@ -71,7 +71,7 @@ public:
 
     virtual void endBackup(OperationContext* opCtx) {}
 
-    virtual Status dropIdent(OperationContext* opCtx, StringData ident);
+    virtual Status dropIdent(OperationContext* opCtx, RecoveryUnit* ru, StringData ident);
 
     virtual bool supportsDocLocking() const {
         return false;
@@ -112,7 +112,7 @@ public:
     }
 
     virtual Timestamp getAllDurableTimestamp() const override {
-        MONGO_UNREACHABLE;
+        return Timestamp();
     }
 
     virtual Timestamp getOldestOpenReadTimestamp() const override {

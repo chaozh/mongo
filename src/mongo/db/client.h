@@ -52,6 +52,7 @@
 namespace mongo {
 
 class Collection;
+class Locker;
 class OperationContext;
 class ThreadClient;
 
@@ -144,12 +145,15 @@ public:
     void reportState(BSONObjBuilder& builder);
 
     // Ensures stability of the client's OperationContext. When the client is locked,
-    // the OperationContext will not disappear.
+    // the OperationContext and the Locker within it will not disappear.
     void lock() {
         _lock.lock();
     }
     void unlock() {
         _lock.unlock();
+    }
+    bool try_lock() {
+        return _lock.try_lock();
     }
 
     /**
@@ -228,6 +232,19 @@ public:
     PseudoRandom& getPrng() {
         return _prng;
     }
+
+    /**
+     * Safely swaps the locker in the OperationContext, releasing the old locker to the caller.
+     * Locks this Client to do this safely.
+     */
+    std::unique_ptr<Locker> swapLockState(std::unique_ptr<Locker> locker);
+
+    /**
+     * Checks if there is an active currentOp associated with this client.
+     * The definition of active varies between User and System connections.
+     * Note that the caller must hold the client lock.
+     */
+    bool hasAnyActiveCurrentOp() const;
 
 private:
     friend class ServiceContext;

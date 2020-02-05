@@ -151,7 +151,7 @@ Status _applyOps(OperationContext* opCtx,
             // NamespaceNotFound.
             // Additionally for inserts, we fail early on non-existent collections.
             Lock::CollectionLock collectionLock(opCtx, nss, MODE_IX);
-            auto collection = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(nss);
+            auto collection = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, nss);
             if (!collection && (*opType == 'i' || *opType == 'u')) {
                 uasserted(
                     ErrorCodes::AtomicityFailure,
@@ -160,27 +160,28 @@ Status _applyOps(OperationContext* opCtx,
                         << nss.ns() << " in atomic applyOps mode: " << redact(opObj));
             }
 
+            // Reject malformed or over-specified operations in an atomic applyOps.
+            try {
+                ReplOperation::parse(IDLParserErrorContext("applyOps"), opObj);
+            } catch (...) {
+                uasserted(ErrorCodes::AtomicityFailure,
+                          str::stream() << "cannot apply a malformed or over-specified operation "
+                                           "in atomic applyOps mode: "
+                                        << redact(opObj) << "; will retry without atomicity: "
+                                        << exceptionToStatus().toString());
+            }
+
             BSONObjBuilder builder;
             builder.appendElements(opObj);
 
-            // If required fields are not present in the BSONObj for an applyOps entry, create these
-            // fields and populate them with dummy values before parsing the BSONObj as an oplog
-            // entry.
-            if (!builder.hasField(OplogEntry::kTimestampFieldName)) {
-                builder.append(OplogEntry::kTimestampFieldName, Timestamp());
-            }
-            if (!builder.hasField(OplogEntry::kWallClockTimeFieldName)) {
-                builder.append(OplogEntry::kWallClockTimeFieldName, Date_t());
-            }
-            // Reject malformed operations in an atomic applyOps.
+            // Create these required fields and populate them with dummy values before parsing the
+            // BSONObj as an oplog entry.
+            builder.append(OplogEntry::kTimestampFieldName, Timestamp());
+            builder.append(OplogEntry::kWallClockTimeFieldName, Date_t());
             auto entry = OplogEntry::parse(builder.done());
-            if (!entry.isOK()) {
-                uasserted(ErrorCodes::AtomicityFailure,
-                          str::stream()
-                              << "cannot apply a malformed operation in atomic applyOps mode: "
-                              << redact(opObj)
-                              << "; will retry without atomicity: " << entry.getStatus());
-            }
+
+            // Malformed operations should have already been caught and retried in non-atomic mode.
+            invariant(entry.isOK());
 
             OldClientContext ctx(opCtx, nss.ns());
 
@@ -311,7 +312,8 @@ Status _checkPrecondition(OperationContext* opCtx,
         if (!database) {
             return {ErrorCodes::NamespaceNotFound, "database in ns does not exist: " + nss.ns()};
         }
-        Collection* collection = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(nss);
+        Collection* collection =
+            CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, nss);
         if (!collection) {
             return {ErrorCodes::NamespaceNotFound, "collection in ns does not exist: " + nss.ns()};
         }
@@ -494,8 +496,8 @@ Status applyOps(OperationContext* opCtx,
 }
 
 // static
-MultiApplier::Operations ApplyOps::extractOperations(const OplogEntry& applyOpsOplogEntry) {
-    MultiApplier::Operations result;
+std::vector<OplogEntry> ApplyOps::extractOperations(const OplogEntry& applyOpsOplogEntry) {
+    std::vector<OplogEntry> result;
     extractOperationsTo(applyOpsOplogEntry, applyOpsOplogEntry.toBSON(), &result);
     return result;
 }
@@ -503,7 +505,7 @@ MultiApplier::Operations ApplyOps::extractOperations(const OplogEntry& applyOpsO
 // static
 void ApplyOps::extractOperationsTo(const OplogEntry& applyOpsOplogEntry,
                                    const BSONObj& topLevelDoc,
-                                   MultiApplier::Operations* operations) {
+                                   std::vector<OplogEntry>* operations) {
     uassert(ErrorCodes::TypeMismatch,
             str::stream() << "ApplyOps::extractOperations(): not a command: "
                           << redact(applyOpsOplogEntry.toBSON()),
@@ -520,6 +522,9 @@ void ApplyOps::extractOperationsTo(const OplogEntry& applyOpsOplogEntry,
     bool alwaysUpsert = info.getAlwaysUpsert() && !applyOpsOplogEntry.getTxnNumber();
 
     for (const auto& operationDoc : operationDocs) {
+        // Make sure that the inner ops are not malformed or over-specified.
+        ReplOperation::parse(IDLParserErrorContext("extractOperations"), operationDoc);
+
         BSONObjBuilder builder(operationDoc);
 
         // Oplog entries can have an oddly-named "b" field for "upsert". MongoDB stopped creating

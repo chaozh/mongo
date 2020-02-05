@@ -35,6 +35,7 @@
 #include "mongo/base/string_data.h"
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/db/field_parser.h"
+#include "mongo/db/repl/repl_set_config.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
@@ -91,8 +92,7 @@ WriteConcernOptions::WriteConcernOptions(const std::string& mode,
                                          Milliseconds timeout)
     : syncMode(sync), wNumNodes(0), wMode(mode), wTimeout(durationCount<Milliseconds>(timeout)) {}
 
-Status WriteConcernOptions::parse(const BSONObj& obj) {
-    *this = WriteConcernOptions();
+StatusWith<WriteConcernOptions> WriteConcernOptions::parse(const BSONObj& obj) {
     if (obj.isEmpty()) {
         return Status(ErrorCodes::FailedToParse, "write concern object cannot be empty");
     }
@@ -100,6 +100,9 @@ Status WriteConcernOptions::parse(const BSONObj& obj) {
     BSONElement jEl;
     BSONElement fsyncEl;
     BSONElement wEl;
+    int wTimeout = 0;
+
+    WriteConcernOptions writeConcern;
 
     for (auto e : obj) {
         const auto fieldName = e.fieldNameStringData();
@@ -108,16 +111,20 @@ Status WriteConcernOptions::parse(const BSONObj& obj) {
             if (!jEl.isNumber() && jEl.type() != Bool) {
                 return Status(ErrorCodes::FailedToParse, "j must be numeric or a boolean value");
             }
+            writeConcern.usedDefault = false;
         } else if (fieldName == kFSyncFieldName) {
             fsyncEl = e;
             if (!fsyncEl.isNumber() && fsyncEl.type() != Bool) {
                 return Status(ErrorCodes::FailedToParse,
                               "fsync must be numeric or a boolean value");
             }
+            writeConcern.usedDefault = false;
         } else if (fieldName == kWFieldName) {
             wEl = e;
+            writeConcern.usedDefault = false;
         } else if (fieldName == kWTimeoutFieldName) {
-            wTimeout = e.numberInt();
+            wTimeout = e.safeNumberLong();
+            writeConcern.usedDefault = false;
         } else if (fieldName == kWElectionIdFieldName) {
             // Ignore.
         } else if (fieldName == kWOpTimeFieldName) {
@@ -132,40 +139,48 @@ Status WriteConcernOptions::parse(const BSONObj& obj) {
 
     const bool j = jEl.trueValue();
     const bool fsync = fsyncEl.trueValue();
-
-    if (j && fsync)
+    if (j && fsync) {
         return Status(ErrorCodes::FailedToParse, "fsync and j options cannot be used together");
+    }
 
     if (j) {
-        syncMode = SyncMode::JOURNAL;
+        writeConcern.syncMode = SyncMode::JOURNAL;
     } else if (fsync) {
-        syncMode = SyncMode::FSYNC;
+        writeConcern.syncMode = SyncMode::FSYNC;
     } else if (!jEl.eoo()) {
-        syncMode = SyncMode::NONE;
+        writeConcern.syncMode = SyncMode::NONE;
     }
 
     if (wEl.isNumber()) {
-        wNumNodes = wEl.numberInt();
-        usedDefaultW = false;
+        auto wNumNodes = wEl.safeNumberLong();
+        if (wNumNodes < 0 ||
+            wNumNodes > static_cast<decltype(wNumNodes)>(repl::ReplSetConfig::kMaxMembers)) {
+            return Status(ErrorCodes::FailedToParse,
+                          str::stream() << "w has to be a non-negative number and not greater than "
+                                        << repl::ReplSetConfig::kMaxMembers);
+        }
+        writeConcern.wNumNodes = static_cast<decltype(writeConcern.wNumNodes)>(wNumNodes);
+        writeConcern.usedDefaultW = false;
     } else if (wEl.type() == String) {
-        wNumNodes = 0;
-        wMode = wEl.valuestrsafe();
-        usedDefaultW = false;
+        writeConcern.wNumNodes = 0;
+        writeConcern.wMode = wEl.valuestrsafe();
+        writeConcern.usedDefaultW = false;
     } else if (wEl.eoo() || wEl.type() == jstNULL || wEl.type() == Undefined) {
-        wNumNodes = 1;
+        writeConcern.wNumNodes = 1;
     } else {
         return Status(ErrorCodes::FailedToParse, "w has to be a number or a string");
     }
 
-    return Status::OK();
+    writeConcern.wTimeout = wTimeout;
+
+    return writeConcern;
 }
 
 WriteConcernOptions WriteConcernOptions::deserializerForIDL(const BSONObj& obj) {
-    WriteConcernOptions writeConcern;
     if (!obj.isEmpty()) {
-        uassertStatusOK(writeConcern.parse(obj));
+        return uassertStatusOK(parse(obj));
     }
-    return writeConcern;
+    return WriteConcernOptions();
 }
 
 StatusWith<WriteConcernOptions> WriteConcernOptions::extractWCFromCommand(const BSONObj& cmdObj) {
@@ -191,12 +206,12 @@ StatusWith<WriteConcernOptions> WriteConcernOptions::extractWCFromCommand(const 
         return writeConcern;
     }
 
-    wcStatus = writeConcern.parse(writeConcernObj);
-    writeConcern.usedDefault = false;
-    if (!wcStatus.isOK()) {
-        return wcStatus;
+    auto sw = parse(writeConcernObj);
+    if (!sw.isOK()) {
+        return sw.getStatus();
     }
-
+    writeConcern = sw.getValue();
+    writeConcern.usedDefault = false;
     return writeConcern;
 }
 

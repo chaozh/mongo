@@ -130,11 +130,14 @@ public:
 
 class ExpressionNaryTestOneArg : public ExpressionBaseTest {
 public:
-    virtual void assertEvaluates(Value input, Value output) {
+    Value eval(Value input) {
         addOperand(_expr, input);
-        ASSERT_VALUE_EQ(output, _expr->evaluate({}, &_expr->getExpressionContext()->variables));
-        ASSERT_EQUALS(output.getType(),
-                      _expr->evaluate({}, &_expr->getExpressionContext()->variables).getType());
+        return _expr->evaluate({}, &_expr->getExpressionContext()->variables);
+    }
+    virtual void assertEvaluates(Value input, Value output) {
+        Value v = eval(input);
+        ASSERT_VALUE_EQ(output, v);
+        ASSERT_EQUALS(output.getType(), v.getType());
     }
 
     intrusive_ptr<ExpressionNary> _expr;
@@ -1186,6 +1189,111 @@ TEST_F(ExpressionRoundTwoArgTest, NullArg2) {
     assertEval(BSONNULL, BSONNULL, BSONNULL);
     assertEval(1, BSONNULL, BSONNULL);
     assertEval(BSONNULL, 1, BSONNULL);
+}
+
+/* ------------------------- ExpressionBinarySize -------------------------- */
+
+class ExpressionBinarySizeTest : public ExpressionNaryTestOneArg {
+public:
+    void assertEval(ImplicitValue input, ImplicitValue output) {
+        intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+        _expr = new ExpressionBinarySize(expCtx);
+        ExpressionNaryTestOneArg::assertEvaluates(input, output);
+    }
+};
+
+TEST_F(ExpressionBinarySizeTest, HandlesStrings) {
+    assertEval("abc"_sd, 3);
+    assertEval(""_sd, 0);
+    assertEval("ab\0c"_sd, 4);
+    assertEval("abc\0"_sd, 4);
+}
+
+TEST_F(ExpressionBinarySizeTest, HandlesBinData) {
+    assertEval(BSONBinData("abc", 3, BinDataGeneral), 3);
+    assertEval(BSONBinData("", 0, BinDataGeneral), 0);
+    assertEval(BSONBinData("ab\0c", 4, BinDataGeneral), 4);
+    assertEval(BSONBinData("abc\0", 4, BinDataGeneral), 4);
+}
+
+TEST_F(ExpressionBinarySizeTest, HandlesNullish) {
+    assertEval(BSONNULL, BSONNULL);
+    assertEval(BSONUndefined, BSONNULL);
+    assertEval(Value(), BSONNULL);
+}
+
+/* ------------------------- ExpressionFirst -------------------------- */
+
+class ExpressionFirstTest : public ExpressionNaryTestOneArg {
+public:
+    void assertEval(ImplicitValue input, ImplicitValue output) {
+        intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+        _expr = new ExpressionFirst(expCtx);
+        ExpressionNaryTestOneArg::assertEvaluates(input, output);
+    }
+    void assertEvalFails(ImplicitValue input) {
+        intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+        _expr = new ExpressionFirst(expCtx);
+        ASSERT_THROWS_CODE(eval(input), DBException, 28689);
+    }
+};
+
+TEST_F(ExpressionFirstTest, HandlesArrays) {
+    assertEval(vector<Value>{Value("A"_sd)}, "A"_sd);
+    assertEval(vector<Value>{Value("A"_sd), Value("B"_sd)}, "A"_sd);
+    assertEval(vector<Value>{Value("A"_sd), Value("B"_sd), Value("C"_sd)}, "A"_sd);
+}
+
+TEST_F(ExpressionFirstTest, HandlesEmptyArray) {
+    assertEval(vector<Value>{}, Value());
+}
+
+TEST_F(ExpressionFirstTest, HandlesNullish) {
+    assertEval(BSONNULL, BSONNULL);
+    assertEval(BSONUndefined, BSONNULL);
+    assertEval(Value(), BSONNULL);
+}
+
+TEST_F(ExpressionFirstTest, RejectsNonArrays) {
+    assertEvalFails("asdf"_sd);
+    assertEvalFails(BSONBinData("asdf", 4, BinDataGeneral));
+}
+
+/* ------------------------- ExpressionLast -------------------------- */
+
+class ExpressionLastTest : public ExpressionNaryTestOneArg {
+public:
+    void assertEval(ImplicitValue input, ImplicitValue output) {
+        intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+        _expr = new ExpressionLast(expCtx);
+        ExpressionNaryTestOneArg::assertEvaluates(input, output);
+    }
+    void assertEvalFails(ImplicitValue input) {
+        intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+        _expr = new ExpressionLast(expCtx);
+        ASSERT_THROWS_CODE(eval(input), DBException, 28689);
+    }
+};
+
+TEST_F(ExpressionLastTest, HandlesArrays) {
+    assertEval(vector<Value>{Value("A"_sd)}, "A"_sd);
+    assertEval(vector<Value>{Value("A"_sd), Value("B"_sd)}, "B"_sd);
+    assertEval(vector<Value>{Value("A"_sd), Value("B"_sd), Value("C"_sd)}, "C"_sd);
+}
+
+TEST_F(ExpressionLastTest, HandlesEmptyArray) {
+    assertEval(vector<Value>{}, Value());
+}
+
+TEST_F(ExpressionLastTest, HandlesNullish) {
+    assertEval(BSONNULL, BSONNULL);
+    assertEval(BSONUndefined, BSONNULL);
+    assertEval(Value(), BSONNULL);
+}
+
+TEST_F(ExpressionLastTest, RejectsNonArrays) {
+    assertEvalFails("asdf"_sd);
+    assertEvalFails(BSONBinData("asdf", 4, BinDataGeneral));
 }
 
 }  // anonymous namespace

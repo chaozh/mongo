@@ -86,7 +86,7 @@ DocumentSource::GetNextResult DocumentSourceSort::doGetNext() {
         invariant(populationResult.isEOF());
     }
 
-    auto result = _sortExecutor->getNextDoc();
+    auto result = _sortExecutor->getNext();
     if (!result)
         return GetNextResult::makeEOF();
     return GetNextResult(std::move(*result));
@@ -143,6 +143,11 @@ boost::optional<long long> DocumentSourceSort::extractLimitForPushdown(
             }
 
             itr = container->erase(itr);
+            // If the removed stage wasn't the last in the pipeline, make sure that the stage
+            // followed the erased stage has a valid pointer to the previous document source.
+            if (itr != container->end()) {
+                (*itr)->setSource(itr != container->begin() ? std::prev(itr)->get() : nullptr);
+            }
         } else if (!nextStage->constraints().canSwapWithLimitAndSample) {
             break;
         } else {
@@ -221,7 +226,7 @@ void DocumentSourceSort::loadDocument(Document&& doc) {
     // already computed the sort key we'd have split the pipeline there, would be merging presorted
     // documents, and wouldn't use this method.
     std::tie(sortKey, docForSorter) = extractSortKey(std::move(doc));
-    _sortExecutor->add(sortKey, std::move(docForSorter));
+    _sortExecutor->add(sortKey, docForSorter);
 }
 
 void DocumentSourceSort::loadingDone() {

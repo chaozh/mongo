@@ -29,7 +29,6 @@
 
 #include "mongo/platform/basic.h"
 
-#include <algorithm>
 #include <memory>
 #include <set>
 #include <string>
@@ -354,8 +353,7 @@ void RenameCollectionTest::setUp() {
     service->setOpObserver(std::move(opObserver));
 
     // Cache two phase index build support setting.
-    _supportsTwoPhaseIndexBuild =
-        IndexBuildsCoordinator::get(_opCtx.get())->supportsTwoPhaseIndexBuild();
+    _supportsTwoPhaseIndexBuild = IndexBuildsCoordinator::supportsTwoPhaseIndexBuild();
 
     _sourceNss = NamespaceString("test.foo");
     _targetNss = NamespaceString("test.bar");
@@ -430,7 +428,7 @@ CollectionOptions _getCollectionOptions(OperationContext* opCtx, const Namespace
     auto collection = autoColl.getCollection();
     ASSERT_TRUE(collection) << "Unable to get collections options for " << nss
                             << " because collection does not exist.";
-    return DurableCatalog::get(opCtx)->getCollectionOptions(opCtx, nss);
+    return DurableCatalog::get(opCtx)->getCollectionOptions(opCtx, collection->getCatalogId());
 }
 
 /**
@@ -446,7 +444,7 @@ CollectionUUID _getCollectionUuid(OperationContext* opCtx, const NamespaceString
  * Get collection namespace by UUID.
  */
 NamespaceString _getCollectionNssFromUUID(OperationContext* opCtx, const UUID& uuid) {
-    Collection* source = CollectionCatalog::get(opCtx).lookupCollectionByUUID(uuid);
+    Collection* source = CollectionCatalog::get(opCtx).lookupCollectionByUUID(opCtx, uuid);
     return source ? source->ns() : NamespaceString();
 }
 
@@ -514,7 +512,7 @@ Collection* _getCollection_inlock(OperationContext* opCtx, const NamespaceString
     if (!db) {
         return nullptr;
     }
-    return CollectionCatalog::get(opCtx).lookupCollectionByNamespace(nss);
+    return CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, nss);
 }
 
 TEST_F(RenameCollectionTest, RenameCollectionReturnsNamespaceNotFoundIfDatabaseDoesNotExist) {
@@ -548,7 +546,7 @@ TEST_F(RenameCollectionTest, RenameCollectionReturnsNotMasterIfNotPrimary) {
 
 TEST_F(RenameCollectionTest, TargetCollectionNameLong) {
     _createCollection(_opCtx.get(), _sourceNss);
-    const std::string targetCollectionName(8192, 'a');
+    const std::string targetCollectionName(500, 'a');
     NamespaceString longTargetNss(_sourceNss.db(), targetCollectionName);
     ASSERT_OK(renameCollection(_opCtx.get(), _sourceNss, longTargetNss, {}));
 }
@@ -557,7 +555,7 @@ TEST_F(RenameCollectionTest, LongIndexNameAllowedForTargetCollection) {
     ASSERT_GREATER_THAN(_targetNssDifferentDb.size(), _sourceNss.size());
 
     _createCollection(_opCtx.get(), _sourceNss);
-    std::size_t longIndexLength = 8192;
+    std::size_t longIndexLength = 500;
     const std::string indexName(longIndexLength, 'a');
     _createIndexOnEmptyCollection(_opCtx.get(), _sourceNss, indexName);
     ASSERT_OK(renameCollection(_opCtx.get(), _sourceNss, _targetNssDifferentDb, {}));
@@ -571,7 +569,7 @@ TEST_F(RenameCollectionTest, LongIndexNameAllowedForTemporaryCollectionForRename
     const NamespaceString tempNss(_targetNssDifferentDb.getSisterNS("tmpXXXXX.renameCollection"));
 
     _createCollection(_opCtx.get(), _sourceNss);
-    std::size_t longIndexLength = 8192;
+    std::size_t longIndexLength = 500;
     const std::string indexName(longIndexLength, 'a');
     _createIndexOnEmptyCollection(_opCtx.get(), _sourceNss, indexName);
     ASSERT_OK(renameCollection(_opCtx.get(), _sourceNss, _targetNssDifferentDb, {}));
@@ -691,7 +689,8 @@ TEST_F(RenameCollectionTest, RenameCollectionForApplyOpsDropTargetByUUIDTargetEx
     // B (originally A) should exist
     ASSERT_TRUE(_collectionExists(_opCtx.get(), collB));
     // The original B should exist too, but with a temporary name
-    const auto& tmpB = CollectionCatalog::get(_opCtx.get()).lookupNSSByUUID(collBUUID);
+    const auto& tmpB =
+        CollectionCatalog::get(_opCtx.get()).lookupNSSByUUID(_opCtx.get(), collBUUID);
     ASSERT(tmpB);
     ASSERT_TRUE(tmpB->coll().startsWith("tmp"));
     ASSERT_TRUE(*tmpB != collB);
@@ -723,7 +722,8 @@ TEST_F(RenameCollectionTest,
     // B (originally A) should exist
     ASSERT_TRUE(_collectionExists(_opCtx.get(), collB));
     // The original B should exist too, but with a temporary name
-    const auto& tmpB = CollectionCatalog::get(_opCtx.get()).lookupNSSByUUID(collBUUID);
+    const auto& tmpB =
+        CollectionCatalog::get(_opCtx.get()).lookupNSSByUUID(_opCtx.get(), collBUUID);
     ASSERT(tmpB);
     ASSERT_TRUE(*tmpB != collB);
     ASSERT_TRUE(tmpB->coll().startsWith("tmp"));
@@ -748,7 +748,8 @@ TEST_F(RenameCollectionTest,
     // B (originally A) should exist
     ASSERT_TRUE(_collectionExists(_opCtx.get(), collB));
     // The original B should exist too, but with a temporary name
-    const auto& tmpB = CollectionCatalog::get(_opCtx.get()).lookupNSSByUUID(collBUUID);
+    const auto& tmpB =
+        CollectionCatalog::get(_opCtx.get()).lookupNSSByUUID(_opCtx.get(), collBUUID);
     ASSERT(tmpB);
     ASSERT_TRUE(*tmpB != collB);
     ASSERT_TRUE(tmpB->coll().startsWith("tmp"));
@@ -1070,13 +1071,10 @@ void _testRenameCollectionAcrossDatabaseOplogEntries(
 
 TEST_F(RenameCollectionTest, RenameCollectionAcrossDatabaseOplogEntries) {
     bool forApplyOps = false;
-    std::vector<std::string> expectedOplogEntries = {
-        "create", "startIndex", "index", "commitIndex", "inserts", "rename", "drop"};
-    if (_supportsTwoPhaseIndexBuild) {
-        expectedOplogEntries.erase(
-            std::remove(expectedOplogEntries.begin(), expectedOplogEntries.end(), "index"),
-            expectedOplogEntries.end());
-    }
+    std::vector<std::string> expectedOplogEntries;
+    // Empty collections generate createIndexes oplog entry even if the node
+    // supports 2 phase index build.
+    expectedOplogEntries = {"create", "index", "inserts", "rename", "drop"};
     _testRenameCollectionAcrossDatabaseOplogEntries(_opCtx.get(),
                                                     _sourceNss,
                                                     _targetNssDifferentDb,
@@ -1087,13 +1085,10 @@ TEST_F(RenameCollectionTest, RenameCollectionAcrossDatabaseOplogEntries) {
 
 TEST_F(RenameCollectionTest, RenameCollectionForApplyOpsAcrossDatabaseOplogEntries) {
     bool forApplyOps = true;
-    std::vector<std::string> expectedOplogEntries = {
-        "create", "startIndex", "index", "commitIndex", "inserts", "rename", "drop"};
-    if (_supportsTwoPhaseIndexBuild) {
-        expectedOplogEntries.erase(
-            std::remove(expectedOplogEntries.begin(), expectedOplogEntries.end(), "index"),
-            expectedOplogEntries.end());
-    }
+    std::vector<std::string> expectedOplogEntries;
+    // Empty collections generate createIndexes oplog entry even if the node
+    // supports 2 phase index build.
+    expectedOplogEntries = {"create", "index", "inserts", "rename", "drop"};
     _testRenameCollectionAcrossDatabaseOplogEntries(_opCtx.get(),
                                                     _sourceNss,
                                                     _targetNssDifferentDb,
@@ -1105,13 +1100,10 @@ TEST_F(RenameCollectionTest, RenameCollectionForApplyOpsAcrossDatabaseOplogEntri
 TEST_F(RenameCollectionTest, RenameCollectionAcrossDatabaseOplogEntriesDropTarget) {
     _createCollection(_opCtx.get(), _targetNssDifferentDb);
     bool forApplyOps = false;
-    std::vector<std::string> expectedOplogEntries = {
-        "create", "startIndex", "index", "commitIndex", "inserts", "rename", "drop"};
-    if (_supportsTwoPhaseIndexBuild) {
-        expectedOplogEntries.erase(
-            std::remove(expectedOplogEntries.begin(), expectedOplogEntries.end(), "index"),
-            expectedOplogEntries.end());
-    }
+    std::vector<std::string> expectedOplogEntries;
+    // Empty collections generate createIndexes oplog entry even if the node
+    // supports 2 phase index build.
+    expectedOplogEntries = {"create", "index", "inserts", "rename", "drop"};
     _testRenameCollectionAcrossDatabaseOplogEntries(_opCtx.get(),
                                                     _sourceNss,
                                                     _targetNssDifferentDb,
@@ -1123,13 +1115,10 @@ TEST_F(RenameCollectionTest, RenameCollectionAcrossDatabaseOplogEntriesDropTarge
 TEST_F(RenameCollectionTest, RenameCollectionForApplyOpsAcrossDatabaseOplogEntriesDropTarget) {
     _createCollection(_opCtx.get(), _targetNssDifferentDb);
     bool forApplyOps = true;
-    std::vector<std::string> expectedOplogEntries = {
-        "create", "startIndex", "index", "commitIndex", "inserts", "rename", "drop"};
-    if (_supportsTwoPhaseIndexBuild) {
-        expectedOplogEntries.erase(
-            std::remove(expectedOplogEntries.begin(), expectedOplogEntries.end(), "index"),
-            expectedOplogEntries.end());
-    }
+    std::vector<std::string> expectedOplogEntries;
+    // Empty collections generate createIndexes oplog entry even if the node
+    // supports 2 phase index build.
+    expectedOplogEntries = {"create", "index", "inserts", "rename", "drop"};
     _testRenameCollectionAcrossDatabaseOplogEntries(_opCtx.get(),
                                                     _sourceNss,
                                                     _targetNssDifferentDb,
@@ -1170,13 +1159,10 @@ TEST_F(RenameCollectionTest, RenameCollectionAcrossDatabaseDropsTemporaryCollect
     ASSERT_THROWS_CODE(renameCollection(_opCtx.get(), _sourceNss, _targetNssDifferentDb, {}),
                        AssertionException,
                        ErrorCodes::OperationFailed);
-    std::vector<std::string> expectedOplogEntries = {
-        "create", "startIndex", "index", "commitIndex", "drop"};
-    if (_supportsTwoPhaseIndexBuild) {
-        expectedOplogEntries.erase(
-            std::remove(expectedOplogEntries.begin(), expectedOplogEntries.end(), "index"),
-            expectedOplogEntries.end());
-    }
+    std::vector<std::string> expectedOplogEntries;
+    // Empty Collections generate createIndexes oplog entry even if the node
+    // supports 2 phase index build.
+    expectedOplogEntries = {"create", "index", "drop"};
     _checkOplogEntries(_opObserver->oplogEntries, expectedOplogEntries);
 }
 
@@ -1243,9 +1229,9 @@ TEST_F(RenameCollectionTest, CollectionCatalogMappingRemainsIntactThroughRename)
     auto& catalog = CollectionCatalog::get(_opCtx.get());
     Collection* sourceColl = _getCollection_inlock(_opCtx.get(), _sourceNss);
     ASSERT(sourceColl);
-    ASSERT_EQ(sourceColl, catalog.lookupCollectionByUUID(sourceColl->uuid()));
+    ASSERT_EQ(sourceColl, catalog.lookupCollectionByUUID(_opCtx.get(), sourceColl->uuid()));
     ASSERT_OK(renameCollection(_opCtx.get(), _sourceNss, _targetNss, {}));
-    ASSERT_EQ(sourceColl, catalog.lookupCollectionByUUID(sourceColl->uuid()));
+    ASSERT_EQ(sourceColl, catalog.lookupCollectionByUUID(_opCtx.get(), sourceColl->uuid()));
 }
 
 TEST_F(RenameCollectionTest, FailRenameCollectionFromReplicatedToUnreplicatedDB) {

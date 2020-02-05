@@ -100,6 +100,7 @@ env.Library(
         'metadata/repl_set_metadata.cpp',
         'metadata/oplog_query_metadata.cpp',
         'metadata/tracking_metadata.cpp',
+        env.Idlc('topology_version.idl')[0],
     ],
     LIBDEPS=[
         'client_metadata',
@@ -107,6 +108,7 @@ env.Library(
         '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/bson/util/bson_extract',
         '$BUILD_DIR/mongo/client/read_preference',
+        '$BUILD_DIR/mongo/db/commands/test_commands_enabled',
         '$BUILD_DIR/mongo/db/logical_time_validator',
         '$BUILD_DIR/mongo/db/repl/optime',
         '$BUILD_DIR/mongo/db/signed_logical_time',

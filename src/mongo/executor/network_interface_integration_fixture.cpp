@@ -47,9 +47,12 @@
 namespace mongo {
 namespace executor {
 
-void NetworkInterfaceIntegrationFixture::startNet(
+void NetworkInterfaceIntegrationFixture::createNet(
     std::unique_ptr<NetworkConnectionHook> connectHook) {
     ConnectionPool::Options options;
+
+    options.minConnections = 0u;
+
 #ifdef _WIN32
     // Connections won't queue on widnows, so attempting to open too many connections
     // concurrently will result in refused connections and test failure.
@@ -59,8 +62,13 @@ void NetworkInterfaceIntegrationFixture::startNet(
 #endif
     _net = makeNetworkInterface(
         "NetworkInterfaceIntegrationFixture", std::move(connectHook), nullptr, std::move(options));
+}
 
-    _net->startup();
+void NetworkInterfaceIntegrationFixture::startNet(
+    std::unique_ptr<NetworkConnectionHook> connectHook) {
+
+    createNet(std::move(connectHook));
+    net().startup();
 }
 
 void NetworkInterfaceIntegrationFixture::tearDown() {

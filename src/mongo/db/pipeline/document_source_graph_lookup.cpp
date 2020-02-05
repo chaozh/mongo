@@ -42,16 +42,29 @@
 #include "mongo/db/pipeline/document_path_support.h"
 #include "mongo/db/pipeline/expression.h"
 #include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/query/query_knobs_gen.h"
 #include "mongo/db/query/query_planner_common.h"
 
 namespace mongo {
+
+namespace {
+void assertIsValidCollectionState(const boost::intrusive_ptr<ExpressionContext>& expCtx) {
+    if (expCtx->mongoProcessInterface->isSharded(expCtx->opCtx, expCtx->ns)) {
+        const bool foreignShardedAllowed =
+            getTestCommandsEnabled() && internalQueryAllowShardedLookup.load();
+        if (!foreignShardedAllowed) {
+            uasserted(31428, "Cannot run $graphLookup with sharded foreign collection");
+        }
+    }
+}
+}  // namespace
 
 using boost::intrusive_ptr;
 
 namespace dps = ::mongo::dotted_path_support;
 
-std::unique_ptr<DocumentSourceGraphLookUp::LiteParsed> DocumentSourceGraphLookUp::liteParse(
-    const AggregationRequest& request, const BSONElement& spec) {
+std::unique_ptr<DocumentSourceGraphLookUp::LiteParsed> DocumentSourceGraphLookUp::LiteParsed::parse(
+    const NamespaceString& nss, const BSONElement& spec) {
     uassert(ErrorCodes::FailedToParse,
             str::stream() << "the $graphLookup stage specification must be an object, but found "
                           << typeName(spec.type()),
@@ -68,19 +81,15 @@ std::unique_ptr<DocumentSourceGraphLookUp::LiteParsed> DocumentSourceGraphLookUp
                           << typeName(specObj["from"].type()),
             fromElement.type() == BSONType::String);
 
-    NamespaceString nss(request.getNamespaceString().db(), fromElement.valueStringData());
+    NamespaceString fromNss(nss.db(), fromElement.valueStringData());
     uassert(ErrorCodes::InvalidNamespace,
-            str::stream() << "invalid $graphLookup namespace: " << nss.ns(),
-            nss.isValid());
-
-    PrivilegeVector privileges{
-        Privilege(ResourcePattern::forExactNamespace(nss), ActionType::find)};
-
-    return std::make_unique<LiteParsed>(std::move(nss), std::move(privileges));
+            str::stream() << "invalid $graphLookup namespace: " << fromNss.ns(),
+            fromNss.isValid());
+    return std::make_unique<LiteParsed>(std::move(fromNss));
 }
 
 REGISTER_DOCUMENT_SOURCE(graphLookup,
-                         DocumentSourceGraphLookUp::liteParse,
+                         DocumentSourceGraphLookUp::LiteParsed::parse,
                          DocumentSourceGraphLookUp::createFromBson);
 
 const char* DocumentSourceGraphLookUp::getSourceName() const {
@@ -178,6 +187,7 @@ void DocumentSourceGraphLookUp::doDispose() {
 void DocumentSourceGraphLookUp::doBreadthFirstSearch() {
     long long depth = 0;
     bool shouldPerformAnotherQuery;
+    assertIsValidCollectionState(_fromExpCtx);
     do {
         shouldPerformAnotherQuery = false;
 
@@ -204,8 +214,13 @@ void DocumentSourceGraphLookUp::doBreadthFirstSearch() {
 
             // We've already allocated space for the trailing $match stage in '_fromPipeline'.
             _fromPipeline.back() = *matchStage;
-            auto pipeline =
-                pExpCtx->mongoProcessInterface->makePipeline(_fromPipeline, _fromExpCtx);
+            MongoProcessInterface::MakePipelineOptions pipelineOpts;
+            pipelineOpts.optimize = true;
+            pipelineOpts.attachCursorSource = true;
+            // By default, $graphLookup doesn't support a sharded 'from' collection.
+            pipelineOpts.allowTargetingShards = internalQueryAllowShardedLookup.load();
+            auto pipeline = pExpCtx->mongoProcessInterface->makePipeline(
+                _fromPipeline, _fromExpCtx, pipelineOpts);
             while (auto next = pipeline->getNext()) {
                 uassert(40271,
                         str::stream()

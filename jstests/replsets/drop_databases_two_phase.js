@@ -12,13 +12,14 @@
  * metadata for the database from the server and appends the 'dropDatabase' operation to the oplog.
  * Unlike the 'Collections' phase, we do not wait for the 'dropDatabase' to propagate to a majority
  * unless explicitly requested by the user with a write concern.
+ *
+ * @tags: [requires_fcv_44]
  */
 
 (function() {
 "use strict";
 
 load('jstests/replsets/libs/two_phase_drops.js');  // For TwoPhaseDropCollectionTest.
-load('jstests/libs/check_log.js');
 load("jstests/replsets/rslib.js");
 
 // Returns a list of all collections in a given database. Use 'args' as the

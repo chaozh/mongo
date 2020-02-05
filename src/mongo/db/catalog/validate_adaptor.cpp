@@ -98,10 +98,12 @@ Status ValidateAdaptor::validateRecord(OperationContext* opCtx,
         MultikeyPaths multikeyPaths;
         iam->getKeys(recordBson,
                      IndexAccessMethod::GetKeysMode::kEnforceConstraints,
+                     IndexAccessMethod::GetKeysContext::kReadOrAddKeys,
                      &documentKeySet,
                      &multikeyMetadataKeys,
                      &multikeyPaths,
-                     recordId);
+                     recordId,
+                     IndexAccessMethod::kNoopOnSuppressedErrorFn);
 
         if (!descriptor->isMultikey() &&
             iam->shouldMarkIndexAsMultikey(
@@ -254,7 +256,7 @@ void ValidateAdaptor::traverseRecordStore(OperationContext* opCtx,
         auto dataSize = record->data.size();
         interruptIntervalNumBytes += dataSize;
         dataSizeTotal += dataSize;
-        size_t validatedSize;
+        size_t validatedSize = 0;
         Status status = validateRecord(opCtx, record->id, record->data, &validatedSize);
 
         // Checks to ensure isInRecordIdOrder() is being used properly.
@@ -321,7 +323,7 @@ void ValidateAdaptor::validateIndexKeyCount(const IndexDescriptor* idx, Validate
 
     // Do not fail on finding too few index entries compared to collection entries when full:false.
     bool hasTooFewKeys = false;
-    bool noErrorOnTooFewKeys = !_validateState->isFullValidate();
+    bool noErrorOnTooFewKeys = !_validateState->isFullIndexValidation();
 
     if (idx->isIdIndex() && numTotalKeys != _numRecords) {
         hasTooFewKeys = (numTotalKeys < _numRecords);
@@ -365,7 +367,7 @@ void ValidateAdaptor::validateIndexKeyCount(const IndexDescriptor* idx, Validate
         }
     }
 
-    if (!_validateState->isFullValidate() && hasTooFewKeys) {
+    if (!_validateState->isFullIndexValidation() && hasTooFewKeys) {
         std::string warning = str::stream()
             << "index " << idx->indexName() << " has fewer keys than records."
             << " Please re-run the validate command with {full: true}";

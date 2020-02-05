@@ -74,6 +74,9 @@ public:
     virtual bool isInitialSyncFlagSet(OperationContext* opCtx) override;
 
     virtual void shutdown(OperationContext* opCtx);
+
+    virtual void clearAppliedThroughIfCleanShutdown(OperationContext* opCtx);
+
     virtual executor::TaskExecutor* getTaskExecutor() const override;
     virtual ThreadPool* getDbWorkThreadPool() const override;
     virtual Status initializeReplSetStorage(OperationContext* opCtx, const BSONObj& config);
@@ -93,6 +96,7 @@ public:
     virtual HostAndPort getClientHostAndPort(const OperationContext* opCtx);
     virtual void closeConnections();
     virtual void shardingOnStepDownHook();
+    virtual void clearOplogVisibilityStateForStepDown() override;
     virtual void signalApplierToChooseNewSyncSource();
     virtual void stopProducer();
     virtual void startProducerIfStopped();
@@ -167,10 +171,9 @@ private:
     // replication.
     SyncSourceFeedback _syncSourceFeedback;
 
-    // TODO (SERVER-43001): The ownership of this will pass to either OplogApplier or
-    // OpQueueBatcher. The OplogBuffer is used to hold operations read from the sync source.
-    // BackgroundSync adds operations to the OplogBuffer while the applier thread consumes these
-    // operations in batches during oplog application.
+    // The OplogBuffer is used to hold operations read from the sync source. During oplog
+    // application, Backgrounds Sync adds operations to the OplogBuffer while the applier's
+    // OplogBatcher consumes these operations from the buffer in batches.
     std::unique_ptr<OplogBuffer> _oplogBuffer;
 
     // The BackgroundSync class is responsible for pulling ops off the network from the sync source

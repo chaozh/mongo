@@ -173,8 +173,7 @@ public:
 
     IndexCatalogEntry* createIndexEntry(OperationContext* opCtx,
                                         std::unique_ptr<IndexDescriptor> descriptor,
-                                        bool initFromDisk,
-                                        bool isReadyIndex) override;
+                                        CreateIndexEntryFlags flags) override;
 
     /**
      * Call this only on an empty collection from inside a WriteUnitOfWork. Index creation on an
@@ -207,7 +206,8 @@ public:
 
 
     Status dropIndex(OperationContext* opCtx, const IndexDescriptor* desc) override;
-
+    Status dropUnfinishedIndex(OperationContext* const opCtx,
+                               const IndexDescriptor* const desc) override;
 
     Status dropIndexEntry(OperationContext* opCtx, IndexCatalogEntry* entry) override;
 

@@ -58,6 +58,7 @@
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/clock_source_mock.h"
 #include "mongo/util/fail_point.h"
+#include "mongo/util/log_global_settings.h"
 #include "mongo/util/net/socket_utils.h"
 #include "mongo/util/tick_source_mock.h"
 
@@ -3291,7 +3292,7 @@ TEST_F(TransactionsMetricsTest, LogTransactionInfoAfterSlowCommit) {
     std::string expectedTransactionInfo = "transaction " +
         txnParticipant.getTransactionInfoForLogForTest(
             opCtx(), &lockerInfo->stats, true, readConcernArgs);
-    ASSERT_EQUALS(1, countLogLinesContaining(expectedTransactionInfo));
+    ASSERT_EQUALS(1, countTextFormatLogLinesContaining(expectedTransactionInfo));
 }
 
 TEST_F(TransactionsMetricsTest, LogPreparedTransactionInfoAfterSlowCommit) {
@@ -3328,7 +3329,7 @@ TEST_F(TransactionsMetricsTest, LogPreparedTransactionInfoAfterSlowCommit) {
     std::string expectedTransactionInfo = "transaction " +
         txnParticipant.getTransactionInfoForLogForTest(
             opCtx(), &lockerInfo->stats, true, readConcernArgs);
-    ASSERT_EQUALS(1, countLogLinesContaining(expectedTransactionInfo));
+    ASSERT_EQUALS(1, countTextFormatLogLinesContaining(expectedTransactionInfo));
 }
 
 TEST_F(TransactionsMetricsTest, LogTransactionInfoAfterSlowAbort) {
@@ -3371,7 +3372,7 @@ TEST_F(TransactionsMetricsTest, LogTransactionInfoAfterSlowAbort) {
                                    metricValue,
                                    false);
 
-    ASSERT_EQUALS(1, countLogLinesContaining(expectedTransactionInfo));
+    ASSERT_EQUALS(1, countTextFormatLogLinesContaining(expectedTransactionInfo));
 }
 
 TEST_F(TransactionsMetricsTest, LogPreparedTransactionInfoAfterSlowAbort) {
@@ -3418,7 +3419,7 @@ TEST_F(TransactionsMetricsTest, LogPreparedTransactionInfoAfterSlowAbort) {
                                    false,
                                    prepareOpTime);
 
-    ASSERT_EQUALS(1, countLogLinesContaining(expectedTransactionInfo));
+    ASSERT_EQUALS(1, countTextFormatLogLinesContaining(expectedTransactionInfo));
 }
 
 TEST_F(TransactionsMetricsTest, LogTransactionInfoAfterExceptionInPrepare) {
@@ -3464,7 +3465,7 @@ TEST_F(TransactionsMetricsTest, LogTransactionInfoAfterExceptionInPrepare) {
                                    metricValue,
                                    false);
 
-    ASSERT_EQUALS(1, countLogLinesContaining(expectedTransactionInfo));
+    ASSERT_EQUALS(1, countTextFormatLogLinesContaining(expectedTransactionInfo));
 }
 
 TEST_F(TransactionsMetricsTest, LogTransactionInfoAfterSlowStashedAbort) {
@@ -3503,7 +3504,7 @@ TEST_F(TransactionsMetricsTest, LogTransactionInfoAfterSlowStashedAbort) {
     stopCapturingLogMessages();
 
     std::string expectedTransactionInfo = "transaction parameters";
-    ASSERT_EQUALS(1, countLogLinesContaining(expectedTransactionInfo));
+    ASSERT_EQUALS(1, countTextFormatLogLinesContaining(expectedTransactionInfo));
 }
 
 TEST_F(TransactionsMetricsTest, LogTransactionInfoVerbosityInfo) {
@@ -3515,8 +3516,7 @@ TEST_F(TransactionsMetricsTest, LogTransactionInfoVerbosityInfo) {
     serverGlobalParams.slowMS = 10000;
 
     // Set verbosity level of transaction components to info.
-    logger::globalLogDomain()->setMinimumLoggedSeverity(logger::LogComponent::kTransaction,
-                                                        logger::LogSeverity::Info());
+    setMinimumLoggedSeverity(logger::LogComponent::kTransaction, logger::LogSeverity::Info());
 
     txnParticipant.unstashTransactionResources(opCtx(), "commitTransaction");
 
@@ -3525,7 +3525,7 @@ TEST_F(TransactionsMetricsTest, LogTransactionInfoVerbosityInfo) {
     stopCapturingLogMessages();
 
     // Test that the transaction is not logged.
-    ASSERT_EQUALS(0, countLogLinesContaining("transaction parameters"));
+    ASSERT_EQUALS(0, countTextFormatLogLinesContaining("transaction parameters"));
 }
 
 TEST_F(TransactionsMetricsTest, LogTransactionInfoVerbosityDebug) {
@@ -3537,8 +3537,7 @@ TEST_F(TransactionsMetricsTest, LogTransactionInfoVerbosityDebug) {
     serverGlobalParams.slowMS = 10000;
 
     // Set verbosity level of transaction components to debug.
-    logger::globalLogDomain()->setMinimumLoggedSeverity(logger::LogComponent::kTransaction,
-                                                        logger::LogSeverity::Debug(1));
+    setMinimumLoggedSeverity(logger::LogComponent::kTransaction, logger::LogSeverity::Debug(1));
 
     txnParticipant.unstashTransactionResources(opCtx(), "commitTransaction");
 
@@ -3547,11 +3546,10 @@ TEST_F(TransactionsMetricsTest, LogTransactionInfoVerbosityDebug) {
     stopCapturingLogMessages();
 
     // Reset verbosity level of transaction components.
-    logger::globalLogDomain()->setMinimumLoggedSeverity(logger::LogComponent::kTransaction,
-                                                        logger::LogSeverity::Info());
+    setMinimumLoggedSeverity(logger::LogComponent::kTransaction, logger::LogSeverity::Info());
 
     // Test that the transaction is still logged.
-    ASSERT_EQUALS(1, countLogLinesContaining("transaction parameters"));
+    ASSERT_EQUALS(1, countTextFormatLogLinesContaining("transaction parameters"));
 }
 
 TEST_F(TxnParticipantTest, RollbackResetsInMemoryStateOfPreparedTransaction) {
@@ -3789,7 +3787,7 @@ TEST_F(TxnParticipantTest, OldestActiveTransactionTimestamp) {
 
         AutoGetOrCreateDb autoDb(opCtx(), nss.db(), MODE_X);
         WriteUnitOfWork wuow(opCtx());
-        auto coll = CollectionCatalog::get(opCtx()).lookupCollectionByNamespace(nss);
+        auto coll = CollectionCatalog::get(opCtx()).lookupCollectionByNamespace(opCtx(), nss);
         ASSERT(coll);
         OpDebug* const nullOpDebug = nullptr;
         ASSERT_OK(
@@ -3801,7 +3799,7 @@ TEST_F(TxnParticipantTest, OldestActiveTransactionTimestamp) {
         Timestamp ts(1, i);
         AutoGetOrCreateDb autoDb(opCtx(), nss.db(), MODE_X);
         WriteUnitOfWork wuow(opCtx());
-        auto coll = CollectionCatalog::get(opCtx()).lookupCollectionByNamespace(nss);
+        auto coll = CollectionCatalog::get(opCtx()).lookupCollectionByNamespace(opCtx(), nss);
         ASSERT(coll);
         auto cursor = coll->getCursor(opCtx());
         while (auto record = cursor->next()) {

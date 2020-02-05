@@ -113,9 +113,7 @@ const commands = [
     {buildInfo: 1},
     {ping: 1},
     {listCommands: 1},
-    {create: "create_collection", writeConcern: {w: "majority"}},
     {drop: "drop_collection", writeConcern: {w: "majority"}},
-    {createIndexes: collName, indexes: [{name: "a_1", key: {a: 1}}], writeConcern: {w: "majority"}},
     // Output inline so the implicitly shard accessed collections override won't drop the
     // output collection during the active transaction test case, which would hang indefinitely
     // waiting for a database exclusive lock.

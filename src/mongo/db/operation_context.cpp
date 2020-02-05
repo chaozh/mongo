@@ -34,6 +34,7 @@
 #include "mongo/db/operation_context.h"
 
 #include "mongo/db/client.h"
+#include "mongo/db/operation_key_manager.h"
 #include "mongo/db/service_context.h"
 #include "mongo/platform/mutex.h"
 #include "mongo/platform/random.h"
@@ -79,13 +80,17 @@ const auto kNoWaiterThread = stdx::thread::id();
 
 }  // namespace
 
-OperationContext::OperationContext(Client* client, unsigned int opId)
+OperationContext::OperationContext(Client* client, OperationId opId)
     : _client(client),
       _opId(opId),
       _elapsedTime(client ? client->getServiceContext()->getTickSource()
                           : SystemTickSource::get()) {}
 
-OperationContext::~OperationContext() = default;
+OperationContext::~OperationContext() {
+    if (_opKey) {
+        OperationKeyManager::get(_client).remove(*_opKey);
+    }
+}
 
 void OperationContext::setDeadlineAndMaxTime(Date_t when,
                                              Microseconds maxTime,
@@ -359,6 +364,14 @@ void OperationContext::setLogicalSessionId(LogicalSessionId lsid) {
     _lsid = std::move(lsid);
 }
 
+void OperationContext::setOperationKey(OperationKey opKey) {
+    // Only set the opKey once
+    invariant(!_opKey);
+
+    _opKey.emplace(std::move(opKey));
+    OperationKeyManager::get(_client).add(*_opKey, _opId);
+}
+
 void OperationContext::setTxnNumber(TxnNumber txnNumber) {
     invariant(_lsid);
     _txnNumber = txnNumber;
@@ -382,7 +395,7 @@ void OperationContext::setLockState(std::unique_ptr<Locker> locker) {
     _locker = std::move(locker);
 }
 
-std::unique_ptr<Locker> OperationContext::swapLockState(std::unique_ptr<Locker> locker) {
+std::unique_ptr<Locker> OperationContext::swapLockState(std::unique_ptr<Locker> locker, WithLock) {
     invariant(_locker);
     invariant(locker);
     _locker.swap(locker);

@@ -38,6 +38,7 @@
 #include "mongo/platform/mutex.h"
 #include "mongo/stdx/unordered_map.h"
 #include "mongo/util/functional.h"
+#include "mongo/util/hierarchical_acquisition.h"
 
 namespace mongo {
 
@@ -61,24 +62,24 @@ public:
     /**
      *  Notify every listener that there is a new ReplicaSet and initialize the State
      */
-    void onFoundSet(const std::string& replicaSet);
+    void onFoundSet(const std::string& replicaSet) noexcept;
 
     /**
      * Notify every listener that a scan completed without finding a primary and update
      */
-    void onPossibleSet(ConnectionString connectionString);
+    void onPossibleSet(ConnectionString connectionString) noexcept;
 
     /**
      * Notify every listener that a scan completed and found a new primary or config
      */
     void onConfirmedSet(ConnectionString connectionString,
                         HostAndPort primary,
-                        std::set<HostAndPort> passives);
+                        std::set<HostAndPort> passives) noexcept;
 
     /**
      * Notify every listener that a ReplicaSet is no longer in use and drop the State
      */
-    void onDroppedSet(const std::string& replicaSet);
+    void onDroppedSet(const std::string& replicaSet) noexcept;
 
     /**
      * Create a listener of a given type and bind it to this notifier
@@ -102,7 +103,8 @@ private:
     void _addListener(Listener* listener);
     void _removeListener(Listener* listener);
 
-    Mutex _mutex = MONGO_MAKE_LATCH("ReplicaSetChangeNotifier::_mutex");
+    Mutex _mutex =
+        MONGO_MAKE_LATCH(HierarchicalAcquisitionLevel(0), "ReplicaSetChangeNotifier::_mutex");
     std::vector<Listener*> _listeners;
     stdx::unordered_map<Key, State> _replicaSetStates;
 };
@@ -140,22 +142,22 @@ public:
     /**
      * React to a new ReplicaSet that will soon be scanned
      */
-    virtual void onFoundSet(const Key& key) = 0;
+    virtual void onFoundSet(const Key& key) noexcept = 0;
 
     /**
      * React to a finished scan that found no primary
      */
-    virtual void onPossibleSet(const State& data) = 0;
+    virtual void onPossibleSet(const State& data) noexcept = 0;
 
     /**
      * React to a finished scan that found a primary
      */
-    virtual void onConfirmedSet(const State& data) = 0;
+    virtual void onConfirmedSet(const State& data) noexcept = 0;
 
     /**
      * React to a ReplicaSet being dropped from use
      */
-    virtual void onDroppedSet(const Key& key) = 0;
+    virtual void onDroppedSet(const Key& key) noexcept = 0;
 
     /**
      * Get the State as of the last signal function invoked on the Notifier

@@ -1324,10 +1324,16 @@ DBCollection.prototype.unsetWriteConcern = function() {
  *
  */
 DBCollection.prototype.count = function(query, options) {
-    query = this.find(query);
-
-    // Apply options and return the result of the find
-    return QueryHelpers._applyCountOptions(query, options).count(true);
+    const cmd =
+        Object.assign({count: this.getName(), query: this._massageObject(query || {})}, options);
+    if (cmd.readConcern) {
+        cmd.readConcern = {level: cmd.readConcern};
+    }
+    const res = this._db.runReadCommand(cmd);
+    if (!res.ok) {
+        throw _getErrorWithCode(res, "count failed: " + tojson(res));
+    }
+    return res.n;
 };
 
 /**
@@ -1403,7 +1409,7 @@ DBCollection.prototype.estimatedDocumentCount = function(options) {
     const res = this.runCommand(cmd);
 
     if (!res.ok) {
-        throw _getErrorWithCode(res, "Error estimating document count: " + tojson(ret));
+        throw _getErrorWithCode(res, "Error estimating document count: " + tojson(res));
     }
 
     // Return the 'n' field, which should be the count of documents.
@@ -1511,16 +1517,14 @@ PlanCache.prototype.help = function() {
     var shortName = this.getName();
     print("PlanCache help");
     print("\tdb." + shortName + ".getPlanCache().help() - show PlanCache help");
-    print("\tdb." + shortName + ".getPlanCache().listQueryShapes() - " +
-          "displays all query shapes in a collection");
     print("\tdb." + shortName + ".getPlanCache().clear() - " +
           "drops all cached queries in a collection");
     print("\tdb." + shortName +
           ".getPlanCache().clearPlansByQuery(query[, projection, sort, collation]) - " +
           "drops query shape from plan cache");
-    print("\tdb." + shortName +
-          ".getPlanCache().getPlansByQuery(query[, projection, sort, collation]) - " +
-          "displays the cached plans for a query shape");
+    print("\tdb." + shortName + ".getPlanCache().list([pipeline]) - " +
+          "displays a serialization of the plan cache for this collection, " +
+          "after applying an optional aggregation pipeline");
     return __magicNoPrint;
 };
 
@@ -1597,26 +1601,11 @@ PlanCache.prototype._runCommandThrowOnError = function(cmd, params) {
 };
 
 /**
- * Lists query shapes in a collection.
- */
-PlanCache.prototype.listQueryShapes = function() {
-    return this._runCommandThrowOnError("planCacheListQueryShapes", {}).shapes;
-};
-
-/**
  * Clears plan cache in a collection.
  */
 PlanCache.prototype.clear = function() {
     this._runCommandThrowOnError("planCacheClear", {});
     return;
-};
-
-/**
- * List plans for a query shape.
- */
-PlanCache.prototype.getPlansByQuery = function(query, projection, sort, collation) {
-    return this._runCommandThrowOnError("planCacheListPlans",
-                                        this._parseQueryShape(query, projection, sort, collation));
 };
 
 /**
@@ -1626,4 +1615,14 @@ PlanCache.prototype.clearPlansByQuery = function(query, projection, sort, collat
     this._runCommandThrowOnError("planCacheClear",
                                  this._parseQueryShape(query, projection, sort, collation));
     return;
+};
+
+/**
+ * Returns an array of plan cache data for the collection, after applying the given optional
+ * aggregation pipeline.
+ */
+PlanCache.prototype.list = function(pipeline) {
+    const additionalPipeline = pipeline || [];
+    const completePipeline = [{$planCacheStats: {}}].concat(additionalPipeline);
+    return this._collection.aggregate(completePipeline).toArray();
 };

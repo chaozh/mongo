@@ -42,9 +42,17 @@
 #include "mongo/db/commands/feature_compatibility_version_parser.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/db_raii.h"
+#include "mongo/db/dbdirectclient.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/ops/write_ops.h"
+#include "mongo/db/read_write_concern_defaults.h"
 #include "mongo/db/repl/repl_client_info.h"
+#include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/s/active_migrations_registry.h"
 #include "mongo/db/s/active_shard_collection_registry.h"
 #include "mongo/db/s/config/sharding_catalog_manager.h"
+#include "mongo/db/s/migration_util.h"
+#include "mongo/db/s/sharding_state.h"
 #include "mongo/db/server_options.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/s/catalog/type_collection.h"
@@ -63,6 +71,27 @@ MONGO_FAIL_POINT_DEFINE(featureCompatibilityDowngrade);
 MONGO_FAIL_POINT_DEFINE(featureCompatibilityUpgrade);
 MONGO_FAIL_POINT_DEFINE(pauseBeforeDowngradingConfigMetadata);  // TODO SERVER-44034: Remove.
 MONGO_FAIL_POINT_DEFINE(pauseBeforeUpgradingConfigMetadata);    // TODO SERVER-44034: Remove.
+MONGO_FAIL_POINT_DEFINE(failUpgrading);
+MONGO_FAIL_POINT_DEFINE(failDowngrading);
+MONGO_FAIL_POINT_DEFINE(allowFCVDowngradeWithCompoundHashedShardKey);
+
+/**
+ * Deletes the persisted default read/write concern document.
+ */
+void deletePersistedDefaultRWConcernDocument(OperationContext* opCtx) {
+    DBDirectClient client(opCtx);
+    const auto commandResponse = client.runCommand([&] {
+        write_ops::Delete deleteOp(NamespaceString::kConfigSettingsNamespace);
+        deleteOp.setDeletes({[&] {
+            write_ops::DeleteOpEntry entry;
+            entry.setQ(BSON("_id" << ReadWriteConcernDefaults::kPersistedDocumentId));
+            entry.setMulti(false);
+            return entry;
+        }()});
+        return deleteOp.serialize({});
+    }());
+    uassertStatusOK(getStatusFromWriteCommandReply(commandResponse->getCommandReply()));
+}
 
 /**
  * Sets the minimum allowed version for the cluster. If it is 4.2, then the node should not use 4.4
@@ -141,6 +170,8 @@ public:
         invariant(!opCtx->lockState()->isLocked());
         Lock::ExclusiveLock lk(opCtx->lockState(), FeatureCompatibilityVersion::fcvLock);
 
+        MigrationBlockingGuard lock(opCtx, ActiveMigrationsRegistry::get(opCtx));
+
         const auto requestedVersion = uassertStatusOK(
             FeatureCompatibilityVersionCommandParser::extractVersionFromCommand(getName(), cmdObj));
         ServerGlobalParams::FeatureCompatibility::Version actualVersion =
@@ -176,7 +207,16 @@ public:
                 Lock::GlobalLock lk(opCtx, MODE_S);
             }
 
+            if (failUpgrading.shouldFail())
+                return false;
+
             if (serverGlobalParams.clusterRole == ClusterRole::ShardServer) {
+                const auto shardingState = ShardingState::get(opCtx);
+                if (shardingState->enabled()) {
+                    LOG(0) << "Upgrade: submitting orphaned ranges for cleanup";
+                    migrationutil::submitOrphanRangesForCleanup(opCtx);
+                }
+
                 // The primary shard sharding a collection will write the initial chunks for a
                 // collection directly to the config server, so wait for all shard collections to
                 // complete to guarantee no chunks are missed by the update on the config server.
@@ -220,6 +260,34 @@ public:
                 return true;
             }
 
+            // Compound hashed shard keys are only allowed in 4.4. If the user tries to downgrade
+            // the cluster to FCV42, they must first drop all the collections with compound hashed
+            // shard key. If we find any existing collections, we uassert.
+            if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
+                const auto grid = Grid::get(opCtx);
+                auto allDbs = uassertStatusOK(grid->catalogClient()->getAllDBs(
+                                                  opCtx, repl::ReadConcernLevel::kLocalReadConcern))
+                                  .value;
+                for (const auto& db : allDbs) {
+                    auto collections = uassertStatusOK(grid->catalogClient()->getCollections(
+                        opCtx, &db.getName(), nullptr, repl::ReadConcernLevel::kLocalReadConcern));
+                    for (const auto& coll : collections) {
+                        if (coll.getDropped()) {
+                            continue;
+                        }
+                        auto shardKeyPattern = coll.getKeyPattern().toBSON();
+                        uassert(31411,
+                                str::stream()
+                                    << "Cannot downgrade the cluster when there is an existing "
+                                       "collection with compound hashed shard key. Please drop the "
+                                       "collection "
+                                    << coll.getNs() << " and re-initiate the downgrade process",
+                                allowFCVDowngradeWithCompoundHashedShardKey.shouldFail() ||
+                                    !ShardKeyPattern::extractHashedField(shardKeyPattern) ||
+                                    shardKeyPattern.nFields() == 1);
+                    }
+                }
+            }
             FeatureCompatibilityVersion::setTargetDowngrade(opCtx);
 
             {
@@ -233,12 +301,25 @@ public:
                 Lock::GlobalLock lk(opCtx, MODE_S);
             }
 
+            if (failDowngrading.shouldFail())
+                return false;
+
+            const bool isReplSet = repl::ReplicationCoordinator::get(opCtx)->getReplicationMode() ==
+                repl::ReplicationCoordinator::modeReplSet;
+
             if (serverGlobalParams.clusterRole == ClusterRole::ShardServer) {
+                LOG(0) << "Downgrade: dropping config.rangeDeletions collection";
+                migrationutil::dropRangeDeletionsCollection(opCtx);
+
                 // The primary shard sharding a collection will write the initial chunks for a
                 // collection directly to the config server, so wait for all shard collections to
                 // complete to guarantee no chunks are missed by the update on the config server.
                 ActiveShardCollectionRegistry::get(opCtx).waitForActiveShardCollectionsToComplete(
                     opCtx);
+            } else if (isReplSet || serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
+                // The default rwc document should only be deleted on plain replica sets and the
+                // config server replica set, not on shards or standalones.
+                deletePersistedDefaultRWConcernDocument(opCtx);
             }
 
             // Downgrade shards before config finishes its downgrade.

@@ -246,6 +246,7 @@ void WiredTigerRecoveryUnit::_ensureSession() {
 
 bool WiredTigerRecoveryUnit::waitUntilDurable(OperationContext* opCtx) {
     invariant(!_inUnitOfWork(), toString(_getState()));
+    invariant(!opCtx->lockState()->isLocked() || storageGlobalParams.repair);
     const bool forceCheckpoint = false;
     const bool stableCheckpoint = false;
     _sessionCache->waitUntilDurable(opCtx, forceCheckpoint, stableCheckpoint);
@@ -255,6 +256,7 @@ bool WiredTigerRecoveryUnit::waitUntilDurable(OperationContext* opCtx) {
 bool WiredTigerRecoveryUnit::waitUntilUnjournaledWritesDurable(OperationContext* opCtx,
                                                                bool stableCheckpoint) {
     invariant(!_inUnitOfWork(), toString(_getState()));
+    invariant(!opCtx->lockState()->isLocked() || storageGlobalParams.repair);
     const bool forceCheckpoint = true;
     // Calling `waitUntilDurable` with `forceCheckpoint` set to false only performs a log
     // (journal) flush, and thus has no effect on unjournaled writes. Setting `forceCheckpoint` to
@@ -378,6 +380,7 @@ void WiredTigerRecoveryUnit::_txnClose(bool commit) {
 
     _prepareTimestamp = Timestamp();
     _durableTimestamp = Timestamp();
+    _catalogConflictTimestamp = Timestamp();
     _roundUpPreparedTimestamps = RoundUpPreparedTimestamps::kNoRound;
     _isOplogReader = false;
     _oplogVisibleTs = boost::none;
@@ -768,6 +771,25 @@ std::shared_ptr<StorageStats> WiredTigerRecoveryUnit::getOperationStatistics() c
     statsPtr->fetchStats(s, "statistics:session", "statistics=(fast)");
 
     return statsPtr;
+}
+
+void WiredTigerRecoveryUnit::setCatalogConflictingTimestamp(Timestamp timestamp) {
+    // This cannot be called after a storage snapshot is allocated.
+    invariant(!_isActive(), toString(_getState()));
+    invariant(_timestampReadSource == ReadSource::kNoTimestamp,
+              str::stream() << "Illegal to set catalog conflicting timestamp for a read source "
+                            << static_cast<int>(_timestampReadSource));
+    invariant(_catalogConflictTimestamp.isNull(),
+              str::stream() << "Trying to set catalog conflicting timestamp to "
+                            << timestamp.toString() << ". It's already set to "
+                            << _catalogConflictTimestamp.toString());
+    invariant(!timestamp.isNull());
+
+    _catalogConflictTimestamp = timestamp;
+}
+
+Timestamp WiredTigerRecoveryUnit::getCatalogConflictingTimestamp() const {
+    return _catalogConflictTimestamp;
 }
 
 }  // namespace mongo

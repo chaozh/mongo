@@ -75,6 +75,10 @@
 var ReplSetTest = function(opts) {
     'use strict';
 
+    load("jstests/libs/parallelTester.js");   // For Thread.
+    load("jstests/libs/fail_point_util.js");  // For configureFailPoint.
+    load("jstests/replsets/rslib.js");        // For setFailPoint.
+
     if (!(this instanceof ReplSetTest)) {
         return new ReplSetTest(opts);
     }
@@ -570,8 +574,32 @@ var ReplSetTest = function(opts) {
      * @param options - The options passed to {@link MongoRunner.runMongod}
      */
     this.startSet = function(options, restart) {
-        print("ReplSetTest starting set");
-        let startTime = new Date();  // Measure the execution time of this function.
+        // If the caller has explicitly specified 'waitForConnect:false', then we will start up all
+        // replica set nodes and return without waiting to connect to any of them.
+        const skipWaitingForAllConnections = (options && options.waitForConnect === false);
+
+        // Start up without waiting for connections.
+        this.startSetAsync(options, restart);
+
+        // Avoid waiting for connections to each node.
+        if (skipWaitingForAllConnections) {
+            print("ReplSetTest startSet skipping waiting for connections to all nodes in set '" +
+                  this.name + "'");
+            return this.nodes;
+        }
+
+        return this.startSetAwait();
+    };
+
+    /**
+     * Starts each node in the replica set with the given options without waiting for a connection
+     * to any node. Call 'startSetAwait' subsequently to wait for startup of each node to complete.
+     *
+     * @param options - The options passed to {@link MongoRunner.runMongod}
+     */
+    this.startSetAsync = function(options, restart) {
+        print("ReplSetTest starting set '" + this.name + "'");
+        self.startSetStartTime = new Date();  // Measure the execution time of node startup.
 
         if (options && options.keyFile) {
             self.keyFile = options.keyFile;
@@ -589,10 +617,6 @@ var ReplSetTest = function(opts) {
             Random.setRandomSeed(jsTest.options().seed);
         }
 
-        // If the caller has explicitly specified 'waitForConnect:false', then we will start up all
-        // replica set nodes and return without waiting to connect to any of them.
-        const skipWaitingForAllConnections = (options && options.waitForConnect === false);
-
         // If the caller has explicitly set 'waitForConnect', then we prefer that. Otherwise we
         // default to not waiting for a connection. We merge the options object with a new field so
         // as to not modify the original options object that was passed in.
@@ -606,13 +630,14 @@ var ReplSetTest = function(opts) {
         for (let n = 0; n < this.ports.length; n++) {
             this.start(n, options, restart);
         }
+        return this.nodes;
+    };
 
-        // Avoid waiting for connections to each node.
-        if (skipWaitingForAllConnections) {
-            print("ReplSetTest startSet skipping waiting for connections to all nodes.");
-            return this.nodes;
-        }
-
+    /**
+     * Waits for startup of each replica set node to complete by waiting until a connection can be
+     * made to each.
+     */
+    this.startSetAwait = function() {
         // Wait until we can establish a connection to each node before proceeding.
         for (let n = 0; n < this.ports.length; n++) {
             this._waitForInitialConnection(n);
@@ -620,7 +645,7 @@ var ReplSetTest = function(opts) {
 
         print("ReplSetTest startSet, nodes: " + tojson(this.nodes));
 
-        print("ReplSetTest startSet took " + (new Date() - startTime) + "ms for " +
+        print("ReplSetTest startSet took " + (new Date() - self.startSetStartTime) + "ms for " +
               this.nodes.length + " nodes.");
         return this.nodes;
     };
@@ -629,8 +654,9 @@ var ReplSetTest = function(opts) {
      * Blocks until the secondary nodes have completed recovery and their roles are known. Blocks on
      * all secondary nodes or just 'slaves', if specified.
      */
-    this.awaitSecondaryNodes = function(timeout, slaves) {
+    this.awaitSecondaryNodes = function(timeout, slaves, retryIntervalMS) {
         timeout = timeout || self.kDefaultTimeoutMS;
+        retryIntervalMS = retryIntervalMS || 200;
 
         assert.soonNoExcept(function() {
             // Reload who the current slaves are
@@ -641,13 +667,58 @@ var ReplSetTest = function(opts) {
             var ready = true;
 
             for (var i = 0; i < len; i++) {
-                var isMaster = slavesToCheck[i].getDB("admin").runCommand({ismaster: 1});
-                var arbiter = (isMaster.arbiterOnly == undefined ? false : isMaster.arbiterOnly);
+                var isMaster = slavesToCheck[i].adminCommand({ismaster: 1});
+                var arbiter = (isMaster.arbiterOnly === undefined ? false : isMaster.arbiterOnly);
                 ready = ready && (isMaster.secondary || arbiter);
             }
 
             return ready;
-        }, "Awaiting secondaries", timeout);
+        }, "Awaiting secondaries", timeout, retryIntervalMS);
+    };
+
+    /**
+     * A special version of awaitSecondaryNodes() used exclusively by rollback_test.js.
+     * Wraps around awaitSecondaryNodes() itself and checks for an unrecoverable rollback
+     * if it throws.
+     */
+    this.awaitSecondaryNodesForRollbackTest = function(
+        timeout, slaves, connToCheckForUnrecoverableRollback) {
+        try {
+            this.awaitSecondaryNodes(timeout, slaves);
+        } catch (originalEx) {
+            // There is a special case where we expect the (rare) possibility of unrecoverable
+            // rollbacks with EMRC:false in rollback suites with unclean shutdowns.
+            jsTestLog("Exception in 'awaitSecondaryNodes', checking for unrecoverable rollback");
+            if (connToCheckForUnrecoverableRollback) {
+                const conn = connToCheckForUnrecoverableRollback;
+
+                const statusRes = assert.commandWorked(conn.adminCommand({replSetGetStatus: 1}));
+                const isRecovering = (statusRes.myState === ReplSetTest.State.RECOVERING);
+                const hasNoSyncSource = (statusRes.syncSourceId === -1);
+
+                const cmdLineOptsRes = assert.commandWorked(conn.adminCommand("getCmdLineOpts"));
+                const hasEMRCFalse =
+                    (cmdLineOptsRes.parsed.replication.enableMajorityReadConcern === false);
+
+                if (isRecovering && hasNoSyncSource && hasEMRCFalse) {
+                    try {
+                        const n = this.getNodeId(conn);
+                        const connToCheck = _useBridge ? _unbridgedNodes[n] : this.nodes[n];
+                        // Confirm that the node is unable to recover after rolling back.
+                        checkLog.contains(
+                            connToCheck,
+                            "remote oplog does not contain entry with optime matching our required optime ",
+                            60 * 1000);
+                    } catch (checkLogEx) {
+                        throw originalEx;
+                    }
+                    // Add this info to the original exception.
+                    originalEx.unrecoverableRollbackDetected = true;
+                }
+            }
+            // Re-throw the original exception in all cases.
+            throw originalEx;
+        }
     };
 
     /**
@@ -661,7 +732,7 @@ var ReplSetTest = function(opts) {
                 status = node.getDB("admin").runCommand({replSetGetStatus: 1});
                 for (var j = 0; j < status.members.length; j++) {
                     if (status.members[j].self) {
-                        return status.members[j].syncingTo === upstreamNode.host;
+                        return status.members[j].syncSourceHost === upstreamNode.host;
                     }
                 }
                 return false;
@@ -856,14 +927,15 @@ var ReplSetTest = function(opts) {
      * pre-defined timeout. If a primary is available it will return a connection to it.
      * Otherwise throws an exception.
      */
-    this.getPrimary = function(timeout) {
+    this.getPrimary = function(timeout, retryIntervalMS) {
         timeout = timeout || self.kDefaultTimeoutMS;
+        retryIntervalMS = retryIntervalMS || 200;
         var primary = null;
 
         assert.soonNoExcept(function() {
             primary = _callIsMaster();
             return primary;
-        }, "Finding primary", timeout);
+        }, "Finding primary", timeout, retryIntervalMS);
 
         return primary;
     };
@@ -1026,7 +1098,8 @@ var ReplSetTest = function(opts) {
      * TODO(SERVER-14017): remove this in favor of using initiate() everywhere.
      */
     this.initiateWithAnyNodeAsPrimary = function(cfg, initCmd, {
-        doNotWaitForStableRecoveryTimestamp: doNotWaitForStableRecoveryTimestamp = false
+        doNotWaitForStableRecoveryTimestamp: doNotWaitForStableRecoveryTimestamp = false,
+        doNotWaitForReplication: doNotWaitForReplication = false
     } = {}) {
         let startTime = new Date();  // Measure the execution time of this function.
         var master = this.nodes[0].getDB("admin");
@@ -1052,27 +1125,59 @@ var ReplSetTest = function(opts) {
 
         cmd[cmdKey] = config;
 
-        // replSetInitiate and replSetReconfig commands can fail with a NodeNotFound error if a
-        // heartbeat times out during the quorum check. They may also fail with
-        // NewReplicaSetConfigurationIncompatible on similar timeout during the config validation
-        // stage while deducing isSelf(). This can fail with an InterruptedDueToReplStateChange
-        // error when interrupted. We try several times, to reduce the chance of failing this way.
-        replSetCommandWithRetry(master, cmd);
-        this.getPrimary();  // Blocks until there is a primary.
-
         // Initiating a replica set with a single node will use "latest" FCV. This will
         // cause IncompatibleServerVersion errors if additional "last-stable" binary version
         // nodes are subsequently added to the set, since such nodes cannot set their FCV to
         // "latest". Therefore, we make sure the primary is "last-stable" FCV before adding in
         // nodes of different binary versions to the replica set.
         let lastStableBinVersionWasSpecifiedForSomeNode = false;
+        let explicitBinVersionWasSpecifiedForSomeNode = false;
         Object.keys(this.nodeOptions).forEach(function(key, index) {
             let val = self.nodeOptions[key];
-            if (typeof (val) === "object" && val.hasOwnProperty("binVersion") &&
-                MongoRunner.areBinVersionsTheSame(val.binVersion, lastStableFCV)) {
-                lastStableBinVersionWasSpecifiedForSomeNode = true;
+            if (typeof (val) === "object" && val.hasOwnProperty("binVersion")) {
+                lastStableBinVersionWasSpecifiedForSomeNode =
+                    MongoRunner.areBinVersionsTheSame(val.binVersion, lastStableFCV);
+                explicitBinVersionWasSpecifiedForSomeNode = true;
             }
         });
+
+        // If no binVersions have been explicitly set, then we should be using the latest binary
+        // version, which allows us to use the failpoint below.
+        let explicitBinVersion =
+            (self.startOptions !== undefined && self.startOptions.hasOwnProperty("binVersion")) ||
+            explicitBinVersionWasSpecifiedForSomeNode ||
+            jsTest.options().useRandomBinVersionsWithinReplicaSet;
+
+        // If a test has explicitly disabled test commands or if we may be running an older mongod
+        // version then we cannot utilize failpoints below, since they may not be supported on older
+        // versions.
+        const failPointsSupported = jsTest.options().enableTestCommands && !explicitBinVersion;
+
+        // Skip waiting for new data to appear in the oplog buffer when transitioning to primary.
+        // This makes step up much faster for a node that doesn't need to drain any oplog
+        // operations. This is only an optimization so it's OK if we bypass it in some suites.
+        let skipWaitFp;
+        if (failPointsSupported) {
+            skipWaitFp = configureFailPoint(this.nodes[0], "skipOplogBatcherWaitForData");
+        }
+
+        // replSetInitiate and replSetReconfig commands can fail with a NodeNotFound error if a
+        // heartbeat times out during the quorum check. They may also fail with
+        // NewReplicaSetConfigurationIncompatible on similar timeout during the config validation
+        // stage while deducing isSelf(). This can fail with an InterruptedDueToReplStateChange
+        // error when interrupted. We try several times, to reduce the chance of failing this way.
+        const initiateStart = new Date();  // Measure the execution time of this section.
+        replSetCommandWithRetry(master, cmd);
+
+        // Blocks until there is a primary. We use a faster retry interval here since we expect the
+        // primary to be ready very soon. We also turn the failpoint off once we have a primary.
+        this.getPrimary(self.kDefaultTimeoutMS, 25 /* retryIntervalMS */);
+        if (failPointsSupported) {
+            skipWaitFp.off();
+        }
+
+        print("ReplSetTest initiate command took " + (new Date() - initiateStart) + "ms for " +
+              this.nodes.length + " nodes in set '" + this.name + "'");
 
         // Set the FCV to 'last-stable' if we are running a mixed version replica set. If this is a
         // config server, the FCV will be set as part of ShardingTest.
@@ -1097,7 +1202,20 @@ var ReplSetTest = function(opts) {
             });
         }
 
+        // Allow nodes to find sync sources more quickly. We also turn down the heartbeat interval
+        // to speed up the initiation process. We use a failpoint so that we can easily turn this
+        // behavior on/off without doing a reconfig. This is only an optimization so it's OK if we
+        // bypass it in some suites.
+        if (failPointsSupported) {
+            this.nodes.forEach(function(conn) {
+                setFailPoint(conn, "forceSyncSourceRetryWaitForInitialSync", {retryMS: 25});
+                setFailPoint(conn, "forceHeartbeatIntervalMS", {intervalMS: 200});
+                setFailPoint(conn, "forceBgSyncSyncSourceRetryWaitMS", {sleepMS: 25});
+            });
+        }
+
         // Reconfigure the set to contain the correct number of nodes (if necessary).
+        const reconfigStart = new Date();  // Measure duration of reconfig and awaitSecondaryNodes.
         if (originalMembers) {
             config.members = originalMembers;
             if (originalSettings) {
@@ -1111,9 +1229,15 @@ var ReplSetTest = function(opts) {
                 config.configsvr = true;
             }
 
-            cmd = {replSetReconfig: config};
+            // Add in nodes 1 at a time since non-force reconfig allows only single node
+            // addition/removal.
             print("Reconfiguring replica set to add in other nodes");
-            replSetCommandWithRetry(master, cmd);
+            for (let i = 2; i <= originalMembers.length; i++) {
+                print("ReplSetTest adding in node " + i);
+                config.members = originalMembers.slice(0, i);
+                replSetCommandWithRetry(master, {replSetReconfig: config});
+                config.version++;
+            }
         }
 
         // Setup authentication if running test with authentication
@@ -1121,7 +1245,15 @@ var ReplSetTest = function(opts) {
             master = this.getPrimary();
             jsTest.authenticateNodes(this.nodes);
         }
-        this.awaitSecondaryNodes();
+
+        // Wait for initial sync to complete on all nodes. Use a faster polling interval so we can
+        // detect initial sync completion more quickly.
+        this.awaitSecondaryNodes(
+            self.kDefaultTimeoutMS, null /* slaves */, 25 /* retryIntervalMS */);
+        print("ReplSetTest initiate reconfig and awaitSecondaryNodes took " +
+              (new Date() - reconfigStart) + "ms for " + this.nodes.length + " nodes in set '" +
+              this.name + "'");
+
         try {
             this.awaitHighestPriorityNodeIsPrimary();
         } catch (e) {
@@ -1197,9 +1329,33 @@ var ReplSetTest = function(opts) {
             });
         }
 
+        const awaitTsStart = new Date();  // Measure duration of awaitLastStableRecoveryTimestamp.
         if (!doNotWaitForStableRecoveryTimestamp) {
-            self.awaitLastStableRecoveryTimestamp();
+            // Speed up the polling interval so we can detect recovery timestamps more quickly.
+            self.awaitLastStableRecoveryTimestamp(25 /* retryIntervalMS */);
         }
+        print("ReplSetTest initiate awaitLastStableRecoveryTimestamp took " +
+              (new Date() - awaitTsStart) + "ms for " + this.nodes.length + " nodes in set '" +
+              this.name + "'");
+
+        // Make sure all nodes are up to date. Bypass this if the heartbeat interval wasn't turned
+        // down or the test specifies that we should not wait for replication. This is only an
+        // optimization so it's OK if we bypass it in some suites.
+        if (failPointsSupported && !doNotWaitForReplication) {
+            asCluster(self.nodes, function() {
+                self.awaitNodesAgreeOnAppliedOpTime();
+            });
+        }
+
+        // Turn off the failpoints now that initial sync and initial setup is complete.
+        if (failPointsSupported) {
+            this.nodes.forEach(function(conn) {
+                clearFailPoint(conn, "forceSyncSourceRetryWaitForInitialSync");
+                clearFailPoint(conn, "forceHeartbeatIntervalMS");
+                clearFailPoint(conn, "forceBgSyncSyncSourceRetryWaitMS");
+            });
+        }
+
         print("ReplSetTest initiateWithAnyNodeAsPrimary took " + (new Date() - startTime) +
               "ms for " + this.nodes.length + " nodes.");
     };
@@ -1234,10 +1390,11 @@ var ReplSetTest = function(opts) {
      * Modifies the election timeout to be 24 hours so that no unplanned elections happen. Then
      * runs replSetInitiate on the replica set with the new config.
      */
-    this.initiateWithHighElectionTimeout = function(opts = {}) {
-        let cfg = this.getReplSetConfig();
-        cfg.settings = Object.assign(opts, {"electionTimeoutMillis": 24 * 60 * 60 * 1000});
-        this.initiate(cfg);
+    this.initiateWithHighElectionTimeout = function(config) {
+        config = config || this.getReplSetConfig();
+        config.settings = config.settings || {};
+        config.settings["electionTimeoutMillis"] = ReplSetTest.kForeverMillis;
+        this.initiate(config);
     };
 
     /**
@@ -1247,17 +1404,30 @@ var ReplSetTest = function(opts) {
      * Calls awaitReplication() which requires all connections in 'nodes' to be authenticated.
      */
     this.stepUp = function(node) {
-        this.awaitReplication();
-        this.awaitNodesAgreeOnAppliedOpTime();
-        this.awaitNodesAgreeOnPrimary();
-        if (this.getPrimary() === node) {
-            return;
-        }
+        assert.soon(() => {
+            this.awaitReplication();
+            this.awaitNodesAgreeOnAppliedOpTime();
+            this.awaitNodesAgreeOnPrimary();
+            if (this.getPrimary() === node) {
+                return true;
+            }
 
-        jsTest.log("Stepping up: " + node.host + " in stepUp");
-        assert.commandWorked(node.adminCommand({replSetStepUp: 1}));
-        this.awaitNodesAgreeOnPrimary();
-        assert.eq(this.getPrimary(), node, 'failed to step up node ' + node.host + ' in stepUp');
+            jsTest.log("Stepping up: " + node.host + " in stepUp");
+
+            try {
+                assert.commandWorked(node.adminCommand({replSetStepUp: 1}));
+            } catch (e) {
+                jsTestLog('Failed to step up node ' + node.host + ' in stepUp');
+                return false;
+            }
+            this.awaitNodesAgreeOnPrimary();
+            if (this.getPrimary() === node) {
+                return true;
+            }
+
+            jsTest.log(node.host + ' is not primary after stepUp command');
+            return false;
+        }, "Timed out while waiting for stepUp to succeed on node in port: " + node.port);
     };
 
     /**
@@ -1391,10 +1561,11 @@ var ReplSetTest = function(opts) {
      * all nodes to report having a stable recovery timestamp, we ensure a degree of stability in
      * our tests to run as expected.
      */
-    this.awaitLastStableRecoveryTimestamp = function() {
+    this.awaitLastStableRecoveryTimestamp = function(retryIntervalMS) {
         let rst = this;
         let master = rst.getPrimary();
         let id = tojson(rst.nodeList());
+        retryIntervalMS = retryIntervalMS || 200;
 
         // All nodes must be in primary/secondary state prior to this point. Perform a majority
         // write to ensure there is a committed operation on the set. The commit point will
@@ -1459,33 +1630,37 @@ var ReplSetTest = function(opts) {
 
         print("AwaitLastStableRecoveryTimestamp: Waiting for stable recovery timestamps for " + id);
 
-        assert.soonNoExcept(function() {
-            for (let node of rst.nodes) {
-                // The `lastStableRecoveryTimestamp` field contains a stable timestamp guaranteed to
-                // exist on storage engine recovery to stable timestamp.
-                let res = assert.commandWorked(node.adminCommand({replSetGetStatus: 1}));
+        assert.soonNoExcept(
+            function() {
+                for (let node of rst.nodes) {
+                    // The `lastStableRecoveryTimestamp` field contains a stable timestamp
+                    // guaranteed to exist on storage engine recovery to stable timestamp.
+                    let res = assert.commandWorked(node.adminCommand({replSetGetStatus: 1}));
 
-                // Continue if we're connected to an arbiter.
-                if (res.myState === ReplSetTest.State.ARBITER) {
-                    continue;
+                    // Continue if we're connected to an arbiter.
+                    if (res.myState === ReplSetTest.State.ARBITER) {
+                        continue;
+                    }
+
+                    // A missing `lastStableRecoveryTimestamp` field indicates that the storage
+                    // engine does not support `recover to a stable timestamp`.
+                    //
+                    // A null `lastStableRecoveryTimestamp` indicates that the storage engine
+                    // supports "recover to a stable timestamp", but does not have a stable recovery
+                    // timestamp yet.
+                    if (res.hasOwnProperty("lastStableRecoveryTimestamp") &&
+                        res.lastStableRecoveryTimestamp.getTime() === 0) {
+                        print("AwaitLastStableRecoveryTimestamp: " + node.host +
+                              " does not have a stable recovery timestamp yet.");
+                        return false;
+                    }
                 }
 
-                // A missing `lastStableRecoveryTimestamp` field indicates that the storage
-                // engine does not support `recover to a stable timestamp`.
-                //
-                // A null `lastStableRecoveryTimestamp` indicates that the storage engine supports
-                // "recover to a stable timestamp", but does not have a stable recovery timestamp
-                // yet.
-                if (res.hasOwnProperty("lastStableRecoveryTimestamp") &&
-                    res.lastStableRecoveryTimestamp.getTime() === 0) {
-                    print("AwaitLastStableRecoveryTimestamp: " + node.host +
-                          " does not have a stable recovery timestamp yet.");
-                    return false;
-                }
-            }
-
-            return true;
-        }, "Not all members have a stable recovery timestamp");
+                return true;
+            },
+            "Not all members have a stable recovery timestamp",
+            ReplSetTest.kDefaultTimeoutMS,
+            retryIntervalMS);
 
         print("AwaitLastStableRecoveryTimestamp: A stable recovery timestamp has successfully " +
               "established on " + id);
@@ -2097,6 +2272,35 @@ var ReplSetTest = function(opts) {
                         });
                     });
 
+                    // Treats each array as a set and returns true if the contents match. Assumes
+                    // the contents of each array are unique.
+                    const compareSets = function(leftArr, rightArr) {
+                        if (leftArr === undefined) {
+                            return rightArr === undefined;
+                        }
+
+                        const map = {};
+                        leftArr.forEach(key => {
+                            map[key] = 1;
+                        });
+
+                        rightArr.forEach(key => {
+                            if (map[key] === undefined) {
+                                map[key] = -1;
+                            } else {
+                                delete map[key];
+                            }
+                        });
+
+                        // The map is empty when both sets match.
+                        for (let key in map) {
+                            if (map.hasOwnProperty(key)) {
+                                return false;
+                            }
+                        }
+                        return true;
+                    };
+
                     // Check that the following collection stats are the same across replica set
                     // members:
                     //  capped
@@ -2114,33 +2318,43 @@ var ReplSetTest = function(opts) {
                             primaryCollInfos.print(collectionPrinted, collName);
                             secondaryCollInfos.print(collectionPrinted, collName);
                             success = false;
-                        } else if (primaryCollStats.capped !== secondaryCollStats.capped ||
-                                   (hasSecondaryIndexes &&
-                                    primaryCollStats.nindexes !== secondaryCollStats.nindexes) ||
-                                   primaryCollStats.ns !== secondaryCollStats.ns) {
-                            // Provide hint on where to look within stats.
-                            let reasons = [];
-                            if (primaryCollStats.capped !== secondaryCollStats.capped) {
-                                reasons.push('capped');
-                            }
-                            if (hasSecondaryIndexes &&
-                                primaryCollStats.nindexes !== secondaryCollStats.nindexes) {
-                                reasons.push('indexes');
-                            }
-                            if (primaryCollStats.ns !== secondaryCollStats.ns) {
-                                reasons.push('ns');
-                            }
-                            print(msgPrefix +
-                                  ', the primary and secondary have different stats for the ' +
-                                  'collection ' + dbName + '.' + collName + ': ' +
-                                  reasons.join(', '));
-                            DataConsistencyChecker.dumpCollectionDiff(this,
-                                                                      collectionPrinted,
-                                                                      primaryCollInfos,
-                                                                      secondaryCollInfos,
-                                                                      collName);
-                            success = false;
+                            return;
                         }
+
+                        // Provide hint on where to look within stats.
+                        let reasons = [];
+                        if (primaryCollStats.capped !== secondaryCollStats.capped) {
+                            reasons.push('capped');
+                        }
+
+                        if (primaryCollStats.ns !== secondaryCollStats.ns) {
+                            reasons.push('ns');
+                        }
+
+                        if (hasSecondaryIndexes &&
+                            primaryCollStats.nindexes !== secondaryCollStats.nindexes) {
+                            reasons.push('indexes');
+                        }
+
+                        const indexBuildsMatch = compareSets(primaryCollStats.indexBuilds,
+                                                             secondaryCollStats.indexBuilds);
+                        if (hasSecondaryIndexes && !indexBuildsMatch) {
+                            reasons.push('indexBuilds');
+                        }
+
+                        if (reasons.length === 0) {
+                            return;
+                        }
+
+                        print(msgPrefix +
+                              ', the primary and secondary have different stats for the ' +
+                              'collection ' + dbName + '.' + collName + ': ' + reasons.join(', '));
+                        DataConsistencyChecker.dumpCollectionDiff(this,
+                                                                  collectionPrinted,
+                                                                  primaryCollInfos,
+                                                                  secondaryCollInfos,
+                                                                  collName);
+                        success = false;
                     });
 
                     if (nonCappedCollNames.length === primaryCollections.length) {
@@ -2470,6 +2684,11 @@ var ReplSetTest = function(opts) {
             options.binVersion = MongoRunner.versionIterator(options.binVersion);
         }
 
+        // Always set log format
+        if (options && options.logFormat) {
+            options.logFormat = jsTest.options().logFormat;
+        }
+
         // If restarting a node, use its existing options as the defaults.
         var baseOptions;
         if ((options && options.restart) || restart) {
@@ -2665,9 +2884,11 @@ var ReplSetTest = function(opts) {
      * @param {Object} [extraOptions={}]
      * @param {boolean} [extraOptions.forRestart=false] indicates whether stop() is being called
      * with the intent to call start() with restart=true for the same node(s) n.
+     * @param {boolean} [extraOptions.waitPid=true] if true, we will wait for the process to
+     * terminate after stopping it.
      */
     this.stop = _nodeParamToSingleNode(_nodeParamToConn(function(
-        n, signal, opts, {forRestart: forRestart = false} = {}) {
+        n, signal, opts, {forRestart: forRestart = false, waitpid: waitPid = true} = {}) {
         // Can specify wait as second parameter, if using default signal
         if (signal == true || signal == false) {
             signal = undefined;
@@ -2676,11 +2897,15 @@ var ReplSetTest = function(opts) {
         n = this.getNodeId(n);
 
         var conn = _useBridge ? _unbridgedNodes[n] : this.nodes[n];
-        print('ReplSetTest stop *** Shutting down mongod in port ' + conn.port + ' ***');
-        var ret = MongoRunner.stopMongod(conn, signal, opts);
+        print('ReplSetTest stop *** Shutting down mongod in port ' + conn.port +
+              ', wait for process termination: ' + waitPid + ' ***');
+        var ret = MongoRunner.stopMongod(conn, signal, opts, waitPid);
 
-        print('ReplSetTest stop *** Mongod in port ' + conn.port + ' shutdown with code (' + ret +
-              ') ***');
+        // We only expect the process to have terminated if we actually called 'waitpid'.
+        if (waitPid) {
+            print('ReplSetTest stop *** Mongod in port ' + conn.port + ' shutdown with code (' +
+                  ret + ') ***');
+        }
 
         if (_useBridge && !forRestart) {
             // We leave the mongobridge process running when the mongod process is being restarted.
@@ -2695,23 +2920,49 @@ var ReplSetTest = function(opts) {
     }));
 
     /**
+     * Performs collection validation on all nodes in the given 'ports' array in parallel.
+     *
+     * @param {int[]} ports the array of mongo ports to run validation on
+     */
+    this.validateNodes = function(ports) {
+        // Perform collection validation on each node in parallel.
+        let validators = [];
+        for (let i = 0; i < ports.length; i++) {
+            let validator = new Thread(MongoRunner.validateCollectionsCallback, this.ports[i]);
+            validators.push(validator);
+            validators[i].start();
+        }
+        // Wait for all validators to finish.
+        for (let i = 0; i < ports.length; i++) {
+            validators[i].join();
+        }
+    };
+
+    /**
      * Kill all members of this replica set.
      *
      * @param {number} signal The signal number to use for killing the members
      * @param {boolean} forRestart will not cleanup data directory
      * @param {Object} opts @see MongoRunner.stopMongod
      */
-    this.stopSet = function(signal, forRestart, opts) {
+    this.stopSet = function(signal, forRestart, opts = {}) {
+        if (jsTestOptions().alwaysUseLogFiles) {
+            if (opts.noCleanData === false) {
+                throw new Error("Always using log files, but received conflicting option.");
+            }
+
+            opts.noCleanData = true;
+        }
         // Check to make sure data is the same on all nodes.
-        if (!jsTest.options().skipCheckDBHashes) {
+        const skipChecks = jsTest.options().skipCheckDBHashes || (opts && opts.skipCheckDBHashes);
+        if (!skipChecks) {
             let startTime = new Date();  // Measure the execution time of consistency checks.
             print("ReplSetTest stopSet going to run data consistency checks.");
-            // To skip this check add TestData.skipCheckDBHashes = true;
-            // Reasons to skip this test include:
+            // To skip this check add TestData.skipCheckDBHashes = true or pass in {opts:
+            // skipCheckDBHashes} Reasons to skip this test include:
             // - the primary goes down and none can be elected (so fsync lock/unlock commands fail)
             // - the replica set is in an unrecoverable inconsistent state. E.g. the replica set
             //   is partitioned.
-            //
             let master = _callIsMaster();
             if (master && this._liveNodes.length > 1) {  // skip for sets with 1 live node
                 // Auth only on live nodes because authutil.assertAuthenticate
@@ -2750,11 +3001,33 @@ var ReplSetTest = function(opts) {
             });
         }
 
-        print("ReplSetTest stopSet stopping all replica set nodes.");
         let startTime = new Date();  // Measure the execution time of shutting down nodes.
-        for (var i = 0; i < this.ports.length; i++) {
-            this.stop(i, signal, opts);
+
+        // Optionally validate collections on all nodes.
+        if (opts.skipValidation) {
+            print("ReplSetTest stopSet skipping validation before stopping nodes.");
+        } else {
+            print("ReplSetTest stopSet validating all replica set nodes before stopping them.");
+            this.validateNodes(this.ports);
         }
+
+        // Stop all nodes without waiting for them to terminate. We also skip validation since we
+        // have already done it above.
+        opts = Object.merge(opts, {skipValidation: true});
+        for (let i = 0; i < this.ports.length; i++) {
+            this.stop(i, signal, opts, {waitpid: false});
+        }
+
+        // Wait for all processes to terminate.
+        for (let i = 0; i < this.ports.length; i++) {
+            let conn = _useBridge ? _unbridgedNodes[i] : this.nodes[i];
+            let port = parseInt(conn.port);
+            print("ReplSetTest stopSet waiting for mongo program on port " + port + " to stop.");
+            let exitCode = waitMongoProgram(port);
+            print("ReplSetTest stopSet mongo program on port " + port + " shut down with code " +
+                  exitCode);
+        }
+
         print("ReplSetTest stopSet stopped all replica set nodes, took " +
               (new Date() - startTime) + "ms for " + this.ports.length + " nodes.");
 
@@ -2763,7 +3036,7 @@ var ReplSetTest = function(opts) {
             return;
         }
 
-        if ((!opts || !opts.noCleanData) && _alldbpaths) {
+        if ((!opts.noCleanData) && _alldbpaths) {
             print("ReplSetTest stopSet deleting all dbpaths");
             for (var i = 0; i < _alldbpaths.length; i++) {
                 print("ReplSetTest stopSet deleting dbpath: " + _alldbpaths[i]);
@@ -2949,6 +3222,7 @@ ReplSetTest.kDefaultTimeoutMS = 10 * 60 * 1000;
  *  Global default number that's effectively infinite.
  */
 ReplSetTest.kForeverSecs = 24 * 60 * 60;
+ReplSetTest.kForeverMillis = ReplSetTest.kForeverSecs * 1000;
 
 /**
  * Set of states that the replica set can be in. Used for the wait functions.

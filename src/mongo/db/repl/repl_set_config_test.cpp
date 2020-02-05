@@ -63,12 +63,14 @@ TEST(ReplSetConfig, ParseMinimalConfigAndCheckDefaults) {
     ReplSetConfig config;
     ASSERT_OK(config.initialize(BSON("_id"
                                      << "rs0"
-                                     << "version" << 1 << "protocolVersion" << 1 << "members"
+                                     << "version" << 1 << "term" << 1 << "protocolVersion" << 1
+                                     << "members"
                                      << BSON_ARRAY(BSON("_id" << 0 << "host"
                                                               << "localhost:12345")))));
     ASSERT_OK(config.validate());
     ASSERT_EQUALS("rs0", config.getReplSetName());
     ASSERT_EQUALS(1, config.getConfigVersion());
+    ASSERT_EQUALS(1, config.getConfigTerm());
     ASSERT_EQUALS(1, config.getNumMembers());
     ASSERT_EQUALS(MemberId(0), config.membersBegin()->getId());
     ASSERT_EQUALS(1, config.getDefaultWriteConcern().wNumNodes);
@@ -91,7 +93,7 @@ TEST(ReplSetConfig, ParseLargeConfigAndCheckAccessors) {
     ASSERT_OK(
         config.initialize(BSON("_id"
                                << "rs0"
-                               << "version" << 1234 << "members"
+                               << "version" << 1234 << "term" << 1 << "members"
                                << BSON_ARRAY(BSON("_id" << 234 << "host"
                                                         << "localhost:12345"
                                                         << "tags"
@@ -109,6 +111,7 @@ TEST(ReplSetConfig, ParseLargeConfigAndCheckAccessors) {
     ASSERT_OK(config.validate());
     ASSERT_EQUALS("rs0", config.getReplSetName());
     ASSERT_EQUALS(1234, config.getConfigVersion());
+    ASSERT_EQUALS(1, config.getConfigTerm());
     ASSERT_EQUALS(1, config.getNumMembers());
     ASSERT_EQUALS(MemberId(234), config.membersBegin()->getId());
     ASSERT_EQUALS(0, config.getDefaultWriteConcern().wNumNodes);
@@ -306,6 +309,75 @@ TEST(ReplSetConfig, ParseFailsWithBadOrMissingVersionField) {
                                      << BSON_ARRAY(BSON("_id" << 0 << "host"
                                                               << "localhost:12345")))));
     ASSERT_EQUALS(ErrorCodes::BadValue, config.validate());
+}
+
+TEST(ReplSetConfig, ParseFailsWithBadOrMissingTermField) {
+    ReplSetConfig config;
+    // Absent term field should set a default.
+    ASSERT_OK(config.initialize(BSON("_id"
+                                     << "rs0"
+                                     << "version" << 1 << "protocolVersion" << 1 << "members"
+                                     << BSON_ARRAY(BSON("_id" << 0 << "host"
+                                                              << "localhost:12345")))));
+    ASSERT_EQUALS(config.getConfigTerm(), -1);
+    ASSERT_EQUALS(ErrorCodes::TypeMismatch,
+                  config.initialize(BSON("_id"
+                                         << "rs0"
+                                         << "version" << 1 << "term"
+                                         << "1"
+                                         << "protocolVersion" << 1 << "members"
+                                         << BSON_ARRAY(BSON("_id" << 0 << "host"
+                                                                  << "localhost:12345")))));
+
+    ASSERT_OK(config.initialize(BSON("_id"
+                                     << "rs0"
+                                     << "version" << 1 << "term" << 1.0 << "protocolVersion" << 1
+                                     << "members"
+                                     << BSON_ARRAY(BSON("_id" << 0 << "host"
+                                                              << "localhost:12345")))));
+    ASSERT_OK(config.validate());
+    ASSERT_OK(config.initialize(BSON("_id"
+                                     << "rs0"
+                                     << "version" << 1 << "term" << 0.0 << "protocolVersion" << 1
+                                     << "members"
+                                     << BSON_ARRAY(BSON("_id" << 0 << "host"
+                                                              << "localhost:12345")))));
+    ASSERT_OK(config.validate());
+    // Config term can be -1.
+    ASSERT_OK(config.initialize(BSON("_id"
+                                     << "rs0"
+                                     << "version" << 1 << "term" << -1.0 << "protocolVersion" << 1
+                                     << "members"
+                                     << BSON_ARRAY(BSON("_id" << 0 << "host"
+                                                              << "localhost:12345")))));
+    ASSERT_OK(config.validate());
+    ASSERT_OK(config.initialize(BSON("_id"
+                                     << "rs0"
+                                     << "version" << 1 << "term" << -2.0 << "protocolVersion" << 1
+                                     << "members"
+                                     << BSON_ARRAY(BSON("_id" << 0 << "host"
+                                                              << "localhost:12345")))));
+    ASSERT_EQUALS(ErrorCodes::BadValue, config.validate());
+    ASSERT_OK(config.initialize(BSON("_id"
+                                     << "rs0"
+                                     << "version" << 1 << "term"
+                                     << static_cast<long long>(std::numeric_limits<int>::max()) + 1
+                                     << "protocolVersion" << 1 << "members"
+                                     << BSON_ARRAY(BSON("_id" << 0 << "host"
+                                                              << "localhost:12345")))));
+    ASSERT_EQUALS(ErrorCodes::BadValue, config.validate());
+
+    // If we provide an explicit term field, then we should not fail initialize since we overwrite
+    // the invalid term. This tests the case where a reconfig command passes in an invalid term.
+    ASSERT_OK(config.initialize(BSON("_id"
+                                     << "rs0"
+                                     << "version" << 1 << "term"
+                                     << "1"
+                                     << "protocolVersion" << 1 << "members"
+                                     << BSON_ARRAY(BSON("_id" << 0 << "host"
+                                                              << "localhost:12345"))),
+                                1 /* explicit term */));
+    ASSERT_OK(config.validate());
 }
 
 TEST(ReplSetConfig, ParseFailsWithBadMembers) {
@@ -1612,6 +1684,7 @@ TEST(ReplSetConfig, ReplSetId) {
                                           << BSON_ARRAY(BSON("_id" << 0 << "host"
                                                                    << "localhost:12345"
                                                                    << "priority" << 1))),
+                                     boost::none,
                                      defaultReplicaSetId));
     ASSERT_OK(configLocal.validate());
     ASSERT_TRUE(configLocal.hasReplicaSetId());
@@ -1641,6 +1714,27 @@ TEST(ReplSetConfig, ReplSetId) {
                            "\"replicaSetId\" had the wrong type. Expected objectId, found int");
 }
 
+TEST(ReplSetConfig, ConfigVersionAndTermComparison) {
+    // Test equality.
+    ASSERT_EQ(ConfigVersionAndTerm(1, 1), ConfigVersionAndTerm(1, 1));
+    ASSERT_EQ(ConfigVersionAndTerm(1, 2), ConfigVersionAndTerm(1, 2));
+    ASSERT_EQ(ConfigVersionAndTerm(2, 2), ConfigVersionAndTerm(2, 2));
+    ASSERT_EQ(ConfigVersionAndTerm(1, -1), ConfigVersionAndTerm(1, 1));
+    ASSERT_EQ(ConfigVersionAndTerm(1, 1), ConfigVersionAndTerm(1, -1));
+    ASSERT_EQ(ConfigVersionAndTerm(1, -1), ConfigVersionAndTerm(1, -1));
+    // Test greater/less than or equal to.
+    ASSERT_GT(ConfigVersionAndTerm(2, 1), ConfigVersionAndTerm(1, 1));
+    ASSERT_GTE(ConfigVersionAndTerm(2, 1), ConfigVersionAndTerm(1, 1));
+    ASSERT_GT(ConfigVersionAndTerm(1, 2), ConfigVersionAndTerm(1, 1));
+    ASSERT_GTE(ConfigVersionAndTerm(1, 2), ConfigVersionAndTerm(1, 1));
+    ASSERT_LT(ConfigVersionAndTerm(1, 1), ConfigVersionAndTerm(2, 1));
+    ASSERT_LTE(ConfigVersionAndTerm(1, 1), ConfigVersionAndTerm(2, 1));
+    ASSERT_LT(ConfigVersionAndTerm(1, 1), ConfigVersionAndTerm(1, 2));
+    ASSERT_LTE(ConfigVersionAndTerm(1, 1), ConfigVersionAndTerm(1, 2));
+    ASSERT_GT(ConfigVersionAndTerm(2, 1), ConfigVersionAndTerm(1, -1));
+    ASSERT_GT(ConfigVersionAndTerm(2, -1), ConfigVersionAndTerm(1, 1));
+    ASSERT_GT(ConfigVersionAndTerm(2, -1), ConfigVersionAndTerm(1, -1));
+}
 }  // namespace
 }  // namespace repl
 }  // namespace mongo

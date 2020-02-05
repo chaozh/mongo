@@ -37,12 +37,13 @@ namespace mongo {
 
 class ShardFiltererImpl : public ShardFilterer {
 public:
-    ShardFiltererImpl(ScopedCollectionMetadata md);
+    ShardFiltererImpl(ScopedCollectionFilter collectionFilter);
 
-    DocumentBelongsResult documentBelongsToMe(const MatchableDocument& doc) const override;
+    DocumentBelongsResult documentBelongsToMe(const WorkingSetMember& wsm) const override;
+    DocumentBelongsResult documentBelongsToMe(const Document& doc) const override;
 
     bool isCollectionSharded() const override {
-        return _metadata->isSharded();
+        return _collectionFilter.isSharded();
     }
 
     const KeyPattern& getKeyPattern() const override {
@@ -51,7 +52,8 @@ public:
     }
 
 private:
-    ScopedCollectionMetadata _metadata;
+    DocumentBelongsResult _shardKeyBelongsToMe(BSONObj shardKey) const;
+    ScopedCollectionFilter _collectionFilter;
     boost::optional<ShardKeyPattern> _keyPattern;
 };
 }  // namespace mongo

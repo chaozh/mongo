@@ -156,7 +156,6 @@ function getAggPlanStages(root, stage) {
         let results = [];
         for (let i = 0; i < docSourceArray.length; i++) {
             let properties = Object.getOwnPropertyNames(docSourceArray[i]);
-            assert.eq(1, properties.length);
             if (properties[0] === stage) {
                 results.push(docSourceArray[i]);
             }
@@ -400,4 +399,23 @@ function assertCoveredQueryAndCount({collection, query, project, count}) {
     assert(isIndexOnly(db, explain.queryPlanner.winningPlan),
            "Winning plan for count was not covered: " + tojson(explain.queryPlanner.winningPlan));
     assertExplainCount({explainResults: explain, expectedCount: count});
+}
+
+/**
+ * Runs explain() operation on 'cmdObj' and verifies that all the stages in 'expectedStages' are
+ * present exactly once in the plan returned. When 'stagesNotExpected' array is passed, also
+ * verifies that none of those stages are present in the explain() plan.
+ */
+function assertStagesForExplainOfCommand({coll, cmdObj, expectedStages, stagesNotExpected}) {
+    const plan = assert.commandWorked(coll.runCommand({explain: cmdObj}));
+    const winningPlan = plan.queryPlanner.winningPlan;
+    for (let expectedStage of expectedStages) {
+        assert(planHasStage(coll.getDB(), winningPlan, expectedStage),
+               "Could not find stage " + expectedStage + ". Plan: " + tojson(plan));
+    }
+    for (let stage of (stagesNotExpected || [])) {
+        assert(!planHasStage(coll.getDB(), winningPlan, stage),
+               "Found stage " + stage + " when not expected. Plan: " + tojson(plan));
+    }
+    return plan;
 }

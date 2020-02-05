@@ -39,6 +39,7 @@
 #include "mongo/db/catalog/document_validation.h"
 #include "mongo/db/catalog/drop_collection.h"
 #include "mongo/db/catalog/index_catalog.h"
+#include "mongo/db/catalog/list_indexes.h"
 #include "mongo/db/client.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/curop.h"
@@ -62,15 +63,13 @@
 #include "mongo/util/scopeguard.h"
 
 namespace mongo {
-
-MONGO_FAIL_POINT_DEFINE(useRenameCollectionPathThroughConfigsvr);
-
 namespace {
 
+MONGO_FAIL_POINT_DEFINE(useRenameCollectionPathThroughConfigsvr);
 MONGO_FAIL_POINT_DEFINE(writeConflictInRenameCollCopyToTmp);
 
 boost::optional<NamespaceString> getNamespaceFromUUID(OperationContext* opCtx, const UUID& uuid) {
-    return CollectionCatalog::get(opCtx).lookupNSSByUUID(uuid);
+    return CollectionCatalog::get(opCtx).lookupNSSByUUID(opCtx, uuid);
 }
 
 bool isCollectionSharded(OperationContext* opCtx, const NamespaceString& nss) {
@@ -116,7 +115,7 @@ Status checkSourceAndTargetNamespaces(OperationContext* opCtx,
         return Status(ErrorCodes::NamespaceNotFound, "source namespace does not exist");
 
     Collection* const sourceColl =
-        CollectionCatalog::get(opCtx).lookupCollectionByNamespace(source);
+        CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, source);
     if (!sourceColl) {
         if (ViewCatalog::get(db)->lookup(opCtx, source.ns()))
             return Status(ErrorCodes::CommandNotSupportedOnView,
@@ -127,7 +126,8 @@ Status checkSourceAndTargetNamespaces(OperationContext* opCtx,
     BackgroundOperation::assertNoBgOpInProgForNs(source.ns());
     IndexBuildsCoordinator::get(opCtx)->assertNoIndexBuildInProgForCollection(sourceColl->uuid());
 
-    Collection* targetColl = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(target);
+    Collection* targetColl =
+        CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, target);
 
     if (!targetColl) {
         if (ViewCatalog::get(db)->lookup(opCtx, target.ns()))
@@ -313,14 +313,14 @@ Status renameCollectionWithinDB(OperationContext* opCtx,
 
     auto db = DatabaseHolder::get(opCtx)->getDb(opCtx, source.db());
     Collection* const sourceColl =
-        CollectionCatalog::get(opCtx).lookupCollectionByNamespace(source);
+        CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, source);
     Collection* const targetColl =
-        CollectionCatalog::get(opCtx).lookupCollectionByNamespace(target);
+        CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, target);
 
     AutoStatsTracker statsTracker(opCtx,
                                   source,
                                   Top::LockType::NotLocked,
-                                  AutoStatsTracker::LogMode::kUpdateTopAndCurop,
+                                  AutoStatsTracker::LogMode::kUpdateCurOp,
                                   db->getProfilingLevel());
 
     if (!targetColl) {
@@ -355,16 +355,17 @@ Status renameCollectionWithinDBForApplyOps(OperationContext* opCtx,
 
     auto db = DatabaseHolder::get(opCtx)->getDb(opCtx, source.db());
     Collection* const sourceColl =
-        CollectionCatalog::get(opCtx).lookupCollectionByNamespace(source);
+        CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, source);
 
     AutoStatsTracker statsTracker(opCtx,
                                   source,
                                   Top::LockType::NotLocked,
-                                  AutoStatsTracker::LogMode::kUpdateTopAndCurop,
+                                  AutoStatsTracker::LogMode::kUpdateCurOp,
                                   db->getProfilingLevel());
 
     return writeConflictRetry(opCtx, "renameCollection", target.ns(), [&] {
-        Collection* targetColl = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(target);
+        Collection* targetColl =
+            CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, target);
         WriteUnitOfWork wuow(opCtx);
         if (targetColl) {
             if (sourceColl->uuid() == targetColl->uuid()) {
@@ -409,7 +410,7 @@ Status renameCollectionWithinDBForApplyOps(OperationContext* opCtx,
             if (collToDropBasedOnUUID && !collToDropBasedOnUUID->isDropPendingNamespace()) {
                 invariant(collToDropBasedOnUUID->db() == target.db());
                 targetColl = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(
-                    *collToDropBasedOnUUID);
+                    opCtx, *collToDropBasedOnUUID);
             }
         }
 
@@ -449,7 +450,10 @@ Status renameBetweenDBs(OperationContext* opCtx,
     boost::optional<Lock::DBLock> sourceDbLock;
     boost::optional<Lock::CollectionLock> sourceCollLock;
     if (!opCtx->lockState()->isCollectionLockedForMode(source, MODE_S)) {
-        sourceDbLock.emplace(opCtx, source.db(), MODE_IS);
+        // Lock the DB using MODE_IX to ensure we have the global lock in that mode, as to prevent
+        // upgrade from MODE_IS to MODE_IX, which caused deadlock on systems not supporting Database
+        // locking and should be avoided in general.
+        sourceDbLock.emplace(opCtx, source.db(), MODE_IX);
         sourceCollLock.emplace(opCtx, source, MODE_S);
     }
 
@@ -474,11 +478,11 @@ Status renameBetweenDBs(OperationContext* opCtx,
                                                    opCtx,
                                                    source,
                                                    Top::LockType::NotLocked,
-                                                   AutoStatsTracker::LogMode::kUpdateTopAndCurop,
+                                                   AutoStatsTracker::LogMode::kUpdateCurOp,
                                                    sourceDB->getProfilingLevel());
 
     Collection* const sourceColl =
-        CollectionCatalog::get(opCtx).lookupCollectionByNamespace(source);
+        CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, source);
     if (!sourceColl) {
         if (sourceDB && ViewCatalog::get(sourceDB)->lookup(opCtx, source.ns()))
             return Status(ErrorCodes::CommandNotSupportedOnView,
@@ -504,8 +508,9 @@ Status renameBetweenDBs(OperationContext* opCtx,
     // Check if the target namespace exists and if dropTarget is true.
     // Return a non-OK status if target exists and dropTarget is not true or if the collection
     // is sharded.
-    Collection* targetColl =
-        targetDB ? CollectionCatalog::get(opCtx).lookupCollectionByNamespace(target) : nullptr;
+    Collection* targetColl = targetDB
+        ? CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, target)
+        : nullptr;
     if (targetColl) {
         if (sourceColl->uuid() == targetColl->uuid()) {
             invariant(source == target);
@@ -548,7 +553,7 @@ Status renameBetweenDBs(OperationContext* opCtx,
     Collection* tmpColl = nullptr;
     {
         auto collectionOptions =
-            DurableCatalog::get(opCtx)->getCollectionOptions(opCtx, sourceColl->ns());
+            DurableCatalog::get(opCtx)->getCollectionOptions(opCtx, sourceColl->getCatalogId());
 
         // Renaming across databases will result in a new UUID.
         collectionOptions.uuid = UUID::gen();
@@ -582,7 +587,8 @@ Status renameBetweenDBs(OperationContext* opCtx,
         }
     });
 
-    // Copy the index descriptions from the source collection.
+    // Copy the index descriptions from the source collection, adjusting the 'ns' field if
+    // necessary.
     std::vector<BSONObj> indexesToCopy;
     for (auto sourceIndIt = sourceColl->getIndexCatalog()->getIndexIterator(opCtx, true);
          sourceIndIt->more();) {
@@ -590,7 +596,28 @@ Status renameBetweenDBs(OperationContext* opCtx,
         if (descriptor->isIdIndex()) {
             continue;
         }
-        indexesToCopy.push_back(descriptor->infoObj());
+
+        const BSONObj currIndex = descriptor->infoObj();
+
+        // In FCV 4.4, there is no 'ns' field to modify.
+        if (serverGlobalParams.featureCompatibility.isVersionInitialized() &&
+            serverGlobalParams.featureCompatibility.getVersion() ==
+                ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo44) {
+            indexesToCopy.push_back(currIndex);
+            continue;
+        }
+
+        // In FCV 4.2, we must rename the 'ns' field if it exists.
+        // Process the source index, adding fields in the same order as they were originally.
+        BSONObjBuilder newIndex;
+        for (auto&& elem : currIndex) {
+            if (elem.fieldNameStringData() == "ns") {
+                newIndex.append("ns", tmpName.ns());
+            } else {
+                newIndex.append(elem);
+            }
+        }
+        indexesToCopy.push_back(newIndex.obj());
     }
 
     // Create indexes using the index specs on the empty temporary collection that was just created.
@@ -604,43 +631,13 @@ Status renameBetweenDBs(OperationContext* opCtx,
     if (!indexesToCopy.empty()) {
         Status status = writeConflictRetry(opCtx, "renameCollection", tmpName.ns(), [&] {
             WriteUnitOfWork wunit(opCtx);
-            auto tmpIndexCatalog = tmpColl->getIndexCatalog();
-            auto opObserver = opCtx->getServiceContext()->getOpObserver();
             auto fromMigrate = false;
-
-            // Emit startIndexBuild and commitIndexBuild oplog entries if supported by the
-            // current FCV.
-            auto buildUUID = serverGlobalParams.featureCompatibility.isVersionInitialized() &&
-                    serverGlobalParams.featureCompatibility.getVersion() ==
-                        ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo44
-                ? boost::make_optional(UUID::gen())
-                : boost::none;
-
-            if (buildUUID) {
-                opObserver->onStartIndexBuild(
-                    opCtx, tmpName, tmpColl->uuid(), *buildUUID, indexesToCopy, fromMigrate);
+            try {
+                IndexBuildsCoordinator::get(opCtx)->createIndexesOnEmptyCollection(
+                    opCtx, tmpColl->uuid(), indexesToCopy, fromMigrate);
+            } catch (DBException& ex) {
+                return ex.toStatus();
             }
-
-            for (const auto& indexToCopy : indexesToCopy) {
-                // If two phase index builds is enabled, index build will be coordinated using
-                // startIndexBuild and commitIndexBuild oplog entries.
-                if (!IndexBuildsCoordinator::get(opCtx)->supportsTwoPhaseIndexBuild()) {
-                    opObserver->onCreateIndex(
-                        opCtx, tmpName, tmpColl->uuid(), indexToCopy, fromMigrate);
-                }
-
-                auto indexResult =
-                    tmpIndexCatalog->createIndexOnEmptyCollection(opCtx, indexToCopy);
-                if (!indexResult.isOK()) {
-                    return indexResult.getStatus();
-                }
-            };
-
-            if (buildUUID) {
-                opObserver->onCommitIndexBuild(
-                    opCtx, tmpName, tmpColl->uuid(), *buildUUID, indexesToCopy, fromMigrate);
-            }
-
             wunit.commit();
             return Status::OK();
         });
@@ -688,6 +685,12 @@ Status renameBetweenDBs(OperationContext* opCtx,
                     }
                     record = cursor->next();
                 }
+
+                // Time to yield; make a safe copy of the current record before releasing our
+                // cursor.
+                if (record)
+                    record->data.makeOwned();
+
                 cursor->save();
                 // When this exits via success or WCE, we need to restore the cursor.
                 ON_BLOCK_EXIT([opCtx, ns = tmpName.ns(), &cursor]() {
@@ -727,6 +730,49 @@ Status renameBetweenDBs(OperationContext* opCtx,
 
 }  // namespace
 
+void doLocalRenameIfOptionsAndIndexesHaveNotChanged(OperationContext* opCtx,
+                                                    const NamespaceString& sourceNs,
+                                                    const NamespaceString& targetNs,
+                                                    bool dropTarget,
+                                                    bool stayTemp,
+                                                    std::list<BSONObj> originalIndexes,
+                                                    BSONObj originalCollectionOptions) {
+    AutoGetDb dbLock(opCtx, targetNs.db(), MODE_X);
+    auto collection = dbLock.getDb()
+        ? CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, targetNs)
+        : nullptr;
+    BSONObj collectionOptions = {};
+    if (collection) {
+        // We do not include the UUID field in the options comparison. It is ok if the target
+        // collection was dropped and recreated, as long as the new target collection has the same
+        // options and indexes as the original one did. This is mainly to support concurrent $out
+        // to the same collection.
+        collectionOptions = DurableCatalog::get(opCtx)
+                                ->getCollectionOptions(opCtx, collection->getCatalogId())
+                                .toBSON()
+                                .removeField("uuid");
+    }
+
+    uassert(ErrorCodes::CommandFailed,
+            str::stream() << "collection options of target collection " << targetNs.ns()
+                          << " changed during processing. Original options: "
+                          << originalCollectionOptions << ", new options: " << collectionOptions,
+            SimpleBSONObjComparator::kInstance.evaluate(
+                originalCollectionOptions.removeField("uuid") == collectionOptions));
+
+    auto currentIndexes =
+        listIndexesEmptyListIfMissing(opCtx, targetNs, false /* includeBuildUUIDs */);
+    uassert(ErrorCodes::CommandFailed,
+            str::stream() << "indexes of target collection " << targetNs.ns()
+                          << " changed during processing.",
+            originalIndexes.size() == currentIndexes.size() &&
+                std::equal(originalIndexes.begin(),
+                           originalIndexes.end(),
+                           currentIndexes.begin(),
+                           SimpleBSONObjComparator::kInstance.makeEqualTo()));
+
+    validateAndRunRenameCollection(opCtx, sourceNs, targetNs, dropTarget, stayTemp);
+}
 void validateAndRunRenameCollection(OperationContext* opCtx,
                                     const NamespaceString& source,
                                     const NamespaceString& target,
@@ -828,7 +874,7 @@ Status renameCollectionForApplyOps(OperationContext* opCtx,
     NamespaceString sourceNss(sourceNsElt.valueStringData());
     NamespaceString targetNss(targetNsElt.valueStringData());
     if (uuidToRename) {
-        auto nss = CollectionCatalog::get(opCtx).lookupNSSByUUID(uuidToRename.get());
+        auto nss = CollectionCatalog::get(opCtx).lookupNSSByUUID(opCtx, uuidToRename.get());
         if (nss)
             sourceNss = *nss;
     }

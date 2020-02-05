@@ -1,5 +1,5 @@
 /**
- *    Copyright (C) 2018-present MongoDB, Inc.
+ *    Copyright (C) 2019-present MongoDB, Inc.
  *
  *    This program is free software: you can redistribute it and/or modify
  *    it under the terms of the Server Side Public License, version 1,
@@ -29,6 +29,12 @@
 
 #pragma once
 
+#include "mongo/db/repl/optime.h"
+#include "mongo/db/s/migration_coordinator_document_gen.h"
+#include "mongo/db/s/persistent_task_store.h"
+#include "mongo/db/s/range_deletion_task_gen.h"
+#include "mongo/s/catalog/type_chunk.h"
+
 namespace mongo {
 
 class BSONObj;
@@ -36,6 +42,8 @@ class NamespaceString;
 class ShardId;
 
 namespace migrationutil {
+
+constexpr auto kRangeDeletionThreadName = "range-deleter"_sd;
 
 /**
  * Creates a report document with the provided parameters:
@@ -56,6 +64,142 @@ BSONObj makeMigrationStatusDocument(const NamespaceString& nss,
                                     const BSONObj& min,
                                     const BSONObj& max);
 
-}  // namespace migrationutil
+/**
+ * Creates a query object that can used to find overlapping ranges in the pending range deletions
+ * collection.
+ */
+Query overlappingRangeQuery(const ChunkRange& range, const UUID& uuid);
 
+/**
+ * Checks the pending range deletions collection to see if there are any pending ranges that
+ * conflict with the passed in range.
+ */
+bool checkForConflictingDeletions(OperationContext* opCtx,
+                                  const ChunkRange& range,
+                                  const UUID& uuid);
+
+/**
+ * Asynchronously attempts to submit the RangeDeletionTask for processing.
+ *
+ * Note that if the current filtering metadata's UUID does not match the task's UUID, the filtering
+ * metadata will be refreshed once. If the UUID's still don't match, the task will be deleted from
+ * disk. If the UUID's do match, the task will be submitted for processing.
+ *
+ * The returned future will contain whether the task was submitted for processing.
+ */
+ExecutorFuture<bool> submitRangeDeletionTask(OperationContext* oppCtx,
+                                             const RangeDeletionTask& deletionTask);
+
+/**
+ * Queries the rangeDeletions collection for ranges that are ready to be deleted and submits them to
+ * the range deleter.
+ */
+void submitPendingDeletions(OperationContext* opCtx);
+
+/**
+ * Asynchronously calls submitPendingDeletions using the fixed executor pool.
+ */
+void resubmitRangeDeletionsOnStepUp(ServiceContext* serviceContext);
+
+void dropRangeDeletionsCollection(OperationContext* opCtx);
+
+/**
+ * Find and submit all orphan ranges for deletion.
+ */
+void submitOrphanRangesForCleanup(OperationContext* opCtx);
+
+/**
+ * Writes the migration coordinator document to config.migrationCoordinators and waits for majority
+ * write concern.
+ */
+void persistMigrationCoordinatorLocally(OperationContext* opCtx,
+                                        const MigrationCoordinatorDocument& migrationDoc);
+
+/**
+ * Writes the range deletion task document to config.rangeDeletions and waits for majority write
+ * concern.
+ */
+void persistRangeDeletionTaskLocally(OperationContext* opCtx,
+                                     const RangeDeletionTask& deletionTask);
+
+/**
+ * Updates the migration coordinator document to set the decision field to "committed" and waits for
+ * majority writeConcern.
+ */
+void persistCommitDecision(OperationContext* opCtx, const UUID& migrationId);
+
+/**
+ * Updates the migration coordinator document to set the decision field to "aborted" and waits for
+ * majority writeConcern.
+ */
+void persistAbortDecision(OperationContext* opCtx, const UUID& migrationId);
+
+/**
+ * Deletes the range deletion task document with the specified id from config.rangeDeletions and
+ * waits for majority write concern.
+ */
+void deleteRangeDeletionTaskLocally(
+    OperationContext* opCtx,
+    const UUID& deletionTaskId,
+    const WriteConcernOptions& writeConcern = WriteConcerns::kMajorityWriteConcern);
+
+/**
+ * Deletes all range deletion task documents with the specified collection UUID from
+ * config.rangeDeletions and waits for majority write concern.
+ */
+void deleteRangeDeletionTasksForCollectionLocally(OperationContext* opCtx,
+                                                  const UUID& collectionUuid);
+
+/**
+ * Deletes the range deletion task document with the specified id from config.rangeDeletions on the
+ * specified shard and waits for majority write concern.
+ */
+void deleteRangeDeletionTaskOnRecipient(OperationContext* opCtx,
+                                        const ShardId& recipientId,
+                                        const UUID& migrationId);
+
+/**
+ * Removes the 'pending' flag from the range deletion task document with the specified id from
+ * config.rangeDeletions and waits for majority write concern. This marks the range as ready for
+ * deletion.
+ */
+void markAsReadyRangeDeletionTaskLocally(OperationContext* opCtx, const UUID& migrationId);
+
+
+/**
+ * Removes the 'pending' flag from the range deletion task document with the specified id from
+ * config.rangeDeletions on the specified shard and waits for majority write concern. This marks the
+ * range as ready for deletion.
+ */
+void markAsReadyRangeDeletionTaskOnRecipient(OperationContext* opCtx,
+                                             const ShardId& recipientId,
+                                             const UUID& migrationId);
+
+/**
+ * Deletes the migration coordinator document with the specified id from
+ * config.migrationCoordinators without waiting for majority writeConcern.
+ */
+void deleteMigrationCoordinatorDocumentLocally(OperationContext* opCtx, const UUID& migrationId);
+
+/**
+ * Sends _configsvrEnsureChunkVersionIsGreaterThan for the range and preMigrationChunkVersion until
+ * hearing success or the node steps down or shuts down.
+ */
+void ensureChunkVersionIsGreaterThan(OperationContext* opCtx,
+                                     const ChunkRange& range,
+                                     const ChunkVersion& preMigrationChunkVersion);
+
+/**
+ * Forces a filtering metadata refresh of the namespace until the refresh succeeds or the node
+ * steps down or shuts down.
+ */
+void refreshFilteringMetadataUntilSuccess(OperationContext* opCtx, const NamespaceString& nss);
+
+/**
+ * Submits an asynchronous task to scan config.migrationCoordinators and drive each unfinished
+ * migration coordination to completion.
+ */
+void resumeMigrationCoordinationsOnStepUp(ServiceContext* serviceContext);
+
+}  // namespace migrationutil
 }  // namespace mongo

@@ -35,6 +35,7 @@
 #include "mongo/bson/oid.h"
 #include "mongo/db/repl/optime.h"
 #include "mongo/db/repl/optime_with.h"
+#include "mongo/rpc/topology_version_gen.h"
 #include "mongo/stdx/unordered_map.h"
 #include "mongo/util/net/hostandport.h"
 #include "mongo/util/time_support.h"
@@ -174,6 +175,10 @@ public:
         return _lastMajorityWrite->value;
     }
 
+    boost::optional<TopologyVersion> getTopologyVersion() const {
+        return _topologyVersion;
+    }
+
     /**
      * If false, calls to toBSON/addToBSON will ignore all other fields and add a specific
      * message to indicate that we have no replica set config.
@@ -216,6 +221,8 @@ public:
     void setIsHidden(bool hidden);
 
     void setShouldBuildIndexes(bool buildIndexes);
+
+    void setTopologyVersion(TopologyVersion topologyVersion);
 
     void setSlaveDelay(Seconds slaveDelay);
 
@@ -278,6 +285,7 @@ private:
     OID _electionId;
     boost::optional<OpTimeWith<time_t>> _lastWrite;
     boost::optional<OpTimeWith<time_t>> _lastMajorityWrite;
+    boost::optional<TopologyVersion> _topologyVersion;
 
     // If _configSet is false this means we don't have a valid repl set config, so toBSON
     // will return a set of hardcoded values that indicate this.

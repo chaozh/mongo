@@ -25,6 +25,12 @@ selector:
   # View tests aren't expected to work when collections are implicitly sharded.
   - jstests/core/txns/view_reads_in_transaction.js
 
+  # TODO(SERVER-45368) re-enable once collection creation is permitted in cross-shard transactions.
+  - jstests/core/txns/create_collection.js
+  - jstests/core/txns/create_collection_parallel.js
+  - jstests/core/txns/create_indexes.js
+  - jstests/core/txns/create_indexes_parallel.js
+
   exclude_with_any_tags:
   - assumes_against_mongod_not_mongos
   # Tests tagged with the following will fail because they assume collections are not sharded.

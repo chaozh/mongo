@@ -37,7 +37,7 @@ class OperationContext;
 class ServiceContext;
 
 /**
- * This implementation of the IndexBuildsCoordinator is for embedded (mobile) server nodes. Nothing
+ * This implementation of the IndexBuildsCoordinator is for embedded server nodes. Nothing
  * is run asynchronously and no network calls are made. Index builds are run without awaiting cross
  * replica set communications.
  *
@@ -58,7 +58,7 @@ public:
 
     StatusWith<SharedSemiFuture<ReplIndexBuildState::IndexCatalogStats>> startIndexBuild(
         OperationContext* opCtx,
-        StringData dbName,
+        std::string dbName,
         CollectionUUID collectionUUID,
         const std::vector<BSONObj>& specs,
         const UUID& buildUUID,

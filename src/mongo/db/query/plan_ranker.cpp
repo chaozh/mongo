@@ -95,7 +95,8 @@ StatusWith<std::unique_ptr<PlanRankingDecision>> PlanRanker::pickBestPlan(
         if (!candidates[i].failed) {
             LOG(5) << "Scoring plan " << i << ":" << endl
                    << redact(candidates[i].solution->toString()) << "Stats:\n"
-                   << redact(Explain::statsToBSON(*statTrees[i]).jsonString(Strict, true));
+                   << redact(Explain::statsToBSON(*statTrees[i])
+                                 .jsonString(ExtendedRelaxedV2_0_0, true));
             LOG(2) << "Scoring query plan: " << Explain::getPlanSummary(candidates[i].root)
                    << " planHitEOF=" << statTrees[i]->common.isEOF;
 
@@ -225,14 +226,9 @@ double PlanRanker::scoreTree(const PlanStageStats* stats) {
     // plan doesn't lose to a less productive plan due to tie breaking.
     const double epsilon = std::min(1.0 / static_cast<double>(10 * workUnits), 1e-4);
 
-    // We prefer covered projections.
-    //
-    // We only do this when we have a projection stage because we have so many jstests that
-    // check bounds even when a collscan plan is just as good as the ixscan'd plan :(
+    // We prefer queries that don't require a fetch stage.
     double noFetchBonus = epsilon;
-    if ((hasStage(STAGE_PROJECTION_DEFAULT, stats) || hasStage(STAGE_PROJECTION_COVERED, stats) ||
-         hasStage(STAGE_PROJECTION_SIMPLE, stats)) &&
-        hasStage(STAGE_FETCH, stats)) {
+    if (hasStage(STAGE_FETCH, stats)) {
         noFetchBonus = 0;
     }
 

@@ -347,7 +347,8 @@ TransactionParticipant::getOldestActiveTimestamp(Timestamp stableTimestamp) {
             return boost::none;
         }
 
-        auto collection = CollectionCatalog::get(opCtx.get()).lookupCollectionByNamespace(nss);
+        auto collection =
+            CollectionCatalog::get(opCtx.get()).lookupCollectionByNamespace(opCtx.get(), nss);
         if (!collection) {
             return boost::none;
         }
@@ -605,6 +606,18 @@ void TransactionParticipant::Participant::_setReadSnapshot(OperationContext* opC
         // Using 'kNoTimestamp' ensures that transactions with mode 'local' are always able to read
         // writes from earlier transactions with mode 'local' on the same connection.
         opCtx->recoveryUnit()->setTimestampReadSource(RecoveryUnit::ReadSource::kNoTimestamp);
+        // Catalog conflicting timestamps must be set on primaries performing transactions.
+        // However, secondaries performing oplog application must avoid setting
+        // _catalogConflictTimestamp. Currently, only oplog application on secondaries can run
+        // inside a transaction, thus `writesAreReplicated` is a suitable proxy to single out
+        // transactions on primaries.
+        if (opCtx->writesAreReplicated()) {
+            // Since this snapshot may reflect oplog holes, record the most visible timestamp before
+            // opening a storage transaction. This timestamp will be used later to detect any
+            // changes in the catalog after a storage transaction is opened.
+            opCtx->recoveryUnit()->setCatalogConflictingTimestamp(
+                opCtx->getServiceContext()->getStorageEngine()->getAllDurableTimestamp());
+        }
     }
 
     opCtx->recoveryUnit()->preallocateSnapshot();
@@ -651,13 +664,6 @@ TransactionParticipant::OplogSlotReserver::~OplogSlotReserver() {
         // side transaction.
         _recoveryUnit->abortUnitOfWork();
     }
-
-    // After releasing the oplog hole, the all_durable timestamp can advance past this oplog hole,
-    // if there are no other open holes. Check if we can advance the stable timestamp any further
-    // since a majority write may be waiting on the stable timestamp to advance beyond this oplog
-    // hole to acknowledge the write to the user.
-    auto replCoord = repl::ReplicationCoordinator::get(_opCtx);
-    replCoord->attemptToAdvanceStableTimestamp();
 }
 
 TransactionParticipant::TxnResources::TxnResources(WithLock wl,
@@ -669,7 +675,7 @@ TransactionParticipant::TxnResources::TxnResources(WithLock wl,
     _ruState = opCtx->getWriteUnitOfWork()->release();
     opCtx->setWriteUnitOfWork(nullptr);
 
-    _locker = opCtx->swapLockState(std::make_unique<LockerImpl>());
+    _locker = opCtx->swapLockState(std::make_unique<LockerImpl>(), wl);
     // Inherit the locking setting from the original one.
     opCtx->lockState()->setShouldConflictWithSecondaryBatchApplication(
         _locker->shouldConflictWithSecondaryBatchApplication());
@@ -702,6 +708,7 @@ TransactionParticipant::TxnResources::TxnResources(WithLock wl,
                            WriteUnitOfWork::RecoveryUnitState::kNotInUnitOfWork);
 
     _readConcernArgs = repl::ReadConcernArgs::get(opCtx);
+    _uncommittedCollections = UncommittedCollections::get(opCtx).shareResources();
 }
 
 TransactionParticipant::TxnResources::~TxnResources() {
@@ -762,8 +769,12 @@ void TransactionParticipant::TxnResources::release(OperationContext* opCtx) {
     // We intentionally do not capture the return value of swapLockState(), which is just an empty
     // locker. At the end of the operation, if the transaction is not complete, we will stash the
     // operation context's locker and replace it with a new empty locker.
-    opCtx->swapLockState(std::move(_locker));
+    opCtx->swapLockState(std::move(_locker), lk);
     opCtx->lockState()->updateThreadIdToCurrentThread();
+
+    // Transfer ownership of UncommittedCollections
+    UncommittedCollections::get(opCtx).receiveResources(_uncommittedCollections);
+    _uncommittedCollections = nullptr;
 
     auto oldState = opCtx->setRecoveryUnit(std::move(_recoveryUnit),
                                            WriteUnitOfWork::RecoveryUnitState::kNotInUnitOfWork);
@@ -833,6 +844,8 @@ void TransactionParticipant::Participant::_stashActiveTransaction(OperationConte
     }
 
     invariant(!o().txnResourceStash);
+    // If this is a prepared transaction, invariant that it does not hold the RSTL lock.
+    invariant(!o().txnState.isPrepared() || !opCtx->lockState()->isRSTLLocked());
     auto stashStyle = opCtx->writesAreReplicated() ? TxnResources::StashStyle::kPrimary
                                                    : TxnResources::StashStyle::kSecondary;
     o(lk).txnResourceStash = TxnResources(lk, opCtx, stashStyle);
@@ -1076,7 +1089,7 @@ Timestamp TransactionParticipant::Participant::prepareTransaction(
         transactionOperationUuids.insert(transactionOp.getUuid().get());
     }
     for (const auto& uuid : transactionOperationUuids) {
-        auto collection = CollectionCatalog::get(opCtx).lookupCollectionByUUID(uuid);
+        auto collection = CollectionCatalog::get(opCtx).lookupCollectionByUUID(opCtx, uuid);
         uassert(ErrorCodes::OperationNotSupportedInTransaction,
                 str::stream() << "prepareTransaction failed because one of the transaction "
                                  "operations was done against a temporary collection '"
@@ -1243,19 +1256,11 @@ void TransactionParticipant::Participant::commitUnpreparedTransaction(OperationC
     const size_t oplogOperationBytes = p().transactionOperationBytes;
     clearOperationsInMemory(opCtx);
 
-    try {
-        // Once committing we cannot throw an exception.
-        UninterruptibleLockGuard noInterrupt(opCtx->lockState());
-        _commitStorageTransaction(opCtx);
-        _finishCommitTransaction(opCtx, operationCount, oplogOperationBytes);
-    } catch (...) {
-        // It is illegal for committing a transaction to fail for any reason, other than an
-        // invalid command, so we crash instead.
-        severe() << "Caught exception during commit of unprepared transaction "
-                 << opCtx->getTxnNumber() << " on " << _sessionId().toBSON() << ": "
-                 << exceptionToStatus();
-        std::terminate();
-    }
+    // _commitStorageTransaction can throw, but it is safe for the exception to be bubbled up to
+    // the caller, since the transaction can still be safely aborted at this point.
+    _commitStorageTransaction(opCtx);
+
+    _finishCommitTransaction(opCtx, operationCount, oplogOperationBytes);
 
     if (needsNoopWrite) {
         performNoopWrite(
@@ -1384,7 +1389,7 @@ void TransactionParticipant::Participant::commitPreparedTransaction(
     }
 }
 
-void TransactionParticipant::Participant::_commitStorageTransaction(OperationContext* opCtx) try {
+void TransactionParticipant::Participant::_commitStorageTransaction(OperationContext* opCtx) {
     invariant(opCtx->getWriteUnitOfWork());
     invariant(opCtx->lockState()->isRSTLLocked());
     opCtx->getWriteUnitOfWork()->commit();
@@ -1397,16 +1402,10 @@ void TransactionParticipant::Participant::_commitStorageTransaction(OperationCon
                            WriteUnitOfWork::RecoveryUnitState::kNotInUnitOfWork);
 
     opCtx->lockState()->unsetMaxLockTimeout();
-} catch (...) {
-    // It is illegal for committing a storage-transaction to fail so we crash instead.
-    severe() << "Caught exception during commit of storage-transaction " << opCtx->getTxnNumber()
-             << " on " << _sessionId().toBSON() << ": " << exceptionToStatus();
-    std::terminate();
 }
 
-void TransactionParticipant::Participant::_finishCommitTransaction(OperationContext* opCtx,
-                                                                   size_t operationCount,
-                                                                   size_t oplogOperationBytes) {
+void TransactionParticipant::Participant::_finishCommitTransaction(
+    OperationContext* opCtx, size_t operationCount, size_t oplogOperationBytes) noexcept {
     {
         auto tickSource = opCtx->getServiceContext()->getTickSource();
         stdx::lock_guard<Client> lk(*opCtx->getClient());

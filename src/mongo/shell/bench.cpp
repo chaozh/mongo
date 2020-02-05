@@ -35,6 +35,7 @@
 
 #include <pcrecpp.h>
 
+#include "mongo/base/shim.h"
 #include "mongo/client/dbclient_cursor.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/query/cursor_response.h"
@@ -743,7 +744,11 @@ void BenchRunConfig::initializeFromBson(const BSONObj& args) {
     }
 }
 
-MONGO_DEFINE_SHIM(BenchRunConfig::createConnectionImpl);
+std::unique_ptr<DBClientBase> BenchRunConfig::createConnectionImpl(
+    const BenchRunConfig& benchRunConfig) {
+    static auto w = MONGO_WEAK_FUNCTION_DEFINITION(BenchRunConfig::createConnectionImpl);
+    return w(benchRunConfig);
+}
 
 std::unique_ptr<DBClientBase> BenchRunConfig::createConnection() const {
     return BenchRunConfig::createConnectionImpl(*this);
@@ -831,9 +836,9 @@ BenchRunWorker::BenchRunWorker(size_t id,
 
 BenchRunWorker::~BenchRunWorker() {
     try {
-        // We explicitly call join() on the started thread to ensure that any thread-local variables
-        // (e.g. 'currentClient' when running through mongoebench) have been destructed before
-        // returning from BenchRunWorker's destructor.
+        // We explicitly call join() on the started thread to ensure
+        // that any thread-local variables have been destructed
+        // before returning from BenchRunWorker's destructor.
         _thread.join();
     } catch (...) {
         severe() << "caught exception in destructor: " << exceptionToStatus();

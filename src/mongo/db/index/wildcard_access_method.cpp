@@ -42,7 +42,7 @@ WildcardAccessMethod::WildcardAccessMethod(IndexCatalogEntry* wildcardState,
     : AbstractIndexAccessMethod(wildcardState, std::move(btree)),
       _keyGen(_descriptor->keyPattern(),
               _descriptor->pathProjection(),
-              _btreeState->getCollator(),
+              _indexCatalogEntry->getCollator(),
               getSortedDataInterface()->getKeyStringVersion(),
               getSortedDataInterface()->getOrdering()) {}
 
@@ -54,6 +54,7 @@ bool WildcardAccessMethod::shouldMarkIndexAsMultikey(
 }
 
 void WildcardAccessMethod::doGetKeys(const BSONObj& obj,
+                                     GetKeysContext context,
                                      KeyStringSet* keys,
                                      KeyStringSet* multikeyMetadataKeys,
                                      MultikeyPaths* multikeyPaths,

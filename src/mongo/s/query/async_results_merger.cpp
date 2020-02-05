@@ -64,7 +64,11 @@ BSONObj extractSortKey(BSONObj obj, bool compareWholeSortKey) {
     if (compareWholeSortKey) {
         return key.wrap();
     }
-    invariant(key.type() == BSONType::Object);
+    // TODO (SERVER-43361): We expect the sort key to be an array, but if the sort key originated
+    // from a 4.2 mongod, it will be a document, instead. Either way, 'isABSONObj()' will return
+    // true, and 'compareSortKeys()' will behave the same way. After branching for 4.5, we can
+    // tighten this invariant to specifically require a 'BSONArray' type.
+    invariant(key.isABSONObj());
     return key.Obj();
 }
 
@@ -75,8 +79,8 @@ BSONObj extractSortKey(BSONObj obj, bool compareWholeSortKey) {
 int compareSortKeys(BSONObj leftSortKey, BSONObj rightSortKey, BSONObj sortKeyPattern) {
     // This does not need to sort with a collator, since mongod has already mapped strings to their
     // ICU comparison keys as part of the $sortKey meta projection.
-    const bool considerFieldName = false;
-    return leftSortKey.woCompare(rightSortKey, sortKeyPattern, considerFieldName);
+    const BSONObj::ComparisonRulesSet rules = 0;  // 'considerFieldNames' flag is not set.
+    return leftSortKey.woCompare(rightSortKey, sortKeyPattern, rules);
 }
 
 }  // namespace
@@ -102,7 +106,11 @@ AsyncResultsMerger::AsyncResultsMerger(OperationContext* opCtx,
     for (const auto& remote : _params.getRemotes()) {
         _remotes.emplace_back(remote.getHostAndPort(),
                               remote.getCursorResponse().getNSS(),
-                              remote.getCursorResponse().getCursorId());
+                              remote.getCursorResponse().getCursorId(),
+                              remote.getCursorResponse().getPartialResultsReturned());
+
+        // A remote cannot be flagged as 'partialResultsReturned' if 'allowPartialResults' is false.
+        invariant(!(_remotes.back().partialResultsReturned && !_params.getAllowPartialResults()));
 
         // We don't check the return value of _addBatchToBuffer here; if there was an error,
         // it will be stored in the remote and the first call to ready() will return true.
@@ -183,21 +191,45 @@ void AsyncResultsMerger::addNewShardCursors(std::vector<RemoteCursor>&& newCurso
         const auto newIndex = _remotes.size();
         _remotes.emplace_back(remote.getHostAndPort(),
                               remote.getCursorResponse().getNSS(),
-                              remote.getCursorResponse().getCursorId());
+                              remote.getCursorResponse().getCursorId(),
+                              remote.getCursorResponse().getPartialResultsReturned());
         _addBatchToBuffer(lk, newIndex, remote.getCursorResponse());
     }
 }
 
+bool AsyncResultsMerger::partialResultsReturned() const {
+    stdx::lock_guard<Latch> lk(_mutex);
+    return std::any_of(_remotes.begin(), _remotes.end(), [](const auto& remote) {
+        return remote.partialResultsReturned;
+    });
+}
+
+std::size_t AsyncResultsMerger::getNumRemotes() const {
+    // Take the lock to guard against shard additions or disconnections.
+    stdx::lock_guard<Latch> lk(_mutex);
+
+    // If 'allowPartialResults' is false, the number of participating remotes is constant.
+    if (!_params.getAllowPartialResults()) {
+        return _remotes.size();
+    }
+    // Otherwise, discount remotes which failed to connect or disconnected prematurely.
+    return std::count_if(_remotes.begin(), _remotes.end(), [](const auto& remote) {
+        return !remote.partialResultsReturned;
+    });
+}
+
 BSONObj AsyncResultsMerger::getHighWaterMark() {
     stdx::lock_guard<Latch> lk(_mutex);
+    // At this point, the high water mark may be the resume token of the last document we returned.
+    // If no further results are eligible for return, we advance to the minimum promised sort key.
     auto minPromisedSortKey = _getMinPromisedSortKey(lk);
     if (!minPromisedSortKey.isEmpty() && !_ready(lk)) {
-        // When 'minPromisedSortKey' contains the "high watermark" resume token, it's stored in
-        // sort-key format: {"": <high watermark>}. We copy the <high watermark> part of of the
-        // sort key, which looks like {_data: ..., _typeBits: ...}, and return that.
-        _highWaterMark = minPromisedSortKey.firstElement().Obj().getOwned();
+        _highWaterMark = minPromisedSortKey;
     }
-    return _highWaterMark;
+    // The high water mark is stored in sort-key format: {"": <high watermark>}. We only return
+    // the <high watermark> part of of the sort key, which looks like {_data: ..., _typeBits: ...}.
+    invariant(_highWaterMark.isEmpty() || _highWaterMark.firstElement().type() == BSONType::Object);
+    return _highWaterMark.isEmpty() ? BSONObj() : _highWaterMark.firstElement().Obj().getOwned();
 }
 
 BSONObj AsyncResultsMerger::_getMinPromisedSortKey(WithLock) {
@@ -579,14 +611,14 @@ void AsyncResultsMerger::_cleanUpFailedBatch(WithLock lk, Status status, size_t 
     //
     // The ExchangePassthrough error code is an internal-only error code used specifically to
     // communicate that an error has occurred, but some other thread is responsible for returning
-    // the error to the user. In order to avoid polluting the user's error message, we ingore such
+    // the error to the user. In order to avoid polluting the user's error message, we ignore such
     // errors with the expectation that all outstanding cursors will be closed promptly.
     if (_params.getAllowPartialResults() || remote.status == ErrorCodes::ExchangePassthrough) {
-        remote.status = Status::OK();
-
-        // Clear the results buffer and cursor id.
+        // Clear the results buffer and cursor id, and set 'partialResultsReturned' if appropriate.
+        remote.partialResultsReturned = (remote.status != ErrorCodes::ExchangePassthrough);
         std::queue<ClusterQueryResult> emptyBuffer;
         std::swap(remote.docBuffer, emptyBuffer);
+        remote.status = Status::OK();
         remote.cursorId = 0;
     }
 }
@@ -651,7 +683,7 @@ bool AsyncResultsMerger::_addBatchToBuffer(WithLock lk,
                            str::stream() << "Missing field '" << AsyncResultsMerger::kSortKeyField
                                          << "' in document: " << obj);
                 return false;
-            } else if (!_params.getCompareWholeSortKey() && key.type() != BSONType::Object) {
+            } else if (!_params.getCompareWholeSortKey() && !key.isABSONObj()) {
                 remote.status =
                     Status(ErrorCodes::InternalError,
                            str::stream() << "Field '" << AsyncResultsMerger::kSortKeyField
@@ -758,10 +790,15 @@ executor::TaskExecutor::EventHandle AsyncResultsMerger::kill(OperationContext* o
 
 AsyncResultsMerger::RemoteCursorData::RemoteCursorData(HostAndPort hostAndPort,
                                                        NamespaceString cursorNss,
-                                                       CursorId establishedCursorId)
+                                                       CursorId establishedCursorId,
+                                                       bool partialResultsReturned)
     : cursorId(establishedCursorId),
       cursorNss(std::move(cursorNss)),
-      shardHostAndPort(std::move(hostAndPort)) {}
+      shardHostAndPort(std::move(hostAndPort)),
+      partialResultsReturned(partialResultsReturned) {
+    // If the 'partialResultsReturned' flag is set, the cursorId must be zero (closed).
+    invariant(!(partialResultsReturned && cursorId != 0));
+}
 
 const HostAndPort& AsyncResultsMerger::RemoteCursorData::getTargetHost() const {
     return shardHostAndPort;

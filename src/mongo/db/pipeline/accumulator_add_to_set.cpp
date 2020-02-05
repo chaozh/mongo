@@ -34,6 +34,7 @@
 #include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/pipeline/accumulation_statement.h"
 #include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/query/query_knobs_gen.h"
 
 namespace mongo {
 
@@ -47,26 +48,29 @@ const char* AccumulatorAddToSet::getOpName() const {
 }
 
 void AccumulatorAddToSet::processInternal(const Value& input, bool merging) {
+    auto addValue = [this](auto&& val) {
+        bool inserted = _set.insert(val).second;
+        if (inserted) {
+            _memUsageBytes += val.getApproximateSize();
+            uassert(ErrorCodes::ExceededMemoryLimit,
+                    str::stream()
+                        << "$addToSet used too much memory and cannot spill to disk. Memory limit: "
+                        << _maxMemUsageBytes << " bytes",
+                    _memUsageBytes < _maxMemUsageBytes);
+        }
+    };
     if (!merging) {
         if (!input.missing()) {
-            bool inserted = _set.insert(input).second;
-            if (inserted) {
-                _memUsageBytes += input.getApproximateSize();
-            }
+            addValue(input);
         }
     } else {
-        // If we're merging, we need to take apart the arrays we
-        // receive and put their elements into the array we are collecting.
-        // If we didn't, then we'd get an array of arrays, with one array
-        // from each merge source.
-        verify(input.getType() == Array);
+        // If we're merging, we need to take apart the arrays we receive and put their elements into
+        // the array we are collecting.  If we didn't, then we'd get an array of arrays, with one
+        // array from each merge source.
+        invariant(input.getType() == Array);
 
-        const vector<Value>& array = input.getArray();
-        for (size_t i = 0; i < array.size(); i++) {
-            bool inserted = _set.insert(array[i]).second;
-            if (inserted) {
-                _memUsageBytes += array[i].getApproximateSize();
-            }
+        for (auto&& val : input.getArray()) {
+            addValue(val);
         }
     }
 }
@@ -75,8 +79,11 @@ Value AccumulatorAddToSet::getValue(bool toBeMerged) {
     return Value(vector<Value>(_set.begin(), _set.end()));
 }
 
-AccumulatorAddToSet::AccumulatorAddToSet(const boost::intrusive_ptr<ExpressionContext>& expCtx)
-    : Accumulator(expCtx), _set(expCtx->getValueComparator().makeUnorderedValueSet()) {
+AccumulatorAddToSet::AccumulatorAddToSet(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                                         boost::optional<int> maxMemoryUsageBytes)
+    : Accumulator(expCtx),
+      _set(expCtx->getValueComparator().makeUnorderedValueSet()),
+      _maxMemUsageBytes(maxMemoryUsageBytes.value_or(internalQueryMaxAddToSetBytes.load())) {
     _memUsageBytes = sizeof(*this);
 }
 
@@ -87,7 +94,7 @@ void AccumulatorAddToSet::reset() {
 
 intrusive_ptr<Accumulator> AccumulatorAddToSet::create(
     const boost::intrusive_ptr<ExpressionContext>& expCtx) {
-    return new AccumulatorAddToSet(expCtx);
+    return new AccumulatorAddToSet(expCtx, boost::none);
 }
 
 }  // namespace mongo

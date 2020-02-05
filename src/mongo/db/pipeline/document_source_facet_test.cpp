@@ -541,22 +541,11 @@ TEST_F(DocumentSourceFacetTest, ShouldOptimizeInnerPipelines) {
     ASSERT_TRUE(dummy->isOptimized);
 }
 
-/**
- * An implementation of the MongoProcessInterface that is okay with changing the OperationContext,
- * but has no other parts of the interface implemented.
- */
-class StubMongoProcessOkWithOpCtxChanges : public StubMongoProcessInterface {
-public:
-    void setOperationContext(OperationContext* opCtx) final {
-        return;
-    }
-};
-
 TEST_F(DocumentSourceFacetTest, ShouldPropagateDetachingAndReattachingOfOpCtx) {
     auto ctx = getExpCtx();
     // We're going to be changing the OperationContext, so we need to use a MongoProcessInterface
     // that won't throw when we do so.
-    ctx->mongoProcessInterface = std::make_unique<StubMongoProcessOkWithOpCtxChanges>();
+    ctx->mongoProcessInterface = std::make_unique<StubMongoProcessInterface>();
 
     auto firstDummy = DocumentSourcePassthrough::create();
     auto firstPipeline = unittest::assertGet(Pipeline::createFacetPipeline({firstDummy}, ctx));
@@ -713,7 +702,7 @@ TEST_F(DocumentSourceFacetTest, ShouldRequireTextScoreIfAnyPipelineRequiresTextS
     facets.emplace_back("needsTextScore", std::move(thirdPipeline));
     auto facetStage = DocumentSourceFacet::create(std::move(facets), ctx);
 
-    DepsTracker deps(DepsTracker::kOnlyTextScore);
+    DepsTracker deps(DepsTracker::kAllMetadata & ~DepsTracker::kOnlyTextScore);
     ASSERT_EQ(facetStage->getDependencies(&deps), DepsTracker::State::EXHAUSTIVE_ALL);
     ASSERT_TRUE(deps.needWholeDocument);
     ASSERT_TRUE(deps.getNeedsMetadata(DocumentMetadataFields::kTextScore));
@@ -733,7 +722,7 @@ TEST_F(DocumentSourceFacetTest, ShouldThrowIfAnyPipelineRequiresTextScoreButItIs
     facets.emplace_back("needsTextScore", std::move(secondPipeline));
     auto facetStage = DocumentSourceFacet::create(std::move(facets), ctx);
 
-    DepsTracker deps(DepsTracker::kNoMetadata);
+    DepsTracker deps(DepsTracker::kAllMetadata);
     ASSERT_THROWS(facetStage->getDependencies(&deps), AssertionException);
 }
 

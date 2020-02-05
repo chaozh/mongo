@@ -35,6 +35,7 @@
 #include "mongo/bson/timestamp.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/repl/is_master_response.h"
+#include "mongo/db/repl/isself.h"
 #include "mongo/db/repl/read_concern_args.h"
 #include "mongo/db/repl/sync_source_resolver.h"
 #include "mongo/db/write_concern_options.h"
@@ -81,6 +82,10 @@ void ReplicationCoordinatorMock::enterTerminalShutdown() {
 }
 
 void ReplicationCoordinatorMock::shutdown(OperationContext*) {
+    // TODO
+}
+
+void ReplicationCoordinatorMock::markAsCleanShutdownIfPossible(OperationContext*) {
     // TODO
 }
 
@@ -343,15 +348,6 @@ Status ReplicationCoordinatorMock::processReplSetGetStatus(BSONObjBuilder*,
     return Status::OK();
 }
 
-void ReplicationCoordinatorMock::fillIsMasterForReplSet(IsMasterResponse* result,
-                                                        const SplitHorizon::Parameters&) {
-    result->setReplSetVersion(_getConfigReturnValue.getConfigVersion());
-    result->setIsMaster(true);
-    result->setIsSecondary(false);
-    result->setMe(_getConfigReturnValue.getMemberAt(0).getHostAndPort());
-    result->setElectionId(OID::gen());
-}
-
 void ReplicationCoordinatorMock::appendSlaveInfoData(BSONObjBuilder* result) {}
 
 void ReplicationCoordinatorMock::appendConnectionStats(executor::ConnectionPoolStats* stats) const {
@@ -478,7 +474,7 @@ bool ReplicationCoordinatorMock::getWriteConcernMajorityShouldJournal() {
     return true;
 }
 
-long long ReplicationCoordinatorMock::getTerm() {
+long long ReplicationCoordinatorMock::getTerm() const {
     return _term;
 }
 
@@ -557,6 +553,33 @@ void ReplicationCoordinatorMock::updateAndLogStateTransitionMetrics(
     const size_t numOpsKilled,
     const size_t numOpsRunning) const {
     return;
+}
+
+TopologyVersion ReplicationCoordinatorMock::getTopologyVersion() const {
+    return TopologyVersion(repl::instanceId, 0);
+}
+
+void ReplicationCoordinatorMock::incrementTopologyVersion(OperationContext* opCtx) {
+    return;
+}
+
+std::shared_ptr<const IsMasterResponse> ReplicationCoordinatorMock::awaitIsMasterResponse(
+    OperationContext* opCtx,
+    const SplitHorizon::Parameters& horizonParams,
+    boost::optional<TopologyVersion> clientTopologyVersion,
+    boost::optional<Date_t> deadline) const {
+    auto response = std::make_shared<IsMasterResponse>();
+    response->setReplSetVersion(_getConfigReturnValue.getConfigVersion());
+    response->setIsMaster(true);
+    response->setIsSecondary(false);
+    response->setMe(_getConfigReturnValue.getMemberAt(0).getHostAndPort());
+    response->setElectionId(OID::gen());
+    response->setTopologyVersion(TopologyVersion(repl::instanceId, 0));
+    return response;
+}
+
+OpTime ReplicationCoordinatorMock::getLatestWriteOpTime(OperationContext* opCtx) const {
+    return getMyLastAppliedOpTime();
 }
 
 }  // namespace repl

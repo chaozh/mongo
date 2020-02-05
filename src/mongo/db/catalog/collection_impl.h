@@ -44,6 +44,7 @@ public:
 
     explicit CollectionImpl(OperationContext* opCtx,
                             const NamespaceString& nss,
+                            RecordId catalogId,
                             UUID uuid,
                             std::unique_ptr<RecordStore> recordStore);
 
@@ -53,6 +54,7 @@ public:
     public:
         std::unique_ptr<Collection> make(OperationContext* opCtx,
                                          const NamespaceString& nss,
+                                         RecordId catalogId,
                                          CollectionUUID uuid,
                                          std::unique_ptr<RecordStore> rs) const final;
     };
@@ -62,6 +64,10 @@ public:
     }
 
     void setNs(NamespaceString nss) final;
+
+    RecordId getCatalogId() const {
+        return _catalogId;
+    }
 
     UUID uuid() const {
         return _uuid;
@@ -282,6 +288,16 @@ public:
 
     uint64_t dataSize(OperationContext* opCtx) const final;
 
+    /**
+     * Currently fast counts are prone to false negative as it is not tolerant to unclean shutdowns.
+     * So, verify that the collection is really empty by opening the collection cursor and reading
+     * the first document.
+     * Expects to hold at least collection lock in mode IS.
+     * TODO SERVER-24266: After making fast counts tolerant to unclean shutdowns, we can make use of
+     * fast count to determine whether the collection is empty and remove cursor checking logic.
+     */
+    bool isEmpty(OperationContext* opCtx) const final;
+
     inline int averageObjectSize(OperationContext* opCtx) const {
         uint64_t n = numRecords(opCtx);
 
@@ -357,6 +373,7 @@ private:
                             OpDebug* opDebug);
 
     NamespaceString _ns;
+    RecordId _catalogId;
     UUID _uuid;
 
     // The RecordStore may be null during a repair operation.
@@ -371,11 +388,17 @@ private:
     // If null, the default collation is simple binary compare.
     std::unique_ptr<CollatorInterface> _collator;
 
-    // Empty means no filter.
+    // Empty means no validator.
     BSONObj _validatorDoc;
 
-    // Points into _validatorDoc. Null means no filter.
-    std::unique_ptr<MatchExpression> _validator;
+    // The collection validator MatchExpression. This is stored as a StatusWith, as we lazily
+    // enforce that collection validators are well formed.
+    // -A non-OK Status indicates that the validator is not well formed, and any attempts to enforce
+    // the validator (inserts) should error.
+    // -A value of {nullptr} indicates that there is no validator.
+    // -Anything else indicates a well formed validator. The MatchExpression will maintain
+    // pointers into _validatorDoc.
+    StatusWithMatchExpression _swValidator;
 
     ValidationAction _validationAction;
     ValidationLevel _validationLevel;

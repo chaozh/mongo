@@ -57,6 +57,7 @@
 #include "mongo/util/exit_code.h"
 #include "mongo/util/log.h"
 #include "mongo/util/quick_exit.h"
+#include "mongo/util/signal_handlers.h"
 #include "mongo/util/stacktrace.h"
 #include "mongo/util/text.h"
 
@@ -182,7 +183,7 @@ void writeMallocFreeStreamToLog() {
 // must hold MallocFreeOStreamGuard to call
 void printSignalAndBacktrace(int signalNum) {
     mallocFreeOStream << "Got signal: " << signalNum << " (" << strsignal(signalNum) << ").\n";
-    printStackTraceFromSignal(mallocFreeOStream);
+    printStackTrace(mallocFreeOStream);
     writeMallocFreeStreamToLog();
 }
 
@@ -337,7 +338,10 @@ void setupSynchronousSignalHandlers() {
             fassertFailed(31334);
         }
     }
-    setupSIGTRAPforGDB();
+    setupSIGTRAPforDebugger();
+#if defined(MONGO_STACKTRACE_CAN_DUMP_ALL_THREADS)
+    setupStackTraceSignalAction(stackTraceSignal());
+#endif
 #endif
 }
 
@@ -356,4 +360,13 @@ void clearSignalMask() {
     invariant(sigprocmask(SIG_SETMASK, &unblockSignalMask, nullptr) == 0);
 #endif
 }
+
+#ifdef __linux__
+
+int stackTraceSignal() {
+    return SIGUSR2;
+}
+
+#endif
+
 }  // namespace mongo

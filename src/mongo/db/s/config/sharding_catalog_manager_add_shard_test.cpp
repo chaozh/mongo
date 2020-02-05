@@ -76,11 +76,7 @@ protected:
      * the client name.
      */
     void setUp() override {
-        ConfigServerTestFixture::setUp();
-
-        // Make sure clusterID is written to the config.version collection.
-        ASSERT_OK(ShardingCatalogManager::get(operationContext())
-                      ->initializeConfigDatabaseIfNeeded(operationContext()));
+        setUpAndInitializeConfigDb();
 
         auto clusterIdLoader = ClusterIdentityLoader::get(operationContext());
         ASSERT_OK(clusterIdLoader->loadClusterId(operationContext(),
@@ -361,8 +357,7 @@ TEST_F(AddShardTest, CreateShardIdentityUpsertForAddShard) {
         << "writeConcern"
         << BSON("w"
                 << "majority"
-                << "wtimeout" << 60000)
-        << "allowImplicitCollectionCreation" << false);
+                << "wtimeout" << 60000));
     auto addShardCmd = add_shard_util::createAddShardCmd(operationContext(), shardName);
     auto actualBSON = add_shard_util::createShardIdentityUpsertForAddShard(addShardCmd);
     ASSERT_BSONOBJ_EQ(expectedBSON, actualBSON);

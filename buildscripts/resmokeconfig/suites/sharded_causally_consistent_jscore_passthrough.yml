@@ -1,5 +1,4 @@
 test_kind: js_test
-use_in_multiversion_burn_in_tests: true
 # This suite's blacklist is a sharded_collections_jscore_passthrough blacklist with some additions
 # from causally_consistent_jscore_passthrough blacklist.
 
@@ -60,23 +59,11 @@ selector:
   - jstests/core/no_db_created.js
   - jstests/core/views/*.js # Views tests aren't expected to work when collections are implicitly sharded.
   - jstests/core/killop_drop_collection.js # Uses fsyncLock.
-  # mapReduce requires sharded output collections to be sharded by {_id: 1}. {_id: "hashed"} is not
-  # supported.
-  - jstests/core/mr_correctness.js
-  - jstests/core/mr_fail_invalid_js.js
-  - jstests/core/mr_scope.js
-  - jstests/core/mr_undef.js
-  # TODO: SERVER-30052
-  - jstests/core/queryoptimizer3.js
-  # TODO: SERVER-27269: mongos can't establish cursor if view has $collStats and views another view.
-  - jstests/core/views/views_coll_stats.js
   # Tests that need triaging & remediation | blacklist decision
   # Comments list possible problem point under review.
   - jstests/core/stages_delete.js # Uses stageDebug command for deletes.
   # Tests that fail for Causal Consistency as they have statements that do not support
   # non-local read concern.
-  - jstests/core/geo_mapreduce.js
-  - jstests/core/geo_mapreduce2.js
   - jstests/core/geo_big_polygon3.js
   - jstests/core/mr*.js
   - jstests/core/collation.js
@@ -86,27 +73,6 @@ selector:
   - jstests/core/views/views_all_commands.js
   - jstests/core/or4.js
   - jstests/core/recursion.js
-  # Tests that fail for Causal Consistency with default injected readPreference 'secondary'
-  # "TODO SERVER-30384: These tests assume that documents are returned in the same order they are
-  # written when no sort is specified; however, the order of documents within a collection can
-  # be different across a primary and secondary."
-  - jstests/core/coveredIndex1.js
-  - jstests/core/distinct1.js
-  - jstests/core/elemMatchProjection.js
-  - jstests/core/find4.js
-  - jstests/core/find5.js
-  - jstests/core/fts1.js
-  - jstests/core/find_dedup.js
-  - jstests/core/fts_spanish.js
-  - jstests/core/geo_distinct.js
-  - jstests/core/geo_s2ordering.js
-  - jstests/core/nan.js
-  - jstests/core/not2.js
-  - jstests/core/sorta.js
-  - jstests/core/sortc.js
-  - jstests/core/sort3.js
-  - jstests/core/sort4.js
-  - jstests/core/ord.js
   # Parallel shell is not causally consistent
   - jstests/core/benchrun_pipeline_updates.js
   - jstests/core/cursora.js
@@ -189,8 +155,5 @@ executor:
           replication:
             heartbeats: 2
     num_rs_nodes_per_shard: 2
-    # TODO SERVER-32572 remove voting_secondaries: true
-    shard_options:
-      voting_secondaries: true
     enable_sharding:
     - test

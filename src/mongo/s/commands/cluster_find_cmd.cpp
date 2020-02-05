@@ -63,6 +63,15 @@ std::unique_ptr<QueryRequest> parseCmdObjectToQueryRequest(OperationContext* opC
                                                            bool isExplain) {
     auto qr = uassertStatusOK(
         QueryRequest::makeFromFindCommand(std::move(nss), std::move(cmdObj), isExplain));
+    if (qr->getReadConcern().isEmpty()) {
+        if (opCtx->isStartingMultiDocumentTransaction() || !opCtx->inMultiDocumentTransaction()) {
+            // If there is no explicit readConcern in the cmdObj, and this is either the first
+            // operation in a transaction, or not running in a transaction, then use the readConcern
+            // from the opCtx (which may be a cluster-wide default).
+            const auto& readConcernArgs = repl::ReadConcernArgs::get(opCtx);
+            qr->setReadConcern(readConcernArgs.toBSON()["readConcern"].Obj());
+        }
+    }
     uassert(
         51202, "Cannot specify runtime constants option to a mongos", !qr->getRuntimeConstants());
     qr->setRuntimeConstants(Variables::generateRuntimeConstants(opCtx));
@@ -113,8 +122,7 @@ public:
         }
 
         ReadConcernSupportResult supportsReadConcern(repl::ReadConcernLevel level) const final {
-            return {ReadConcernSupportResult::ReadConcern::kSupported,
-                    ReadConcernSupportResult::DefaultReadConcern::kPermitted};
+            return ReadConcernSupportResult::allSupportedAndDefaultPermitted();
         }
 
         NamespaceString ns() const override {
@@ -213,9 +221,10 @@ public:
             try {
                 // Do the work to generate the first batch of results. This blocks waiting to get
                 // responses from the shard(s).
+                bool partialResultsReturned = false;
                 std::vector<BSONObj> batch;
-                auto cursorId =
-                    ClusterFind::runQuery(opCtx, *cq, ReadPreferenceSetting::get(opCtx), &batch);
+                auto cursorId = ClusterFind::runQuery(
+                    opCtx, *cq, ReadPreferenceSetting::get(opCtx), &batch, &partialResultsReturned);
 
                 // Build the response document.
                 CursorResponseBuilder::Options options;
@@ -224,6 +233,7 @@ public:
                 for (const auto& obj : batch) {
                     firstBatch.append(obj);
                 }
+                firstBatch.setPartialResultsReturned(partialResultsReturned);
                 firstBatch.done(cursorId, cq->ns());
             } catch (const ExceptionFor<ErrorCodes::CommandOnShardedViewNotSupportedOnMongod>& ex) {
                 result->reset();

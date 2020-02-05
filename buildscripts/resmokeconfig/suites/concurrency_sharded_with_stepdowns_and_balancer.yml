@@ -26,7 +26,7 @@ selector:
   - jstests/concurrency/fsm_workloads/agg_graph_lookup.js
   - jstests/concurrency/fsm_workloads/view_catalog_cycle_lookup.js
 
-  # Disabled pending investigation in SERVER-43251.
+  # Disabled because MapReduce can lose cursors if the primary steps down during the operation.
   - jstests/concurrency/fsm_workloads/map_reduce_inline.js
   - jstests/concurrency/fsm_workloads/map_reduce_interrupt.js
   - jstests/concurrency/fsm_workloads/map_reduce_merge.js
@@ -134,6 +134,7 @@ selector:
   - jstests/concurrency/fsm_workloads/yield_sort.js
   - jstests/concurrency/fsm_workloads/yield_sort_merge.js
   - jstests/concurrency/fsm_workloads/yield_text.js
+  - jstests/concurrency/fsm_workloads/yield_with_drop.js
 
   # Uses non retryable writes.
   - jstests/concurrency/fsm_workloads/remove_and_bulk_insert.js
@@ -178,6 +179,9 @@ selector:
   - jstests/concurrency/fsm_workloads/snapshot_read_kill_op_only.js
   - jstests/concurrency/fsm_workloads/snapshot_read_kill_operations.js
 
+  # SERVER-44160 Modify cleanupOrphaned to wait for overlapping ranges to finish
+  - jstests/concurrency/fsm_workloads/cleanupOrphanedWhileMigrating.js
+
   exclude_with_any_tags:
   - assumes_balancer_off
   - requires_replication
@@ -220,7 +224,6 @@ executor:
       replset_config_options:
         settings:
           catchUpTimeoutMillis: 0
-      voting_secondaries: true
     shard_options:
       all_nodes_electable: true
       mongod_options:
@@ -228,7 +231,6 @@ executor:
       replset_config_options:
         settings:
           catchUpTimeoutMillis: 0
-      voting_secondaries: true
     mongod_options:
       set_parameters:
         enableTestCommands: 1

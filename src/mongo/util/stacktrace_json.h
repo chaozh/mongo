@@ -36,28 +36,49 @@
 #include "mongo/bson/bsonelement.h"
 #include "mongo/util/stacktrace.h"
 
-namespace mongo::stacktrace_detail {
+namespace mongo::stack_trace_detail {
 
 /**
  * A utility for uint64_t <=> uppercase hex string conversions. It
  * can be used to produce a StringData.
  *
- *     sink << Hex(x).str();  // as a temporary
+ *     sink << Hex(x);  // as a temporary
  *
  *     Hex hx(x);
- *     StringData sd = hx.str()  // sd storage is in `hx`.
+ *     StringData sd = hx;  // sd storage is in `hx`.
  */
 class Hex {
 public:
-    using Buf = std::array<char, 16>;
+    using Buf = std::array<char, 18>;  // 64/4 hex digits plus potential "0x"
 
-    static StringData toHex(uint64_t x, Buf& buf);
+    static StringData toHex(uint64_t x, Buf& buf, bool showBase = false);
 
     static uint64_t fromHex(StringData s);
 
-    explicit Hex(uint64_t x) : _str(toHex(x, _buf)) {}
+    explicit Hex(uint64_t x, bool showBase = false) : _str{toHex(x, _buf, showBase)} {}
+    explicit Hex(const void* x, bool showBase = false)
+        : Hex{reinterpret_cast<uintptr_t>(x), showBase} {}
 
-    StringData str() const {
+    operator StringData() const {
+        return _str;
+    }
+
+private:
+    Buf _buf;
+    StringData _str;
+};
+
+class Dec {
+public:
+    using Buf = std::array<char, 20>;  // ceil(64*log10(2))
+
+    static StringData toDec(uint64_t x, Buf& buf);
+
+    static uint64_t fromDec(StringData s);
+
+    explicit Dec(uint64_t x) : _str(toDec(x, _buf)) {}
+
+    operator StringData() const {
         return _str;
     }
 
@@ -77,6 +98,14 @@ public:
     Value doc();
 
 private:
+    void indent() {
+        ++_indent;
+    }
+    void dedent() {
+        --_indent;
+    }
+
+    int _indent = 0;
     StackTraceSink& _sink;
 };
 
@@ -121,6 +150,14 @@ public:
      */
     void append(const BSONElement& be);
 
+    CheapJson* env() const {
+        return _env;
+    }
+
+    void setPretty(bool newPretty) {
+        _pretty = newPretty;
+    }
+
 private:
     enum Kind {
         kNop,  // A blank Value, not an aggregate, emits no punctuation. Can emit one element.
@@ -130,12 +167,15 @@ private:
 
     /* Emit the opening brace corresponding to the specified `k`. */
     Value(CheapJson* env, Kind k);
+    Value(const Value& parent, Kind k);
     void _copyBsonElementValue(const BSONElement& be);
     void _next();
 
+    const Value* _parent = nullptr;
     CheapJson* _env;
     Kind _kind;
-    StringData _sep;  // Emitted upon append. Starts empty, then set to ",".
+    StringData _sep;      // Emitted upon append. Starts empty, then set to ",".
+    bool _pretty{false};  // inherited from parent, but can override.
 };
 
-}  // namespace mongo::stacktrace_detail
+}  // namespace mongo::stack_trace_detail

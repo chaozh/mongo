@@ -53,6 +53,7 @@
 #include "mongo/transport/message_compressor_manager.h"
 #include "mongo/transport/session.h"
 #include "mongo/transport/transport_layer.h"
+#include "mongo/util/hierarchical_acquisition.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
@@ -195,7 +196,7 @@ public:
      *
      * This is the only method that is allowed to be called from other threads.
      */
-    void shutdownAndDisallowReconnect();
+    virtual void shutdownAndDisallowReconnect();
 
     void setWireVersions(int minWireVersion, int maxWireVersion) {
         _minWireVersion = minWireVersion;
@@ -228,7 +229,7 @@ public:
     }
 
     void say(Message& toSend, bool isRetry = false, std::string* actualServer = nullptr) override;
-    bool recv(Message& m, int lastRequestId) override;
+    Status recv(Message& m, int lastRequestId) override;
     void checkResponse(const std::vector<BSONObj>& batch,
                        bool networkError,
                        bool* retry = nullptr,
@@ -243,6 +244,10 @@ public:
     void setSoTimeout(double timeout);
     double getSoTimeout() const override {
         return _socketTimeout.value_or(Milliseconds{0}).count() / 1000.0;
+    }
+
+    void setHandshakeValidationHook(const HandshakeValidationHook& hook) {
+        _hook = hook;
     }
 
     bool lazySupported() const override {
@@ -293,7 +298,8 @@ protected:
     // rebind the handle from the owning thread. The thread that owns this DBClientConnection is
     // allowed to use the _session without locking the mutex. This mutex also guards writes to
     // _stayFailed, although reads are allowed outside the mutex.
-    Mutex _sessionMutex = MONGO_MAKE_LATCH("DBClientConnection::_sessionMutex");
+    Mutex _sessionMutex =
+        MONGO_MAKE_LATCH(HierarchicalAcquisitionLevel(0), "DBClientConnection::_sessionMutex");
     transport::SessionHandle _session;
     boost::optional<Milliseconds> _socketTimeout;
     transport::Session::TagMask _tagMask = transport::Session::kEmptyTagMask;

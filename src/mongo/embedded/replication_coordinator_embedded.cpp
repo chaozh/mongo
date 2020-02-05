@@ -53,6 +53,8 @@ void ReplicationCoordinatorEmbedded::enterTerminalShutdown() {}
 
 void ReplicationCoordinatorEmbedded::shutdown(OperationContext* opCtx) {}
 
+void ReplicationCoordinatorEmbedded::markAsCleanShutdownIfPossible(OperationContext* opCtx) {}
+
 const ReplSettings& ReplicationCoordinatorEmbedded::getSettings() const {
     static ReplSettings _settings;
     return _settings;
@@ -152,7 +154,7 @@ void ReplicationCoordinatorEmbedded::appendConnectionStats(
 }
 
 MemberState ReplicationCoordinatorEmbedded::getMemberState() const {
-    UASSERT_NOT_IMPLEMENTED;
+    return MemberState::RS_PRIMARY;
 }
 
 std::vector<repl::MemberData> ReplicationCoordinatorEmbedded::getMemberData() const {
@@ -304,11 +306,6 @@ Status ReplicationCoordinatorEmbedded::processReplSetGetStatus(BSONObjBuilder*,
     UASSERT_NOT_IMPLEMENTED;
 }
 
-void ReplicationCoordinatorEmbedded::fillIsMasterForReplSet(IsMasterResponse*,
-                                                            const SplitHorizon::Parameters&) {
-    UASSERT_NOT_IMPLEMENTED;
-}
-
 void ReplicationCoordinatorEmbedded::appendSlaveInfoData(BSONObjBuilder*) {
     UASSERT_NOT_IMPLEMENTED;
 }
@@ -441,7 +438,7 @@ Status ReplicationCoordinatorEmbedded::processHeartbeatV1(const ReplSetHeartbeat
     UASSERT_NOT_IMPLEMENTED;
 }
 
-long long ReplicationCoordinatorEmbedded::getTerm() {
+long long ReplicationCoordinatorEmbedded::getTerm() const {
     UASSERT_NOT_IMPLEMENTED;
 }
 
@@ -491,6 +488,26 @@ void ReplicationCoordinatorEmbedded::updateAndLogStateTransitionMetrics(
     const size_t numOpsKilled,
     const size_t numOpsRunning) const {
     UASSERT_NOT_IMPLEMENTED;
+}
+
+TopologyVersion ReplicationCoordinatorEmbedded::getTopologyVersion() const {
+    UASSERT_NOT_IMPLEMENTED;
+}
+
+void ReplicationCoordinatorEmbedded::incrementTopologyVersion(OperationContext* opCtx) {
+    UASSERT_NOT_IMPLEMENTED;
+}
+
+std::shared_ptr<const repl::IsMasterResponse> ReplicationCoordinatorEmbedded::awaitIsMasterResponse(
+    OperationContext* opCtx,
+    const repl::SplitHorizon::Parameters& horizonParams,
+    boost::optional<TopologyVersion> previous,
+    boost::optional<Date_t> deadline) const {
+    UASSERT_NOT_IMPLEMENTED;
+};
+
+OpTime ReplicationCoordinatorEmbedded::getLatestWriteOpTime(OperationContext* opCtx) const {
+    return getMyLastAppliedOpTime();
 }
 
 }  // namespace embedded

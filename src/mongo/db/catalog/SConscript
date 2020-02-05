@@ -124,6 +124,19 @@ env.Library(
 )
 
 env.Library(
+    target='index_build_oplog_entry',
+    source=[
+        "index_build_oplog_entry.cpp",
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
+        "$BUILD_DIR/mongo/bson/util/bson_extract",
+        "$BUILD_DIR/mongo/db/repl/oplog_entry",
+        "$BUILD_DIR/mongo/rpc/command_status",
+    ],
+)
+
+env.Library(
     target='index_key_validate',
     source=[
         "index_key_validate.cpp",
@@ -225,10 +238,6 @@ env.Library(
         env.Idlc('multi_index_block.idl')[0],
     ],
     LIBDEPS=[
-        'collection',
-        'index_build_block',
-        'index_timestamp_helper',
-        'index_build_block',
         '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/db/audit',
         '$BUILD_DIR/mongo/db/background',
@@ -239,11 +248,15 @@ env.Library(
         '$BUILD_DIR/mongo/db/storage/write_unit_of_work',
         '$BUILD_DIR/mongo/util/fail_point',
         '$BUILD_DIR/mongo/util/progress_meter',
+        'collection',
+        'index_build_block',
+        'index_timestamp_helper',
     ],
     LIBDEPS_PRIVATE=[
         '$BUILD_DIR/mongo/db/index/index_build_interceptor',
         '$BUILD_DIR/mongo/db/storage/storage_options',
         '$BUILD_DIR/mongo/idl/server_parameter',
+        'collection_catalog',
     ]
 )
 
@@ -251,14 +264,16 @@ env.Library(
     target='collection_catalog',
     source=[
         'collection_catalog.cpp',
+        'uncommitted_collections.cpp',
     ],
     LIBDEPS=[
-        'collection',
         '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/db/namespace_string',
         '$BUILD_DIR/mongo/db/service_context',
+        'collection',
     ],
     LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/db/concurrency/write_conflict_exception',
         '$BUILD_DIR/mongo/idl/server_parameter',
     ]
 )
@@ -284,7 +299,7 @@ env.Library(
         'collection_catalog',
         'database_holder',
         '$BUILD_DIR/mongo/db/index_builds_coordinator_interface',
-        '$BUILD_DIR/mongo/db/repair_database',
+        '$BUILD_DIR/mongo/db/rebuild_indexes',
         '$BUILD_DIR/mongo/db/service_context',
     ],
 )
@@ -331,7 +346,6 @@ env.Library(
         '$BUILD_DIR/mongo/db/db_raii',
         '$BUILD_DIR/mongo/db/index/index_access_method',
         '$BUILD_DIR/mongo/db/index/index_access_method_factory',
-        '$BUILD_DIR/mongo/db/index_d',
         '$BUILD_DIR/mongo/db/op_observer',
         '$BUILD_DIR/mongo/db/repl/drop_pending_collection_reaper',
         '$BUILD_DIR/mongo/db/repl/oplog',
@@ -344,16 +358,18 @@ env.Library(
         '$BUILD_DIR/mongo/db/views/views_mongod',
     ],
     LIBDEPS_PRIVATE=[
-        'index_build_block',
-        'throttle_cursor',
-        'validate_state',
+        '$BUILD_DIR/mongo/db/catalog/collection_catalog',
         '$BUILD_DIR/mongo/db/catalog/collection_catalog_helper',
         '$BUILD_DIR/mongo/db/commands/server_status_core',
         '$BUILD_DIR/mongo/db/index/index_build_interceptor',
+        '$BUILD_DIR/mongo/db/index/index_access_methods',
         '$BUILD_DIR/mongo/db/logical_clock',
         '$BUILD_DIR/mongo/db/repl/repl_settings',
         '$BUILD_DIR/mongo/db/storage/storage_engine_common',
         '$BUILD_DIR/mongo/db/transaction',
+        'index_build_block',
+        'throttle_cursor',
+        'validate_state',
     ],
 )
 
@@ -395,6 +411,7 @@ env.Library(
         'drop_database.cpp',
         'drop_indexes.cpp',
         'rename_collection.cpp',
+        'list_indexes.cpp',
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',

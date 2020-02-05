@@ -68,17 +68,38 @@ public:
      * collection is unsharded. This ensures that the unique index verification happens once on
      * mongos and can be bypassed on the shards.
      */
-    class LiteParsed final : public LiteParsedDocumentSourceForeignCollections {
+    class LiteParsed final : public LiteParsedDocumentSourceForeignCollection {
     public:
-        using LiteParsedDocumentSourceForeignCollections::
-            LiteParsedDocumentSourceForeignCollections;
+        LiteParsed(NamespaceString foreignNss,
+                   MergeWhenMatchedModeEnum whenMatched,
+                   MergeWhenNotMatchedModeEnum whenNotMatched)
+            : LiteParsedDocumentSourceForeignCollection(std::move(foreignNss)),
+              _whenMatched(whenMatched),
+              _whenNotMatched(whenNotMatched) {}
 
-        static std::unique_ptr<LiteParsed> parse(const AggregationRequest& request,
+        using LiteParsedDocumentSourceForeignCollection::LiteParsedDocumentSourceForeignCollection;
+
+        static std::unique_ptr<LiteParsed> parse(const NamespaceString& nss,
                                                  const BSONElement& spec);
 
         bool allowedToPassthroughFromMongos() const final {
             return false;
         }
+
+        ReadConcernSupportResult supportsReadConcern(repl::ReadConcernLevel level) const final {
+            return {
+                {level == repl::ReadConcernLevel::kLinearizableReadConcern,
+                 {ErrorCodes::InvalidOptions,
+                  "{} cannot be used with a 'linearizable' read concern level"_format(kStageName)}},
+                Status::OK()};
+        }
+
+        PrivilegeVector requiredPrivileges(bool isMongos,
+                                           bool bypassDocumentValidation) const final;
+
+    private:
+        MergeWhenMatchedModeEnum _whenMatched;
+        MergeWhenNotMatchedModeEnum _whenNotMatched;
     };
 
     virtual ~DocumentSourceMerge() = default;

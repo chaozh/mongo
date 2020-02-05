@@ -44,6 +44,7 @@
 #include "mongo/platform/mutex.h"
 #include "mongo/stdx/condition_variable.h"
 #include "mongo/transport/session.h"
+#include "mongo/util/concurrency/with_lock.h"
 #include "mongo/util/decorable.h"
 #include "mongo/util/interruptible.h"
 #include "mongo/util/lockable_adapter.h"
@@ -78,7 +79,7 @@ class OperationContext : public Interruptible, public Decorable<OperationContext
     OperationContext& operator=(const OperationContext&) = delete;
 
 public:
-    OperationContext(Client* client, unsigned int opId);
+    OperationContext(Client* client, OperationId opId);
     virtual ~OperationContext();
 
     bool shouldParticipateInFlowControl() const {
@@ -133,9 +134,10 @@ public:
     void setLockState(std::unique_ptr<Locker> locker);
 
     /**
-     * Swaps the locker, releasing the old locker to the caller.
+     * Swaps the locker, releasing the old locker to the caller.  The Client lock is required to
+     * call this function.
      */
-    std::unique_ptr<Locker> swapLockState(std::unique_ptr<Locker> locker);
+    std::unique_ptr<Locker> swapLockState(std::unique_ptr<Locker> locker, WithLock);
 
     /**
      * Returns Status::OK() unless this operation is in a killed state.
@@ -164,9 +166,23 @@ public:
     /**
      * Returns the operation ID associated with this operation.
      */
-    unsigned int getOpID() const {
+    OperationId getOpID() const {
         return _opId;
     }
+
+    /**
+     * Returns the operation UUID associated with this operation or boost::none.
+     */
+    const boost::optional<OperationKey>& getOperationKey() const {
+        return _opKey;
+    }
+
+    /**
+     * Sets the operation UUID associated with this operation.
+     *
+     * This function may only be called once per OperationContext.
+     */
+    void setOperationKey(OperationKey opKey);
 
     /**
      * Returns the session ID associated with this operation, if there is one.
@@ -370,6 +386,20 @@ public:
         _inMultiDocumentTransaction = true;
     }
 
+    /**
+     * Returns whether this operation is starting a multi-document transaction.
+     */
+    bool isStartingMultiDocumentTransaction() const {
+        return _isStartingMultiDocumentTransaction;
+    }
+
+    /**
+     * Sets whether this operation is starting a multi-document transaction.
+     */
+    void setIsStartingMultiDocumentTransaction(bool isStartingMultiDocumentTransaction) {
+        _isStartingMultiDocumentTransaction = isStartingMultiDocumentTransaction;
+    }
+
     void setComment(const BSONObj& comment) {
         _comment = comment.getOwned();
     }
@@ -377,6 +407,20 @@ public:
     boost::optional<BSONElement> getComment() {
         // The '_comment' object, if present, will only ever have one field.
         return _comment ? boost::optional<BSONElement>(_comment->firstElement()) : boost::none;
+    }
+
+    /**
+     * Sets whether this operation is an exhaust command.
+     */
+    void setExhaust(bool exhaust) {
+        _exhaust = exhaust;
+    }
+
+    /**
+     * Returns whether this operation is an exhaust command.
+     */
+    bool isExhaust() const {
+        return _exhaust;
     }
 
 private:
@@ -460,7 +504,8 @@ private:
 
     Client* const _client;
 
-    const unsigned int _opId;
+    const OperationId _opId;
+    boost::optional<OperationKey> _opKey;
 
     boost::optional<LogicalSessionId> _lsid;
     boost::optional<TxnNumber> _txnNumber;
@@ -507,10 +552,14 @@ private:
     bool _writesAreReplicated = true;
     bool _shouldParticipateInFlowControl = true;
     bool _inMultiDocumentTransaction = false;
+    bool _isStartingMultiDocumentTransaction = false;
 
     // If populated, this is an owned singleton BSONObj whose only field, 'comment', is a copy of
     // the 'comment' field from the input command object.
     boost::optional<BSONObj> _comment;
+
+    // Whether this operation is an exhaust command.
+    bool _exhaust = false;
 };
 
 namespace repl {

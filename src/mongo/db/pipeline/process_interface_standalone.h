@@ -29,7 +29,7 @@
 
 #pragma once
 
-#include "mongo/db/dbdirectclient.h"
+#include "mongo/db/client.h"
 #include "mongo/db/exec/shard_filterer.h"
 #include "mongo/db/ops/write_ops_exec.h"
 #include "mongo/db/ops/write_ops_gen.h"
@@ -54,8 +54,6 @@ public:
 
     virtual ~MongoInterfaceStandalone() = default;
 
-    void setOperationContext(OperationContext* opCtx) final;
-    DBClientBase* directClient() final;
     std::unique_ptr<TransactionHistoryIteratorBase> createTransactionHistoryIterator(
         repl::OpTime time) const final;
 
@@ -73,11 +71,18 @@ public:
                                     const NamespaceString& ns,
                                     BatchedObjects&& batch,
                                     const WriteConcernOptions& wc,
-                                    bool upsert,
+                                    UpsertType upsert,
                                     bool multi,
                                     boost::optional<OID> targetEpoch) override;
 
-    CollectionIndexUsageMap getIndexStats(OperationContext* opCtx, const NamespaceString& ns) final;
+    std::vector<Document> getIndexStats(OperationContext* opCtx,
+                                        const NamespaceString& ns,
+                                        StringData host,
+                                        bool addShardName) final;
+
+    std::list<BSONObj> getIndexSpecs(OperationContext* opCtx,
+                                     const NamespaceString& ns,
+                                     bool includeBuildUUIDs);
     void appendLatencyStats(OperationContext* opCtx,
                             const NamespaceString& nss,
                             bool includeHistograms,
@@ -92,18 +97,27 @@ public:
     Status appendQueryExecStats(OperationContext* opCtx,
                                 const NamespaceString& nss,
                                 BSONObjBuilder* builder) const final override;
-    BSONObj getCollectionOptions(const NamespaceString& nss) final;
+    BSONObj getCollectionOptions(OperationContext* opCtx, const NamespaceString& nss) final;
     void renameIfOptionsAndIndexesHaveNotChanged(OperationContext* opCtx,
                                                  const BSONObj& renameCommandObj,
                                                  const NamespaceString& targetNs,
                                                  const BSONObj& originalCollectionOptions,
-                                                 const std::list<BSONObj>& originalIndexes) final;
+                                                 const std::list<BSONObj>& originalIndexes);
+    void createCollection(OperationContext* opCtx,
+                          const std::string& dbName,
+                          const BSONObj& cmdObj);
+    void createIndexesOnEmptyCollection(OperationContext* opCtx,
+                                        const NamespaceString& ns,
+                                        const std::vector<BSONObj>& indexSpecs);
+    void dropCollection(OperationContext* opCtx, const NamespaceString& collection);
     std::unique_ptr<Pipeline, PipelineDeleter> makePipeline(
         const std::vector<BSONObj>& rawPipeline,
         const boost::intrusive_ptr<ExpressionContext>& expCtx,
         const MakePipelineOptions opts = MakePipelineOptions{}) final;
     std::unique_ptr<Pipeline, PipelineDeleter> attachCursorSourceToPipeline(
-        const boost::intrusive_ptr<ExpressionContext>& expCtx, Pipeline* pipeline) override;
+        const boost::intrusive_ptr<ExpressionContext>& expCtx,
+        Pipeline* pipeline,
+        bool allowTargetingShards = true) override;
     std::unique_ptr<Pipeline, PipelineDeleter> attachCursorSourceToPipelineForLocalRead(
         const boost::intrusive_ptr<ExpressionContext>& expCtx, Pipeline* pipeline) override;
     std::string getShardName(OperationContext* opCtx) const final;
@@ -126,7 +140,8 @@ public:
         bool allowSpeculativeMajorityRead = false) final;
     std::vector<GenericCursor> getIdleCursors(const boost::intrusive_ptr<ExpressionContext>& expCtx,
                                               CurrentOpUserMode userMode) const final;
-    BackupCursorState openBackupCursor(OperationContext* opCtx) final;
+    BackupCursorState openBackupCursor(OperationContext* opCtx,
+                                       const StorageEngine::BackupOptions& options) final;
     void closeBackupCursor(OperationContext* opCtx, const UUID& backupId) final;
     BackupCursorExtendState extendBackupCursor(OperationContext* opCtx,
                                                const UUID& backupId,
@@ -140,6 +155,11 @@ public:
                                          const NamespaceString& nss,
                                          const std::set<FieldPath>& fieldPaths) const;
 
+    boost::optional<ChunkVersion> refreshAndGetCollectionVersion(
+        const boost::intrusive_ptr<ExpressionContext>& expCtx,
+        const NamespaceString& nss) const final {
+        return boost::none;  // Nothing is sharded here.
+    }
     virtual void checkRoutingInfoEpochOrThrow(const boost::intrusive_ptr<ExpressionContext>& expCtx,
                                               const NamespaceString& nss,
                                               ChunkVersion targetCollectionVersion) const override {
@@ -180,7 +200,7 @@ protected:
     Update buildUpdateOp(const boost::intrusive_ptr<ExpressionContext>& expCtx,
                          const NamespaceString& nss,
                          BatchedObjects&& batch,
-                         bool upsert,
+                         UpsertType upsert,
                          bool multi);
 
 private:
@@ -195,7 +215,6 @@ private:
                                                                      StringData dbName,
                                                                      UUID collectionUUID);
 
-    DBDirectClient _client;
     std::map<UUID, std::unique_ptr<const CollatorInterface>> _collatorCache;
 
     // Object which contains a JavaScript Scope, used for executing JS in pipeline stages and

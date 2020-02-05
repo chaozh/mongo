@@ -1,15 +1,19 @@
 /**
  * This test is labeled resource intensive because its total io_write is 47MB compared to a median
  * of 5MB across all sharding tests in wiredTiger.
- * @tags: [resource_intensive]
+ * @tags: [
+ *   resource_intensive,
+ *   requires_fcv_44,
+ * ]
  */
 load("jstests/replsets/rslib.js");
 
 var NODE_COUNT = 2;
 
-// Checking UUID consistency involves reading from the config server through mongos, but this test
-// sets an invalid readPreference on the connection to the mongos.
+// Checking UUID and index consistency involves reading from the config server through mongos, but
+// this test sets an invalid readPreference on the connection to the mongos.
 TestData.skipCheckingUUIDsConsistentAcrossCluster = true;
+TestData.skipCheckingIndexesConsistentAcrossCluster = true;
 
 /**
  * Prepare to call testReadPreference() or assertFailure().
@@ -130,30 +134,40 @@ var testReadPreference = function(conn, hostList, isMongos, mode, tagSets, expec
     };
 
     // Test inline mapReduce on sharded collection.
-    // Note that in sharded map reduce, it will output the result in a temp collection
-    // even if out is inline.
     if (isMongos) {
         cmdTest({mapreduce: 'user', map: mapFunc, reduce: reduceFunc, out: {inline: 1}},
                 false,
-                formatProfileQuery({mapreduce: 'user', shardedFirstPass: true}));
+                formatProfileQuery({aggregate: 'user'}));
     }
 
     // Test inline mapReduce on unsharded collection.
-    cmdTest({mapreduce: 'mrIn', map: mapFunc, reduce: reduceFunc, out: {inline: 1}},
-            true,
-            formatProfileQuery({mapreduce: 'mrIn', 'out.inline': 1}));
+    if (isMongos) {
+        cmdTest({mapreduce: 'mrIn', map: mapFunc, reduce: reduceFunc, out: {inline: 1}},
+                true,
+                formatProfileQuery({aggregate: 'mrIn'}));
+    } else {
+        cmdTest({mapreduce: 'mrIn', map: mapFunc, reduce: reduceFunc, out: {inline: 1}},
+                true,
+                formatProfileQuery({mapreduce: 'mrIn', 'out.inline': 1}));
+    }
 
     // Test non-inline mapReduce on sharded collection.
     if (isMongos) {
         cmdTest({mapreduce: 'user', map: mapFunc, reduce: reduceFunc, out: {replace: 'mrOut'}},
                 false,
-                formatProfileQuery({mapreduce: 'user', shardedFirstPass: true}));
+                formatProfileQuery({aggregate: 'user'}));
     }
 
     // Test non-inline mapReduce on unsharded collection.
-    cmdTest({mapreduce: 'mrIn', map: mapFunc, reduce: reduceFunc, out: {replace: 'mrOut'}},
-            false,
-            formatProfileQuery({mapreduce: 'mrIn', 'out.replace': 'mrOut'}));
+    if (isMongos) {
+        cmdTest({mapreduce: 'mrIn', map: mapFunc, reduce: reduceFunc, out: {replace: 'mrOut'}},
+                false,
+                formatProfileQuery({aggregate: 'user'}));
+    } else {
+        cmdTest({mapreduce: 'mrIn', map: mapFunc, reduce: reduceFunc, out: {replace: 'mrOut'}},
+                false,
+                formatProfileQuery({mapreduce: 'mrIn', 'out.replace': 'mrOut'}));
+    }
 
     // Test other commands that can be sent to secondary.
     cmdTest({count: 'user'}, true, formatProfileQuery({count: 'user'}));

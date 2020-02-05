@@ -29,6 +29,8 @@
 
 #pragma once
 
+#include "mongo/bson/bsonobj.h"
+
 #include <cstdint>
 #include <string>
 
@@ -45,8 +47,8 @@ public:
         // startupWarnings ramlog
         kStartupWarnings = 1 << 1,
 
-        // representing the logv1 javascriptOutput domain
-        kJavascript = 1 << 2,
+        // representing the logv1 plainShellOutput domain
+        kPlainShell = 1 << 2,
     };
 
     LogTag() : _value(kNone) {}
@@ -62,7 +64,7 @@ public:
         return _value & other._value;
     }
 
-    std::string toJSONArray();
+    BSONArray toBSONArray();
 
 private:
     uint64_t _value;

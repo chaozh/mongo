@@ -19,6 +19,7 @@ adminDb.createUser({user: "user", pwd: "pass", roles: jsTest.adminUserRoles});
 const authenticatedConn = new Mongo(mongos.host);
 authenticatedConn.getDB('admin').auth("user", "pass");
 adminDb = authenticatedConn.getDB("admin");
+assert.commandWorked(adminDb.adminCommand({enablesharding: "output"}));
 
 const configDb = authenticatedConn.getDB("config");
 
@@ -27,6 +28,7 @@ inputDb.createUser({user: "user", pwd: "pass", roles: jsTest.basicUserRoles});
 
 const outputDb = authenticatedConn.getDB("output");
 outputDb.createUser({user: "user", pwd: "pass", roles: jsTest.basicUserRoles});
+assert.commandWorked(adminDb.runCommand({enableSharding: outputDb.getName()}));
 
 const nDocs = 50;
 // Setup the input db
@@ -39,6 +41,9 @@ assert.eq(inputDb.numbers.count(), nDocs);
 function doMapReduce(connection, outputDb) {
     // clean output db and run m/r
     outputDb.numbers_out.drop();
+    assert.commandWorked(
+        adminDb.runCommand({shardCollection: outputDb.numbers_out.getFullName(), key: {_id: 1}}));
+
     return connection.getDB('input').runCommand({
         mapreduce: "numbers",
         map: function() {

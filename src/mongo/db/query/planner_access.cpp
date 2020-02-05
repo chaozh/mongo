@@ -230,20 +230,21 @@ std::unique_ptr<QuerySolutionNode> QueryPlannerAccess::makeCollectionScan(
         }
     }
 
-    // The sort can specify $natural as well. The sort direction should override the hint
-    // direction if both are specified.
-    const BSONObj& sortObj = query.getQueryRequest().getSort();
-    if (!sortObj.isEmpty()) {
-        BSONElement natural = dps::extractElementAtPath(sortObj, "$natural");
-        if (!natural.eoo()) {
-            csn->direction = natural.numberInt() >= 0 ? 1 : -1;
-        }
+    // Extract and assign the 'requestResumeToken' field.
+    csn->requestResumeToken = query.getQueryRequest().getRequestResumeToken();
+
+    // Extract and assign the RecordId from the 'resumeAfter' token, if present.
+    const BSONObj& resumeAfterObj = query.getQueryRequest().getResumeAfter();
+    if (!resumeAfterObj.isEmpty()) {
+        csn->resumeAfterRecordId = RecordId(resumeAfterObj["$recordId"].numberLong());
     }
 
     if (query.nss().isOplog() && csn->direction == 1) {
         // Optimizes the start and end location parameters for a collection scan for an oplog
-        // collection.
-        std::tie(csn->minTs, csn->maxTs) = extractTsRange(query.root());
+        // collection. Not compatible with $_resumeAfter so we do not optimize in that case.
+        if (resumeAfterObj.isEmpty()) {
+            std::tie(csn->minTs, csn->maxTs) = extractTsRange(query.root());
+        }
 
         // If the query is just a lower bound on "ts" on a forward scan, every document in the
         // collection after the first matching one must also match. To avoid wasting time
@@ -321,7 +322,8 @@ std::unique_ptr<QuerySolutionNode> QueryPlannerAccess::makeLeafNode(
         // because expr might be inside an array operator that provides a path prefix.
         auto isn = std::make_unique<IndexScanNode>(index);
         isn->bounds.fields.resize(index.keyPattern.nFields());
-        isn->addKeyMetadata = query.getQueryRequest().returnKey();
+        isn->addKeyMetadata = query.getQueryRequest().returnKey() ||
+            query.metadataDeps()[DocumentMetadataFields::kIndexKey];
         isn->queryCollator = query.getCollator();
 
         // Get the ixtag->pos-th element of the index key pattern.
@@ -1340,7 +1342,8 @@ std::unique_ptr<QuerySolutionNode> QueryPlannerAccess::scanWholeIndex(
 
     // Build an ixscan over the id index, use it, and return it.
     unique_ptr<IndexScanNode> isn = std::make_unique<IndexScanNode>(index);
-    isn->addKeyMetadata = query.getQueryRequest().returnKey();
+    isn->addKeyMetadata = query.getQueryRequest().returnKey() ||
+        query.metadataDeps()[DocumentMetadataFields::kIndexKey];
     isn->queryCollator = query.getCollator();
 
     IndexBoundsBuilder::allValuesBounds(index.keyPattern, &isn->bounds);
@@ -1472,7 +1475,8 @@ std::unique_ptr<QuerySolutionNode> QueryPlannerAccess::makeIndexScan(
     // Build an ixscan over the id index, use it, and return it.
     auto isn = std::make_unique<IndexScanNode>(index);
     isn->direction = 1;
-    isn->addKeyMetadata = query.getQueryRequest().returnKey();
+    isn->addKeyMetadata = query.getQueryRequest().returnKey() ||
+        query.metadataDeps()[DocumentMetadataFields::kIndexKey];
     isn->bounds.isSimpleRange = true;
     isn->bounds.startKey = startKey;
     isn->bounds.endKey = endKey;

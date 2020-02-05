@@ -43,7 +43,7 @@ namespace {
  * context.
  */
 struct DepsAnalysisData {
-    DepsTracker fieldDependencyTracker{DepsTracker::kAllMetadata};
+    DepsTracker fieldDependencyTracker;
 
     void addRequiredField(const std::string& fieldName) {
         fieldDependencyTracker.fields.insert(fieldName);
@@ -77,23 +77,17 @@ public:
 
     void visit(const ProjectionSliceASTNode* node) final {
         _deps->requiresDocument = true;
+        _deps->hasExpressions = true;
     }
 
     void visit(const ProjectionElemMatchASTNode* node) final {
         _deps->requiresDocument = true;
+        _deps->hasExpressions = true;
     }
 
     void visit(const ExpressionASTNode* node) final {
-        const Expression* expr = node->expressionRaw();
-        const ExpressionMeta* meta = dynamic_cast<const ExpressionMeta*>(expr);
-
-        // Only {$meta: 'sortKey'} projections can be covered. Projections with any other expression
-        // need the document.
-        if (!(meta && meta->getMetaType() == DocumentMetadataFields::MetaType::kSortKey)) {
-            _deps->requiresDocument = true;
-        }
+        _deps->hasExpressions = true;
     }
-
     void visit(const BooleanConstantASTNode* node) final {}
     void visit(const MatchExpressionASTNode* node) final {}
 
@@ -137,11 +131,15 @@ public:
     void visit(const ExpressionASTNode* node) final {
         // The output of an expression on a dotted path depends on whether that field is an array.
         invariant(node->parent());
-        if (!node->parent()->isRoot()) {
-            addFullPathAsDependency();
-        }
+        node->expressionRaw()->addDependencies(&_context->data().fieldDependencyTracker);
 
-        node->expression()->addDependencies(&_context->data().fieldDependencyTracker);
+        if (_context->fullPath().getPathLength() > 1) {
+            // If assigning to a top-level field, the value of that field is not actually required.
+            // Otherwise, any assignment of an expression to a field requires the first component
+            // of that field. e.g. {a.b.c: <expression>} will require all of 'a' since it may be an
+            // array.
+            addTopLevelPathAsDependency();
+        }
     }
 
     void visit(const BooleanConstantASTNode* node) final {
@@ -189,6 +187,7 @@ auto analyzeProjection(const ProjectionPathASTNode* root, ProjectType type) {
     }
 
     deps.metadataRequested = tracker.metadataDeps();
+    deps.requiresDocument = deps.requiresDocument || tracker.needWholeDocument;
     return deps;
 }
 }  // namespace
@@ -242,7 +241,7 @@ std::pair<const ASTNode*, size_t> findCommonPoint(const ASTNode* astNode,
 }
 }  // namespace
 
-bool Projection::isFieldRetainedExactly(StringData path) {
+bool Projection::isFieldRetainedExactly(StringData path) const {
     FieldPath fieldPath(path);
 
     const auto [node, pathIndex] = findCommonPoint(&_root, fieldPath, 0);

@@ -9,6 +9,12 @@
 load("jstests/libs/command_sequence_with_retries.js");  // for CommandSequenceWithRetries
 
 MongoRunner.validateCollectionsCallback = function(port) {
+    // This function may be executed in a new Thread context, so ensure the proper definitions
+    // are loaded.
+    if (typeof CommandSequenceWithRetries === "undefined") {
+        load("jstests/libs/command_sequence_with_retries.js");
+    }
+
     if (jsTest.options().skipCollectionAndIndexValidation) {
         print("Skipping collection validation during mongod shutdown");
         return;
@@ -99,9 +105,7 @@ MongoRunner.validateCollectionsCallback = function(port) {
                   function(conn) {
                       const res = conn.adminCommand({listDatabases: 1});
                       if (!res.ok) {
-                          // TODO: SERVER-31916 for the KeyNotFound error
-                          assert.commandFailedWithCode(
-                              res, [ErrorCodes.Unauthorized, ErrorCodes.KeyNotFound]);
+                          assert.commandFailedWithCode(res, ErrorCodes.Unauthorized);
                           return {shouldStop: true, reason: "cannot run listDatabases"};
                       }
                       assert.commandWorked(res);

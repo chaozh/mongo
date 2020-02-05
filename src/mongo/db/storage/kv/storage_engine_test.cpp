@@ -62,17 +62,21 @@ TEST_F(StorageEngineTest, ReconcileIdentsTest) {
 
     // Add a collection, `db.coll1` to both the DurableCatalog and KVEngine. The returned value is
     // the `ident` name given to the collection.
-    auto swIdentName = createCollection(opCtx.get(), NamespaceString("db.coll1"));
-    ASSERT_OK(swIdentName);
+    auto swCollInfo = createCollection(opCtx.get(), NamespaceString("db.coll1"));
+    ASSERT_OK(swCollInfo.getStatus());
     // Create a table in the KVEngine not reflected in the DurableCatalog. This should be dropped
     // when reconciling.
     ASSERT_OK(createCollTable(opCtx.get(), NamespaceString("db.coll2")));
-    ASSERT_OK(reconcile(opCtx.get()).getStatus());
+
+    auto reconcileResult = unittest::assertGet(reconcile(opCtx.get()));
+    ASSERT_EQUALS(0UL, reconcileResult.indexesToRebuild.size());
+    ASSERT_EQUALS(0UL, reconcileResult.indexBuildsToRestart.size());
+
     auto identsVec = getAllKVEngineIdents(opCtx.get());
     auto idents = std::set<std::string>(identsVec.begin(), identsVec.end());
     // There are two idents. `_mdb_catalog` and the ident for `db.coll1`.
     ASSERT_EQUALS(static_cast<const unsigned long>(2), idents.size());
-    ASSERT_TRUE(idents.find(swIdentName.getValue()) != idents.end());
+    ASSERT_TRUE(idents.find(swCollInfo.getValue().ident) != idents.end());
     ASSERT_TRUE(idents.find("_mdb_catalog") != idents.end());
 
     // Create a catalog entry for the `_id` index. Drop the created the table.
@@ -80,19 +84,20 @@ TEST_F(StorageEngineTest, ReconcileIdentsTest) {
         opCtx.get(), NamespaceString("db.coll1"), "_id", false /* isBackgroundSecondaryBuild */));
     ASSERT_OK(dropIndexTable(opCtx.get(), NamespaceString("db.coll1"), "_id"));
     // The reconcile response should include this index as needing to be rebuilt.
-    auto reconcileStatus = reconcile(opCtx.get());
-    ASSERT_OK(reconcileStatus.getStatus());
-    ASSERT_EQUALS(static_cast<const unsigned long>(1), reconcileStatus.getValue().size());
-    StorageEngine::CollectionIndexNamePair& toRebuild = reconcileStatus.getValue()[0];
-    ASSERT_EQUALS("db.coll1", toRebuild.first);
-    ASSERT_EQUALS("_id", toRebuild.second);
+    reconcileResult = unittest::assertGet(reconcile(opCtx.get()));
+    ASSERT_EQUALS(1UL, reconcileResult.indexesToRebuild.size());
+    ASSERT_EQUALS(0UL, reconcileResult.indexBuildsToRestart.size());
+
+    StorageEngine::IndexIdentifier& toRebuild = reconcileResult.indexesToRebuild[0];
+    ASSERT_EQUALS("db.coll1", toRebuild.nss.ns());
+    ASSERT_EQUALS("_id", toRebuild.indexName);
 
     // Now drop the `db.coll1` table, while leaving the DurableCatalog entry.
-    ASSERT_OK(dropIdent(opCtx.get(), swIdentName.getValue()));
+    ASSERT_OK(dropIdent(opCtx.get(), opCtx.get()->recoveryUnit(), swCollInfo.getValue().ident));
     ASSERT_EQUALS(static_cast<const unsigned long>(1), getAllKVEngineIdents(opCtx.get()).size());
 
     // Reconciling this should result in an error.
-    reconcileStatus = reconcile(opCtx.get());
+    auto reconcileStatus = reconcile(opCtx.get());
     ASSERT_NOT_OK(reconcileStatus.getStatus());
     ASSERT_EQUALS(ErrorCodes::UnrecoverableRollbackError, reconcileStatus.getStatus());
 }
@@ -101,10 +106,10 @@ TEST_F(StorageEngineTest, LoadCatalogDropsOrphansAfterUncleanShutdown) {
     auto opCtx = cc().makeOperationContext();
 
     const NamespaceString collNs("db.coll1");
-    auto swIdentName = createCollection(opCtx.get(), collNs);
-    ASSERT_OK(swIdentName);
+    auto swCollInfo = createCollection(opCtx.get(), collNs);
+    ASSERT_OK(swCollInfo.getStatus());
 
-    ASSERT_OK(dropIdent(opCtx.get(), swIdentName.getValue()));
+    ASSERT_OK(dropIdent(opCtx.get(), opCtx.get()->recoveryUnit(), swCollInfo.getValue().ident));
     ASSERT(collectionExists(opCtx.get(), collNs));
 
     // After the catalog is reloaded, we expect that the collection has been dropped because the
@@ -116,7 +121,7 @@ TEST_F(StorageEngineTest, LoadCatalogDropsOrphansAfterUncleanShutdown) {
         _storageEngine->loadCatalog(opCtx.get());
     }
 
-    ASSERT(!identExists(opCtx.get(), swIdentName.getValue()));
+    ASSERT(!identExists(opCtx.get(), swCollInfo.getValue().ident));
     ASSERT(!collectionExists(opCtx.get(), collNs));
 }
 
@@ -131,7 +136,9 @@ TEST_F(StorageEngineTest, ReconcileDropsTemporary) {
 
     ASSERT(identExists(opCtx.get(), ident));
 
-    ASSERT_OK(reconcile(opCtx.get()).getStatus());
+    auto reconcileResult = unittest::assertGet(reconcile(opCtx.get()));
+    ASSERT_EQUALS(0UL, reconcileResult.indexesToRebuild.size());
+    ASSERT_EQUALS(0UL, reconcileResult.indexBuildsToRestart.size());
 
     // The storage engine is responsible for dropping its temporary idents.
     ASSERT(!identExists(opCtx.get(), ident));
@@ -159,7 +166,7 @@ TEST_F(StorageEngineTest, TemporaryDropsItself) {
     ASSERT(!identExists(opCtx.get(), ident));
 }
 
-TEST_F(StorageEngineTest, ReconcileDoesNotDropIndexBuildTempTables) {
+TEST_F(StorageEngineTest, ReconcileUnfinishedIndex) {
     auto opCtx = cc().makeOperationContext();
 
     Lock::GlobalLock lk(&*opCtx, MODE_IS);
@@ -167,40 +174,32 @@ TEST_F(StorageEngineTest, ReconcileDoesNotDropIndexBuildTempTables) {
     const NamespaceString ns("db.coll1");
     const std::string indexName("a_1");
 
-    auto swIdentName = createCollection(opCtx.get(), ns);
-    ASSERT_OK(swIdentName);
+    auto swCollInfo = createCollection(opCtx.get(), ns);
+    ASSERT_OK(swCollInfo.getStatus());
 
+
+    // Start an non-backgroundSecondary single-phase (i.e. no build UUID) index.
     const bool isBackgroundSecondaryBuild = false;
-    ASSERT_OK(startIndexBuild(opCtx.get(), ns, indexName, isBackgroundSecondaryBuild));
+    const boost::optional<UUID> buildUUID = boost::none;
+    ASSERT_OK(startIndexBuild(opCtx.get(), ns, indexName, isBackgroundSecondaryBuild, buildUUID));
 
-    auto sideWrites = makeTemporary(opCtx.get());
-    auto constraintViolations = makeTemporary(opCtx.get());
+    const auto indexIdent = _storageEngine->getCatalog()->getIndexIdent(
+        opCtx.get(), swCollInfo.getValue().catalogId, indexName);
 
-    const auto indexIdent = _storageEngine->getCatalog()->getIndexIdent(opCtx.get(), ns, indexName);
+    auto reconcileResult = unittest::assertGet(reconcile(opCtx.get()));
 
-    indexBuildScan(opCtx.get(),
-                   ns,
-                   indexName,
-                   sideWrites->rs()->getIdent(),
-                   constraintViolations->rs()->getIdent());
-    indexBuildDrain(opCtx.get(), ns, indexName);
-
-    auto reconcileStatus = reconcile(opCtx.get());
-    ASSERT_OK(reconcileStatus.getStatus());
+    // Reconcile should have to dropped the ident to allow the index to be rebuilt.
     ASSERT(!identExists(opCtx.get(), indexIdent));
 
-    // Because this non-backgroundSecondary index is unfinished, reconcile will drop the index.
-    ASSERT_EQUALS(0UL, reconcileStatus.getValue().size());
+    // Because this non-backgroundSecondary index is unfinished, reconcile will drop the index and
+    // not require it to be rebuilt.
+    ASSERT_EQUALS(0UL, reconcileResult.indexesToRebuild.size());
 
-    // The owning index was dropped, and so should its temporary tables.
-    ASSERT(!identExists(opCtx.get(), sideWrites->rs()->getIdent()));
-    ASSERT(!identExists(opCtx.get(), constraintViolations->rs()->getIdent()));
-
-    sideWrites->deleteTemporaryTable(opCtx.get());
-    constraintViolations->deleteTemporaryTable(opCtx.get());
+    // There are no two-phase builds to restart.
+    ASSERT_EQUALS(0UL, reconcileResult.indexBuildsToRestart.size());
 }
 
-TEST_F(StorageEngineTest, ReconcileDoesNotDropIndexBuildTempTablesBackgroundSecondary) {
+TEST_F(StorageEngineTest, ReconcileUnfinishedBackgroundSecondaryIndex) {
     auto opCtx = cc().makeOperationContext();
 
     Lock::GlobalLock lk(&*opCtx, MODE_IS);
@@ -208,52 +207,92 @@ TEST_F(StorageEngineTest, ReconcileDoesNotDropIndexBuildTempTablesBackgroundSeco
     const NamespaceString ns("db.coll1");
     const std::string indexName("a_1");
 
-    auto swIdentName = createCollection(opCtx.get(), ns);
-    ASSERT_OK(swIdentName);
+    auto swCollInfo = createCollection(opCtx.get(), ns);
+    ASSERT_OK(swCollInfo.getStatus());
 
+    // Start a backgroundSecondary single-phase (i.e. no build UUID) index.
     const bool isBackgroundSecondaryBuild = true;
-    ASSERT_OK(startIndexBuild(opCtx.get(), ns, indexName, isBackgroundSecondaryBuild));
+    const boost::optional<UUID> buildUUID = boost::none;
+    ASSERT_OK(startIndexBuild(opCtx.get(), ns, indexName, isBackgroundSecondaryBuild, buildUUID));
 
-    auto sideWrites = makeTemporary(opCtx.get());
-    auto constraintViolations = makeTemporary(opCtx.get());
+    const auto indexIdent = _storageEngine->getCatalog()->getIndexIdent(
+        opCtx.get(), swCollInfo.getValue().catalogId, indexName);
 
-    const auto indexIdent = _storageEngine->getCatalog()->getIndexIdent(opCtx.get(), ns, indexName);
+    auto reconcileResult = unittest::assertGet(reconcile(opCtx.get()));
 
-    indexBuildScan(opCtx.get(),
-                   ns,
-                   indexName,
-                   sideWrites->rs()->getIdent(),
-                   constraintViolations->rs()->getIdent());
-    indexBuildDrain(opCtx.get(), ns, indexName);
-
-    auto reconcileStatus = reconcile(opCtx.get());
-    ASSERT_OK(reconcileStatus.getStatus());
+    // Reconcile should not have dropped the ident because it expects the caller will drop and
+    // rebuild the index.
     ASSERT(identExists(opCtx.get(), indexIdent));
 
-    // Because this backgroundSecondary index is unfinished, reconcile will identify that it should
-    // be rebuilt.
-    ASSERT_EQUALS(1UL, reconcileStatus.getValue().size());
-    StorageEngine::CollectionIndexNamePair& toRebuild = reconcileStatus.getValue()[0];
-    ASSERT_EQUALS(ns.toString(), toRebuild.first);
-    ASSERT_EQUALS(indexName, toRebuild.second);
+    // Because this backgroundSecondary index is unfinished, reconcile will drop the index and
+    // require it to be rebuilt.
+    ASSERT_EQUALS(1UL, reconcileResult.indexesToRebuild.size());
+    StorageEngine::IndexIdentifier& toRebuild = reconcileResult.indexesToRebuild[0];
+    ASSERT_EQUALS(ns.ns(), toRebuild.nss.ns());
+    ASSERT_EQUALS(indexName, toRebuild.indexName);
 
-    // Because these temporary idents were associated with an in-progress index build, they are not
-    // dropped.
-    ASSERT(identExists(opCtx.get(), sideWrites->rs()->getIdent()));
-    ASSERT(identExists(opCtx.get(), constraintViolations->rs()->getIdent()));
+    // There are no two-phase builds to restart.
+    ASSERT_EQUALS(0UL, reconcileResult.indexBuildsToRestart.size());
+}
 
-    sideWrites->deleteTemporaryTable(opCtx.get());
-    constraintViolations->deleteTemporaryTable(opCtx.get());
+TEST_F(StorageEngineTest, ReconcileTwoPhaseIndexBuilds) {
+    auto opCtx = cc().makeOperationContext();
+
+    Lock::GlobalLock lk(&*opCtx, MODE_IS);
+
+    const NamespaceString ns("db.coll1");
+    const std::string indexA("a_1");
+    const std::string indexB("b_1");
+
+    auto swCollInfo = createCollection(opCtx.get(), ns);
+    ASSERT_OK(swCollInfo.getStatus());
+
+    // Using a build UUID implies that this index build is two-phase, so the isBackgroundSecondary
+    // field will be ignored. There is no special behavior on primaries or secondaries.
+    auto buildUUID = UUID::gen();
+    const bool isBackgroundSecondaryBuild = false;
+
+    // Start two indexes with the same buildUUID to simulate building multiple indexes within the
+    // same build.
+    ASSERT_OK(startIndexBuild(opCtx.get(), ns, indexA, isBackgroundSecondaryBuild, buildUUID));
+    ASSERT_OK(startIndexBuild(opCtx.get(), ns, indexB, isBackgroundSecondaryBuild, buildUUID));
+
+    const auto indexIdentA = _storageEngine->getCatalog()->getIndexIdent(
+        opCtx.get(), swCollInfo.getValue().catalogId, indexA);
+    const auto indexIdentB = _storageEngine->getCatalog()->getIndexIdent(
+        opCtx.get(), swCollInfo.getValue().catalogId, indexB);
+
+    auto reconcileResult = unittest::assertGet(reconcile(opCtx.get()));
+
+    // Reconcile should not have dropped the ident to allow the restarted index build to do so
+    // transactionally with the start.
+    ASSERT(identExists(opCtx.get(), indexIdentA));
+    ASSERT(identExists(opCtx.get(), indexIdentB));
+
+    // Because this is an unfinished two-phase index build, reconcile will not require this index to
+    // be rebuilt to completion, rather restarted.
+    ASSERT_EQUALS(0UL, reconcileResult.indexesToRebuild.size());
+
+    // Only one index build should be indicated as needing to be restarted.
+    ASSERT_EQUALS(1UL, reconcileResult.indexBuildsToRestart.size());
+    auto& [toRestartBuildUUID, toRestart] = *reconcileResult.indexBuildsToRestart.begin();
+    ASSERT_EQ(buildUUID, toRestartBuildUUID);
+
+    // Both specs should be listed within the same build.
+    auto& specs = toRestart.indexSpecs;
+    ASSERT_EQ(2UL, specs.size());
+    ASSERT_EQ(indexA, specs[0]["name"].str());
+    ASSERT_EQ(indexB, specs[1]["name"].str());
 }
 
 TEST_F(StorageEngineRepairTest, LoadCatalogRecoversOrphans) {
     auto opCtx = cc().makeOperationContext();
 
     const NamespaceString collNs("db.coll1");
-    auto swIdentName = createCollection(opCtx.get(), collNs);
-    ASSERT_OK(swIdentName);
+    auto swCollInfo = createCollection(opCtx.get(), collNs);
+    ASSERT_OK(swCollInfo.getStatus());
 
-    ASSERT_OK(dropIdent(opCtx.get(), swIdentName.getValue()));
+    ASSERT_OK(dropIdent(opCtx.get(), opCtx.get()->recoveryUnit(), swCollInfo.getValue().ident));
     ASSERT(collectionExists(opCtx.get(), collNs));
 
     // After the catalog is reloaded, we expect that the ident has been recovered because the
@@ -264,7 +303,7 @@ TEST_F(StorageEngineRepairTest, LoadCatalogRecoversOrphans) {
         _storageEngine->loadCatalog(opCtx.get());
     }
 
-    ASSERT(identExists(opCtx.get(), swIdentName.getValue()));
+    ASSERT(identExists(opCtx.get(), swCollInfo.getValue().ident));
     ASSERT(collectionExists(opCtx.get(), collNs));
     StorageRepairObserver::get(getGlobalServiceContext())->onRepairDone(opCtx.get());
     ASSERT_EQ(1U, StorageRepairObserver::get(getGlobalServiceContext())->getModifications().size());
@@ -274,17 +313,19 @@ TEST_F(StorageEngineRepairTest, ReconcileSucceeds) {
     auto opCtx = cc().makeOperationContext();
 
     const NamespaceString collNs("db.coll1");
-    auto swIdentName = createCollection(opCtx.get(), collNs);
-    ASSERT_OK(swIdentName);
+    auto swCollInfo = createCollection(opCtx.get(), collNs);
+    ASSERT_OK(swCollInfo.getStatus());
 
-    ASSERT_OK(dropIdent(opCtx.get(), swIdentName.getValue()));
+    ASSERT_OK(dropIdent(opCtx.get(), opCtx.get()->recoveryUnit(), swCollInfo.getValue().ident));
     ASSERT(collectionExists(opCtx.get(), collNs));
 
     // Reconcile would normally return an error if a collection existed with a missing ident in the
     // storage engine. When in a repair context, that should not be the case.
-    ASSERT_OK(reconcile(opCtx.get()).getStatus());
+    auto reconcileResult = unittest::assertGet(reconcile(opCtx.get()));
+    ASSERT_EQUALS(0UL, reconcileResult.indexesToRebuild.size());
+    ASSERT_EQUALS(0UL, reconcileResult.indexBuildsToRestart.size());
 
-    ASSERT(!identExists(opCtx.get(), swIdentName.getValue()));
+    ASSERT(!identExists(opCtx.get(), swCollInfo.getValue().ident));
     ASSERT(collectionExists(opCtx.get(), collNs));
     StorageRepairObserver::get(getGlobalServiceContext())->onRepairDone(opCtx.get());
     ASSERT_EQ(0U, StorageRepairObserver::get(getGlobalServiceContext())->getModifications().size());
@@ -294,8 +335,8 @@ TEST_F(StorageEngineRepairTest, LoadCatalogRecoversOrphansInCatalog) {
     auto opCtx = cc().makeOperationContext();
 
     const NamespaceString collNs("db.coll1");
-    auto swIdentName = createCollection(opCtx.get(), collNs);
-    ASSERT_OK(swIdentName);
+    auto swCollInfo = createCollection(opCtx.get(), collNs);
+    ASSERT_OK(swCollInfo.getStatus());
     ASSERT(collectionExists(opCtx.get(), collNs));
 
     AutoGetDb db(opCtx.get(), collNs.db(), LockMode::MODE_X);
@@ -307,11 +348,11 @@ TEST_F(StorageEngineRepairTest, LoadCatalogRecoversOrphansInCatalog) {
 
     // When in a repair context, loadCatalog() recreates catalog entries for orphaned idents.
     _storageEngine->loadCatalog(opCtx.get());
-    auto identNs = swIdentName.getValue();
+    auto identNs = swCollInfo.getValue().ident;
     std::replace(identNs.begin(), identNs.end(), '-', '_');
     NamespaceString orphanNs = NamespaceString("local.orphan." + identNs);
 
-    ASSERT(identExists(opCtx.get(), swIdentName.getValue()));
+    ASSERT(identExists(opCtx.get(), swCollInfo.getValue().ident));
     ASSERT(collectionExists(opCtx.get(), orphanNs));
 
     StorageRepairObserver::get(getGlobalServiceContext())->onRepairDone(opCtx.get());
@@ -322,8 +363,8 @@ TEST_F(StorageEngineTest, LoadCatalogDropsOrphans) {
     auto opCtx = cc().makeOperationContext();
 
     const NamespaceString collNs("db.coll1");
-    auto swIdentName = createCollection(opCtx.get(), collNs);
-    ASSERT_OK(swIdentName);
+    auto swCollInfo = createCollection(opCtx.get(), collNs);
+    ASSERT_OK(swCollInfo.getStatus());
     ASSERT(collectionExists(opCtx.get(), collNs));
 
     AutoGetDb db(opCtx.get(), collNs.db(), LockMode::MODE_X);
@@ -337,10 +378,12 @@ TEST_F(StorageEngineTest, LoadCatalogDropsOrphans) {
     // orphaned idents.
     _storageEngine->loadCatalog(opCtx.get());
     // reconcileCatalogAndIdents() drops orphaned idents.
-    ASSERT_OK(reconcile(opCtx.get()).getStatus());
+    auto reconcileResult = unittest::assertGet(reconcile(opCtx.get()));
+    ASSERT_EQUALS(0UL, reconcileResult.indexesToRebuild.size());
+    ASSERT_EQUALS(0UL, reconcileResult.indexBuildsToRestart.size());
 
-    ASSERT(!identExists(opCtx.get(), swIdentName.getValue()));
-    auto identNs = swIdentName.getValue();
+    ASSERT(!identExists(opCtx.get(), swCollInfo.getValue().ident));
+    auto identNs = swCollInfo.getValue().ident;
     std::replace(identNs.begin(), identNs.end(), '-', '_');
     NamespaceString orphanNs = NamespaceString("local.orphan." + identNs);
     ASSERT(!collectionExists(opCtx.get(), orphanNs));

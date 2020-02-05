@@ -59,13 +59,14 @@ MONGO_FAIL_POINT_DEFINE(skipReconstructPreparedTransactions);
 
 // Apply the oplog entries for a prepare or a prepared commit during recovery/initial sync.
 Status _applyOperationsForTransaction(OperationContext* opCtx,
-                                      const repl::MultiApplier::Operations& ops,
+                                      const std::vector<OplogEntry>& ops,
                                       repl::OplogApplication::Mode oplogApplicationMode) {
     // Apply each the operations via repl::applyOperation.
     for (const auto& op : ops) {
         try {
+            Status status = Status::OK();
             AutoGetCollection coll(opCtx, op.getNss(), MODE_IX);
-            auto status = repl::applyOperation_inlock(
+            status = repl::applyOperation_inlock(
                 opCtx, coll.getDb(), &op, false /*alwaysUpsert*/, oplogApplicationMode);
             if (!status.isOK()) {
                 return status;
@@ -228,14 +229,16 @@ Status applyAbortTransaction(OperationContext* opCtx,
     MONGO_UNREACHABLE;
 }
 
-repl::MultiApplier::Operations readTransactionOperationsFromOplogChain(
+std::pair<std::vector<OplogEntry>, bool> _readTransactionOperationsFromOplogChain(
     OperationContext* opCtx,
     const OplogEntry& lastEntryInTxn,
-    const std::vector<OplogEntry*>& cachedOps) noexcept {
+    const std::vector<OplogEntry*>& cachedOps,
+    const bool checkForCommands) noexcept {
+    bool isTransactionWithCommand = false;
     // Traverse the oplog chain with its own snapshot and read timestamp.
     ReadSourceScope readSourceScope(opCtx);
 
-    repl::MultiApplier::Operations ops;
+    std::vector<OplogEntry> ops;
 
     // The cachedOps are the ops for this transaction that are from the same oplog application batch
     // as the commit or prepare, those which have not necessarily been written to the oplog.  These
@@ -293,7 +296,35 @@ repl::MultiApplier::Operations readTransactionOperationsFromOplogChain(
 
     // Reconstruct the operations from the prepare or unprepared commit oplog entry.
     repl::ApplyOps::extractOperationsTo(prepareOrUnpreparedCommit, lastEntryInTxnObj, &ops);
-    return ops;
+
+    // It is safe to assume that any commands inside `ops` are real commands to be applied, as
+    // opposed to auxiliary commands such as "commit" and "abort".
+    if (checkForCommands) {
+        for (auto&& op : ops) {
+            if (op.isCommand()) {
+                isTransactionWithCommand = true;
+                break;
+            }
+        }
+    }
+    return std::make_pair(ops, isTransactionWithCommand);
+}
+
+std::vector<OplogEntry> readTransactionOperationsFromOplogChain(
+    OperationContext* opCtx,
+    const OplogEntry& lastEntryInTxn,
+    const std::vector<OplogEntry*>& cachedOps) noexcept {
+    auto result = _readTransactionOperationsFromOplogChain(
+        opCtx, lastEntryInTxn, cachedOps, false /*checkForCommands*/);
+    return std::get<0>(result);
+}
+
+std::pair<std::vector<OplogEntry>, bool> readTransactionOperationsFromOplogChainAndCheckForCommands(
+    OperationContext* opCtx,
+    const OplogEntry& lastEntryInTxn,
+    const std::vector<OplogEntry*>& cachedOps) noexcept {
+    return _readTransactionOperationsFromOplogChain(
+        opCtx, lastEntryInTxn, cachedOps, true /*checkForCommands*/);
 }
 
 namespace {
@@ -332,7 +363,7 @@ Status _applyPrepareTransaction(OperationContext* opCtx,
     // This blocking behavior can also introduce a deadlock with two-phase index builds on
     // a secondary if a prepared transaction blocks on an index build, but the index build can't
     // re-acquire its X lock because of the transaction.
-    if (!IndexBuildsCoordinator::get(opCtx)->supportsTwoPhaseIndexBuild()) {
+    if (!IndexBuildsCoordinator::supportsTwoPhaseIndexBuild()) {
         for (const auto& op : ops) {
             auto ns = op.getNss();
             auto uuid = *op.getUuid();

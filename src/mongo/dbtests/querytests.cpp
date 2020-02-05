@@ -68,7 +68,8 @@ public:
         {
             WriteUnitOfWork wunit(&_opCtx);
             _database = _context.db();
-            _collection = CollectionCatalog::get(&_opCtx).lookupCollectionByNamespace(nss());
+            _collection =
+                CollectionCatalog::get(&_opCtx).lookupCollectionByNamespace(&_opCtx, nss());
             if (_collection) {
                 _database->dropCollection(&_opCtx, nss()).transitional_ignore();
             }
@@ -224,7 +225,7 @@ public:
         {
             WriteUnitOfWork wunit(&_opCtx);
             Database* db = ctx.db();
-            if (CollectionCatalog::get(&_opCtx).lookupCollectionByNamespace(nss())) {
+            if (CollectionCatalog::get(&_opCtx).lookupCollectionByNamespace(&_opCtx, nss())) {
                 _collection = nullptr;
                 db->dropCollection(&_opCtx, nss()).transitional_ignore();
             }
@@ -1011,8 +1012,8 @@ public:
         ASSERT(
             _client.query(NamespaceString(ns), Query("{a:{$in:[1,[1,2,3]]}}").hint(BSON("a" << 1)))
                 ->more());
-        ASSERT(_client.query(NamespaceString(ns), Query("{a:[1,2,3]}").hint(BSON("a" << 1)))
-                   ->more());  // SERVER-146
+        ASSERT(
+            _client.query(NamespaceString(ns), Query("{a:[1,2,3]}").hint(BSON("a" << 1)))->more());
     }
 };
 
@@ -1026,7 +1027,7 @@ public:
         _client.insert(ns, fromjson("{a:[[1],2]}"));
         check("$natural");
         ASSERT_OK(dbtests::createIndex(&_opCtx, ns, BSON("a" << 1)));
-        check("a");  // SERVER-146
+        check("a");
     }
 
 private:
@@ -1917,9 +1918,7 @@ public:
         DbMessage dbMessage(message);
         QueryMessage queryMessage(dbMessage);
         Message result;
-        string exhaust = runQuery(&_opCtx, queryMessage, NamespaceString(ns()), result);
-        ASSERT(exhaust.size());
-        ASSERT_EQUALS(string(ns()), exhaust);
+        ASSERT_TRUE(runQuery(&_opCtx, queryMessage, NamespaceString(ns()), result));
     }
 };
 

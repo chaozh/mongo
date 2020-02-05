@@ -94,6 +94,7 @@ void checkOplogFormatVersion(OperationContext* opCtx, const std::string& uri) {
 
 MONGO_FAIL_POINT_DEFINE(WTWriteConflictException);
 MONGO_FAIL_POINT_DEFINE(WTWriteConflictExceptionForReads);
+MONGO_FAIL_POINT_DEFINE(slowOplogSamplingReads);
 
 const std::string kWiredTigerEngineName = "wiredTiger";
 
@@ -333,13 +334,21 @@ void WiredTigerRecordStore::OplogStones::_calculateStones(OperationContext* opCt
     log() << "The size storer reports that the oplog contains " << numRecords
           << " records totaling to " << dataSize << " bytes";
 
+    // Don't calculate stones if this is a new collection. This is to prevent standalones from
+    // attempting to get a forward scanning oplog cursor on an explicit create of the oplog
+    // collection. These values can be wrong. The assumption is that if they are both observed to be
+    // zero, there must be very little data in the oplog; the cost of being wrong is imperceptible.
+    if (numRecords == 0 && dataSize == 0) {
+        return;
+    }
+
     // Only use sampling to estimate where to place the oplog stones if the number of samples drawn
     // is less than 5% of the collection.
     const uint64_t kMinSampleRatioForRandCursor = 20;
 
     // If the oplog doesn't contain enough records to make sampling more efficient, then scan the
     // oplog to determine where to put down stones.
-    if (numRecords <= 0 || dataSize <= 0 ||
+    if (numRecords < 0 || dataSize < 0 ||
         uint64_t(numRecords) <
             kMinSampleRatioForRandCursor * kRandomSamplesPerStone * numStonesToKeep) {
         _calculateStonesByScanning(opCtx);
@@ -437,7 +446,11 @@ void WiredTigerRecordStore::OplogStones::_calculateStonesBySampling(OperationCon
     // each logical section.
     auto cursor = _rs->getRandomCursorWithOptions(opCtx, extraConfig);
     std::vector<RecordId> oplogEstimates;
+    auto lastProgressLog = Date_t::now();
     for (int i = 0; i < numSamples; ++i) {
+        auto samplingLogIntervalSeconds = gOplogSamplingLogIntervalSeconds.load();
+        slowOplogSamplingReads.execute(
+            [&](const BSONObj& dataObj) { sleepsecs(dataObj["delay"].numberInt()); });
         auto record = cursor->next();
         if (!record) {
             // This shouldn't really happen unless the size storer values are far off from reality.
@@ -447,8 +460,17 @@ void WiredTigerRecordStore::OplogStones::_calculateStonesBySampling(OperationCon
             return;
         }
         oplogEstimates.push_back(record->id);
+
+        const auto now = Date_t::now();
+        if (samplingLogIntervalSeconds > 0 &&
+            now - lastProgressLog >= Seconds(samplingLogIntervalSeconds)) {
+            log() << "Oplog sampling progress: " << (i + 1) << " of " << numSamples
+                  << " samples taken";
+            lastProgressLog = now;
+        }
     }
     std::sort(oplogEstimates.begin(), oplogEstimates.end());
+    log() << "Oplog sampling complete";
 
     for (int i = 1; i <= wholeStones; ++i) {
         // Use every (kRandomSamplesPerStone)th sample, starting with the
@@ -848,6 +870,18 @@ int64_t WiredTigerRecordStore::storageSize(OperationContext* opCtx,
         return 1;
     }
     return size;
+}
+
+int64_t WiredTigerRecordStore::freeStorageSize(OperationContext* opCtx) const {
+    invariant(opCtx->lockState()->isReadLocked());
+
+    WiredTigerSession* session = WiredTigerRecoveryUnit::get(opCtx)->getSessionNoTxn();
+    auto result = WiredTigerUtil::getStatisticsValue(session->getSession(),
+                                                     "statistics:" + getURI(),
+                                                     "statistics=(fast)",
+                                                     WT_STAT_DSRC_BLOCK_REUSE_BYTES);
+    uassertStatusOK(result.getStatus());
+    return result.getValue();
 }
 
 // Retrieve the value from a positioned cursor.
@@ -1372,7 +1406,11 @@ StatusWith<Timestamp> WiredTigerRecordStore::getLatestOplogTimestamp(
     WT_SESSION* sess = sessRaii->getSession();
     WT_CURSOR* cursor;
     invariantWTOK(sess->open_cursor(sess, _uri.c_str(), nullptr, nullptr, &cursor));
-    invariantWTOK(cursor->prev(cursor));
+    int ret = cursor->prev(cursor);
+    if (ret == WT_NOTFOUND) {
+        return Status(ErrorCodes::CollectionIsEmpty, "oplog is empty");
+    }
+    invariantWTOK(ret);
 
     RecordId recordId = getKey(cursor);
     invariantWTOK(sess->reset(sess));
@@ -1861,15 +1899,22 @@ Status WiredTigerRecordStore::oplogDiskLocRegister(OperationContext* opCtx,
                                                    const Timestamp& ts,
                                                    bool orderedCommit) {
     opCtx->recoveryUnit()->setOrderedCommit(orderedCommit);
+
     if (!orderedCommit) {
         // This labels the current transaction with a timestamp.
         // This is required for oplog visibility to work correctly, as WiredTiger uses the
         // transaction list to determine where there are holes in the oplog.
         return opCtx->recoveryUnit()->setTimestamp(ts);
     }
+
     // This handles non-primary (secondary) state behavior; we simply set the oplog visiblity read
     // timestamp here, as there cannot be visible holes prior to the opTime passed in.
     _kvEngine->getOplogManager()->setOplogReadTimestamp(ts);
+
+    // Inserts and updates usually notify waiters on commit, but the oplog collection has special
+    // visibility rules and waiters must be notified whenever the oplog read timestamp is forwarded.
+    notifyCappedWaitersIfNeeded();
+
     return Status::OK();
 }
 

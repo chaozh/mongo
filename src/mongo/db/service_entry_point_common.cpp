@@ -49,7 +49,7 @@
 #include "mongo/db/curop_metrics.h"
 #include "mongo/db/cursor_manager.h"
 #include "mongo/db/dbdirectclient.h"
-#include "mongo/db/handle_request_response.h"
+#include "mongo/db/error_labels.h"
 #include "mongo/db/initialize_operation_session_info.h"
 #include "mongo/db/introspect.h"
 #include "mongo/db/jsobj.h"
@@ -68,6 +68,7 @@
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/speculative_majority_read_info.h"
+#include "mongo/db/repl/storage_interface.h"
 #include "mongo/db/run_op_kill_cursors.h"
 #include "mongo/db/s/operation_sharding_state.h"
 #include "mongo/db/s/sharded_connection_info.h"
@@ -103,6 +104,7 @@ MONGO_FAIL_POINT_DEFINE(skipCheckingForNotMasterInCommandDispatch);
 MONGO_FAIL_POINT_DEFINE(sleepMillisAfterCommandExecutionBegins);
 MONGO_FAIL_POINT_DEFINE(waitAfterNewStatementBlocksBehindPrepare);
 MONGO_FAIL_POINT_DEFINE(waitAfterCommandFinishesExecution);
+MONGO_FAIL_POINT_DEFINE(failWithErrorCodeInRunCommand);
 
 // Tracks the number of times a legacy unacknowledged write failed due to
 // not master error resulted in network disconnection.
@@ -239,8 +241,9 @@ StatusWith<repl::ReadConcernArgs> _extractReadConcern(OperationContext* opCtx,
     }
 
     auto readConcernSupport = invocation->supportsReadConcern(readConcernArgs.getLevel());
-    if (readConcernSupport.defaultReadConcern ==
-            ReadConcernSupportResult::DefaultReadConcern::kPermitted &&
+    if (readConcernSupport.defaultReadConcernPermit.isOK() &&
+        (startTransaction || !opCtx->inMultiDocumentTransaction()) &&
+        repl::ReplicationCoordinator::get(opCtx)->isReplEnabled() &&
         !opCtx->getClient()->isInDirectClient()) {
         if (serverGlobalParams.clusterRole == ClusterRole::ShardServer ||
             serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
@@ -250,7 +253,7 @@ StatusWith<repl::ReadConcernArgs> _extractReadConcern(OperationContext* opCtx,
             // server defaults.  So, warn if the operation has not specified readConcern and is on a
             // shard/config server.
             if (!readConcernArgs.isSpecified()) {
-                // TODO: Disabled until after SERVER-43712, to avoid log spam.
+                // TODO: Disabled until after SERVER-44539, to avoid log spam.
                 // log() << "Missing readConcern on " << invocation->definition()->getName();
             }
         } else {
@@ -260,43 +263,49 @@ StatusWith<repl::ReadConcernArgs> _extractReadConcern(OperationContext* opCtx,
             // since this covers both isSpecified() && !isSpecified()
             if (readConcernArgs.isEmpty()) {
                 const auto rcDefault = ReadWriteConcernDefaults::get(opCtx->getServiceContext())
-                                           .getDefaultReadConcern();
+                                           .getDefaultReadConcern(opCtx);
                 if (rcDefault) {
-                    readConcernArgs = *rcDefault;
+                    readConcernArgs = std::move(*rcDefault);
                     LOG(2) << "Applying default readConcern on "
                            << invocation->definition()->getName() << " of " << *rcDefault;
+                    // Update the readConcernSupport, since the default RC was applied.
+                    readConcernSupport =
+                        invocation->supportsReadConcern(readConcernArgs.getLevel());
                 }
             }
         }
     }
 
-    auto readConcernLevel = readConcernArgs.getLevel();
-    // Update the readConcernSupport, in case the default RC was applied.
-    readConcernSupport = invocation->supportsReadConcern(readConcernLevel);
-    if (startTransaction && readConcernLevel != repl::ReadConcernLevel::kSnapshotReadConcern &&
-        readConcernLevel != repl::ReadConcernLevel::kMajorityReadConcern &&
-        readConcernLevel != repl::ReadConcernLevel::kLocalReadConcern) {
-        return Status(
-            ErrorCodes::InvalidOptions,
-            "The readConcern level must be either 'local' (default), 'majority' or 'snapshot' in "
-            "order to run in a transaction");
+    // If we are starting a transaction, we only need to check whether the read concern is
+    // appropriate for running a transaction. There is no need to check whether the specific
+    // command supports the read concern, because all commands that are allowed to run in a
+    // transaction must support all applicable read concerns.
+    if (startTransaction) {
+        if (!isReadConcernLevelAllowedInTransaction(readConcernArgs.getLevel())) {
+            return {ErrorCodes::InvalidOptions,
+                    "The readConcern level must be either 'local' (default), 'majority' or "
+                    "'snapshot' in "
+                    "order to run in a transaction"};
+        }
+        if (readConcernArgs.getArgsOpTime()) {
+            return {ErrorCodes::InvalidOptions,
+                    str::stream() << "The readConcern cannot specify '"
+                                  << repl::ReadConcernArgs::kAfterOpTimeFieldName
+                                  << "' in a transaction"};
+        }
     }
 
-    if (startTransaction && readConcernArgs.getArgsOpTime()) {
-        return Status(ErrorCodes::InvalidOptions,
-                      str::stream()
-                          << "The readConcern cannot specify '"
-                          << repl::ReadConcernArgs::kAfterOpTimeFieldName << "' in a transaction");
-    }
-
-    // There is no need to check if the command supports the read concern while in a transaction
-    // because all commands that are allowed to run in a transaction must support all the read
-    // concerns that can be used with a transaction.
-    if (!startTransaction &&
-        readConcernSupport.readConcern == ReadConcernSupportResult::ReadConcern::kNotSupported) {
-        return {ErrorCodes::InvalidOptions,
-                str::stream() << "Command does not support read concern "
-                              << readConcernArgs.toString()};
+    // Otherwise, if there is a read concern present - either user-specified or from the default -
+    // then check whether the command supports it. If there is no explicit read concern level, then
+    // it is implicitly "local". There is no need to check whether this is supported, because all
+    // commands either support "local" or upconvert the absent readConcern to a stronger level that
+    // they do support; for instance, $changeStream upconverts to RC level "majority".
+    if (!startTransaction && readConcernArgs.hasLevel()) {
+        if (!readConcernSupport.readConcernSupport.isOK()) {
+            return readConcernSupport.readConcernSupport.withContext(
+                str::stream() << "Command " << invocation->definition()->getName()
+                              << " does not support " << readConcernArgs.toString());
+        }
     }
 
     // If this command invocation asked for 'majority' read concern, supports blocking majority
@@ -422,6 +431,36 @@ void appendClusterAndOperationTime(OperationContext* opCtx,
     operationTime.appendAsOperationTime(commandBodyFieldsBob);
 }
 
+void appendErrorLabelsAndTopologyVersion(OperationContext* opCtx,
+                                         BSONObjBuilder* commandBodyFieldsBob,
+                                         const OperationSessionInfoFromClient& sessionOptions,
+                                         const std::string& commandName,
+                                         boost::optional<ErrorCodes::Error> code,
+                                         boost::optional<ErrorCodes::Error> wcCode,
+                                         bool isInternalClient) {
+    auto errorLabels =
+        getErrorLabels(opCtx, sessionOptions, commandName, code, wcCode, isInternalClient);
+    commandBodyFieldsBob->appendElements(errorLabels);
+
+    auto isNotMasterError = false;
+    if (code) {
+        isNotMasterError = ErrorCodes::isA<ErrorCategory::NotMasterError>(*code);
+    }
+
+    if (!isNotMasterError && wcCode) {
+        isNotMasterError = ErrorCodes::isA<ErrorCategory::NotMasterError>(*wcCode);
+    }
+
+    const auto replCoord = repl::ReplicationCoordinator::get(opCtx);
+    if (replCoord->getReplicationMode() != repl::ReplicationCoordinator::modeReplSet ||
+        !isNotMasterError) {
+        return;
+    }
+    const auto topologyVersion = replCoord->getTopologyVersion();
+    BSONObjBuilder topologyVersionBuilder(commandBodyFieldsBob->subobjStart("topologyVersion"));
+    topologyVersion.serialize(&topologyVersionBuilder);
+}
+
 namespace {
 void _abortUnpreparedOrStashPreparedTransaction(
     OperationContext* opCtx, TransactionParticipant::Participant* txnParticipant) {
@@ -473,6 +512,11 @@ void invokeWithSessionCheckedOut(OperationContext* opCtx,
                 // Check the session back in and wait for ongoing prepared transaction to complete.
                 MongoDOperationContextSession::checkIn(opCtx);
                 prepareCompleted.wait(opCtx);
+                // Wait for the prepared commit or abort oplog entry to be visible in the oplog.
+                // This will prevent a new transaction from missing the transaction table update for
+                // the previous prepared commit or abort due to an oplog hole.
+                auto storageInterface = repl::StorageInterface::get(opCtx);
+                storageInterface->waitForAllEarlierOplogWritesToBeVisible(opCtx);
                 MongoDOperationContextSession::checkOut(opCtx);
             }
         }
@@ -607,10 +651,12 @@ bool runCommandImpl(OperationContext* opCtx,
             // server defaults.  So, warn if the operation has not specified writeConcern and is on
             // a shard/config server.
             if (!opCtx->getClient()->isInDirectClient() &&
+                (!opCtx->inMultiDocumentTransaction() ||
+                 isTransactionCommand(command->getName())) &&
                 (serverGlobalParams.clusterRole == ClusterRole::ShardServer ||
                  serverGlobalParams.clusterRole == ClusterRole::ConfigServer) &&
                 !request.body.hasField(WriteConcernOptions::kWriteConcernField)) {
-                // TODO: Disabled until after SERVER-43712, to avoid log spam.
+                // TODO: Disabled until after SERVER-44539, to avoid log spam.
                 // log() << "Missing writeConcern on " << command->getName();
             }
             extractedWriteConcern.emplace(
@@ -628,22 +674,39 @@ bool runCommandImpl(OperationContext* opCtx,
                 [&](const BSONObj& data) {
                     bb.append(data["writeConcernError"]);
                     reallyWait = false;
+                    if (data.hasField(kErrorLabelsFieldName) &&
+                        data[kErrorLabelsFieldName].type() == Array) {
+                        // Propagate error labels specified in the failCommand failpoint to the
+                        // OperationContext decoration to override getErrorLabels() behaviors.
+                        invariant(!errorLabelsOverride(opCtx));
+                        errorLabelsOverride(opCtx).emplace(
+                            data.getObjectField(kErrorLabelsFieldName).getOwned());
+                    }
                 },
                 [&](const BSONObj& data) {
                     return CommandHelpers::shouldActivateFailCommandFailPoint(
-                               data,
-                               request.getCommandName(),
-                               opCtx->getClient(),
-                               invocation->ns()) &&
+                               data, invocation, opCtx->getClient()) &&
                         data.hasField("writeConcernError");
                 });
             if (reallyWait) {
+                CurOp::get(opCtx)->debug().writeConcern.emplace(opCtx->getWriteConcern());
                 behaviors.waitForWriteConcern(opCtx, invocation, lastOpBeforeRun, bb);
             }
         };
 
         try {
-            if (shouldCheckOutSession) {
+            if (MONGO_unlikely(failWithErrorCodeInRunCommand.shouldFail())) {
+                auto scoped = failWithErrorCodeInRunCommand.scoped();
+                const auto errorCode = scoped.getData()["errorCode"].numberInt();
+                log() << "failWithErrorCodeInRunCommand enabled - failing command with error "
+                         "code: "
+                      << errorCode;
+                BSONObjBuilder errorBuilder;
+                errorBuilder.append("ok", 0.0);
+                errorBuilder.append("code", errorCode);
+                errorBuilder.append("errmsg", "failWithErrorCodeInRunCommand enabled.");
+                replyBuilder->setCommandReply(errorBuilder.obj());
+            } else if (shouldCheckOutSession) {
                 invokeWithSessionCheckedOut(opCtx, invocation, sessionOptions, replyBuilder);
             } else {
                 invocation->run(opCtx, replyBuilder);
@@ -706,23 +769,27 @@ bool runCommandImpl(OperationContext* opCtx,
     }();
     behaviors.attachCurOpErrInfo(opCtx, replyBuilder->getBodyBuilder().asTempObj());
 
-    if (!ok) {
-        auto response = replyBuilder->getBodyBuilder().asTempObj();
+    {
+        boost::optional<ErrorCodes::Error> code;
+        boost::optional<ErrorCodes::Error> wcCode;
+        auto body = replyBuilder->getBodyBuilder();
+        auto response = body.asTempObj();
         auto codeField = response["code"];
-        const auto hasWriteConcern = response.hasField("writeConcernError");
-        if (codeField.isNumber()) {
-            auto code = ErrorCodes::Error(codeField.numberInt());
-            // Append the error labels for transient transaction errors.
-            auto errorLabels =
-                getErrorLabels(sessionOptions, command->getName(), code, hasWriteConcern);
-            replyBuilder->getBodyBuilder().appendElements(errorLabels);
+        if (!ok && codeField.isNumber()) {
+            code = ErrorCodes::Error(codeField.numberInt());
         }
+        if (response.hasField("writeConcernError")) {
+            wcCode = ErrorCodes::Error(response["writeConcernError"]["code"].numberInt());
+        }
+        auto isInternalClient = opCtx->getClient()->session() &&
+            (opCtx->getClient()->session()->getTags() & transport::Session::kInternalClient);
+        appendErrorLabelsAndTopologyVersion(
+            opCtx, &body, sessionOptions, command->getName(), code, wcCode, isInternalClient);
     }
 
     auto commandBodyBob = replyBuilder->getBodyBuilder();
     behaviors.appendReplyMetadata(opCtx, request, &commandBodyBob);
     appendClusterAndOperationTime(opCtx, &commandBodyBob, &commandBodyBob, startOperationTime);
-
     return ok;
 }
 
@@ -761,8 +828,6 @@ void execCommandDatabase(OperationContext* opCtx,
             }
         });
 
-        // TODO: move this back to runCommands when mongos supports OperationContext
-        // see SERVER-18515 for details.
         rpc::readRequestMetadata(opCtx, request.body, command->requiresAuth());
         rpc::TrackingMetadata::get(opCtx).initWithOperName(command->getName());
 
@@ -775,7 +840,7 @@ void execCommandDatabase(OperationContext* opCtx,
             replCoord->getReplicationMode() == repl::ReplicationCoordinator::modeReplSet,
             opCtx->getServiceContext()->getStorageEngine()->supportsDocLocking());
 
-        CommandHelpers::evaluateFailCommandFailPoint(opCtx, command->getName(), invocation->ns());
+        CommandHelpers::evaluateFailCommandFailPoint(opCtx, invocation.get());
 
         const auto dbname = request.getDatabase().toString();
         uassert(
@@ -930,13 +995,17 @@ void execCommandDatabase(OperationContext* opCtx,
             opCtx->lockState()->setShouldConflictWithSecondaryBatchApplication(false);
         }
 
+        // Remember whether or not this operation is starting a transaction, in case something later
+        // in the execution needs to adjust its behavior based on this.
+        opCtx->setIsStartingMultiDocumentTransaction(startTransaction);
+
         auto& oss = OperationShardingState::get(opCtx);
 
         if (!opCtx->getClient()->isInDirectClient() &&
             readConcernArgs.getLevel() != repl::ReadConcernLevel::kAvailableReadConcern &&
             (iAmPrimary ||
              (readConcernArgs.hasLevel() || readConcernArgs.getArgsAfterClusterTime()))) {
-            oss.initializeClientRoutingVersions(invocation->ns(), request.body);
+            oss.initializeClientRoutingVersionsFromCommand(invocation->ns(), request.body);
 
             auto const shardingState = ShardingState::get(opCtx);
             if (oss.hasShardVersion() || oss.hasDbVersion()) {
@@ -965,8 +1034,7 @@ void execCommandDatabase(OperationContext* opCtx,
 
         command->incrementCommandsExecuted();
 
-        if (logger::globalLogDomain()->shouldLog(logger::LogComponent::kTracking,
-                                                 logger::LogSeverity::Debug(1)) &&
+        if (shouldLog(logger::LogComponent::kTracking, logger::LogSeverity::Debug(1)) &&
             rpc::TrackingMetadata::get(opCtx).getParentOperId()) {
             MONGO_LOG_COMPONENT(1, logger::LogComponent::kTracking)
                 << rpc::TrackingMetadata::get(opCtx).toString();
@@ -1013,10 +1081,19 @@ void execCommandDatabase(OperationContext* opCtx,
 
         // Append the error labels for transient transaction errors.
         auto response = extraFieldsBuilder.asTempObj();
-        auto hasWriteConcern = response.hasField("writeConcernError");
-        auto errorLabels =
-            getErrorLabels(sessionOptions, command->getName(), e.code(), hasWriteConcern);
-        extraFieldsBuilder.appendElements(errorLabels);
+        boost::optional<ErrorCodes::Error> wcCode;
+        if (response.hasField("writeConcernError")) {
+            wcCode = ErrorCodes::Error(response["writeConcernError"]["code"].numberInt());
+        }
+        auto isInternalClient = opCtx->getClient()->session() &&
+            (opCtx->getClient()->session()->getTags() & transport::Session::kInternalClient);
+        appendErrorLabelsAndTopologyVersion(opCtx,
+                                            &extraFieldsBuilder,
+                                            sessionOptions,
+                                            command->getName(),
+                                            e.code(),
+                                            wcCode,
+                                            isInternalClient);
 
         BSONObjBuilder metadataBob;
         behaviors.appendReplyMetadata(opCtx, request, &metadataBob);
@@ -1119,6 +1196,8 @@ DbResponse receivedCommands(OperationContext* opCtx,
                 CurOp::get(opCtx)->setLogicalOp_inlock(c->getLogicalOp());
             }
 
+            opCtx->setExhaust(OpMsg::isFlagSet(message, OpMsg::kExhaustSupported));
+
             execCommandDatabase(opCtx, c, request, replyBuilder.get(), behaviors);
         } catch (const DBException& ex) {
             BSONObjBuilder metadataBob;
@@ -1153,10 +1232,10 @@ DbResponse receivedCommands(OperationContext* opCtx,
 
     if (OpMsg::isFlagSet(message, OpMsg::kExhaustSupported)) {
         auto responseObj = replyBuilder->getBodyBuilder().asTempObj();
-        auto cursorObj = responseObj.getObjectField("cursor");
-        if (responseObj.getField("ok").trueValue() && !cursorObj.isEmpty()) {
-            dbResponse.exhaustNS = cursorObj.getField("ns").String();
-            dbResponse.exhaustCursorId = cursorObj.getField("id").numberLong();
+
+        if (responseObj.getField("ok").trueValue()) {
+            dbResponse.shouldRunAgainForExhaust = replyBuilder->shouldRunAgainForExhaust();
+            dbResponse.nextInvocation = replyBuilder->getNextInvocation();
         }
     }
 
@@ -1187,7 +1266,7 @@ DbResponse receivedQuery(OperationContext* opCtx,
         audit::logQueryAuthzCheck(client, nss, q.query, status.code());
         uassertStatusOK(status);
 
-        dbResponse.exhaustNS = runQuery(opCtx, q, nss, dbResponse.response);
+        dbResponse.shouldRunAgainForExhaust = runQuery(opCtx, q, nss, dbResponse.response);
     } catch (const AssertionException& e) {
         behaviors.handleException(e, opCtx);
 
@@ -1349,7 +1428,7 @@ DbResponse receivedGetMore(OperationContext* opCtx,
 
     if (exhaust) {
         curop.debug().exhaust = true;
-        dbresponse.exhaustNS = ns;
+        dbresponse.shouldRunAgainForExhaust = true;
     }
 
     return dbresponse;

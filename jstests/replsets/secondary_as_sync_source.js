@@ -26,17 +26,22 @@ function addTestDocuments(db) {
     assert.commandWorked(bulk.execute());
 }
 
-let replSet = new ReplSetTest({name: "indexBuilds", nodes: 2, useBridge: true});
-let nodes = replSet.nodeList();
-
-replSet.startSet({startClean: true});
-replSet.initiate({
-    _id: "indexBuilds",
-    members: [
-        {_id: 0, host: nodes[0]},
-        {_id: 1, host: nodes[1], votes: 0, priority: 0},
-    ]
+const replSet = new ReplSetTest({
+    nodes: [
+        {},
+        {
+            // Disallow elections on secondary.
+            rsConfig: {
+                priority: 0,
+                votes: 0,
+            },
+            slowms: 30000,  // Don't log slow operations on secondary. See SERVER-44821.
+        },
+    ],
+    useBridge: true,
 });
+const nodes = replSet.startSet();
+replSet.initiate();
 
 let primary = replSet.getPrimary();
 let primaryDB = primary.getDB(dbName);
@@ -46,14 +51,10 @@ let secondaryDB = secondary.getDB(dbName);
 
 addTestDocuments(primaryDB);
 
-const enableTwoPhaseIndexBuild =
-    assert.commandWorked(primary.adminCommand({getParameter: 1, enableTwoPhaseIndexBuild: 1}))
-        .enableTwoPhaseIndexBuild;
-
 // Used to wait for two-phase builds to complete.
 let awaitIndex;
 
-if (!enableTwoPhaseIndexBuild) {
+if (!IndexBuildTest.supportsTwoPhaseIndexBuild(primary)) {
     jsTest.log("Hanging index build on the secondary node");
     IndexBuildTest.pauseIndexBuilds(secondary);
 
@@ -76,7 +77,14 @@ if (!enableTwoPhaseIndexBuild) {
 }
 
 jsTest.log("Adding a new node to the replica set");
-let newNode = replSet.add({rsConfig: {votes: 0, priority: 0}});
+let newNode = replSet.add({
+    // Disallow elections on secondary.
+    rsConfig: {
+        priority: 0,
+        votes: 0,
+    },
+    slowms: 30000,  // Don't log slow operations on secondary.
+});
 
 // Ensure that the new node and primary cannot communicate to each other.
 newNode.disconnect(primary);
@@ -87,7 +95,7 @@ replSet.reInitiate();
 waitForState(newNode, ReplSetTest.State.SECONDARY);
 
 jsTest.log("Removing index build hang to allow it to finish");
-if (!enableTwoPhaseIndexBuild) {
+if (!IndexBuildTest.supportsTwoPhaseIndexBuild(primary)) {
     // Let the 'secondary' finish its index build.
     IndexBuildTest.resumeIndexBuilds(secondary);
 } else {

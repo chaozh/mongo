@@ -65,10 +65,9 @@ TEST_F(QueryPlannerTest, CantUseTextUnlessHaveTextPred) {
     addIndex(BSON("a" << 1 << "_fts"
                       << "text"
                       << "_ftsx" << 1));
-    runQuery(fromjson("{a:1}"));
-
     // No table scans allowed so there is no solution.
-    assertNumSolutions(0);
+    runInvalidQuery(fromjson("{a:1}"));
+    assertNoSolutions();
 }
 
 // But if you create an index {a:1, b:"text"} you can use it if it has a pred on 'a'
@@ -335,9 +334,9 @@ TEST_F(QueryPlannerTest, TextInsideOrOneBranchNotIndexed) {
     addIndex(BSON("_fts"
                   << "text"
                   << "_ftsx" << 1));
-    runQuery(fromjson("{a: 1, $or: [{b: 2}, {$text: {$search: 'foo'}}]}"));
+    runInvalidQuery(fromjson("{a: 1, $or: [{b: 2}, {$text: {$search: 'foo'}}]}"));
 
-    assertNumSolutions(0);
+    assertNoSolutions();
 }
 
 // If the unindexable $or is not the one containing the $text predicate,
@@ -523,6 +522,16 @@ TEST_F(QueryPlannerTest, ExprEqCanUseSuffixOfTextIndex) {
     assertNumSolutions(1U);
     assertSolutionExists(
         "{text: {search: 'blah', prefix: {}, filter: {a: {$_internalExprEq: 3}}}}");
+}
+
+TEST_F(QueryPlannerTest, CantExplodeMetaSort) {
+    addIndex(BSON("a" << 1 << "b" << 1 << "_fts"
+                      << "text"
+                      << "_ftsx" << 1));
+    runInvalidQuerySortProj(
+        fromjson("{$text: {$search: 'keyword'}, a: {$in: [1, 2]}, b: {$in: [3, 4]}}"),
+        fromjson("{c: {$meta: 'textScore'}}"),
+        fromjson("{c: {$meta: 'textScore'}}"));
 }
 
 }  // namespace

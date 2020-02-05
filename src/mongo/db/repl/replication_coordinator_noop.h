@@ -53,6 +53,8 @@ public:
 
     void shutdown(OperationContext* opCtx) final;
 
+    void markAsCleanShutdownIfPossible(OperationContext* opCtx) final;
+
     ServiceContext* getServiceContext() final {
         return _service;
     }
@@ -157,8 +159,6 @@ public:
 
     Status processReplSetGetStatus(BSONObjBuilder*, ReplSetGetStatusResponseStyle) final;
 
-    void fillIsMasterForReplSet(IsMasterResponse*, const SplitHorizon::Parameters& horizon) final;
-
     void appendSlaveInfoData(BSONObjBuilder*) final;
 
     ReplSetConfig getConfig() const final;
@@ -219,7 +219,7 @@ public:
 
     void dropAllSnapshots() final;
 
-    long long getTerm() final;
+    long long getTerm() const final;
 
     Status updateTerm(OperationContext*, long long) final;
 
@@ -251,10 +251,22 @@ public:
 
     void finishRecoveryIfEligible(OperationContext* opCtx) final;
 
+    void incrementTopologyVersion(OperationContext* opCtx) final;
+
     void updateAndLogStateTransitionMetrics(
         const ReplicationCoordinator::OpsKillingStateTransitionEnum stateTransition,
         const size_t numOpsKilled,
         const size_t numOpsRunning) const final;
+
+    TopologyVersion getTopologyVersion() const final;
+
+    std::shared_ptr<const IsMasterResponse> awaitIsMasterResponse(
+        OperationContext* opCtx,
+        const SplitHorizon::Parameters& horizonParams,
+        boost::optional<TopologyVersion> clientTopologyVersion,
+        boost::optional<Date_t> deadline) const final;
+
+    OpTime getLatestWriteOpTime(OperationContext* opCtx) const override;
 
 private:
     ServiceContext* const _service;

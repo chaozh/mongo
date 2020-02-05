@@ -1,8 +1,14 @@
 # -*- mode: python -*-
 
 Import('env')
+Import("get_option")
 
 env = env.Clone()
+
+env.SConscript(
+    dirs=['sdam'],
+    exports=['env']
+)
 
 # Contains only the core ConnectionString functionality, *not* the ability to call connect() and
 # return a DBClientBase* back. For that you need to link against the 'clientdriver_network' library.
@@ -26,10 +32,46 @@ env.Library(
     ],
     source=[
         'read_preference.cpp',
+        env.Idlc('hedging_mode.idl')[0],
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/bson/util/bson_extract',
         '$BUILD_DIR/mongo/db/service_context'
+    ],
+)
+
+env.Library(
+    target=[
+        'sasl_iam_common',
+    ],
+    source=[
+        env.Idlc('sasl_iam_protocol_common.idl')[0],
+    ],
+    LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/idl/idl_parser',
+        '$BUILD_DIR/mongo/db/server_options_core', # For object_check.h
+    ],
+)
+
+kmsEnv = env.Clone()
+
+kmsEnv.InjectThirdParty(libraries=['kms-message'])
+
+kmsEnv.Library(
+    target=[
+        'sasl_iam_client',
+    ],
+    source=[
+        'sasl_iam_client_protocol.cpp',
+        env.Idlc('sasl_iam_client_protocol.idl')[0],
+    ],
+    LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/third_party/shim_kms_message',
+        '$BUILD_DIR/mongo/idl/idl_parser',
+        '$BUILD_DIR/mongo/db/server_options_core', # For object_check.h
+        'sasl_iam_common',
     ],
 )
 
@@ -44,6 +86,12 @@ saslClientSource = [
     'sasl_plain_client_conversation.cpp',
     'sasl_scram_client_conversation.cpp',
 ]
+
+if get_option('ssl') == 'on':
+    saslClientSource.extend([
+        'sasl_iam_client_conversation.cpp',
+        env.Idlc('sasl_iam_client_options.idl')[0],
+    ])
 
 # Add in actual sasl dependencies if sasl is enabled, otherwise
 # leave library empty so other targets can link to it unconditionally
@@ -64,6 +112,7 @@ saslClientEnv.Library(
     target='sasl_client',
     source=saslClientSource,
     LIBDEPS=[
+        "sasl_iam_client" if get_option('ssl') == 'on' else '',
         '$BUILD_DIR/mongo/base/secure_allocator',
         '$BUILD_DIR/mongo/bson/util/bson_extract',
         '$BUILD_DIR/mongo/executor/remote_command',
@@ -73,6 +122,9 @@ saslClientEnv.Library(
         '$BUILD_DIR/mongo/util/md5',
         '$BUILD_DIR/mongo/util/net/network',
         '$BUILD_DIR/mongo/util/options_parser/options_parser',
+    ],
+    LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/util/net/http_client',
     ],
     SYSLIBDEPS=saslLibs,
 )
@@ -140,6 +192,7 @@ clientDriverEnv.Library(
         'replica_set_change_notifier.cpp',
         'replica_set_monitor.cpp',
         'replica_set_monitor_manager.cpp',
+        'server_ping_monitor.cpp',
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/db/write_concern_options',
@@ -320,5 +373,15 @@ env.CppIntegrationTest(
         '$BUILD_DIR/mongo/transport/transport_layer_egress_init',
         '$BUILD_DIR/mongo/util/version_impl',
         'clientdriver_network',
+    ],
+)
+
+env.Library(
+    target='dbclient_mockcursor',
+    source=[
+        'dbclient_mockcursor.cpp'
+    ],
+    LIBDEPS_PRIVATE=[
+        'clientdriver_minimal'
     ],
 )

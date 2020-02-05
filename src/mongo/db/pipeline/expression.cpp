@@ -510,24 +510,24 @@ const char* ExpressionArray::getOpName() const {
 
 /* ------------------------- ExpressionArrayElemAt -------------------------- */
 
-Value ExpressionArrayElemAt::evaluate(const Document& root, Variables* variables) const {
-    const Value array = _children[0]->evaluate(root, variables);
-    const Value indexArg = _children[1]->evaluate(root, variables);
-
+namespace {
+Value arrayElemAt(const ExpressionNary* self, Value array, Value indexArg) {
     if (array.nullish() || indexArg.nullish()) {
         return Value(BSONNULL);
     }
 
+    size_t arity = self->getOperandList().size();
     uassert(28689,
-            str::stream() << getOpName() << "'s first argument must be an array, but is "
-                          << typeName(array.getType()),
+            str::stream() << self->getOpName() << "'s "
+                          << (arity == 1 ? "argument" : "first argument")
+                          << " must be an array, but is " << typeName(array.getType()),
             array.isArray());
     uassert(28690,
-            str::stream() << getOpName() << "'s second argument must be a numeric value,"
+            str::stream() << self->getOpName() << "'s second argument must be a numeric value,"
                           << " but is " << typeName(indexArg.getType()),
             indexArg.numeric());
     uassert(28691,
-            str::stream() << getOpName() << "'s second argument must be representable as"
+            str::stream() << self->getOpName() << "'s second argument must be representable as"
                           << " a 32-bit integer: " << indexArg.coerceToDouble(),
             indexArg.integral());
 
@@ -542,10 +542,47 @@ Value ExpressionArrayElemAt::evaluate(const Document& root, Variables* variables
     const size_t index = static_cast<size_t>(i);
     return array[index];
 }
+}  // namespace
+
+Value ExpressionArrayElemAt::evaluate(const Document& root, Variables* variables) const {
+    const Value array = _children[0]->evaluate(root, variables);
+    const Value indexArg = _children[1]->evaluate(root, variables);
+    return arrayElemAt(this, array, indexArg);
+}
 
 REGISTER_EXPRESSION(arrayElemAt, ExpressionArrayElemAt::parse);
 const char* ExpressionArrayElemAt::getOpName() const {
     return "$arrayElemAt";
+}
+
+/* ------------------------- ExpressionFirst -------------------------- */
+
+Value ExpressionFirst::evaluate(const Document& root, Variables* variables) const {
+    const Value array = _children[0]->evaluate(root, variables);
+    return arrayElemAt(this, array, Value(0));
+}
+
+REGISTER_EXPRESSION_WITH_MIN_VERSION(
+    first,
+    ExpressionFirst::parse,
+    ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo44);
+const char* ExpressionFirst::getOpName() const {
+    return "$first";
+}
+
+/* ------------------------- ExpressionLast -------------------------- */
+
+Value ExpressionLast::evaluate(const Document& root, Variables* variables) const {
+    const Value array = _children[0]->evaluate(root, variables);
+    return arrayElemAt(this, array, Value(-1));
+}
+
+REGISTER_EXPRESSION_WITH_MIN_VERSION(
+    last,
+    ExpressionLast::parse,
+    ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo44);
+const char* ExpressionLast::getOpName() const {
+    return "$last";
 }
 
 /* ------------------------- ExpressionObjectToArray -------------------------- */
@@ -678,6 +715,26 @@ Value ExpressionArrayToObject::evaluate(const Document& root, Variables* variabl
 REGISTER_EXPRESSION(arrayToObject, ExpressionArrayToObject::parse);
 const char* ExpressionArrayToObject::getOpName() const {
     return "$arrayToObject";
+}
+
+/* ------------------------- ExpressionBsonSize -------------------------- */
+
+REGISTER_EXPRESSION_WITH_MIN_VERSION(
+    bsonSize,
+    ExpressionBsonSize::parse,
+    ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo44);
+Value ExpressionBsonSize::evaluate(const Document& root, Variables* variables) const {
+    Value arg = _children[0]->evaluate(root, variables);
+
+    if (arg.nullish())
+        return Value(BSONNULL);
+
+    uassert(31393,
+            str::stream() << "$bsonSize requires a document input, found: "
+                          << typeName(arg.getType()),
+            arg.getType() == BSONType::Object);
+
+    return Value(arg.getDocument().toBson().objsize());
 }
 
 /* ------------------------- ExpressionCeil -------------------------- */
@@ -1282,9 +1339,9 @@ Value ExpressionDateFromParts::evaluate(const Document& root, Variables* variabl
         }
 
         uassert(40523,
-                str::stream() << "'year' must evaluate to an integer in the range " << 0 << " to "
+                str::stream() << "'year' must evaluate to an integer in the range " << 1 << " to "
                               << 9999 << ", found " << year,
-                year >= 0 && year <= 9999);
+                year >= 1 && year <= 9999);
 
         return Value(
             timeZone->createFromDateParts(year, month, day, hour, minute, second, millisecond));
@@ -1304,9 +1361,9 @@ Value ExpressionDateFromParts::evaluate(const Document& root, Variables* variabl
         }
 
         uassert(31095,
-                str::stream() << "'isoWeekYear' must evaluate to an integer in the range " << 0
+                str::stream() << "'isoWeekYear' must evaluate to an integer in the range " << 1
                               << " to " << 9999 << ", found " << isoWeekYear,
-                isoWeekYear >= 0 && isoWeekYear <= 9999);
+                isoWeekYear >= 1 && isoWeekYear <= 9999);
 
         return Value(timeZone->createFromIso8601DateParts(
             isoWeekYear, isoWeek, isoDayOfWeek, hour, minute, second, millisecond));
@@ -2643,10 +2700,24 @@ Value ExpressionMeta::evaluate(const Document& root, Variables* variables) const
         case MetaType::kIndexKey:
             return metadata.hasIndexKey() ? Value(metadata.getIndexKey()) : Value();
         case MetaType::kSortKey:
-            return metadata.hasSortKey()
-                ? Value(DocumentMetadataFields::serializeSortKey(metadata.isSingleElementKey(),
-                                                                 metadata.getSortKey()))
-                : Value();
+            if (metadata.hasSortKey()) {
+                switch (getExpressionContext()->sortKeyFormat) {
+                    case SortKeyFormat::k42ChangeStreamSortKey:
+                        invariant(metadata.isSingleElementKey());
+                        return Value(metadata.getSortKey());
+                    case SortKeyFormat::k42SortKey:
+                        return Value(DocumentMetadataFields::serializeSortKeyAsObject(
+                            metadata.isSingleElementKey(), metadata.getSortKey()));
+                    case SortKeyFormat::k44SortKey:
+                        return Value(DocumentMetadataFields::serializeSortKeyAsArray(
+                            metadata.isSingleElementKey(), metadata.getSortKey()));
+                        break;
+                    default:
+                        MONGO_UNREACHABLE;
+                }
+            } else {
+                return Value();
+            }
         default:
             MONGO_UNREACHABLE;
     }
@@ -3784,6 +3855,178 @@ Value ExpressionReduce::serialize(bool explain) const {
                                     {"in", _in->serialize(explain)}}}});
 }
 
+/* ------------------------ ExpressionReplaceBase ------------------------ */
+
+void ExpressionReplaceBase::_doAddDependencies(DepsTracker* deps) const {
+    _input->addDependencies(deps);
+    _find->addDependencies(deps);
+    _replacement->addDependencies(deps);
+}
+
+Value ExpressionReplaceBase::serialize(bool explain) const {
+    return Value(Document{{getOpName(),
+                           Document{{"input", _input->serialize(explain)},
+                                    {"find", _find->serialize(explain)},
+                                    {"replacement", _replacement->serialize(explain)}}}});
+}
+
+namespace {
+std::tuple<intrusive_ptr<Expression>, intrusive_ptr<Expression>, intrusive_ptr<Expression>>
+parseExpressionReplaceBase(const char* opName,
+                           const intrusive_ptr<ExpressionContext>& expCtx,
+                           BSONElement expr,
+                           const VariablesParseState& vps) {
+
+    uassert(51751,
+            str::stream() << opName
+                          << " requires an object as an argument, found: " << typeName(expr.type()),
+            expr.type() == Object);
+
+    intrusive_ptr<Expression> input;
+    intrusive_ptr<Expression> find;
+    intrusive_ptr<Expression> replacement;
+    for (auto&& elem : expr.Obj()) {
+        auto field = elem.fieldNameStringData();
+
+        if (field == "input"_sd) {
+            input = Expression::parseOperand(expCtx, elem, vps);
+        } else if (field == "find"_sd) {
+            find = Expression::parseOperand(expCtx, elem, vps);
+        } else if (field == "replacement"_sd) {
+            replacement = Expression::parseOperand(expCtx, elem, vps);
+        } else {
+            uasserted(51750, str::stream() << opName << " found an unknown argument: " << field);
+        }
+    }
+
+    uassert(51749, str::stream() << opName << " requires 'input' to be specified", input);
+    uassert(51748, str::stream() << opName << " requires 'find' to be specified", find);
+    uassert(
+        51747, str::stream() << opName << " requires 'replacement' to be specified", replacement);
+
+    return {input, find, replacement};
+}
+}  // namespace
+
+Value ExpressionReplaceBase::evaluate(const Document& root, Variables* variables) const {
+    Value input = _input->evaluate(root, variables);
+    Value find = _find->evaluate(root, variables);
+    Value replacement = _replacement->evaluate(root, variables);
+
+    // Throw an error if any arg is non-string, non-nullish.
+    uassert(51746,
+            str::stream() << getOpName()
+                          << " requires that 'input' be a string, found: " << input.toString(),
+            input.getType() == BSONType::String || input.nullish());
+    uassert(51745,
+            str::stream() << getOpName()
+                          << " requires that 'find' be a string, found: " << find.toString(),
+            find.getType() == BSONType::String || find.nullish());
+    uassert(51744,
+            str::stream() << getOpName() << " requires that 'replacement' be a string, found: "
+                          << replacement.toString(),
+            replacement.getType() == BSONType::String || replacement.nullish());
+
+    // Return null if any arg is nullish.
+    if (input.nullish())
+        return Value(BSONNULL);
+    if (find.nullish())
+        return Value(BSONNULL);
+    if (replacement.nullish())
+        return Value(BSONNULL);
+
+    return _doEval(input.getStringData(), find.getStringData(), replacement.getStringData());
+}
+
+intrusive_ptr<Expression> ExpressionReplaceBase::optimize() {
+    _input = _input->optimize();
+    _find = _find->optimize();
+    _replacement = _replacement->optimize();
+    return this;
+}
+
+/* ------------------------ ExpressionReplaceOne ------------------------ */
+
+REGISTER_EXPRESSION_WITH_MIN_VERSION(
+    replaceOne,
+    ExpressionReplaceOne::parse,
+    ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo44);
+intrusive_ptr<Expression> ExpressionReplaceOne::parse(
+    const intrusive_ptr<ExpressionContext>& expCtx,
+    BSONElement expr,
+    const VariablesParseState& vps) {
+    auto [input, find, replacement] = parseExpressionReplaceBase(opName, expCtx, expr, vps);
+    return make_intrusive<ExpressionReplaceOne>(
+        expCtx, std::move(input), std::move(find), std::move(replacement));
+}
+
+Value ExpressionReplaceOne::_doEval(StringData input,
+                                    StringData find,
+                                    StringData replacement) const {
+    size_t startIndex = input.find(find);
+    if (startIndex == std::string::npos) {
+        return Value(StringData(input));
+    }
+
+    // An empty string matches at every position, so replaceOne should insert the replacement text
+    // at position 0. input.find correctly returns position 0 when 'find' is empty, so we don't need
+    // any special case to handle this.
+    size_t endIndex = startIndex + find.size();
+    StringBuilder output;
+    output << input.substr(0, startIndex);
+    output << replacement;
+    output << input.substr(endIndex);
+    return Value(output.stringData());
+}
+
+/* ------------------------ ExpressionReplaceAll ------------------------ */
+
+REGISTER_EXPRESSION_WITH_MIN_VERSION(
+    replaceAll,
+    ExpressionReplaceAll::parse,
+    ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo44);
+intrusive_ptr<Expression> ExpressionReplaceAll::parse(
+    const intrusive_ptr<ExpressionContext>& expCtx,
+    BSONElement expr,
+    const VariablesParseState& vps) {
+    auto [input, find, replacement] = parseExpressionReplaceBase(opName, expCtx, expr, vps);
+    return make_intrusive<ExpressionReplaceAll>(
+        expCtx, std::move(input), std::move(find), std::move(replacement));
+}
+
+Value ExpressionReplaceAll::_doEval(StringData input,
+                                    StringData find,
+                                    StringData replacement) const {
+    // An empty string matches at every position, so replaceAll should insert 'replacement' at every
+    // position when 'find' is empty. Handling this as a special case lets us assume 'find' is
+    // nonempty in the usual case.
+    if (find.size() == 0) {
+        StringBuilder output;
+        for (char c : input) {
+            output << replacement << c;
+        }
+        output << replacement;
+        return Value(output.stringData());
+    }
+
+    StringBuilder output;
+    for (;;) {
+        size_t startIndex = input.find(find);
+        if (startIndex == std::string::npos) {
+            output << input;
+            break;
+        }
+
+        size_t endIndex = startIndex + find.size();
+        output << input.substr(0, startIndex);
+        output << replacement;
+        // This step assumes 'find' is nonempty. If 'find' were empty then input.find would always
+        // find a match at position 0, and the input would never shrink.
+        input = input.substr(endIndex);
+    }
+    return Value(output.stringData());
+}
+
 /* ------------------------ ExpressionReverseArray ------------------------ */
 
 Value ExpressionReverseArray::evaluate(const Document& root, Variables* variables) const {
@@ -4198,34 +4441,28 @@ Value ExpressionSplit::evaluate(const Document& root, Variables* variables) cons
                           << typeName(separatorArg.getType()),
             separatorArg.getType() == BSONType::String);
 
-    std::string input = inputArg.getString();
-    std::string separator = separatorArg.getString();
+    StringData input = inputArg.getStringData();
+    StringData separator = separatorArg.getStringData();
 
     uassert(40087, "$split requires a non-empty separator", !separator.empty());
 
     std::vector<Value> output;
 
-    // Keep track of the index at which the current output string began.
-    size_t splitStartIndex = 0;
+    const char* needle = separator.rawData();
+    const char* const needleEnd = needle + separator.size();
+    const char* remainingHaystack = input.rawData();
+    const char* const haystackEnd = remainingHaystack + input.size();
 
-    // Iterate through 'input' and check to see if 'separator' matches at any point.
-    for (size_t i = 0; i < input.size();) {
-        if (stringHasTokenAtIndex(i, input, separator)) {
-            // We matched; add the current string to our output and jump ahead.
-            StringData splitString(input.c_str() + splitStartIndex, i - splitStartIndex);
-            output.push_back(Value(splitString));
-            i += separator.size();
-            splitStartIndex = i;
-        } else {
-            // We did not match, continue to the next character.
-            ++i;
-        }
+    const char* it = remainingHaystack;
+    while ((it = std::search(remainingHaystack, haystackEnd, needle, needleEnd)) != haystackEnd) {
+        StringData sd(remainingHaystack, it - remainingHaystack);
+        output.push_back(Value(sd));
+        remainingHaystack = it + separator.size();
     }
 
-    StringData splitString(input.c_str() + splitStartIndex, input.size() - splitStartIndex);
+    StringData splitString(remainingHaystack, input.size() - (remainingHaystack - input.rawData()));
     output.push_back(Value(splitString));
-
-    return Value(output);
+    return Value(std::move(output));
 }
 
 REGISTER_EXPRESSION(split, ExpressionSplit::parse);
@@ -4416,25 +4653,60 @@ const char* ExpressionSubstrCP::getOpName() const {
 
 /* ----------------------- ExpressionStrLenBytes ------------------------- */
 
-Value ExpressionStrLenBytes::evaluate(const Document& root, Variables* variables) const {
-    Value str(_children[0]->evaluate(root, variables));
-
-    uassert(34473,
-            str::stream() << "$strLenBytes requires a string argument, found: "
-                          << typeName(str.getType()),
-            str.getType() == String);
-
-    size_t strLen = str.getString().size();
+namespace {
+Value strLenBytes(StringData str) {
+    size_t strLen = str.size();
 
     uassert(34470,
             "string length could not be represented as an int.",
             strLen <= std::numeric_limits<int>::max());
     return Value(static_cast<int>(strLen));
 }
+}  // namespace
+
+Value ExpressionStrLenBytes::evaluate(const Document& root, Variables* variables) const {
+    Value str(_children[0]->evaluate(root, variables));
+
+    uassert(34473,
+            str::stream() << "$strLenBytes requires a string argument, found: "
+                          << typeName(str.getType()),
+            str.getType() == BSONType::String);
+
+    return strLenBytes(str.getStringData());
+}
 
 REGISTER_EXPRESSION(strLenBytes, ExpressionStrLenBytes::parse);
 const char* ExpressionStrLenBytes::getOpName() const {
     return "$strLenBytes";
+}
+
+/* -------------------------- ExpressionBinarySize ------------------------------ */
+
+Value ExpressionBinarySize::evaluate(const Document& root, Variables* variables) const {
+    Value arg = _children[0]->evaluate(root, variables);
+    if (arg.nullish()) {
+        return Value(BSONNULL);
+    }
+
+    uassert(51276,
+            str::stream() << "$binarySize requires a string or BinData argument, found: "
+                          << typeName(arg.getType()),
+            arg.getType() == BSONType::BinData || arg.getType() == BSONType::String);
+
+    if (arg.getType() == BSONType::String) {
+        return strLenBytes(arg.getStringData());
+    }
+
+    BSONBinData binData = arg.getBinData();
+    return Value(binData.length);
+}
+
+REGISTER_EXPRESSION_WITH_MIN_VERSION(
+    binarySize,
+    ExpressionBinarySize::parse,
+    ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo44);
+const char* ExpressionBinarySize::getOpName() const {
+    return "$binarySize";
 }
 
 /* ----------------------- ExpressionStrLenCP ------------------------- */
@@ -5031,7 +5303,10 @@ Value ExpressionIsNumber::evaluate(const Document& root, Variables* variables) c
     return Value(val.numeric());
 }
 
-REGISTER_EXPRESSION(isNumber, ExpressionIsNumber::parse);
+REGISTER_EXPRESSION_WITH_MIN_VERSION(
+    isNumber,
+    ExpressionIsNumber::parse,
+    ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo44);
 const char* ExpressionIsNumber::getOpName() const {
     return "$isNumber";
 }
@@ -5914,13 +6189,14 @@ int ExpressionRegex::execute(RegexExecutionState* regexState) const {
                                0,  // No need to overwrite the options set during pcre_compile.
                                &(regexState->capturesBuffer.front()),
                                regexState->capturesBuffer.size());
-    // The 'execResult' will be (numCaptures + 1) if there is a match, -1 if there is no match,
-    // negative (other than -1) if there is an error during execution, and zero if capturesBuffer's
-    // capacity is not sufficient to hold all the results. The latter scenario should never occur.
+    // The 'execResult' will be -1 if there is no match, 0 < execResult <= (numCaptures + 1)
+    // depending on how many capture groups match, negative (other than -1) if there is an error
+    // during execution, and zero if capturesBuffer's capacity is not sufficient to hold all the
+    // results. The latter scenario should never occur.
     uassert(51156,
             str::stream() << "Error occurred while executing the regular expression in " << _opName
                           << ". Result code: " << execResult,
-            execResult == -1 || execResult == (regexState->numCaptures + 1));
+            execResult == -1 || (execResult > 0 && execResult <= (regexState->numCaptures + 1)));
     return execResult;
 }
 
@@ -5936,9 +6212,35 @@ Value ExpressionRegex::nextMatch(RegexExecutionState* regexState) const {
     // calls.
     StringData input = *(regexState->input);
 
+    auto verifyBounds = [&input, this](auto startPos, auto limitPos, auto isCapture) {
+        // If a capture group was not matched, then the 'startPos' and 'limitPos' will both be -1.
+        // These bounds cannot occur for a match on the full string.
+        if (startPos == -1 || limitPos == -1) {
+            massert(31304,
+                    str::stream() << "Unexpected error occurred while executing " << _opName
+                                  << ". startPos: " << startPos << ", limitPos: " << limitPos,
+                    isCapture && startPos == -1 && limitPos == -1);
+            return;
+        }
+
+        massert(31305,
+                str::stream() << "Unexpected error occurred while executing " << _opName
+                              << ". startPos: " << startPos,
+                (startPos >= 0 && static_cast<size_t>(startPos) <= input.size()));
+        massert(31306,
+                str::stream() << "Unexpected error occurred while executing " << _opName
+                              << ". limitPos: " << limitPos,
+                (limitPos >= 0 && static_cast<size_t>(limitPos) <= input.size()));
+        massert(31307,
+                str::stream() << "Unexpected error occurred while executing " << _opName
+                              << ". startPos: " << startPos << ", limitPos: " << limitPos,
+                startPos <= limitPos);
+    };
+
     // The first and second entries of the 'capturesBuffer' will have the start and (end+1) indices
     // of the matched string, as byte offsets. '(limit - startIndex)' would be the length of the
     // captured string.
+    verifyBounds(regexState->capturesBuffer[0], regexState->capturesBuffer[1], false);
     const int matchStartByteIndex = regexState->capturesBuffer[0];
     StringData matchedStr =
         input.substr(matchStartByteIndex, regexState->capturesBuffer[1] - matchStartByteIndex);
@@ -5963,7 +6265,12 @@ Value ExpressionRegex::nextMatch(RegexExecutionState* regexState) const {
     for (int i = 0; i < regexState->numCaptures; ++i) {
         const int start = regexState->capturesBuffer[2 * (i + 1)];
         const int limit = regexState->capturesBuffer[2 * (i + 1) + 1];
-        captures.push_back(Value(input.substr(start, limit - start)));
+        verifyBounds(start, limit, true);
+
+        // The 'start' and 'limit' will be set to -1, if the 'input' didn't match the current
+        // capture group. In this case we put a 'null' placeholder in place of the capture group.
+        captures.push_back(start == -1 && limit == -1 ? Value(BSONNULL)
+                                                      : Value(input.substr(start, limit - start)));
     }
 
     MutableDocument match;

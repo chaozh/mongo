@@ -359,11 +359,11 @@ std::vector<BSONObj> collectionIndexInfo(OperationContext* opCtx, Collection* co
 
     // List the indices,
     auto durableCatalog = DurableCatalog::get(opCtx);
-    durableCatalog->getAllIndexes(opCtx, collection->ns(), &names);
+    durableCatalog->getAllIndexes(opCtx, collection->getCatalogId(), &names);
 
     // and get the info for each one.
     for (const auto& name : names) {
-        result.push_back(durableCatalog->getIndexSpec(opCtx, collection->ns(), name));
+        result.push_back(durableCatalog->getIndexSpec(opCtx, collection->getCatalogId(), name));
     }
 
     auto comp = std::make_unique<SimpleBSONObjComparator>();
@@ -374,7 +374,9 @@ std::vector<BSONObj> collectionIndexInfo(OperationContext* opCtx, Collection* co
 }
 
 BSONObj collectionOptions(OperationContext* opCtx, Collection* collection) {
-    return DurableCatalog::get(opCtx)->getCollectionOptions(opCtx, collection->ns()).toBSON();
+    return DurableCatalog::get(opCtx)
+        ->getCollectionOptions(opCtx, collection->getCatalogId())
+        .toBSON();
 }
 
 AutoGetDbForDbCheck::AutoGetDbForDbCheck(OperationContext* opCtx, const NamespaceString& nss)
@@ -386,8 +388,9 @@ AutoGetCollectionForDbCheck::AutoGetCollectionForDbCheck(OperationContext* opCtx
     : _agd(opCtx, nss), _collLock(opCtx, nss, MODE_S) {
     std::string msg;
 
-    _collection =
-        _agd.getDb() ? CollectionCatalog::get(opCtx).lookupCollectionByNamespace(nss) : nullptr;
+    _collection = _agd.getDb()
+        ? CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, nss)
+        : nullptr;
 
     // If the collection gets deleted after the check is launched, record that in the health log.
     if (!_collection) {
@@ -462,7 +465,7 @@ Status dbCheckDatabaseOnSecondary(OperationContext* opCtx,
                                   const DbCheckOplogCollection& entry) {
     // dbCheckCollectionResult-specific stuff.
     auto uuid = uassertStatusOK(UUID::parse(entry.getUuid().toString()));
-    auto collection = CollectionCatalog::get(opCtx).lookupCollectionByUUID(uuid);
+    auto collection = CollectionCatalog::get(opCtx).lookupCollectionByUUID(opCtx, uuid);
 
     if (!collection) {
         Status status(ErrorCodes::NamespaceNotFound, "Could not find collection for dbCheck");

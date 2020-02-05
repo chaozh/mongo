@@ -29,7 +29,7 @@
 
 #pragma once
 
-#include "mongo/db/exec/projection_exec_agg.h"
+#include "mongo/db/exec/wildcard_projection.h"
 #include "mongo/db/field_ref.h"
 #include "mongo/db/query/collation/collator_interface.h"
 #include "mongo/db/storage/key_string.h"
@@ -47,12 +47,11 @@ public:
     static constexpr StringData kSubtreeSuffix = ".$**"_sd;
 
     /**
-     * Returns an owned ProjectionExecAgg identical to the one that WildcardKeyGenerator will use
+     * Returns an owned ProjectionExecutor identical to the one that WildcardKeyGenerator will use
      * internally when generating the keys for the $** index, as defined by the 'keyPattern' and
      * 'pathProjection' arguments.
      */
-    static std::unique_ptr<ProjectionExecAgg> createProjectionExec(BSONObj keyPattern,
-                                                                   BSONObj pathProjection);
+    static WildcardProjection createProjectionExecutor(BSONObj keyPattern, BSONObj pathProjection);
 
     WildcardKeyGenerator(BSONObj keyPattern,
                          BSONObj pathProjection,
@@ -61,10 +60,10 @@ public:
                          Ordering ordering);
 
     /**
-     * Returns a pointer to the key generator's underlying ProjectionExecAgg.
+     * Returns a pointer to the key generator's underlying ProjectionExecutor.
      */
-    const ProjectionExecAgg* getProjectionExec() const {
-        return _projExec.get();
+    const WildcardProjection* getWildcardProjection() const {
+        return &_proj;
     }
 
     /**
@@ -107,7 +106,7 @@ private:
                              KeyStringSet* keys,
                              boost::optional<RecordId> id) const;
 
-    std::unique_ptr<ProjectionExecAgg> _projExec;
+    WildcardProjection _proj;
     const CollatorInterface* _collator;
     const BSONObj _keyPattern;
     const KeyString::Version _keyStringVersion;

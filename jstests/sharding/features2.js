@@ -1,14 +1,9 @@
 (function() {
+'use strict';
 
-"use strict";
-
-var s = new ShardingTest({name: "features2", shards: 2, mongos: 1});
-
-s.adminCommand({enablesharding: "test"});
+var s = new ShardingTest({shards: 2, mongos: 1});
+assert.commandWorked(s.s0.adminCommand({enablesharding: "test"}));
 s.ensurePrimaryShard('test', s.shard1.shardName);
-
-let a = s._connections[0].getDB("test");
-let b = s._connections[1].getDB("test");
 
 let db = s.getDB("test");
 
@@ -19,15 +14,18 @@ db.foo.save({x: 2});
 db.foo.save({x: 3});
 db.foo.ensureIndex({x: 1});
 
+let a = s.shard0.getDB("test");
+let b = s.shard1.getDB("test");
+
 assert.eq("1,2,3", db.foo.distinct("x"), "distinct 1");
 assert(a.foo.distinct("x").length == 3 || b.foo.distinct("x").length == 3, "distinct 2");
 assert(a.foo.distinct("x").length == 0 || b.foo.distinct("x").length == 0, "distinct 3");
 
-assert.eq(1, s.onNumShards("foo"), "A1");
+assert.eq(1, s.onNumShards("test", "foo"), "A1");
 
 s.shardColl("foo", {x: 1}, {x: 2}, {x: 3}, null, true /* waitForDelete */);
 
-assert.eq(2, s.onNumShards("foo"), "A2");
+assert.eq(2, s.onNumShards("test", "foo"), "A2");
 
 assert.eq("1,2,3", db.foo.distinct("x"), "distinct 4");
 
@@ -60,7 +58,7 @@ db.foo2.save({_id: new ObjectId()});
 db.foo2.save({_id: new ObjectId()});
 db.foo2.save({_id: new ObjectId()});
 
-assert.eq(1, s.onNumShards("foo2"), "F1");
+assert.eq(1, s.onNumShards("test", "foo2"), "F1");
 
 printjson(db.foo2.getIndexes());
 s.adminCommand({shardcollection: "test.foo2", key: {_id: 1}});
@@ -98,7 +96,6 @@ let doMR = function(n) {
 
     var res = db.mr.mapReduce(m, r, "smr1_out");
     printjson(res);
-    assert.eq(4, res.counts.input, "MR T0 " + n);
 
     var x = db[res.result];
     assert.eq(3, x.find().count(), "MR T1 " + n);
@@ -118,7 +115,6 @@ let doMR = function(n) {
 
     var res = db.mr.mapReduce(m, r, {out: {inline: 1}});
     printjson(res);
-    assert.eq(4, res.counts.input, "MR T6 " + n);
 
     var z = {};
     res.results.forEach(function(a) {
@@ -133,9 +129,9 @@ let doMR = function(n) {
 
 doMR("before");
 
-assert.eq(1, s.onNumShards("mr"), "E1");
+assert.eq(1, s.onNumShards("test", "mr"), "E1");
 s.shardColl("mr", {x: 1}, {x: 2}, {x: 3}, null, true /* waitForDelete */);
-assert.eq(2, s.onNumShards("mr"), "E1");
+assert.eq(2, s.onNumShards("test", "mr"), "E1");
 
 doMR("after");
 
@@ -148,7 +144,7 @@ doMR("after extra split");
 let cmd = {mapreduce: "mr", map: "emit( ", reduce: "fooz + ", out: "broken1"};
 
 let x = db.runCommand(cmd);
-let y = s._connections[0].getDB("test").runCommand(cmd);
+let y = s.shard0.getDB("test").runCommand(cmd);
 
 printjson(x);
 printjson(y);

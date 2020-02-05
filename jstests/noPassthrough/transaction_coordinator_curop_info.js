@@ -7,6 +7,7 @@
 (function() {
 'use strict';
 load('jstests/libs/fail_point_util.js');
+load('jstests/sharding/libs/sharded_transactions_helpers.js');  // for waitForFailpoint
 
 function commitTxn(st, lsid, txnNumber, expectedError = null) {
     let cmd = "db.adminCommand({" +
@@ -25,12 +26,18 @@ function commitTxn(st, lsid, txnNumber, expectedError = null) {
 }
 
 function curOpAfterFailpoint(failPoint, filter, timesEntered = 1) {
-    jsTest.log(`waiting for failpoint '${failPoint.failPointName}' to appear in the log ${
+    jsTest.log(`waiting for failpoint '${failPoint.failPointName}' to be entered ${
         timesEntered} time(s).`);
-    failPoint.wait(timesEntered);
+    if (timesEntered > 1) {
+        const expectedLog = "Hit " + failPoint.failPointName + " failpoint";
+        waitForFailpoint(expectedLog, timesEntered);
+    } else {
+        failPoint.wait();
+    }
 
     jsTest.log(`Running curOp operation after '${failPoint.failPointName}' failpoint.`);
-    let result = adminDB.aggregate([{$currentOp: {}}, {$match: filter}]).toArray();
+    let result =
+        adminDB.aggregate([{$currentOp: {'idleConnections': true}}, {$match: filter}]).toArray();
 
     jsTest.log(`${result.length} matching curOp entries after '${failPoint.failPointName}':\n${
         tojson(result)}`);
@@ -43,7 +50,6 @@ function curOpAfterFailpoint(failPoint, filter, timesEntered = 1) {
 
 function makeWorkerFilterWithAction(session, action, txnNumber) {
     return {
-        active: true,
         'twoPhaseCommitCoordinator.lsid.id': session.getSessionId().id,
         'twoPhaseCommitCoordinator.txnNumber': NumberLong(txnNumber),
         'twoPhaseCommitCoordinator.action': action,
@@ -97,6 +103,7 @@ assert.commandWorked(st.s.adminCommand({split: ns, middle: {_id: 0}}));
 assert.commandWorked(st.s.adminCommand({moveChunk: ns, find: {_id: 0}, to: participant.shardName}));
 assert.commandWorked(coordinator.adminCommand({_flushRoutingTableCacheUpdates: ns}));
 assert.commandWorked(participant.adminCommand({_flushRoutingTableCacheUpdates: ns}));
+st.refreshCatalogCacheForNs(st.s, ns);
 
 let failPoints = enableFailPoints(coordinator, failPointNames);
 

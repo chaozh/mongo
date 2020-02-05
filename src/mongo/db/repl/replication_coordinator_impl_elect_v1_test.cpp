@@ -159,14 +159,15 @@ TEST_F(ReplCoordTest, ElectionSucceedsWhenNodeIsTheOnlyElectableNode) {
     auto& opCtx = *opCtxPtr;
 
     // Since we're still in drain mode, expect that we report ismaster: false, issecondary:true.
-    IsMasterResponse imResponse;
-    getReplCoord()->fillIsMasterForReplSet(&imResponse, {});
-    ASSERT_FALSE(imResponse.isMaster()) << imResponse.toBSON().toString();
-    ASSERT_TRUE(imResponse.isSecondary()) << imResponse.toBSON().toString();
+    auto imResponse =
+        getReplCoord()->awaitIsMasterResponse(opCtxPtr.get(), {}, boost::none, boost::none);
+    ASSERT_FALSE(imResponse->isMaster()) << imResponse->toBSON().toString();
+    ASSERT_TRUE(imResponse->isSecondary()) << imResponse->toBSON().toString();
     signalDrainComplete(&opCtx);
-    getReplCoord()->fillIsMasterForReplSet(&imResponse, {});
-    ASSERT_TRUE(imResponse.isMaster()) << imResponse.toBSON().toString();
-    ASSERT_FALSE(imResponse.isSecondary()) << imResponse.toBSON().toString();
+    imResponse =
+        getReplCoord()->awaitIsMasterResponse(opCtxPtr.get(), {}, boost::none, boost::none);
+    ASSERT_TRUE(imResponse->isMaster()) << imResponse->toBSON().toString();
+    ASSERT_FALSE(imResponse->isSecondary()) << imResponse->toBSON().toString();
 }
 
 TEST_F(ReplCoordTest, StartElectionDoesNotStartAnElectionWhenNodeIsRecovering) {
@@ -215,14 +216,15 @@ TEST_F(ReplCoordTest, ElectionSucceedsWhenNodeIsTheOnlyNode) {
     auto& opCtx = *opCtxPtr;
 
     // Since we're still in drain mode, expect that we report ismaster: false, issecondary:true.
-    IsMasterResponse imResponse;
-    getReplCoord()->fillIsMasterForReplSet(&imResponse, {});
-    ASSERT_FALSE(imResponse.isMaster()) << imResponse.toBSON().toString();
-    ASSERT_TRUE(imResponse.isSecondary()) << imResponse.toBSON().toString();
+    auto imResponse =
+        getReplCoord()->awaitIsMasterResponse(opCtxPtr.get(), {}, boost::none, boost::none);
+    ASSERT_FALSE(imResponse->isMaster()) << imResponse->toBSON().toString();
+    ASSERT_TRUE(imResponse->isSecondary()) << imResponse->toBSON().toString();
     signalDrainComplete(&opCtx);
-    getReplCoord()->fillIsMasterForReplSet(&imResponse, {});
-    ASSERT_TRUE(imResponse.isMaster()) << imResponse.toBSON().toString();
-    ASSERT_FALSE(imResponse.isSecondary()) << imResponse.toBSON().toString();
+    imResponse =
+        getReplCoord()->awaitIsMasterResponse(opCtxPtr.get(), {}, boost::none, boost::none);
+    ASSERT_TRUE(imResponse->isMaster()) << imResponse->toBSON().toString();
+    ASSERT_FALSE(imResponse->isSecondary()) << imResponse->toBSON().toString();
 
     // Check that only the 'numCatchUpsSkipped' primary catchup conclusion reason was incremented.
     ASSERT_EQ(0, ReplicationMetrics::get(opCtxPtr.get()).getNumCatchUpsSucceeded_forTesting());
@@ -266,7 +268,7 @@ TEST_F(ReplCoordTest, ElectionSucceedsWhenAllNodesVoteYea) {
     ASSERT_EQ(1, lastVote.getValue().getTerm());
 
     stopCapturingLogMessages();
-    ASSERT_EQUALS(1, countLogLinesContaining("election succeeded"));
+    ASSERT_EQUALS(1, countTextFormatLogLinesContaining("election succeeded"));
 
     // Check that the numElectionTimeoutsCalled and the numElectionTimeoutsSuccessful election
     // metrics have been incremented, and that none of the metrics that track the number of
@@ -320,7 +322,7 @@ TEST_F(ReplCoordTest, ElectionSucceedsWhenMaxSevenNodesVoteYea) {
     ASSERT_EQ(1, lastVote.getValue().getTerm());
 
     stopCapturingLogMessages();
-    ASSERT_EQUALS(1, countLogLinesContaining("election succeeded"));
+    ASSERT_EQUALS(1, countTextFormatLogLinesContaining("election succeeded"));
 }
 
 TEST_F(ReplCoordTest, ElectionFailsWhenInsufficientVotesAreReceivedDuringDryRun) {
@@ -386,8 +388,9 @@ TEST_F(ReplCoordTest, ElectionFailsWhenInsufficientVotesAreReceivedDuringDryRun)
     }
     net->exitNetwork();
     stopCapturingLogMessages();
-    ASSERT_EQUALS(
-        1, countLogLinesContaining("not running for primary, we received insufficient votes"));
+    ASSERT_EQUALS(1,
+                  countTextFormatLogLinesContaining(
+                      "not running for primary, we received insufficient votes"));
 
     // Check that the node's election candidate metrics have been cleared, since it lost the dry-run
     // election and will not become primary.
@@ -451,8 +454,9 @@ TEST_F(ReplCoordTest, ElectionFailsWhenDryRunResponseContainsANewerTerm) {
     net->exitNetwork();
     getReplCoord()->waitForElectionFinish_forTest();
     stopCapturingLogMessages();
-    ASSERT_EQUALS(
-        1, countLogLinesContaining("not running for primary, we have been superseded already"));
+    ASSERT_EQUALS(1,
+                  countTextFormatLogLinesContaining(
+                      "not running for primary, we have been superseded already"));
 }
 
 TEST_F(ReplCoordTest, NodeWillNotStandForElectionDuringHeartbeatReconfig) {
@@ -515,7 +519,7 @@ TEST_F(ReplCoordTest, NodeWillNotStandForElectionDuringHeartbeatReconfig) {
     ASSERT_EQUALS(ErrorCodes::ConfigurationInProgress,
                   getReplCoord()->processReplSetReconfig(&opCtx, args, &result));
 
-    logger::globalLogDomain()->setMinimumLoggedSeverity(logger::LogSeverity::Debug(2));
+    setMinimumLoggedSeverity(logger::LogSeverity::Debug(2));
     startCapturingLogMessages();
 
     // receive sufficient heartbeats to allow the node to see a majority.
@@ -569,8 +573,8 @@ TEST_F(ReplCoordTest, NodeWillNotStandForElectionDuringHeartbeatReconfig) {
     stopCapturingLogMessages();
     // ensure node does not stand for election
     ASSERT_EQUALS(1,
-                  countLogLinesContaining("Not standing for election; processing "
-                                          "a configuration change"));
+                  countTextFormatLogLinesContaining("Not standing for election; processing "
+                                                    "a configuration change"));
     globalFailPointRegistry().find("blockHeartbeatReconfigFinish")->setMode(FailPoint::off);
 }
 
@@ -619,8 +623,9 @@ TEST_F(ReplCoordTest, ElectionFailsWhenInsufficientVotesAreReceivedDuringRequest
 
     getReplCoord()->waitForElectionFinish_forTest();
     stopCapturingLogMessages();
-    ASSERT_EQUALS(1,
-                  countLogLinesContaining("not becoming primary, we received insufficient votes"));
+    ASSERT_EQUALS(
+        1,
+        countTextFormatLogLinesContaining("not becoming primary, we received insufficient votes"));
 }
 
 TEST_F(ReplCoordTest, TransitionToRollbackFailsWhenElectionInProgress) {
@@ -712,8 +717,9 @@ TEST_F(ReplCoordTest, ElectionFailsWhenVoteRequestResponseContainsANewerTerm) {
 
     getReplCoord()->waitForElectionFinish_forTest();
     stopCapturingLogMessages();
-    ASSERT_EQUALS(1,
-                  countLogLinesContaining("not becoming primary, we have been superseded already"));
+    ASSERT_EQUALS(
+        1,
+        countTextFormatLogLinesContaining("not becoming primary, we have been superseded already"));
 
     // Check that the node's election candidate metrics have been cleared, since it lost the actual
     // election and will not become primary.
@@ -755,7 +761,7 @@ TEST_F(ReplCoordTest, ElectionFailsWhenTermChangesDuringDryRun) {
 
     stopCapturingLogMessages();
     ASSERT_EQUALS(1,
-                  countLogLinesContaining(
+                  countTextFormatLogLinesContaining(
                       "not running for primary, we have been superseded already during dry run"));
 }
 
@@ -806,8 +812,9 @@ TEST_F(ReplCoordTest, ElectionFailsWhenTermChangesDuringActualElection) {
     net->exitNetwork();
     getReplCoord()->waitForElectionFinish_forTest();
     stopCapturingLogMessages();
-    ASSERT_EQUALS(1,
-                  countLogLinesContaining("not becoming primary, we have been superseded already"));
+    ASSERT_EQUALS(
+        1,
+        countTextFormatLogLinesContaining("not becoming primary, we have been superseded already"));
 }
 
 class TakeoverTest : public ReplCoordTest {
@@ -895,10 +902,11 @@ public:
         ASSERT_EQ(lastVoteExpected.getTerm(), lastVote.getValue().getTerm());
 
         if (reason == StartElectionReasonEnum::kPriorityTakeover) {
-            ASSERT_EQUALS(1,
-                          countLogLinesContaining("Starting an election for a priority takeover"));
+            ASSERT_EQUALS(
+                1,
+                countTextFormatLogLinesContaining("Starting an election for a priority takeover"));
         }
-        ASSERT_EQUALS(1, countLogLinesContaining("election succeeded"));
+        ASSERT_EQUALS(1, countTextFormatLogLinesContaining("election succeeded"));
     }
 
 private:
@@ -1101,7 +1109,7 @@ TEST_F(TakeoverTest, PrefersPriorityToCatchupTakeoverIfNodeHasHighestPriority) {
                                                          << "node3:12345"))
                              << "protocolVersion" << 1);
 
-    logger::globalLogDomain()->setMinimumLoggedSeverity(logger::LogSeverity::Debug(2));
+    setMinimumLoggedSeverity(logger::LogSeverity::Debug(2));
     startCapturingLogMessages();
 
     assertStartSuccess(configObj, HostAndPort("node1", 12345));
@@ -1134,10 +1142,10 @@ TEST_F(TakeoverTest, PrefersPriorityToCatchupTakeoverIfNodeHasHighestPriority) {
     ASSERT_FALSE(replCoord->getCatchupTakeover_forTest());
 
     stopCapturingLogMessages();
-    ASSERT_EQUALS(
-        1,
-        countLogLinesContaining("I can take over the primary because I have a higher priority, "
-                                "the highest priority in the replica set, and fresher data."));
+    ASSERT_EQUALS(1,
+                  countTextFormatLogLinesContaining(
+                      "I can take over the primary because I have a higher priority, "
+                      "the highest priority in the replica set, and fresher data."));
 }
 
 TEST_F(TakeoverTest, CatchupTakeoverNotScheduledTwice) {
@@ -1320,13 +1328,15 @@ TEST_F(TakeoverTest, CatchupTakeoverCallbackCanceledIfElectionTimeoutRuns) {
 
     stopCapturingLogMessages();
 
-    ASSERT_EQUALS(1, countLogLinesContaining("Starting an election, since we've seen no PRIMARY"));
+    ASSERT_EQUALS(
+        1, countTextFormatLogLinesContaining("Starting an election, since we've seen no PRIMARY"));
 
     // Make sure catchup takeover never happend and CatchupTakeover callback was canceled.
     ASSERT_FALSE(replCoord->getCatchupTakeover_forTest());
     ASSERT(replCoord->getMemberState().secondary());
-    ASSERT_EQUALS(1, countLogLinesContaining("Canceling catchup takeover callback"));
-    ASSERT_EQUALS(0, countLogLinesContaining("Starting an election for a catchup takeover"));
+    ASSERT_EQUALS(1, countTextFormatLogLinesContaining("Canceling catchup takeover callback"));
+    ASSERT_EQUALS(0,
+                  countTextFormatLogLinesContaining("Starting an election for a catchup takeover"));
 }
 
 TEST_F(TakeoverTest, CatchupTakeoverCanceledIfTransitionToRollback) {
@@ -1385,8 +1395,9 @@ TEST_F(TakeoverTest, CatchupTakeoverCanceledIfTransitionToRollback) {
 
     // Make sure catchup takeover never happend and CatchupTakeover callback was canceled.
     ASSERT_FALSE(replCoord->getCatchupTakeover_forTest());
-    ASSERT_EQUALS(1, countLogLinesContaining("Canceling catchup takeover callback"));
-    ASSERT_EQUALS(0, countLogLinesContaining("Starting an election for a catchup takeover"));
+    ASSERT_EQUALS(1, countTextFormatLogLinesContaining("Canceling catchup takeover callback"));
+    ASSERT_EQUALS(0,
+                  countTextFormatLogLinesContaining("Starting an election for a catchup takeover"));
 }
 
 TEST_F(TakeoverTest, SuccessfulCatchupTakeover) {
@@ -1444,7 +1455,8 @@ TEST_F(TakeoverTest, SuccessfulCatchupTakeover) {
 
     // Since the heartbeats go through the catchupTakeoverTimeout, this log
     // message happens already (otherwise it would happen in performSuccessfulTakeover).
-    ASSERT_EQUALS(1, countLogLinesContaining("Starting an election for a catchup takeover"));
+    ASSERT_EQUALS(1,
+                  countTextFormatLogLinesContaining("Starting an election for a catchup takeover"));
 
     LastVote lastVoteExpected = LastVote(replCoord->getTerm() + 1, 0);
     performSuccessfulTakeover(
@@ -1522,7 +1534,8 @@ TEST_F(TakeoverTest, CatchupTakeoverDryRunFailsPrimarySaysNo) {
     now = respondToHeartbeatsUntil(
         config, catchupTakeoverTime, HostAndPort("node2", 12345), behindOptime);
 
-    ASSERT_EQUALS(1, countLogLinesContaining("Starting an election for a catchup takeover"));
+    ASSERT_EQUALS(1,
+                  countTextFormatLogLinesContaining("Starting an election for a catchup takeover"));
 
     // Simulate a dry run where the primary has caught up and is now ahead of the
     // node trying to do the catchup takeover. All the secondary nodes respond
@@ -1568,7 +1581,7 @@ TEST_F(TakeoverTest, CatchupTakeoverDryRunFailsPrimarySaysNo) {
 
     // Make sure an election wasn't called for and that we are still secondary.
     ASSERT_EQUALS(1,
-                  countLogLinesContaining(
+                  countTextFormatLogLinesContaining(
                       "not running for primary, the current primary responded no in the dry run"));
     ASSERT(replCoord->getMemberState().secondary());
 }
@@ -1628,7 +1641,8 @@ TEST_F(TakeoverTest, PrimaryCatchesUpBeforeCatchupTakeover) {
     // Make sure we're secondary and that no catchup takeover election happened.
     ASSERT(replCoord->getMemberState().secondary());
     ASSERT_FALSE(replCoord->getCatchupTakeover_forTest());
-    ASSERT_EQUALS(1, countLogLinesContaining("Not starting an election for a catchup takeover"));
+    ASSERT_EQUALS(
+        1, countTextFormatLogLinesContaining("Not starting an election for a catchup takeover"));
 }
 
 TEST_F(TakeoverTest, PrimaryCatchesUpBeforeHighPriorityNodeCatchupTakeover) {
@@ -1688,7 +1702,8 @@ TEST_F(TakeoverTest, PrimaryCatchesUpBeforeHighPriorityNodeCatchupTakeover) {
     // Make sure we're secondary and that no catchup takeover election happens.
     ASSERT(replCoord->getMemberState().secondary());
     ASSERT_FALSE(replCoord->getCatchupTakeover_forTest());
-    ASSERT_EQUALS(1, countLogLinesContaining("Not starting an election for a catchup takeover"));
+    ASSERT_EQUALS(
+        1, countTextFormatLogLinesContaining("Not starting an election for a catchup takeover"));
 
     // Make sure that the priority takeover has now been scheduled and at the
     // correct time.
@@ -1865,8 +1880,9 @@ TEST_F(TakeoverTest, DontCallForPriorityTakeoverWhenLaggedSameSecond) {
     stopCapturingLogMessages();
 
     ASSERT(replCoord->getMemberState().secondary());
-    ASSERT_EQUALS(1,
-                  countLogLinesContaining("Not standing for election because member is not "
+    ASSERT_EQUALS(
+        1,
+        countTextFormatLogLinesContaining("Not standing for election because member is not "
                                           "caught up enough to the most up-to-date member to "
                                           "call for priority takeover"));
 
@@ -1949,8 +1965,9 @@ TEST_F(TakeoverTest, DontCallForPriorityTakeoverWhenLaggedDifferentSecond) {
     stopCapturingLogMessages();
 
     ASSERT(replCoord->getMemberState().secondary());
-    ASSERT_EQUALS(1,
-                  countLogLinesContaining("Not standing for election because member is not "
+    ASSERT_EQUALS(
+        1,
+        countTextFormatLogLinesContaining("Not standing for election because member is not "
                                           "caught up enough to the most up-to-date member to "
                                           "call for priority takeover"));
 
@@ -2167,10 +2184,11 @@ protected:
         ASSERT_OK(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
 
         simulateSuccessfulV1Voting();
-        IsMasterResponse imResponse;
-        getReplCoord()->fillIsMasterForReplSet(&imResponse, {});
-        ASSERT_FALSE(imResponse.isMaster()) << imResponse.toBSON().toString();
-        ASSERT_TRUE(imResponse.isSecondary()) << imResponse.toBSON().toString();
+        const auto opCtx = makeOperationContext();
+        auto imResponse =
+            getReplCoord()->awaitIsMasterResponse(opCtx.get(), {}, boost::none, boost::none);
+        ASSERT_FALSE(imResponse->isMaster()) << imResponse->toBSON().toString();
+        ASSERT_TRUE(imResponse->isSecondary()) << imResponse->toBSON().toString();
 
         return config;
     }
@@ -2252,7 +2270,9 @@ TEST_F(PrimaryCatchUpTest, PrimaryDoesNotNeedToCatchUp) {
     ASSERT_EQUALS(2, count);
     ASSERT(getReplCoord()->getApplierState() == ApplierState::Draining);
     stopCapturingLogMessages();
-    ASSERT_EQ(1, countLogLinesContaining("Caught up to the latest optime known via heartbeats"));
+    ASSERT_EQ(
+        1,
+        countTextFormatLogLinesContaining("Caught up to the latest optime known via heartbeats"));
     auto opCtx = makeOperationContext();
     signalDrainComplete(opCtx.get());
     Lock::GlobalLock lock(opCtx.get(), MODE_IX);
@@ -2306,7 +2326,8 @@ TEST_F(PrimaryCatchUpTest, CatchupSucceeds) {
     advanceMyLastAppliedOpTime(time2, Date_t() + Seconds(time2.getSecs()));
     ASSERT(getReplCoord()->getApplierState() == ApplierState::Draining);
     stopCapturingLogMessages();
-    ASSERT_EQUALS(1, countLogLinesContaining("Caught up to the latest known optime successfully"));
+    ASSERT_EQUALS(
+        1, countTextFormatLogLinesContaining("Caught up to the latest known optime successfully"));
     auto opCtx = makeOperationContext();
     signalDrainComplete(opCtx.get());
     Lock::GlobalLock lock(opCtx.get(), MODE_IX);
@@ -2340,7 +2361,7 @@ TEST_F(PrimaryCatchUpTest, CatchupTimeout) {
     });
     ASSERT(getReplCoord()->getApplierState() == ApplierState::Draining);
     stopCapturingLogMessages();
-    ASSERT_EQUALS(1, countLogLinesContaining("Catchup timed out"));
+    ASSERT_EQUALS(1, countTextFormatLogLinesContaining("Catchup timed out"));
     auto opCtx = makeOperationContext();
     signalDrainComplete(opCtx.get());
     Lock::GlobalLock lock(opCtx.get(), MODE_IX);
@@ -2379,7 +2400,9 @@ TEST_F(PrimaryCatchUpTest, CannotSeeAllNodes) {
     });
     ASSERT(getReplCoord()->getApplierState() == ApplierState::Draining);
     stopCapturingLogMessages();
-    ASSERT_EQ(1, countLogLinesContaining("Caught up to the latest optime known via heartbeats"));
+    ASSERT_EQ(
+        1,
+        countTextFormatLogLinesContaining("Caught up to the latest optime known via heartbeats"));
     auto opCtx = makeOperationContext();
     signalDrainComplete(opCtx.get());
     Lock::GlobalLock lock(opCtx.get(), MODE_IX);
@@ -2419,7 +2442,9 @@ TEST_F(PrimaryCatchUpTest, HeartbeatTimeout) {
     });
     ASSERT(getReplCoord()->getApplierState() == ApplierState::Draining);
     stopCapturingLogMessages();
-    ASSERT_EQ(1, countLogLinesContaining("Caught up to the latest optime known via heartbeats"));
+    ASSERT_EQ(
+        1,
+        countTextFormatLogLinesContaining("Caught up to the latest optime known via heartbeats"));
     auto opCtx = makeOperationContext();
     signalDrainComplete(opCtx.get());
     Lock::GlobalLock lock(opCtx.get(), MODE_IX);
@@ -2456,9 +2481,9 @@ TEST_F(PrimaryCatchUpTest, PrimaryStepsDownBeforeHeartbeatRefreshing) {
     ASSERT_TRUE(getReplCoord()->getMemberState().secondary());
     ASSERT(getReplCoord()->getApplierState() == ApplierState::Running);
     stopCapturingLogMessages();
-    ASSERT_EQUALS(1, countLogLinesContaining("Exited primary catch-up mode"));
-    ASSERT_EQUALS(0, countLogLinesContaining("Caught up to the latest"));
-    ASSERT_EQUALS(0, countLogLinesContaining("Catchup timed out"));
+    ASSERT_EQUALS(1, countTextFormatLogLinesContaining("Exited primary catch-up mode"));
+    ASSERT_EQUALS(0, countTextFormatLogLinesContaining("Caught up to the latest"));
+    ASSERT_EQUALS(0, countTextFormatLogLinesContaining("Catchup timed out"));
     auto opCtx = makeOperationContext();
     Lock::GlobalLock lock(opCtx.get(), MODE_IX);
     ASSERT_FALSE(getReplCoord()->canAcceptWritesForDatabase(opCtx.get(), "test"));
@@ -2504,9 +2529,9 @@ TEST_F(PrimaryCatchUpTest, PrimaryStepsDownDuringCatchUp) {
     //    replyHeartbeatsAndRunUntil(getNet()->now() + config.getCatchUpTimeoutPeriod());
     ASSERT(getReplCoord()->getApplierState() == ApplierState::Running);
     stopCapturingLogMessages();
-    ASSERT_EQUALS(1, countLogLinesContaining("Exited primary catch-up mode"));
-    ASSERT_EQUALS(0, countLogLinesContaining("Caught up to the latest"));
-    ASSERT_EQUALS(0, countLogLinesContaining("Catchup timed out"));
+    ASSERT_EQUALS(1, countTextFormatLogLinesContaining("Exited primary catch-up mode"));
+    ASSERT_EQUALS(0, countTextFormatLogLinesContaining("Caught up to the latest"));
+    ASSERT_EQUALS(0, countTextFormatLogLinesContaining("Catchup timed out"));
     auto opCtx = makeOperationContext();
     Lock::GlobalLock lock(opCtx.get(), MODE_IX);
     ASSERT_FALSE(getReplCoord()->canAcceptWritesForDatabase(opCtx.get(), "test"));
@@ -2548,7 +2573,7 @@ TEST_F(PrimaryCatchUpTest, PrimaryStepsDownDuringDrainMode) {
     advanceMyLastAppliedOpTime(time2, Date_t() + Seconds(time2.getSecs()));
     ASSERT(replCoord->getApplierState() == ApplierState::Draining);
     stopCapturingLogMessages();
-    ASSERT_EQUALS(1, countLogLinesContaining("Caught up to the latest"));
+    ASSERT_EQUALS(1, countTextFormatLogLinesContaining("Caught up to the latest"));
 
     // Check that the number of elections requiring primary catchup was incremented.
     auto opCtx = makeOperationContext();
@@ -2633,7 +2658,7 @@ TEST_F(PrimaryCatchUpTest, FreshestNodeBecomesAvailableLater) {
     // The node is still in catchup mode, but the target optime has been set.
     ASSERT(getReplCoord()->getApplierState() == ApplierState::Running);
     stopCapturingLogMessages();
-    ASSERT_EQ(1, countLogLinesContaining("Heartbeats updated catchup target optime"));
+    ASSERT_EQ(1, countTextFormatLogLinesContaining("Heartbeats updated catchup target optime"));
     ASSERT_EQUALS(time3,
                   ReplicationMetrics::get(getServiceContext()).getTargetCatchupOpTime_forTesting());
 
@@ -2655,7 +2680,7 @@ TEST_F(PrimaryCatchUpTest, FreshestNodeBecomesAvailableLater) {
     // The node is still in catchup mode, but the target optime has been updated.
     ASSERT(getReplCoord()->getApplierState() == ApplierState::Running);
     stopCapturingLogMessages();
-    ASSERT_EQ(1, countLogLinesContaining("Heartbeats updated catchup target optime"));
+    ASSERT_EQ(1, countTextFormatLogLinesContaining("Heartbeats updated catchup target optime"));
     ASSERT_EQUALS(time4,
                   ReplicationMetrics::get(getServiceContext()).getTargetCatchupOpTime_forTesting());
 
@@ -2668,7 +2693,7 @@ TEST_F(PrimaryCatchUpTest, FreshestNodeBecomesAvailableLater) {
     advanceMyLastAppliedOpTime(time4, Date_t() + Seconds(time4.getSecs()));
     ASSERT(getReplCoord()->getApplierState() == ApplierState::Draining);
     stopCapturingLogMessages();
-    ASSERT_EQ(1, countLogLinesContaining("Caught up to the latest"));
+    ASSERT_EQ(1, countTextFormatLogLinesContaining("Caught up to the latest"));
     auto opCtx = makeOperationContext();
     signalDrainComplete(opCtx.get());
     Lock::GlobalLock lock(opCtx.get(), MODE_IX);
@@ -2727,9 +2752,9 @@ TEST_F(PrimaryCatchUpTest, InfiniteTimeoutAndAbort) {
     ASSERT(getReplCoord()->getApplierState() == ApplierState::Draining);
 
     stopCapturingLogMessages();
-    ASSERT_EQUALS(1, countLogLinesContaining("Exited primary catch-up mode"));
-    ASSERT_EQUALS(0, countLogLinesContaining("Caught up to the latest"));
-    ASSERT_EQUALS(0, countLogLinesContaining("Catchup timed out"));
+    ASSERT_EQUALS(1, countTextFormatLogLinesContaining("Exited primary catch-up mode"));
+    ASSERT_EQUALS(0, countTextFormatLogLinesContaining("Caught up to the latest"));
+    ASSERT_EQUALS(0, countTextFormatLogLinesContaining("Catchup timed out"));
     auto opCtx = makeOperationContext();
     signalDrainComplete(opCtx.get());
     Lock::GlobalLock lock(opCtx.get(), MODE_IX);
@@ -2758,7 +2783,7 @@ TEST_F(PrimaryCatchUpTest, ZeroTimeout) {
     ReplSetConfig config = setUp3NodeReplSetAndRunForElection(time1, 0);
     ASSERT(getReplCoord()->getApplierState() == ApplierState::Draining);
     stopCapturingLogMessages();
-    ASSERT_EQUALS(1, countLogLinesContaining("Skipping primary catchup"));
+    ASSERT_EQUALS(1, countTextFormatLogLinesContaining("Skipping primary catchup"));
     auto opCtx = makeOperationContext();
     signalDrainComplete(opCtx.get());
     Lock::GlobalLock lock(opCtx.get(), MODE_IX);
@@ -2799,9 +2824,9 @@ TEST_F(PrimaryCatchUpTest, CatchUpFailsDueToPrimaryStepDown) {
     ASSERT(getReplCoord()->getApplierState() == ApplierState::Running);
 
     stopCapturingLogMessages();
-    ASSERT_EQUALS(1, countLogLinesContaining("Exited primary catch-up mode"));
-    ASSERT_EQUALS(0, countLogLinesContaining("Caught up to the latest"));
-    ASSERT_EQUALS(0, countLogLinesContaining("Catchup timed out"));
+    ASSERT_EQUALS(1, countTextFormatLogLinesContaining("Exited primary catch-up mode"));
+    ASSERT_EQUALS(0, countTextFormatLogLinesContaining("Caught up to the latest"));
+    ASSERT_EQUALS(0, countTextFormatLogLinesContaining("Catchup timed out"));
 
     // Check that the number of elections requiring primary catchup was incremented.
     ASSERT_EQ(1, ReplicationMetrics::get(opCtx.get()).getNumCatchUps_forTesting());

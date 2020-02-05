@@ -136,7 +136,7 @@ class TestSuiteExecutor(object):  # pylint: disable=too-many-instance-attributes
 
                 sb = []  # String builder.
                 self._suite.summarize_latest(sb)
-                self.logger.info("Summary: %s", "\n    ".join(sb))
+                self.logger.info("Summary of latest execution: %s", "\n    ".join(sb))
 
                 if not report.wasSuccessful():
                     return_code = 1
@@ -227,7 +227,7 @@ class TestSuiteExecutor(object):  # pylint: disable=too-many-instance-attributes
         """
         success = True
         for job in self._jobs:
-            if not job.teardown_fixture():
+            if not job.manager.teardown_fixture(self.logger):
                 self.logger.warning("Teardown of %s of job %s was not successful", job.fixture,
                                     job.job_num)
                 success = False

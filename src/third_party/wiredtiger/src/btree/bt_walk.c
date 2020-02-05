@@ -79,16 +79,10 @@ found:
 static inline bool
 __ref_is_leaf(WT_SESSION_IMPL *session, WT_REF *ref)
 {
-    size_t addr_size;
-    const uint8_t *addr;
-    u_int type;
+    bool is_leaf;
 
-    /*
-     * If the page has a disk address, we can crack it to figure out if this page is a leaf page or
-     * not. If there's no address, the page isn't on disk and we don't know the page type.
-     */
-    __wt_ref_info(session, ref, &addr, &addr_size, &type);
-    return (addr == NULL ? false : type == WT_CELL_ADDR_LEAF || type == WT_CELL_ADDR_LEAF_NO);
+    __wt_ref_info_lock(session, ref, NULL, NULL, &is_leaf);
+    return (is_leaf);
 }
 
 /*
@@ -263,13 +257,13 @@ __tree_walk_internal(WT_SESSION_IMPL *session, WT_REF **refp, uint64_t *walkcntp
     WT_DECL_RET;
     WT_PAGE_INDEX *pindex;
     WT_REF *couple, *ref, *ref_orig;
-    uint64_t restart_sleep, restart_yield, swap_sleep, swap_yield;
+    uint64_t restart_sleep, restart_yield;
     uint32_t current_state, slot;
     bool empty_internal, prev, skip;
 
     btree = S2BT(session);
     pindex = NULL;
-    restart_sleep = restart_yield = swap_sleep = swap_yield = 0;
+    restart_sleep = restart_yield = 0;
     empty_internal = false;
 
     /*
@@ -398,34 +392,25 @@ restart:
             if (LF_ISSET(WT_READ_SKIP_INTL))
                 continue;
 
-            for (;;) {
-                /*
-                 * Swap our previous hazard pointer for the page we'll return.
-                 *
-                 * Not-found is an expected return, as eviction might have been attempted. The page
-                 * can't be evicted, we're holding a hazard pointer on a child, spin until we're
-                 * successful.
-                 *
-                 * Restart is not expected, our parent WT_REF should not have split.
-                 */
-                ret = __wt_page_swap(session, couple, ref, WT_READ_NOTFOUND_OK | flags);
-                if (ret == 0) {
-                    /* Success, "couple" released. */
-                    couple = NULL;
-                    *refp = ref;
-                    goto done;
-                }
-
-                WT_ASSERT(session, ret == WT_NOTFOUND);
-                WT_ERR_NOTFOUND_OK(ret);
-
-                __wt_spin_backoff(&swap_yield, &swap_sleep);
-                if (swap_yield < 1000)
-                    WT_STAT_CONN_INCR(session, cache_eviction_walk_internal_yield);
-                if (swap_sleep != 0)
-                    WT_STAT_CONN_INCRV(session, cache_eviction_walk_internal_wait, swap_sleep);
+            /*
+             * Swap our previous hazard pointer for the page we'll return.
+             *
+             * Not-found is an expected return, as eviction might have been attempted. Restart is
+             * not expected, our parent WT_REF should not have split.
+             */
+            ret = __wt_page_swap(session, couple, ref, WT_READ_NOTFOUND_OK | flags);
+            if (ret == 0) {
+                /* Success, "couple" released. */
+                couple = NULL;
+                *refp = ref;
+                goto done;
             }
-            /* NOTREACHED */
+
+            /* An expected error, so "couple" is unchanged. */
+            if (ret == WT_NOTFOUND)
+                continue;
+
+            goto err;
         }
 
         if (prev)

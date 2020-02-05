@@ -28,6 +28,9 @@
 
 #include "test_util.h"
 
+#ifdef HAVE_SETRLIMIT
+#include <sys/resource.h>
+#endif
 #include <signal.h>
 
 #define EXTPATH "../../ext/" /* Extensions path */
@@ -63,6 +66,7 @@ typedef struct {
     char *home_backup_init;  /* Initialize backup command */
     char *home_config;       /* Run CONFIG file path */
     char *home_init;         /* Initialize home command */
+    char *home_lasdump;      /* LAS dump filename */
     char *home_log;          /* Operation log file path */
     char *home_pagedump;     /* Page dump filename */
     char *home_rand;         /* RNG log file path */
@@ -101,15 +105,6 @@ typedef struct {
     uint64_t timestamp; /* Counter for timestamps */
 
     uint64_t truncate_cnt; /* Counter for truncation */
-
-    /*
-     * We have a list of records that are appended, but not yet "resolved", that is, we haven't yet
-     * incremented the g.rows value to reflect the new records.
-     */
-    uint64_t *append;             /* Appended records */
-    size_t append_max;            /* Maximum unresolved records */
-    size_t append_cnt;            /* Current unresolved records */
-    pthread_rwlock_t append_lock; /* Single-thread resolution */
 
     pthread_rwlock_t death_lock; /* Single-thread failure */
 
@@ -165,8 +160,8 @@ typedef struct {
     char *c_logging_compression;
     uint32_t c_logging_file_max;
     uint32_t c_logging_prealloc;
-    uint32_t c_long_running_txn;
     uint32_t c_lsm_worker_threads;
+    uint32_t c_major_timeout;
     uint32_t c_memory_page_max;
     uint32_t c_merge_max;
     uint32_t c_mmap;
@@ -312,6 +307,9 @@ typedef struct {
     uint64_t commit_ts;    /* commit timestamp */
     SNAP_OPS *snap, *snap_first, snap_list[512];
 
+    uint64_t insert_list[256]; /* column-store inserted records */
+    u_int insert_list_cnt;
+
     WT_ITEM *tbuf, _tbuf; /* temporary buffer */
 
 #define TINFO_RUNNING 1  /* Running */
@@ -343,29 +341,30 @@ void key_gen_init(WT_ITEM *);
 void key_gen_insert(WT_RAND_STATE *, WT_ITEM *, uint64_t);
 void key_gen_teardown(WT_ITEM *);
 void key_init(void);
-WT_THREAD_RET lrt(void *);
 WT_THREAD_RET random_kv(void *);
 void path_setup(const char *);
 int read_row_worker(WT_CURSOR *, uint64_t, WT_ITEM *, WT_ITEM *, bool);
-uint32_t rng(WT_RAND_STATE *);
+uint32_t rng_slow(WT_RAND_STATE *);
+void set_alarm(u_int);
+void set_core_off(void);
 void snap_init(TINFO *, uint64_t, bool);
 void snap_repeat_single(WT_CURSOR *, TINFO *);
 int snap_repeat_txn(WT_CURSOR *, TINFO *);
 void snap_repeat_update(TINFO *, bool);
 void snap_track(TINFO *, thread_op);
 WT_THREAD_RET timestamp(void *);
+void timestamp_once(void);
 void track(const char *, uint64_t, TINFO *);
 void val_gen(WT_RAND_STATE *, WT_ITEM *, uint64_t);
 void val_gen_init(WT_ITEM *);
 void val_gen_teardown(WT_ITEM *);
 void val_init(void);
-void val_teardown(void);
 void wts_close(void);
 void wts_dump(const char *, bool);
 void wts_init(void);
 void wts_load(void);
 void wts_open(const char *, bool, WT_CONNECTION **);
-void wts_ops(bool);
+void wts_ops(u_int, bool);
 void wts_read_scan(void);
 void wts_rebalance(void);
 void wts_reopen(void);

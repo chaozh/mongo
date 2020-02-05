@@ -31,8 +31,26 @@ if (rc != 0) {
 
     // Output is of the format: 'glibc x.yz'
     var output = rawMongoProgramOutput();
+    clearRawMongoProgramOutput();
+
+    jsTestLog(`getconf GNU_LIBC_VERSION\n${output}`);
+
     var fields = output.split(" ");
     var glibc_version = parseFloat(fields[2]);
+
+    var rc = runProgram("cat", "/etc/os-release");
+    if (rc != 0) {
+        jsTestLog(
+            `Failed the check for /etc/os-release, we are probably not on a *nix. Skipping this test.`);
+        return;
+    }
+
+    var osRelease = rawMongoProgramOutput();
+    clearRawMongoProgramOutput();
+
+    jsTestLog(`cat /etc/os-release\n${osRelease}`);
+
+    var suzeMatch = osRelease.match(/ID="?sles"?/);
 
     // Fail this test if we are on GLIBC >= 2.2 and HOSTALIASES still doesn't work
     if (glibc_version < 2.2) {
@@ -40,18 +58,16 @@ if (rc != 0) {
             `HOSTALIASES does not seem to work as expected on this system. GLIBC
                 version is ${glibc_version}, skipping this test.`);
         return;
-    } else {
-        var verCheck = runProgram("grep", "/etc/os-release", "\"SUSE Linux Enterprise Server\"");
-        if (verCheck == 0) {
-            jsTestLog(
-                `HOSTALIASES does not seem to work as expected but we detected SLES. GLIBC
-                    version is ${glibc_version}, skipping this test.`);
-            return;
-        }
-        assert(false,
-               `HOSTALIASES does not seem to work as expected on this system. GLIBC
-                version is ${glibc_version}`);
+    } else if (suzeMatch) {
+        jsTestLog(
+            `HOSTALIASES does not seem to work as expected but we detected SLES. GLIBC
+                version is ${glibc_version}, skipping this test.`);
+        return;
     }
+
+    assert(false,
+           `HOSTALIASES does not seem to work as expected on this system. GLIBC
+            version is ${glibc_version}`);
 }
 
 var replTest = new ReplSetTest({
@@ -92,6 +108,11 @@ replTest.initiate(config);
 
 var checkExpectedHorizon = function(url, memberIndex, expectedHostname) {
     // Run isMaster in the shell and check that we get the expected hostname back
+    const assertion = (memberIndex === "me")
+        ? ("assert(db.runCommand({isMaster: 1})['me'] == '" + expectedHostname + "')")
+        : ("assert(db.runCommand({isMaster: 1})['hosts'][" + memberIndex + "] == '" +
+           expectedHostname + "')");
+
     var argv = [
         'env',
         "HOSTALIASES=" + hostsFile,
@@ -99,8 +120,7 @@ var checkExpectedHorizon = function(url, memberIndex, expectedHostname) {
         './mongo',
         url,
         '--eval',
-        ("assert(db.runCommand({isMaster: 1})['hosts'][" + memberIndex + "] == '" +
-         expectedHostname + "')")
+        assertion
     ];
     return runMongoProgram(...argv);
 };
@@ -109,6 +129,9 @@ var checkExpectedHorizon = function(url, memberIndex, expectedHostname) {
 var defaultURL = `mongodb://${node0localHostname}/admin?replicaSet=${replTest.name}&ssl=true`;
 jsTestLog(`URL without horizon: ${defaultURL}`);
 assert.eq(checkExpectedHorizon(defaultURL, 0, node0localHostname),
+          0,
+          "localhost does not return horizon");
+assert.eq(checkExpectedHorizon(defaultURL, "me", node0localHostname),
           0,
           "localhost does not return horizon");
 assert.eq(checkExpectedHorizon(defaultURL, 1, node1localHostname),
@@ -121,6 +144,9 @@ jsTestLog(`URL with horizon: ${horizonURL}`);
 assert.eq(checkExpectedHorizon(horizonURL, 0, node0horizonHostname),
           0,
           "does not return horizon as expected");
+assert.eq(checkExpectedHorizon(horizonURL, "me", node0horizonHostname),
+          0,
+          "does not return horizon as expected");
 assert.eq(checkExpectedHorizon(horizonURL, 1, node1horizonHostname),
           0,
           "does not return horizon as expected");
@@ -130,6 +156,9 @@ var horizonMissingURL =
     `mongodb://${node0horizonMissingHostname}/admin?replicaSet=${replTest.name}&ssl=true`;
 jsTestLog(`URL with horizon: ${horizonMissingURL}`);
 assert.eq(checkExpectedHorizon(horizonMissingURL, 0, node0localHostname),
+          0,
+          "does not return localhost as expected");
+assert.eq(checkExpectedHorizon(horizonMissingURL, "me", node0localHostname),
           0,
           "does not return localhost as expected");
 assert.eq(checkExpectedHorizon(horizonMissingURL, 1, node1localHostname),
@@ -148,6 +177,9 @@ var horizonMissingURL =
     `mongodb://${node0horizonMissingHostname}/admin?replicaSet=${replTest.name}&ssl=true`;
 jsTestLog(`URL with horizon: ${horizonMissingURL}`);
 assert.eq(checkExpectedHorizon(horizonMissingURL, 0, node0horizonMissingHostname),
+          0,
+          "does not return horizon as expected");
+assert.eq(checkExpectedHorizon(horizonMissingURL, "me", node0horizonMissingHostname),
           0,
           "does not return horizon as expected");
 assert.eq(checkExpectedHorizon(horizonMissingURL, 1, node1horizonMissingHostname),
@@ -169,6 +201,9 @@ assert.adminCommandWorkedAllowingNetworkError(replTest.getPrimary(), {replSetRec
 var horizonDifferentPortURL = `mongodb://${node0horizonHostname}/admin?ssl=true`;
 jsTestLog(`URL with horizon using different port: ${horizonDifferentPortURL}`);
 assert.eq(checkExpectedHorizon(horizonDifferentPortURL, 0, node0horizonHostnameDifferentPort),
+          0,
+          "does not return horizon as expected");
+assert.eq(checkExpectedHorizon(horizonDifferentPortURL, "me", node0horizonHostnameDifferentPort),
           0,
           "does not return horizon as expected");
 assert.eq(checkExpectedHorizon(horizonDifferentPortURL, 1, node1horizonHostnameDifferentPort),

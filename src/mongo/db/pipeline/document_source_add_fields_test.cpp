@@ -47,10 +47,9 @@ namespace {
 using std::vector;
 
 //
-// DocumentSourceAddFields delegates much of its responsibilities to the ParsedAddFields, which
-// derives from ParsedAggregationProjection.
-// Most of the functional tests are testing ParsedAddFields directly. These are meant as
-// simpler integration tests.
+// DocumentSourceAddFields delegates much of its responsibilities to the
+// AddFieldsProjectionExecutor. Most of the functional tests are testing
+// AddFieldsProjectionExecutor. directly. These are meant as simpler integration tests.
 //
 
 // This provides access to getExpCtx(), but we'll use a different name for this test suite.
@@ -147,7 +146,7 @@ TEST_F(AddFieldsTest, ShouldAddReferencedFieldsToDependencies) {
     auto addFields = DocumentSourceAddFields::create(
         fromjson("{a: true, x: '$b', y: {$and: ['$c','$d']}, z: {$meta: 'textScore'}}"),
         getExpCtx());
-    DepsTracker dependencies(DepsTracker::kOnlyTextScore);
+    DepsTracker dependencies(DepsTracker::kAllMetadata & ~DepsTracker::kOnlyTextScore);
     ASSERT_EQUALS(DepsTracker::State::SEE_NEXT, addFields->getDependencies(&dependencies));
     ASSERT_EQUALS(3U, dependencies.fields.size());
 

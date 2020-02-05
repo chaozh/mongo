@@ -95,11 +95,14 @@ protected:
         // checkpoint and see all the new data.
         _opCtx.recoveryUnit()->waitUntilUnjournaledWritesDurable(&_opCtx);
 
+        auto options = (_full) ? CollectionValidation::ValidateOptions::kFullValidation
+                               : CollectionValidation::ValidateOptions::kNoFullValidation;
+
         ValidateResults results;
         BSONObjBuilder output;
 
         ASSERT_OK(
-            CollectionValidation::validate(&_opCtx, _nss, _full, _background, &results, &output));
+            CollectionValidation::validate(&_opCtx, _nss, options, _background, &results, &output));
 
         //  Check if errors are reported if and only if valid is set to false.
         ASSERT_EQ(results.valid, results.errors.empty());
@@ -891,10 +894,12 @@ public:
             KeyStringSet keys;
             iam->getKeys(actualKey,
                          IndexAccessMethod::GetKeysMode::kRelaxConstraintsUnfiltered,
+                         IndexAccessMethod::GetKeysContext::kReadOrAddKeys,
                          &keys,
                          nullptr,
                          nullptr,
-                         id1);
+                         id1,
+                         IndexAccessMethod::kNoopOnSuppressedErrorFn);
             auto removeStatus =
                 iam->removeKeys(&_opCtx, {keys.begin(), keys.end()}, id1, options, &numDeleted);
             auto insertStatus = iam->insert(&_opCtx, badKey, id1, options, &insertResult);
@@ -1205,7 +1210,12 @@ public:
             BSONObjBuilder output;
 
             ASSERT_OK(CollectionValidation::validate(
-                &_opCtx, _nss, /*fullValidate=*/true, _background, &results, &output));
+                &_opCtx,
+                _nss,
+                CollectionValidation::ValidateOptions::kFullValidation,
+                _background,
+                &results,
+                &output));
 
             ASSERT_EQ(false, results.valid);
             ASSERT_EQ(static_cast<size_t>(1), results.errors.size());
@@ -1287,10 +1297,12 @@ public:
             KeyStringSet keys;
             iam->getKeys(actualKey,
                          IndexAccessMethod::GetKeysMode::kRelaxConstraintsUnfiltered,
+                         IndexAccessMethod::GetKeysContext::kReadOrAddKeys,
                          &keys,
                          nullptr,
                          nullptr,
-                         rid);
+                         rid,
+                         IndexAccessMethod::kNoopOnSuppressedErrorFn);
             auto removeStatus =
                 iam->removeKeys(&_opCtx, {keys.begin(), keys.end()}, rid, options, &numDeleted);
 
@@ -1310,7 +1322,12 @@ public:
             BSONObjBuilder output;
 
             ASSERT_OK(CollectionValidation::validate(
-                &_opCtx, _nss, /*fullValidate=*/true, _background, &results, &output));
+                &_opCtx,
+                _nss,
+                CollectionValidation::ValidateOptions::kFullValidation,
+                _background,
+                &results,
+                &output));
 
             ASSERT_EQ(false, results.valid);
             ASSERT_EQ(static_cast<size_t>(1), results.errors.size());
@@ -1393,7 +1410,12 @@ public:
             BSONObjBuilder output;
 
             ASSERT_OK(CollectionValidation::validate(
-                &_opCtx, _nss, /*fullValidate=*/true, _background, &results, &output));
+                &_opCtx,
+                _nss,
+                CollectionValidation::ValidateOptions::kFullValidation,
+                _background,
+                &results,
+                &output));
 
             ASSERT_EQ(false, results.valid);
             ASSERT_EQ(static_cast<size_t>(2), results.errors.size());
@@ -1486,10 +1508,12 @@ public:
             KeyStringSet keys;
             iam->getKeys(actualKey,
                          IndexAccessMethod::GetKeysMode::kRelaxConstraintsUnfiltered,
+                         IndexAccessMethod::GetKeysContext::kReadOrAddKeys,
                          &keys,
                          nullptr,
                          nullptr,
-                         rid);
+                         rid,
+                         IndexAccessMethod::kNoopOnSuppressedErrorFn);
             auto removeStatus =
                 iam->removeKeys(&_opCtx, {keys.begin(), keys.end()}, rid, options, &numDeleted);
 
@@ -1520,10 +1544,12 @@ public:
             KeyStringSet keys;
             iam->getKeys(actualKey,
                          IndexAccessMethod::GetKeysMode::kRelaxConstraintsUnfiltered,
+                         IndexAccessMethod::GetKeysContext::kReadOrAddKeys,
                          &keys,
                          nullptr,
                          nullptr,
-                         rid);
+                         rid,
+                         IndexAccessMethod::kNoopOnSuppressedErrorFn);
             auto removeStatus =
                 iam->removeKeys(&_opCtx, {keys.begin(), keys.end()}, rid, options, &numDeleted);
 

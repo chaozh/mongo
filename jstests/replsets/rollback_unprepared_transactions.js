@@ -1,11 +1,10 @@
 /**
  * Tests that an unprepared transaction can be rolled back.
- * @tags: [requires_replication, requires_wiredtiger]
+ * @tags: [requires_replication, requires_wiredtiger, requires_fcv_44]
  */
 (function() {
 'use strict';
 
-load('jstests/libs/check_log.js');
 load('jstests/replsets/libs/rollback_test.js');
 load('jstests/replsets/libs/rollback_files.js');
 load("jstests/libs/uuid_util.js");

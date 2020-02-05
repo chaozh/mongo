@@ -41,6 +41,7 @@
 #include "mongo/db/repl/repl_settings.h"
 #include "mongo/db/repl/split_horizon.h"
 #include "mongo/db/repl/sync_source_selector.h"
+#include "mongo/rpc/topology_version_gen.h"
 #include "mongo/util/net/hostandport.h"
 #include "mongo/util/time_support.h"
 
@@ -130,6 +131,15 @@ public:
      * blocking until all replication-related shutdown tasks are complete.
      */
     virtual void shutdown(OperationContext* opCtx) = 0;
+
+    /**
+     * Performs some bookkeeping to make sure that it's a clean shutdown (i.e. dataset is
+     * consistent with top of the oplog).
+     * This should be called after calling shutdown() and should make sure that that are no
+     * active readers while executing this method as this does perform timestamped storage
+     * writes at lastAppliedTimestamp.
+     */
+    virtual void markAsCleanShutdownIfPossible(OperationContext* opCtx) = 0;
 
     /**
      * Returns a reference to the parsed command line arguments that are related to replication.
@@ -581,13 +591,6 @@ public:
     virtual Status resyncData(OperationContext* opCtx, bool waitUntilCompleted) = 0;
 
     /**
-     * Handles an incoming isMaster command for a replica set node.  Should not be
-     * called on a standalone node.
-     */
-    virtual void fillIsMasterForReplSet(IsMasterResponse* result,
-                                        const SplitHorizon::Parameters& horizonParams) = 0;
-
-    /**
      * Adds to "result" a description of the slaveInfo data structure used to map RIDs to their
      * last known optimes.
      */
@@ -790,7 +793,13 @@ public:
     /**
      * Returns the current term.
      */
-    virtual long long getTerm() = 0;
+    virtual long long getTerm() const = 0;
+
+    /**
+     * Returns the TopologyVersion. It is possible to return a stale value. This is safe because
+     * we expect the 'processId' field to never change and 'counter' should always be increasing.
+     */
+    virtual TopologyVersion getTopologyVersion() const = 0;
 
     /**
      * Attempts to update the current term for the V1 election protocol. If the term changes and
@@ -936,6 +945,37 @@ public:
         const ReplicationCoordinator::OpsKillingStateTransitionEnum stateTransition,
         const size_t numOpsKilled,
         const size_t numOpsRunning) const = 0;
+
+    /**
+     * Increment the server TopologyVersion and fulfill the promise of any currently waiting
+     * isMaster request.
+     */
+    virtual void incrementTopologyVersion(OperationContext* opCtx) = 0;
+
+    /**
+     * Constructs and returns an IsMasterResponse. Will block until the given deadline waiting for a
+     * significant topology change if the 'counter' field of 'clientTopologyVersion' is equal to the
+     * current TopologyVersion 'counter' from the TopologyCoordinator. Returns immediately if
+     * 'clientTopologyVersion' < TopologyVersion of the TopologyCoordinator or if the processId
+     * differs.
+     */
+    virtual std::shared_ptr<const IsMasterResponse> awaitIsMasterResponse(
+        OperationContext* opCtx,
+        const SplitHorizon::Parameters& horizonParams,
+        boost::optional<TopologyVersion> clientTopologyVersion,
+        boost::optional<Date_t> deadline) const = 0;
+
+    /**
+     * Returns the OpTime that consists of the timestamp of the latest oplog entry and the current
+     * term.
+     * This function throws if:
+     * 1. It is called on secondaries.
+     * 2. OperationContext times out or is interrupted.
+     * 3. Oplog collection does not exist.
+     * 4. Oplog collection is empty.
+     * 5. Getting latest oplog timestamp is not supported by the storage engine.
+     */
+    virtual OpTime getLatestWriteOpTime(OperationContext* opCtx) const = 0;
 
 protected:
     ReplicationCoordinator();

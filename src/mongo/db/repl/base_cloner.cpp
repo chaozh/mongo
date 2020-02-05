@@ -33,10 +33,13 @@
 
 #include "mongo/db/repl/base_cloner.h"
 #include "mongo/util/log.h"
+#include "mongo/util/scopeguard.h"
 
 namespace mongo {
 namespace {
 MONGO_FAIL_POINT_DEFINE(hangBeforeClonerStage);
+MONGO_FAIL_POINT_DEFINE(hangBeforeRetryingClonerStage);
+MONGO_FAIL_POINT_DEFINE(hangBeforeCheckingRollBackIdClonerStage);
 MONGO_FAIL_POINT_DEFINE(hangAfterClonerStage);
 }  // namespace
 using executor::TaskExecutor;
@@ -51,15 +54,13 @@ BaseCloner::BaseCloner(StringData clonerName,
                        HostAndPort source,
                        DBClientConnection* client,
                        StorageInterface* storageInterface,
-                       ThreadPool* dbPool,
-                       ClockSource* clock)
+                       ThreadPool* dbPool)
     : _clonerName(clonerName),
       _sharedData(sharedData),
       _client(client),
       _storageInterface(storageInterface),
       _dbPool(dbPool),
-      _source(source),
-      _clock(clock) {
+      _source(source) {
     invariant(sharedData);
     invariant(!source.empty());
     invariant(client);
@@ -129,8 +130,6 @@ void BaseCloner::pauseForFuzzer(BaseClonerStage* stage) {
 }
 
 BaseCloner::AfterStageBehavior BaseCloner::runStage(BaseClonerStage* stage) {
-    // TODO(SERVER-43275): Implement retry logic here.  Alternately, do the initial connection
-    // in the retry logic, but make sure not to count the initial attempt as a "re-" try.
     LOG(1) << "Cloner " << getClonerName() << " running stage " << stage->getName();
     pauseForFuzzer(stage);
     auto isThisStageFailPoint = [this, stage](const BSONObj& data) {
@@ -145,13 +144,7 @@ BaseCloner::AfterStageBehavior BaseCloner::runStage(BaseClonerStage* stage) {
             }
         },
         isThisStageFailPoint);
-    if (_client->isFailed()) {
-        Status failed(ErrorCodes::HostUnreachable, "Client is disconnected");
-        log() << "Failed because host " << getSource() << " is unreachable.";
-        setInitialSyncFailedStatus(failed);
-        uassertStatusOK(failed);
-    }
-    auto afterStageBehavior = stage->run();
+    auto afterStageBehavior = runStageWithRetries(stage);
     hangAfterClonerStage.executeIf(
         [&](const BSONObj& data) {
             log() << "Cloner " << getClonerName() << " hanging after running stage "
@@ -165,7 +158,108 @@ BaseCloner::AfterStageBehavior BaseCloner::runStage(BaseClonerStage* stage) {
     return afterStageBehavior;
 }
 
-Future<void> BaseCloner::runOnExecutor(TaskExecutor* executor) {
+void BaseCloner::clearRetryingState() {
+    _retryableOp = boost::none;
+}
+
+Status BaseCloner::checkRollBackIdIsUnchanged() {
+    BSONObj info;
+    try {
+        getClient()->simpleCommand("admin", &info, "replSetGetRBID");
+    } catch (DBException& e) {
+        if (ErrorCodes::isRetriableError(e)) {
+            auto status = e.toStatus().withContext(
+                ": failed while attempting to retrieve rollBackId after re-connect");
+            LOG(1) << status;
+            return status;
+        }
+        throw;
+    }
+    uassert(
+        31298, "Sync source returned invalid result from replSetGetRBID", info["rbid"].isNumber());
+    auto rollBackId = info["rbid"].numberInt();
+    uassert(ErrorCodes::UnrecoverableRollbackError,
+            str::stream() << "Rollback occurred on our sync source " << getSource()
+                          << " during initial sync",
+            rollBackId == _sharedData->getRollBackId());
+    return Status::OK();
+}
+
+BaseCloner::AfterStageBehavior BaseCloner::runStageWithRetries(BaseClonerStage* stage) {
+    ON_BLOCK_EXIT([this] { clearRetryingState(); });
+    Status lastError = Status::OK();
+    auto isThisStageFailPoint = [this, stage](const BSONObj& data) {
+        return data["stage"].str() == stage->getName() && isMyFailPoint(data);
+    };
+    while (true) {
+        try {
+            // mustExit is set when the clone has been canceled externally.
+            if (mustExit())
+                return kSkipRemainingStages;
+            if (!lastError.isOK()) {
+                // If lastError is set, this is a retry.
+                hangBeforeRetryingClonerStage.executeIf(
+                    [&](const BSONObj& data) {
+                        log() << "Cloner " << getClonerName() << " hanging before retrying stage "
+                              << stage->getName();
+                        while (!mustExit() &&
+                               hangBeforeRetryingClonerStage.shouldFail(isThisStageFailPoint)) {
+                            sleepmillis(100);
+                        }
+                    },
+                    isThisStageFailPoint);
+                log() << "Initial Sync retrying " << getClonerName() << " stage "
+                      << stage->getName() << " due to " << lastError;
+                bool shouldRetry = [&] {
+                    stdx::lock_guard<InitialSyncSharedData> lk(*_sharedData);
+                    return _sharedData->shouldRetryOperation(lk, &_retryableOp);
+                }();
+                if (!shouldRetry) {
+                    auto status = lastError.withContext(
+                        str::stream()
+                        << ": Exceeded initialSyncTransientErrorRetryPeriodSeconds "
+                        << _sharedData->getAllowedOutageDuration(
+                               stdx::lock_guard<InitialSyncSharedData>(*_sharedData)));
+                    setInitialSyncFailedStatus(status);
+                    uassertStatusOK(status);
+                }
+                hangBeforeCheckingRollBackIdClonerStage.executeIf(
+                    [&](const BSONObj& data) {
+                        log() << "Cloner " << getClonerName()
+                              << " hanging before checking rollBackId for stage "
+                              << stage->getName();
+                        while (!mustExit() &&
+                               hangBeforeCheckingRollBackIdClonerStage.shouldFail(
+                                   isThisStageFailPoint)) {
+                            sleepmillis(100);
+                        }
+                    },
+                    isThisStageFailPoint);
+                if (stage->checkRollBackIdOnRetry()) {
+                    // If checkRollBackIdIsUnchanged fails without throwing, it means a network
+                    // error occurred and it's safe to continue (which will cause another retry).
+                    if (!checkRollBackIdIsUnchanged().isOK())
+                        continue;
+                    // After successfully checking the rollback ID, the client should always be OK.
+                    invariant(!getClient()->isFailed());
+                }
+            }
+            return stage->run();
+        } catch (DBException& e) {
+            lastError = e.toStatus();
+            if (!stage->isTransientError(lastError)) {
+                log() << "Non-retryable error occured during cloner " << getClonerName()
+                      << " stage " + stage->getName() << ": " << lastError;
+                throw;
+            }
+            LOG(1) << "Transient error occured during cloner " << getClonerName()
+                   << " stage " + stage->getName() << ": " << lastError;
+        }
+    }
+}
+
+std::pair<Future<void>, TaskExecutor::EventHandle> BaseCloner::runOnExecutorEvent(
+    TaskExecutor* executor) {
     {
         stdx::lock_guard<Latch> lk(_mutex);
         invariant(!_active && !_startedAsync);
@@ -177,8 +271,12 @@ Future<void> BaseCloner::runOnExecutor(TaskExecutor* executor) {
     _promise = std::move(pf.promise);
     auto callback = [this](const TaskExecutor::CallbackArgs& args) mutable {
         if (!args.status.isOK()) {
-            stdx::lock_guard<Latch> lk(_mutex);
-            _startedAsync = false;
+            {
+                stdx::lock_guard<Latch> lk(_mutex);
+                _startedAsync = false;
+            }
+            // The _promise can run the error callback on this thread, so we must not hold the lock
+            // when we set it.
             _promise.setError(args.status);
             return;
         }
@@ -189,11 +287,18 @@ Future<void> BaseCloner::runOnExecutor(TaskExecutor* executor) {
             return status;
         });
     };
-    auto cbhStatus = executor->scheduleWork(callback);
-    if (!cbhStatus.isOK()) {
-        _promise.setError(cbhStatus.getStatus());
+    TaskExecutor::EventHandle event;
+    auto statusEvent = executor->makeEvent();
+    if (!statusEvent.isOK()) {
+        _promise.setError(statusEvent.getStatus());
+    } else {
+        event = statusEvent.getValue();
+        auto cbhStatus = executor->onEvent(event, callback);
+        if (!cbhStatus.isOK()) {
+            _promise.setError(cbhStatus.getStatus());
+        }
     }
-    return std::move(pf.future);
+    return std::make_pair(std::move(pf.future), event);
 }
 
 

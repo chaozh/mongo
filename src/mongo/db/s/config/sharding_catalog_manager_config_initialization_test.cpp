@@ -78,7 +78,24 @@ void assertBSONObjsSame(const std::vector<BSONObj>& expectedBSON,
     }
 }
 
-using ConfigInitializationTest = ConfigServerTestFixture;
+class ConfigInitializationTest : public ConfigServerTestFixture {
+protected:
+    /*
+     * Initializes the sharding state and locks both the config db and rstl.
+     */
+    void setUp() override {
+        // Prevent DistLockManager from writing to lockpings collection before we create the
+        // indexes.
+        _autoDb = setUpAndLockConfigDb();
+    }
+
+    void tearDown() override {
+        _autoDb = {};
+        ConfigServerTestFixture::tearDown();
+    }
+
+    std::unique_ptr<AutoGetDb> _autoDb;
+};
 
 TEST_F(ConfigInitializationTest, UpgradeNotNeeded) {
     VersionType version;

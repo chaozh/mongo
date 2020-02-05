@@ -40,6 +40,7 @@
 #endif
 
 #include <fmt/format.h>
+#include <iomanip>
 #include <memory>
 
 #include "mongo/db/storage/wiredtiger/wiredtiger_kv_engine.h"
@@ -70,6 +71,7 @@
 #include "mongo/db/storage/journal_listener.h"
 #include "mongo/db/storage/storage_file_util.h"
 #include "mongo/db/storage/storage_options.h"
+#include "mongo/db/storage/storage_parameters_gen.h"
 #include "mongo/db/storage/storage_repair_observer.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_cursor.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_customization_hooks.h"
@@ -89,6 +91,7 @@
 #include "mongo/util/exit.h"
 #include "mongo/util/log.h"
 #include "mongo/util/processinfo.h"
+#include "mongo/util/quick_exit.h"
 #include "mongo/util/scopeguard.h"
 #include "mongo/util/time_support.h"
 
@@ -244,32 +247,71 @@ public:
         ThreadClient tc(name(), getGlobalServiceContext());
         LOG(1) << "starting " << name() << " thread";
 
-        while (!_shuttingDown.load()) {
+        while (true) {
             auto opCtx = tc->makeOperationContext();
             try {
-                const bool forceCheckpoint = false;
-                const bool stableCheckpoint = false;
-                _sessionCache->waitUntilDurable(opCtx.get(), forceCheckpoint, stableCheckpoint);
+                _sessionCache->waitUntilDurable(
+                    opCtx.get(), /*forceCheckpoint*/ false, /*stableCheckpoint*/ false);
             } catch (const AssertionException& e) {
                 invariant(e.code() == ErrorCodes::ShutdownInProgress);
             }
 
-            int ms = storageGlobalParams.journalCommitIntervalMs.load();
+            // Wait until either journalCommitIntervalMs passes or an immediate journal flush is
+            // requested (or shutdown).
+
+            auto deadline =
+                Date_t::now() + Milliseconds(storageGlobalParams.journalCommitIntervalMs.load());
+            stdx::unique_lock<Latch> lk(_stateMutex);
 
             MONGO_IDLE_THREAD_BLOCK;
-            sleepmillis(ms);
+            _flushJournalNowCV.wait_until(lk, deadline.toSystemTimePoint(), [&] {
+                return _flushJournalNow || _shuttingDown;
+            });
+
+            _flushJournalNow = false;
+
+            if (_shuttingDown) {
+                LOG(1) << "stopping " << name() << " thread";
+                return;
+            }
         }
-        LOG(1) << "stopping " << name() << " thread";
     }
 
+    /**
+     * Signals the thread to quit and then waits until it does.
+     */
     void shutdown() {
-        _shuttingDown.store(true);
+        {
+            stdx::lock_guard<Latch> lk(_stateMutex);
+            _shuttingDown = true;
+            _flushJournalNowCV.notify_one();
+        }
         wait();
+    }
+
+    /**
+     * Signals an immediate journal flush.
+     */
+    void triggerJournalFlush() {
+        stdx::lock_guard<Latch> lk(_stateMutex);
+        if (!_flushJournalNow) {
+            _flushJournalNow = true;
+            _flushJournalNowCV.notify_one();
+        }
     }
 
 private:
     WiredTigerSessionCache* _sessionCache;
-    AtomicWord<bool> _shuttingDown{false};
+
+    // Protects the state below.
+    mutable Mutex _stateMutex = MONGO_MAKE_LATCH("WiredTigerJournalFlusherStateMutex");
+
+    // Signaled to wake up the thread, if the thread is waiting. The thread will check whether
+    // _flushJournalNow or _shuttingDown is set.
+    mutable stdx::condition_variable _flushJournalNowCV;
+
+    bool _flushJournalNow = false;
+    bool _shuttingDown = false;
 };
 
 namespace {
@@ -554,10 +596,14 @@ Status OpenReadTransactionParam::setFromString(const std::string& str) {
 
 namespace {
 
-StatusWith<std::vector<StorageEngine::BackupBlock>> getDataBlocksFromBackupCursor(
-    WT_CURSOR* cursor, std::string dbPath, const char* statusPrefix) {
+StatusWith<StorageEngine::BackupInformation> getBackupInformationFromBackupCursor(
+    WT_SESSION* session,
+    WT_CURSOR* cursor,
+    bool incrementalBackup,
+    std::string dbPath,
+    const char* statusPrefix) {
     int wtRet;
-    std::vector<StorageEngine::BackupBlock> blocks;
+    StorageEngine::BackupInformation backupInformation;
     const char* filename;
     const auto directoryPath = boost::filesystem::path(dbPath);
     const auto wiredTigerLogFilePrefix = "WiredTigerLog";
@@ -566,26 +612,62 @@ StatusWith<std::vector<StorageEngine::BackupBlock>> getDataBlocksFromBackupCurso
 
         std::string name(filename);
 
-        auto filePath = directoryPath;
+        boost::filesystem::path filePath = directoryPath;
+        boost::filesystem::path relativePath;
         if (name.find(wiredTigerLogFilePrefix) == 0) {
             // TODO SERVER-13455:replace `journal/` with the configurable journal path.
             filePath /= boost::filesystem::path("journal");
+            relativePath /= boost::filesystem::path("journal");
         }
         filePath /= name;
+        relativePath /= name;
 
         boost::system::error_code errorCode;
-        const std::uint64_t filesize = boost::filesystem::file_size(filePath, errorCode);
-        uassert(31317,
+        const std::uint64_t fileSize = boost::filesystem::file_size(filePath, errorCode);
+        uassert(31403,
                 "Failed to get a file's size. Filename: {} Error: {}"_format(filePath.string(),
                                                                              errorCode.message()),
                 !errorCode);
-        blocks.push_back({filePath.string(), 0, filesize});
+
+        StorageEngine::BackupFile backupFile(fileSize);
+        backupInformation.insert({filePath.string(), backupFile});
+
+        if (!incrementalBackup) {
+            continue;
+        }
+
+        // For each file listed, open a duplicate backup cursor and get the blocks to copy.
+        std::stringstream ss;
+        ss << "incremental=(file=\"" << str::escape(relativePath.string()) << "\")";
+        const std::string config = ss.str();
+        WT_CURSOR* dupCursor;
+        wtRet = session->open_cursor(session, nullptr, cursor, config.c_str(), &dupCursor);
+        if (wtRet != 0) {
+            return wtRCToStatus(wtRet);
+        }
+
+        while ((wtRet = dupCursor->next(dupCursor)) == 0) {
+            uint64_t offset, size, type;
+            invariantWTOK(dupCursor->get_key(dupCursor, &offset, &size, &type));
+            LOG(2) << "Block to copy for incremental backup: filename: " << filePath.string()
+                   << ", offset: " << offset << ", size: " << size << ", type: " << type;
+            backupInformation.at(filePath.string()).blocksToCopy.push_back({offset, size});
+        }
+
+        if (wtRet != WT_NOTFOUND) {
+            return wtRCToStatus(wtRet);
+        }
+
+        wtRet = dupCursor->close(dupCursor);
+        if (wtRet != 0) {
+            return wtRCToStatus(wtRet);
+        }
     }
 
     if (wtRet != WT_NOTFOUND) {
         return wtRCToStatus(wtRet, statusPrefix);
     }
-    return blocks;
+    return backupInformation;
 }
 
 }  // namespace
@@ -674,10 +756,7 @@ WiredTigerKVEngine::WiredTigerKVEngine(const std::string& canonicalName,
               ->getTableCreateConfig("system");
     ss << WiredTigerExtensions::get(getGlobalServiceContext())->getOpenExtensionsConfig();
     ss << extraOpenOptions;
-    if (_readOnly) {
-        invariant(!_durable);
-        ss << ",readonly=true,";
-    }
+
     if (!_durable && !_readOnly) {
         // If we started without the journal, but previously used the journal then open with the
         // WT log enabled to perform any unclean shutdown recovery and then close and reopen in
@@ -760,12 +839,22 @@ WiredTigerKVEngine::WiredTigerKVEngine(const std::string& canonicalName,
     _sizeStorer = std::make_unique<WiredTigerSizeStorer>(_conn, _sizeStorerUri, _readOnly);
 
     Locker::setGlobalThrottling(&openReadTransaction, &openWriteTransaction);
+
+    _runTimeConfigParam.reset(new WiredTigerEngineRuntimeConfigParameter(
+        "wiredTigerEngineRuntimeConfig", ServerParameterType::kRuntimeOnly));
+    _runTimeConfigParam->_data.second = this;
+    _maxCacheOverflowParam.reset(new WiredTigerMaxCacheOverflowSizeGBParameter(
+        "wiredTigerMaxCacheOverflowSizeGB", ServerParameterType::kRuntimeOnly));
+    _maxCacheOverflowParam->_data = {maxCacheOverflowFileSizeMB / 1024, this};
 }
 
 WiredTigerKVEngine::~WiredTigerKVEngine() {
-    if (_conn) {
-        cleanShutdown();
-    }
+    // Remove server parameters that we added in the constructor, to enable unit tests to reload the
+    // storage engine again in this same process.
+    ServerParameterSet::getGlobal()->remove("wiredTigerEngineRuntimeConfig");
+    ServerParameterSet::getGlobal()->remove("wiredTigerMaxCacheOverflowSizeGB");
+
+    cleanShutdown();
 
     _sessionCache.reset(nullptr);
 }
@@ -926,7 +1015,16 @@ void WiredTigerKVEngine::cleanShutdown() {
         closeConfig += "use_timestamp=false,";
     }
 
-    invariantWTOK(_conn->close(_conn, closeConfig.c_str()));
+    const Timestamp stableTimestamp = getStableTimestamp();
+    const Timestamp initialDataTimestamp = getInitialDataTimestamp();
+    if (stableTimestamp >= initialDataTimestamp) {
+        invariantWTOK(_conn->close(_conn, closeConfig.c_str()));
+    } else {
+        log() << "Skipping checkpoint during clean shutdown because stableTimestamp ("
+              << stableTimestamp << ") is less than the initialDataTimestamp ("
+              << initialDataTimestamp << ")";
+        quickExit(EXIT_SUCCESS);
+    }
     _conn = nullptr;
 }
 
@@ -1088,9 +1186,44 @@ void WiredTigerKVEngine::endBackup(OperationContext* opCtx) {
     _backupSession.reset();
 }
 
-StatusWith<std::vector<StorageEngine::BackupBlock>> WiredTigerKVEngine::beginNonBlockingBackup(
-    OperationContext* opCtx) {
+Status WiredTigerKVEngine::disableIncrementalBackup(OperationContext* opCtx) {
+    // Opening an incremental backup cursor with the "force_stop=true" configuration option then
+    // closing the cursor will set a flag in WiredTiger that causes it to release all incremental
+    // information and resources.
+    // Opening a subsequent incremental backup cursor will reset the flag in WiredTiger and
+    // reinstate incremental backup history.
+    uassert(31401, "Cannot open backup cursor with in-memory storage engine.", !isEphemeral());
+
+    auto sessionRaii = std::make_unique<WiredTigerSession>(_conn);
+    WT_CURSOR* cursor = nullptr;
+    WT_SESSION* session = sessionRaii->getSession();
+    int wtRet =
+        session->open_cursor(session, "backup:", nullptr, "incremental=(force_stop=true)", &cursor);
+    if (wtRet != 0) {
+        error() << "Could not open a backup cursor to disable incremental backups";
+        return wtRCToStatus(wtRet);
+    }
+
+    return Status::OK();
+}
+
+StatusWith<StorageEngine::BackupInformation> WiredTigerKVEngine::beginNonBlockingBackup(
+    OperationContext* opCtx, const StorageEngine::BackupOptions& options) {
     uassert(51034, "Cannot open backup cursor with in-memory mode.", !isEphemeral());
+
+    std::stringstream ss;
+    if (options.incrementalBackup) {
+        invariant(options.thisBackupName);
+        ss << "incremental=(enabled=true,force_stop=false,";
+        ss << "granularity=" << options.blockSizeMB << "MB,";
+        ss << "this_id=" << std::quoted(str::escape(*options.thisBackupName)) << ",";
+
+        if (options.srcBackupName) {
+            ss << "src_id=" << std::quoted(str::escape(*options.srcBackupName)) << ",";
+        }
+
+        ss << ")";
+    }
 
     // Oplog truncation thread won't remove oplog since the checkpoint pinned by the backup cursor.
     stdx::lock_guard<Latch> lock(_oplogPinnedByBackupMutex);
@@ -1106,23 +1239,24 @@ StatusWith<std::vector<StorageEngine::BackupBlock>> WiredTigerKVEngine::beginNon
     auto sessionRaii = std::make_unique<WiredTigerSession>(_conn);
     WT_CURSOR* cursor = nullptr;
     WT_SESSION* session = sessionRaii->getSession();
-    int wtRet = session->open_cursor(session, "backup:", nullptr, nullptr, &cursor);
+    const std::string config = ss.str();
+    int wtRet = session->open_cursor(session, "backup:", nullptr, config.c_str(), &cursor);
     if (wtRet != 0) {
         return wtRCToStatus(wtRet);
     }
 
-    auto swBlocksToCopy =
-        getDataBlocksFromBackupCursor(cursor, _path, "Error opening backup cursor.");
+    auto swBackupInfo = getBackupInformationFromBackupCursor(
+        session, cursor, options.incrementalBackup, _path, "Error opening backup cursor.");
 
-    if (!swBlocksToCopy.isOK()) {
-        return swBlocksToCopy;
+    if (!swBackupInfo.isOK()) {
+        return swBackupInfo;
     }
 
     pinOplogGuard.dismiss();
     _backupSession = std::move(sessionRaii);
     _backupCursor = cursor;
 
-    return swBlocksToCopy;
+    return swBackupInfo;
 }
 
 void WiredTigerKVEngine::endNonBlockingBackup(OperationContext* opCtx) {
@@ -1138,6 +1272,8 @@ StatusWith<std::vector<std::string>> WiredTigerKVEngine::extendBackupCursor(
     uassert(51033, "Cannot extend backup cursor with in-memory mode.", !isEphemeral());
     invariant(_backupCursor);
 
+    // The "target=(\"log:\")" configuration string for the cursor will ensure that we only see the
+    // log files when iterating on the cursor.
     WT_CURSOR* cursor = nullptr;
     WT_SESSION* session = _backupSession->getSession();
     int wtRet = session->open_cursor(session, nullptr, _backupCursor, "target=(\"log:\")", &cursor);
@@ -1145,25 +1281,27 @@ StatusWith<std::vector<std::string>> WiredTigerKVEngine::extendBackupCursor(
         return wtRCToStatus(wtRet);
     }
 
-    StatusWith<std::vector<StorageEngine::BackupBlock>> swBlocksToCopy =
-        getDataBlocksFromBackupCursor(cursor, _path, "Error extending backup cursor.");
+    StatusWith<StorageEngine::BackupInformation> swBackupInfo =
+        getBackupInformationFromBackupCursor(
+            session, cursor, /*incrementalBackup=*/false, _path, "Error extending backup cursor.");
 
     wtRet = cursor->close(cursor);
     if (wtRet != 0) {
         return wtRCToStatus(wtRet);
     }
 
-    if (!swBlocksToCopy.isOK()) {
-        return swBlocksToCopy.getStatus();
+    if (!swBackupInfo.isOK()) {
+        return swBackupInfo.getStatus();
     }
 
-    // Journal files returned from the future backup cursor are not intended to have block level
-    // information. For now, this is being explicitly codified by transforming the result into a
-    // vector of filename strings. The lack of block/filesize information instructs the client to
-    // copy the whole file.
+    // Once all the backup cursors have been opened on a sharded cluster, we need to ensure that the
+    // data being copied from each shard is at the same point-in-time across the entire cluster to
+    // have a consistent view of the data. For shards that opened their backup cursor before the
+    // established point-in-time for backup, they will need to create a full copy of the additional
+    // journal files returned by this method to ensure a consistent backup of the data is taken.
     std::vector<std::string> filenames;
-    for (const auto& block : swBlocksToCopy.getValue()) {
-        filenames.push_back(std::move(block.filename));
+    for (const auto& entry : swBackupInfo.getValue()) {
+        filenames.push_back(entry.first);
     }
 
     return {filenames};
@@ -1434,11 +1572,11 @@ std::unique_ptr<RecordStore> WiredTigerKVEngine::makeTemporaryRecordStore(Operat
     return std::move(rs);
 }
 
-Status WiredTigerKVEngine::dropIdent(OperationContext* opCtx, StringData ident) {
+Status WiredTigerKVEngine::dropIdent(OperationContext* opCtx, RecoveryUnit* ru, StringData ident) {
     string uri = _uri(ident);
 
-    WiredTigerRecoveryUnit* ru = WiredTigerRecoveryUnit::get(opCtx);
-    ru->getSessionNoTxn()->closeAllCursors(uri);
+    WiredTigerRecoveryUnit* wtRu = checked_cast<WiredTigerRecoveryUnit*>(ru);
+    wtRu->getSessionNoTxn()->closeAllCursors(uri);
     _sessionCache->closeAllCursors(uri);
 
     WiredTigerSession session(_conn);
@@ -2027,8 +2165,10 @@ void WiredTigerKVEngine::haltOplogManager() {
     }
 }
 
-void WiredTigerKVEngine::replicationBatchIsComplete() const {
-    _oplogManager->triggerJournalFlush();
+void WiredTigerKVEngine::triggerJournalFlush() const {
+    if (_journalFlusher) {
+        _journalFlusher->triggerJournalFlush();
+    }
 }
 
 bool WiredTigerKVEngine::isCacheUnderPressure(OperationContext* opCtx) const {

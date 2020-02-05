@@ -62,15 +62,17 @@ using std::string;
 IndexCatalogEntryImpl::IndexCatalogEntryImpl(OperationContext* const opCtx,
                                              const std::string& ident,
                                              std::unique_ptr<IndexDescriptor> descriptor,
-                                             CollectionQueryInfo* const queryInfo)
+                                             CollectionQueryInfo* const queryInfo,
+                                             bool isFrozen)
     : _ident(ident),
       _descriptor(std::move(descriptor)),
       _queryInfo(queryInfo),
       _ordering(Ordering::make(_descriptor->keyPattern())),
       _isReady(false),
+      _isFrozen(isFrozen),
       _isDropped(false),
       _prefix(DurableCatalog::get(opCtx)->getIndexPrefix(
-          opCtx, _descriptor->parentNS(), _descriptor->indexName())) {
+          opCtx, _descriptor->getCollection()->getCatalogId(), _descriptor->indexName())) {
     _descriptor->_cachedEntry = this;
 
     _isReady = _catalogIsReady(opCtx);
@@ -143,6 +145,11 @@ bool IndexCatalogEntryImpl::isReady(OperationContext* opCtx) const {
     if (kDebugBuild)
         invariant(_isReady == _catalogIsReady(opCtx));
     return _isReady;
+}
+
+bool IndexCatalogEntryImpl::isFrozen() const {
+    invariant(!_isFrozen || !_isReady);
+    return _isFrozen;
 }
 
 bool IndexCatalogEntryImpl::isMultikey() const {
@@ -287,7 +294,10 @@ void IndexCatalogEntryImpl::setMultikey(OperationContext* opCtx,
             }
             fassert(31164, status);
             indexMetadataHasChanged = DurableCatalog::get(opCtx)->setIndexIsMultikey(
-                opCtx, ns(), _descriptor->indexName(), paths);
+                opCtx,
+                _descriptor->getCollection()->getCatalogId(),
+                _descriptor->indexName(),
+                paths);
             opCtx->recoveryUnit()->onCommit(
                 [onMultikeyCommitFn, indexMetadataHasChanged](boost::optional<Timestamp>) {
                     onMultikeyCommitFn(indexMetadataHasChanged);
@@ -296,7 +306,7 @@ void IndexCatalogEntryImpl::setMultikey(OperationContext* opCtx,
         });
     } else {
         indexMetadataHasChanged = DurableCatalog::get(opCtx)->setIndexIsMultikey(
-            opCtx, ns(), _descriptor->indexName(), paths);
+            opCtx, _descriptor->getCollection()->getCatalogId(), _descriptor->indexName(), paths);
     }
 
     opCtx->recoveryUnit()->onCommit(
@@ -308,21 +318,26 @@ void IndexCatalogEntryImpl::setMultikey(OperationContext* opCtx,
 // ----
 
 bool IndexCatalogEntryImpl::_catalogIsReady(OperationContext* opCtx) const {
-    return DurableCatalog::get(opCtx)->isIndexReady(opCtx, ns(), _descriptor->indexName());
+    return DurableCatalog::get(opCtx)->isIndexReady(
+        opCtx, _descriptor->getCollection()->getCatalogId(), _descriptor->indexName());
 }
 
 bool IndexCatalogEntryImpl::_catalogIsPresent(OperationContext* opCtx) const {
-    return DurableCatalog::get(opCtx)->isIndexPresent(opCtx, ns(), _descriptor->indexName());
+    return DurableCatalog::get(opCtx)->isIndexPresent(
+        opCtx, _descriptor->getCollection()->getCatalogId(), _descriptor->indexName());
 }
 
 bool IndexCatalogEntryImpl::_catalogIsMultikey(OperationContext* opCtx,
                                                MultikeyPaths* multikeyPaths) const {
-    return DurableCatalog::get(opCtx)->isIndexMultikey(
-        opCtx, ns(), _descriptor->indexName(), multikeyPaths);
+    return DurableCatalog::get(opCtx)->isIndexMultikey(opCtx,
+                                                       _descriptor->getCollection()->getCatalogId(),
+                                                       _descriptor->indexName(),
+                                                       multikeyPaths);
 }
 
 KVPrefix IndexCatalogEntryImpl::_catalogGetPrefix(OperationContext* opCtx) const {
-    return DurableCatalog::get(opCtx)->getIndexPrefix(opCtx, ns(), _descriptor->indexName());
+    return DurableCatalog::get(opCtx)->getIndexPrefix(
+        opCtx, _descriptor->getCollection()->getCatalogId(), _descriptor->indexName());
 }
 
 }  // namespace mongo

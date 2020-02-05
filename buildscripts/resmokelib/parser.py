@@ -5,6 +5,7 @@ import os
 import os.path
 import sys
 import shlex
+import configparser
 
 import datetime
 import optparse
@@ -42,6 +43,14 @@ def _make_parser():  # pylint: disable=too-many-statements
     parser.add_option("--configDir", dest="config_dir", metavar="CONFIG_DIR",
                       help="Directory to search for resmoke configuration files")
 
+    parser.add_option("--installDir", dest="install_dir", metavar="INSTALL_DIR",
+                      help="Directory to search for MongoDB binaries")
+
+    parser.add_option(
+        "--alwaysUseLogFiles", dest="always_use_log_files", action="store_true",
+        help=("Logs server output to a file located in the db path and prevents the"
+              " cleaning of dbpaths after testing. Note that conflicting options"
+              " passed in from test files may cause an error."))
     parser.add_option(
         "--archiveFile", dest="archive_file", metavar="ARCHIVE_FILE",
         help=("Sets the archive file name for the Evergreen task running the tests."
@@ -134,10 +143,8 @@ def _make_parser():  # pylint: disable=too-many-statements
               " started by resmoke.py. The argument is specified as bracketed YAML -"
               " i.e. JSON with support for single quoted and unquoted keys."))
 
-    parser.add_option(
-        "--mongoebench", dest="mongoebench_executable", metavar="PATH",
-        help=("The path to the mongoebench (benchrun embedded) executable for"
-              " resmoke.py to use."))
+    parser.add_option("--logFormat", dest="log_format",
+                      help="The log format used by mongo executables.")
 
     parser.add_option("--mongos", dest="mongos_executable", metavar="PATH",
                       help="The path to the mongos executable for resmoke.py to use.")
@@ -267,6 +274,15 @@ def _make_parser():  # pylint: disable=too-many-statements
         help="Sets the storage engine cache size configuration"
         " setting for all mongod's.")
 
+    parser.add_option(
+        "--numReplSetNodes", type="int", dest="num_replset_nodes", metavar="N",
+        help="The number of nodes to initialize per ReplicaSetFixture. This is also "
+        "used to indicate the number of replica set members per shard in a "
+        "ShardedClusterFixture.")
+
+    parser.add_option("--numShards", type="int", dest="num_shards", metavar="N",
+                      help="The number of shards to use in a ShardedClusterFixture.")
+
     parser.add_option("--tagFile", dest="tag_file", metavar="OPTIONS",
                       help="A YAML file that associates tests and tags.")
 
@@ -290,6 +306,11 @@ def _make_parser():  # pylint: disable=too-many-statements
         " binary version configuration. Specify 'old-new' to configure a replica set with a"
         " 'last-stable' version primary and 'latest' version secondary. For a sharded cluster"
         " with two shards and two replica set nodes each, specify 'old-new-old-new'.")
+
+    parser.add_option(
+        "--linearChain", type="choice", action="store", dest="linear_chain", choices=("on", "off"),
+        metavar="ON|OFF", help="Enable or disable linear chaining for tests using "
+        "ReplicaSetFixture.")
 
     evergreen_options = optparse.OptionGroup(
         parser, title=_EVERGREEN_OPTIONS_TITLE,
@@ -380,22 +401,10 @@ def _make_parser():  # pylint: disable=too-many-statements
     benchmark_options.add_option("--benchmarkRepetitions", type="int", dest="benchmark_repetitions",
                                  metavar="BENCHMARK_REPETITIONS", help=benchmark_repetitions_help)
 
-    benchrun_devices = ["Android", "Desktop"]
-    benchmark_options.add_option(
-        "--benchrunDevice", dest="benchrun_device", metavar="DEVICE", type="choice", action="store",
-        choices=benchrun_devices, help=("The device to run the benchrun test on, choose from {}."
-                                        " Defaults to DEVICE='%default'.".format(benchrun_devices)))
+    parser.set_defaults(dry_run="off", find_suites=False, list_suites=False, logger_file="console",
+                        shuffle="auto", stagger_jobs="off", suite_files="with_server",
+                        majority_read_concern="on")
 
-    benchmark_options.add_option("--benchrunReportRoot", dest="benchrun_report_root",
-                                 metavar="PATH", help="The root path for benchrun test report.")
-
-    benchmark_options.add_option("--benchrunEmbeddedRoot", dest="benchrun_embedded_root",
-                                 metavar="PATH",
-                                 help="The root path on the mobile device, for a benchrun test.")
-
-    parser.set_defaults(benchrun_device="Desktop", dry_run="off", find_suites=False,
-                        list_suites=False, logger_file="console", shuffle="auto",
-                        stagger_jobs="off", suite_files="with_server", majority_read_concern="on")
     return parser
 
 
@@ -574,15 +583,20 @@ def _update_config_vars(values):  # pylint: disable=too-many-statements,too-many
         if cmdline_vars[cmdline_key] is not None:
             config[cmdline_key] = cmdline_vars[cmdline_key]
 
+    if os.path.isfile("resmoke.ini"):
+        config_parser = configparser.ConfigParser()
+        config_parser.read("resmoke.ini")
+        if "resmoke" in config_parser.sections():
+            user_config = dict(config_parser["resmoke"])
+            config.update(user_config)
+
+    _config.ALWAYS_USE_LOG_FILES = config.pop("always_use_log_files")
     _config.ARCHIVE_FILE = config.pop("archive_file")
     _config.ARCHIVE_LIMIT_MB = config.pop("archive_limit_mb")
     _config.ARCHIVE_LIMIT_TESTS = config.pop("archive_limit_tests")
     _config.BASE_PORT = int(config.pop("base_port"))
-    _config.BENCHRUN_DEVICE = config.pop("benchrun_device")
-    _config.BENCHRUN_EMBEDDED_ROOT = config.pop("benchrun_embedded_root")
     _config.BUILDLOGGER_URL = config.pop("buildlogger_url")
     _config.DBPATH_PREFIX = _expand_user(config.pop("dbpath_prefix"))
-    _config.DBTEST_EXECUTABLE = _expand_user(config.pop("dbtest_executable"))
     _config.DRY_RUN = config.pop("dry_run")
     # EXCLUDE_WITH_ANY_TAGS will always contain the implicitly defined EXCLUDED_TAG.
     _config.EXCLUDE_WITH_ANY_TAGS = [_config.EXCLUDED_TAG]
@@ -594,18 +608,35 @@ def _update_config_vars(values):  # pylint: disable=too-many-statements,too-many
     _config.INCLUDE_WITH_ANY_TAGS = _tags_from_list(config.pop("include_with_any_tags"))
     _config.GENNY_EXECUTABLE = _expand_user(config.pop("genny_executable"))
     _config.JOBS = config.pop("jobs")
+    _config.LINEAR_CHAIN = config.pop("linear_chain") == "on"
+    _config.LOG_FORMAT = config.pop("log_format")
     _config.MAJORITY_READ_CONCERN = config.pop("majority_read_concern") == "on"
     _config.MIXED_BIN_VERSIONS = config.pop("mixed_bin_versions")
     if _config.MIXED_BIN_VERSIONS is not None:
         _config.MIXED_BIN_VERSIONS = _config.MIXED_BIN_VERSIONS.split("-")
+
+    _config.INSTALL_DIR = config.pop("install_dir")
+    if _config.INSTALL_DIR is not None:
+        # Inject INSTALL_DIR into the $PATH so RunProgram in the shell
+        # helpers can find the installed binaries.
+        os.environ['PATH'] = "{}:{}".format(_expand_user(_config.INSTALL_DIR), os.environ['PATH'])
+
+        for binary in ["mongo", "mongod", "mongos", "dbtest"]:
+            keyname = binary + "_executable"
+            if config.get(keyname, None) is None:
+                config[keyname] = os.path.join(_config.INSTALL_DIR, binary)
+
+    _config.DBTEST_EXECUTABLE = _expand_user(config.pop("dbtest_executable"))
     _config.MONGO_EXECUTABLE = _expand_user(config.pop("mongo_executable"))
     _config.MONGOD_EXECUTABLE = _expand_user(config.pop("mongod_executable"))
     _config.MONGOD_SET_PARAMETERS = config.pop("mongod_set_parameters")
-    _config.MONGOEBENCH_EXECUTABLE = _expand_user(config.pop("mongoebench_executable"))
     _config.MONGOS_EXECUTABLE = _expand_user(config.pop("mongos_executable"))
+
     _config.MONGOS_SET_PARAMETERS = config.pop("mongos_set_parameters")
     _config.NO_JOURNAL = config.pop("no_journal")
     _config.NUM_CLIENTS_PER_FIXTURE = config.pop("num_clients_per_fixture")
+    _config.NUM_REPLSET_NODES = config.pop("num_replset_nodes")
+    _config.NUM_SHARDS = config.pop("num_shards")
     _config.PERF_REPORT_FILE = config.pop("perf_report_file")
     _config.RANDOM_SEED = config.pop("seed")
     _config.REPEAT_SUITES = config.pop("repeat_suites")
@@ -650,7 +681,6 @@ def _update_config_vars(values):  # pylint: disable=too-many-statements,too-many
     if benchmark_min_time is not None:
         _config.BENCHMARK_MIN_TIME = datetime.timedelta(seconds=benchmark_min_time)
     _config.BENCHMARK_REPETITIONS = config.pop("benchmark_repetitions")
-    _config.BENCHRUN_REPORT_ROOT = config.pop("benchrun_report_root")
 
     # Config Dir options.
     _config.CONFIG_DIR = config.pop("config_dir")
@@ -701,6 +731,11 @@ def _update_config_vars(values):  # pylint: disable=too-many-statements,too-many
 def _get_logging_config(pathname):
     """Read YAML configuration from 'pathname' how to log tests and fixtures."""
     try:
+        # If the user provides a full valid path to a logging config
+        # we don't need to search LOGGER_DIR for the file.
+        if os.path.exists(pathname):
+            return utils.load_yaml_file(pathname).pop("logging")
+
         root = os.path.abspath(_config.LOGGER_DIR)
         files = os.listdir(root)
         for filename in files:

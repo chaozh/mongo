@@ -76,8 +76,10 @@ std::unique_ptr<QueryRequest> parseCmdObjectToQueryRequest(OperationContext* opC
     return qr;
 }
 
-boost::intrusive_ptr<ExpressionContext> makeExpressionContext(OperationContext* opCtx,
-                                                              const QueryRequest& queryRequest) {
+boost::intrusive_ptr<ExpressionContext> makeExpressionContext(
+    OperationContext* opCtx,
+    const QueryRequest& queryRequest,
+    boost::optional<ExplainOptions::Verbosity> verbosity) {
     std::unique_ptr<CollatorInterface> collator;
     if (!queryRequest.getCollation().isEmpty()) {
         collator = uassertStatusOK(CollatorFactoryInterface::get(opCtx->getServiceContext())
@@ -100,9 +102,9 @@ boost::intrusive_ptr<ExpressionContext> makeExpressionContext(OperationContext* 
     // sense to start initializing these fields for find operations as well.
     auto expCtx =
         make_intrusive<ExpressionContext>(opCtx,
-                                          boost::none,  // explain
-                                          false,        // fromMongos
-                                          false,        // needsMerge
+                                          verbosity,
+                                          false,  // fromMongos
+                                          false,  // needsMerge
                                           queryRequest.allowDiskUse(),
                                           false,  // bypassDocumentValidation
                                           queryRequest.nss(),
@@ -113,6 +115,17 @@ boost::intrusive_ptr<ExpressionContext> makeExpressionContext(OperationContext* 
                                           boost::none  // uuid
         );
     expCtx->tempDir = storageGlobalParams.dbpath + "/_tmp";
+    // TODO (SERVER-43361): We will not need to set 'sortKeyFormat' after branching for 4.5.
+    auto assumeInternalClient = !opCtx->getClient()->session() ||
+        (opCtx->getClient()->session()->getTags() & transport::Session::kInternalClient);
+    if (assumeInternalClient) {
+        expCtx->sortKeyFormat =
+            queryRequest.use44SortKeys() ? SortKeyFormat::k44SortKey : SortKeyFormat::k42SortKey;
+    } else {
+        // The client is not a mongoS, so we will not need to use an older sort key format to
+        // support it. Use default value for the ExpressionContext's 'sortKeyFormat' member
+        // variable, which is the newest format.
+    }
     return expCtx;
 }
 
@@ -176,8 +189,7 @@ public:
         }
 
         ReadConcernSupportResult supportsReadConcern(repl::ReadConcernLevel level) const final {
-            return {ReadConcernSupportResult::ReadConcern::kSupported,
-                    ReadConcernSupportResult::DefaultReadConcern::kPermitted};
+            return ReadConcernSupportResult::allSupportedAndDefaultPermitted();
         }
 
         bool canIgnorePrepareConflicts() const override {
@@ -206,7 +218,7 @@ public:
             const auto hasTerm = _request.body.hasField(kTermField);
             uassertStatusOK(authSession->checkAuthForFind(
                 CollectionCatalog::get(opCtx).resolveNamespaceStringOrUUID(
-                    CommandHelpers::parseNsOrUUID(_dbName, _request.body)),
+                    opCtx, CommandHelpers::parseNsOrUUID(_dbName, _request.body)),
                 hasTerm));
         }
 
@@ -227,7 +239,7 @@ public:
 
             // Finish the parsing step by using the QueryRequest to create a CanonicalQuery.
             const ExtensionsCallbackReal extensionsCallback(opCtx, &nss);
-            auto expCtx = makeExpressionContext(opCtx, *qr);
+            auto expCtx = makeExpressionContext(opCtx, *qr, verbosity);
             auto cq = uassertStatusOK(
                 CanonicalQuery::canonicalize(opCtx,
                                              std::move(qr),
@@ -425,7 +437,7 @@ public:
 
             // Finish the parsing step by using the QueryRequest to create a CanonicalQuery.
             const ExtensionsCallbackReal extensionsCallback(opCtx, &nss);
-            auto expCtx = makeExpressionContext(opCtx, *qr);
+            auto expCtx = makeExpressionContext(opCtx, *qr, boost::none /* verbosity */);
             auto cq = uassertStatusOK(
                 CanonicalQuery::canonicalize(opCtx,
                                              std::move(qr),
@@ -502,6 +514,9 @@ public:
                     exec->enqueue(obj);
                     break;
                 }
+
+                // If this executor produces a postBatchResumeToken, add it to the response.
+                firstBatch.setPostBatchResumeToken(exec->getPostBatchResumeToken());
 
                 // Add result to output buffer.
                 firstBatch.append(obj);

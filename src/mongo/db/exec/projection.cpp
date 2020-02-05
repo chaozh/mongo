@@ -36,6 +36,7 @@
 
 #include "mongo/db/exec/document_value/document.h"
 #include "mongo/db/exec/plan_stage.h"
+#include "mongo/db/exec/projection_executor_builder.h"
 #include "mongo/db/exec/scoped_timer.h"
 #include "mongo/db/exec/working_set_common.h"
 #include "mongo/db/jsobj.h"
@@ -45,9 +46,6 @@
 #include "mongo/util/str.h"
 
 namespace mongo {
-
-static const char* kIdField = "_id";
-
 namespace {
 
 void transitionMemberToOwnedObj(Document&& doc, WorkingSetMember* member) {
@@ -58,7 +56,11 @@ void transitionMemberToOwnedObj(Document&& doc, WorkingSetMember* member) {
 }
 
 void transitionMemberToOwnedObj(const BSONObj& bo, WorkingSetMember* member) {
-    transitionMemberToOwnedObj(Document{bo}, member);
+    // Use the DocumentStorage that already exists on the WorkingSetMember's document
+    // field if possible.
+    MutableDocument md(std::move(member->doc.value()));
+    md.reset(bo, false);
+    transitionMemberToOwnedObj(md.freeze(), member);
 }
 
 /**
@@ -115,36 +117,14 @@ auto rehydrateIndexKey(const BSONObj& keyPattern, const BSONObj& dehydratedKey) 
 }
 }  // namespace
 
-ProjectionStage::ProjectionStage(OperationContext* opCtx,
+ProjectionStage::ProjectionStage(boost::intrusive_ptr<ExpressionContext> expCtx,
                                  const BSONObj& projObj,
                                  WorkingSet* ws,
                                  std::unique_ptr<PlanStage> child,
                                  const char* stageType)
-    : PlanStage(opCtx, std::move(child), stageType), _projObj(projObj), _ws(*ws) {}
-
-// static
-void ProjectionStage::getSimpleInclusionFields(const BSONObj& projObj, FieldSet* includedFields) {
-    // The _id is included by default.
-    bool includeId = true;
-
-    // Figure out what fields are in the projection. We could eventually do this using the
-    // Projection AST.
-    BSONObjIterator projObjIt(projObj);
-    while (projObjIt.more()) {
-        BSONElement elt = projObjIt.next();
-        // Must deal with the _id case separately as there is an implicit _id: 1 in the
-        // projection.
-        if ((elt.fieldNameStringData() == kIdField) && !elt.trueValue()) {
-            includeId = false;
-            continue;
-        }
-        (*includedFields)[elt.fieldNameStringData()] = true;
-    }
-
-    if (includeId) {
-        (*includedFields)[kIdField] = true;
-    }
-}
+    : PlanStage{expCtx->opCtx, std::move(child), stageType},
+      _projObj{expCtx->explain ? boost::make_optional(projObj.getOwned()) : boost::none},
+      _ws{*ws} {}
 
 bool ProjectionStage::isEOF() {
     return child()->isEOF();
@@ -184,7 +164,7 @@ std::unique_ptr<PlanStageStats> ProjectionStage::getStats() {
     auto ret = std::make_unique<PlanStageStats>(_commonStats, stageType());
 
     auto projStats = std::make_unique<ProjectionStats>(_specificStats);
-    projStats->projObj = _projObj;
+    projStats->projObj = _projObj.value_or(BSONObj{});
     ret->specific = std::move(projStats);
 
     ret->children.emplace_back(child()->getStats());
@@ -196,10 +176,11 @@ ProjectionStageDefault::ProjectionStageDefault(boost::intrusive_ptr<ExpressionCo
                                                const projection_ast::Projection* projection,
                                                WorkingSet* ws,
                                                std::unique_ptr<PlanStage> child)
-    : ProjectionStage{expCtx->opCtx, projObj, ws, std::move(child), "PROJECTION_DEFAULT"},
-      _wantRecordId{projection->metadataDeps()[DocumentMetadataFields::kRecordId]},
+    : ProjectionStage{expCtx, projObj, ws, std::move(child), "PROJECTION_DEFAULT"},
+      _requestedMetadata{projection->metadataDeps()},
       _projectType{projection->type()},
-      _executor{projection_executor::buildProjectionExecutor(expCtx, projection, {})} {}
+      _executor{projection_executor::buildProjectionExecutor(
+          expCtx, projection, {}, projection_executor::kDefaultBuilderParams)} {}
 
 Status ProjectionStageDefault::transform(WorkingSetMember* member) const {
     Document input;
@@ -208,7 +189,8 @@ Status ProjectionStageDefault::transform(WorkingSetMember* member) const {
     // The recordId metadata is different though, because it's a fundamental part of the WSM and
     // we store it within the WSM itself rather than WSM metadata, so we need to transfer it into
     // the metadata object if the projection has a recordId $meta expression.
-    if (_wantRecordId && !member->metadata().hasRecordId()) {
+    if (_requestedMetadata[DocumentMetadataFields::kRecordId] &&
+        !member->metadata().hasRecordId()) {
         member->metadata().setRecordId(member->recordId);
     }
 
@@ -228,11 +210,16 @@ Status ProjectionStageDefault::transform(WorkingSetMember* member) const {
         input = rehydrateIndexKey(member->keyData[0].indexKeyPattern, member->keyData[0].keyData);
     }
 
-    // Before applying the projection we will move document metadata from the WSM into the document
-    // itself, in case the projection contains $meta expressions and needs this data, and will move
-    // it back to the WSM once the projection has been applied.
-    auto projected = attachMetadataToWorkingSetMember(
-        _executor->applyTransformation(attachMetadataToDocument(std::move(input), member)), member);
+    // If the projection doesn't need any metadata, then we'll just apply the projection to the
+    // input document. Otherwise, before applying the projection, we will move document metadata
+    // from the WSM into the document itself, and will move it back to the WSM once the projection
+    // has been applied.
+    auto projected = _requestedMetadata.any()
+        ? attachMetadataToWorkingSetMember(
+              _executor->applyTransformation(attachMetadataToDocument(std::move(input), member)),
+              member)
+        : _executor->applyTransformation(input);
+
     // An exclusion projection can return an unowned object since the output document is
     // constructed from the input one backed by BSON which is owned by the storage system, so we
     // need to  make sure we transition an owned document.
@@ -241,16 +228,15 @@ Status ProjectionStageDefault::transform(WorkingSetMember* member) const {
     return Status::OK();
 }
 
-ProjectionStageCovered::ProjectionStageCovered(OperationContext* opCtx,
+ProjectionStageCovered::ProjectionStageCovered(boost::intrusive_ptr<ExpressionContext> expCtx,
                                                const BSONObj& projObj,
+                                               const projection_ast::Projection* projection,
                                                WorkingSet* ws,
                                                std::unique_ptr<PlanStage> child,
                                                const BSONObj& coveredKeyObj)
-    : ProjectionStage(opCtx, projObj, ws, std::move(child), "PROJECTION_COVERED"),
-      _coveredKeyObj(coveredKeyObj) {
-    invariant(projObjHasOwnedData());
-    // Figure out what fields are in the projection.
-    getSimpleInclusionFields(_projObj, &_includedFields);
+    : ProjectionStage{expCtx, projObj, ws, std::move(child), "PROJECTION_COVERED"},
+      _coveredKeyObj{coveredKeyObj} {
+    invariant(projection->isSimple());
 
     // If we're pulling data out of one index we can pre-compute the indices of the fields
     // in the key that we pull data from and avoid looking up the field name each time.
@@ -258,6 +244,8 @@ ProjectionStageCovered::ProjectionStageCovered(OperationContext* opCtx,
     // Sanity-check.
     invariant(_coveredKeyObj.isOwned());
 
+    _includedFields = {projection->getRequiredFields().begin(),
+                       projection->getRequiredFields().end()};
     BSONObjIterator kpIt(_coveredKeyObj);
     while (kpIt.more()) {
         BSONElement elt = kpIt.next();
@@ -269,7 +257,7 @@ ProjectionStageCovered::ProjectionStageCovered(OperationContext* opCtx,
             _includeKey.push_back(false);
         } else {
             // If we are including this key field store its field name.
-            _keyFieldNames.push_back(fieldIt->first);
+            _keyFieldNames.push_back(*fieldIt);
             _includeKey.push_back(true);
         }
     }
@@ -297,14 +285,15 @@ Status ProjectionStageCovered::transform(WorkingSetMember* member) const {
     return Status::OK();
 }
 
-ProjectionStageSimple::ProjectionStageSimple(OperationContext* opCtx,
+ProjectionStageSimple::ProjectionStageSimple(boost::intrusive_ptr<ExpressionContext> expCtx,
                                              const BSONObj& projObj,
+                                             const projection_ast::Projection* projection,
                                              WorkingSet* ws,
                                              std::unique_ptr<PlanStage> child)
-    : ProjectionStage(opCtx, projObj, ws, std::move(child), "PROJECTION_SIMPLE") {
-    invariant(projObjHasOwnedData());
-    // Figure out what fields are in the projection.
-    getSimpleInclusionFields(_projObj, &_includedFields);
+    : ProjectionStage{expCtx, projObj, ws, std::move(child), "PROJECTION_SIMPLE"} {
+    invariant(projection->isSimple());
+    _includedFields = {projection->getRequiredFields().begin(),
+                       projection->getRequiredFields().end()};
 }
 
 Status ProjectionStageSimple::transform(WorkingSetMember* member) const {
@@ -316,10 +305,15 @@ Status ProjectionStageSimple::transform(WorkingSetMember* member) const {
     // Apply the SIMPLE_DOC projection.
     // Look at every field in the source document and see if we're including it.
     auto objToProject = member->doc.value().toBson();
+    auto nFieldsNeeded = _includedFields.size();
     for (auto&& elt : objToProject) {
-        auto fieldIt = _includedFields.find(elt.fieldNameStringData());
-        if (_includedFields.end() != fieldIt) {
+        auto fieldName{elt.fieldNameStringData()};
+        absl::string_view fieldNameKey{fieldName.rawData(), fieldName.size()};
+        if (auto fieldIt = _includedFields.find(fieldNameKey); _includedFields.end() != fieldIt) {
             bob.append(elt);
+            if (--nFieldsNeeded == 0) {
+                break;
+            }
         }
     }
 

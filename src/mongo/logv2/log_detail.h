@@ -27,9 +27,11 @@
  *    it in the license file.
  */
 
+#pragma once
+
 #include "mongo/base/status.h"
 #include "mongo/bson/util/builder.h"
-#include "mongo/logv2/attribute_argument_set.h"
+#include "mongo/logv2/attribute_storage.h"
 #include "mongo/logv2/log_component.h"
 #include "mongo/logv2/log_domain.h"
 #include "mongo/logv2/log_options.h"
@@ -39,25 +41,34 @@
 namespace mongo {
 namespace logv2 {
 namespace detail {
-void doLogImpl(LogSeverity const& severity,
-               StringData stable_id,
+
+void doLogImpl(int32_t id,
+               LogSeverity const& severity,
                LogOptions const& options,
                StringData message,
-               AttributeArgumentSet const& attrs);
+               TypeErasedAttributeStorage const& attrs);
 
 
 template <typename S, typename... Args>
-void doLog(LogSeverity const& severity,
-           StringData stable_id,
+void doLog(int32_t id,
+           LogSeverity const& severity,
            LogOptions const& options,
            S const& message,
-           fmt::internal::named_arg<Args, char>&&... args) {
-    AttributeArgumentSet attr_set;
-    auto arg_store = fmt::internal::make_args_checked(message, (args.value)...);
-    attr_set._values = arg_store;
-    (attr_set._names.push_back(::mongo::StringData(args.name.data(), args.name.size())), ...);
-    auto msg = static_cast<fmt::string_view>(message);
-    doLogImpl(severity, stable_id, options, ::mongo::StringData(msg.data(), msg.size()), attr_set);
+           const fmt::internal::named_arg<Args, char>&... args) {
+    auto attributes = makeAttributeStorage(args...);
+
+    fmt::string_view msg{message};
+    doLogImpl(id, severity, options, StringData(msg.data(), msg.size()), attributes);
+}
+
+template <typename S>
+void doLog(int32_t id,
+           LogSeverity const& severity,
+           LogOptions const& options,
+           S const& message,
+           const DynamicAttributes& dynamicAttrs) {
+    fmt::string_view msg{message};
+    doLogImpl(id, severity, options, StringData(msg.data(), msg.size()), dynamicAttrs);
 }
 
 }  // namespace detail

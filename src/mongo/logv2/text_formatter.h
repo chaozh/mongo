@@ -29,69 +29,17 @@
 
 #pragma once
 
-#include <boost/log/attributes/value_extraction.hpp>
-#include <boost/log/core/record_view.hpp>
-#include <boost/log/expressions/message.hpp>
-#include <boost/log/utility/formatting_ostream.hpp>
+#include "mongo/logv2/plain_formatter.h"
 
-#include "mongo/logv2/attribute_argument_set.h"
-#include "mongo/logv2/attributes.h"
-#include "mongo/logv2/log_component.h"
-#include "mongo/logv2/log_severity.h"
-#include "mongo/logv2/log_tag.h"
-#include "mongo/util/time_support.h"
+namespace mongo::logv2 {
 
-#include <fmt/format.h>
-
-namespace mongo {
-namespace logv2 {
-
-class TextFormatter {
+class TextFormatter : protected PlainFormatter {
 public:
-    TextFormatter() = default;
-
-    // Boost log synchronizes calls to a formatter within a backend sink. If this is copied for some
-    // reason (to another backend sink), no need to copy the buffer. This is just storage so we
-    // don't need to allocate this memory every time. A final solution should format directly into
-    // the formatting_ostream.
-    TextFormatter(TextFormatter const&) {}
-
-    TextFormatter& operator=(TextFormatter const&) {
-        return *this;
-    }
-
     static bool binary() {
         return false;
     };
 
-    void operator()(boost::log::record_view const& rec, boost::log::formatting_ostream& strm) {
-        using namespace boost::log;
-
-        StringData message = extract<StringData>(attributes::message(), rec).get();
-        const auto& attrs = extract<AttributeArgumentSet>(attributes::attributes(), rec).get();
-
-        _buffer.clear();
-        fmt::format_to(
-            _buffer,
-            "{} {:<2} {:<8} [{}] ",
-            extract<Date_t>(attributes::timeStamp(), rec).get().toString(),
-            extract<LogSeverity>(attributes::severity(), rec).get().toStringDataCompact(),
-            extract<LogComponent>(attributes::component(), rec).get().getNameForLog(),
-            extract<StringData>(attributes::threadName(), rec).get());
-        strm.write(_buffer.data(), _buffer.size());
-
-        if (extract<LogTag>(attributes::tags(), rec).get().has(LogTag::kStartupWarnings)) {
-            strm << "** WARNING: ";
-        }
-
-        _buffer.clear();
-        fmt::internal::vformat_to(_buffer, to_string_view(message), attrs._values);
-        strm.write(_buffer.data(), _buffer.size());
-    }
-
-protected:
-    fmt::memory_buffer _buffer;
+    void operator()(boost::log::record_view const& rec, boost::log::formatting_ostream& strm) const;
 };
 
-}  // namespace logv2
-}  // namespace mongo
+}  // namespace mongo::logv2

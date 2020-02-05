@@ -96,7 +96,11 @@ void assertInvalidProjection(const char* queryStr, const char* projStr) {
 }
 
 TEST(QueryProjectionTest, MakeEmptyProjection) {
-    Projection proj(createProjection("{}", "{}"));
+    ASSERT_THROWS_CODE(createProjection("{}", "{}"), AssertionException, 51272);
+}
+
+TEST(QueryProjectionTest, MakeEmptyFindProjection) {
+    Projection proj(createFindProjection("{}", "{}"));
     ASSERT_TRUE(proj.requiresDocument());
 }
 
@@ -220,8 +224,19 @@ TEST(QueryProjectionTest, InvalidPositionalProjectionDefaultPathMatchExpression)
         DBException);
 }
 
-TEST(QueryProjectionTest, ProjectionDefaults) {
-    auto proj = createProjection("{}", "{}");
+TEST(QueryProjectionTest, InclusionProjectionDefaults) {
+    auto proj = createProjection("{}", "{_id: 1}");
+
+    ASSERT_FALSE(proj.metadataDeps()[DocumentMetadataFields::kSortKey]);
+    ASSERT_FALSE(proj.requiresDocument());
+    ASSERT_FALSE(proj.requiresMatchDetails());
+    ASSERT_FALSE(proj.metadataDeps()[DocumentMetadataFields::kGeoNearDist]);
+    ASSERT_FALSE(proj.metadataDeps()[DocumentMetadataFields::kGeoNearPoint]);
+    ASSERT_FALSE(proj.metadataDeps()[DocumentMetadataFields::kTextScore]);
+}
+
+TEST(QueryProjectionTest, ExclusionProjectionDefaults) {
+    auto proj = createProjection("{}", "{_id: 0}");
 
     ASSERT_FALSE(proj.metadataDeps()[DocumentMetadataFields::kSortKey]);
     ASSERT_TRUE(proj.requiresDocument());
@@ -231,9 +246,31 @@ TEST(QueryProjectionTest, ProjectionDefaults) {
     ASSERT_FALSE(proj.metadataDeps()[DocumentMetadataFields::kTextScore]);
 }
 
-TEST(QueryProjectionTest, SortKeyMetaProjectionInExclusionProjection) {
-    // A projection with just a $meta projection defaults to an exclusion projection.
+TEST(QueryProjectionTest, FindProjectionDefaults) {
+    auto proj = createFindProjection("{}", "{}");
+
+    ASSERT_FALSE(proj.metadataDeps()[DocumentMetadataFields::kSortKey]);
+    ASSERT_TRUE(proj.requiresDocument());
+    ASSERT_FALSE(proj.requiresMatchDetails());
+    ASSERT_FALSE(proj.metadataDeps()[DocumentMetadataFields::kGeoNearDist]);
+    ASSERT_FALSE(proj.metadataDeps()[DocumentMetadataFields::kGeoNearPoint]);
+    ASSERT_FALSE(proj.metadataDeps()[DocumentMetadataFields::kTextScore]);
+}
+
+TEST(QueryProjectionTest, SortKeyMetaProjectionInAgg) {
+    // A projection with just a $meta projection defaults to an exclusion projection in find().
     auto proj = createProjection("{}", "{foo: {$meta: 'sortKey'}}");
+
+    ASSERT_TRUE(proj.metadataDeps()[DocumentMetadataFields::kSortKey]);
+    ASSERT_FALSE(proj.requiresMatchDetails());
+    ASSERT_FALSE(proj.metadataDeps()[DocumentMetadataFields::kGeoNearDist]);
+    ASSERT_FALSE(proj.metadataDeps()[DocumentMetadataFields::kGeoNearPoint]);
+    ASSERT_FALSE(proj.requiresDocument());
+}
+
+TEST(QueryProjectionTest, SortKeyMetaProjectionInFind) {
+    // A projection with just a $meta projection defaults to an exclusion projection in find().
+    auto proj = createFindProjection("{}", "{foo: {$meta: 'sortKey'}}");
 
     ASSERT_TRUE(proj.metadataDeps()[DocumentMetadataFields::kSortKey]);
     ASSERT_FALSE(proj.requiresMatchDetails());
@@ -458,4 +495,51 @@ TEST(QueryProjectionTest, DBRefProjections) {
     // so these fields cannot be arrays.
     createFindProjection("{'a.$id': {$elemMatch: {x: 1}}}", "{'a.$id.$': 1}");
 }
+
+TEST(QueryProjectionTest, ProjectionWithExpressionIsNotSimple) {
+    auto proj = createProjection("{}", "{a: {$add: [3, 4]}}");
+    ASSERT_FALSE(proj.isSimple());
+
+    const auto& fields = proj.getRequiredFields();
+    ASSERT_EQ(fields.size(), 1);
+    ASSERT_EQ(fields[0], "_id");
+}
+
+TEST(QueryProjectionTest, ProjectionWithTopLevelExpressionConstantDoesNotRequireField) {
+    auto proj = createProjection("{}", "{a: {$add: ['$b', 3]}}");
+    ASSERT_FALSE(proj.isSimple());
+
+    const auto& fields = proj.getRequiredFields();
+    ASSERT_EQ(fields.size(), 2);
+    ASSERT_EQ(fields[0], "_id");
+    ASSERT_EQ(fields[1], "b");
+}
+
+TEST(QueryProjectionTest, ProjectionWithROOTNeedsWholeDocument) {
+    auto proj = createProjection("{}", "{a: '$$ROOT'}");
+    ASSERT_FALSE(proj.isSimple());
+    ASSERT_TRUE(proj.requiresDocument());
+}
+
+TEST(QueryProjectionTest, ProjectionWithFieldPathExpressionDoesNotNeedWholeDocument) {
+    auto proj = createProjection("{}", "{_id: 0, a: {$add: ['$b', '$c']}}");
+    ASSERT_FALSE(proj.isSimple());
+    ASSERT_FALSE(proj.requiresDocument());
+
+    const auto& fields = proj.getRequiredFields();
+    ASSERT_EQ(fields.size(), 2);
+    ASSERT_EQ(fields[0], "b");
+    ASSERT_EQ(fields[1], "c");
+}
+
+TEST(QueryProjectionTest, AssignmentToDottedPathRequiresFirstComponent) {
+    auto proj = createProjection("{}", "{_id: 0, 'a.b': {$add: [5, 3]}}");
+    ASSERT_FALSE(proj.isSimple());
+    ASSERT_FALSE(proj.requiresDocument());
+
+    const auto& fields = proj.getRequiredFields();
+    ASSERT_EQ(fields.size(), 1);
+    ASSERT_EQ(fields[0], "a");
+}
+
 }  // namespace

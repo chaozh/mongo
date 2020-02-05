@@ -2,12 +2,14 @@
  * Tests that setting the feature compatibility version during initial sync leads to initial sync
  * restarting. This test also ensures that even if initial sync takes two attempts to complete,
  * that the fCV is reset between attempts.
+ *
+ * This tests behavior centered around both upgrading and downgrading FCV.
+ * @tags: [multiversion_incompatible]
  */
 
 (function() {
 'use strict';
 
-load('jstests/libs/check_log.js');
 load("jstests/libs/fail_point_util.js");
 
 const rst = new ReplSetTest({nodes: 2});

@@ -42,7 +42,7 @@
 #include "mongo/db/ftdc/ftdc_mongod.h"
 #include "mongo/db/index_builds_coordinator.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/db/repair_database.h"
+#include "mongo/db/rebuild_indexes.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
@@ -110,22 +110,22 @@ void openCatalog(OperationContext* opCtx, const MinVisibleTimestampMap& minVisib
     storageEngine->loadCatalog(opCtx);
 
     log() << "openCatalog: reconciling catalog and idents";
-    auto indexesToRebuild = storageEngine->reconcileCatalogAndIdents(opCtx);
-    fassert(40688, indexesToRebuild.getStatus());
+    auto reconcileResult = fassert(40688, storageEngine->reconcileCatalogAndIdents(opCtx));
 
     // Determine which indexes need to be rebuilt. rebuildIndexesOnCollection() requires that all
     // indexes on that collection are done at once, so we use a map to group them together.
     StringMap<IndexNameObjs> nsToIndexNameObjMap;
-    for (auto indexNamespace : indexesToRebuild.getValue()) {
-        NamespaceString collNss(indexNamespace.first);
-        auto indexName = indexNamespace.second;
-        auto indexSpecs = getIndexNameObjs(
-            opCtx, collNss, [&indexName](const std::string& name) { return name == indexName; });
+    for (StorageEngine::IndexIdentifier indexIdentifier : reconcileResult.indexesToRebuild) {
+        auto indexName = indexIdentifier.indexName;
+        auto indexSpecs =
+            getIndexNameObjs(opCtx,
+                             indexIdentifier.catalogId,
+                             [&indexName](const std::string& name) { return name == indexName; });
         if (!indexSpecs.isOK() || indexSpecs.getValue().first.empty()) {
             fassert(40689,
                     {ErrorCodes::InternalError,
                      str::stream() << "failed to get index spec for index " << indexName
-                                   << " in collection " << collNss.toString()});
+                                   << " in collection " << indexIdentifier.nss});
         }
         auto indexesToRebuild = indexSpecs.getValue();
         invariant(
@@ -137,7 +137,7 @@ void openCatalog(OperationContext* opCtx, const MinVisibleTimestampMap& minVisib
             str::stream() << "expected to find a list containing exactly 1 index spec, but found "
                           << indexesToRebuild.second.size());
 
-        auto& ino = nsToIndexNameObjMap[collNss.ns()];
+        auto& ino = nsToIndexNameObjMap[indexIdentifier.nss.ns()];
         ino.first.emplace_back(std::move(indexesToRebuild.first.back()));
         ino.second.emplace_back(std::move(indexesToRebuild.second.back()));
     }
@@ -145,7 +145,7 @@ void openCatalog(OperationContext* opCtx, const MinVisibleTimestampMap& minVisib
     for (const auto& entry : nsToIndexNameObjMap) {
         NamespaceString collNss(entry.first);
 
-        auto collection = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(collNss);
+        auto collection = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, collNss);
         invariant(collection, str::stream() << "couldn't get collection " << collNss.toString());
 
         for (const auto& indexName : entry.second.first) {
@@ -154,8 +154,15 @@ void openCatalog(OperationContext* opCtx, const MinVisibleTimestampMap& minVisib
         }
 
         std::vector<BSONObj> indexSpecs = entry.second.second;
-        fassert(40690, rebuildIndexesOnCollection(opCtx, collection, indexSpecs));
+        fassert(40690, rebuildIndexesOnCollection(opCtx, collection, indexSpecs, RepairData::kNo));
     }
+
+    // Once all unfinished index builds have been dropped and the catalog has been reloaded, restart
+    // any unfinished index builds. This will not restart any index builds to completion, but rather
+    // start the background thread, build the index, and wait for a replicated commit or abort oplog
+    // entry.
+    IndexBuildsCoordinator::get(opCtx)->restartIndexBuildsForRecovery(
+        opCtx, reconcileResult.indexBuildsToRestart);
 
     // Open all databases and repopulate the CollectionCatalog.
     log() << "openCatalog: reopening all databases";
@@ -168,7 +175,8 @@ void openCatalog(OperationContext* opCtx, const MinVisibleTimestampMap& minVisib
         for (auto&& collNss :
              CollectionCatalog::get(opCtx).getAllCollectionNamesFromDb(opCtx, dbName)) {
             // Note that the collection name already includes the database component.
-            auto collection = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(collNss);
+            auto collection =
+                CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, collNss);
             invariant(collection,
                       str::stream()
                           << "failed to get valid collection pointer for namespace " << collNss);
@@ -186,6 +194,7 @@ void openCatalog(OperationContext* opCtx, const MinVisibleTimestampMap& minVisib
             }
         }
     }
+
     // Opening CollectionCatalog: The collection catalog is now in sync with the storage engine
     // catalog. Clear the pre-closing state.
     CollectionCatalog::get(opCtx).onOpenCatalog(opCtx);

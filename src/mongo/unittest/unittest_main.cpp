@@ -36,6 +36,7 @@
 #include "mongo/logger/logger.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/unittest/unittest_options_gen.h"
+#include "mongo/util/log_global_settings.h"
 #include "mongo/util/options_parser/environment.h"
 #include "mongo/util/options_parser/option_section.h"
 #include "mongo/util/options_parser/options_parser.h"
@@ -74,6 +75,8 @@ int main(int argc, char** argv, char** envp) {
     std::string filter;
     int repeat = 1;
     std::string verbose;
+    std::string fileNameFilter;
+
     // "list" and "repeat" will be assigned with default values, if not present.
     invariant(environment.get("list", &list));
     invariant(environment.get("repeat", &repeat));
@@ -81,6 +84,7 @@ int main(int argc, char** argv, char** envp) {
     environment.get("suite", &suites).ignore();
     environment.get("filter", &filter).ignore();
     environment.get("verbose", &verbose).ignore();
+    environment.get("fileNameFilter", &fileNameFilter).ignore();
 
     if (std::any_of(verbose.cbegin(), verbose.cend(), [](char ch) { return ch != 'v'; })) {
         std::cerr << "The string for the --verbose option cannot contain characters other than 'v'"
@@ -88,8 +92,7 @@ int main(int argc, char** argv, char** envp) {
         std::cerr << options.helpString();
         return EXIT_FAILURE;
     }
-    ::mongo::logger::globalLogDomain()->setMinimumLoggedSeverity(
-        ::mongo::logger::LogSeverity::Debug(verbose.length()));
+    mongo::setMinimumLoggedSeverity(::mongo::logger::LogSeverity::Debug(verbose.length()));
 
     if (list) {
         auto suiteNames = ::mongo::unittest::getAllSuiteNames();
@@ -99,7 +102,7 @@ int main(int argc, char** argv, char** envp) {
         return EXIT_SUCCESS;
     }
 
-    auto result = ::mongo::unittest::Suite::run(suites, filter, repeat);
+    auto result = ::mongo::unittest::Suite::run(suites, filter, fileNameFilter, repeat);
 
     ret = ::mongo::runGlobalDeinitializers();
     if (!ret.isOK()) {

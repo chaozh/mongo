@@ -32,10 +32,6 @@
 #include "mongo/db/exec/shard_filterer.h"
 #include "mongo/db/pipeline/mongo_process_common.h"
 #include "mongo/db/pipeline/pipeline.h"
-#include "mongo/s/async_requests_sender.h"
-#include "mongo/s/catalog_cache.h"
-#include "mongo/s/query/cluster_aggregation_planner.h"
-#include "mongo/s/query/owned_remote_cursor.h"
 
 namespace mongo {
 
@@ -48,8 +44,6 @@ public:
     MongoSInterface() = default;
 
     virtual ~MongoSInterface() = default;
-
-    void setOperationContext(OperationContext* opCtx) final {}
 
     boost::optional<Document> lookupSingleDocument(
         const boost::intrusive_ptr<ExpressionContext>& expCtx,
@@ -67,10 +61,6 @@ public:
         MONGO_UNREACHABLE;
     }
 
-    DBClientBase* directClient() final {
-        MONGO_UNREACHABLE;
-    }
-
     bool isSharded(OperationContext* opCtx, const NamespaceString& nss) final;
 
     Status insert(const boost::intrusive_ptr<ExpressionContext>& expCtx,
@@ -85,14 +75,22 @@ public:
                                     const NamespaceString& ns,
                                     BatchedObjects&& batch,
                                     const WriteConcernOptions& wc,
-                                    bool upsert,
+                                    UpsertType upsert,
                                     bool multi,
                                     boost::optional<OID>) final {
         MONGO_UNREACHABLE;
     }
 
-    CollectionIndexUsageMap getIndexStats(OperationContext* opCtx,
-                                          const NamespaceString& ns) final {
+    std::vector<Document> getIndexStats(OperationContext* opCtx,
+                                        const NamespaceString& ns,
+                                        StringData host,
+                                        bool addShardName) final {
+        MONGO_UNREACHABLE;
+    }
+
+    std::list<BSONObj> getIndexSpecs(OperationContext* opCtx,
+                                     const NamespaceString& ns,
+                                     bool includeBuildUUIDs) final {
         MONGO_UNREACHABLE;
     }
 
@@ -122,7 +120,7 @@ public:
         MONGO_UNREACHABLE;
     }
 
-    BSONObj getCollectionOptions(const NamespaceString& nss) final {
+    BSONObj getCollectionOptions(OperationContext* opCtx, const NamespaceString& nss) final {
         MONGO_UNREACHABLE;
     }
 
@@ -134,8 +132,26 @@ public:
         MONGO_UNREACHABLE;
     }
 
+    void createCollection(OperationContext* opCtx,
+                          const std::string& dbName,
+                          const BSONObj& cmdObj) final {
+        MONGO_UNREACHABLE;
+    }
+
+    void createIndexesOnEmptyCollection(OperationContext* opCtx,
+                                        const NamespaceString& ns,
+                                        const std::vector<BSONObj>& indexSpecs) final {
+        MONGO_UNREACHABLE;
+    }
+
+    void dropCollection(OperationContext* opCtx, const NamespaceString& collection) final {
+        MONGO_UNREACHABLE;
+    }
+
     std::unique_ptr<Pipeline, PipelineDeleter> attachCursorSourceToPipeline(
-        const boost::intrusive_ptr<ExpressionContext>& expCtx, Pipeline* pipeline) final;
+        const boost::intrusive_ptr<ExpressionContext>& expCtx,
+        Pipeline* pipeline,
+        bool allowTargetingShards = true) final;
 
     std::unique_ptr<Pipeline, PipelineDeleter> attachCursorSourceToPipelineForLocalRead(
         const boost::intrusive_ptr<ExpressionContext>& expCtx, Pipeline* pipeline) final {
@@ -166,7 +182,8 @@ public:
      * The following methods only make sense for data-bearing nodes and should never be called on
      * a mongos.
      */
-    BackupCursorState openBackupCursor(OperationContext* opCtx) final {
+    BackupCursorState openBackupCursor(OperationContext* opCtx,
+                                       const StorageEngine::BackupOptions& options) final {
         MONGO_UNREACHABLE;
     }
 

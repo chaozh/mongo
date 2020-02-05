@@ -93,7 +93,6 @@ class TestReport(unittest.TestResult):  # pylint: disable=too-many-instance-attr
         unittest.TestResult.startTest(self, test)
 
         test_info = _TestInfo(test.id(), test.test_name, test.dynamic)
-        test_info.start_time = time.time()
 
         basename = test.basename()
         command = test.as_command()
@@ -113,6 +112,7 @@ class TestReport(unittest.TestResult):  # pylint: disable=too-many-instance-attr
         test_info.url_endpoint = test_logger.url_endpoint
 
         test.override_logger(test_logger)
+        test_info.start_time = time.time()
 
     def stopTest(self, test):  # pylint: disable=invalid-name
         """Call after 'test' has run."""
@@ -361,3 +361,22 @@ class _TestInfo(object):  # pylint: disable=too-many-instance-attributes
         self.evergreen_status = None
         self.return_code = None
         self.url_endpoint = None
+
+
+def test_order(test_name):
+    """
+    A key function used for sorting _TestInfo objects by recommended order of investigation.
+
+    Investigate setup/teardown errors, then hooks, then test files.
+    """
+
+    if 'fixture_setup' in test_name:
+        return 1
+    elif 'fixture_teardown' in test_name:
+        return 2
+    elif 'fixture_abort' in test_name:
+        return 3
+    elif ':' in test_name:
+        return 4
+    else:
+        return 5

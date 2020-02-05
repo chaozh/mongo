@@ -162,6 +162,11 @@ val_init(void)
 {
     size_t i;
 
+    /* Discard any previous value initialization. */
+    free(val_base);
+    val_base = NULL;
+    val_dup_data_len = val_len = 0;
+
     /*
      * Set initial buffer contents to recognizable text.
      *
@@ -174,14 +179,6 @@ val_init(void)
         val_base[i] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"[i % 26];
 
     val_dup_data_len = value_len(NULL, (uint64_t)mmrand(NULL, 1, 20), g.c_value_min, g.c_value_max);
-}
-
-void
-val_teardown(void)
-{
-    free(val_base);
-    val_base = NULL;
-    val_dup_data_len = val_len = 0;
 }
 
 void
@@ -329,6 +326,11 @@ path_setup(const char *home)
     g.home_log = dmalloc(len);
     testutil_check(__wt_snprintf(g.home_log, len, "%s/%s", g.home, "log"));
 
+    /* LAS dump file. */
+    len = strlen(g.home) + strlen("LASdump") + 2;
+    g.home_lasdump = dmalloc(len);
+    testutil_check(__wt_snprintf(g.home_lasdump, len, "%s/%s", g.home, "LASdump"));
+
     /* Page dump file. */
     len = strlen(g.home) + strlen("pagedump") + 2;
     g.home_pagedump = dmalloc(len);
@@ -420,32 +422,20 @@ path_setup(const char *home)
 }
 
 /*
- * rng --
- *     Return a random number.
+ * rng_slow --
+ *     Return a random number, doing the real work.
  */
 uint32_t
-rng(WT_RAND_STATE *rnd)
+rng_slow(WT_RAND_STATE *rnd)
 {
     u_long ulv;
     uint32_t v;
     char *endptr, buf[64];
 
     /*
-     * Threaded operations have their own RNG information, otherwise we use the default.
-     */
-    if (rnd == NULL)
-        rnd = &g.rnd;
-
-    /*
      * We can reproduce a single-threaded run based on the random numbers used in the initial run,
      * plus the configuration files.
-     *
-     * Check g.replay and g.rand_log_stop: multithreaded runs log/replay until they get to the
-     * operations phase, then turn off log/replay, threaded operation order can't be replayed.
      */
-    if (g.rand_log_stop)
-        return (__wt_random(rnd));
-
     if (g.replay) {
         if (fgets(buf, sizeof(buf), g.randfp) == NULL) {
             if (feof(g.randfp)) {
@@ -567,24 +557,45 @@ checkpoint(void *arg)
 }
 
 /*
+ * timestamp_once --
+ *     Update the timestamp once.
+ */
+void
+timestamp_once(void)
+{
+    static const char *oldest_timestamp_str = "oldest_timestamp=";
+    WT_CONNECTION *conn;
+    WT_DECL_RET;
+    char buf[WT_TS_HEX_STRING_SIZE + 64];
+
+    conn = g.wts_conn;
+
+    testutil_check(__wt_snprintf(buf, sizeof(buf), "%s", oldest_timestamp_str));
+
+    /*
+     * Lock out transaction timestamp operations. The lock acts as a barrier ensuring we've checked
+     * if the workers have finished, we don't want that line reordered.
+     */
+    testutil_check(pthread_rwlock_wrlock(&g.ts_lock));
+
+    ret = conn->query_timestamp(conn, buf + strlen(oldest_timestamp_str), "get=all_durable");
+    testutil_assert(ret == 0 || ret == WT_NOTFOUND);
+    if (ret == 0)
+        testutil_check(conn->set_timestamp(conn, buf));
+
+    testutil_check(pthread_rwlock_unlock(&g.ts_lock));
+}
+
+/*
  * timestamp --
  *     Periodically update the oldest timestamp.
  */
 WT_THREAD_RET
 timestamp(void *arg)
 {
-    WT_CONNECTION *conn;
-    WT_DECL_RET;
-    WT_SESSION *session;
-    char buf[WT_TS_HEX_STRING_SIZE + 64];
     bool done;
 
     (void)(arg);
-    conn = g.wts_conn;
-
-    testutil_check(conn->open_session(conn, NULL, NULL, &session));
-
-    testutil_check(__wt_snprintf(buf, sizeof(buf), "%s", "oldest_timestamp="));
 
     /* Update the oldest timestamp at least once every 15 seconds. */
     done = false;
@@ -598,21 +609,10 @@ timestamp(void *arg)
         else
             random_sleep(&g.rnd, 15);
 
-        /*
-         * Lock out transaction timestamp operations. The lock acts as a barrier ensuring we've
-         * checked if the workers have finished, we don't want that line reordered.
-         */
-        testutil_check(pthread_rwlock_wrlock(&g.ts_lock));
+        timestamp_once();
 
-        ret = conn->query_timestamp(conn, buf + strlen("oldest_timestamp="), "get=all_committed");
-        testutil_assert(ret == 0 || ret == WT_NOTFOUND);
-        if (ret == 0)
-            testutil_check(conn->set_timestamp(conn, buf));
-
-        testutil_check(pthread_rwlock_unlock(&g.ts_lock));
     } while (!done);
 
-    testutil_check(session->close(session, NULL));
     return (WT_THREAD_RET_VALUE);
 }
 

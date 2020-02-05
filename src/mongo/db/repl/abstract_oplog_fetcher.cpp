@@ -47,15 +47,13 @@
 namespace mongo {
 namespace repl {
 
-namespace {
+// This failpoint is shared with oplog_fetcher.
+MONGO_FAIL_POINT_DEFINE(hangBeforeStartingOplogFetcher)
 
+namespace {
 Counter64 readersCreatedStats;
 ServerStatusMetricField<Counter64> displayReadersCreated("repl.network.readersCreated",
                                                          &readersCreatedStats);
-
-// Number of milliseconds to add to the `find` and `getMore` timeouts to calculate the network
-// timeout for the requests.
-const Milliseconds kNetworkTimeoutBufferMS{5000};
 
 // Default `maxTimeMS` timeout for `getMore`s.
 const Milliseconds kDefaultOplogGetMoreMaxMS{5000};
@@ -69,16 +67,35 @@ AbstractOplogFetcher::AbstractOplogFetcher(executor::TaskExecutor* executor,
                                            std::size_t maxFetcherRestarts,
                                            OnShutdownCallbackFn onShutdownCallbackFn,
                                            const std::string& componentName)
-    : AbstractAsyncComponent(executor, componentName),
-      _source(source),
-      _nss(nss),
-      _maxFetcherRestarts(maxFetcherRestarts),
-      _onShutdownCallbackFn(onShutdownCallbackFn),
-      _lastFetched(lastFetched) {
-
+    : AbstractOplogFetcher(executor,
+                           lastFetched,
+                           source,
+                           nss,
+                           std::make_unique<OplogFetcherRestartDecisionDefault>(maxFetcherRestarts),
+                           onShutdownCallbackFn,
+                           componentName) {
     invariant(!_lastFetched.isNull());
     invariant(onShutdownCallbackFn);
 }
+
+AbstractOplogFetcher::AbstractOplogFetcher(
+    executor::TaskExecutor* executor,
+    OpTime lastFetched,
+    HostAndPort source,
+    NamespaceString nss,
+    std::unique_ptr<OplogFetcherRestartDecision> oplogFetcherRestartDecision,
+    OnShutdownCallbackFn onShutdownCallbackFn,
+    const std::string& componentName)
+    : AbstractAsyncComponent(executor, componentName),
+      _source(source),
+      _nss(nss),
+      _oplogFetcherRestartDecision(std::move(oplogFetcherRestartDecision)),
+      _onShutdownCallbackFn(onShutdownCallbackFn),
+      _lastFetched(lastFetched) {
+    invariant(!_lastFetched.isNull());
+    invariant(onShutdownCallbackFn);
+}
+
 
 Milliseconds AbstractOplogFetcher::_getInitialFindMaxTime() const {
     return Milliseconds(oplogInitialFindMaxSeconds.load() * 1000);
@@ -90,6 +107,10 @@ Milliseconds AbstractOplogFetcher::_getRetriedFindMaxTime() const {
 
 Milliseconds AbstractOplogFetcher::_getGetMoreMaxTime() const {
     return kDefaultOplogGetMoreMaxMS;
+}
+
+Milliseconds AbstractOplogFetcher::_getNetworkTimeoutBuffer() const {
+    return Milliseconds(oplogNetworkTimeoutBufferSeconds.load() * 1000);
 }
 
 std::string AbstractOplogFetcher::toString() const {
@@ -131,6 +152,12 @@ void AbstractOplogFetcher::_makeAndScheduleFetcherCallback(
 Status AbstractOplogFetcher::_doStartup_inlock() noexcept {
     return _scheduleWorkAndSaveHandle_inlock(
         [this](const executor::TaskExecutor::CallbackArgs& args) {
+            // Tests use this failpoint to prevent the oplog fetcher from starting.  If those
+            // tests fail and the oplog fetcher is canceled, we want to continue so we see
+            // a test failure quickly instead of a test timeout eventually.
+            while (hangBeforeStartingOplogFetcher.shouldFail() && !args.myHandle.isCanceled()) {
+                sleepmillis(100);
+            }
             _makeAndScheduleFetcherCallback(args);
         },
         &_makeAndScheduleFetcherHandle,
@@ -189,24 +216,15 @@ void AbstractOplogFetcher::_callback(const Fetcher::QueryResponseStatus& result,
         _finishCallback(responseStatus);
         return;
     }
-
     // If target cut connections between connecting and querying (for
     // example, because it stepped down) we might not have a cursor.
     if (!responseStatus.isOK()) {
-
         BSONObj findCommandObj =
             _makeFindCommandObject(_nss, _getLastOpTimeFetched(), _getRetriedFindMaxTime());
         BSONObj metadataObj = _makeMetadataObject();
         {
-            stdx::lock_guard<Latch> lock(_mutex);
-            if (_fetcherRestarts == _maxFetcherRestarts) {
-                log() << "Error returned from oplog query (no more query restarts left): "
-                      << redact(responseStatus);
-            } else {
-                log() << "Restarting oplog query due to error: " << redact(responseStatus)
-                      << ". Last fetched optime: " << _lastFetched
-                      << ". Restarts remaining: " << (_maxFetcherRestarts - _fetcherRestarts);
-                _fetcherRestarts++;
+            if (_oplogFetcherRestartDecision->shouldContinue(this, responseStatus)) {
+                stdx::lock_guard<Latch> lock(_mutex);
                 // Destroying current instance in _shuttingDownFetcher will possibly block.
                 _shuttingDownFetcher.reset();
                 // Move the old fetcher into the shutting down instance.
@@ -232,7 +250,7 @@ void AbstractOplogFetcher::_callback(const Fetcher::QueryResponseStatus& result,
     {
         stdx::lock_guard<Latch> lock(_mutex);
         invariant(_isActive_inlock());
-        _fetcherRestarts = 0;
+        _oplogFetcherRestartDecision->fetchSuccessful(this);
     }
 
     if (_isShuttingDown()) {
@@ -296,6 +314,7 @@ void AbstractOplogFetcher::_finishCallback(Status status) {
     _onShutdownCallbackFn(status);
 
     decltype(_onShutdownCallbackFn) onShutdownCallbackFn;
+    decltype(_oplogFetcherRestartDecision) oplogFetcherRestartDecision;
     stdx::lock_guard<Latch> lock(_mutex);
     _transitionToComplete_inlock();
 
@@ -304,6 +323,10 @@ void AbstractOplogFetcher::_finishCallback(Status status) {
     // 'onShutdownCallbackFn' is declared before 'lock'.
     invariant(_onShutdownCallbackFn);
     std::swap(_onShutdownCallbackFn, onShutdownCallbackFn);
+
+    // Release any resources held by the OplogFetcherRestartDecision
+    invariant(_oplogFetcherRestartDecision);
+    std::swap(_oplogFetcherRestartDecision, oplogFetcherRestartDecision);
 }
 
 std::unique_ptr<Fetcher> AbstractOplogFetcher::_makeFetcher(const BSONObj& findCommandObj,
@@ -318,9 +341,30 @@ std::unique_ptr<Fetcher> AbstractOplogFetcher::_makeFetcher(const BSONObj& findC
                Fetcher::NextAction*,
                BSONObjBuilder* builder) { return _callback(resp, builder); },
         metadataObj,
-        findMaxTime + kNetworkTimeoutBufferMS,
-        _getGetMoreMaxTime() + kNetworkTimeoutBufferMS);
+        findMaxTime + _getNetworkTimeoutBuffer(),
+        _getGetMoreMaxTime() + _getNetworkTimeoutBuffer());
 }
+
+bool AbstractOplogFetcher::OplogFetcherRestartDecisionDefault::shouldContinue(
+    AbstractOplogFetcher* fetcher, Status status) {
+    if (_fetcherRestarts == _maxFetcherRestarts) {
+        log() << "Error returned from oplog query (no more query restarts left): "
+              << redact(status);
+        return false;
+    }
+    log() << "Restarting oplog query due to error: " << redact(status)
+          << ". Last fetched optime: " << fetcher->_getLastOpTimeFetched()
+          << ". Restarts remaining: " << (_maxFetcherRestarts - _fetcherRestarts);
+    _fetcherRestarts++;
+    return true;
+}
+
+void AbstractOplogFetcher::OplogFetcherRestartDecisionDefault::fetchSuccessful(
+    AbstractOplogFetcher* fetcher) {
+    _fetcherRestarts = 0;
+};
+
+AbstractOplogFetcher::OplogFetcherRestartDecision::~OplogFetcherRestartDecision(){};
 
 }  // namespace repl
 }  // namespace mongo

@@ -73,6 +73,19 @@ ScopedOperationCompletionShardingActions::~ScopedOperationCompletionShardingActi
     }
 
     if (auto staleInfo = status->extraInfo<StaleConfigInfo>()) {
+        if (staleInfo->getCriticalSectionSignal()) {
+            // Set migration critical section on operation sharding state: operation will wait for
+            // the migration to finish before returning.
+            auto& oss = OperationShardingState::get(_opCtx);
+            oss.setMigrationCriticalSectionSignal(staleInfo->getCriticalSectionSignal());
+        }
+
+        if (serverGlobalParams.featureCompatibility.isVersionInitialized() &&
+            serverGlobalParams.featureCompatibility.getVersion() ==
+                ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo44) {
+            invariant(staleInfo->getShardId());
+        }
+
         auto handleMismatchStatus = onShardVersionMismatchNoExcept(
             _opCtx, staleInfo->getNss(), staleInfo->getVersionReceived());
         if (!handleMismatchStatus.isOK())
@@ -88,7 +101,9 @@ ScopedOperationCompletionShardingActions::~ScopedOperationCompletionShardingActi
                   << causedBy(redact(handleMismatchStatus));
     } else if (auto cannotImplicitCreateCollInfo =
                    status->extraInfo<CannotImplicitlyCreateCollectionInfo>()) {
-        if (ShardingState::get(_opCtx)->enabled()) {
+        if (ShardingState::get(_opCtx)->enabled() &&
+            serverGlobalParams.featureCompatibility.getVersion() ==
+                ServerGlobalParams::FeatureCompatibility::Version::kFullyDowngradedTo42) {
             auto handleCannotImplicitCreateStatus =
                 onCannotImplicitlyCreateCollection(_opCtx, cannotImplicitCreateCollInfo->getNss());
             if (!handleCannotImplicitCreateStatus.isOK())

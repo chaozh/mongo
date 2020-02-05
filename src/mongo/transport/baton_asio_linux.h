@@ -44,6 +44,7 @@
 #include "mongo/transport/session_asio.h"
 #include "mongo/util/errno_util.h"
 #include "mongo/util/future.h"
+#include "mongo/util/hierarchical_acquisition.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
@@ -266,8 +267,11 @@ public:
                 auto toRun = std::exchange(_scheduled, {});
 
                 lk.unlock();
-                for (auto& job : toRun) {
+                while (toRun.size()) {
+                    // While there are jobs to run, run and dtor in sequence
+                    auto& job = toRun.back();
                     job(Status::OK());
+                    toRun.pop_back();
                 }
                 lk.lock();
             }
@@ -456,7 +460,7 @@ private:
         return EventFDHolder::getForClient(_opCtx->getClient());
     }
 
-    Mutex _mutex = MONGO_MAKE_LATCH("BatonASIO::_mutex");
+    Mutex _mutex = MONGO_MAKE_LATCH(HierarchicalAcquisitionLevel(0), "BatonASIO::_mutex");
 
     OperationContext* _opCtx;
 

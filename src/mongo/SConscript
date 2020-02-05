@@ -81,7 +81,6 @@ baseEnv.Library(
         'base/simple_string_data_comparator.cpp',
         'base/status.cpp',
         'base/string_data.cpp',
-        'base/transaction_error.cpp',
         'base/validate_locale.cpp',
         'bson/bson_comparator_interface_base.cpp',
         'bson/bson_depth.cpp',
@@ -111,17 +110,21 @@ baseEnv.Library(
         'logger/rotatable_file_manager.cpp',
         'logger/rotatable_file_writer.cpp',
         'logv2/attributes.cpp',
+        'logv2/bson_formatter.cpp',
         'logv2/console.cpp',
-        'logv2/log_detail.cpp',
+        'logv2/json_formatter.cpp',
         'logv2/log_component.cpp',
         'logv2/log_component_settings.cpp',
+        'logv2/log_detail.cpp',
         'logv2/log_domain.cpp',
         'logv2/log_domain_global.cpp',
         'logv2/log_domain_internal.cpp',
         'logv2/log_manager.cpp',
         'logv2/log_severity.cpp',
         'logv2/log_tag.cpp',
+        'logv2/plain_formatter.cpp',
         'logv2/ramlog.cpp',
+        'logv2/text_formatter.cpp',
         'platform/decimal128.cpp',
         'platform/mutex.cpp',
         'platform/posix_fadvise.cpp',
@@ -140,6 +143,7 @@ baseEnv.Library(
         'util/concurrency/idle_thread_block.cpp',
         'util/concurrency/thread_name.cpp',
         'util/duration.cpp',
+        'util/str_escape.cpp',
         'util/errno_util.cpp',
         'util/exception_filter_win32.cpp',
         'util/exit.cpp',
@@ -150,10 +154,10 @@ baseEnv.Library(
         'util/platform_init.cpp',
         'util/shell_exec.cpp',
         'util/signal_handlers_synchronous.cpp',
-        'util/stacktrace.cpp',
         'util/stacktrace_${TARGET_OS_FAMILY}.cpp',
         'util/stacktrace_json.cpp',
         'util/stacktrace_somap.cpp',
+        'util/stacktrace_threads.cpp',
         'util/str.cpp',
         'util/system_clock_source.cpp',
         'util/system_tick_source.cpp',
@@ -181,6 +185,7 @@ baseEnv.Library(
     LIBDEPS_PRIVATE=[
         'util/debugger',
     ],
+    AIB_COMPONENT='platform',
 )
 
 # Shim library for boost to depend on
@@ -350,6 +355,7 @@ mongod = env.Program(
     target="mongod",
     source=[
         "db/db.cpp",
+        "db/read_write_concern_defaults_cache_lookup_mongod.cpp",
     ] + env.WindowsResourceFile("db/db.rc"),
     LIBDEPS=[
         '$BUILD_DIR/third_party/shim_snappy',
@@ -400,6 +406,7 @@ mongod = env.Program(
         'db/pipeline/process_interface_factory_mongod',
         'db/query_exec',
         'db/read_concern_d_impl',
+        'db/read_write_concern_defaults',
         'db/repair_database_and_check_version',
         'db/repl/bgsync',
         'db/repl/oplog_application',
@@ -457,6 +464,7 @@ mongod = env.Program(
         'util/clock_sources',
         'util/elapsed_tracker',
         'util/fail_point',
+        'util/latch_analyzer',
         'util/net/network',
         'util/ntservice',
         'util/options_parser/options_parser_init',
@@ -464,11 +472,15 @@ mongod = env.Program(
         'util/version_impl',
         'watchdog/watchdog_mongod',
     ],
-    AIB_COMPONENT="servers",
+    LIBDEPS_PRIVATE=[
+        'db/index/index_access_methods',
+    ],
+    AIB_COMPONENT="mongod",
     AIB_COMPONENTS_EXTRA=[
-        "dist",
-        "default",
         "core",
+        "default",
+        "dist",
+        "servers",
     ],
 )
 
@@ -476,9 +488,6 @@ hygienic = get_option('install-mode') == 'hygienic'
 
 if not hygienic:
     env.Default(env.Install('#/', mongod))
-
-# tools
-rewrittenTools = [ "mongodump", "mongorestore", "mongoexport", "mongoimport", "mongostat", "mongotop", "bsondump", "mongofiles" ]
 
 if env.TargetOSIs('windows'):
     generatedServerManifest = env.Substfile(
@@ -515,6 +524,7 @@ if not hygienic:
 mongos = env.Program(
     target='mongos',
     source=[
+        "db/read_write_concern_defaults_cache_lookup_mongos.cpp",
         's/cluster_cursor_stats.cpp',
         's/mongos_options.cpp',
         's/mongos_options_init.cpp',
@@ -538,6 +548,7 @@ mongos = env.Program(
         'db/logical_session_cache',
         'db/logical_session_cache_impl',
         'db/logical_time_metadata_hook',
+        'db/read_write_concern_defaults',
         'db/server_options',
         'db/server_options_base',
         'db/service_liaison_mongos',
@@ -560,6 +571,7 @@ mongos = env.Program(
         'transport/transport_layer_manager',
         'util/clock_sources',
         'util/fail_point',
+        'util/latch_analyzer',
         'util/net/ssl_options_server' if get_option('ssl') == 'on' else '',
         'util/ntservice',
         'util/version_impl',
@@ -568,10 +580,11 @@ mongos = env.Program(
         'util/options_parser/options_parser_init',
         'util/options_parser/options_parser',
     ],
-    AIB_COMPONENT="servers",
+    AIB_COMPONENT="mongos",
     AIB_COMPONENTS_EXTRA=[
-        "dist",
         "core",
+        "dist",
+        "servers"
     ]
 )
 
@@ -663,10 +676,11 @@ if not has_option('noshell') and usemozjs:
             "$BUILD_DIR/mongo/client/connection_string",
             '$BUILD_DIR/mongo/util/net/ssl_options_client' if get_option('ssl') == 'on' else '',
         ],
-        AIB_COMPONENT="shell",
+        AIB_COMPONENT="mongo",
         AIB_COMPONENTS_EXTRA=[
-            "dist",
             "core",
+            "dist",
+            "shell",
         ],
     )
 
@@ -738,52 +752,6 @@ def installBinary( e, name ):
 
     if env.TargetOSIs('posix'):
         e.AddPostAction( inst, 'chmod 755 $TARGET' )
-
-def installExternalBinary( e, name_str ):
-    name = env.File("#/%s" % add_exe(name_str))
-    if not name.isfile():
-        env.FatalError("ERROR: external binary not found: {0}", name)
-
-    if hygienic:
-        env.AutoInstall(
-            target='$PREFIX_BINDIR',
-            source=[
-                name
-            ],
-            AIB_COMPONENT='tools',
-            AIB_COMPONENTS_EXTRA=['dist'],
-            AIB_ROLE='runtime',
-        )
-        return
-
-    distBinaries.append(name)
-
-    inst = e.Install( "$DESTDIR/bin", name )
-
-    if env.TargetOSIs('posix'):
-        e.AddPostAction( inst, 'chmod 755 $TARGET' )
-
-# "--use-new-tools" adds dependencies for rewritten (Go) tools
-# It is required for "dist" but optional for "install"
-if has_option("use-new-tools"):
-
-    if hygienic:
-        env.AutoInstall(
-            target='$DESTDIR',
-            source=env.File('#/src/mongo-tools/distsrc/THIRD-PARTY-NOTICES.gotools'),
-            AIB_COMPONENT='tools',
-            AIB_COMPONENTS_EXTRA=['dist'],
-            AIB_ROLE='base',
-        )
-    else:
-        env.Append(MODULE_BANNERS=[env.File('#/src/mongo-tools/distsrc/THIRD-PARTY-NOTICES.gotools')])
-
-    toolsRoot = "src/mongo-tools"
-
-    for t in rewrittenTools:
-        installExternalBinary(env, "%s/%s" % (toolsRoot, t))
-    if has_option("build-mongoreplay") and get_option("build-mongoreplay") == "true":
-        installExternalBinary(env, "%s/%s" % (toolsRoot, "mongoreplay"))
 
 # legacy tools
 if not hygienic:
@@ -901,9 +869,7 @@ if env.TargetOSIs('posix'):
     env.AddPostAction( compass_script_installer, 'chmod 755 $TARGET' )
     env.AddPostAction( compass_installer, 'chmod 755 $TARGET' )
 
-# "dist" target is valid only when --use-new-tools is specified
-# Attempts to build release artifacts without tools must fail
-if has_option("use-new-tools") and not hygienic:
+if not hygienic:
     server_archive = env.Command(
         target='#/${SERVER_ARCHIVE}',
         source=['#buildscripts/make_archive.py'] + env["MODULE_BANNERS"] + env["ARCHIVE_ADDITIONS"] + distBinaries,
@@ -916,8 +882,6 @@ if has_option("use-new-tools") and not hygienic:
                 '--transform $BUILD_DIR/mongo/stripped/db/modules/enterprise=$SERVER_DIST_BASENAME/bin',
                 '--transform $BUILD_DIR/mongo/stripped=$SERVER_DIST_BASENAME/bin',
                 '--transform $BUILD_DIR/mongo=$SERVER_DIST_BASENAME/bin',
-                '--transform $BUILD_DIR/mongo/stripped/src/mongo-tools=$SERVER_DIST_BASENAME/bin',
-                '--transform src/mongo-tools=$SERVER_DIST_BASENAME/bin',
                 '--transform src/mongo/installer/compass=$SERVER_DIST_BASENAME/bin',
                 '${TEMPFILE(SOURCES[1:])}'
             ],
@@ -944,12 +908,6 @@ if has_option("use-new-tools") and not hygienic:
 
     env.Alias('dist-debugsymbols', debug_symbols_dist)
     env.NoCache(debug_symbols_dist)
-
-elif not hygienic:
-    def failDist(env, target, source):
-        env.FatalError("ERROR: 'dist' target only valid with --use-new-tools.")
-    env.Alias("dist", [], [ failDist ] )
-    env.AlwaysBuild("dist")
 
 #final alias
 if not hygienic:

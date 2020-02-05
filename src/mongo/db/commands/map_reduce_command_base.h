@@ -44,6 +44,24 @@ public:
                "details.";
     }
 
+    /**
+     * The mapReduce command supports only 'local' and 'available' readConcern levels.
+     * For aggregation-based mapReduce there are no known restrictions to broader support, but work
+     * would need to be done confirm support for both command and aggregation stages as is done for
+     * the aggregate command.
+     */
+    virtual ReadConcernSupportResult supportsReadConcern(const BSONObj& cmdObj,
+                                                         repl::ReadConcernLevel level) const {
+        static const Status kReadConcernNotSupported{ErrorCodes::InvalidOptions,
+                                                     "read concern not supported"};
+        static const Status kDefaultReadConcernNotPermitted{ErrorCodes::InvalidOptions,
+                                                            "default read concern not permitted"};
+        return {{level != repl::ReadConcernLevel::kLocalReadConcern &&
+                     level != repl::ReadConcernLevel::kAvailableReadConcern,
+                 kReadConcernNotSupported},
+                {kDefaultReadConcernNotPermitted}};
+    }
+
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return map_reduce_common::mrSupportsWriteConcern(cmd);
     }
@@ -65,12 +83,38 @@ public:
         map_reduce_common::addPrivilegesRequiredForMapReduce(this, dbname, cmdObj, out);
     }
 
+    virtual void _explainImpl(OperationContext* opCtx,
+                              const BSONObj& cmd,
+                              BSONObjBuilder& result,
+                              boost::optional<ExplainOptions::Verbosity> verbosity) const = 0;
+
+    Status explain(OperationContext* opCtx,
+                   const OpMsgRequest& request,
+                   ExplainOptions::Verbosity verbosity,
+                   rpc::ReplyBuilderInterface* result) const override {
+        if (serverGlobalParams.featureCompatibility.getVersion() ==
+            ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo44) {
+            auto builder = result->getBodyBuilder();
+            auto explain = boost::make_optional(verbosity);
+            try {
+                _explainImpl(opCtx, request.body, builder, explain);
+            } catch (...) {
+                return exceptionToStatus();
+            }
+            return Status::OK();
+        } else {
+            return Status(
+                ErrorCodes::IllegalOperation,
+                "explain for mapReduce is not available prior to featureCompatibilityVersion 4.4");
+        }
+        MONGO_UNREACHABLE;
+    }
+
     bool errmsgRun(OperationContext* opCtx,
                    const std::string& dbname,
                    const BSONObj& cmd,
                    std::string& errmsg,
                    BSONObjBuilder& result) {
-
         return _runImpl(opCtx, dbname, cmd, errmsg, result);
     }
 

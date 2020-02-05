@@ -11,7 +11,6 @@
 
 (function() {
 "use strict";
-load("jstests/libs/check_log.js");
 load("jstests/replsets/libs/rollback_test.js");
 
 const dbName = "test";
@@ -27,7 +26,7 @@ config.members[2].priority = 0;
 config.settings = {
     chainingAllowed: false
 };
-rst.initiate(config);
+rst.initiateWithHighElectionTimeout(config);
 
 const rollbackTest = new RollbackTest(collName, rst);
 

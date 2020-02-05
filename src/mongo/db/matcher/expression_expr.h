@@ -29,6 +29,7 @@
 
 #pragma once
 
+#include <boost/optional.hpp>
 #include <vector>
 
 #include "mongo/db/matcher/expression.h"
@@ -63,7 +64,7 @@ public:
         debug << "$expr " << _expression->serialize(false).toString();
     }
 
-    void serialize(BSONObjBuilder* out) const final;
+    void serialize(BSONObjBuilder* out, bool includePath) const final;
 
     bool equivalent(const MatchExpression* other) const final;
 
@@ -79,8 +80,8 @@ public:
         MONGO_UNREACHABLE;
     }
 
-    std::vector<MatchExpression*>* getChildVector() final {
-        return nullptr;
+    boost::optional<std::vector<MatchExpression*>&> getChildVector() final {
+        return boost::none;
     }
 
     boost::intrusive_ptr<ExpressionContext> getExpressionContext() {

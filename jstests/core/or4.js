@@ -3,13 +3,18 @@
 //   requires_fastcount,
 //   requires_getmore,
 //   requires_non_retryable_writes,
+//   # Map Reduce before 4.4. does not support outputting to a sharded collection whose shard key is
+//   # {_id: "hashed"}.
+//   requires_fcv_44,
 // ]
 
+load("jstests/aggregation/extras/utils.js");  // For resultsEq
 (function() {
 "use strict";
 
 const coll = db.or4;
 coll.drop();
+db.getCollection("mrOutput").drop();
 
 coll.ensureIndex({a: 1});
 coll.ensureIndex({b: 1});
@@ -64,16 +69,20 @@ assert.eq(4, coll.find({$or: [{a: 2}, {b: 3}]}).limit(4).toArray().length);
 
 assert.eq([1, 2], Array.sort(coll.distinct('a', {$or: [{a: 2}, {b: 3}]})));
 
-assert.eq(5,
-          coll.mapReduce(
-                  function() {
-                      emit('a', this.a);
-                  },
-                  function(key, vals) {
-                      return vals.length;
-                  },
-                  {out: {inline: true}, query: {$or: [{a: 2}, {b: 3}]}})
-              .counts.input);
+assert.commandWorked(coll.mapReduce(
+    function() {
+        if (!this.hasOwnProperty('a')) {
+            emit('a', 0);
+        } else {
+            emit('a', this.a);
+        }
+    },
+    function(key, vals) {
+        return vals.reduce((a, b) => a + b, 0);
+    },
+    {out: {merge: "mrOutput"}, query: {$or: [{a: 2}, {b: 3}]}}));
+assert(resultsEq([{"_id": "a", "value": 7}], db.getCollection("mrOutput").find().toArray()),
+       db.getCollection("mrOutput").find().toArray());
 
 coll.remove({});
 

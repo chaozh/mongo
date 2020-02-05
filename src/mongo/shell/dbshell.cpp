@@ -47,7 +47,10 @@
 #include "mongo/base/init.h"
 #include "mongo/base/initializer.h"
 #include "mongo/base/status.h"
+#include "mongo/client/authenticate.h"
 #include "mongo/client/mongo_uri.h"
+#include "mongo/client/sasl_iam_client_options.h"
+#include "mongo/config.h"
 #include "mongo/db/auth/sasl_command_constants.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands/test_commands_enabled.h"
@@ -57,10 +60,10 @@
 #include "mongo/logger/logger.h"
 #include "mongo/logger/logv2_appender.h"
 #include "mongo/logger/message_event_utf8_encoder.h"
-#include "mongo/logv2/attribute_argument_set.h"
 #include "mongo/logv2/attributes.h"
 #include "mongo/logv2/component_settings_filter.h"
 #include "mongo/logv2/console.h"
+#include "mongo/logv2/json_formatter.h"
 #include "mongo/logv2/log_domain_global.h"
 #include "mongo/logv2/log_manager.h"
 #include "mongo/logv2/text_formatter.h"
@@ -75,6 +78,7 @@
 #include "mongo/util/exit.h"
 #include "mongo/util/file.h"
 #include "mongo/util/log.h"
+#include "mongo/util/net/ocsp/ocsp_manager.h"
 #include "mongo/util/net/ssl_options.h"
 #include "mongo/util/password.h"
 #include "mongo/util/quick_exit.h"
@@ -191,23 +195,26 @@ public:
 /**
  * Formatter to provide specialized formatting for logs from javascript engine
  */
-class ShellFormatter final : private logv2::TextFormatter {
+class ShellFormatter final : private logv2::TextFormatter, private logv2::JSONFormatter {
 public:
+    ShellFormatter(bool isJson) : _isJson(isJson) {}
     void operator()(boost::log::record_view const& rec, boost::log::formatting_ostream& strm) {
         using namespace logv2;
         using boost::log::extract;
 
-        if (extract<LogTag>(attributes::tags(), rec).get().has(LogTag::kJavascript)) {
-            StringData message = extract<StringData>(attributes::message(), rec).get();
-            const auto& attrs = extract<AttributeArgumentSet>(attributes::attributes(), rec).get();
-
-            _buffer.clear();
-            fmt::internal::vformat_to(_buffer, to_string_view(message), attrs._values);
-            strm.write(_buffer.data(), _buffer.size());
+        if (extract<LogTag>(attributes::tags(), rec).get().has(LogTag::kPlainShell)) {
+            PlainFormatter::operator()(rec, strm);
         } else {
-            logv2::TextFormatter::operator()(rec, strm);
+            if (_isJson) {
+                JSONFormatter::operator()(rec, strm);
+            } else {
+                TextFormatter::operator()(rec, strm);
+            }
         }
     }
+
+private:
+    bool _isJson;
 };
 
 }  // namespace
@@ -697,7 +704,8 @@ static void edit(const std::string& whatToEdit) {
 namespace {
 bool mechanismRequiresPassword(const MongoURI& uri) {
     if (const auto authMechanisms = uri.getOption("authMechanism")) {
-        constexpr std::array<StringData, 2> passwordlessMechanisms{"GSSAPI"_sd, "MONGODB-X509"_sd};
+        constexpr std::array<StringData, 3> passwordlessMechanisms{
+            auth::kMechanismGSSAPI, auth::kMechanismMongoX509, auth::kMechanismMongoIAM};
         const std::string& authMechanism = authMechanisms.get();
         for (const auto& mechanism : passwordlessMechanisms) {
             if (mechanism.toString() == authMechanism) {
@@ -721,14 +729,22 @@ int _main(int argc, char* argv[], char** envp) {
     setupSignalHandlers();
     setupSignals();
 
-    logger::globalLogManager()->getGlobalDomain()->clearAppenders();
-    logger::globalLogManager()->getGlobalDomain()->attachAppender(
-        std::make_unique<ShellConsoleAppender>(
-            std::make_unique<logger::MessageEventDetailsEncoder>()));
-
+    // Log to stdout for any early logging before we re-configure the logger
     auto& lv2Manager = logv2::LogManager::global();
     logv2::LogDomainGlobal::ConfigurationOptions lv2Config;
-    lv2Config.makeDisabled();
+    if (logV2Enabled()) {
+        logger::globalLogManager()->getGlobalDomain()->clearAppenders();
+        logger::globalLogManager()->getGlobalDomain()->attachAppender(
+            std::make_unique<logger::LogV2Appender<logger::MessageEventEphemeral>>(
+                &lv2Manager.getGlobalDomain(), false));
+    } else {
+        logger::globalLogManager()->getGlobalDomain()->clearAppenders();
+        logger::globalLogManager()->getGlobalDomain()->attachAppender(
+            std::make_unique<ShellConsoleAppender>(
+                std::make_unique<logger::MessageEventDetailsEncoder>()));
+
+        lv2Config.makeDisabled();
+    }
     uassertStatusOK(lv2Manager.getGlobalDomainInternal().configure(lv2Config));
 
     mongo::shell_utils::RecordMyLocation(argv[0]);
@@ -737,6 +753,9 @@ int _main(int argc, char* argv[], char** envp) {
     setGlobalServiceContext(ServiceContext::make());
     // TODO This should use a TransportLayerManager or TransportLayerFactory
     auto serviceContext = getGlobalServiceContext();
+
+    OCSPManager::get()->startThreadPool();
+
     transport::TransportLayerASIO::Options opts;
     opts.enableIPv6 = shellGlobalParams.enableIPv6;
     opts.mode = transport::TransportLayerASIO::Options::kEgress;
@@ -755,34 +774,39 @@ int _main(int argc, char* argv[], char** envp) {
     if (!mongo::serverGlobalParams.quiet.load())
         std::cout << mongoShellVersion(VersionInfoInterface::instance()) << std::endl;
 
-    if (!shellGlobalParams.logV2) {
+    if (!logV2Enabled()) {
         logger::globalLogManager()
-            ->getNamedDomain("javascriptOutput")
+            ->getNamedDomain("plainShellOutput")
             ->attachAppender(std::make_unique<ShellConsoleAppender>(
                 std::make_unique<logger::MessageEventUnadornedEncoder>()));
     } else {
         logger::globalLogManager()->getGlobalDomain()->clearAppenders();
         logger::globalLogManager()->getGlobalDomain()->attachAppender(
             std::make_unique<logger::LogV2Appender<logger::MessageEventEphemeral>>(
-                &(lv2Manager.getGlobalDomain())));
+                &(lv2Manager.getGlobalDomain()), false));
         logger::globalLogManager()
-            ->getNamedDomain("javascriptOutput")
+            ->getNamedDomain("plainShellOutput")
             ->attachAppender(std::make_unique<logger::LogV2Appender<logger::MessageEventEphemeral>>(
-                &lv2Manager.getGlobalDomain(), logv2::LogTag::kJavascript));
+                &lv2Manager.getGlobalDomain(), false, logv2::LogTag::kPlainShell));
 
         auto consoleSink = boost::make_shared<boost::log::sinks::synchronous_sink<ShellBackend>>();
         consoleSink->set_filter(logv2::ComponentSettingsFilter(lv2Manager.getGlobalDomain(),
                                                                lv2Manager.getGlobalSettings()));
-        consoleSink->set_formatter(ShellFormatter());
+        consoleSink->set_formatter(
+            ShellFormatter(shellGlobalParams.logFormat == logv2::LogFormat::kJson));
 
         consoleSink->locked_backend()->add_stream(
             boost::shared_ptr<std::ostream>(&logv2::Console::out(), boost::null_deleter()));
 
         consoleSink->locked_backend()->auto_flush();
 
+        // Remove the initial config from above when setting this sink, otherwise we log everything
+        // twice.
+        lv2Config.makeDisabled();
+        uassertStatusOK(lv2Manager.getGlobalDomainInternal().configure(lv2Config));
+
         boost::log::core::get()->add_sink(std::move(consoleSink));
     }
-
 
     // Get the URL passed to the shell
     std::string& cmdlineURI = shellGlobalParams.url;
@@ -798,6 +822,13 @@ int _main(int argc, char* argv[], char** envp) {
     parsedURI.setOptionIfNecessary("authSource"s, shellGlobalParams.authenticationDatabase);
     parsedURI.setOptionIfNecessary("gssapiServiceName"s, shellGlobalParams.gssapiServiceName);
     parsedURI.setOptionIfNecessary("gssapiHostName"s, shellGlobalParams.gssapiHostName);
+#ifdef MONGO_CONFIG_SSL
+    if (!iam::saslIamClientGlobalParams.awsSessionToken.empty()) {
+        parsedURI.setOptionIfNecessary("authmechanismproperties"s,
+                                       std::string("AWS_SESSION_TOKEN:") +
+                                           iam::saslIamClientGlobalParams.awsSessionToken);
+    }
+#endif
 
     if (const auto authMechanisms = parsedURI.getOption("authMechanism")) {
         std::stringstream ss;

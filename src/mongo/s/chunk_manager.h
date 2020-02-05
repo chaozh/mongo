@@ -52,8 +52,20 @@ class ChunkManager;
 // Ordered map from the max for each chunk to an entry describing the chunk
 using ChunkInfoMap = std::map<std::string, std::shared_ptr<ChunkInfo>>;
 
-// Map from a shard is to the max chunk version on that shard
-using ShardVersionMap = std::map<ShardId, ChunkVersion>;
+struct ShardVersionTargetingInfo {
+    // Indicates whether the shard is stale and thus needs a catalog cache refresh. Is false by
+    // default.
+    AtomicWord<bool> isStale;
+
+    // Max chunk version for the shard.
+    ChunkVersion shardVersion;
+
+    ShardVersionTargetingInfo(const OID& epoch);
+};
+
+// Map from a shard to a struct indicating both the max chunk version on that shard and whether the
+// shard is currently marked as needing a catalog cache refresh (stale).
+using ShardVersionMap = std::map<ShardId, ShardVersionTargetingInfo>;
 
 /**
  * In-memory representation of the routing table for a single sharded collection at various points
@@ -116,6 +128,18 @@ public:
         return _unique;
     }
 
+    /**
+     * Mark the given shard as stale, indicating that requests targetted to this shard (for this
+     * namespace) need to block on a catalog cache refresh.
+     */
+    void setShardStale(const ShardId& shardId);
+
+    /**
+     * Mark all shards as not stale, indicating that a refresh has happened and requests targeted
+     * to all shards (for this namespace) do not currently need to block on a catalog cache refresh.
+     */
+    void setAllShardsRefreshed();
+
     ChunkVersion getVersion() const {
         return _collectionVersion;
     }
@@ -130,6 +154,11 @@ public:
      * Returns the ids of all shards on which the collection has any chunks.
      */
     void getAllShardIds(std::set<ShardId>* all) const;
+
+    /**
+     * Returns the number of shards on which the collection has any chunks
+     */
+    int getNShardsOwningChunks() const;
 
     /**
      * Returns true if, for this shard, the chunks are identical in both chunk managers
@@ -194,9 +223,9 @@ private:
     // Max version across all chunks
     const ChunkVersion _collectionVersion;
 
-    // Map from shard id to the maximum chunk version for that shard. If a shard contains no
-    // chunks, it won't be present in this map.
-    const ShardVersionMap _shardVersions;
+    // The representation of shard versions and staleness indicators for this namespace. If a
+    // shard does not exist, it will not have an entry in the map.
+    ShardVersionMap _shardVersions;
 
     friend class ChunkManager;
 };
@@ -359,6 +388,13 @@ public:
      */
     void getAllShardIds(std::set<ShardId>* all) const {
         _rt->getAllShardIds(all);
+    }
+
+    /**
+     * Returns the number of shards on which the collection has any chunks
+     */
+    int getNShardsOwningChunks() {
+        return _rt->getNShardsOwningChunks();
     }
 
     // Transforms query into bounds for each field in the shard key

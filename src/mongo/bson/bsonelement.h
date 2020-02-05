@@ -31,6 +31,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <fmt/format.h>
 #include <string.h>  // strlen
 #include <string>
 #include <vector>
@@ -52,6 +53,9 @@ class BSONObj;
 class BSONElement;
 class BSONObjBuilder;
 class Timestamp;
+class ExtendedCanonicalV200Generator;
+class ExtendedRelaxedV200Generator;
+class LegacyStrictGenerator;
 
 typedef BSONElement be;
 typedef BSONObj bo;
@@ -211,10 +215,23 @@ public:
                            bool includeFieldNames = true,
                            int pretty = 0) const;
 
-    void jsonStringStream(JsonStringFormat format,
+    void jsonStringBuffer(JsonStringFormat format,
                           bool includeFieldNames,
                           int pretty,
-                          std::stringstream& s) const;
+                          fmt::memory_buffer& buffer) const;
+
+    void jsonStringGenerator(ExtendedCanonicalV200Generator const& generator,
+                             bool includeFieldNames,
+                             int pretty,
+                             fmt::memory_buffer& buffer) const;
+    void jsonStringGenerator(ExtendedRelaxedV200Generator const& generator,
+                             bool includeFieldNames,
+                             int pretty,
+                             fmt::memory_buffer& buffer) const;
+    void jsonStringGenerator(LegacyStrictGenerator const& generator,
+                             bool includeFieldNames,
+                             int pretty,
+                             fmt::memory_buffer& buffer) const;
 
     operator std::string() const {
         return toString();
@@ -339,11 +356,24 @@ public:
         return ConstDataView(value()).read<LittleEndian<long long>>();
     }
 
-    /** Retrieve int value for the element safely.  Zero returned if not a number. */
+    /**
+     * Retrieves the value of this element as a 32 bit integer. If the BSON type is non-numeric,
+     * returns zero. If the element holds a double, truncates the fractional part.
+     *
+     * Results in undefined behavior if called on a double that is NaN, +/-infinity, or too
+     * large/small to be represented as an int.  Use 'safeNumberLong()' to safely convert an
+     * arbitrary BSON element to an integer without risk of UB.
+     */
     int numberInt() const;
-    /** Retrieve long value for the element safely.  Zero returned if not a number.
-     *  Behavior is not defined for double values that are NaNs, or too large/small
-     *  to be represented by long longs */
+
+    /**
+     * Retrieves the value of this element as a 64 bit integer. If the BSON type is non-numeric,
+     * returns zero. If the element holds a double, truncates the fractional part.
+     *
+     * Results in undefined behavior if called on a double that is NaN, +/-infinity, or too
+     * large/small to be repsented as a long. Use 'safeNumberLong()' to safely convert an arbitrary
+     * BSON element to an integer without risk of UB.
+     */
     long long numberLong() const;
 
     /** Like numberLong() but with well-defined behavior for doubles that
@@ -741,6 +771,12 @@ public:
     static const double kLongLongMaxPlusOneAsDouble;
 
 private:
+    template <typename Generator>
+    void _jsonStringGenerator(const Generator& g,
+                              bool includeFieldNames,
+                              int pretty,
+                              fmt::memory_buffer& buffer) const;
+
     const char* data;
     int fieldNameSize_;  // internal size includes null terminator
     int totalSize;
@@ -829,8 +865,6 @@ inline double BSONElement::numberDouble() const {
     }
 }
 
-/** Retrieve int value for the element safely.  Zero returned if not a number. Converted to int if
- * another numeric type. */
 inline int BSONElement::numberInt() const {
     switch (type()) {
         case NumberDouble:
@@ -846,7 +880,6 @@ inline int BSONElement::numberInt() const {
     }
 }
 
-/** Retrieve long value for the element safely.  Zero returned if not a number. */
 inline long long BSONElement::numberLong() const {
     switch (type()) {
         case NumberDouble:

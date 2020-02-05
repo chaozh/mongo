@@ -37,7 +37,13 @@
 #include <string>
 
 #include "mongo/bson/simple_bsonobj_comparator.h"
+#include "mongo/db/exec/projection_executor.h"
+#include "mongo/db/exec/projection_executor_builder.h"
+#include "mongo/db/exec/wildcard_projection.h"
 #include "mongo/db/json.h"
+#include "mongo/db/pipeline/expression_context_for_test.h"
+#include "mongo/db/query/projection_parser.h"
+#include "mongo/db/query/projection_policies.h"
 #include "mongo/db/query/query_settings.h"
 #include "mongo/db/query/query_test_service_context.h"
 #include "mongo/stdx/unordered_set.h"
@@ -47,6 +53,13 @@
 using namespace mongo;
 
 namespace {
+auto createProjectionExecutor(const BSONObj& spec, const ProjectionPolicies& policies) {
+    const boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    auto projection = projection_ast::parse(expCtx, spec, policies);
+    auto executor = projection_executor::buildProjectionExecutor(
+        expCtx, &projection, policies, projection_executor::kDefaultBuilderParams);
+    return WildcardProjection{std::move(executor)};
+}
 
 using std::unique_ptr;
 
@@ -138,7 +151,7 @@ IndexEntry buildSimpleIndexEntry(const BSONObj& kp, const std::string& indexName
  * is neccesary for wildcard indicies.
  */
 IndexEntry buildWildcardIndexEntry(const BSONObj& kp,
-                                   const ProjectionExecAgg* projExec,
+                                   const WildcardProjection& wcProj,
                                    const std::string& indexName) {
     return {kp,
             IndexNames::nameToType(IndexNames::findPluginName(kp)),
@@ -151,7 +164,7 @@ IndexEntry buildWildcardIndexEntry(const BSONObj& kp,
             nullptr,
             {},
             nullptr,
-            projExec};
+            &wcProj};
 }
 
 // Use of index filters to select compound index over single key index.
@@ -207,11 +220,11 @@ TEST(GetExecutorTest, GetAllowedIndicesMatchesMultipleIndexesByKey) {
 }
 
 TEST(GetExecutorTest, GetAllowedWildcardIndicesByKey) {
-    auto projExec = ProjectionExecAgg::create(
+    auto wcProj = createProjectionExecutor(
         fromjson("{_id: 0}"),
-        ProjectionExecAgg::DefaultIdPolicy::kExcludeId,
-        ProjectionExecAgg::ArrayRecursionPolicy::kDoNotRecurseNestedArrays);
-    testAllowedIndices({buildWildcardIndexEntry(BSON("$**" << 1), projExec.get(), "$**_1"),
+        {ProjectionPolicies::DefaultIdPolicy::kExcludeId,
+         ProjectionPolicies::ArrayRecursionPolicy::kDoNotRecurseNestedArrays});
+    testAllowedIndices({buildWildcardIndexEntry(BSON("$**" << 1), wcProj, "$**_1"),
                         buildSimpleIndexEntry(fromjson("{a: 1}"), "a_1"),
                         buildSimpleIndexEntry(fromjson("{a: 1, b: 1}"), "a_1_b_1"),
                         buildSimpleIndexEntry(fromjson("{a: 1, c: 1}"), "a_1_c_1")},
@@ -221,11 +234,11 @@ TEST(GetExecutorTest, GetAllowedWildcardIndicesByKey) {
 }
 
 TEST(GetExecutorTest, GetAllowedWildcardIndicesByName) {
-    auto projExec = ProjectionExecAgg::create(
+    auto wcProj = createProjectionExecutor(
         fromjson("{_id: 0}"),
-        ProjectionExecAgg::DefaultIdPolicy::kExcludeId,
-        ProjectionExecAgg::ArrayRecursionPolicy::kDoNotRecurseNestedArrays);
-    testAllowedIndices({buildWildcardIndexEntry(BSON("$**" << 1), projExec.get(), "$**_1"),
+        {ProjectionPolicies::DefaultIdPolicy::kExcludeId,
+         ProjectionPolicies::ArrayRecursionPolicy::kDoNotRecurseNestedArrays});
+    testAllowedIndices({buildWildcardIndexEntry(BSON("$**" << 1), wcProj, "$**_1"),
                         buildSimpleIndexEntry(fromjson("{a: 1}"), "a_1"),
                         buildSimpleIndexEntry(fromjson("{a: 1, b: 1}"), "a_1_b_1"),
                         buildSimpleIndexEntry(fromjson("{a: 1, c: 1}"), "a_1_c_1")},
@@ -235,11 +248,11 @@ TEST(GetExecutorTest, GetAllowedWildcardIndicesByName) {
 }
 
 TEST(GetExecutorTest, GetAllowedPathSpecifiedWildcardIndicesByKey) {
-    auto projExec = ProjectionExecAgg::create(
+    auto wcProj = createProjectionExecutor(
         fromjson("{_id: 0}"),
-        ProjectionExecAgg::DefaultIdPolicy::kExcludeId,
-        ProjectionExecAgg::ArrayRecursionPolicy::kDoNotRecurseNestedArrays);
-    testAllowedIndices({buildWildcardIndexEntry(BSON("a.$**" << 1), projExec.get(), "a.$**_1"),
+        {ProjectionPolicies::DefaultIdPolicy::kExcludeId,
+         ProjectionPolicies::ArrayRecursionPolicy::kDoNotRecurseNestedArrays});
+    testAllowedIndices({buildWildcardIndexEntry(BSON("a.$**" << 1), wcProj, "a.$**_1"),
                         buildSimpleIndexEntry(fromjson("{a: 1}"), "a_1"),
                         buildSimpleIndexEntry(fromjson("{a: 1, b: 1}"), "a_1_b_1"),
                         buildSimpleIndexEntry(fromjson("{a: 1, c: 1}"), "a_1_c_1")},
@@ -249,11 +262,11 @@ TEST(GetExecutorTest, GetAllowedPathSpecifiedWildcardIndicesByKey) {
 }
 
 TEST(GetExecutorTest, GetAllowedPathSpecifiedWildcardIndicesByName) {
-    auto projExec = ProjectionExecAgg::create(
+    auto wcProj = createProjectionExecutor(
         fromjson("{_id: 0}"),
-        ProjectionExecAgg::DefaultIdPolicy::kExcludeId,
-        ProjectionExecAgg::ArrayRecursionPolicy::kDoNotRecurseNestedArrays);
-    testAllowedIndices({buildWildcardIndexEntry(BSON("a.$**" << 1), projExec.get(), "a.$**_1"),
+        {ProjectionPolicies::DefaultIdPolicy::kExcludeId,
+         ProjectionPolicies::ArrayRecursionPolicy::kDoNotRecurseNestedArrays});
+    testAllowedIndices({buildWildcardIndexEntry(BSON("a.$**" << 1), wcProj, "a.$**_1"),
                         buildSimpleIndexEntry(fromjson("{a: 1}"), "a_1"),
                         buildSimpleIndexEntry(fromjson("{a: 1, b: 1}"), "a_1_b_1"),
                         buildSimpleIndexEntry(fromjson("{a: 1, c: 1}"), "a_1_c_1")},

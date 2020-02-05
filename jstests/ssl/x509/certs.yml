@@ -324,6 +324,103 @@ certs:
   extensions: {basicConstraints: {CA: true}}
 
 ###
+# OCSP Tree
+###
+
+- name: 'ca_ocsp.pem'
+  description: >-
+    Primary Root Certificate Authority
+    Most Certificates are issued by this CA.
+  Subject: {CN: 'Kernel Test CA'}
+  Issuer: self
+  include_header: false
+  output_path: 'jstests/libs/ocsp/'
+  extensions:
+    basicConstraints:
+      critical: true
+      CA: true
+
+- name: 'server_ocsp.pem'
+  description: >-
+    OCSP certificate for the mongodb server.
+  Subject:
+    CN: 'localhost'
+    C: US
+    ST: NY
+    L: OCSP-1
+  Issuer: 'ca_ocsp.pem'
+  include_header: false
+  output_path: 'jstests/libs/ocsp/'
+  extensions:
+    basicConstraints: {CA: false}
+    subjectAltName:
+      DNS: localhost
+      IP: 127.0.0.1
+    authorityInfoAccess: 'OCSP;URI:http://localhost:8100/status/'
+    subjectKeyIdentifier: hash
+    keyUsage: [digitalSignature, keyEncipherment]
+    extendedKeyUsage: [serverAuth, clientAuth]
+
+- name: 'server_ocsp_mustStaple.pem'
+  description: >-
+    Must Staple OCSP certificate for the mongodb server.
+  Subject:
+    CN: 'localhost'
+    C: US
+    ST: NY
+    L: OCSP-1
+  Issuer: 'ca_ocsp.pem'
+  include_header: false
+  output_path: 'jstests/libs/ocsp/'
+  extensions:
+    basicConstraints: {CA: false}
+    subjectAltName:
+      DNS: localhost
+      IP: 127.0.0.1
+    authorityInfoAccess: 'OCSP;URI:http://localhost:8100/status/'
+    mustStaple: true
+    subjectKeyIdentifier: hash
+    keyUsage: [digitalSignature, keyEncipherment]
+    extendedKeyUsage: [serverAuth, clientAuth]
+
+- name: 'client_ocsp.pem'
+  description: >-
+    OCSP certificate for the mongodb client.
+  Subject:
+    CN: 'localhost'
+    C: US
+    ST: NY
+    L: OCSP-2
+  Issuer: 'ca_ocsp.pem'
+  include_header: false
+  output_path: 'jstests/libs/ocsp/'
+  extensions:
+    basicConstraints: {CA: false}
+    subjectAltName:
+      DNS: localhost
+      IP: 127.0.0.1
+    authorityInfoAccess: 'OCSP;URI:http://localhost:8100/status/'
+    subjectKeyIdentifier: hash
+    keyUsage: [digitalSignature, keyEncipherment]
+    extendedKeyUsage: [clientAuth]
+
+- name: 'ocsp_responder.crt'
+  description: Certificate and key for the OCSP responder
+  Subject:
+    CN: 'localhost'
+    C: US
+    ST: NY
+    L: OCSP-3
+  Issuer: 'ca_ocsp.pem'
+  include_header: false
+  keyfile: 'ocsp_responder.key'
+  output_path: 'jstests/libs/ocsp/'
+  extensions:
+    basicConstraints: {CA: false}
+    keyUsage: [nonRepudiation, digitalSignature, keyEncipherment]
+    extendedKeyUsage: [OCSPSigning]
+
+###
 # Rollover tree
 ###
 
@@ -441,6 +538,24 @@ certs:
   extensions:
     subjectAltName:
       DNS: ['localhost', '127.0.0.1']
+
+- name: 'trusted-client-testdb-roles.pem'
+  description: Client certificate with X509 role grants via trusted chain.
+  Subject: {OU: 'Kernel Users', CN: 'Trusted Kernel Test Client With Roles'}
+  Issuer: 'trusted-ca.pem'
+  output_path: 'jstests/ssl/x509/'
+  extensions:
+    mongoRoles:
+    - {role: role1, db: testDB}
+    - {role: role2, db: testDB}
+
+# Both ca.pem and trusted-ca.pem
+- name: 'root-and-trusted-ca.pem'
+  description: Combined ca.pem and trusted-ca.pem
+  output_path: 'jstests/ssl/x509/'
+  append_cert:
+  - 'ca.pem'
+  - 'trusted-ca.pem'
 
 ###
 # ECDSA tree

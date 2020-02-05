@@ -386,8 +386,17 @@ var ShardingTest = function(params) {
         }
     };
 
-    this.stop = function(opts) {
+    this.stop = function(opts = {}) {
         this.checkUUIDsConsistentAcrossCluster();
+        this.checkIndexesConsistentAcrossCluster();
+
+        if (jsTestOptions().alwaysUseLogFiles) {
+            if (opts.noCleanData === false) {
+                throw new Error("Always using log files, but received conflicting option.");
+            }
+
+            opts.noCleanData = true;
+        }
 
         this.stopAllMongos(opts);
 
@@ -411,7 +420,7 @@ var ShardingTest = function(params) {
             }
         }
 
-        if (!opts || !opts.noCleanData) {
+        if (!opts.noCleanData) {
             print("ShardingTest stop deleting all dbpaths");
             for (var i = 0; i < _alldbpaths.length; i++) {
                 resetDbpath(MongoRunner.dataPath + _alldbpaths[i]);
@@ -512,38 +521,21 @@ var ShardingTest = function(params) {
         print("ShardingTest " + out);
     };
 
-    this.sync = function() {
-        this.adminCommand("connpoolsync");
+    /**
+     * Returns the number of shards which contain the given dbName.collName collection
+     */
+    this.onNumShards = function(dbName, collName) {
+        return this.shardCounts(dbName, collName)
+            .reduce((total, currentValue) => total + (currentValue > 0 ? 1 : 0), 0);
     };
 
-    this.onNumShards = function(collName, dbName) {
-        dbName = dbName || "test";
-
-        // We should sync since we're going directly to mongod here
-        this.sync();
-
-        var num = 0;
-        for (var i = 0; i < this._connections.length; i++) {
-            if (this._connections[i].getDB(dbName).getCollection(collName).count() > 0) {
-                num++;
-            }
-        }
-
-        return num;
-    };
-
-    this.shardCounts = function(collName, dbName) {
-        dbName = dbName || "test";
-
-        // We should sync since we're going directly to mongod here
-        this.sync();
-
-        var counts = {};
-        for (var i = 0; i < this._connections.length; i++) {
-            counts[i] = this._connections[i].getDB(dbName).getCollection(collName).count();
-        }
-
-        return counts;
+    /**
+     * Returns an array of the size of numShards where each element is the number of documents on
+     * that particular shard
+     */
+    this.shardCounts = function(dbName, collName) {
+        return this._connections.map((connection) =>
+                                         connection.getDB(dbName).getCollection(collName).count());
     };
 
     this.chunkCounts = function(collName, dbName) {
@@ -977,7 +969,7 @@ var ShardingTest = function(params) {
      *     otherParams.configOptions.binVersion, otherParams.shardOptions.binVersion,
      *     otherParams.mongosOptions.binVersion
      */
-    function _isMixedVersionCluster() {
+    this.isMixedVersionCluster = function() {
         var lastStableBinVersion = MongoRunner.getBinVersionFor('last-stable');
 
         // Must check shardMixedBinVersion because it causes shardOptions.binVersion to be an object
@@ -1039,7 +1031,14 @@ var ShardingTest = function(params) {
         }
 
         return false;
-    }
+    };
+
+    /**
+     * Runs a find on the namespace to force a refresh of the node's catalog cache.
+     */
+    this.refreshCatalogCacheForNs = function(node, ns) {
+        node.getCollection(ns).findOne();
+    };
 
     /**
      * Returns if there is a new feature compatibility version for the "latest" version. This must
@@ -1047,6 +1046,21 @@ var ShardingTest = function(params) {
      */
     function _hasNewFeatureCompatibilityVersion() {
         return true;
+    }
+
+    /**
+     * Returns the total number of mongod nodes across all shards, excluding config server nodes.
+     * Used only for diagnostic logging.
+     */
+    function totalNumShardNodes(shardsAsReplSets) {
+        // Standalone mongod shards.
+        if (!shardsAsReplSets) {
+            return self._connections.length;
+        }
+
+        // Replica set shards.
+        const numNodesPerReplSet = self._rs.map(r => r.test.nodes.length);
+        return numNodesPerReplSet.reduce((a, b) => a + b, 0);
     }
 
     // ShardingTest initialization
@@ -1135,7 +1149,7 @@ var ShardingTest = function(params) {
             jsTestOptions().networkMessageCompressors;
     }
 
-    var keyFile = otherParams.keyFile;
+    this.keyFile = otherParams.keyFile;
     var hostName = otherParams.host === undefined ? getHostName() : otherParams.host;
 
     this._testName = testName;
@@ -1208,10 +1222,15 @@ var ShardingTest = function(params) {
         randomSeedAlreadySet = true;
     }
 
-    // Start the MongoD servers (shards)
+    // Should we start up shards as replica sets.
+    const shardsAsReplSets = (otherParams.rs || otherParams["rs" + i] || startShardsAsRS);
+
+    //
+    // Start each shard replica set or standalone mongod.
+    //
     let startTime = new Date();  // Measure the execution time of startup and initiate.
     for (var i = 0; i < numShards; i++) {
-        if (otherParams.rs || otherParams["rs" + i] || startShardsAsRS) {
+        if (shardsAsReplSets) {
             var setName = testName + "-rs" + i;
 
             var rsDefaults = {
@@ -1283,7 +1302,7 @@ var ShardingTest = function(params) {
                 useHostName: otherParams.useHostname,
                 useBridge: otherParams.useBridge,
                 bridgeOptions: otherParams.bridgeOptions,
-                keyFile: keyFile,
+                keyFile: this.keyFile,
                 protocolVersion: protocolVersion,
                 waitForKeys: false,
                 settings: rsSettings,
@@ -1291,31 +1310,18 @@ var ShardingTest = function(params) {
             });
 
             print("ShardingTest starting replica set for shard: " + setName);
+
+            // Start up the replica set but don't wait for it to complete. This allows the startup
+            // of each shard to proceed in parallel.
             this._rs[i] =
-                {setName: setName, test: rs, nodes: rs.startSet(rsDefaults), url: rs.getURL()};
-
-            // ReplSetTest.initiate() requires all nodes to be to be authorized to run
-            // replSetGetStatus.
-            // TODO(SERVER-14017): Remove this in favor of using initiate() everywhere.
-            print("ShardingTest initiating replica set for shard: " + setName);
-            rs.initiateWithAnyNodeAsPrimary();
-
-            this["rs" + i] = rs;
-            this._rsObjects[i] = rs;
-
-            _alldbpaths.push(null);
-            this._connections.push(null);
-
-            if (otherParams.useBridge) {
-                unbridgedConnections.push(null);
-            }
+                {setName: setName, test: rs, nodes: rs.startSetAsync(rsDefaults), url: rs.getURL()};
         } else {
             var options = {
                 useHostname: otherParams.useHostname,
                 pathOpts: Object.merge(pathOpts, {shard: i}),
                 dbpath: "$testName$shard",
                 shardsvr: '',
-                keyFile: keyFile
+                keyFile: this.keyFile
             };
 
             options.setParameter = options.setParameter || {};
@@ -1382,34 +1388,9 @@ var ShardingTest = function(params) {
         }
     }
 
-    // Do replication on replica sets if required
-    for (var i = 0; i < numShards; i++) {
-        if (!otherParams.rs && !otherParams["rs" + i] && !startShardsAsRS) {
-            continue;
-        }
-
-        var rs = this._rs[i].test;
-        rs.getPrimary().getDB("admin").foo.save({x: 1});
-
-        if (keyFile) {
-            authutil.asCluster(rs.nodes, keyFile, function() {
-                rs.awaitReplication();
-            });
-        }
-
-        rs.awaitSecondaryNodes();
-
-        var rsConn = new Mongo(rs.getURL());
-        rsConn.name = rs.getURL();
-
-        this._connections[i] = rsConn;
-        this["shard" + i] = rsConn;
-        rsConn.rs = rs;
-    }
-
-    print("ShardingTest startup and initiation for all shards took " + (new Date() - startTime) +
-          "ms for " + numShards + " shards.");
-
+    //
+    // Start up the config server replica set.
+    //
     this._configServers = [];
 
     // Using replica set for config servers
@@ -1418,7 +1399,7 @@ var ShardingTest = function(params) {
         host: hostName,
         useBridge: otherParams.useBridge,
         bridgeOptions: otherParams.bridgeOptions,
-        keyFile: keyFile,
+        keyFile: this.keyFile,
         waitForKeys: false,
         name: testName + "-configRS",
         seedRandomNumberGenerator: !randomSeedAlreadySet,
@@ -1449,15 +1430,82 @@ var ShardingTest = function(params) {
 
     rstOptions.nodes = nodeOptions;
 
-    startTime = new Date();  // Measure the execution time of config server startup and initiate.
-
-    // Start the config server's replica set
+    // Start the config server's replica set without waiting for it to complete. This allows it
+    // to proceed in parallel with the startup of each shard.
     this.configRS = new ReplSetTest(rstOptions);
-    this.configRS.startSet(startOptions);
+    this.configRS.startSetAsync(startOptions);
 
+    //
+    // Wait for each shard replica set to finish starting up.
+    //
+    if (shardsAsReplSets) {
+        for (let i = 0; i < numShards; i++) {
+            print("Waiting for shard " + this._rs[i].setName + " to finish starting up.");
+            this._rs[i].test.startSetAwait();
+        }
+    }
+
+    //
+    // Wait for the config server to finish starting up.
+    //
+    print("Waiting for the config server to finish starting up.");
+    this.configRS.startSetAwait();
     var config = this.configRS.getReplSetConfig();
     config.configsvr = true;
     config.settings = config.settings || {};
+
+    print("ShardingTest startup for all nodes took " + (new Date() - startTime) + "ms with " +
+          this.configRS.nodeList().length + " config server nodes and " +
+          totalNumShardNodes(shardsAsReplSets) + " total shard nodes.");
+
+    //
+    // Initiate each shard replica set.
+    //
+    if (shardsAsReplSets) {
+        for (var i = 0; i < numShards; i++) {
+            print("ShardingTest initiating replica set for shard: " + this._rs[i].setName);
+
+            // ReplSetTest.initiate() requires all nodes to be to be authorized to run
+            // replSetGetStatus.
+            // TODO(SERVER-14017): Remove this in favor of using initiate() everywhere.
+            this._rs[i].test.initiateWithAnyNodeAsPrimary();
+
+            this["rs" + i] = this._rs[i].test;
+            this._rsObjects[i] = this._rs[i].test;
+
+            _alldbpaths.push(null);
+            this._connections.push(null);
+
+            if (otherParams.useBridge) {
+                unbridgedConnections.push(null);
+            }
+        }
+    }
+
+    // Do replication on replica sets if required
+    for (var i = 0; i < numShards; i++) {
+        if (!shardsAsReplSets) {
+            continue;
+        }
+
+        var rs = this._rs[i].test;
+        rs.getPrimary().getDB("admin").foo.save({x: 1});
+
+        if (this.keyFile) {
+            authutil.asCluster(rs.nodes, this.keyFile, function() {
+                rs.awaitReplication();
+            });
+        }
+
+        rs.awaitSecondaryNodes();
+
+        var rsConn = new Mongo(rs.getURL());
+        rsConn.name = rs.getURL();
+
+        this._connections[i] = rsConn;
+        this["shard" + i] = rsConn;
+        rsConn.rs = rs;
+    }
 
     // ReplSetTest.initiate() requires all nodes to be to be authorized to run replSetGetStatus.
     // TODO(SERVER-14017): Remove this in favor of using initiate() everywhere.
@@ -1466,8 +1514,9 @@ var ShardingTest = function(params) {
     // Wait for master to be elected before starting mongos
     var csrsPrimary = this.configRS.getPrimary();
 
-    print("ShardingTest startup and initiation for the config server took " +
-          (new Date() - startTime) + "ms with " + this.configRS.nodeList().length + " nodes.");
+    print("ShardingTest startup and initiation for all nodes took " + (new Date() - startTime) +
+          "ms with " + this.configRS.nodeList().length + " config server nodes and " +
+          totalNumShardNodes(shardsAsReplSets) + " total shard nodes.");
 
     // If 'otherParams.mongosOptions.binVersion' is an array value, then we'll end up constructing a
     // version iterator.
@@ -1477,7 +1526,7 @@ var ShardingTest = function(params) {
             useHostname: otherParams.useHostname,
             pathOpts: Object.merge(pathOpts, {mongos: i}),
             verbose: mongosVerboseLevel,
-            keyFile: keyFile,
+            keyFile: this.keyFile,
         };
 
         if (otherParams.mongosOptions && otherParams.mongosOptions.binVersion) {
@@ -1494,7 +1543,7 @@ var ShardingTest = function(params) {
     }
 
     const configRS = this.configRS;
-    if (_hasNewFeatureCompatibilityVersion() && _isMixedVersionCluster()) {
+    if (_hasNewFeatureCompatibilityVersion() && this.isMixedVersionCluster()) {
         function setFeatureCompatibilityVersion() {
             assert.commandWorked(
                 csrsPrimary.adminCommand({setFeatureCompatibilityVersion: lastStableFCV}));
@@ -1504,8 +1553,8 @@ var ShardingTest = function(params) {
             configRS.awaitReplication();
         }
 
-        if (keyFile) {
-            authutil.asCluster(this.configRS.nodes, keyFile, setFeatureCompatibilityVersion);
+        if (this.keyFile) {
+            authutil.asCluster(this.configRS.nodes, this.keyFile, setFeatureCompatibilityVersion);
         } else {
             setFeatureCompatibilityVersion();
         }
@@ -1522,8 +1571,8 @@ var ShardingTest = function(params) {
             configRS.awaitLastOpCommitted();
         }
 
-        if (keyFile) {
-            authutil.asCluster(csrsPrimary, keyFile, setChunkSize);
+        if (this.keyFile) {
+            authutil.asCluster(csrsPrimary, this.keyFile, setChunkSize);
         } else {
             setChunkSize();
         }
@@ -1595,8 +1644,8 @@ var ShardingTest = function(params) {
 
     // If auth is enabled for the test, login the mongos connections as system in order to configure
     // the instances and then log them out again.
-    if (keyFile) {
-        authutil.asCluster(this._mongos, keyFile, _configureCluster);
+    if (this.keyFile) {
+        authutil.asCluster(this._mongos, this.keyFile, _configureCluster);
     } else if (mongosOptions[0] && mongosOptions[0].keyFile) {
         authutil.asCluster(this._mongos, mongosOptions[0].keyFile, _configureCluster);
     } else {
@@ -1655,12 +1704,41 @@ var ShardingTest = function(params) {
              MongoRunner.getBinVersionFor(otherParams.configOptions.binVersion)))) {
         this.configRS.getPrimary().getDB("admin").runCommand({refreshLogicalSessionCacheNow: 1});
 
-        for (let i = 0; i < numShards; i++) {
-            if (otherParams.rs || otherParams["rs" + i] || startShardsAsRS) {
-                const rs = this._rs[i].test;
-                rs.getPrimary().getDB("admin").runCommand({_flushRoutingTableCacheUpdatesCmd: 1});
+        const x509AuthRequired = (mongosOptions[0] && mongosOptions[0].clusterAuthMode &&
+                                  mongosOptions[0].clusterAuthMode === "x509");
+
+        // Flushes the routing table cache on connection 'conn'. If 'keyFileLocal' is defined,
+        // authenticates the keyfile user on 'authConn' - a connection or set of connections for
+        // the shard - before executing the flush.
+        const flushRT = function flushRoutingTableAndHandleAuth(conn, authConn, keyFileLocal) {
+            // Invokes the actual execution of cache refresh.
+            const execFlushRT = (conn) => {
+                assert.commandWorked(conn.getDB("admin").runCommand(
+                    {_flushRoutingTableCacheUpdates: "config.system.sessions"}));
+            };
+
+            if (keyFileLocal) {
+                authutil.asCluster(authConn, keyFileLocal, () => execFlushRT(conn));
             } else {
-                this["shard" + i].getDB("admin").runCommand({_flushRoutingTableCacheUpdatesCmd: 1});
+                execFlushRT(conn);
+            }
+        };
+
+        // TODO SERVER-45108: Enable support for x509 auth for _flushRoutingTableCacheUpdates.
+        if (!otherParams.manualAddShard && !x509AuthRequired) {
+            for (let i = 0; i < numShards; i++) {
+                const keyFileLocal =
+                    (otherParams.shards && otherParams.shards[i] && otherParams.shards[i].keyFile)
+                    ? otherParams.shards[i].keyFile
+                    : this.keyFile;
+
+                if (otherParams.rs || otherParams["rs" + i] || startShardsAsRS) {
+                    const rs = this._rs[i].test;
+                    flushRT(rs.getPrimary(), rs.nodes, keyFileLocal);
+                } else {
+                    // If specified, use the keyFile for the standalone shard.
+                    flushRT(this["shard" + i], this["shard" + i], keyFileLocal);
+                }
             }
         }
     }
@@ -1669,3 +1747,6 @@ var ShardingTest = function(params) {
 // Stub for a hook to check that collection UUIDs are consistent across shards and the config
 // server.
 ShardingTest.prototype.checkUUIDsConsistentAcrossCluster = function() {};
+
+// Stub for a hook to check that indexes are consistent across shards.
+ShardingTest.prototype.checkIndexesConsistentAcrossCluster = function() {};

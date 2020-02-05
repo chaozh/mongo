@@ -223,8 +223,8 @@ StorageInterfaceImpl::createCollectionForBulkLoading(
         UnreplicatedWritesBlock uwb(opCtx.get());
 
         // Get locks and create the collection.
-        AutoGetOrCreateDb db(opCtx.get(), nss.db(), MODE_X);
-        AutoGetCollection coll(opCtx.get(), nss, fixLockModeForSystemDotViewsChanges(nss, MODE_IX));
+        AutoGetOrCreateDb db(opCtx.get(), nss.db(), MODE_IX);
+        AutoGetCollection coll(opCtx.get(), nss, fixLockModeForSystemDotViewsChanges(nss, MODE_X));
 
         if (coll.getCollection()) {
             return Status(ErrorCodes::NamespaceExists,
@@ -420,30 +420,37 @@ Status StorageInterfaceImpl::createOplog(OperationContext* opCtx, const Namespac
 
 StatusWith<size_t> StorageInterfaceImpl::getOplogMaxSize(OperationContext* opCtx,
                                                          const NamespaceString& nss) {
-    AutoGetCollectionForReadCommand autoColl(opCtx, nss);
-    auto collectionResult = getCollection(autoColl, nss, "Your oplog doesn't exist.");
-    if (!collectionResult.isOK()) {
-        return collectionResult.getStatus();
-    }
+    // This writeConflictRetry loop protects callers from WriteConflictExceptions thrown by the
+    // storage engine running out of cache space, despite this operation not performing any writes.
+    return writeConflictRetry(
+        opCtx, "StorageInterfaceImpl::getOplogMaxSize", nss.ns(), [&]() -> StatusWith<size_t> {
+            AutoGetCollectionForReadCommand autoColl(opCtx, nss);
+            auto collectionResult = getCollection(autoColl, nss, "Your oplog doesn't exist.");
+            if (!collectionResult.isOK()) {
+                return collectionResult.getStatus();
+            }
 
-    const auto options = DurableCatalog::get(opCtx)->getCollectionOptions(opCtx, nss);
-    if (!options.capped)
-        return {ErrorCodes::BadValue, str::stream() << nss.ns() << " isn't capped"};
+            const auto options = DurableCatalog::get(opCtx)->getCollectionOptions(
+                opCtx, collectionResult.getValue()->getCatalogId());
+            if (!options.capped)
+                return {ErrorCodes::BadValue, str::stream() << nss.ns() << " isn't capped"};
 
-    return options.cappedSize;
+            return options.cappedSize;
+        });
 }
 
 Status StorageInterfaceImpl::createCollection(OperationContext* opCtx,
                                               const NamespaceString& nss,
                                               const CollectionOptions& options) {
     return writeConflictRetry(opCtx, "StorageInterfaceImpl::createCollection", nss.ns(), [&] {
-        AutoGetOrCreateDb databaseWriteGuard(opCtx, nss.db(), MODE_X);
+        AutoGetOrCreateDb databaseWriteGuard(opCtx, nss.db(), MODE_IX);
         auto db = databaseWriteGuard.getDb();
         invariant(db);
-        if (CollectionCatalog::get(opCtx).lookupCollectionByNamespace(nss)) {
+        if (CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, nss)) {
             return Status(ErrorCodes::NamespaceExists,
                           str::stream() << "Collection " << nss.ns() << " already exists.");
         }
+        Lock::CollectionLock lk(opCtx, nss, MODE_IX);
         WriteUnitOfWork wuow(opCtx);
         try {
             auto coll = db->createCollection(opCtx, nss, options);
@@ -863,8 +870,8 @@ Status _updateWithQuery(OperationContext* opCtx,
             uassertStatusOK(opCtx->recoveryUnit()->setTimestamp(ts));
         }
 
-        auto planExecutorResult =
-            mongo::getExecutorUpdate(opCtx, nullptr, collection, &parsedUpdate);
+        auto planExecutorResult = mongo::getExecutorUpdate(
+            opCtx, nullptr, collection, &parsedUpdate, boost::none /* verbosity */);
         if (!planExecutorResult.isOK()) {
             return planExecutorResult.getStatus();
         }
@@ -992,8 +999,8 @@ Status StorageInterfaceImpl::deleteByFilter(OperationContext* opCtx,
         }
         auto collection = collectionResult.getValue();
 
-        auto planExecutorResult =
-            mongo::getExecutorDelete(opCtx, nullptr, collection, &parsedDelete);
+        auto planExecutorResult = mongo::getExecutorDelete(
+            opCtx, nullptr, collection, &parsedDelete, boost::none /* verbosity */);
         if (!planExecutorResult.isOK()) {
             return planExecutorResult.getStatus();
         }
@@ -1110,12 +1117,12 @@ Status StorageInterfaceImpl::isAdminDbValid(OperationContext* opCtx) {
     }
 
     Collection* const usersCollection = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(
-        AuthorizationManager::usersCollectionNamespace);
+        opCtx, AuthorizationManager::usersCollectionNamespace);
     const bool hasUsers =
         usersCollection && !Helpers::findOne(opCtx, usersCollection, BSONObj(), false).isNull();
     Collection* const adminVersionCollection =
         CollectionCatalog::get(opCtx).lookupCollectionByNamespace(
-            AuthorizationManager::versionCollectionNamespace);
+            opCtx, AuthorizationManager::versionCollectionNamespace);
     BSONObj authSchemaVersionDocument;
     if (!adminVersionCollection ||
         !Helpers::findOne(opCtx,

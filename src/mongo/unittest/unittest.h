@@ -316,7 +316,8 @@
     class TEST_TYPE : public TEST_BASE {                                                       \
     private:                                                                                   \
         void _doTest() override;                                                               \
-        static inline const RegistrationAgent<TEST_TYPE> _agent{#FIXTURE_NAME, #TEST_NAME};    \
+        static inline const RegistrationAgent<TEST_TYPE> _agent{                               \
+            #FIXTURE_NAME, #TEST_NAME, __FILE__};                                              \
     };                                                                                         \
     void TEST_TYPE::_doTest()
 
@@ -351,6 +352,7 @@ class Suite : public std::enable_shared_from_this<Suite> {
 private:
     struct SuiteTest {
         std::string name;
+        std::string fileName;
         std::function<void()> fn;
     };
 
@@ -363,12 +365,15 @@ public:
     Suite(const Suite&) = delete;
     Suite& operator=(const Suite&) = delete;
 
-    void add(std::string name, std::function<void()> testFn);
+    void add(std::string name, std::string fileName, std::function<void()> testFn);
 
-    std::unique_ptr<Result> run(const std::string& filter, int runsPerTest);
+    std::unique_ptr<Result> run(const std::string& filter,
+                                const std::string& fileNameFilter,
+                                int runsPerTest);
 
     static int run(const std::vector<std::string>& suites,
                    const std::string& filter,
+                   const std::string& fileNameFilter,
                    int runsPerTest);
 
     /**
@@ -377,9 +382,14 @@ public:
      *
      * Safe to call during static initialization.
      */
-    static Suite& getSuite(const std::string& name);
+    static Suite& getSuite(StringData name);
 
 private:
+    /** Points to the string data of the _name field. */
+    StringData key() const {
+        return _name;
+    }
+
     std::string _name;
     std::vector<SuiteTest> _tests;
 };
@@ -469,7 +479,7 @@ struct OldStyleSuiteInitializer {
         log() << "\t done setupTests" << std::endl;
         auto& suite = Suite::getSuite(suiteSpec.name());
         for (auto&& t : suiteSpec.tests()) {
-            suite.add(t.name, t.fn);
+            suite.add(t.name, "", t.fn);
         }
     }
 };
@@ -505,22 +515,33 @@ protected:
     template <typename T>
     class RegistrationAgent {
     public:
-        RegistrationAgent(std::string suiteName, std::string testName)
-            : _suiteName(std::move(suiteName)), _testName(std::move(testName)) {
-            Suite::getSuite(_suiteName).add(_testName, [] { T{}.run(); });
+        /**
+         * These StringData must point to data that outlives this RegistrationAgent.
+         * In the case of TEST/TEST_F, these are string literals.
+         */
+        RegistrationAgent(StringData suiteName, StringData testName, StringData fileName)
+            : _suiteName{suiteName}, _testName{testName}, _fileName{fileName} {
+            Suite::getSuite(_suiteName).add(std::string{_testName}, std::string{_fileName}, [] {
+                T{}.run();
+            });
         }
 
-        const std::string& getSuiteName() const {
+        StringData getSuiteName() const {
             return _suiteName;
         }
 
-        const std::string& getTestName() const {
+        StringData getTestName() const {
             return _testName;
         }
 
+        StringData getFileName() const {
+            return _fileName;
+        }
+
     private:
-        std::string _suiteName;
-        std::string _testName;
+        StringData _suiteName;
+        StringData _testName;
+        StringData _fileName;
     };
 
     /**
@@ -548,19 +569,17 @@ protected:
      * Gets a vector of strings, one log line per string, captured since
      * the last call to startCapturingLogMessages() in this test.
      */
-    const std::vector<std::string>& getCapturedLogMessages() const {
-        return _capturedLogMessages;
-    }
+    const std::vector<std::string>& getCapturedTextFormatLogMessages() const;
 
     /**
      * Returns the number of collected log lines containing "needle".
      */
-    int64_t countLogLinesContaining(const std::string& needle);
+    int64_t countTextFormatLogLinesContaining(const std::string& needle);
 
     /**
      * Prints the captured log lines.
      */
-    void printCapturedLogLines() const;
+    void printCapturedTextFormatLogLines() const;
 
 private:
     /**
@@ -568,10 +587,9 @@ private:
      */
     virtual void _doTest() = 0;
 
-    bool _isCapturingLogMessages;
-    std::vector<std::string> _capturedLogMessages;
-    logger::MessageLogDomain::AppenderHandle _captureAppenderHandle;
-    std::unique_ptr<logger::MessageLogDomain::EventAppender> _captureAppender;
+
+    class CaptureLogs;
+    std::unique_ptr<CaptureLogs> _captureLogs;
 };
 
 /**

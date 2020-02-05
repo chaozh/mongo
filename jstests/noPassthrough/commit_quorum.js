@@ -5,7 +5,6 @@
  */
 (function() {
 load("jstests/noPassthrough/libs/index_build.js");
-load("jstests/libs/check_log.js");
 
 const replSet = new ReplSetTest({
     nodes: [
@@ -35,6 +34,9 @@ for (let i = 0; i < numDocs; i++) {
 assert.commandWorked(bulk.execute());
 
 const collName = "createIndexes";
+// This test depends on using the IndexBuildsCoordinator to build this index, which as of
+// SERVER-44405, will not occur in this test unless the collection is created beforehand.
+assert.commandWorked(testDB.runCommand({create: collName}));
 
 // Use createIndex(es) to build indexes and check the commit quorum.
 let res = assert.commandWorked(testDB[collName].createIndex({x: 1}));

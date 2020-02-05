@@ -31,6 +31,7 @@
 
 #include "mongo/db/repl/repl_set_config_checks.h"
 
+#include <algorithm>
 #include <iterator>
 
 #include "mongo/db/repl/repl_set_config.h"
@@ -62,7 +63,8 @@ StatusWith<int> findSelfInConfig(ReplicationCoordinatorExternalState* externalSt
     }
     if (meConfigs.empty()) {
         return StatusWith<int>(ErrorCodes::NodeNotFound,
-                               str::stream() << "No host described in new configuration "
+                               str::stream() << "No host described in new configuration with term "
+                                             << newConfig.getConfigTerm() << " and version "
                                              << newConfig.getConfigVersion() << " for replica set "
                                              << newConfig.getReplSetName() << " maps to this node");
     }
@@ -73,9 +75,9 @@ StatusWith<int> findSelfInConfig(ReplicationCoordinatorExternalState* externalSt
             message << ", " << meConfigs[i]->getHostAndPort().toString();
         }
         message << " and " << meConfigs.back()->getHostAndPort().toString()
-                << " all map to this node in new configuration version "
-                << newConfig.getConfigVersion() << " for replica set "
-                << newConfig.getReplSetName();
+                << " all map to this node in new configuration with term "
+                << newConfig.getConfigTerm() << " and version " << newConfig.getConfigVersion()
+                << " for replica set " << newConfig.getReplSetName();
         return StatusWith<int>(ErrorCodes::InvalidReplicaSetConfig, message);
     }
 
@@ -94,7 +96,8 @@ Status checkElectable(const ReplSetConfig& newConfig, int configIndex) {
         return Status(ErrorCodes::NodeNotElectable,
                       str::stream() << "This node, " << myConfig.getHostAndPort().toString()
                                     << ", with _id " << myConfig.getId()
-                                    << " is not electable under the new configuration version "
+                                    << " is not electable under the new configuration with term "
+                                    << newConfig.getConfigTerm() << " and version "
                                     << newConfig.getConfigVersion() << " for replica set "
                                     << newConfig.getReplSetName());
     }
@@ -132,6 +135,50 @@ Status validateArbiterPriorities(const ReplSetConfig& config) {
                                         << " is an arbiter but has priority " << iter->getPriority()
                                         << ". Arbiter priority must be 0.");
         }
+    }
+    return Status::OK();
+}
+
+/**
+ * Compares two initialized and validated replica set configurations and checks to see if the
+ * transition from 'oldConfig' to 'newConfig' adds or removes at most 1 voting node.
+ *
+ * Assumes that the member id uniquely identifies a logical replica set node. We use the set of
+ * member ids in the old and new config to determine the safety of the single node change.
+ */
+Status validateSingleNodeChange(const ReplSetConfig& oldConfig, const ReplSetConfig& newConfig) {
+    // Add MemberId of voting nodes from each config into respective sets.
+    std::set<MemberId> oldIdSet, newIdSet;
+    for (MemberConfig m : oldConfig.votingMembers()) {
+        oldIdSet.insert(m.getId());
+    }
+    for (MemberConfig m : newConfig.votingMembers()) {
+        newIdSet.insert(m.getId());
+    }
+
+    //
+    // The symmetric difference between the id sets of each config is the set of ids that are
+    // present in either set but not in their intersection. A set X can be transformed into set Y
+    // with 1 addition or removal operation if and only if their symmetric difference is equal to 1.
+    // If the symmetric difference is 1, there are two possibilities:
+    //
+    // (1) There is exactly 1 element e in Y that does not appear in X. In this case we can
+    // transform X to Y by adding the element e to X.
+    //
+    // (2) There is exactly 1 element in X that does not appear in Y. In this case we can transform
+    // X to Y by removing the element e from X.
+    //
+
+    // The symmetric difference can't be larger than the union of both sets.
+    std::vector<MemberId> symmDiff(oldIdSet.size() + newIdSet.size());
+    auto diffEndIt = std::set_symmetric_difference(
+        oldIdSet.begin(), oldIdSet.end(), newIdSet.begin(), newIdSet.end(), symmDiff.begin());
+    auto symmDiffSize = std::distance(symmDiff.begin(), diffEndIt);
+
+    if (symmDiffSize > 1) {
+        return Status(ErrorCodes::InvalidReplicaSetConfig,
+                      str::stream() << "Non force replica set reconfig can only add or remove at "
+                                       "most 1 voting member.");
     }
     return Status::OK();
 }
@@ -278,6 +325,13 @@ StatusWith<int> validateConfigForInitiate(ReplicationCoordinatorExternalState* e
                                              << " have version 1, but found "
                                              << newConfig.getConfigVersion());
     }
+
+    if (newConfig.getConfigTerm() != OpTime::kInitialTerm) {
+        return StatusWith<int>(
+            ErrorCodes::NewReplicaSetConfigurationIncompatible,
+            str::stream() << "Configuration used to initiate a replica set must have term "
+                          << OpTime::kInitialTerm << ", but found " << newConfig.getConfigTerm());
+    }
     return findSelfInConfigIfElectable(externalState, newConfig, ctx);
 }
 
@@ -300,6 +354,15 @@ StatusWith<int> validateConfigForReconfig(ReplicationCoordinatorExternalState* e
     status = validateOldAndNewConfigsCompatible(oldConfig, newConfig);
     if (!status.isOK()) {
         return StatusWith<int>(status);
+    }
+
+    // For non-force reconfigs, verify that the reconfig only adds or removes a single node. This
+    // ensures that all quorums of the new config overlap with all quorums of the old config.
+    if (!force) {
+        status = validateSingleNodeChange(oldConfig, newConfig);
+        if (!status.isOK()) {
+            return StatusWith<int>(status);
+        }
     }
 
     status = validateArbiterPriorities(newConfig);

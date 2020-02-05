@@ -38,6 +38,7 @@
 #include "mongo/db/write_concern_options.h"
 #include "mongo/platform/mutex.h"
 #include "mongo/util/concurrency/with_lock.h"
+#include "mongo/util/read_through_cache.h"
 
 namespace mongo {
 
@@ -52,14 +53,29 @@ public:
     using ReadConcern = repl::ReadConcernArgs;
     using WriteConcern = WriteConcernOptions;
 
+    using FetchDefaultsFn = std::function<boost::optional<RWConcernDefault>(OperationContext*)>;
+
     static constexpr StringData readConcernFieldName = ReadConcern::kReadConcernFieldName;
     static constexpr StringData writeConcernFieldName = WriteConcern::kWriteConcernField;
 
-    static ReadWriteConcernDefaults& get(ServiceContext* service);
-    static ReadWriteConcernDefaults& get(ServiceContext& service);
+    // The _id of the persisted default read/write concern document.
+    static constexpr StringData kPersistedDocumentId = "ReadWriteConcernDefaults"_sd;
 
-    ReadWriteConcernDefaults() = default;
-    ~ReadWriteConcernDefaults() = default;
+    static ReadWriteConcernDefaults& get(ServiceContext* service);
+    static ReadWriteConcernDefaults& get(OperationContext* opCtx);
+    static void create(ServiceContext* service, FetchDefaultsFn fetchDefaultsFn);
+
+    ReadWriteConcernDefaults(FetchDefaultsFn fetchDefaultsFn);
+    ~ReadWriteConcernDefaults();
+
+    /**
+     * Syntactic sugar around 'getDefault' below. A return value of boost::none means that there is
+     * no default specified for that particular concern.
+     */
+    boost::optional<ReadConcern> getDefaultReadConcern(OperationContext* opCtx);
+    boost::optional<WriteConcern> getDefaultWriteConcern(OperationContext* opCtx);
+
+    RWConcernDefault getDefault(OperationContext* opCtx);
 
     /**
      * Returns true if the RC level is permissible to use as a default, and false if it cannot be a
@@ -74,13 +90,24 @@ public:
     static void checkSuitabilityAsDefault(const WriteConcern& wc);
 
     /**
-     * Interface when an admin has run the command to change the defaults.
+     * Examines a document key affected by a write to config.settings and will register a WUOW
+     * onCommit handler that invalidates this cache when the operation commits if the write affects
+     * the read/write concern defaults document.
+     */
+    void observeDirectWriteToConfigSettings(OperationContext* opCtx,
+                                            BSONElement idElem,
+                                            boost::optional<BSONObj> newDoc);
+
+    /**
+     * Generates a new read and write concern default to be persisted on disk, without updating the
+     * cached value.
      * At least one of the `rc` or `wc` params must be set.
      * Will generate and use a new epoch and setTime for the updated defaults, which are returned.
+     * Validates the supplied read and write concerns can serve as defaults.
      */
-    RWConcernDefault setConcerns(OperationContext* opCtx,
-                                 const boost::optional<ReadConcern>& rc,
-                                 const boost::optional<WriteConcern>& wc);
+    RWConcernDefault generateNewConcerns(OperationContext* opCtx,
+                                         const boost::optional<ReadConcern>& rc,
+                                         const boost::optional<WriteConcern>& wc);
 
     /**
      * Invalidates the cached RWC defaults, causing them to be refreshed.
@@ -92,20 +119,39 @@ public:
      */
     void invalidate();
 
-    RWConcernDefault getDefault() const;
-    boost::optional<ReadConcern> getDefaultReadConcern() const;
-    boost::optional<WriteConcern> getDefaultWriteConcern() const;
+    /**
+     * Manually looks up the latest defaults, and if their epoch is more recent than the cached
+     * defaults or indicates there are no defaults, then update the cache with the new defaults.
+     */
+    void refreshIfNecessary(OperationContext* opCtx);
+
+    /**
+     * Sets the given read write concern as the defaults in the cache.
+     */
+    void setDefault(RWConcernDefault&& rwc);
 
 private:
-    enum Type { kReadWriteConcernEntry };
+    enum class Type { kReadWriteConcernEntry };
 
-    void _setDefault(WithLock, RWConcernDefault&& rwc);
-    boost::optional<RWConcernDefault> _getDefault(WithLock) const;
+    boost::optional<RWConcernDefault> _getDefault(OperationContext* opCtx);
 
-    // Protects access to the private members below.
-    mutable Mutex _mutex = MONGO_MAKE_LATCH("ReadWriteConcernDefaults::_mutex");
+    class Cache : public ReadThroughCache<Type, RWConcernDefault> {
+        Cache(const Cache&) = delete;
+        Cache& operator=(const Cache&) = delete;
 
-    std::map<Type, RWConcernDefault> _defaults;
+    public:
+        Cache(LookupFn lookupFn);
+        virtual ~Cache() = default;
+
+        boost::optional<RWConcernDefault> lookup(OperationContext* opCtx, const Type& key) override;
+
+    private:
+        Mutex _mutex = MONGO_MAKE_LATCH("ReadWriteConcernDefaults::Cache");
+
+        LookupFn _lookupFn;
+    };
+
+    Cache _defaults;
 };
 
 }  // namespace mongo

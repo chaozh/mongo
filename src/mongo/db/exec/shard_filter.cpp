@@ -51,10 +51,10 @@ using std::vector;
 const char* ShardFilterStage::kStageType = "SHARDING_FILTER";
 
 ShardFilterStage::ShardFilterStage(OperationContext* opCtx,
-                                   ScopedCollectionMetadata metadata,
+                                   ScopedCollectionFilter collectionFilter,
                                    WorkingSet* ws,
                                    std::unique_ptr<PlanStage> child)
-    : PlanStage(kStageType, opCtx), _ws(ws), _shardFilterer(std::move(metadata)) {
+    : PlanStage(kStageType, opCtx), _ws(ws), _shardFilterer(std::move(collectionFilter)) {
     _children.emplace_back(std::move(child));
 }
 
@@ -78,11 +78,7 @@ PlanStage::StageState ShardFilterStage::doWork(WorkingSetID* out) {
         // aborted migrations
         if (_shardFilterer.isCollectionSharded()) {
             WorkingSetMember* member = _ws->get(*out);
-            WorkingSetMatchableDocument matchable(member);
-
-            ShardFilterer::DocumentBelongsResult res =
-                _shardFilterer.documentBelongsToMe(matchable);
-
+            ShardFilterer::DocumentBelongsResult res = _shardFilterer.documentBelongsToMe(*member);
             if (res != ShardFilterer::DocumentBelongsResult::kBelongs) {
                 if (res == ShardFilterer::DocumentBelongsResult::kNoShardKey) {
                     // We can't find a shard key for this working set member - this should never

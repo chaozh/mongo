@@ -38,6 +38,8 @@
 #include "mongo/db/repl/topology_coordinator.h"
 #include "mongo/db/repl/topology_coordinator_gen.h"
 
+#include <fmt/format.h>
+#include <fmt/ostream.h>
 #include <limits>
 #include <string>
 
@@ -57,7 +59,6 @@
 #include "mongo/util/fail_point.h"
 #include "mongo/util/hex.h"
 #include "mongo/util/log.h"
-#include "mongo/util/net/socket_utils.h"
 #include "mongo/util/scopeguard.h"
 #include "mongo/util/str.h"
 
@@ -74,6 +75,8 @@ MONGO_FAIL_POINT_DEFINE(voteYesInDryRunButNoInRealElection);
 MONGO_FAIL_POINT_DEFINE(disableMaxSyncSourceLagSecs);
 
 constexpr Milliseconds TopologyCoordinator::PingStats::UninitializedPingTime;
+
+using namespace fmt::literals;
 
 std::string TopologyCoordinator::roleToString(TopologyCoordinator::Role role) {
     switch (role) {
@@ -135,15 +138,6 @@ bool _hasOnlyAuthErrorUpHeartbeats(const std::vector<MemberData>& hbdata, const 
 void appendOpTime(BSONObjBuilder* bob, const char* elemName, const OpTime& opTime) {
     opTime.append(bob, elemName);
 }
-
-void appendIP(BSONObjBuilder* bob, const char* elemName, const HostAndPort& hostAndPort) {
-    auto ip = hostbyname(hostAndPort.host().c_str());
-    if (ip == "") {
-        bob->appendNull("ip");
-    } else {
-        bob->append("ip", ip);
-    }
-}
 }  // namespace
 
 void TopologyCoordinator::PingStats::start(Date_t now) {
@@ -171,6 +165,7 @@ void TopologyCoordinator::PingStats::miss() {
 
 TopologyCoordinator::TopologyCoordinator(Options options)
     : _role(Role::kFollower),
+      _topologyVersion(instanceId, 0),
       _term(OpTime::kUninitializedTerm),
       _currentPrimaryIndex(-1),
       _forceSyncSourceIndex(-1),
@@ -186,6 +181,10 @@ TopologyCoordinator::TopologyCoordinator(Options options)
 
 TopologyCoordinator::Role TopologyCoordinator::getRole() const {
     return _role;
+}
+
+TopologyVersion TopologyCoordinator::getTopologyVersion() const {
+    return _topologyVersion;
 }
 
 void TopologyCoordinator::setForceSyncSourceIndex(int index) {
@@ -282,6 +281,16 @@ HostAndPort TopologyCoordinator::chooseNewSyncSource(Date_t now,
         } else if (_currentPrimaryIndex == _selfIndex) {
             LOG(1)
                 << "Cannot select a sync source because chaining is not allowed and we are primary";
+            _syncSource = HostAndPort();
+            return _syncSource;
+        } else if (_memberData.at(_currentPrimaryIndex).getHeartbeatAppliedOpTime() <
+                   lastOpTimeFetched) {
+            LOG(1) << "Cannot select a sync source because chaining is not allowed and the primary "
+                      "is behind me. Last oplog optime of primary {}: {}, my last fetched oplog "
+                      "optime: {}"_format(
+                          _currentPrimaryMember()->getHostAndPort(),
+                          _memberData.at(_currentPrimaryIndex).getLastAppliedOpTime().toBSON(),
+                          lastOpTimeFetched.toBSON());
             _syncSource = HostAndPort();
             return _syncSource;
         } else {
@@ -751,8 +760,8 @@ HeartbeatResponseAction TopologyCoordinator::processHeartbeatResponse(
             } else {
                 LOG(2) << "Config from heartbeat response was same as ours.";
             }
-            if (logger::globalLogDomain()->shouldLog(MongoLogDefaultComponent_component,
-                                                     ::mongo::LogstreamBuilder::severityCast(2))) {
+            if (shouldLog(MongoLogDefaultComponent_component,
+                          ::mongo::LogstreamBuilder::severityCast(2))) {
                 LogstreamBuilder lsb = log();
                 if (_rsConfig.isInitialized()) {
                     lsb << "Current config: " << _rsConfig.toBSON() << "; ";
@@ -1062,16 +1071,22 @@ StatusWith<bool> TopologyCoordinator::setLastOptime(const UpdatePositionArgs::Up
            << " has reached optime: " << args.appliedOpTime
            << " and is durable through: " << args.durableOpTime;
 
-    if (args.cfgver != _rsConfig.getConfigVersion()) {
-        std::string errmsg = str::stream()
-            << "Received replSetUpdatePosition for node with memberId " << memberId
-            << " whose config version of " << args.cfgver << " doesn't match our config version of "
-            << _rsConfig.getConfigVersion();
-        LOG(1) << errmsg;
-        *configVersion = _rsConfig.getConfigVersion();
-        return Status(ErrorCodes::InvalidReplicaSetConfig, errmsg);
+    // If we're in FCV 4.4, allow replSetUpdatePosition commands between config versions.
+    if (!serverGlobalParams.featureCompatibility.isVersion(
+            ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo44)) {
+        if (args.cfgver != _rsConfig.getConfigVersion()) {
+            std::string errmsg = str::stream()
+                << "Received replSetUpdatePosition for node with memberId " << memberId
+                << " whose config version of " << args.cfgver
+                << " doesn't match our config version of " << _rsConfig.getConfigVersion();
+            LOG(1) << errmsg;
+            *configVersion = _rsConfig.getConfigVersion();
+            return Status(ErrorCodes::InvalidReplicaSetConfig, errmsg);
+        }
     }
 
+    // While we can accept replSetUpdatePosition commands across config versions, we still do not
+    // allow receiving them from a node that is not in our config.
     auto* memberData = _findMemberDataByMemberId(memberId.getData());
     if (!memberData) {
         invariant(!_rsConfig.findMemberByID(memberId.getData()));
@@ -1096,6 +1111,14 @@ StatusWith<bool> TopologyCoordinator::setLastOptime(const UpdatePositionArgs::Up
                          {args.durableOpTime, args.durableWallTime}, now) ||
         advancedOpTime;
     return advancedOpTime;
+}
+
+void TopologyCoordinator::updateLastCommittedInPrevConfig() {
+    _lastCommittedInPrevConfig = _lastCommittedOpTimeAndWallTime.opTime;
+}
+
+OpTime TopologyCoordinator::getLastCommittedInPrevConfig() {
+    return _lastCommittedInPrevConfig;
 }
 
 MemberData* TopologyCoordinator::_findMemberDataByMemberId(const int memberId) {
@@ -1459,7 +1482,6 @@ void TopologyCoordinator::prepareStatusResponse(const ReplSetStatusArgs& rsStatu
             response->append("maintenanceMode", _maintenanceModeCalls);
         }
         response->append("lastHeartbeatMessage", "");
-        response->append("syncingTo", "");
         response->append("syncSourceHost", "");
         response->append("syncSourceId", -1);
 
@@ -1477,7 +1499,6 @@ void TopologyCoordinator::prepareStatusResponse(const ReplSetStatusArgs& rsStatu
             BSONObjBuilder bb;
             bb.append("_id", _selfConfig().getId().getData());
             bb.append("name", _selfConfig().getHostAndPort().toString());
-            appendIP(&bb, "ip", _selfConfig().getHostAndPort());
             bb.append("health", 1.0);
             bb.append("state", static_cast<int>(myState.s));
             bb.append("stateStr", myState.toString());
@@ -1489,12 +1510,10 @@ void TopologyCoordinator::prepareStatusResponse(const ReplSetStatusArgs& rsStatu
             }
 
             if (!_syncSource.empty() && !_iAmPrimary()) {
-                bb.append("syncingTo", _syncSource.toString());
                 bb.append("syncSourceHost", _syncSource.toString());
                 const MemberConfig* member = _rsConfig.findMemberByHostAndPort(_syncSource);
                 bb.append("syncSourceId", member ? member->getId().getData() : -1);
             } else {
-                bb.append("syncingTo", "");
                 bb.append("syncSourceHost", "");
                 bb.append("syncSourceId", -1);
             }
@@ -1511,6 +1530,7 @@ void TopologyCoordinator::prepareStatusResponse(const ReplSetStatusArgs& rsStatu
                               Date_t::fromDurationSinceEpoch(Seconds(_electionTime.getSecs())));
             }
             bb.appendIntOrLL("configVersion", _rsConfig.getConfigVersion());
+            bb.appendIntOrLL("configTerm", _rsConfig.getConfigTerm());
             bb.append("self", true);
             bb.append("lastHeartbeatMessage", "");
             membersOut.push_back(bb.obj());
@@ -1520,7 +1540,6 @@ void TopologyCoordinator::prepareStatusResponse(const ReplSetStatusArgs& rsStatu
             BSONObjBuilder bb;
             bb.append("_id", itConfig.getId().getData());
             bb.append("name", itConfig.getHostAndPort().toString());
-            appendIP(&bb, "ip", itConfig.getHostAndPort());
             double h = it->getHealth();
             bb.append("health", h);
             const MemberState state = it->getState();
@@ -1557,12 +1576,10 @@ void TopologyCoordinator::prepareStatusResponse(const ReplSetStatusArgs& rsStatu
             }
             const HostAndPort& syncSource = it->getSyncSource();
             if (!syncSource.empty() && !state.primary()) {
-                bb.append("syncingTo", syncSource.toString());
                 bb.append("syncSourceHost", syncSource.toString());
                 const MemberConfig* member = _rsConfig.findMemberByHostAndPort(syncSource);
                 bb.append("syncSourceId", member ? member->getId().getData() : -1);
             } else {
-                bb.append("syncingTo", "");
                 bb.append("syncSourceHost", "");
                 bb.append("syncSourceId", -1);
             }
@@ -1594,12 +1611,10 @@ void TopologyCoordinator::prepareStatusResponse(const ReplSetStatusArgs& rsStatu
 
     // Add sync source info
     if (!_syncSource.empty() && !myState.primary() && !myState.removed()) {
-        response->append("syncingTo", _syncSource.toString());
         response->append("syncSourceHost", _syncSource.toString());
         const MemberConfig* member = _rsConfig.findMemberByHostAndPort(_syncSource);
         response->append("syncSourceId", member ? member->getId().getData() : -1);
     } else {
-        response->append("syncingTo", "");
         response->append("syncSourceHost", "");
         response->append("syncSourceId", -1);
     }
@@ -1723,13 +1738,11 @@ void TopologyCoordinator::fillMemberData(BSONObjBuilder* result) {
     }
 }
 
-void TopologyCoordinator::fillIsMasterForReplSet(IsMasterResponse* const response,
-                                                 const SplitHorizon::Parameters& horizonParams) {
+void TopologyCoordinator::fillIsMasterForReplSet(std::shared_ptr<IsMasterResponse> response,
+                                                 const StringData& horizonString) const {
+    invariant(_rsConfig.isInitialized());
+    response->setTopologyVersion(getTopologyVersion());
     const MemberState myState = getMemberState();
-    if (!_rsConfig.isInitialized()) {
-        response->markAsNoConfig();
-        return;
-    }
 
     response->setReplSetName(_rsConfig.getReplSetName());
     if (myState.removed()) {
@@ -1739,15 +1752,11 @@ void TopologyCoordinator::fillIsMasterForReplSet(IsMasterResponse* const respons
 
     invariant(!_rsConfig.members().empty());
 
-    const auto& self = _rsConfig.members()[_selfIndex];
-
-    const auto horizon = self.determineHorizon(horizonParams);
-
     for (const auto& member : _rsConfig.members()) {
         if (member.isHidden() || member.getSlaveDelay() > Seconds{0}) {
             continue;
         }
-        auto hostView = member.getHostAndPort(horizon);
+        auto hostView = member.getHostAndPort(horizonString);
 
         if (member.isElectable()) {
             response->addHost(std::move(hostView));
@@ -1767,7 +1776,7 @@ void TopologyCoordinator::fillIsMasterForReplSet(IsMasterResponse* const respons
 
     const MemberConfig* curPrimary = _currentPrimaryMember();
     if (curPrimary) {
-        response->setPrimary(curPrimary->getHostAndPort(horizon));
+        response->setPrimary(curPrimary->getHostAndPort(horizonString));
     }
 
     const MemberConfig& selfConfig = _rsConfig.getMemberAt(_selfIndex);
@@ -1797,7 +1806,7 @@ void TopologyCoordinator::fillIsMasterForReplSet(IsMasterResponse* const respons
             response->addTag(tagKey, tagConfig.getTagValue(*tag));
         }
     }
-    response->setMe(selfConfig.getHostAndPort());
+    response->setMe(selfConfig.getHostAndPort(horizonString));
     if (_iAmPrimary()) {
         response->setElectionId(_electionId);
     }
@@ -2297,6 +2306,12 @@ bool TopologyCoordinator::isSafeToStepDown() {
 
     OpTime lastApplied = getMyLastAppliedOpTime();
 
+    // No need to wait for secondaries to catch up if this node has not yet written in the current
+    // term.
+    if (lastApplied.getTerm() != _term) {
+        return true;
+    }
+
     auto tagStatus = _rsConfig.findCustomWriteMode(ReplSetConfig::kMajorityWriteConcernModeName);
     invariant(tagStatus.isOK());
 
@@ -2603,13 +2618,20 @@ bool TopologyCoordinator::shouldChangeSyncSource(
         return true;
     }
 
-    if (replMetadata.getConfigVersion() != _rsConfig.getConfigVersion()) {
-        log() << "Choosing new sync source because the config version supplied by " << currentSource
-              << ", " << replMetadata.getConfigVersion() << ", does not match ours, "
-              << _rsConfig.getConfigVersion();
-        return true;
+    // If we're in FCV 4.4, allow data replication between config versions. Otherwise, change
+    // our sync source.
+    if (!serverGlobalParams.featureCompatibility.isVersion(
+            ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo44)) {
+        if (replMetadata.getConfigVersion() != _rsConfig.getConfigVersion()) {
+            log() << "Choosing new sync source because the config version supplied by "
+                  << currentSource << ", " << replMetadata.getConfigVersion()
+                  << ", does not match ours, " << _rsConfig.getConfigVersion();
+            return true;
+        }
     }
 
+    // While we can allow data replication across config versions, we still do not allow syncing
+    // from a node that is not in our config.
     const int currentSourceIndex = _rsConfig.findMemberIndexByHostAndPort(currentSource);
     if (currentSourceIndex == -1) {
         log() << "Choosing new sync source because " << currentSource.toString()
@@ -2746,41 +2768,60 @@ void TopologyCoordinator::processReplSetRequestVotes(const ReplSetRequestVotesAr
         return;
     }
 
+    // If either config term is -1, ignore the config term entirely and compare config versions.
+    bool compareConfigTerms = args.getConfigTerm() != -1 && _rsConfig.getConfigTerm() != -1;
+
     if (args.getTerm() < _term) {
         response->setVoteGranted(false);
-        response->setReason(str::stream() << "candidate's term (" << args.getTerm()
-                                          << ") is lower than mine (" << _term << ")");
-    } else if (args.getConfigVersion() != _rsConfig.getConfigVersion()) {
+        response->setReason(str::stream() << "candidate's term ({}) is lower than mine ({})"_format(
+                                args.getTerm(), _term));
+    } else if (compareConfigTerms && args.getConfigTerm() < _rsConfig.getConfigTerm()) {
         response->setVoteGranted(false);
         response->setReason(str::stream()
-                            << "candidate's config version (" << args.getConfigVersion()
-                            << ") differs from mine (" << _rsConfig.getConfigVersion() << ")");
+                            << "candidate's term in config(term, version): ({}, {}) is lower "
+                               "than mine ({}, {})"_format(args.getConfigTerm(),
+                                                           args.getConfigVersion(),
+                                                           _rsConfig.getConfigTerm(),
+                                                           _rsConfig.getConfigVersion()));
+    } else if ((!compareConfigTerms || args.getConfigTerm() == _rsConfig.getConfigTerm()) &&
+               args.getConfigVersion() < _rsConfig.getConfigVersion()) {
+        // If the terms should not be compared or if the terms are equal, fall back to version
+        // comparison.
+        response->setVoteGranted(false);
+        response->setReason(str::stream()
+                            << "ignoring term of -1 for comparison, candidate's version in "
+                               "config(term, version): ({}, {}) is lower than mine ({}, {})"_format(
+                                   args.getConfigTerm(),
+                                   args.getConfigVersion(),
+                                   _rsConfig.getConfigTerm(),
+                                   _rsConfig.getConfigVersion()));
     } else if (args.getSetName() != _rsConfig.getReplSetName()) {
         response->setVoteGranted(false);
         response->setReason(str::stream()
-                            << "candidate's set name (" << args.getSetName()
-                            << ") differs from mine (" << _rsConfig.getReplSetName() << ")");
+                            << "candidate's set name ({}) differs from mine ({})"_format(
+                                   args.getSetName(), _rsConfig.getReplSetName()));
     } else if (args.getLastDurableOpTime() < getMyLastAppliedOpTime()) {
         response->setVoteGranted(false);
-        response
-            ->setReason(str::stream()
-                        << "candidate's data is staler than mine. candidate's last applied OpTime: "
-                        << args.getLastDurableOpTime().toString()
-                        << ", my last applied OpTime: " << getMyLastAppliedOpTime().toString());
+        response->setReason(str::stream()
+                            << "candidate's data is staler than mine. candidate's last applied "
+                               "OpTime: {}, my last applied OpTime: {}"_format(
+                                   args.getLastDurableOpTime().toString(),
+                                   getMyLastAppliedOpTime().toString()));
     } else if (!args.isADryRun() && _lastVote.getTerm() == args.getTerm()) {
         response->setVoteGranted(false);
-        response->setReason(str::stream()
-                            << "already voted for another candidate ("
-                            << _rsConfig.getMemberAt(_lastVote.getCandidateIndex()).getHostAndPort()
-                            << ") this term (" << _lastVote.getTerm() << ")");
+        response->setReason(
+            str::stream() << "already voted for another candidate ({}) this "
+                             "term ({})"_format(_rsConfig.getMemberAt(_lastVote.getCandidateIndex())
+                                                    .getHostAndPort(),
+                                                _lastVote.getTerm()));
     } else {
         int betterPrimary = _findHealthyPrimaryOfEqualOrGreaterPriority(args.getCandidateIndex());
         if (_selfConfig().isArbiter() && betterPrimary >= 0) {
             response->setVoteGranted(false);
-            response->setReason(str::stream()
-                                << "can see a healthy primary ("
-                                << _rsConfig.getMemberAt(betterPrimary).getHostAndPort()
-                                << ") of equal or greater priority");
+            response
+                ->setReason(str::stream()
+                            << "can see a healthy primary ({}) of equal or greater priority"_format(
+                                   _rsConfig.getMemberAt(betterPrimary).getHostAndPort()));
         } else {
             if (!args.isADryRun()) {
                 _lastVote.setTerm(args.getTerm());
@@ -2840,6 +2881,11 @@ void TopologyCoordinator::restartHeartbeats() {
     for (auto& hb : _memberData) {
         hb.restart();
     }
+}
+
+void TopologyCoordinator::incrementTopologyVersion() {
+    auto counter = _topologyVersion.getCounter();
+    _topologyVersion.setCounter(counter + 1);
 }
 
 OpTime TopologyCoordinator::latestKnownOpTime() const {

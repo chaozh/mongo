@@ -38,6 +38,7 @@
 #include "mongo/db/operation_context.h"
 #include "mongo/db/ops/write_ops_parsers.h"
 #include "mongo/db/s/database_sharding_state.h"
+#include "mongo/s/client/num_hosts_targeted_metrics.h"
 #include "mongo/s/cluster_commands_helpers.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/transaction_router.h"
@@ -435,6 +436,8 @@ Status BatchWriteOp::targetBatch(const NSTargeter& targeter,
         targetedBatches->emplace(batch->getEndpoint().shardName, batch);
     }
 
+    _nShardsOwningChunks = targeter.getNShardsOwningChunks();
+
     return Status::OK();
 }
 
@@ -542,6 +545,9 @@ BatchedCommandRequest BatchWriteOp::buildBatchRequest(
             // writeErrors
             request.setWriteConcern(upgradeWriteConcern(_clientRequest.getWriteConcern()));
         }
+    } else if (!TransactionRouter::get(_opCtx)) {
+        // Apply the WC from the opCtx (except if in a transaction).
+        request.setWriteConcern(_opCtx->getWriteConcern().toBSON());
     }
 
     request.setAllowImplicitCreate(_clientRequest.isImplicitCreateAllowed());
@@ -824,6 +830,10 @@ int BatchWriteOp::numWriteOpsIn(WriteOpState opState) const {
         });
 }
 
+boost::optional<int> BatchWriteOp::getNShardsOwningChunks() {
+    return _nShardsOwningChunks;
+}
+
 void BatchWriteOp::_incBatchStats(const BatchedCommandResponse& response) {
     const auto batchType = _clientRequest.getBatchType();
 
@@ -925,6 +935,11 @@ void TrackedErrors::addError(ShardError error) {
 const std::vector<ShardError>& TrackedErrors::getErrors(int errCode) const {
     dassert(isTracking(errCode));
     return _errorMap.find(errCode)->second;
+}
+
+void TargetedWriteBatch::addWrite(TargetedWrite* targetedWrite, int estWriteSize) {
+    _writes.mutableVector().push_back(targetedWrite);
+    _estimatedSizeBytes += estWriteSize;
 }
 
 }  // namespace mongo

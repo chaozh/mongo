@@ -19,22 +19,29 @@ class IndexBuildTest {
      * Accepts optional filter that can be used to customize the db.currentOp() query.
      */
     static getIndexBuildOpId(database, collectionName, indexName, filter) {
-        const result = database.currentOp(filter || true);
-        assert.commandWorked(result);
+        let pipeline = [{$currentOp: {allUsers: true, idleConnections: true}}];
+        if (filter) {
+            pipeline.push({$match: filter});
+        }
+        const result = database.getSiblingDB("admin")
+                           .aggregate(pipeline, {readConcern: {level: "local"}})
+                           .toArray();
         let indexBuildOpId = -1;
         let indexBuildObj = {};
         let indexBuildNamespace = "";
 
-        result.inprog.forEach(function(op) {
+        result.forEach(function(op) {
             if (op.op != 'command') {
                 return;
             }
-            if (op.command.createIndexes === undefined) {
+            const cmdBody = op.command;
+
+            if (cmdBody.createIndexes === undefined) {
                 return;
             }
             // If no collection is provided, return any index build.
-            if (!collectionName || op.command.createIndexes === collectionName) {
-                op.command.indexes.forEach((index) => {
+            if (!collectionName || cmdBody.createIndexes === collectionName) {
+                cmdBody.indexes.forEach((index) => {
                     if (!indexName || index.name === indexName) {
                         indexBuildOpId = op.opid;
                         indexBuildObj = index;
@@ -94,7 +101,7 @@ class IndexBuildTest {
      * An optional 'onOperationFn' callback accepts an operation to perform any additional checks.
      */
     static assertIndexBuildCurrentOpContents(database, opId, onOperationFn) {
-        const inprog = database.currentOp({opid: opId}).inprog;
+        const inprog = database.currentOp({opid: opId, "$all": true}).inprog;
         assert.eq(1,
                   inprog.length,
                   'unable to find opid ' + opId +
@@ -177,5 +184,25 @@ class IndexBuildTest {
     static resumeIndexBuilds(conn) {
         assert.commandWorked(
             conn.adminCommand({configureFailPoint: 'hangAfterStartingIndexBuild', mode: 'off'}));
+    }
+
+    /**
+     * Returns true if two phase index builds are supported.
+     */
+    static supportsTwoPhaseIndexBuild(conn) {
+        const adminDB = conn.getDB('admin');
+        const serverStatus = assert.commandWorked(adminDB.serverStatus());
+        const storageEngineSection = serverStatus.storageEngine;
+        return storageEngineSection.supportsTwoPhaseIndexBuild;
+    }
+
+    /**
+     * Returns true if majority commit quorum is supported by two phase index builds.
+     */
+    static supportsIndexBuildMajorityCommitQuorum(conn) {
+        return assert
+            .commandWorked(
+                conn.adminCommand({getParameter: 1, enableIndexBuildMajorityCommitQuorum: 1}))
+            .enableIndexBuildMajorityCommitQuorum;
     }
 }

@@ -1,5 +1,7 @@
 // Tests for $merge against a stale mongos with combinations of sharded/unsharded source and target
 // collections.
+// Requires fcv44 because the expected error codes for $out have changed in 4.4.
+// @tags: [requires_fcv_44]
 (function() {
 "use strict";
 
@@ -226,20 +228,23 @@ function runOutTest(mongosList) {
     });
 }
 
-// Legacy $out will fail if the target collection is sharded.
+// TODO SERVER-45186 Uncomment this section.
+/*
+Legacy $out will fail if the target collection is sharded.
 setupStaleMongos({shardedSource: false, shardedTarget: false});
 runOutTest([staleMongosSource, staleMongosTarget]);
 
 setupStaleMongos({shardedSource: true, shardedTarget: true});
 assert.eq(assert.throws(() => runOutTest(staleMongosSource)).code, 28769);
-assert.eq(assert.throws(() => runOutTest(staleMongosTarget)).code, 17017);
+assert.eq(assert.throws(() => runOutTest(staleMongosTarget)).code, ErrorCodes.IllegalOperation);
 
 setupStaleMongos({shardedSource: true, shardedTarget: false});
 runOutTest([staleMongosSource, staleMongosTarget]);
 
 setupStaleMongos({shardedSource: false, shardedTarget: true});
 assert.eq(assert.throws(() => runOutTest(staleMongosSource)).code, 28769);
-assert.eq(assert.throws(() => runOutTest(staleMongosTarget)).code, 17017);
+assert.eq(assert.throws(() => runOutTest(staleMongosTarget)).code, ErrorCodes.IllegalOperation);
+*/
 
 st.stop();
 }());

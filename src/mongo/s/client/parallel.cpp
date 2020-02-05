@@ -618,7 +618,10 @@ void ParallelSortClusteredCursor::startInit(OperationContext* opCtx) {
             NamespaceString staleNS(e->getNss());
             _markStaleNS(staleNS, e);
 
-            Grid::get(opCtx)->catalogCache()->invalidateShardedCollection(staleNS);
+            Grid::get(opCtx)
+                ->catalogCache()
+                ->invalidateShardOrEntireCollectionEntryForShardedCollection(
+                    opCtx, nss, e->getVersionWanted(), e->getVersionReceived(), e->getShardId());
 
             LOG(1) << "stale config of ns " << staleNS << " during initialization, will retry"
                    << causedBy(redact(e));
@@ -832,7 +835,14 @@ void ParallelSortClusteredCursor::finishInit(OperationContext* opCtx) {
                 const StaleConfigException& ex = exEntry.second;
 
                 _markStaleNS(staleNS, ex);
-                Grid::get(opCtx)->catalogCache()->invalidateShardedCollection(staleNS);
+                // If we don't have a shardId (a valid case being receiving an exception from a
+                // v4.2 binary), we have to set the entire collection as stale.
+                if (!ex->getShardId()) {
+                    Grid::get(opCtx)->catalogCache()->onEpochChange(staleNS);
+                } else {
+                    Grid::get(opCtx)->catalogCache()->invalidateShardForShardedCollection(
+                        staleNS, *ex->getShardId());
+                }
 
                 LOG(1) << "stale config of ns " << staleNS << " on finishing query, will retry"
                        << causedBy(redact(ex));
@@ -1150,7 +1160,8 @@ void ParallelSortClusteredCursor::_oldInit(OperationContext* opCtx) {
             // Version is zero b/c this is deprecated codepath
             uasserted(StaleConfigInfo(NamespaceString(_ns),
                                       ChunkVersion(0, 0, OID()),
-                                      ChunkVersion(0, 0, OID())),
+                                      ChunkVersion(0, 0, OID()),
+                                      boost::none),
                       errMsg.str());
         } else if (throwException) {
             uasserted(14827, errMsg.str());

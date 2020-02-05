@@ -55,6 +55,18 @@ public:
      */
     virtual void recoverFromOplog(OperationContext* opCtx,
                                   boost::optional<Timestamp> stableTimestamp) = 0;
+
+    /**
+     *  Recovers the data on disk from the oplog and puts the node in readOnly mode. If
+     *  'takeUnstableCheckpointOnShutdown' is specified and an unstable checkpoint is present,
+     *  ensures that recovery can be skipped safely.
+     */
+    virtual void recoverFromOplogAsStandalone(OperationContext* opCtx) = 0;
+
+    /**
+     * Recovers the data on disk from the oplog up to and including the given timestamp.
+     */
+    virtual void recoverFromOplogUpTo(OperationContext* opCtx, Timestamp endPoint) = 0;
 };
 
 class ReplicationRecoveryImpl : public ReplicationRecovery {
@@ -68,7 +80,17 @@ public:
     void recoverFromOplog(OperationContext* opCtx,
                           boost::optional<Timestamp> stableTimestamp) override;
 
+    void recoverFromOplogAsStandalone(OperationContext* opCtx) override;
+
+    void recoverFromOplogUpTo(OperationContext* opCtx, Timestamp endPoint) override;
+
 private:
+    /**
+     * Confirms that the data and oplog all indicate that the nodes has an unstable checkpoint
+     * that is fully up to date.
+     */
+    void _assertNoRecoveryNeededOnUnstableCheckpoint(OperationContext* opCtx);
+
     /**
      * After truncating the oplog, completes recovery if we're recovering from a stable timestamp
      * or a stable checkpoint.
@@ -87,12 +109,20 @@ private:
                                         OpTime topOfOplog);
 
     /**
-     * Applies all oplog entries from oplogApplicationStartPoint (exclusive) to topOfOplog
+     * Applies all oplog entries from oplogApplicationStartPoint (inclusive) to topOfOplog
      * (inclusive). This fasserts if oplogApplicationStartPoint is not in the oplog.
      */
     void _applyToEndOfOplog(OperationContext* opCtx,
                             const Timestamp& oplogApplicationStartPoint,
                             const Timestamp& topOfOplog);
+
+    /**
+     * Applies all oplog entries from startPoint (inclusive) to endPoint (inclusive). Returns the
+     * Timestamp of the last applied operation.
+     */
+    Timestamp _applyOplogOperations(OperationContext* opCtx,
+                                    const Timestamp& startPoint,
+                                    const Timestamp& endPoint);
 
     /**
      * Gets the last applied OpTime from the end of the oplog. Returns CollectionIsEmpty if there is
@@ -101,10 +131,9 @@ private:
     StatusWith<OpTime> _getTopOfOplog(OperationContext* opCtx) const;
 
     /**
-     * Truncates the oplog after the "truncateTimestamp" entry. Includes the "truncateTimestamp"
-     * entry if "inclusive" is set to true.
+     * Truncates the oplog after the "truncateTimestamp" entry.
      */
-    void _truncateOplogTo(OperationContext* opCtx, Timestamp truncateTimestamp, bool inclusive);
+    void _truncateOplogTo(OperationContext* opCtx, Timestamp truncateTimestamp);
 
     /**
      * Uses the oplogTruncateAfterPoint, accessed via '_consistencyMarkers', to decide whether to

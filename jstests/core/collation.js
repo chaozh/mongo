@@ -1,10 +1,14 @@
 // Cannot implicitly shard accessed collections because of collection existing when none
 // expected.
+// Tagged with requires_fcv_44 due to change in the implementation of the returnKey query
+// modifier, along with stricter rules for $-prefixed field name, which are not compatible
+// with older versions.
 // @tags: [
 //   assumes_no_implicit_collection_creation_after_drop,
 //   does_not_support_stepdowns,
 //   requires_non_retryable_commands,
 //   requires_non_retryable_writes,
+//   requires_fcv_44
 // ]
 
 // Integration tests for the collation feature.
@@ -953,20 +957,6 @@ assert.eq(null,
 // Collation tests for mapReduce.
 //
 
-// mapReduce should return "collection doesn't exist" error when collation specified and
-// collection does not exist.
-coll.drop();
-assert.throws(function() {
-    coll.mapReduce(
-        function() {
-            emit(this.str, 1);
-        },
-        function(key, values) {
-            return Array.sum(values);
-        },
-        {out: {inline: 1}, collation: {locale: "fr"}});
-});
-
 // mapReduce should return correct results when collation specified and no indexes exist.
 coll.drop();
 assert.commandWorked(coll.insert({_id: 1, str: "foo"}));
@@ -1806,17 +1796,12 @@ if (!isMongos) {
 
     var cloneCollOutput = db.runCommand(
         {cloneCollectionAsCapped: coll.getName(), toCollection: clonedColl.getName(), size: 4096});
-    if (jsTest.options().storageEngine === "mobile") {
-        // Capped collections are not supported by the mobile storage engine
-        assert.commandFailedWithCode(cloneCollOutput, ErrorCodes.InvalidOptions);
-    } else {
-        assert.commandWorked(cloneCollOutput);
-        const clonedCollectionInfos = db.getCollectionInfos({name: clonedColl.getName()});
-        assert.eq(clonedCollectionInfos.length, 1, tojson(clonedCollectionInfos));
-        assert.eq(originalCollectionInfos[0].options.collation,
-                  clonedCollectionInfos[0].options.collation);
-        assert.eq([{_id: "FOO"}], clonedColl.find({_id: "foo"}).toArray());
-    }
+    assert.commandWorked(cloneCollOutput);
+    const clonedCollectionInfos = db.getCollectionInfos({name: clonedColl.getName()});
+    assert.eq(clonedCollectionInfos.length, 1, tojson(clonedCollectionInfos));
+    assert.eq(originalCollectionInfos[0].options.collation,
+              clonedCollectionInfos[0].options.collation);
+    assert.eq([{_id: "FOO"}], clonedColl.find({_id: "foo"}).toArray());
 }
 
 // Test that the find command's min/max options respect the collation.

@@ -35,6 +35,63 @@ __wt_ref_cas_state_int(WT_SESSION_IMPL *session, WT_REF *ref, uint32_t old_state
 }
 
 /*
+ * __wt_txn_context_prepare_check --
+ *     Return an error if the current transaction is in the prepare state.
+ */
+static inline int
+__wt_txn_context_prepare_check(WT_SESSION_IMPL *session)
+{
+    if (F_ISSET(&session->txn, WT_TXN_PREPARE))
+        WT_RET_MSG(session, EINVAL, "not permitted in a prepared transaction");
+    return (0);
+}
+
+/*
+ * __wt_txn_context_check --
+ *     Complain if a transaction is/isn't running.
+ */
+static inline int
+__wt_txn_context_check(WT_SESSION_IMPL *session, bool requires_txn)
+{
+    if (requires_txn && !F_ISSET(&session->txn, WT_TXN_RUNNING))
+        WT_RET_MSG(session, EINVAL, "only permitted in a running transaction");
+    if (!requires_txn && F_ISSET(&session->txn, WT_TXN_RUNNING))
+        WT_RET_MSG(session, EINVAL, "not permitted in a running transaction");
+    return (0);
+}
+
+/*
+ * __wt_txn_err_set --
+ *     Set an error in the current transaction.
+ */
+static inline void
+__wt_txn_err_set(WT_SESSION_IMPL *session, int ret)
+{
+    WT_TXN *txn;
+
+    txn = &session->txn;
+
+    /*  Ignore standard errors that don't fail the transaction. */
+    if (ret == WT_NOTFOUND || ret == WT_DUPLICATE_KEY || ret == WT_PREPARE_CONFLICT)
+        return;
+
+    /* Less commonly, it's not a running transaction. */
+    if (!F_ISSET(txn, WT_TXN_RUNNING))
+        return;
+
+    /* The transaction has to be rolled back. */
+    F_SET(txn, WT_TXN_ERROR);
+
+    /*
+     * Check for a prepared transaction, and quit: we can't ignore the error and we can't roll back
+     * a prepared transaction.
+     */
+    if (F_ISSET(txn, WT_TXN_PREPARE))
+        WT_PANIC_MSG(session, ret,
+          "transactional error logged after transaction was prepared, failing the system");
+}
+
+/*
  * __wt_txn_timestamp_flags --
  *     Set transaction related timestamp flags.
  */
@@ -147,108 +204,6 @@ __txn_resolve_prepared_update(WT_SESSION_IMPL *session, WT_UPDATE *upd)
     upd->start_ts = txn->commit_timestamp;
     upd->durable_ts = txn->durable_timestamp;
     WT_PUBLISH(upd->prepare_state, WT_PREPARE_RESOLVED);
-}
-
-/*
- * __wt_txn_resolve_prepared_op --
- *     Resolve a transaction's operations indirect references. In case of prepared transactions, the
- *     prepared updates could be evicted using cache overflow mechanism. Transaction operations
- *     referring to these prepared updates would be referring to them using indirect references (i.e
- *     keys/recnos), which need to be resolved as part of that transaction commit/rollback. If no
- *     updates are resolved throw an error. Increment resolved update count for each resolved update
- *     count we locate.
- */
-static inline int
-__wt_txn_resolve_prepared_op(
-  WT_SESSION_IMPL *session, WT_TXN_OP *op, bool commit, int64_t *resolved_update_countp)
-{
-    WT_CURSOR *cursor;
-    WT_DECL_RET;
-    WT_TXN *txn;
-    WT_UPDATE *upd;
-    const char *open_cursor_cfg[] = {WT_CONFIG_BASE(session, WT_SESSION_open_cursor), NULL};
-
-    txn = &session->txn;
-
-    if (op->type == WT_TXN_OP_NONE || op->type == WT_TXN_OP_REF_DELETE ||
-      op->type == WT_TXN_OP_TRUNCATE_COL || op->type == WT_TXN_OP_TRUNCATE_ROW)
-        return (0);
-
-    WT_RET(__wt_open_cursor(session, op->btree->dhandle->name, NULL, open_cursor_cfg, &cursor));
-
-    /*
-     * Transaction prepare is cleared temporarily as cursor functions are not allowed for prepared
-     * transactions.
-     */
-    F_CLR(txn, WT_TXN_PREPARE);
-    if (op->type == WT_TXN_OP_BASIC_ROW || op->type == WT_TXN_OP_INMEM_ROW)
-        __wt_cursor_set_raw_key(cursor, &op->u.op_row.key);
-    else
-        ((WT_CURSOR_BTREE *)cursor)->iface.recno = op->u.op_col.recno;
-    F_SET(txn, WT_TXN_PREPARE);
-
-    WT_WITH_BTREE(
-      session, op->btree, ret = __wt_btcur_search_uncommitted((WT_CURSOR_BTREE *)cursor, &upd));
-    WT_ERR(ret);
-
-    /* If we haven't found anything then there's an error. */
-    if (upd == NULL) {
-        WT_ERR_ASSERT(session, upd != NULL, WT_NOTFOUND,
-          "Unable to locate update associated with a prepared operation.");
-    }
-
-    for (; upd != NULL; upd = upd->next) {
-        /*
-         * Aborted updates can exist in the update chain of our txn. Generally this will occur due
-         * to a reserved update. As such we should skip over these updates. If the txn id is then
-         * different and not aborted we know we've reached the end of our update chain and can exit.
-         */
-        if (upd->txnid == WT_TXN_ABORTED)
-            continue;
-        if (upd->txnid != txn->id)
-            break;
-
-        ++(*resolved_update_countp);
-
-        if (!commit) {
-            upd->txnid = WT_TXN_ABORTED;
-            continue;
-        }
-
-        /*
-         * Newer updates are inserted at head of update chain, and
-         * transaction operations are added at the tail of the
-         * transaction modify chain.
-         *
-         * For example, a transaction has modified [k,v] as
-         * [k, v]  -> [k, u1]   (txn_op : txn_op1)
-         * [k, u1] -> [k, u2]   (txn_op : txn_op2)
-         * update chain : u2->u1
-         * txn_mod      : txn_op1->txn_op2.
-         *
-         * Only the key is saved in the transaction operation
-         * structure, hence we cannot identify whether "txn_op1"
-         * corresponds to "u2" or "u1" during commit/rollback.
-         *
-         * To make things simpler we will handle all the updates
-         * that match the key saved in a transaction operation in a
-         * single go. As a result, multiple updates of a key, if any
-         * will be resolved as part of the first transaction operation
-         * resolution of that key, and subsequent transaction operation
-         * resolution of the same key will be effectively
-         * a no-op.
-         *
-         * In the above example, we will resolve "u2" and "u1" as part
-         * of resolving "txn_op1" and will not do any significant
-         * thing as part of "txn_op2".
-         */
-
-        /* Resolve the prepared update to be committed update. */
-        __txn_resolve_prepared_update(session, upd);
-    }
-err:
-    WT_TRET(cursor->close(cursor));
-    return (ret);
 }
 
 /*
@@ -808,12 +763,17 @@ __wt_txn_read(WT_SESSION_IMPL *session, WT_UPDATE *upd, WT_UPDATE **updp)
 {
     static WT_UPDATE tombstone = {.txnid = WT_TXN_NONE, .type = WT_UPDATE_TOMBSTONE};
     WT_VISIBLE_TYPE upd_visible;
+    uint8_t type;
     bool skipped_birthmark;
 
     *updp = NULL;
+
+    type = WT_UPDATE_INVALID; /* [-Wconditional-uninitialized] */
     for (skipped_birthmark = false; upd != NULL; upd = upd->next) {
+        WT_ORDERED_READ(type, upd->type);
+
         /* Skip reserved place-holders, they're never visible. */
-        if (upd->type != WT_UPDATE_RESERVE) {
+        if (type != WT_UPDATE_RESERVE) {
             upd_visible = __wt_txn_upd_visible_type(session, upd);
             if (upd_visible == WT_VISIBLE_TRUE)
                 break;
@@ -821,14 +781,16 @@ __wt_txn_read(WT_SESSION_IMPL *session, WT_UPDATE *upd, WT_UPDATE **updp)
                 return (WT_PREPARE_CONFLICT);
         }
         /* An invisible birthmark is equivalent to a tombstone. */
-        if (upd->type == WT_UPDATE_BIRTHMARK)
+        if (type == WT_UPDATE_BIRTHMARK)
             skipped_birthmark = true;
     }
 
-    if (upd == NULL && skipped_birthmark)
+    if (upd == NULL && skipped_birthmark) {
         upd = &tombstone;
+        type = upd->type;
+    }
 
-    *updp = upd == NULL || upd->type == WT_UPDATE_BIRTHMARK ? NULL : upd;
+    *updp = upd == NULL || type == WT_UPDATE_BIRTHMARK ? NULL : upd;
     return (0);
 }
 

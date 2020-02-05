@@ -228,19 +228,18 @@ public:
              const std::string& dbname,
              const BSONObj& cmdObj,
              BSONObjBuilder& result) override {
-
         uassert(ErrorCodes::IllegalOperation,
                 "_configsvrShardCollection can only be run on config servers",
                 serverGlobalParams.clusterRole == ClusterRole::ConfigServer);
+        uassert(ErrorCodes::InvalidOptions,
+                str::stream()
+                    << "_configsvrShardCollection must be called with majority writeConcern, got "
+                    << cmdObj,
+                opCtx->getWriteConcern().wMode == WriteConcernOptions::kMajority);
 
         // Set the operation context read concern level to local for reads into the config database.
         repl::ReadConcernArgs::get(opCtx) =
             repl::ReadConcernArgs(repl::ReadConcernLevel::kLocalReadConcern);
-
-        uassert(ErrorCodes::InvalidOptions,
-                str::stream() << "shardCollection must be called with majority writeConcern, got "
-                              << cmdObj,
-                opCtx->getWriteConcern().wMode == WriteConcernOptions::kMajority);
 
         const NamespaceString nss(parseNs(dbname, cmdObj));
         auto request = ConfigsvrShardCollectionRequest::parse(
@@ -338,6 +337,7 @@ public:
         shardsvrShardCollectionRequest.setKey(request.getKey());
         shardsvrShardCollectionRequest.setUnique(request.getUnique());
         shardsvrShardCollectionRequest.setNumInitialChunks(request.getNumInitialChunks());
+        shardsvrShardCollectionRequest.setPresplitHashedZones(request.getPresplitHashedZones());
         shardsvrShardCollectionRequest.setInitialSplitPoints(request.getInitialSplitPoints());
         shardsvrShardCollectionRequest.setCollation(request.getCollation());
         shardsvrShardCollectionRequest.setGetUUIDfromPrimaryShard(

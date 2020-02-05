@@ -31,6 +31,8 @@
 
 #include "mongo/platform/basic.h"
 
+#include <algorithm>
+
 #include "mongo/base/string_data.h"
 #include "mongo/db/repl/all_database_cloner.h"
 #include "mongo/util/assert_util.h"
@@ -42,19 +44,59 @@ AllDatabaseCloner::AllDatabaseCloner(InitialSyncSharedData* sharedData,
                                      const HostAndPort& source,
                                      DBClientConnection* client,
                                      StorageInterface* storageInterface,
-                                     ThreadPool* dbPool,
-                                     ClockSource* clockSource)
-    : BaseCloner("AllDatabaseCloner"_sd,
-                 sharedData,
-                 source,
-                 client,
-                 storageInterface,
-                 dbPool,
-                 clockSource),
+                                     ThreadPool* dbPool)
+    : BaseCloner("AllDatabaseCloner"_sd, sharedData, source, client, storageInterface, dbPool),
+      _connectStage("connect", this, &AllDatabaseCloner::connectStage),
       _listDatabasesStage("listDatabases", this, &AllDatabaseCloner::listDatabasesStage) {}
 
 BaseCloner::ClonerStages AllDatabaseCloner::getStages() {
-    return {&_listDatabasesStage};
+    return {&_connectStage, &_listDatabasesStage};
+}
+
+Status AllDatabaseCloner::ensurePrimaryOrSecondary(
+    const executor::RemoteCommandResponse& isMasterReply) {
+    if (!isMasterReply.isOK()) {
+        log() << "Cannot reconnect because isMaster command failed.";
+        return isMasterReply.status;
+    }
+    if (isMasterReply.data["ismaster"].trueValue() || isMasterReply.data["secondary"].trueValue())
+        return Status::OK();
+
+    // There is a window during startup where a node has an invalid configuration and will have
+    // an isMaster response the same as a removed node.  So we must check to see if the node is
+    // removed by checking local configuration.
+    auto otherNodes =
+        ReplicationCoordinator::get(getGlobalServiceContext())->getOtherNodesInReplSet();
+    if (std::find(otherNodes.begin(), otherNodes.end(), getSource()) == otherNodes.end()) {
+        Status status(ErrorCodes::NotMasterOrSecondary,
+                      str::stream() << "Sync source " << getSource()
+                                    << " has been removed from the replication configuration.");
+        stdx::lock_guard<InitialSyncSharedData> lk(*getSharedData());
+        // Setting the status in the shared data will cancel the initial sync.
+        getSharedData()->setInitialSyncStatusIfOK(lk, status);
+        return status;
+    }
+    return Status(ErrorCodes::NotMasterOrSecondary,
+                  str::stream() << "Cannot connect because sync source " << getSource()
+                                << " is neither primary nor secondary.");
+}
+
+BaseCloner::AfterStageBehavior AllDatabaseCloner::connectStage() {
+    auto* client = getClient();
+    // If the client already has the address (from a previous attempt), we must allow it to
+    // handle the reconnect itself. This is necessary to get correct backoff behavior.
+    if (client->getServerHostAndPort() != getSource()) {
+        client->setHandshakeValidationHook(
+            [this](const executor::RemoteCommandResponse& isMasterReply) {
+                return ensurePrimaryOrSecondary(isMasterReply);
+            });
+        uassertStatusOK(client->connect(getSource(), StringData()));
+    } else {
+        client->checkConnection();
+    }
+    uassertStatusOK(replAuthenticate(client).withContext(
+        str::stream() << "Failed to authenticate to " << getSource()));
+    return kContinueNormally;
 }
 
 BaseCloner::AfterStageBehavior AllDatabaseCloner::listDatabasesStage() {
@@ -82,25 +124,15 @@ BaseCloner::AfterStageBehavior AllDatabaseCloner::listDatabasesStage() {
     return kContinueNormally;
 }
 
-void AllDatabaseCloner::preStage() {
-    // TODO(SERVER-43275): Implement retry logic here.  Alternately, do the initial connection
-    // in the BaseCloner retry logic and remove this method, but remember not to count the initial
-    // connection as a _re_try.
-    auto* client = getClient();
-    Status clientConnectionStatus = client->connect(getSource(), StringData());
-    if (clientConnectionStatus.isOK() && !replAuthenticate(client)) {
-        clientConnectionStatus =
-            Status{ErrorCodes::AuthenticationFailed,
-                   str::stream() << "Failed to authenticate to " << getSource()};
-    }
-    uassertStatusOK(clientConnectionStatus);
-}
-
 void AllDatabaseCloner::postStage() {
     {
         stdx::lock_guard<Latch> lk(_mutex);
-        _stats.databaseCount = _databases.size();
         _stats.databasesCloned = 0;
+        _stats.databaseStats.reserve(_databases.size());
+        for (const auto& dbName : _databases) {
+            _stats.databaseStats.emplace_back();
+            _stats.databaseStats.back().dbname = dbName;
+        }
     }
     for (const auto& dbName : _databases) {
         {
@@ -110,8 +142,7 @@ void AllDatabaseCloner::postStage() {
                                                                       getSource(),
                                                                       getClient(),
                                                                       getStorageInterface(),
-                                                                      getDBPool(),
-                                                                      getClock());
+                                                                      getDBPool());
         }
         auto dbStatus = _currentDatabaseCloner->run();
         if (dbStatus.isOK()) {
@@ -143,7 +174,7 @@ void AllDatabaseCloner::postStage() {
         }
         {
             stdx::lock_guard<Latch> lk(_mutex);
-            _stats.databaseStats.emplace_back(_currentDatabaseCloner->getStats());
+            _stats.databaseStats[_stats.databasesCloned] = _currentDatabaseCloner->getStats();
             _currentDatabaseCloner = nullptr;
             _stats.databasesCloned++;
         }
@@ -154,7 +185,7 @@ AllDatabaseCloner::Stats AllDatabaseCloner::getStats() const {
     stdx::lock_guard<Latch> lk(_mutex);
     AllDatabaseCloner::Stats stats = _stats;
     if (_currentDatabaseCloner) {
-        stats.databaseStats.emplace_back(_currentDatabaseCloner->getStats());
+        stats.databaseStats[_stats.databasesCloned] = _currentDatabaseCloner->getStats();
     }
     return stats;
 }
@@ -164,8 +195,7 @@ std::string AllDatabaseCloner::toString() const {
     return str::stream() << "initial sync --"
                          << " active:" << isActive(lk) << " status:" << getStatus(lk).toString()
                          << " source:" << getSource()
-                         << " db cloners completed:" << _stats.databasesCloned
-                         << " db count:" << _stats.databaseCount;
+                         << " db cloners completed:" << _stats.databasesCloned;
 }
 
 std::string AllDatabaseCloner::Stats::toString() const {
@@ -180,7 +210,6 @@ BSONObj AllDatabaseCloner::Stats::toBSON() const {
 
 void AllDatabaseCloner::Stats::append(BSONObjBuilder* builder) const {
     builder->appendNumber("databasesCloned", databasesCloned);
-    builder->appendNumber("databaseCount", databaseCount);
     for (auto&& db : databaseStats) {
         BSONObjBuilder dbBuilder(builder->subobjStart(db.dbname));
         db.append(&dbBuilder);

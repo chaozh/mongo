@@ -114,7 +114,7 @@ unsigned long long collectionCount(OperationContext* opCtx,
         auto databaseHolder = DatabaseHolder::get(opCtx);
         auto db = databaseHolder->getDb(opCtx, nss.ns());
         if (db) {
-            coll = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(nss);
+            coll = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, nss);
         }
     } else {
         ctx.emplace(opCtx, nss);
@@ -183,8 +183,9 @@ void dropTempCollections(OperationContext* cleanupOpCtx,
             [cleanupOpCtx, &tempNamespace] {
                 AutoGetDb autoDb(cleanupOpCtx, tempNamespace.db(), MODE_X);
                 if (auto db = autoDb.getDb()) {
-                    if (auto collection = CollectionCatalog::get(cleanupOpCtx)
-                                              .lookupCollectionByNamespace(tempNamespace)) {
+                    if (auto collection =
+                            CollectionCatalog::get(cleanupOpCtx)
+                                .lookupCollectionByNamespace(cleanupOpCtx, tempNamespace)) {
                         uassert(ErrorCodes::PrimarySteppedDown,
                                 str::stream() << "no longer primary while dropping temporary "
                                                  "collection for mapReduce: "
@@ -210,7 +211,7 @@ void dropTempCollections(OperationContext* cleanupOpCtx,
                 auto databaseHolder = DatabaseHolder::get(cleanupOpCtx);
                 if (auto db = databaseHolder->getDb(cleanupOpCtx, incLong.ns())) {
                     if (auto collection = CollectionCatalog::get(cleanupOpCtx)
-                                              .lookupCollectionByNamespace(incLong)) {
+                                              .lookupCollectionByNamespace(cleanupOpCtx, incLong)) {
                         BackgroundOperation::assertNoBgOpInProgForNs(incLong.ns());
                         IndexBuildsCoordinator::get(cleanupOpCtx)
                             ->assertNoIndexBuildInProgForCollection(collection->uuid());
@@ -525,7 +526,8 @@ void State::prepTempCollection() {
         writeConflictRetry(_opCtx, "M/R prepTempCollection", _config.incLong.ns(), [this] {
             AutoGetOrCreateDb autoGetIncCollDb(_opCtx, _config.incLong.db(), MODE_X);
             auto const db = autoGetIncCollDb.getDb();
-            invariant(!CollectionCatalog::get(_opCtx).lookupCollectionByNamespace(_config.incLong));
+            invariant(!CollectionCatalog::get(_opCtx).lookupCollectionByNamespace(_opCtx,
+                                                                                  _config.incLong));
 
             CollectionOptions options;
             options.setNoIdIndex();
@@ -560,8 +562,8 @@ void State::prepTempCollection() {
 
         auto const finalColl = autoGetFinalColl.getCollection();
         if (finalColl) {
-            finalOptions =
-                DurableCatalog::get(_opCtx)->getCollectionOptions(_opCtx, finalColl->ns());
+            finalOptions = DurableCatalog::get(_opCtx)->getCollectionOptions(
+                _opCtx, finalColl->getCatalogId());
 
             std::unique_ptr<IndexCatalog::IndexIterator> ii =
                 finalColl->getIndexCatalog()->getIndexIterator(_opCtx, true);
@@ -587,8 +589,8 @@ void State::prepTempCollection() {
         // Create temp collection and insert the indexes from temporary storage
         AutoGetOrCreateDb autoGetFinalDb(_opCtx, _config.tempNamespace.db(), MODE_X);
         auto const db = autoGetFinalDb.getDb();
-        invariant(
-            !CollectionCatalog::get(_opCtx).lookupCollectionByNamespace(_config.tempNamespace));
+        invariant(!CollectionCatalog::get(_opCtx).lookupCollectionByNamespace(
+            _opCtx, _config.tempNamespace));
 
         uassert(
             ErrorCodes::PrimarySteppedDown,
@@ -623,39 +625,9 @@ void State::prepTempCollection() {
             _opCtx, indexesToInsert, removeIndexBuildsToo);
 
         if (!filteredIndexes.empty()) {
-            // Emit startIndexBuild and commitIndexBuild oplog entries if supported by the
-            // current FCV.
-            auto opObserver = _opCtx->getServiceContext()->getOpObserver();
-            const auto& tmpName = _config.tempNamespace;
             auto fromMigrate = false;
-            auto buildUUID = serverGlobalParams.featureCompatibility.isVersionInitialized() &&
-                    serverGlobalParams.featureCompatibility.getVersion() ==
-                        ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo44
-                ? boost::make_optional(UUID::gen())
-                : boost::none;
-
-            if (buildUUID) {
-                opObserver->onStartIndexBuild(
-                    _opCtx, tmpName, tempColl->uuid(), *buildUUID, filteredIndexes, fromMigrate);
-            }
-
-            for (const auto& indexToInsert : filteredIndexes) {
-                uassertStatusOK(tempColl->getIndexCatalog()->createIndexOnEmptyCollection(
-                    _opCtx, indexToInsert));
-
-                // If two phase index builds is enabled, index build will be coordinated using
-                // startIndexBuild and commitIndexBuild oplog entries.
-                if (!IndexBuildsCoordinator::get(_opCtx)->supportsTwoPhaseIndexBuild()) {
-                    // Log the createIndex operation.
-                    opObserver->onCreateIndex(
-                        _opCtx, tmpName, tempColl->uuid(), indexToInsert, fromMigrate);
-                }
-            }
-
-            if (buildUUID) {
-                opObserver->onCommitIndexBuild(
-                    _opCtx, tmpName, tempColl->uuid(), *buildUUID, filteredIndexes, fromMigrate);
-            }
+            IndexBuildsCoordinator::get(_opCtx)->createIndexesOnEmptyCollection(
+                _opCtx, tempColl->uuid(), filteredIndexes, fromMigrate);
         }
 
         wuow.commit();
@@ -763,11 +735,16 @@ long long State::postProcessCollectionNonAtomic(OperationContext* opCtx,
     // Make sure we enforce prepare conflicts before writing.
     EnforcePrepareConflictsBlock enforcePrepare(opCtx);
 
-    if (_config.outputOptions.finalNamespace == _config.tempNamespace)
-        return collectionCount(opCtx, _config.outputOptions.finalNamespace, callerHoldsGlobalLock);
+    auto outputCount =
+        collectionCount(opCtx, _config.outputOptions.finalNamespace, callerHoldsGlobalLock);
 
-    if (_config.outputOptions.outType == OutputType::Replace ||
-        collectionCount(opCtx, _config.outputOptions.finalNamespace, callerHoldsGlobalLock) == 0) {
+    // Determine whether the temp collection should be renamed to the final output collection and
+    // thus preserve the UUID. This is possible in the following cases:
+    //  * Output mode "replace"
+    //  * If this mapReduce is creating a new sharded output collection, which can be determined by
+    //  whether mongos sent the UUID that the final output collection should have (that is, whether
+    //  _config.finalOutputCollUUID is set).
+    if (_config.outputOptions.outType == OutputType::Replace || _config.finalOutputCollUUID) {
         // This must be global because we may write across different databases.
         Lock::GlobalWrite lock(opCtx);
         // replace: just rename from temp to final collection name, dropping previous collection
@@ -785,12 +762,10 @@ long long State::postProcessCollectionNonAtomic(OperationContext* opCtx,
         _db.dropCollection(_config.tempNamespace.ns());
     } else if (_config.outputOptions.outType == OutputType::Merge) {
         // merge: upsert new docs into old collection
-        const auto count = collectionCount(opCtx, _config.tempNamespace, callerHoldsGlobalLock);
-
         ProgressMeterHolder pm;
         {
             stdx::unique_lock<Client> lk(*opCtx->getClient());
-            pm.set(curOp->setProgress_inlock("M/R Merge Post Processing", count));
+            pm.set(curOp->setProgress_inlock("M/R Merge Post Processing", outputCount));
         }
 
         unique_ptr<DBClientCursor> cursor = _db.query(_config.tempNamespace, BSONObj());
@@ -806,12 +781,10 @@ long long State::postProcessCollectionNonAtomic(OperationContext* opCtx,
         // reduce: apply reduce op on new result and existing one
         BSONList values;
 
-        const auto count = collectionCount(opCtx, _config.tempNamespace, callerHoldsGlobalLock);
-
         ProgressMeterHolder pm;
         {
             stdx::unique_lock<Client> lk(*opCtx->getClient());
-            pm.set(curOp->setProgress_inlock("M/R Reduce Post Processing", count));
+            pm.set(curOp->setProgress_inlock("M/R Reduce Post Processing", outputCount));
         }
 
         unique_ptr<DBClientCursor> cursor = _db.query(_config.tempNamespace, BSONObj());
@@ -823,7 +796,6 @@ long long State::postProcessCollectionNonAtomic(OperationContext* opCtx,
 
             const bool found = [&] {
                 AutoGetCollection autoColl(opCtx, _config.outputOptions.finalNamespace, MODE_IS);
-                assertCollectionNotNull(_config.outputOptions.finalNamespace, autoColl);
                 return Helpers::findOne(
                     opCtx, autoColl.getCollection(), temp["_id"].wrap(), old, true);
             }();
@@ -1443,10 +1415,10 @@ bool runMapReduce(OperationContext* opCtx,
 
     uassert(16149, "cannot run map reduce without the js engine", getGlobalScriptEngine());
 
-    const auto metadata = [&] {
+    const auto collectionFilter = [&] {
         AutoGetCollectionForReadCommand autoColl(opCtx, config.nss);
         return CollectionShardingState::get(opCtx, config.nss)
-            ->getOrphansFilter(opCtx, autoColl.getCollection());
+            ->getOwnershipFilter(opCtx, autoColl.getCollection());
     }();
 
     bool shouldHaveData = false;
@@ -1541,9 +1513,9 @@ bool runMapReduce(OperationContext* opCtx,
 
                 // Check to see if this is a new object we don't own yet because of a chunk
                 // migration
-                if (metadata->isSharded()) {
-                    ShardKeyPattern kp(metadata->getKeyPattern());
-                    if (!metadata->keyBelongsToMe(kp.extractShardKeyFromDoc(o))) {
+                if (collectionFilter.isSharded()) {
+                    ShardKeyPattern kp(collectionFilter.getKeyPattern());
+                    if (!collectionFilter.keyBelongsToMe(kp.extractShardKeyFromDoc(o))) {
                         continue;
                     }
                 }
@@ -1660,6 +1632,12 @@ bool runMapReduce(OperationContext* opCtx,
             return false;
         }
     } catch (StaleConfigException& e) {
+        if (serverGlobalParams.featureCompatibility.isVersionInitialized() &&
+            serverGlobalParams.featureCompatibility.getVersion() ==
+                ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo44) {
+            invariant(e.extraInfo<StaleConfigInfo>()->getShardId());
+        }
+
         log() << "mr detected stale config, should retry" << redact(e);
         throw;
     }

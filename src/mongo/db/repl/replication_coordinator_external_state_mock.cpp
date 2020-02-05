@@ -82,6 +82,9 @@ Status ReplicationCoordinatorExternalStateMock::initializeReplSetStorage(Operati
 
 void ReplicationCoordinatorExternalStateMock::shutdown(OperationContext*) {}
 
+void ReplicationCoordinatorExternalStateMock::clearAppliedThroughIfCleanShutdown(
+    OperationContext*) {}
+
 executor::TaskExecutor* ReplicationCoordinatorExternalStateMock::getTaskExecutor() const {
     return nullptr;
 }
@@ -227,6 +230,8 @@ void ReplicationCoordinatorExternalStateMock::closeConnections() {
 }
 
 void ReplicationCoordinatorExternalStateMock::shardingOnStepDownHook() {}
+
+void ReplicationCoordinatorExternalStateMock::clearOplogVisibilityStateForStepDown() {}
 
 void ReplicationCoordinatorExternalStateMock::signalApplierToChooseNewSyncSource() {}
 

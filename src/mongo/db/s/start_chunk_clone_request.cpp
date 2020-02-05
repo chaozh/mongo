@@ -34,12 +34,17 @@
 #include "mongo/base/status_with.h"
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/bson/util/bson_extract.h"
+#include "mongo/db/commands/feature_compatibility_version.h"
 
 namespace mongo {
 namespace {
 
 const char kRecvChunkStart[] = "_recvChunkStart";
 const char kFromShardConnectionString[] = "from";
+// Note: The UUID parsing code relies on this field being named 'uuid'.
+const char kMigrationId[] = "uuid";
+const char kLsid[] = "lsid";
+const char kTxnNumber[] = "txnNumber";
 const char kFromShardId[] = "fromShardName";
 const char kToShardId[] = "toShardName";
 const char kChunkMinKey[] = "min";
@@ -70,6 +75,15 @@ StatusWith<StartChunkCloneRequest> StartChunkCloneRequest::createFromCommand(Nam
     StartChunkCloneRequest request(std::move(nss),
                                    std::move(sessionIdStatus.getValue()),
                                    std::move(secondaryThrottleStatus.getValue()));
+
+    // TODO (SERVER-44787): Remove this existence check after 4.4 is released and the
+    // disableResumableRangeDeleter option is removed.
+    if (obj.getField("uuid")) {
+        request._migrationId = UUID::parse(obj);
+        request._lsid = LogicalSessionId::parse(IDLParserErrorContext("StartChunkCloneRequest"),
+                                                obj[kLsid].Obj());
+        request._txnNumber = obj.getField(kTxnNumber).Long();
+    }
 
     {
         std::string fromShardConnectionString;
@@ -150,6 +164,39 @@ StatusWith<StartChunkCloneRequest> StartChunkCloneRequest::createFromCommand(Nam
     return request;
 }
 
+void StartChunkCloneRequest::appendAsCommand(
+    BSONObjBuilder* builder,
+    const NamespaceString& nss,
+    const UUID& migrationId,
+    const LogicalSessionId& lsid,
+    TxnNumber txnNumber,
+    const MigrationSessionId& sessionId,
+    const ConnectionString& fromShardConnectionString,
+    const ShardId& fromShardId,
+    const ShardId& toShardId,
+    const BSONObj& chunkMinKey,
+    const BSONObj& chunkMaxKey,
+    const BSONObj& shardKeyPattern,
+    const MigrationSecondaryThrottleOptions& secondaryThrottle) {
+    invariant(builder->asTempObj().isEmpty());
+    invariant(nss.isValid());
+    invariant(fromShardConnectionString.isValid());
+
+    builder->append(kRecvChunkStart, nss.ns());
+    migrationId.appendToBuilder(builder, kMigrationId);
+    builder->append(kLsid, lsid.toBSON());
+    builder->append(kTxnNumber, txnNumber);
+    sessionId.append(builder);
+    builder->append(kFromShardConnectionString, fromShardConnectionString.toString());
+    builder->append(kFromShardId, fromShardId.toString());
+    builder->append(kToShardId, toShardId.toString());
+    builder->append(kChunkMinKey, chunkMinKey);
+    builder->append(kChunkMaxKey, chunkMaxKey);
+    builder->append(kShardKeyPattern, shardKeyPattern);
+    secondaryThrottle.append(builder);
+}
+
+// TODO (SERVER-44787): Remove this overload after 4.4 is released.
 void StartChunkCloneRequest::appendAsCommand(
     BSONObjBuilder* builder,
     const NamespaceString& nss,

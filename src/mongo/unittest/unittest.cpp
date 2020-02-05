@@ -33,6 +33,7 @@
 
 #include "mongo/unittest/unittest.h"
 
+#include <boost/log/core.hpp>
 #include <fmt/format.h>
 #include <fmt/printf.h>
 #include <functional>
@@ -48,6 +49,12 @@
 #include "mongo/logger/logger.h"
 #include "mongo/logger/message_event_utf8_encoder.h"
 #include "mongo/logger/message_log_domain.h"
+#include "mongo/logv2/component_settings_filter.h"
+#include "mongo/logv2/log_capture_backend.h"
+#include "mongo/logv2/log_domain.h"
+#include "mongo/logv2/log_domain_global.h"
+#include "mongo/logv2/log_manager.h"
+#include "mongo/logv2/plain_formatter.h"
 #include "mongo/platform/mutex.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/log.h"
@@ -67,8 +74,9 @@ logger::MessageLogDomain* unittestOutput() {
     return p;
 }
 
+/** Each map key is owned by its corresponding Suite object. */
 auto& suitesMap() {
-    static std::map<std::string, std::shared_ptr<Suite>> m;
+    static std::map<StringData, std::shared_ptr<Suite>> m;
     return m;
 }
 
@@ -186,13 +194,30 @@ struct UnitTestEnvironment {
 
 }  // namespace
 
-Test::Test() : _isCapturingLogMessages(false) {}
-
-Test::~Test() {
-    if (_isCapturingLogMessages) {
-        stopCapturingLogMessages();
+class Test::CaptureLogs {
+public:
+    ~CaptureLogs() {
+        if (_isCapturingLogMessages) {
+            stopCapturingLogMessages();
+        }
     }
-}
+    void startCapturingLogMessages();
+    void stopCapturingLogMessages();
+    const std::vector<std::string>& getCapturedTextFormatLogMessages() const;
+    int64_t countTextFormatLogLinesContaining(const std::string& needle);
+    void printCapturedTextFormatLogLines() const;
+
+private:
+    bool _isCapturingLogMessages{false};
+    std::vector<std::string> _capturedLogMessages;
+    logger::MessageLogDomain::AppenderHandle _captureAppenderHandle;
+    std::unique_ptr<logger::MessageLogDomain::EventAppender> _captureAppender;
+    boost::shared_ptr<boost::log::sinks::synchronous_sink<logv2::LogCaptureBackend>> _captureSink;
+};
+
+Test::Test() : _captureLogs(std::make_unique<CaptureLogs>()) {}
+
+Test::~Test() {}
 
 void Test::run() {
     UnitTestEnvironment environment(this);
@@ -245,52 +270,98 @@ private:
 };
 }  // namespace
 
-void Test::startCapturingLogMessages() {
+void Test::CaptureLogs::startCapturingLogMessages() {
     invariant(!_isCapturingLogMessages);
     _capturedLogMessages.clear();
-    if (!_captureAppender) {
-        _captureAppender = std::make_unique<StringVectorAppender>(&_capturedLogMessages);
+
+    if (logV2Enabled()) {
+        if (!_captureSink) {
+            _captureSink = logv2::LogCaptureBackend::create(_capturedLogMessages);
+            _captureSink->set_filter(
+                logv2::AllLogsFilter(logv2::LogManager::global().getGlobalDomain()));
+            _captureSink->set_formatter(logv2::PlainFormatter());
+        }
+        boost::log::core::get()->add_sink(_captureSink);
+    } else {
+        if (!_captureAppender) {
+            _captureAppender = std::make_unique<StringVectorAppender>(&_capturedLogMessages);
+        }
+        checked_cast<StringVectorAppender*>(_captureAppender.get())->enable();
+        _captureAppenderHandle =
+            logger::globalLogDomain()->attachAppender(std::move(_captureAppender));
     }
-    checked_cast<StringVectorAppender*>(_captureAppender.get())->enable();
-    _captureAppenderHandle = logger::globalLogDomain()->attachAppender(std::move(_captureAppender));
+
     _isCapturingLogMessages = true;
 }
 
-void Test::stopCapturingLogMessages() {
+void Test::CaptureLogs::stopCapturingLogMessages() {
     invariant(_isCapturingLogMessages);
-    invariant(!_captureAppender);
-    _captureAppender = logger::globalLogDomain()->detachAppender(_captureAppenderHandle);
-    checked_cast<StringVectorAppender*>(_captureAppender.get())->disable();
+    if (logV2Enabled()) {
+        boost::log::core::get()->remove_sink(_captureSink);
+    } else {
+        invariant(!_captureAppender);
+        _captureAppender = logger::globalLogDomain()->detachAppender(_captureAppenderHandle);
+        checked_cast<StringVectorAppender*>(_captureAppender.get())->disable();
+    }
+
     _isCapturingLogMessages = false;
 }
-void Test::printCapturedLogLines() const {
+
+const std::vector<std::string>& Test::CaptureLogs::getCapturedTextFormatLogMessages() const {
+    return _capturedLogMessages;
+}
+
+void Test::CaptureLogs::printCapturedTextFormatLogLines() const {
     log() << "****************************** Captured Lines (start) *****************************";
-    for (const auto& line : getCapturedLogMessages()) {
+    for (const auto& line : getCapturedTextFormatLogMessages()) {
         log() << line;
     }
     log() << "****************************** Captured Lines (end) ******************************";
 }
 
-int64_t Test::countLogLinesContaining(const std::string& needle) {
-    const auto& msgs = getCapturedLogMessages();
+int64_t Test::CaptureLogs::countTextFormatLogLinesContaining(const std::string& needle) {
+    const auto& msgs = getCapturedTextFormatLogMessages();
     return std::count_if(
         msgs.begin(), msgs.end(), [&](const std::string& s) { return stringContains(s, needle); });
 }
 
-Suite::Suite(ConstructorEnable, std::string name) : _name(std::move(name)) {}
-
-void Suite::add(std::string name, std::function<void()> testFn) {
-    _tests.push_back({std::move(name), std::move(testFn)});
+void Test::startCapturingLogMessages() {
+    _captureLogs->startCapturingLogMessages();
+}
+void Test::stopCapturingLogMessages() {
+    _captureLogs->stopCapturingLogMessages();
+}
+const std::vector<std::string>& Test::getCapturedTextFormatLogMessages() const {
+    return _captureLogs->getCapturedTextFormatLogMessages();
+}
+int64_t Test::countTextFormatLogLinesContaining(const std::string& needle) {
+    return _captureLogs->countTextFormatLogLinesContaining(needle);
+}
+void Test::printCapturedTextFormatLogLines() const {
+    _captureLogs->printCapturedTextFormatLogLines();
 }
 
-std::unique_ptr<Result> Suite::run(const std::string& filter, int runsPerTest) {
+Suite::Suite(ConstructorEnable, std::string name) : _name(std::move(name)) {}
+
+void Suite::add(std::string name, std::string fileName, std::function<void()> testFn) {
+    _tests.push_back({std::move(name), std::move(fileName), std::move(testFn)});
+}
+
+std::unique_ptr<Result> Suite::run(const std::string& filter,
+                                   const std::string& fileNameFilter,
+                                   int runsPerTest) {
     Timer timer;
     auto r = std::make_unique<Result>(_name);
 
     for (const auto& tc : _tests) {
         if (filter.size() && tc.name.find(filter) == std::string::npos) {
-            LOG(1) << "\t skipping test: " << tc.name << " because doesn't match filter"
-                   << std::endl;
+            LOG(1) << "\t skipping test: " << tc.name << " because it doesn't match filter";
+            continue;
+        }
+
+        if (fileNameFilter.size() && tc.fileName.find(fileNameFilter) == std::string::npos) {
+            LOG(1) << "\t skipping test: " << tc.fileName
+                   << " because it doesn't match fileNameFilter";
             continue;
         }
 
@@ -337,12 +408,15 @@ std::unique_ptr<Result> Suite::run(const std::string& filter, int runsPerTest) {
 
     r->_millis = timer.millis();
 
-    log() << "\t DONE running tests" << std::endl;
+    log() << "\t DONE running tests";
 
     return r;
 }
 
-int Suite::run(const std::vector<std::string>& suites, const std::string& filter, int runsPerTest) {
+int Suite::run(const std::vector<std::string>& suites,
+               const std::string& filter,
+               const std::string& fileNameFilter,
+               int runsPerTest) {
     if (suitesMap().empty()) {
         log() << "error: no suites registered.";
         return EXIT_FAILURE;
@@ -360,7 +434,7 @@ int Suite::run(const std::vector<std::string>& suites, const std::string& filter
 
     if (torun.empty()) {
         for (const auto& kv : suitesMap()) {
-            torun.push_back(kv.first);
+            torun.push_back(std::string{kv.first});
         }
     }
 
@@ -371,7 +445,7 @@ int Suite::run(const std::vector<std::string>& suites, const std::string& filter
         fassert(16145, s != nullptr);
 
         log() << "going to run suite: " << name << std::endl;
-        results.push_back(s->run(filter, runsPerTest));
+        results.push_back(s->run(filter, fileNameFilter, runsPerTest));
     }
 
     log() << "**************************************************" << std::endl;
@@ -423,13 +497,13 @@ int Suite::run(const std::vector<std::string>& suites, const std::string& filter
     return rc;
 }
 
-Suite& Suite::getSuite(const std::string& name) {
+Suite& Suite::getSuite(StringData name) {
     auto& map = suitesMap();
     if (auto found = map.find(name); found != map.end()) {
         return *found->second;
     }
-    auto sp = std::make_shared<Suite>(ConstructorEnable{}, name);
-    auto [it, noCollision] = map.try_emplace(name, sp->shared_from_this());
+    auto sp = std::make_shared<Suite>(ConstructorEnable{}, std::string{name});
+    auto [it, noCollision] = map.try_emplace(sp->key(), sp->shared_from_this());
     fassert(10162, noCollision);
     return *sp;
 }
@@ -486,7 +560,7 @@ std::ostream& TestAssertionFailure::stream() {
 std::vector<std::string> getAllSuiteNames() {
     std::vector<std::string> result;
     for (const auto& kv : suitesMap()) {
-        result.push_back(kv.first);
+        result.push_back(std::string{kv.first});
     }
     return result;
 }

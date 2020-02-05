@@ -33,6 +33,7 @@
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/repl/bson_extract_optime.h"
+#include "mongo/db/server_options.h"
 
 namespace mongo {
 namespace repl {
@@ -41,6 +42,7 @@ namespace {
 const std::string kCandidateIndexFieldName = "candidateIndex";
 const std::string kCommandName = "replSetRequestVotes";
 const std::string kConfigVersionFieldName = "configVersion";
+const std::string kConfigTermFieldName = "configTerm";
 const std::string kDryRunFieldName = "dryRun";
 // The underlying field name is inaccurate, but changing it requires a fair amount of cross
 // compatibility work for no real benefit.
@@ -56,6 +58,7 @@ const std::string kLegalArgsFieldNames[] = {
     kCandidateIndexFieldName,
     kCommandName,
     kConfigVersionFieldName,
+    kConfigTermFieldName,
     kDryRunFieldName,
     kLastDurableOpTimeFieldName,
     kSetNameFieldName,
@@ -80,7 +83,14 @@ Status ReplSetRequestVotesArgs::initialize(const BSONObj& argsObj) {
     if (!status.isOK())
         return status;
 
-    status = bsonExtractIntegerField(argsObj, kConfigVersionFieldName, &_cfgver);
+    status = bsonExtractIntegerField(argsObj, kConfigVersionFieldName, &_cfgVer);
+    if (!status.isOK())
+        return status;
+
+    // In order to be compatible with FCV 4.2, default the config term to -1 if we are unable
+    // parse a configTerm field from the args.
+    status = bsonExtractIntegerFieldWithDefault(
+        argsObj, kConfigTermFieldName, OpTime::kUninitializedTerm, &_cfgTerm);
     if (!status.isOK())
         return status;
 
@@ -112,7 +122,11 @@ long long ReplSetRequestVotesArgs::getCandidateIndex() const {
 }
 
 long long ReplSetRequestVotesArgs::getConfigVersion() const {
-    return _cfgver;
+    return _cfgVer;
+}
+
+long long ReplSetRequestVotesArgs::getConfigTerm() const {
+    return _cfgTerm;
 }
 
 OpTime ReplSetRequestVotesArgs::getLastDurableOpTime() const {
@@ -129,7 +143,8 @@ void ReplSetRequestVotesArgs::addToBSON(BSONObjBuilder* builder) const {
     builder->append(kDryRunFieldName, _dryRun);
     builder->append(kTermFieldName, _term);
     builder->appendIntOrLL(kCandidateIndexFieldName, _candidateIndex);
-    builder->appendIntOrLL(kConfigVersionFieldName, _cfgver);
+    builder->appendIntOrLL(kConfigVersionFieldName, _cfgVer);
+    builder->appendIntOrLL(kConfigTermFieldName, _cfgTerm);
     _lastDurableOpTime.append(builder, kLastDurableOpTimeFieldName);
 }
 

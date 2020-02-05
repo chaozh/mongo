@@ -48,6 +48,67 @@ class BSONObj;
 namespace repl {
 
 /**
+ * A structure that stores a ReplSetConfig (version, term) pair.
+ *
+ * This can be used to compare two ReplSetConfig objects to determine which is logically newer.
+ */
+class ConfigVersionAndTerm {
+public:
+    ConfigVersionAndTerm() : _version(0), _term(OpTime::kUninitializedTerm) {}
+    ConfigVersionAndTerm(int version, long long term) : _version(version), _term(term) {}
+
+    inline bool operator==(const ConfigVersionAndTerm& rhs) const {
+        // If term of either item is uninitialized (-1), then we ignore terms entirely and only
+        // compare versions.
+        if (_term == OpTime::kUninitializedTerm || rhs._term == OpTime::kUninitializedTerm) {
+            return _version == rhs._version;
+        }
+        // Compare term first, then the versions.
+        return std::tie(_term, _version) == std::tie(rhs._term, rhs._version);
+    }
+
+    inline bool operator<(const ConfigVersionAndTerm& rhs) const {
+        // If term of either item is uninitialized (-1), then we ignore terms entirely and only
+        // compare versions. This allows force reconfigs, which set the config term to -1, to
+        // override other configs by using a high config version.
+        if (_term == OpTime::kUninitializedTerm || rhs._term == OpTime::kUninitializedTerm) {
+            return _version < rhs._version;
+        }
+        // Compare term first, then the versions.
+        return std::tie(_term, _version) < std::tie(rhs._term, rhs._version);
+    }
+
+    inline bool operator!=(const ConfigVersionAndTerm& rhs) const {
+        return !(*this == rhs);
+    }
+
+    inline bool operator<=(const ConfigVersionAndTerm& rhs) const {
+        return *this < rhs || *this == rhs;
+    }
+
+    inline bool operator>(const ConfigVersionAndTerm& rhs) const {
+        return !(*this <= rhs);
+    }
+
+    inline bool operator>=(const ConfigVersionAndTerm& rhs) const {
+        return !(*this < rhs);
+    }
+
+    // TODO (SERVER-45082): Implement string conversion.
+    std::string toString() const {
+        return "";
+    };
+
+    friend std::ostream& operator<<(std::ostream& out, const ConfigVersionAndTerm& cvt) {
+        return out << cvt.toString();
+    }
+
+private:
+    long long _version;
+    long long _term;
+};
+
+/**
  * Representation of the configuration information about a particular replica set.
  */
 class ReplSetConfig {
@@ -56,13 +117,18 @@ public:
 
     static const std::string kConfigServerFieldName;
     static const std::string kVersionFieldName;
+    static const std::string kTermFieldName;
     static const std::string kMajorityWriteConcernModeName;
 
     // If this field is present, a repair operation potentially modified replicated data. This
     // should never be included in a valid configuration document.
     static const std::string kRepairedFieldName;
 
-    static const size_t kMaxMembers = 50;
+    /**
+     * Inline `kMaxMembers` to allow others (e.g, `WriteConcernOptions`) use
+     * the constant without linking to `repl_set_config.cpp`.
+     */
+    inline static const size_t kMaxMembers = 50;
     static const size_t kMaxVotingMembers = 7;
     static const Milliseconds kInfiniteCatchUpTimeout;
     static const Milliseconds kCatchUpDisabled;
@@ -78,12 +144,17 @@ public:
     /**
      * Initializes this ReplSetConfig from the contents of "cfg".
      * Sets _replicaSetId to "defaultReplicaSetId" if a replica set ID is not specified in "cfg".
+     * If forceTerm is not boost::none, sets _term to the given term. Otherwise, parses term from
+     * config BSON.
      */
-    Status initialize(const BSONObj& cfg, OID defaultReplicaSetId = OID());
+    Status initialize(const BSONObj& cfg,
+                      boost::optional<long long> forceTerm = boost::none,
+                      OID defaultReplicaSetId = OID());
 
     /**
      * Same as the generic initialize() above except will default "configsvr" setting to the value
      * of serverGlobalParams.configsvr.
+     * Sets _term to kInitialTerm.
      */
     Status initializeForInitiate(const BSONObj& cfg);
 
@@ -118,6 +189,16 @@ public:
      */
     long long getConfigVersion() const {
         return _version;
+    }
+
+    /**
+     * Gets the term of this configuration.
+     *
+     * The configuration term is the term of the primary that originally created this configuration.
+     * Configurations in a replica set are totally ordered by their term and configuration version.
+     */
+    long long getConfigTerm() const {
+        return _term;
     }
 
     /**
@@ -163,6 +244,19 @@ public:
     const std::vector<MemberConfig>& members() const {
         return _members;
     }
+
+    /**
+     * Returns all voting members in this ReplSetConfig.
+     */
+    std::vector<MemberConfig> votingMembers() const {
+        std::vector<MemberConfig> votingMembers;
+        for (const MemberConfig& m : _members) {
+            if (m.getNumVotes() > 0) {
+                votingMembers.push_back(m);
+            }
+        }
+        return votingMembers;
+    };
 
     /**
      * Access a MemberConfig element by index.
@@ -395,11 +489,17 @@ private:
     /**
      * Sets replica set ID to 'defaultReplicaSetId' if forInitiate is false and 'cfg' does not
      * contain an ID.
+     * Sets _term to kInitialTerm for initiate.
+     * Sets _term to forceTerm if it is not boost::none. Otherwise, parses term from 'cfg'.
      */
-    Status _initialize(const BSONObj& cfg, bool forInitiate, OID defaultReplicaSetId);
+    Status _initialize(const BSONObj& cfg,
+                       bool forInitiate,
+                       boost::optional<long long> forceTerm,
+                       OID defaultReplicaSetId);
 
     bool _isInitialized = false;
     long long _version = 1;
+    long long _term = OpTime::kUninitializedTerm;
     std::string _replSetName;
     std::vector<MemberConfig> _members;
     WriteConcernOptions _defaultWriteConcern;

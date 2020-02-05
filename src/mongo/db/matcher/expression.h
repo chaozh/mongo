@@ -29,6 +29,7 @@
 
 #pragma once
 
+#include <boost/optional.hpp>
 #include <functional>
 #include <memory>
 
@@ -185,11 +186,12 @@ public:
 
     /**
      * For MatchExpression nodes that can participate in tree restructuring (like AND/OR), returns a
-     * non-const vector of MatchExpression* child nodes.
+     * non-const vector of MatchExpression* child nodes. If the MatchExpression does not
+     * participated in tree restructuring, returns boost::none.
      * Do not use to traverse the MatchExpression tree. Use numChildren() and getChild(), which
      * provide access to all nodes.
      */
-    virtual std::vector<MatchExpression*>* getChildVector() = 0;
+    virtual boost::optional<std::vector<MatchExpression*>&> getChildVector() = 0;
 
     /**
      * Get the path of the leaf.  Returns StringData() if there is no path (node is logical).
@@ -291,9 +293,10 @@ public:
     /**
      * Serialize the MatchExpression to BSON, appending to 'out'. Output of this method is expected
      * to be a valid query object, that, when parsed, produces a logically equivalent
-     * MatchExpression.
+     * MatchExpression. If 'includePath' is false then the serialization should assume it's in a
+     * context where the path has been serialized elsewhere, such as within an $elemMatch value.
      */
-    virtual void serialize(BSONObjBuilder* out) const = 0;
+    virtual void serialize(BSONObjBuilder* out, bool includePath = true) const = 0;
 
     /**
      * Returns true if this expression will always evaluate to false, such as an $or with no

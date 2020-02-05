@@ -186,7 +186,8 @@ BSONObj buildCollectionBson(OperationContext* opCtx,
         return b.obj();
     }
 
-    CollectionOptions options = DurableCatalog::get(opCtx)->getCollectionOptions(opCtx, nss);
+    CollectionOptions options =
+        DurableCatalog::get(opCtx)->getCollectionOptions(opCtx, collection->getCatalogId());
 
     // While the UUID is stored as a collection option, from the user's perspective it is an
     // unsettable read-only property, so put it in the 'info' section.
@@ -311,7 +312,7 @@ public:
 
                         Lock::CollectionLock clk(opCtx, nss, MODE_IS);
                         Collection* collection =
-                            CollectionCatalog::get(opCtx).lookupCollectionByNamespace(nss);
+                            CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, nss);
                         BSONObj collBson =
                             buildCollectionBson(opCtx, collection, includePendingDrops, nameOnly);
                         if (!collBson.isEmpty()) {

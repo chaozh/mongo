@@ -79,7 +79,7 @@ for (let i = 0; i < nDocs; i++) {
     bulk.insert({word: "hello", val: "a".repeat(longStringLength)});
 }
 assert.commandWorked(bulk.execute());
-assert.commandFailedWithCode(db.runCommand(command), [ErrorCodes.BSONObjectTooLarge, 16493]);
+assert.commandFailedWithCode(db.runCommand(command), [31392, 16493]);
 
 //
 // Test that the accumulator correctly fails for invalid arguments.
@@ -95,7 +95,7 @@ assert.commandFailedWithCode(db.runCommand(command), 31244);
 
 groupPipe[0].$group.wordCount.$_internalJsReduce.eval = reduce;
 groupPipe[0].$group.wordCount.$_internalJsReduce.data = 5;
-assert.commandFailedWithCode(db.runCommand(command), 31245);
+assert.commandFailedWithCode(db.runCommand(command), 31242);
 
 groupPipe[0].$group.wordCount.$_internalJsReduce = {
     notEval: 1,

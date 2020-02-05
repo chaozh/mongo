@@ -1,0 +1,28 @@
+# Copyright (C) 2019-present MongoDB, Inc.
+
+global:
+    cpp_namespace: "mongo::iam"
+    configs:
+        section: 'IAM AWS Options'
+        source: [ cli ]
+    cpp_includes:
+        - mongo/client/sasl_iam_client_options.h
+
+configs:
+    awsIamSessionToken:
+        description: "AWS Session Token for temporary credentials"
+        arg_vartype: String
+        cpp_varname: saslIamClientGlobalParams.awsSessionToken
+
+server_parameters:
+    awsEC2InstanceMetadataUrl:
+        description: "Test parameter to override the URL for AWS EC2 Instance Metadata"
+        set_at: startup
+        cpp_varname: saslIamClientGlobalParams.awsEC2InstanceMetadataUrl
+        default: "http://169.254.169.254"
+
+    awsECSInstanceMetadataUrl:
+        description: "Test parameter to override the URL for AWS ECS Instance Metadata"
+        set_at: startup
+        cpp_varname: saslIamClientGlobalParams.awsECSInstanceMetadataUrl
+        default: "http://169.254.170.2"

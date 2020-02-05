@@ -13,8 +13,6 @@
  *     assumes_against_mongod_not_mongos,
  *     # Sets a failpoint on one mongod, so switching primaries would break the test.
  *     does_not_support_stepdowns,
- *     # A write takes a global exclusive lock on the mobile engine, so two concurrent writers
- *     # (index builds) are impossible.
  *     # The ephemeralForTest engine has collection level locking, meaning that it upgrades
  *     # collection intent locks to exclusive. This test depends on two concurrent ops taking
  *     # concurrent collection IX locks.
@@ -25,7 +23,6 @@
 (function() {
 "use strict";
 
-load("jstests/libs/check_log.js");
 load("jstests/libs/parallel_shell_helpers.js");
 load('jstests/libs/test_background_ops.js');
 
@@ -44,11 +41,13 @@ const indexSpecC = {
 
 testColl.drop();
 assert.commandWorked(testDB.adminCommand({clearLog: 'global'}));
-
-// TODO (SERVER-40952): currently createIndexes will hold an X lock for the duration of the
-// build if the collection is not created beforehand. This test needs that not to happen, so we
-// can pause a build and a subsequently issued request can get an IX lock.
+// This test depends on using the IndexBuildsCoordinator to build this index, which as of
+// SERVER-44405, will not occur in this test unless the collection is created beforehand.
 assert.commandWorked(testDB.runCommand({create: collName}));
+
+// Insert document into collection to avoid optimization for index creation on an empty collection.
+// This allows us to pause index builds on the collection using a fail point.
+assert.commandWorked(testColl.insert({a: 1}));
 
 function runSuccessfulIndexBuild(dbName, collName, indexSpec, requestNumber) {
     jsTest.log("Index build request " + requestNumber + " starting...");

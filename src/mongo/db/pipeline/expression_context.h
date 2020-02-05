@@ -117,7 +117,7 @@ public:
     ExpressionContext(OperationContext* opCtx,
                       const boost::optional<ExplainOptions::Verbosity>& explain,
                       bool fromMongos,
-                      bool needsmerge,
+                      bool needsMerge,
                       bool allowDiskUse,
                       bool bypassDocumentValidation,
                       const NamespaceString& ns,
@@ -240,6 +240,9 @@ public:
      * Returns a JsExec and a boolean indicating whether the Scope was created as part of this call.
      */
     auto getJsExecWithScope() const {
+        uassert(31264,
+                "Cannot run server-side javascript without the javascript engine enabled",
+                getGlobalScriptEngine());
         RuntimeConstants runtimeConstants = getRuntimeConstants();
         const boost::optional<mongo::BSONObj>& scope = runtimeConstants.getJsScope();
         return JsExecution::get(opCtx, scope.get_value_or(BSONObj()), ns.db());
@@ -287,9 +290,16 @@ public:
     boost::optional<ServerGlobalParams::FeatureCompatibility::Version>
         maxFeatureCompatibilityVersion;
 
-    // True if this ExpressionContext is associated with a Change Stream that should serialize its
-    // "$sortKey" using the 4.2 format.
-    bool use42ChangeStreamSortKeys = false;
+    // In a shard mongoD, we use this to determine the format for "sortKey" data. This format has to
+    // match the format that the mongoS expects.
+    // TODO (SERVER-43361): After branching for 4.5, there will be no need to support any format
+    // other than the "k44SortKey" format, so this will be removed.
+    SortKeyFormat sortKeyFormat = SortKeyFormat::k44SortKey;
+
+    // True if this context is associated with a pipeline which is permitted to use the new
+    // upsertSupplied mechanism for applicable $merge modes.
+    // TODO SERVER-44884: remove this when we branch for 4.5.
+    bool useNewUpsert = false;
 
     // True if this ExpressionContext is used to parse a view definition pipeline.
     bool isParsingViewDefinition = false;

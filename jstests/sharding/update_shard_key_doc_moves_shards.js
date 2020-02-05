@@ -1,7 +1,7 @@
 /*
  * Tests that changing the shard key value of a document using update and findAndModify works
  * correctly when the doc will change shards.
- * @tags: [uses_transactions, uses_multi_shard_transaction]
+ * @tags: [requires_find_command, uses_transactions, uses_multi_shard_transaction]
  */
 
 (function() {
@@ -22,7 +22,6 @@ st.ensurePrimaryShard(kDbName, shard0);
 function changeShardKeyWhenFailpointsSet(session, sessionDB, runInTxn, isFindAndModify) {
     let docsToInsert = [{"x": 4, "a": 3}, {"x": 100}, {"x": 300, "a": 3}, {"x": 500, "a": 6}];
     shardCollectionMoveChunks(st, kDbName, ns, {"x": 1}, docsToInsert, {"x": 100}, {"x": 300});
-    cleanupOrphanedDocs(st, ns);
 
     // Assert that the document is not updated when the delete fails
     assert.commandWorked(st.rs1.getPrimary().getDB(kDbName).adminCommand({
@@ -302,10 +301,26 @@ assert.commandFailedWithCode(session.abortTransaction_forTesting(), ErrorCodes.N
 
 mongos.getDB(kDbName).foo.drop();
 
+// ----Assert that specifying writeConcern succeeds----
+
+shardCollectionMoveChunks(st, kDbName, ns, {"x": 1}, docsToInsert, {"x": 100}, {"x": 300});
+
+assert.commandWorked(sessionDB.foo.update({x: 4}, {$set: {x: 1000}}, {writeConcern: {w: 1}}));
+
+assert.commandWorked(sessionDB.runCommand({
+    findAndModify: 'foo',
+    query: {x: 78},
+    update: {$set: {x: 250}},
+    lsid: {id: UUID()},
+    txnNumber: NumberLong(1),
+    writeConcern: {w: 1},
+}));
+
+mongos.getDB(kDbName).foo.drop();
+
 // ----Assert retryable write result has WCE when the internal commitTransaction fails----
 
 shardCollectionMoveChunks(st, kDbName, ns, {"x": 1}, docsToInsert, {"x": 100}, {"x": 300});
-cleanupOrphanedDocs(st, ns);
 
 // Turn on failcommand fail point to fail CoordinateCommitTransaction
 assert.commandWorked(st.rs0.getPrimary().getDB(kDbName).adminCommand({
@@ -322,14 +337,13 @@ res = sessionDB.foo.update({x: 4}, {$set: {x: 1000}});
 assert.commandWorkedIgnoringWriteConcernErrors(res);
 assert.eq(12345, res.getWriteConcernError().code);
 
-let findAndModCmd = {
+res = sessionDB.runCommand({
     findAndModify: 'foo',
     query: {x: 78},
     update: {$set: {x: 250}},
     lsid: {id: UUID()},
     txnNumber: NumberLong(1),
-};
-res = sessionDB.runCommand(findAndModCmd);
+});
 assert.commandWorkedIgnoringWriteConcernErrors(res);
 assert.eq(res.writeConcernError.code, 12345);
 assert(res.writeConcernError.errmsg.includes("dummy error"));
@@ -355,7 +369,6 @@ assertCannotUpdateInBulkOpWhenDocsMoveShards(st, kDbName, ns, session, sessionDB
 
 // Update two docs, updating one twice
 shardCollectionMoveChunks(st, kDbName, ns, {"x": 1}, docsToInsert, {"x": 100}, {"x": 300});
-cleanupOrphanedDocs(st, ns);
 
 session.startTransaction();
 let id = mongos.getDB(kDbName).foo.find({"x": 500}).toArray()[0]._id;
@@ -376,7 +389,6 @@ mongos.getDB(kDbName).foo.drop();
 // Check that doing $inc on doc A, then updating shard key for doc A, then $inc again only incs
 // once
 shardCollectionMoveChunks(st, kDbName, ns, {"x": 1}, docsToInsert, {"x": 100}, {"x": 300});
-cleanupOrphanedDocs(st, ns);
 
 session.startTransaction();
 assert.commandWorked(sessionDB.foo.update({"x": 500}, {"$inc": {"a": 1}}));
@@ -392,7 +404,6 @@ assert.eq(1, mongos.getDB(kDbName).foo.find({"x": 30, "a": 7}).itcount());
 mongos.getDB(kDbName).foo.drop();
 
 shardCollectionMoveChunks(st, kDbName, ns, {"x": 1}, docsToInsert, {"x": 100}, {"x": 300});
-cleanupOrphanedDocs(st, ns);
 
 // Insert and $inc before moving doc
 session.startTransaction();
@@ -414,7 +425,6 @@ mongos.getDB(kDbName).foo.drop();
 // ----Assert correct behavior when update is sent directly to a shard----
 
 shardCollectionMoveChunks(st, kDbName, ns, {"x": 1}, docsToInsert, {"x": 100}, {"x": 300});
-cleanupOrphanedDocs(st, ns);
 
 //
 // For Op-style updates.

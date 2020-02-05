@@ -112,8 +112,7 @@ bool canOptimizeAwayPipeline(const Pipeline* pipeline,
         pipeline->getSources().empty() &&
         // For exchange we will create a number of pipelines consisting of a single
         // DocumentSourceExchange stage, so cannot not optimize it away.
-        !request.getExchangeSpec() &&
-        !QueryPlannerCommon::hasNode(exec->getCanonicalQuery()->root(), MatchExpression::TEXT);
+        !request.getExchangeSpec();
 }
 
 /**
@@ -214,9 +213,8 @@ bool handleCursorCommand(OperationContext* opCtx,
         // for later.
 
         auto* expCtx = exec->getExpCtx().get();
-        BSONObj next = expCtx->needsMerge
-            ? nextDoc.toBsonWithMetaData(expCtx ? expCtx->use42ChangeStreamSortKeys : false)
-            : nextDoc.toBson();
+        BSONObj next = expCtx->needsMerge ? nextDoc.toBsonWithMetaData(expCtx->sortKeyFormat)
+                                          : nextDoc.toBson();
         if (!FindCommon::haveSpaceForNext(next, objCount, responseBuilder.bytesUsed())) {
             exec->enqueue(nextDoc);
             stashedResult = true;
@@ -292,7 +290,8 @@ StatusWith<StringMap<ExpressionContext::ResolvedNamespace>> resolveInvolvedNames
             // from a $merge to a collection in a different database. Since we cannot write to
             // views, simply assume that the namespace is a collection.
             resolvedNamespaces[involvedNs.coll()] = {involvedNs, std::vector<BSONObj>{}};
-        } else if (!db || CollectionCatalog::get(opCtx).lookupCollectionByNamespace(involvedNs)) {
+        } else if (!db ||
+                   CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, involvedNs)) {
             // If the aggregation database exists and 'involvedNs' refers to a collection namespace,
             // then we resolve it as an empty pipeline in order to read directly from the underlying
             // collection. If the database doesn't exist, then we still resolve it as an empty
@@ -313,8 +312,8 @@ StatusWith<StringMap<ExpressionContext::ResolvedNamespace>> resolveInvolvedNames
 
             // We parse the pipeline corresponding to the resolved view in case we must resolve
             // other view namespaces that are also involved.
-            LiteParsedPipeline resolvedViewLitePipeline(
-                {resolvedView.getValue().getNamespace(), resolvedView.getValue().getPipeline()});
+            LiteParsedPipeline resolvedViewLitePipeline(resolvedView.getValue().getNamespace(),
+                                                        resolvedView.getValue().getPipeline());
 
             const auto& resolvedViewInvolvedNamespaces =
                 resolvedViewLitePipeline.getInvolvedNamespaces();
@@ -343,7 +342,7 @@ Status collatorCompatibleWithPipeline(OperationContext* opCtx,
         return Status::OK();
     }
     for (auto&& potentialViewNs : liteParsedPipeline.getInvolvedNamespaces()) {
-        if (CollectionCatalog::get(opCtx).lookupCollectionByNamespace(potentialViewNs)) {
+        if (CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, potentialViewNs)) {
             continue;
         }
 
@@ -480,8 +479,18 @@ std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> createOuterPipelineProxyExe
 }  // namespace
 
 Status runAggregate(OperationContext* opCtx,
+                    const NamespaceString& nss,
+                    const AggregationRequest& request,
+                    const BSONObj& cmdObj,
+                    const PrivilegeVector& privileges,
+                    rpc::ReplyBuilderInterface* result) {
+    return runAggregate(opCtx, nss, request, {request}, cmdObj, privileges, result);
+}
+
+Status runAggregate(OperationContext* opCtx,
                     const NamespaceString& origNss,
                     const AggregationRequest& request,
+                    const LiteParsedPipeline& liteParsedPipeline,
                     const BSONObj& cmdObj,
                     const PrivilegeVector& privileges,
                     rpc::ReplyBuilderInterface* result) {
@@ -504,17 +513,11 @@ Status runAggregate(OperationContext* opCtx,
     boost::intrusive_ptr<ExpressionContext> expCtx;
     auto curOp = CurOp::get(opCtx);
     {
-        const LiteParsedPipeline liteParsedPipeline(request);
-
         // If we are in a transaction, check whether the parsed pipeline supports
         // being in a transaction.
         if (opCtx->inMultiDocumentTransaction()) {
             liteParsedPipeline.assertSupportsMultiDocumentTransaction(request.getExplain());
         }
-
-        // Check whether the parsed pipeline supports the given read concern.
-        liteParsedPipeline.assertSupportsReadConcern(
-            opCtx, request.getExplain(), serverGlobalParams.enableMajorityReadConcern);
 
         const auto& pipelineInvolvedNamespaces = liteParsedPipeline.getInvolvedNamespaces();
 
@@ -549,7 +552,7 @@ Status runAggregate(OperationContext* opCtx,
             statsTracker.emplace(opCtx,
                                  nss,
                                  Top::LockType::NotLocked,
-                                 AutoStatsTracker::LogMode::kUpdateTopAndCurop,
+                                 AutoStatsTracker::LogMode::kUpdateTopAndCurOp,
                                  0);
             collatorToUse.emplace(
                 PipelineD::resolveCollator(opCtx, request.getCollation(), nullptr));
@@ -613,6 +616,30 @@ Status runAggregate(OperationContext* opCtx,
         invariant(collatorToUse);
         expCtx = makeExpressionContext(opCtx, request, std::move(*collatorToUse), uuid);
 
+        // If this is a shard server, we need to use the correct sort key format for the mongoS that
+        // generated this query. We determine the version by checking for the "use44SortKeys" flag
+        // in the aggregation request.
+        // TODO (SERVER-43361): This check will be unnecessary after branching for 4.5.
+        if (expCtx->fromMongos) {
+            if (request.getUse44SortKeys()) {
+                // This request originated with 4.4-or-newer mongoS, which can understand the new
+                // sort key format. Note: it's possible that merging will actually occur on a mongoD
+                // (for pipelines that merge on a shard), but if the mongoS is 4.4 or newer, all
+                // shard servers must also be 4.4 or newer.
+                expCtx->sortKeyFormat = SortKeyFormat::k44SortKey;
+            } else {
+                // This request originated with an older mongoS that will not understand the new
+                // sort key format. We must use the older format, which differs depending on whether
+                // or not the pipeline is a change stream. Non-$changeStream pipelines may still
+                // merge on a mongoD, but a 4.4 mongoD can still understand the 4.2 sort key format.
+                expCtx->sortKeyFormat = liteParsedPipeline.hasChangeStream()
+                    ? SortKeyFormat::k42ChangeStreamSortKey
+                    : SortKeyFormat::k42SortKey;
+            }
+        } else {
+            // Use default value for the ExpressionContext's 'sortKeyFormat' member variable.
+        }
+
         auto pipeline = uassertStatusOK(Pipeline::parse(request.getPipeline(), expCtx));
 
         // Check that the view's collation matches the collation of any views involved in the
@@ -667,6 +694,10 @@ Status runAggregate(OperationContext* opCtx,
                                                           attachExecutorCallback.first,
                                                           std::move(attachExecutorCallback.second),
                                                           pipeline.get());
+
+            // Optimize again, since there may be additional optimizations that can be done after
+            // adding the initial cursor stage.
+            pipeline->optimizePipeline();
 
             auto pipelines =
                 createExchangePipelinesIfNeeded(opCtx, expCtx, request, std::move(pipeline), uuid);

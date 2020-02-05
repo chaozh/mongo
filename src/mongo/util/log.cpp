@@ -35,6 +35,7 @@
 
 #include "mongo/util/log.h"
 
+#include "mongo/config.h"
 #include "mongo/db/server_options.h"
 #include "mongo/logger/console_appender.h"
 #include "mongo/logger/message_event_utf8_encoder.h"
@@ -53,6 +54,20 @@
 // TODO: Eliminate cout/cerr.
 
 namespace mongo {
+
+#if defined(MONGO_CONFIG_LOGV1_DEFAULT)
+static bool _logV2Enabled = false;
+#else
+static bool _logV2Enabled = true;
+#endif
+
+bool logV2Enabled() {
+    return _logV2Enabled;
+}
+
+void logV2Set(bool setting) {
+    _logV2Enabled = setting;
+}
 
 static logger::ExtraLogContextFn _appendExtraLogContext;
 

@@ -33,6 +33,7 @@
 
 #include "mongo/db/repl/oplog_entry.h"
 
+#include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/util/log.h"
 #include "mongo/util/time_support.h"
@@ -164,6 +165,31 @@ ReplOperation MutableOplogEntry::makeInsertOperation(const NamespaceString& nss,
     return op;
 }
 
+BSONObj MutableOplogEntry::makeCreateCollCmdObj(const NamespaceString& collectionName,
+                                                const CollectionOptions& options,
+                                                const BSONObj& idIndex) {
+    BSONObjBuilder b;
+    b.append("create", collectionName.coll().toString());
+    {
+        // Don't store the UUID as part of the options, but instead only at the top level
+        CollectionOptions optionsToStore = options;
+        optionsToStore.uuid.reset();
+        b.appendElements(optionsToStore.toBSON());
+    }
+
+    // Include the full _id index spec in the oplog for index versions >= 2.
+    if (!idIndex.isEmpty()) {
+        auto versionElem = idIndex[IndexDescriptor::kIndexVersionFieldName];
+        invariant(versionElem.isNumber());
+        if (IndexDescriptor::IndexVersion::kV2 <=
+            static_cast<IndexDescriptor::IndexVersion>(versionElem.numberInt())) {
+            b.append("idIndex", idIndex);
+        }
+    }
+
+    return b.obj();
+}
+
 ReplOperation MutableOplogEntry::makeUpdateOperation(const NamespaceString nss,
                                                      boost::optional<UUID> uuid,
                                                      const BSONObj& update,
@@ -174,6 +200,35 @@ ReplOperation MutableOplogEntry::makeUpdateOperation(const NamespaceString nss,
     op.setUuid(uuid);
     op.setObject(update.getOwned());
     op.setObject2(criteria.getOwned());
+    return op;
+}
+
+ReplOperation MutableOplogEntry::makeCreateCommand(const NamespaceString nss,
+                                                   const CollectionOptions& options,
+                                                   const BSONObj& idIndex) {
+
+    ReplOperation op;
+    op.setOpType(OpTypeEnum::kCommand);
+    op.setNss(nss.getCommandNS());
+    op.setUuid(options.uuid);
+    op.setObject(makeCreateCollCmdObj(nss, options, idIndex));
+    return op;
+}
+
+ReplOperation MutableOplogEntry::makeCreateIndexesCommand(const NamespaceString nss,
+                                                          CollectionUUID uuid,
+                                                          const BSONObj& indexDoc) {
+    ReplOperation op;
+    op.setOpType(OpTypeEnum::kCommand);
+    op.setNss(nss.getCommandNS());
+    op.setUuid(uuid);
+
+    BSONObjBuilder builder;
+    builder.append("createIndexes", nss.coll());
+    builder.appendElements(indexDoc);
+
+    op.setObject(builder.obj());
+
     return op;
 }
 
@@ -296,6 +351,28 @@ bool OplogEntry::isCrudOpType() const {
 bool OplogEntry::shouldPrepare() const {
     return getCommandType() == CommandType::kApplyOps &&
         getObject()[ApplyOpsCommandInfoBase::kPrepareFieldName].booleanSafe();
+}
+
+bool OplogEntry::isTransactionWithCommand() const {
+    auto applyOps = getObject().getField("applyOps");
+    if (applyOps.eoo()) {
+        return false;
+    }
+    if (!getTxnNumber() || !getSessionId()) {
+        // Only transactions can produce applyOps oplog entries with transaction numbers and
+        // session IDs.
+        return false;
+    }
+    // Iterating through the entire applyOps array is not optimal for performance. A potential
+    // optimization, if necessary, could be to ensure the primary always constructs applyOps oplog
+    // entries with commands at the beginning.
+    for (BSONElement e : applyOps.Array()) {
+        auto ns = e.Obj().getField("ns");
+        if (!ns.eoo() && NamespaceString(ns.String()).isCommand()) {
+            return true;
+        }
+    }
+    return false;
 }
 
 BSONElement OplogEntry::getIdElement() const {

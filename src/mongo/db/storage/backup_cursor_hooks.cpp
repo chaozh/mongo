@@ -77,7 +77,8 @@ void BackupCursorHooks::fsyncUnlock(OperationContext* opCtx) {
     MONGO_UNREACHABLE;
 }
 
-BackupCursorState BackupCursorHooks::openBackupCursor(OperationContext* opCtx) {
+BackupCursorState BackupCursorHooks::openBackupCursor(OperationContext* opCtx,
+                                                      const StorageEngine::BackupOptions& options) {
     MONGO_UNREACHABLE;
 }
 

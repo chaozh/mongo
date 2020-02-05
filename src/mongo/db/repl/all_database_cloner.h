@@ -41,7 +41,6 @@ class AllDatabaseCloner final : public BaseCloner {
 public:
     struct Stats {
         size_t databasesCloned{0};
-        size_t databaseCount{0};
         std::vector<DatabaseCloner::Stats> databaseStats;
 
         std::string toString() const;
@@ -53,8 +52,7 @@ public:
                       const HostAndPort& source,
                       DBClientConnection* client,
                       StorageInterface* storageInterface,
-                      ThreadPool* dbPool,
-                      ClockSource* clock = SystemClockSource::get());
+                      ThreadPool* dbPool);
 
     virtual ~AllDatabaseCloner() = default;
 
@@ -67,14 +65,47 @@ protected:
 
 private:
     friend class AllDatabaseClonerTest;
+    class ConnectStage : public ClonerStage<AllDatabaseCloner> {
+    public:
+        ConnectStage(std::string name, AllDatabaseCloner* cloner, ClonerRunFn stageFunc)
+            : ClonerStage<AllDatabaseCloner>(name, cloner, stageFunc){};
+        virtual bool checkRollBackIdOnRetry() {
+            return false;
+        }
+    };
+
+    /**
+     * Validation function to ensure we connect only to primary or secondary nodes.
+     *
+     * Because the cloner connection is separate from the usual inter-node connection pool and
+     * did not have the 'hangUpOnStepDown:false' flag set in the initial isMaster request, we
+     * will always disconnect if the sync source transitions to a state other than PRIMARY
+     * or SECONDARY.  It will not disconnect on a PRIMARY to SECONDARY or SECONDARY to PRIMARY
+     * transition because we no longer do that (the flag name is anachronistic).  After
+     * disconnecting, this validation function will prevent us from reconnecting until the node
+     * re-enters PRIMARY or SECONDARY state.
+     *
+     * The reason this is necessary is that in 4.2, commands which read metadata (listDatabases,
+     * listCollections, listIndexes) succeed while the sync source is in RECOVERING or ROLLBACK.
+     * In those states, this metadata may be out of date compared to the end of the oplog. So
+     * we could for instance do a listCollections on a database while in RECOVERING, and miss an
+     * entire collection that was recently added.  Then before we read any data (which would cause
+     * a failure) the node could finish recovery, and we could end up missing an entire collection.
+     * If the only data added to that collection was within the recovery period, the initial sync
+     * would succeed and we would have an inconsistent node.  If other data was added we would
+     * invariant during oplog application with a NamespaceNotFound error.
+     */
+    Status ensurePrimaryOrSecondary(const executor::RemoteCommandResponse& isMasterReply);
+
+    /**
+     * Stage function that makes a connection to the sync source.
+     */
+    AfterStageBehavior connectStage();
 
     /**
      * Stage function that retrieves database information from the sync source.
      */
     AfterStageBehavior listDatabasesStage();
-
-    // The pre-stage for this class connects to the sync source.
-    void preStage() final;
 
     /**
      *
@@ -96,6 +127,7 @@ private:
     // (X)  Access only allowed from the main flow of control called from run() or constructor.
     // (MX) Write access with mutex from main flow of control, read access with mutex from other
     //      threads, read access allowed from main flow without mutex.
+    ConnectStage _connectStage;                              // (R)
     ClonerStage<AllDatabaseCloner> _listDatabasesStage;      // (R)
     std::vector<std::string> _databases;                     // (X)
     std::unique_ptr<DatabaseCloner> _currentDatabaseCloner;  // (MX)

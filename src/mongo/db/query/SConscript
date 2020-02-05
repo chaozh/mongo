@@ -42,6 +42,7 @@ env.Library(
         "$BUILD_DIR/mongo/base",
         "$BUILD_DIR/mongo/db/bson/dotted_path_support",
         '$BUILD_DIR/mongo/db/commands/server_status_core',
+        "$BUILD_DIR/mongo/db/exec/projection_executor",
         "$BUILD_DIR/mongo/db/index/expression_params",
         "$BUILD_DIR/mongo/db/index/key_generator",
         "$BUILD_DIR/mongo/db/index_names",
@@ -85,6 +86,7 @@ env.Library(
 env.Library(
     target="query_common",
     source=[
+        "explain_common.cpp",
         "find_common.cpp",
         "parsed_distinct.cpp",
     ],
@@ -121,7 +123,6 @@ env.Library(
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
-        '$BUILD_DIR/mongo/db/commands/map_reduce_stats',
         '$BUILD_DIR/mongo/db/namespace_string',
     ],
 )
@@ -255,7 +256,12 @@ env.CppUnitTest(
         "get_executor_test.cpp",
         "getmore_request_test.cpp",
         "hint_parser_test.cpp",
+        "index_bounds_builder_collator_test.cpp",
+        "index_bounds_builder_eq_null_test.cpp",
+        "index_bounds_builder_interval_test.cpp",
+        "index_bounds_builder_regex_test.cpp",
         "index_bounds_builder_test.cpp",
+        "index_bounds_builder_type_test.cpp",
         "index_bounds_test.cpp",
         "index_entry_test.cpp",
         "interval_test.cpp",
@@ -266,6 +272,7 @@ env.CppUnitTest(
         "parsed_distinct_test.cpp",
         "plan_cache_indexability_test.cpp",
         "plan_cache_test.cpp",
+        "plan_ranker_test.cpp",
         "planner_access_test.cpp",
         "planner_analysis_test.cpp",
         "planner_ixselect_test.cpp",
@@ -274,6 +281,7 @@ env.CppUnitTest(
         "query_planner_array_test.cpp",
         "query_planner_collation_test.cpp",
         "query_planner_geo_test.cpp",
+        "query_planner_hashed_index_test.cpp",
         "query_planner_partialidx_test.cpp",
         "query_planner_index_test.cpp",
         "query_planner_operator_test.cpp",

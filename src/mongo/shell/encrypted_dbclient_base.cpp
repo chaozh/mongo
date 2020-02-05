@@ -56,7 +56,6 @@
 #include "mongo/shell/kms.h"
 #include "mongo/shell/kms_gen.h"
 #include "mongo/shell/shell_options.h"
-#include "mongo/util/lru_cache.h"
 
 namespace mongo {
 
@@ -453,7 +452,8 @@ void EncryptedDBClientBase::encrypt(mozjs::MozJSImplScope* scope,
 
     // Prepare the return value
     ConstDataRange ciphertextBlob(encryptionFrame.get());
-    std::string blobStr = base64::encode(ciphertextBlob.data(), ciphertextBlob.length());
+    std::string blobStr =
+        base64::encode(StringData(ciphertextBlob.data(), ciphertextBlob.length()));
     JS::AutoValueArray<2> arr(cx);
 
     arr[0].setInt32(BinDataType::Encrypt);

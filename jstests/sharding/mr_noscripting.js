@@ -1,4 +1,5 @@
 // Tests that running mapReduce does not crash anything if the shards have scripting disabled.
+// @tags: [requires_fcv_44]
 (function() {
 "use strict";
 const shardOpts = [
@@ -26,7 +27,7 @@ const reduceFn = function(key, values) {
 };
 
 assert.commandFailedWithCode(
-    testDB.runCommand({mapreduce: 'bar', map: mapFn, reduce: reduceFn, out: {inline: 1}}), 16149);
+    testDB.runCommand({mapreduce: 'bar', map: mapFn, reduce: reduceFn, out: {inline: 1}}), 31264);
 
 st.stop();
 }());

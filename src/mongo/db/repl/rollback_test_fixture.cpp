@@ -39,6 +39,7 @@
 #include "mongo/db/db_raii.h"
 #include "mongo/db/op_observer_noop.h"
 #include "mongo/db/op_observer_registry.h"
+#include "mongo/db/read_write_concern_defaults_cache_lookup_mock.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/replication_consistency_markers_mock.h"
 #include "mongo/db/repl/replication_coordinator.h"
@@ -49,6 +50,7 @@
 #include "mongo/db/storage/durable_catalog.h"
 #include "mongo/logger/log_component.h"
 #include "mongo/logger/logger.h"
+#include "mongo/util/log_global_settings.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
@@ -109,11 +111,13 @@ void RollbackTest::setUp() {
     _replicationProcess->initializeRollbackID(_opCtx.get()).transitional_ignore();
 
     // Increase rollback log component verbosity for unit tests.
-    mongo::logger::globalLogDomain()->setMinimumLoggedSeverity(
-        logger::LogComponent::kReplicationRollback, logger::LogSeverity::Debug(2));
+    setMinimumLoggedSeverity(logger::LogComponent::kReplicationRollback,
+                             logger::LogSeverity::Debug(2));
 
     auto observerRegistry = checked_cast<OpObserverRegistry*>(serviceContext->getOpObserver());
     observerRegistry->addObserver(std::make_unique<RollbackTestOpObserver>());
+
+    ReadWriteConcernDefaults::create(serviceContext, _lookupMock.getFetchDefaultsFn());
 }
 
 RollbackTest::ReplicationCoordinatorRollbackMock::ReplicationCoordinatorRollbackMock(
@@ -185,6 +189,25 @@ std::pair<BSONObj, RecordId> RollbackTest::makeCommandOp(Timestamp ts,
         bob.append("o2", *o2);
     }
     bob.append("wall", Date_t());
+
+    return std::make_pair(bob.obj(), RecordId(recordId));
+}
+
+std::pair<BSONObj, RecordId> RollbackTest::makeCommandOpForApplyOps(OptionalCollectionUUID uuid,
+                                                                    StringData nss,
+                                                                    BSONObj cmdObj,
+                                                                    int recordId,
+                                                                    boost::optional<BSONObj> o2) {
+    BSONObjBuilder bob;
+    bob.append("op", "c");
+    if (uuid) {  // Not all ops have UUID fields.
+        uuid.get().appendToBuilder(&bob, "ui");
+    }
+    bob.append("ns", nss);
+    bob.append("o", cmdObj);
+    if (o2) {
+        bob.append("o2", *o2);
+    }
 
     return std::make_pair(bob.obj(), RecordId(recordId));
 }
@@ -314,13 +337,15 @@ void RollbackResyncsCollectionOptionsTest::resyncCollectionOptionsTest(
                            OplogInterfaceMock({collectionModificationOperation, commonOperation}),
                            rollbackSource,
                            {},
+                           {},
                            _coordinator,
                            _replicationProcess.get()));
 
     // Make sure the collection options are correct.
     AutoGetCollectionForReadCommand autoColl(_opCtx.get(), NamespaceString(nss.toString()));
     auto collAfterRollbackOptions =
-        DurableCatalog::get(_opCtx.get())->getCollectionOptions(_opCtx.get(), nss);
+        DurableCatalog::get(_opCtx.get())
+            ->getCollectionOptions(_opCtx.get(), autoColl.getCollection()->getCatalogId());
 
     BSONObjBuilder expectedOptionsBob;
     if (localCollOptions.uuid) {

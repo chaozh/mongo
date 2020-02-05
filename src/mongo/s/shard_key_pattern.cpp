@@ -38,6 +38,7 @@
 #include "mongo/db/hasher.h"
 #include "mongo/db/index_names.h"
 #include "mongo/db/matcher/extensions_callback_noop.h"
+#include "mongo/db/matcher/path_internal.h"
 #include "mongo/db/query/canonical_query.h"
 #include "mongo/db/update/path_support.h"
 #include "mongo/util/str.h"
@@ -58,14 +59,16 @@ const BSONObj kNullObj = BSON("" << BSONNULL);
 
 /**
  * Currently the allowable shard keys are either:
- * i) a hashed single field, e.g. { a : "hashed" }, or
+ * i) a single field, e.g. { a : "hashed" }, {a: 1} or
  * ii) a compound list of ascending, potentially-nested field paths, e.g. { a : 1 , b.c : 1 }
+ * iii) a compound hashed shard key with exactly one hashed field e.g. {a: 1, b: 'hashed', c: 1}
  */
 std::vector<std::unique_ptr<FieldRef>> parseShardKeyPattern(const BSONObj& keyPattern) {
     uassert(ErrorCodes::BadValue, "Shard key is empty", !keyPattern.isEmpty());
 
     std::vector<std::unique_ptr<FieldRef>> parsedPaths;
 
+    auto numHashedFields = 0;
     for (const auto& patternEl : keyPattern) {
         auto newFieldRef(std::make_unique<FieldRef>(patternEl.fieldNameStringData()));
 
@@ -88,16 +91,16 @@ std::vector<std::unique_ptr<FieldRef>> parseShardKeyPattern(const BSONObj& keyPa
                     !newFieldRef->getPart(i).empty());
         }
 
-        // Numeric and ascending (1.0), or "hashed" and single field
+        // Numeric and ascending (1.0), or "hashed" with exactly hashed field.
+        auto isHashedPattern = ShardKeyPattern::isHashedPatternEl(patternEl);
+        numHashedFields += isHashedPattern ? 1 : 0;
         uassert(ErrorCodes::BadValue,
-                str::stream()
-                    << "Shard key " << keyPattern.toString()
-                    << " can contain either a single 'hashed' field"
-                    << " or multiple numerical fields set to a value of 1. Failed to parse field "
-                    << patternEl.fieldNameStringData(),
+                str::stream() << "Shard key " << keyPattern.toString()
+                              << " can contain at most one 'hashed' field, and/or multiple "
+                                 "numerical fields set to a value of 1. Failed to parse field "
+                              << patternEl.fieldNameStringData(),
                 (patternEl.isNumber() && patternEl.numberInt() == 1) ||
-                    (keyPattern.nFields() == 1 && ShardKeyPattern::isHashedPatternEl(patternEl)));
-
+                    (isHashedPattern && numHashedFields == 1));
         parsedPaths.emplace_back(std::move(newFieldRef));
     }
 
@@ -125,21 +128,11 @@ bool isValidShardKeyElementForStorage(const BSONElement& element) {
     return true;
 }
 
-BSONElement extractKeyElementFromMatchable(const MatchableDocument& matchable, StringData pathStr) {
-    ElementPath path;
-    path.init(pathStr);
-    path.setLeafArrayBehavior(ElementPath::LeafArrayBehavior::kNoTraversal);
-    path.setNonLeafArrayBehavior(ElementPath::NonLeafArrayBehavior::kNoTraversal);
-
-    MatchableDocument::IteratorHolder matchIt(&matchable, &path);
-    if (!matchIt->more())
-        return BSONElement();
-
-    BSONElement matchEl = matchIt->next().element();
-    // We shouldn't have more than one element - we don't expand arrays
-    dassert(!matchIt->more());
-
-    return matchEl;
+BSONElement extractKeyElementFromDoc(const BSONObj& obj, StringData pathStr) {
+    // Any arrays found get immediately returned. We are equipped up the call stack to specifically
+    // deal with array values.
+    size_t idxPath;
+    return getFieldDottedOrArray(obj, FieldRef(pathStr), &idxPath);
 }
 
 BSONElement findEqualityElement(const EqualityMatches& equalities, const FieldRef& path) {
@@ -154,10 +147,37 @@ BSONElement findEqualityElement(const EqualityMatches& equalities, const FieldRe
         return BSONElement();
 
     StringData suffixStr = path.dottedSubstring(parentPathPart, path.numParts());
-    BSONMatchableDocument matchable(parentEl.Obj());
-    return extractKeyElementFromMatchable(matchable, suffixStr);
+    return extractKeyElementFromDoc(parentEl.Obj(), suffixStr);
 }
 
+/**
+ * Extracts the BSONElement matching 'fieldName' from the 'indexKeyDataVector'. Returns a pair with
+ * first field representing the matching BSONElement and the second field representing whether the
+ * value is hashed or not. In cases where there is more than one match for 'fieldName' we return the
+ * first matching non-hashed value.
+ */
+std::pair<BSONElement, bool> extractFieldFromIndexData(
+    const std::vector<ShardKeyPattern::IndexKeyData>& indexKeyDataVector, StringData fieldName) {
+    std::pair<BSONElement, bool> output;
+    for (auto&& indexKeyData : indexKeyDataVector) {
+        BSONObjIterator keyDataIt(indexKeyData.data);
+        for (auto&& keyPatternElt : indexKeyData.pattern) {
+            invariant(keyDataIt.more());
+            BSONElement keyDataElt = keyDataIt.next();
+            if (fieldName == keyPatternElt.fieldNameStringData()) {
+                const auto isHashed = (keyPatternElt.valueStringData() == IndexNames::HASHED);
+                output = {keyDataElt, isHashed};
+                if (!isHashed) {
+                    return output;
+                }
+                // If the field is hashed, do not return immediately. We will continue to look for
+                // raw document value in other indexes.
+                break;
+            }
+        }
+    }
+    return output;
+}
 }  // namespace
 
 Status ShardKeyPattern::checkShardKeyIsValidForMetadataStorage(const BSONObj& shardKey) {
@@ -171,10 +191,19 @@ Status ShardKeyPattern::checkShardKeyIsValidForMetadataStorage(const BSONObj& sh
     return Status::OK();
 }
 
+BSONElement ShardKeyPattern::extractHashedField(BSONObj keyPattern) {
+    for (auto&& element : keyPattern) {
+        if (isHashedPatternEl(element)) {
+            return element;
+        }
+    }
+    return BSONElement();
+}
 ShardKeyPattern::ShardKeyPattern(const BSONObj& keyPattern)
     : _keyPattern(keyPattern),
       _keyPatternPaths(parseShardKeyPattern(keyPattern)),
-      _hasId(keyPattern.hasField("_id"_sd)) {}
+      _hasId(keyPattern.hasField("_id"_sd)),
+      _hashedField(extractHashedField(keyPattern)) {}
 
 ShardKeyPattern::ShardKeyPattern(const KeyPattern& keyPattern)
     : ShardKeyPattern(keyPattern.toBSON()) {}
@@ -184,7 +213,28 @@ bool ShardKeyPattern::isHashedPatternEl(const BSONElement& el) {
 }
 
 bool ShardKeyPattern::isHashedPattern() const {
+    return !_hashedField.eoo();
+}
+
+bool ShardKeyPattern::isValidHashedValue(const BSONElement& el) {
+    switch (el.type()) {
+        case MinKey:
+        case MaxKey:
+        case NumberLong:
+            return true;
+        default:
+            return false;
+    }
+    MONGO_UNREACHABLE;
+}
+
+
+bool ShardKeyPattern::hasHashedPrefix() const {
     return isHashedPatternEl(_keyPattern.toBSON().firstElement());
+}
+
+BSONElement ShardKeyPattern::getHashedField() const {
+    return _hashedField;
 }
 
 const KeyPattern& ShardKeyPattern::getKeyPattern() const {
@@ -242,14 +292,50 @@ BSONObj ShardKeyPattern::normalizeShardKey(const BSONObj& shardKey) const {
     return keyBuilder.obj();
 }
 
-BSONObj ShardKeyPattern::extractShardKeyFromMatchable(const MatchableDocument& matchable) const {
+BSONObj ShardKeyPattern::extractShardKeyFromIndexKeyData(
+    const std::vector<IndexKeyData>& indexKeyDataVector) const {
     BSONObjBuilder keyBuilder;
+    for (auto&& shardKeyField : _keyPattern.toBSON()) {
+        auto [matchEl, isAlreadyHashed] =
+            extractFieldFromIndexData(indexKeyDataVector, shardKeyField.fieldNameStringData());
+        invariant(matchEl);
 
-    BSONObjIterator patternIt(_keyPattern.toBSON());
-    while (patternIt.more()) {
-        BSONElement patternEl = patternIt.next();
-        BSONElement matchEl =
-            extractKeyElementFromMatchable(matchable, patternEl.fieldNameStringData());
+        // A shard key field cannot have array values. If we encounter array values return
+        // immediately.
+        if (!isValidShardKeyElementForExtractionFromDocument(matchEl)) {
+            return BSONObj();
+        }
+
+        // There are four possible cases here:
+        // 1. Index provides hashed data and the shard key field is hashed. Then we append the
+        // data as it is.
+        // 2. Index provides actual data and the shard key field is hashed. Then we hash the data
+        // before appending.
+        // 3. Index provides actual data and the shard key field is non-hashed. Then we append the
+        // data as it is.
+        // 4. Index provides hashed data and the shard key field is non-hashed. This can never
+        // happen and we should invariant.
+        if (isAlreadyHashed) {
+            invariant(isHashedPatternEl(shardKeyField));
+        }
+        if (!isAlreadyHashed && isHashedPatternEl(shardKeyField)) {
+            keyBuilder.append(
+                shardKeyField.fieldNameStringData(),
+                BSONElementHasher::hash64(matchEl, BSONElementHasher::DEFAULT_HASH_SEED));
+        } else {
+            // NOTE: The matched element may *not* have the same field name as the path -
+            // index keys don't contain field names, for example.
+            keyBuilder.appendAs(matchEl, shardKeyField.fieldNameStringData());
+        }
+    }
+    dassert(isShardKey(keyBuilder.asTempObj()));
+    return keyBuilder.obj();
+}
+
+BSONObj ShardKeyPattern::extractShardKeyFromDoc(const BSONObj& doc) const {
+    BSONObjBuilder keyBuilder;
+    for (auto&& patternEl : _keyPattern.toBSON()) {
+        BSONElement matchEl = extractKeyElementFromDoc(doc, patternEl.fieldNameStringData());
 
         if (matchEl.eoo()) {
             matchEl = kNullObj.firstElement();
@@ -274,21 +360,14 @@ BSONObj ShardKeyPattern::extractShardKeyFromMatchable(const MatchableDocument& m
     return keyBuilder.obj();
 }
 
-BSONObj ShardKeyPattern::extractShardKeyFromDoc(const BSONObj& doc) const {
-    BSONMatchableDocument matchable(doc);
-    return extractShardKeyFromMatchable(matchable);
-}
-
 BSONObj ShardKeyPattern::emplaceMissingShardKeyValuesForDocument(const BSONObj doc) const {
     BSONObjBuilder fullDocBuilder(doc);
-
-    BSONMatchableDocument matchable(doc);
     for (const auto& skField : _keyPattern.toBSON()) {
         // Illegal to emplace a null _id.
         if (skField.fieldNameStringData() == kIdField) {
             continue;
         }
-        auto matchEl = extractKeyElementFromMatchable(matchable, skField.fieldNameStringData());
+        auto matchEl = extractKeyElementFromDoc(doc, skField.fieldNameStringData());
         if (matchEl.eoo()) {
             fullDocBuilder << skField.fieldNameStringData() << BSONNULL;
         }
@@ -332,7 +411,7 @@ BSONObj ShardKeyPattern::extractShardKeyFromQuery(const CanonicalQuery& query) c
 
     // Extract key from equalities
     // NOTE: The method below is equivalent to constructing a BSONObj and running
-    // extractShardKeyFromMatchable, but doesn't require creating the doc.
+    // extractShardKeyFromDoc, but doesn't require creating the doc.
 
     BSONObjBuilder keyBuilder;
     // Iterate the parsed paths to avoid re-parsing
@@ -343,7 +422,7 @@ BSONObj ShardKeyPattern::extractShardKeyFromQuery(const CanonicalQuery& query) c
         if (!isValidShardKeyElementForStorage(equalEl))
             return BSONObj();
 
-        if (isHashedPattern()) {
+        if (_hashedField && _hashedField.fieldNameStringData() == patternPath.dottedField()) {
             keyBuilder.append(
                 patternPath.dottedField(),
                 BSONElementHasher::hash64(equalEl, BSONElementHasher::DEFAULT_HASH_SEED));

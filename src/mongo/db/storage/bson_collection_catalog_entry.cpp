@@ -33,6 +33,7 @@
 #include <numeric>
 
 #include "mongo/db/field_ref.h"
+#include "mongo/db/server_options.h"
 
 namespace mongo {
 
@@ -141,6 +142,28 @@ bool BSONCollectionCatalogEntry::MetaData::eraseIndex(StringData name) {
 
 void BSONCollectionCatalogEntry::MetaData::rename(StringData toNS) {
     ns = toNS.toString();
+
+    // In FCV 4.4, the 'ns' field is not present. Only rename the 'ns' field for each index in
+    // FCV 4.2.
+    if (serverGlobalParams.featureCompatibility.isVersionInitialized() &&
+        serverGlobalParams.featureCompatibility.getVersion() ==
+            ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo44) {
+        return;
+    }
+
+    for (size_t i = 0; i < indexes.size(); i++) {
+        BSONObj spec = indexes[i].spec;
+        BSONObjBuilder b;
+        // Add the fields in the same order they were in the original specification.
+        for (auto&& elem : spec) {
+            if (elem.fieldNameStringData() == "ns") {
+                b.append("ns", toNS);
+            } else {
+                b.append(elem);
+            }
+        }
+        indexes[i].spec = b.obj();
+    }
 }
 
 KVPrefix BSONCollectionCatalogEntry::MetaData::getMaxPrefix() const {
@@ -176,16 +199,8 @@ BSONObj BSONCollectionCatalogEntry::MetaData::toBSON() const {
             sub.append("prefix", indexes[i].prefix.toBSONValue());
             sub.append("backgroundSecondary", indexes[i].isBackgroundSecondaryBuild);
 
-            sub.append("runTwoPhaseBuild", indexes[i].runTwoPhaseBuild);
-            sub.append("versionOfBuild", static_cast<long long>(indexes[i].versionOfBuild));
-            if (indexes[i].buildPhase) {
-                sub.append("buildPhase", *indexes[i].buildPhase);
-            }
-            if (indexes[i].constraintViolationsIdent) {
-                sub.append("constraintViolationsIdent", *indexes[i].constraintViolationsIdent);
-            }
-            if (indexes[i].sideWritesIdent) {
-                sub.append("sideWritesIdent", *indexes[i].sideWritesIdent);
+            if (indexes[i].buildUUID) {
+                indexes[i].buildUUID->appendToBuilder(&sub, "buildUUID");
             }
             sub.doneFast();
         }
@@ -222,18 +237,8 @@ void BSONCollectionCatalogEntry::MetaData::parse(const BSONObj& obj) {
             // Opt-in to rebuilding behavior for old-format index catalog objects.
             imd.isBackgroundSecondaryBuild = bgSecondary.eoo() || bgSecondary.trueValue();
 
-            imd.runTwoPhaseBuild = idx["runTwoPhaseBuild"].trueValue();
-            if (idx.hasField("versionOfBuild")) {
-                imd.versionOfBuild = idx["versionOfBuild"].numberLong();
-            }
-            if (idx["buildPhase"]) {
-                imd.buildPhase = idx["buildPhase"].str();
-            }
-            if (idx["constraintViolationsIdent"]) {
-                imd.constraintViolationsIdent = idx["constraintViolationsIdent"].str();
-            }
-            if (idx["sideWritesIdent"]) {
-                imd.sideWritesIdent = idx["sideWritesIdent"].str();
+            if (idx["buildUUID"]) {
+                imd.buildUUID = fassert(31353, UUID::parse(idx["buildUUID"]));
             }
             indexes.push_back(imd);
         }

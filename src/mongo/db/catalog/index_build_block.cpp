@@ -36,6 +36,7 @@
 #include <vector>
 
 #include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/uncommitted_collections.h"
 #include "mongo/db/catalog_raii.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/index/index_descriptor.h"
@@ -54,11 +55,13 @@ class IndexCatalog;
 IndexBuildBlock::IndexBuildBlock(IndexCatalog* indexCatalog,
                                  const NamespaceString& nss,
                                  const BSONObj& spec,
-                                 IndexBuildMethod method)
+                                 IndexBuildMethod method,
+                                 boost::optional<UUID> indexBuildUUID)
     : _indexCatalog(indexCatalog),
       _nss(nss),
       _spec(spec.getOwned()),
       _method(method),
+      _buildUUID(indexBuildUUID),
       _indexCatalogEntry(nullptr) {}
 
 void IndexBuildBlock::deleteTemporaryTables(OperationContext* opCtx) {
@@ -93,36 +96,25 @@ Status IndexBuildBlock::init(OperationContext* opCtx, Collection* collection) {
     }
 
     // Setup on-disk structures.
-    const auto protocol = IndexBuildProtocol::kSinglePhase;
-    Status status = DurableCatalog::get(opCtx)->prepareForIndexBuild(
-        opCtx, _nss, descriptor.get(), protocol, isBackgroundSecondaryBuild);
+    Status status = DurableCatalog::get(opCtx)->prepareForIndexBuild(opCtx,
+                                                                     collection->getCatalogId(),
+                                                                     descriptor.get(),
+                                                                     _buildUUID,
+                                                                     isBackgroundSecondaryBuild);
     if (!status.isOK())
         return status;
 
-    const bool initFromDisk = false;
-    const bool isReadyIndex = false;
     _indexCatalogEntry =
-        _indexCatalog->createIndexEntry(opCtx, std::move(descriptor), initFromDisk, isReadyIndex);
+        _indexCatalog->createIndexEntry(opCtx, std::move(descriptor), CreateIndexEntryFlags::kNone);
 
+    // Only track skipped records with two-phase index builds, which is indicated by a present build
+    // UUID.
+    const auto trackSkipped = (_buildUUID) ? IndexBuildInterceptor::TrackSkippedRecords::kTrack
+                                           : IndexBuildInterceptor::TrackSkippedRecords::kNoTrack;
     if (_method == IndexBuildMethod::kHybrid) {
-        _indexBuildInterceptor = std::make_unique<IndexBuildInterceptor>(opCtx, _indexCatalogEntry);
+        _indexBuildInterceptor =
+            std::make_unique<IndexBuildInterceptor>(opCtx, _indexCatalogEntry, trackSkipped);
         _indexCatalogEntry->setIndexBuildInterceptor(_indexBuildInterceptor.get());
-
-        if (IndexBuildProtocol::kTwoPhase == protocol) {
-            const auto sideWritesIdent = _indexBuildInterceptor->getSideWritesTableIdent();
-            // Only unique indexes have a constraint violations table.
-            const auto constraintsIdent = (_indexCatalogEntry->descriptor()->unique())
-                ? boost::optional<std::string>(
-                      _indexBuildInterceptor->getConstraintViolationsTableIdent())
-                : boost::none;
-
-            DurableCatalog::get(opCtx)->setIndexBuildScanning(
-                opCtx,
-                _nss,
-                _indexCatalogEntry->descriptor()->indexName(),
-                sideWritesIdent,
-                constraintsIdent);
-        }
     }
 
     if (isBackgroundIndex) {
@@ -168,9 +160,17 @@ void IndexBuildBlock::success(OperationContext* opCtx, Collection* collection) {
     // Being in a WUOW means all timestamping responsibility can be pushed up to the caller.
     invariant(opCtx->lockState()->inAWriteUnitOfWork());
 
-    invariant(opCtx->lockState()->isCollectionLockedForMode(_nss, MODE_X));
+    UncommittedCollections::get(opCtx).invariantHasExclusiveAccessToCollection(opCtx,
+                                                                               collection->ns());
 
     if (_indexBuildInterceptor) {
+        // Skipped records are only checked when we complete an index build as primary.
+        const auto replCoord = repl::ReplicationCoordinator::get(opCtx);
+        const auto skippedRecordsTracker = _indexBuildInterceptor->getSkippedRecordTracker();
+        if (skippedRecordsTracker && replCoord->canAcceptWritesFor(opCtx, collection->ns())) {
+            invariant(skippedRecordsTracker->areAllRecordsApplied(opCtx));
+        }
+
         // An index build should never be completed with writes remaining in the interceptor.
         invariant(_indexBuildInterceptor->areAllWritesApplied(opCtx));
 
@@ -181,8 +181,9 @@ void IndexBuildBlock::success(OperationContext* opCtx, Collection* collection) {
     log() << "index build: done building index " << _indexName << " on ns " << _nss;
 
     collection->indexBuildSuccess(opCtx, _indexCatalogEntry);
+    auto svcCtx = opCtx->getClient()->getServiceContext();
 
-    opCtx->recoveryUnit()->onCommit([opCtx, entry = _indexCatalogEntry, coll = collection](
+    opCtx->recoveryUnit()->onCommit([svcCtx, entry = _indexCatalogEntry, coll = collection](
                                         boost::optional<Timestamp> commitTime) {
         // Note: this runs after the WUOW commits but before we release our X lock on the
         // collection. This means that any snapshot created after this must include the full
@@ -192,7 +193,7 @@ void IndexBuildBlock::success(OperationContext* opCtx, Collection* collection) {
             // timestamp. We use the cluster time since it's guaranteed to be greater than the
             // time of the index build. It is possible the cluster time could be in the future,
             // and we will need to do another write to reach the minimum visible snapshot.
-            commitTime = LogicalClock::getClusterTimeForReplicaSet(opCtx).asTimestamp();
+            commitTime = LogicalClock::getClusterTimeForReplicaSet(svcCtx).asTimestamp();
         }
         entry->setMinimumVisibleSnapshot(commitTime.get());
         // We must also set the minimum visible snapshot on the collection like during init().

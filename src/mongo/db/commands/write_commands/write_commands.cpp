@@ -364,6 +364,7 @@ private:
             updateRequest.setArrayFilters(write_ops::arrayFiltersOf(_batch.getUpdates()[0]));
             updateRequest.setMulti(_batch.getUpdates()[0].getMulti());
             updateRequest.setUpsert(_batch.getUpdates()[0].getUpsert());
+            updateRequest.setUpsertSuppliedDocument(_batch.getUpdates()[0].getUpsertSupplied());
             updateRequest.setYieldPolicy(PlanExecutor::YIELD_AUTO);
             updateRequest.setHint(_batch.getUpdates()[0].getHint());
             updateRequest.setExplain();
@@ -377,8 +378,11 @@ private:
             // info is more accurate.
             AutoGetCollection collection(opCtx, _batch.getNamespace(), MODE_IX);
 
-            auto exec = uassertStatusOK(getExecutorUpdate(
-                opCtx, &CurOp::get(opCtx)->debug(), collection.getCollection(), &parsedUpdate));
+            auto exec = uassertStatusOK(getExecutorUpdate(opCtx,
+                                                          &CurOp::get(opCtx)->debug(),
+                                                          collection.getCollection(),
+                                                          &parsedUpdate,
+                                                          verbosity));
             auto bodyBuilder = result->getBodyBuilder();
             Explain::explainStages(
                 exec.get(), collection.getCollection(), verbosity, BSONObj(), &bodyBuilder);
@@ -451,8 +455,11 @@ private:
             AutoGetCollection collection(opCtx, _batch.getNamespace(), MODE_IX);
 
             // Explain the plan tree.
-            auto exec = uassertStatusOK(getExecutorDelete(
-                opCtx, &CurOp::get(opCtx)->debug(), collection.getCollection(), &parsedDelete));
+            auto exec = uassertStatusOK(getExecutorDelete(opCtx,
+                                                          &CurOp::get(opCtx)->debug(),
+                                                          collection.getCollection(),
+                                                          &parsedDelete,
+                                                          verbosity));
             auto bodyBuilder = result->getBodyBuilder();
             Explain::explainStages(
                 exec.get(), collection.getCollection(), verbosity, BSONObj(), &bodyBuilder);

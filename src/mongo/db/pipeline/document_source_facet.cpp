@@ -120,43 +120,14 @@ StageConstraints::LookupRequirement computeLookupRequirement(
 }  // namespace
 
 std::unique_ptr<DocumentSourceFacet::LiteParsed> DocumentSourceFacet::LiteParsed::parse(
-    const AggregationRequest& request, const BSONElement& spec) {
+    const NamespaceString& nss, const BSONElement& spec) {
     std::vector<LiteParsedPipeline> liteParsedPipelines;
 
     for (auto&& rawPipeline : extractRawPipelines(spec)) {
-        liteParsedPipelines.emplace_back(
-            AggregationRequest(request.getNamespaceString(), rawPipeline.second));
+        liteParsedPipelines.emplace_back(LiteParsedPipeline(nss, rawPipeline.second));
     }
 
-    PrivilegeVector requiredPrivileges;
-    for (auto&& pipeline : liteParsedPipelines) {
-
-        // A correct isMongos flag is only required for DocumentSourceCurrentOp which is disallowed
-        // in $facet pipelines.
-        const bool unusedIsMongosFlag = false;
-        Privilege::addPrivilegesToPrivilegeVector(&requiredPrivileges,
-                                                  pipeline.requiredPrivileges(unusedIsMongosFlag));
-    }
-
-    return std::make_unique<DocumentSourceFacet::LiteParsed>(std::move(liteParsedPipelines),
-                                                             std::move(requiredPrivileges));
-}
-
-stdx::unordered_set<NamespaceString> DocumentSourceFacet::LiteParsed::getInvolvedNamespaces()
-    const {
-    stdx::unordered_set<NamespaceString> involvedNamespaces;
-    for (auto&& liteParsedPipeline : _liteParsedPipelines) {
-        auto involvedInSubPipe = liteParsedPipeline.getInvolvedNamespaces();
-        involvedNamespaces.insert(involvedInSubPipe.begin(), involvedInSubPipe.end());
-    }
-    return involvedNamespaces;
-}
-
-bool DocumentSourceFacet::LiteParsed::allowShardedForeignCollection(NamespaceString nss) const {
-    return std::all_of(
-        _liteParsedPipelines.begin(), _liteParsedPipelines.end(), [&nss](auto&& pipeline) {
-            return pipeline.allowShardedForeignCollection(nss);
-        });
+    return std::make_unique<DocumentSourceFacet::LiteParsed>(std::move(liteParsedPipelines));
 }
 
 REGISTER_DOCUMENT_SOURCE(facet,
@@ -296,7 +267,7 @@ bool DocumentSourceFacet::usedDisk() {
 DepsTracker::State DocumentSourceFacet::getDependencies(DepsTracker* deps) const {
     const bool scopeHasVariables = pExpCtx->variablesParseState.hasDefinedVariables();
     for (auto&& facet : _facets) {
-        auto subDepsTracker = facet.pipeline->getDependencies(deps->getMetadataAvailable());
+        auto subDepsTracker = facet.pipeline->getDependencies(deps->getUnavailableMetadata());
 
         deps->fields.insert(subDepsTracker.fields.begin(), subDepsTracker.fields.end());
         deps->vars.insert(subDepsTracker.vars.begin(), subDepsTracker.vars.end());

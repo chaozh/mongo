@@ -43,6 +43,7 @@
 #include "mongo/db/repl/split_horizon.h"
 #include "mongo/db/repl/update_position_args.h"
 #include "mongo/db/server_options.h"
+#include "mongo/rpc/topology_version_gen.h"
 #include "mongo/util/net/hostandport.h"
 #include "mongo/util/time_support.h"
 
@@ -110,6 +111,11 @@ public:
      * Gets the role of this member in the replication protocol.
      */
     Role getRole() const;
+
+    /**
+     * Gets the current topology version of this member.
+     */
+    TopologyVersion getTopologyVersion() const;
 
     /**
      * Gets the MemberState of this member in the replica set.
@@ -330,8 +336,8 @@ public:
     // Produce a reply to an ismaster request.  It is only valid to call this if we are a
     // replset.  Drivers interpret the isMaster fields according to the Server Discovery and
     // Monitoring Spec, see the "Parsing an isMaster response" section.
-    void fillIsMasterForReplSet(IsMasterResponse* response,
-                                const SplitHorizon::Parameters& horizonParams);
+    void fillIsMasterForReplSet(std::shared_ptr<IsMasterResponse> response,
+                                const StringData& horizonString) const;
 
     // Produce member data for the serverStatus command and diagnostic logging.
     void fillMemberData(BSONObjBuilder* result);
@@ -503,6 +509,16 @@ public:
                                    long long* configVersion);
 
     /**
+     * Sets the latest optime committed in the previous config to the current lastCommitted optime.
+     */
+    void updateLastCommittedInPrevConfig();
+
+    /**
+     * Returns the latest optime committed in the previous config.
+     */
+    OpTime getLastCommittedInPrevConfig();
+
+    /**
      * Sets lastVote to be for ourself in this term.
      */
     void voteForMyselfV1();
@@ -666,6 +682,11 @@ public:
      * Reset the booleans to record the last heartbeat restart.
      */
     void restartHeartbeats();
+
+    /**
+     * Increments the counter field of the current TopologyVersion.
+     */
+    void incrementTopologyVersion();
 
     // Scans through all members that are 'up' and returns the latest known optime.
     OpTime latestKnownOpTime() const;
@@ -886,6 +907,9 @@ private:
     // This node's role in the replication protocol.
     Role _role;
 
+    // This node's topology version. This is updated upon a significant topology change.
+    TopologyVersion _topologyVersion;
+
     // This is a unique id that is generated and set each time we transition to PRIMARY, as the
     // result of an election.
     OID _electionId;
@@ -943,6 +967,9 @@ private:
     // OpTime representing our transition to PRIMARY and the start of our term.
     // _lastCommittedOpTime cannot be set to an earlier OpTime.
     OpTime _firstOpTimeOfMyTerm;
+
+    // Latest committed optime in the previous config.
+    OpTime _lastCommittedInPrevConfig;
 
     // The number of calls we have had to enter maintenance mode
     int _maintenanceModeCalls;

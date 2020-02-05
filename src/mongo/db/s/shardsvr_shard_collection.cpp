@@ -71,6 +71,10 @@ namespace mongo {
 
 namespace {
 
+MONGO_FAIL_POINT_DEFINE(pauseShardCollectionBeforeCriticalSection);
+MONGO_FAIL_POINT_DEFINE(pauseShardCollectionReadOnlyCriticalSection);
+MONGO_FAIL_POINT_DEFINE(pauseShardCollectionCommitPhase);
+MONGO_FAIL_POINT_DEFINE(pauseShardCollectionAfterCriticalSection);
 MONGO_FAIL_POINT_DEFINE(pauseShardCollectionBeforeReturning);
 
 struct ShardCollectionTargetState {
@@ -78,9 +82,6 @@ struct ShardCollectionTargetState {
     ShardKeyPattern shardKeyPattern;
     std::vector<TagsType> tags;
     bool collectionIsEmpty;
-    std::vector<BSONObj> splitPoints;
-    int numContiguousChunksPerShard;
-    bool fromMapReduce;
 };
 
 const ReadPreferenceSetting kConfigReadSelector(ReadPreference::Nearest, TagSet{});
@@ -182,7 +183,7 @@ BSONObj makeCreateIndexesCmd(const NamespaceString& nss,
     createIndexes.append("createIndexes", nss.coll());
     createIndexes.append("indexes", BSON_ARRAY(index.obj()));
     createIndexes.append("writeConcern", WriteConcernOptions::Majority);
-    return appendAllowImplicitCreate(createIndexes.obj(), true);
+    return createIndexes.obj();
 }
 
 /**
@@ -348,15 +349,16 @@ void validateShardKeyAgainstExistingZones(OperationContext* opCtx,
                                   << tag.getMinKey() << " -->> " << tag.getMaxKey(),
                     match);
 
-            if (ShardKeyPattern::isHashedPatternEl(proposedKeyElement) &&
-                (tagMinKeyElement.type() != NumberLong || tagMaxKeyElement.type() != NumberLong)) {
-                uasserted(ErrorCodes::InvalidOptions,
-                          str::stream() << "cannot do hash sharding with the proposed key "
-                                        << proposedKey.toString() << " because there exists a zone "
-                                        << tag.getMinKey() << " -->> " << tag.getMaxKey()
-                                        << " whose boundaries are not "
-                                           "of type NumberLong");
-            }
+            // If the field is hashed, make sure that the min and max values are of supported type.
+            uassert(
+                ErrorCodes::InvalidOptions,
+                str::stream() << "cannot do hash sharding with the proposed key "
+                              << proposedKey.toString() << " because there exists a zone "
+                              << tag.getMinKey() << " -->> " << tag.getMaxKey()
+                              << " whose boundaries are not of type NumberLong, MinKey or MaxKey",
+                !ShardKeyPattern::isHashedPatternEl(proposedKeyElement) ||
+                    (ShardKeyPattern::isValidHashedValue(tagMinKeyElement) &&
+                     ShardKeyPattern::isValidHashedValue(tagMaxKeyElement)));
         }
     }
 }
@@ -441,34 +443,6 @@ int getNumShards(OperationContext* opCtx) {
     return shardIds.size();
 }
 
-struct SplitPoints {
-    std::vector<BSONObj> initialPoints;
-    std::vector<BSONObj> finalPoints;
-};
-
-SplitPoints calculateInitialAndFinalSplitPoints(const ShardsvrShardCollection& request,
-                                                const ShardKeyPattern& shardKeyPattern,
-                                                std::vector<TagsType>& tags,
-                                                int numShards,
-                                                bool collectionIsEmpty) {
-    std::vector<BSONObj> initialSplitPoints;
-    std::vector<BSONObj> finalSplitPoints;
-
-    if (request.getInitialSplitPoints()) {
-        finalSplitPoints = *request.getInitialSplitPoints();
-    } else if (tags.empty()) {
-        InitialSplitPolicy::calculateHashedSplitPointsForEmptyCollection(
-            shardKeyPattern,
-            collectionIsEmpty,
-            numShards,
-            request.getNumInitialChunks(),
-            &initialSplitPoints,
-            &finalSplitPoints);
-    }
-
-    return {std::move(initialSplitPoints), std::move(finalSplitPoints)};
-}
-
 ShardCollectionTargetState calculateTargetState(OperationContext* opCtx,
                                                 const NamespaceString& nss,
                                                 const ShardsvrShardCollection& request) {
@@ -484,36 +458,7 @@ ShardCollectionTargetState calculateTargetState(OperationContext* opCtx,
     auto uuid = getOrGenerateUUID(opCtx, nss, request);
 
     const bool isEmpty = checkIfCollectionIsEmpty(opCtx, nss);
-    const bool fromMapReduce = bool(request.getInitialSplitPoints());
-
-    // Map/reduce with output to an empty collection assumes it has full control of the
-    // output collection and it would be an unsupported operation if the collection is
-    // being concurrently written
-    if (fromMapReduce) {
-        uassert(ErrorCodes::ConflictingOperationInProgress,
-                str::stream() << "Map reduce with sharded output to a new collection found "
-                              << nss.ns() << " to be non-empty which is not supported.",
-                isEmpty);
-    }
-
-    int numShards = getNumShards(opCtx);
-
-    auto splitPoints =
-        calculateInitialAndFinalSplitPoints(request, shardKeyPattern, tags, numShards, isEmpty);
-
-    auto initialSplitPoints = splitPoints.initialPoints;
-    auto finalSplitPoints = splitPoints.finalPoints;
-
-    const int numContiguousChunksPerShard = initialSplitPoints.empty()
-        ? 1
-        : (finalSplitPoints.size() + 1) / (initialSplitPoints.size() + 1);
-
-    return {uuid,
-            std::move(shardKeyPattern),
-            tags,
-            isEmpty,
-            finalSplitPoints,
-            numContiguousChunksPerShard};
+    return {uuid, std::move(shardKeyPattern), tags, isEmpty};
 }
 
 void logStartShardCollection(OperationContext* opCtx,
@@ -537,10 +482,7 @@ void logStartShardCollection(OperationContext* opCtx,
         collectionDetail.append("collection", nss.ns());
         prerequisites.uuid.appendToBuilder(&collectionDetail, "uuid");
         collectionDetail.append("empty", prerequisites.collectionIsEmpty);
-        collectionDetail.append("fromMapReduce", prerequisites.fromMapReduce);
         collectionDetail.append("primary", primaryShard->toString());
-        collectionDetail.append("numChunks",
-                                static_cast<int>(prerequisites.splitPoints.size() + 1));
         uassertStatusOK(ShardingLogging::get(opCtx)->logChangeChecked(
             opCtx,
             "shardCollection.start",
@@ -697,7 +639,15 @@ UUID shardCollection(OperationContext* opCtx,
         return *collectionOptional->getUUID();
     }
 
-    InitialSplitPolicy::ShardingOptimizationType optimizationType;
+    bool isFCV44 = serverGlobalParams.featureCompatibility.isVersionInitialized() &&
+        serverGlobalParams.featureCompatibility.getVersion() ==
+            ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo44;
+    uassert(ErrorCodes::BadValue,
+            "Compound hashed shard key can only be used when FCV is fully upgraded to 4.4",
+            isFCV44 || !ShardKeyPattern::extractHashedField(request.getKey()) ||
+                request.getKey().nFields() == 1);
+
+    std::unique_ptr<InitialSplitPolicy> splitPolicy;
     InitialSplitPolicy::ShardCollectionConfig initialChunks;
     boost::optional<ShardCollectionTargetState> targetState;
 
@@ -717,10 +667,14 @@ UUID shardCollection(OperationContext* opCtx,
             refreshAllShards(opCtx, nss, dbPrimaryShardId, initialChunks.chunks);
         };
 
+    pauseShardCollectionBeforeCriticalSection.pauseWhileSet();
+
     {
         // From this point onward the collection can only be read, not written to, so it is safe to
         // construct the prerequisites and generate the target state.
         CollectionCriticalSection critSec(opCtx, nss);
+
+        pauseShardCollectionReadOnlyCriticalSection.pauseWhileSet();
 
         if (auto collectionOptional =
                 InitialSplitPolicy::checkIfCollectionAlreadyShardedWithSameOptions(
@@ -736,41 +690,34 @@ UUID shardCollection(OperationContext* opCtx,
         // From this point onward, the collection can not be written to or read from.
         critSec.enterCommitPhase();
 
+        pauseShardCollectionCommitPhase.pauseWhileSet();
         logStartShardCollection(opCtx, cmdObj, nss, request, *targetState, dbPrimaryShardId);
 
-        optimizationType = InitialSplitPolicy::calculateOptimizationType(
-            targetState->splitPoints, targetState->tags, targetState->collectionIsEmpty);
-        if (optimizationType != InitialSplitPolicy::ShardingOptimizationType::None) {
-            initialChunks = InitialSplitPolicy::createFirstChunksOptimized(
-                opCtx,
-                nss,
-                targetState->shardKeyPattern,
-                dbPrimaryShardId,
-                targetState->splitPoints,
-                targetState->tags,
-                optimizationType,
-                targetState->collectionIsEmpty,
-                targetState->numContiguousChunksPerShard);
-
-            // If we are coming from mapReduce, we will have created chunks with a distribution
-            // such that all reduce writes end up being local. In that case, we do not need to
-            // create the chunk on other shards.
-            if (!targetState->fromMapReduce) {
-                createCollectionOnShardsReceivingChunks(
-                    opCtx, nss, initialChunks.chunks, dbPrimaryShardId);
-            }
+        splitPolicy =
+            InitialSplitPolicy::calculateOptimizationStrategy(opCtx,
+                                                              targetState->shardKeyPattern,
+                                                              request,
+                                                              targetState->tags,
+                                                              getNumShards(opCtx),
+                                                              targetState->collectionIsEmpty);
+        if (splitPolicy->isOptimized()) {
+            initialChunks = splitPolicy->createFirstChunks(
+                opCtx, targetState->shardKeyPattern, {nss, dbPrimaryShardId});
+            createCollectionOnShardsReceivingChunks(
+                opCtx, nss, initialChunks.chunks, dbPrimaryShardId);
 
             writeChunkDocumentsAndRefreshShards(*targetState, initialChunks);
         }
     }
 
     // We have now left the critical section.
+    pauseShardCollectionAfterCriticalSection.pauseWhileSet();
 
-    if (optimizationType == InitialSplitPolicy::ShardingOptimizationType::None) {
+    if (!splitPolicy->isOptimized()) {
         invariant(initialChunks.chunks.empty());
 
-        initialChunks = InitialSplitPolicy::createFirstChunksUnoptimized(
-            opCtx, nss, targetState->shardKeyPattern, dbPrimaryShardId);
+        initialChunks = splitPolicy->createFirstChunks(
+            opCtx, targetState->shardKeyPattern, {nss, dbPrimaryShardId});
 
         writeChunkDocumentsAndRefreshShards(*targetState, initialChunks);
     }
@@ -783,7 +730,8 @@ UUID shardCollection(OperationContext* opCtx,
         opCtx,
         "shardCollection.end",
         nss.ns(),
-        BSON("version" << initialChunks.collVersion().toString()),
+        BSON("version" << initialChunks.collVersion().toString() << "numChunks"
+                       << static_cast<int>(initialChunks.chunks.size())),
         ShardingCatalogClient::kMajorityWriteConcern);
 
     return targetState->uuid;

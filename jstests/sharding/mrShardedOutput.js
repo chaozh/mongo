@@ -1,135 +1,82 @@
-// This test runs map reduce from a sharded input collection and outputs it to a sharded collection.
-// The test is done in 2 passes - the first pass runs the map reduce and outputs it to a
-// non-existing collection. The second pass runs map reduce with the collection input twice the size
-// of the first and outputs it to the new sharded collection created in the first pass.
+// Tests the behavior of mapReduce outputting to a sharded collection and specifying the 'sharded'
+// flag.
+// This test stresses behavior that is only true of the mapReduce implementation using aggregation,
+// so it cannot be run in mixed-version suites.
+// @tags: [requires_fcv_44]
 (function() {
 "use strict";
+
+load("jstests/libs/fixture_helpers.js");  // For 'FixtureHelpers'.
 
 const st = new ShardingTest({shards: 2, other: {chunkSize: 1}});
 
 const config = st.getDB("config");
-st.adminCommand({enablesharding: "test"});
-st.ensurePrimaryShard("test", st.shard1.shardName);
-st.adminCommand({shardcollection: "test.foo", key: {"a": 1}});
-
 const testDB = st.getDB("test");
+const inputColl = testDB.foo;
+const outputColl = testDB.mr_sharded_out;
 
-function map2() {
-    emit(this.i, {count: 1, y: this.y});
-}
-function reduce2(key, values) {
-    return values[0];
-}
-
-let numDocs = 0;
-const numBatch = 5000;
+const numDocs = 500;
 const str = new Array(1024).join('a');
+// Shard the input collection by "a" and split into two chunks, one on each shard.
+st.shardColl(inputColl, {a: 1}, {a: numDocs / 2}, {a: numDocs});
 
-// Pre split now so we don't have to balance the chunks later.
-// M/R is strange in that it chooses the output shards based on currently sharded
-// collections in the database. The upshot is that we need a sharded collection on
-// both shards in order to ensure M/R will output to two shards.
-st.adminCommand({split: 'test.foo', middle: {a: numDocs + numBatch / 2}});
-st.adminCommand({moveChunk: 'test.foo', find: {a: numDocs}, to: st.shard0.shardName});
-
-// Add some more data for input so that chunks will get split further
-for (let splitPoint = 0; splitPoint < numBatch; splitPoint += 400) {
-    testDB.adminCommand({split: 'test.foo', middle: {a: splitPoint}});
+function map() {
+    emit(this._id, {count: 1, y: this.y});
+}
+function reduce(key, values) {
+    // 'values' can contain a null entry if we're using reduce for output mode "reduce" and the
+    // target doesn't exist.
+    return {
+        count: Array.sum(values.map(val => val === null ? 0 : val.count)),
+        y: values.map(val => val === null ? "" : val.y).join("")
+    };
 }
 
-let bulk = testDB.foo.initializeUnorderedBulkOp();
-for (let i = 0; i < numBatch; ++i) {
-    bulk.insert({a: numDocs + i, y: str, i: numDocs + i});
-}
-assert.commandWorked(bulk.execute());
-
-numDocs += numBatch;
-
-// Do the MapReduce step
-jsTest.log("Setup OK: count matches (" + numDocs + ") -- Starting MapReduce");
-let res = testDB.foo.mapReduce(map2, reduce2, {out: {replace: "mrShardedOut", sharded: true}});
-jsTest.log("MapReduce results:" + tojson(res));
-
-let reduceOutputCount = res.counts.output;
-assert.eq(numDocs,
-          reduceOutputCount,
-          "MapReduce FAILED: res.counts.output = " + reduceOutputCount + ", should be " + numDocs);
-
-jsTest.log("Checking that all MapReduce output documents are in output collection");
-let outColl = testDB["mrShardedOut"];
-let outCollCount = outColl.find().itcount();
-assert.eq(numDocs,
-          outCollCount,
-          "MapReduce FAILED: outColl.find().itcount() = " + outCollCount + ", should be " +
-              numDocs + ": this may happen intermittently until resolution of SERVER-3627");
-
-// Make sure it's sharded and split
-let newNumChunks = config.chunks.count({ns: testDB.mrShardedOut._fullName});
-assert.gt(
-    newNumChunks, 1, "Sharding FAILURE: " + testDB.mrShardedOut._fullName + " has only 1 chunk");
-
-// Check that there are no "jumbo" chunks.
-const objSize = Object.bsonsize(testDB.mrShardedOut.findOne());
-const docsPerChunk = 1024 * 1024 / objSize * 1.1;  // 1MB chunk size + allowance
-
-config.chunks.find({ns: testDB.mrShardedOut.getFullName()}).forEach(function(chunkDoc) {
-    const count =
-        testDB.mrShardedOut.find({_id: {$gte: chunkDoc.min._id, $lt: chunkDoc.max._id}}).itcount();
-    assert.lte(count, docsPerChunk, 'Chunk has too many docs: ' + tojson(chunkDoc));
-});
-
-// Check that chunks for the newly created sharded output collection are well distributed.
-const shard0Chunks =
-    config.chunks.find({ns: testDB.mrShardedOut._fullName, shard: st.shard0.shardName}).count();
-const shard1Chunks =
-    config.chunks.find({ns: testDB.mrShardedOut._fullName, shard: st.shard1.shardName}).count();
-assert.lte(Math.abs(shard0Chunks - shard1Chunks), 1);
-
-jsTest.log('Starting second pass');
-
-st.adminCommand({split: 'test.foo', middle: {a: numDocs + numBatch / 2}});
-st.adminCommand({moveChunk: 'test.foo', find: {a: numDocs}, to: st.shard0.shardName});
-
-// Add some more data for input so that chunks will get split further
-for (let splitPoint = 0; splitPoint < numBatch; splitPoint += 400) {
-    testDB.adminCommand({split: 'test.foo', middle: {a: numDocs + splitPoint}});
-}
-
-bulk = testDB.foo.initializeUnorderedBulkOp();
-for (let i = 0; i < numBatch; ++i) {
-    bulk.insert({a: numDocs + i, y: str, i: numDocs + i});
+const bulk = inputColl.initializeUnorderedBulkOp();
+for (let i = 0; i < numDocs; ++i) {
+    bulk.insert({_id: i, a: numDocs + i, y: str, i: numDocs + i});
 }
 assert.commandWorked(bulk.execute());
-numDocs += numBatch;
 
-// Do the MapReduce step
-jsTest.log("Setup OK: count matches (" + numDocs + ") -- Starting MapReduce");
-res = testDB.foo.mapReduce(map2, reduce2, {out: {replace: "mrShardedOut", sharded: true}});
-jsTest.log("MapReduce results:" + tojson(res));
+// Should not be able to replace to a sharded collection.
+let error = assert.throws(
+    () => inputColl.mapReduce(map, reduce, {out: {replace: outputColl.getName(), sharded: true}}));
+assert.eq(error.code, ErrorCodes.InvalidOptions);
 
-reduceOutputCount = res.counts.output;
-assert.eq(numDocs,
-          reduceOutputCount,
-          "MapReduce FAILED: res.counts.output = " + reduceOutputCount + ", should be " + numDocs);
+// Should fail if we specify "merge" or "reduce" with sharded: true and the collection does not yet
+// exist as sharded.
+error = assert.throws(
+    () => inputColl.mapReduce(map, reduce, {out: {merge: outputColl.getName(), sharded: true}}));
+assert.eq(error.code, ErrorCodes.InvalidOptions);
 
-jsTest.log("Checking that all MapReduce output documents are in output collection");
-outColl = testDB.mrShardedOut;
-outCollCount = outColl.find().itcount();
-assert.eq(numDocs,
-          outCollCount,
-          "MapReduce FAILED: outColl.find().itcount() = " + outCollCount + ", should be " +
-              numDocs + ": this may happen intermittently until resolution of SERVER-3627");
+error = assert.throws(
+    () => inputColl.mapReduce(map, reduce, {out: {reduce: outputColl.getName(), sharded: true}}));
+assert.eq(error.code, ErrorCodes.InvalidOptions);
 
-// Make sure it's sharded and split
-newNumChunks = config.chunks.count({ns: testDB.mrShardedOut._fullName});
-assert.gt(
-    newNumChunks, 1, "Sharding FAILURE: " + testDB.mrShardedOut._fullName + " has only 1 chunk");
+// Now create and shard the output collection, again with one chunk on each shard.
+st.shardColl(outputColl, {_id: 1}, {_id: numDocs / 2}, {_id: numDocs / 2});
 
-config.chunks.find({ns: testDB.mrShardedOut.getFullName()}).forEach(function(chunkDoc) {
-    const count =
-        testDB.mrShardedOut.find({_id: {$gte: chunkDoc.min._id, $lt: chunkDoc.max._id}}).itcount();
-    assert.lte(count, docsPerChunk, 'Chunk has too many docs: ' + tojson(chunkDoc));
-});
+// Should be able to output successfully with any non-replace mode now.
+inputColl.mapReduce(map, reduce, {out: {merge: outputColl.getName(), sharded: true}});
+assert.eq(numDocs, outputColl.find().itcount());
+// It should not be required to specify the sharded option anymore.
+inputColl.mapReduce(map, reduce, {out: {merge: outputColl.getName()}});
+assert.eq(numDocs, outputColl.find().itcount());
+assert(FixtureHelpers.isSharded(outputColl));
+
+// Now remove half of the output collection to prove that we can "reduce" with those that exist.
+assert.commandWorked(outputColl.remove({_id: {$mod: [2, 0]}}));
+inputColl.mapReduce(map, reduce, {out: {reduce: outputColl.getName(), sharded: true}});
+assert.eq(numDocs, outputColl.find().itcount());
+const evenResult = outputColl.findOne({_id: {$mod: [2, 0]}});
+const oddResult = outputColl.findOne({_id: {$mod: [2, 1]}});
+assert.eq(evenResult.value.count * 2, oddResult.value.count, [evenResult, oddResult]);
+
+// Should not be able to use replace mode if the collection exists and is sharded, even if the
+// 'sharded' option is not specified.
+error =
+    assert.throws(() => inputColl.mapReduce(map, reduce, {out: {replace: outputColl.getName()}}));
+assert.eq(error.code, ErrorCodes.IllegalOperation);
 
 st.stop();
 }());

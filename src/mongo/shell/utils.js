@@ -275,6 +275,7 @@ jsTestOptions = function() {
             wiredTigerIndexConfigString: TestData.wiredTigerIndexConfigString,
             noJournal: TestData.noJournal,
             auth: TestData.auth,
+            logFormat: TestData.logFormat,
             // Note: keyFile is also used as a flag to indicate cluster auth is turned on, set it
             // to a truthy value if you'd like to do cluster auth, even if it's not keyFile auth.
             // Use clusterAuthMode to specify the actual auth mode you want to use.
@@ -314,6 +315,8 @@ jsTestOptions = function() {
             skipValidationNamespaces: TestData.skipValidationNamespaces || [],
             skipCheckingUUIDsConsistentAcrossCluster:
                 TestData.skipCheckingUUIDsConsistentAcrossCluster || false,
+            skipCheckingIndexesConsistentAcrossCluster:
+                TestData.skipCheckingIndexesConsistentAcrossCluster || false,
             skipCheckingCatalogCacheConsistencyWithShardingCatalog:
                 TestData.skipCheckingCatalogCacheConsistencyWithShardingCatalog || false,
             skipAwaitingReplicationOnShardsBeforeCheckingUUIDs:
@@ -346,6 +349,10 @@ jsTestOptions = function() {
             // Set a specific random seed to be used when useRandomBinVersionsWithinReplicaSet is
             // true.
             seed: TestData.seed || undefined,
+            // Override the logging options for mongod and mongos so they always log to a file
+            // in dbpath; additionally, prevent the dbpath from being cleared after a node
+            // is shut down.
+            alwaysUseLogFiles: TestData.alwaysUseLogFiles || false,
         });
     }
     return _jsTestOptions;
@@ -392,7 +399,9 @@ jsTest.authenticate = function(conn) {
                 pwd: jsTestOptions().authPassword,
             });
             return conn.authenticated;
-        }, "Authenticating connection: " + conn, 5000, 1000);
+            // Dont' run the hang analyzer because we expect that this might fail in the normal
+            // course of events.
+        }, "Authenticating connection: " + conn, 5000, 1000, {runHangAnalyzer: false});
     } catch (e) {
         print("Caught exception while authenticating connection: " + tojson(e));
         conn.authenticated = false;

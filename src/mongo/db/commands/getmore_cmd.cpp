@@ -73,6 +73,15 @@ MONGO_FAIL_POINT_DEFINE(GetMoreHangBeforeReadLock);
 // The timeout when waiting for linearizable read concern on a getMore command.
 static constexpr int kLinearizableReadConcernTimeout = 15000;
 
+// getMore can run with any readConcern, because cursor-creating commands like find can run with any
+// readConcern.  However, since getMore automatically uses the readConcern of the command that
+// created the cursor, it is not appropriate to apply the default readConcern (just as
+// client-specified readConcern isn't appropriate).
+static const ReadConcernSupportResult kSupportsReadConcernResult{
+    Status::OK(),
+    {{ErrorCodes::InvalidOptions,
+      "default read concern not permitted (getMore uses the cursor's read concern)"}}};
+
 /**
  * Validates that the lsid of 'opCtx' matches that of 'cursor'. This must be called after
  * authenticating, so that it is safe to report the lsid of 'cursor'.
@@ -237,6 +246,10 @@ public:
             return false;
         }
 
+        ReadConcernSupportResult supportsReadConcern(repl::ReadConcernLevel level) const override {
+            return kSupportsReadConcernResult;
+        }
+
         bool allowsAfterClusterTime() const override {
             return false;
         }
@@ -282,8 +295,10 @@ public:
                 while (!FindCommon::enoughForGetMore(request.batchSize.value_or(0), *numResults) &&
                        PlanExecutor::ADVANCED == (*state = exec->getNext(&doc, nullptr))) {
                     auto* expCtx = exec->getExpCtx().get();
+                    // Note that "needsMerge" implies a find or aggregate operation, which should
+                    // always have a non-NULL 'expCtx' value.
                     BSONObj obj = cursor->needsMerge()
-                        ? doc.toBsonWithMetaData(expCtx ? expCtx->use42ChangeStreamSortKeys : false)
+                        ? doc.toBsonWithMetaData(expCtx->sortKeyFormat)
                         : doc.toBson();
 
                     // If adding this object will cause us to exceed the message size limit, then we
@@ -390,7 +405,7 @@ public:
                     statsTracker.emplace(opCtx,
                                          _request.nss,
                                          Top::LockType::NotLocked,
-                                         AutoStatsTracker::LogMode::kUpdateTopAndCurop,
+                                         AutoStatsTracker::LogMode::kUpdateTopAndCurOp,
                                          dbProfilingLevel);
                 }
             } else {
@@ -419,7 +434,7 @@ public:
                 statsTracker.emplace(opCtx,
                                      _request.nss,
                                      Top::LockType::ReadLocked,
-                                     AutoStatsTracker::LogMode::kUpdateTopAndCurop,
+                                     AutoStatsTracker::LogMode::kUpdateTopAndCurOp,
                                      readLock->getDb() ? readLock->getDb()->getProfilingLevel()
                                                        : doNotChangeProfilingLevel);
 
@@ -548,9 +563,15 @@ public:
 
             // Mark this as an AwaitData operation if appropriate.
             if (cursorPin->isAwaitData() && !disableAwaitDataFailpointActive) {
-                if (_request.lastKnownCommittedOpTime)
-                    clientsLastKnownCommittedOpTime(opCtx) =
-                        _request.lastKnownCommittedOpTime.get();
+                auto lastKnownCommittedOpTime = _request.lastKnownCommittedOpTime;
+                if (opCtx->isExhaust() && cursorPin->getLastKnownCommittedOpTime()) {
+                    // Use the commit point of the last batch for exhaust cursors.
+                    lastKnownCommittedOpTime = cursorPin->getLastKnownCommittedOpTime();
+                }
+                if (lastKnownCommittedOpTime) {
+                    clientsLastKnownCommittedOpTime(opCtx) = lastKnownCommittedOpTime.get();
+                }
+
                 awaitDataState(opCtx).shouldWaitForInserts = true;
             }
 
@@ -607,6 +628,12 @@ public:
                 cursorPin->setLeftoverMaxTimeMicros(opCtx->getRemainingMaxTimeMicros());
                 cursorPin->incNReturnedSoFar(numResults);
                 cursorPin->incNBatches();
+
+                if (opCtx->isExhaust() && !clientsLastKnownCommittedOpTime(opCtx).isNull()) {
+                    // Set the commit point of the latest batch.
+                    auto replCoord = repl::ReplicationCoordinator::get(opCtx);
+                    cursorPin->setLastKnownCommittedOpTime(replCoord->getLastCommittedOpTime());
+                }
             } else {
                 curOp->debug().cursorExhausted = true;
             }
@@ -619,6 +646,12 @@ public:
 
             if (respondWithId) {
                 cursorFreer.dismiss();
+
+                if (opCtx->isExhaust()) {
+                    // Indicate that an exhaust message should be generated and the previous BSONObj
+                    // command parameters should be reused as the next BSONObj command parameters.
+                    reply->setNextInvocation(boost::none);
+                }
             }
         }
 
@@ -629,10 +662,14 @@ public:
             curOp->debug().cursorid = _request.cursorid;
 
             // Validate term before acquiring locks, if provided.
-            if (_request.term) {
+            if (_request.term && _request.nss == NamespaceString::kRsOplogNamespace) {
                 auto replCoord = repl::ReplicationCoordinator::get(opCtx);
                 // Note: updateTerm returns ok if term stayed the same.
                 uassertStatusOK(replCoord->updateTerm(opCtx, *_request.term));
+                // If the term field is present in an oplog request, it means this is an oplog
+                // getMore for replication oplog fetching because the term field is only allowed for
+                // internal clients (see checkAuthForGetMore).
+                curOp->debug().isReplOplogFetching = true;
             }
 
             auto cursorManager = CursorManager::get(opCtx);

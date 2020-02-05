@@ -131,17 +131,21 @@ private:
     }
 
     static void _lockShare(CURL*, curl_lock_data, curl_lock_access, void* ctx) {
-        reinterpret_cast<Mutex*>(ctx)->lock();
+        reinterpret_cast<stdx::recursive_mutex*>(ctx)->lock();
     }
 
     static void _unlockShare(CURL*, curl_lock_data, void* ctx) {
-        reinterpret_cast<Mutex*>(ctx)->unlock();
+        reinterpret_cast<stdx::recursive_mutex*>(ctx)->unlock();
     }
 
 private:
     bool _initialized = false;
     CURLSH* _share = nullptr;
-    Mutex _shareMutex = MONGO_MAKE_LATCH("CurlLibraryManager::_shareMutex");
+
+    // A recursive mutex here is needed because CURL needs to lock this multiple times depending
+    // on the "internal CURL type" of the object that CURL is sending. Using a normal mutex
+    // causes the CURL system to deadlock.
+    stdx::recursive_mutex _shareMutex{};
 } curlLibraryManager;
 
 /**
@@ -273,6 +277,21 @@ public:
         curl_easy_setopt(myHandle.get(), CURLOPT_READFUNCTION, ReadMemoryCallback);
         curl_easy_setopt(myHandle.get(), CURLOPT_READDATA, &cdrc);
         curl_easy_setopt(myHandle.get(), CURLOPT_POSTFIELDSIZE, (long)cdrc.length());
+
+        return doRequest(myHandle.get(), url);
+    }
+
+    DataBuilder put(StringData url, ConstDataRange cdr) const final {
+        // Make a local copy of the base handle for this request.
+        CurlHandle myHandle(curl_easy_duphandle(_handle.get()));
+        uassert(ErrorCodes::InternalError, "Curl initialization failed", myHandle);
+
+        curl_easy_setopt(myHandle.get(), CURLOPT_PUT, 1);
+
+        ConstDataRangeCursor cdrc(cdr);
+        curl_easy_setopt(myHandle.get(), CURLOPT_READFUNCTION, ReadMemoryCallback);
+        curl_easy_setopt(myHandle.get(), CURLOPT_READDATA, &cdrc);
+        curl_easy_setopt(myHandle.get(), CURLOPT_INFILESIZE_LARGE, (long)cdrc.length());
 
         return doRequest(myHandle.get(), url);
     }

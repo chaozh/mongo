@@ -116,7 +116,7 @@ protected:
         log() << "Simulating writing a rollback file for namespace " << nss.ns() << " with uuid "
               << uuid;
         for (auto&& id : idSet) {
-            log() << "Looking up " << id.jsonString();
+            log() << "Looking up " << id.jsonString(JsonStringFormat::LegacyStrict);
             auto document = _findDocumentById(opCtx, uuid, nss, id.firstElement());
             if (document) {
                 _uuidToObjsMap[uuid].push_back(*document);
@@ -576,7 +576,7 @@ TEST_F(RollbackImplTest, RollbackPersistsDocumentAfterCommonPointToOplogTruncate
     auto coll = _initializeCollection(_opCtx.get(), UUID::gen(), nss);
 
     ASSERT_OK(_rollback->runRollback(_opCtx.get()));
-    ASSERT_EQUALS(_truncatePoint, Timestamp(3, 3));
+    ASSERT_EQUALS(_truncatePoint, Timestamp(2, 2));
 }
 
 TEST_F(RollbackImplTest, RollbackImplResetsOptimesFromOplogAfterRollback) {
@@ -839,7 +839,7 @@ TEST_F(RollbackImplTest,
     truncateAfterPoint =
         _replicationProcess->getConsistencyMarkers()->getOplogTruncateAfterPoint(_opCtx.get());
     ASSERT_EQUALS(Timestamp(), truncateAfterPoint);
-    ASSERT_EQUALS(_truncatePoint, Timestamp(2, 2));
+    ASSERT_EQUALS(_truncatePoint, Timestamp(1, 1));
     ASSERT_EQ(_storageInterface->getFinalCollectionCount(uuid), 1);
 }
 
@@ -863,7 +863,7 @@ TEST_F(RollbackImplTest, RollbackSucceedsAndTruncatesOplog) {
         _replicationProcess->getConsistencyMarkers()->getOplogTruncateAfterPoint(_opCtx.get());
     ASSERT_EQUALS(Timestamp(), truncateAfterPoint);
     _assertDocsInOplog(_opCtx.get(), {1});
-    ASSERT_EQUALS(_truncatePoint, Timestamp(2, 2));
+    ASSERT_EQUALS(_truncatePoint, Timestamp(1, 1));
 }
 
 DEATH_TEST_F(RollbackImplTest,
@@ -1418,8 +1418,13 @@ RollbackImplTest::_setUpUnpreparedTransactionForCountTest(UUID collId) {
     // set to true.
     auto insertOp2 = _insertDocAndReturnOplogEntry(BSON("_id" << 2), collId, nss, 2);
     auto partialApplyOpsOpTime = unittest::assertGet(OpTime::parseFromOplogEntry(insertOp2.first));
-    auto partialApplyOpsObj =
-        BSON("applyOps" << BSON_ARRAY(insertOp2.first) << "partialTxn" << true);
+
+    // applyOps oplog entries cannot have an inner "ts", "t" or "wall" field.
+    auto insertOp2Obj = insertOp2.first.removeField("ts");
+    insertOp2Obj = insertOp2Obj.removeField("t");
+    insertOp2Obj = insertOp2Obj.removeField("wall");
+
+    auto partialApplyOpsObj = BSON("applyOps" << BSON_ARRAY(insertOp2Obj) << "partialTxn" << true);
     OplogEntry partialApplyOpsOplogEntry(partialApplyOpsOpTime,      // opTime
                                          1LL,                        // hash
                                          OpTypeEnum::kCommand,       // opType
@@ -1444,7 +1449,13 @@ RollbackImplTest::_setUpUnpreparedTransactionForCountTest(UUID collId) {
     // chain of applyOps oplog entries for this transaction.
     auto insertOp3 = _insertDocAndReturnOplogEntry(BSON("_id" << 3), collId, nss, 3);
     auto commitApplyOpsOpTime = unittest::assertGet(OpTime::parseFromOplogEntry(insertOp3.first));
-    auto commitApplyOpsObj = BSON("applyOps" << BSON_ARRAY(insertOp3.first) << "count" << 1);
+
+    // applyOps oplog entries cannot have an inner "ts", "t" or "wall" field.
+    auto insertOp3Obj = insertOp3.first.removeField("ts");
+    insertOp3Obj = insertOp3Obj.removeField("t");
+    insertOp3Obj = insertOp3Obj.removeField("wall");
+
+    auto commitApplyOpsObj = BSON("applyOps" << BSON_ARRAY(insertOp3Obj) << "count" << 1);
     OplogEntry commitApplyOpsOplogEntry(commitApplyOpsOpTime,       // opTime
                                         1LL,                        // hash
                                         OpTypeEnum::kCommand,       // opType
@@ -1551,12 +1562,12 @@ public:
         auto search = uuidToIdMap.find(uuid);
         ASSERT(search != uuidToIdMap.end())
             << "map is unexpectedly missing an entry for uuid " << uuid.toString()
-            << " containing object " << bson.jsonString();
+            << " containing object " << bson.jsonString(JsonStringFormat::LegacyStrict);
         const auto& idObjSet = search->second;
         const auto iter = idObjSet.find(bson);
-        ASSERT(iter != idObjSet.end())
-            << "_id object set is unexpectedly missing object " << bson.jsonString()
-            << " in namespace with uuid " << uuid.toString();
+        ASSERT(iter != idObjSet.end()) << "_id object set is unexpectedly missing object "
+                                       << bson.jsonString(JsonStringFormat::LegacyStrict)
+                                       << " in namespace with uuid " << uuid.toString();
     }
 
 
@@ -1750,28 +1761,22 @@ TEST_F(RollbackImplObserverInfoTest, RollbackRecordsNamespacesOfApplyOpsOplogEnt
 
     // Add a few different sub-ops from different namespaces to make sure they all get recorded.
     auto createNss = NamespaceString("test", "createColl");
-    auto createOp = makeCommandOp(Timestamp(2, 2),
-                                  UUID::gen(),
-                                  createNss.getCommandNS().toString(),
-                                  BSON("create" << createNss.coll()),
-                                  2);
+    auto createOp = makeCommandOpForApplyOps(
+        UUID::gen(), createNss.getCommandNS().toString(), BSON("create" << createNss.coll()), 2);
 
     auto dropNss = NamespaceString("test", "dropColl");
     auto dropUuid = UUID::gen();
-    auto dropOp = makeCommandOp(Timestamp(2, 2),
-                                dropUuid,
-                                dropNss.getCommandNS().toString(),
-                                BSON("drop" << dropNss.coll()),
-                                2);
+    auto dropOp = makeCommandOpForApplyOps(
+        dropUuid, dropNss.getCommandNS().toString(), BSON("drop" << dropNss.coll()), 2);
     _initializeCollection(_opCtx.get(), dropUuid, dropNss);
 
     auto collModNss = NamespaceString("test", "collModColl");
-    auto collModOp = makeCommandOp(Timestamp(2, 2),
-                                   UUID::gen(),
-                                   collModNss.getCommandNS().ns(),
-                                   BSON("collMod" << collModNss.coll() << "validationLevel"
-                                                  << "off"),
-                                   2);
+    auto collModOp =
+        makeCommandOpForApplyOps(UUID::gen(),
+                                 collModNss.getCommandNS().ns(),
+                                 BSON("collMod" << collModNss.coll() << "validationLevel"
+                                                << "off"),
+                                 2);
 
     // Create the applyOps command object.
     BSONArrayBuilder subops;
@@ -1876,24 +1881,6 @@ TEST_F(RollbackImplObserverInfoTest,
     const auto insertOp = _insertDocAndReturnOplogEntry(BSON("_id" << 1), uuid, nss, 2);
     ASSERT_OK(rollbackOps({insertOp}));
     ASSERT(_rbInfo.rollbackSessionIds.empty());
-}
-
-TEST_F(RollbackImplObserverInfoTest, RollbackRecordsSessionIdFromApplyOpsSubOp) {
-    const auto collId = UUID::gen();
-    const auto coll = _initializeCollection(_opCtx.get(), collId, nss);
-    auto sessionId = UUID::gen();
-    auto sessionOpObj = makeSessionOp(collId, nss, sessionId, 1L);
-
-    // Create the applyOps command object.
-    BSONArrayBuilder subops;
-    subops.append(sessionOpObj);
-    auto applyOpsCmdOp = makeCommandOp(
-        Timestamp(2, 2), boost::none, "admin.$cmd", BSON("applyOps" << subops.arr()), 2);
-
-    // Run the rollback and make sure the correct session id was recorded.
-    ASSERT_OK(rollbackOps({applyOpsCmdOp}));
-    std::set<UUID> expectedSessionIds = {sessionId};
-    ASSERT(expectedSessionIds == _rbInfo.rollbackSessionIds);
 }
 
 TEST_F(RollbackImplObserverInfoTest, RollbackRecordsShardIdentityRollback) {

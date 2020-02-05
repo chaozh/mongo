@@ -54,8 +54,8 @@ namespace CollectionValidation {
 ValidateState::ValidateState(OperationContext* opCtx,
                              const NamespaceString& nss,
                              bool background,
-                             bool fullValidate)
-    : _nss(nss), _background(background), _fullValidate(fullValidate), _dataThrottle(opCtx) {
+                             ValidateOptions options)
+    : _nss(nss), _background(background), _options(options), _dataThrottle(opCtx) {
 
     // Subsequent re-locks will use the UUID when 'background' is true.
     if (_background) {
@@ -67,8 +67,8 @@ ValidateState::ValidateState(OperationContext* opCtx,
     }
 
     _database = _databaseLock->getDb() ? _databaseLock->getDb() : nullptr;
-    _collection =
-        _database ? CollectionCatalog::get(opCtx).lookupCollectionByNamespace(_nss) : nullptr;
+    _collection = _database ? CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, _nss)
+                            : nullptr;
 
     if (!_collection) {
         if (_database && ViewCatalog::get(_database)->lookup(opCtx, _nss.ns())) {
@@ -115,11 +115,6 @@ void ValidateState::_yieldLocks(OperationContext* opCtx) {
 
 void ValidateState::_yieldCursors(OperationContext* opCtx) {
     invariant(!_background);
-
-    // Mobile does not support saving and restoring cursors, so we skip yielding cursors for it.
-    if (storageGlobalParams.engine == "mobile") {
-        return;
-    }
 
     // Save all the cursors.
     for (const auto& indexCursor : _indexCursors) {
@@ -179,7 +174,8 @@ void ValidateState::initializeCursors(OperationContext* opCtx) {
 
     std::vector<std::string> readyDurableIndexes;
     try {
-        DurableCatalog::get(opCtx)->getReadyIndexes(opCtx, _nss, &readyDurableIndexes);
+        DurableCatalog::get(opCtx)->getReadyIndexes(
+            opCtx, _collection->getCatalogId(), &readyDurableIndexes);
     } catch (const ExceptionFor<ErrorCodes::CursorNotFound>& ex) {
         invariant(_background);
         log() << "Skipping background validation on collection '" << _nss
@@ -213,7 +209,7 @@ void ValidateState::initializeCursors(OperationContext* opCtx) {
         // because its in-memory representation is gone).
         auto diskIndexIdent =
             opCtx->getServiceContext()->getStorageEngine()->getCatalog()->getIndexIdent(
-                opCtx, _nss, desc->indexName());
+                opCtx, _collection->getCatalogId(), desc->indexName());
         if (entry->getIdent() != diskIndexIdent) {
             log() << "Skipping validation on index '" << desc->indexName() << "' in collection '"
                   << _nss << "' because the index was recreated and is not yet in a checkpoint.";
@@ -288,7 +284,7 @@ void ValidateState::_relockDatabaseAndCollection(OperationContext* opCtx) {
         uasserted(ErrorCodes::Interrupted, collErrMsg);
     }
 
-    _collection = CollectionCatalog::get(opCtx).lookupCollectionByUUID(*_uuid);
+    _collection = CollectionCatalog::get(opCtx).lookupCollectionByUUID(opCtx, *_uuid);
     uassert(ErrorCodes::Interrupted, collErrMsg, _collection);
 
     // The namespace of the collection can be changed during a same database collection rename.

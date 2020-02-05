@@ -35,14 +35,6 @@
 #include "mongo/logv2/log_manager.h"
 #include "mongo/unittest/unittest.h"
 
-#include <boost/log/attributes/attribute_value_set.hpp>
-#include <boost/log/core/record_view.hpp>
-#include <boost/log/utility/formatting_ostream.hpp>
-
-#include <boost/log/sinks.hpp>
-
-#include <boost/make_shared.hpp>
-
 namespace mongo {
 namespace logv2 {
 

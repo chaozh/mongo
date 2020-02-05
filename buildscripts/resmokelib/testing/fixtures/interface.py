@@ -2,6 +2,7 @@
 
 import os.path
 import time
+from enum import Enum
 
 import pymongo
 import pymongo.errors
@@ -9,10 +10,24 @@ import pymongo.errors
 from ... import config
 from ... import errors
 from ... import logging
+from ... import multiversionconstants as multiversion
 from ... import utils
 from ...utils import registry
 
 _FIXTURES = {}  # type: ignore
+
+
+class TeardownMode(Enum):
+    """
+    Enumeration representing different ways a fixture can be torn down.
+
+    Each constant has the value of a Linux signal, even though the signal won't be used on Windows.
+    This class is used because the 'signal' package on Windows has different values.
+    """
+
+    TERMINATE = 15
+    KILL = 9
+    ABORT = 6
 
 
 def make_fixture(class_name, *args, **kwargs):
@@ -30,9 +45,9 @@ class Fixture(object, metaclass=registry.make_registry_metaclass(_FIXTURES)):
     # is defined for all subclasses of Fixture.
     REGISTERED_NAME = "Fixture"
 
-    _LAST_STABLE_FCV = "4.2"
-    _LATEST_FCV = "4.4"
-    _LAST_STABLE_BIN_VERSION = "4.2"
+    _LAST_STABLE_FCV = multiversion.LAST_STABLE_FCV
+    _LATEST_FCV = multiversion.LATEST_FCV
+    _LAST_STABLE_BIN_VERSION = multiversion.LAST_STABLE_BIN_VERSION
 
     def __init__(self, logger, job_num, dbpath_prefix=None):
         """Initialize the fixture with a logger instance."""
@@ -64,7 +79,7 @@ class Fixture(object, metaclass=registry.make_registry_metaclass(_FIXTURES)):
         """Block until the fixture can be used for testing."""
         pass
 
-    def teardown(self, finished=False):  # noqa
+    def teardown(self, finished=False, mode=None):  # noqa
         """Destroy the fixture.
 
         The fixture's logging handlers are closed if 'finished' is true,
@@ -75,7 +90,7 @@ class Fixture(object, metaclass=registry.make_registry_metaclass(_FIXTURES)):
         """
 
         try:
-            self._do_teardown()
+            self._do_teardown(mode=mode)
         finally:
             if finished:
                 for handler in self.logger.handlers:
@@ -83,7 +98,7 @@ class Fixture(object, metaclass=registry.make_registry_metaclass(_FIXTURES)):
                     # want the logs to eventually get flushed.
                     logging.flush.close_later(handler)
 
-    def _do_teardown(self):  # noqa
+    def _do_teardown(self, mode=None):  # noqa
         """Destroy the fixture.
 
         This method must be implemented by subclasses.
@@ -242,7 +257,7 @@ class FixtureTeardownHandler(object):
         """
         return self._message
 
-    def teardown(self, fixture, name):  # noqa: D406,D407,D411,D413
+    def teardown(self, fixture, name, mode=None):  # noqa: D406,D407,D411,D413
         """Tear down the given fixture and log errors instead of raising a ServerFailure exception.
 
         Args:
@@ -253,7 +268,7 @@ class FixtureTeardownHandler(object):
         """
         try:
             self._logger.info("Stopping %s...", name)
-            fixture.teardown()
+            fixture.teardown(mode=mode)
             self._logger.info("Successfully stopped %s.", name)
             return True
         except errors.ServerFailure as err:

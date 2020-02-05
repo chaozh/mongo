@@ -35,7 +35,6 @@
 #include "mongo/db/commands/map_reduce_agg.h"
 #include "mongo/db/commands/map_reduce_command_base.h"
 #include "mongo/db/commands/mr.h"
-#include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/query/find_common.h"
 #include "mongo/db/query/query_knobs_gen.h"
@@ -63,15 +62,25 @@ public:
         return FindCommon::kInitReplyBufferSize;
     }
 
+    void _explainImpl(OperationContext* opCtx,
+                      const BSONObj& cmd,
+                      BSONObjBuilder& result,
+                      boost::optional<ExplainOptions::Verbosity> verbosity) const override {
+        map_reduce_agg::runAggregationMapReduce(opCtx, cmd, result, verbosity);
+    }
+
 private:
     bool _runImpl(OperationContext* opCtx,
                   const std::string& dbname,
                   const BSONObj& cmd,
                   std::string& errmsg,
                   BSONObjBuilder& result) final {
-        if (getTestCommandsEnabled() && internalQueryUseAggMapReduce.load()) {
-            return map_reduce_agg::runAggregationMapReduce(opCtx, dbname, cmd, errmsg, result);
-        }
+        // Execute the mapReduce as an aggregation pipeline only if fully upgraded to 4.4, since
+        // a 4.2 mongos in a mixed version cluster expects a fundamentally different response that
+        // is not supported by the aggregation equivalent.
+        if (serverGlobalParams.featureCompatibility.getVersion() ==
+            ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo44)
+            return map_reduce_agg::runAggregationMapReduce(opCtx, cmd, result, boost::none);
         return mr::runMapReduce(opCtx, dbname, cmd, errmsg, result);
     }
 } mapReduceCommand;

@@ -6,6 +6,7 @@
  * @tags: [
  *     uses_transactions,
  *     uses_prepare_transaction,
+ *     requires_fcv_44,
  * ]
  */
 
@@ -70,10 +71,7 @@ jsTestLog("Running operations while collection cloning is paused");
 // the oplog application stage of initial sync.
 assert.commandWorked(testColl.insert({_id: 1, a: 1}));
 
-const enableTwoPhaseIndexBuild =
-    assert.commandWorked(primary.adminCommand({getParameter: 1, enableTwoPhaseIndexBuild: 1}))
-        .enableTwoPhaseIndexBuild;
-if (!enableTwoPhaseIndexBuild) {
+if (!IndexBuildTest.supportsTwoPhaseIndexBuild(primary)) {
     // Make the index build hang on the secondary so that initial sync gets to the prepared-txn
     // reconstruct stage with the index build still running.
     jsTest.log("Hanging index build on the secondary node");
@@ -112,7 +110,7 @@ assert.commandWorked(secondary.adminCommand(
     {configureFailPoint: "initialSyncHangDuringCollectionClone", mode: "off"}));
 
 // Unblock index build.
-if (!enableTwoPhaseIndexBuild) {
+if (!IndexBuildTest.supportsTwoPhaseIndexBuild(primary)) {
     // Wait for log message.
     assert.soon(
         () => rawMongoProgramOutput().indexOf(

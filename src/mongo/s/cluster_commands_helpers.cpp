@@ -38,9 +38,11 @@
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/curop.h"
+#include "mongo/db/error_labels.h"
 #include "mongo/db/logical_clock.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/query/cursor_response.h"
+#include "mongo/db/repl/read_concern_args.h"
 #include "mongo/executor/task_executor_pool.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/rpc/write_concern_error_detail.h"
@@ -110,9 +112,6 @@ const auto kAllowImplicitCollectionCreation = "allowImplicitCollectionCreation"_
 std::vector<AsyncRequestsSender::Request> buildUnversionedRequestsForShards(
     OperationContext* opCtx, std::vector<ShardId> shardIds, const BSONObj& cmdObj) {
     auto cmdToSend = cmdObj;
-    if (!cmdToSend.hasField(kAllowImplicitCollectionCreation)) {
-        cmdToSend = appendAllowImplicitCreate(cmdToSend, false);
-    }
 
     std::vector<AsyncRequestsSender::Request> requests;
     for (auto&& shardId : shardIds)
@@ -137,9 +136,6 @@ std::vector<AsyncRequestsSender::Request> buildVersionedRequestsForTargetedShard
     const BSONObj& collation) {
 
     auto cmdToSend = cmdObj;
-    if (!cmdToSend.hasField(kAllowImplicitCollectionCreation)) {
-        cmdToSend = appendAllowImplicitCreate(cmdToSend, false);
-    }
 
     if (!routingInfo.cm()) {
         // The collection is unsharded. Target only the primary shard for the database.
@@ -226,15 +222,6 @@ std::vector<AsyncRequestsSender::Response> gatherResponses(
             if (ErrorCodes::CommandOnShardedViewNotSupportedOnMongod == status) {
                 uassertStatusOK(status);
             }
-
-            // TODO: This should not be needed once we get better targetting with SERVER-32723.
-            // Some commands are sent with allowImplicit: false to all shards and expect only some
-            // of them to succeed.
-            if (ignorableErrors.find(ErrorCodes::CannotImplicitlyCreateCollection) ==
-                    ignorableErrors.end() &&
-                ErrorCodes::CannotImplicitlyCreateCollection == status) {
-                uassertStatusOK(status);
-            }
         }
         responses.push_back(std::move(response));
     }
@@ -265,6 +252,93 @@ BSONObj appendAllowImplicitCreate(BSONObj cmdObj, bool allow) {
     BSONObjBuilder newCmdBuilder(std::move(cmdObj));
     newCmdBuilder.append(kAllowImplicitCollectionCreation, allow);
     return newCmdBuilder.obj();
+}
+
+BSONObj applyReadWriteConcern(OperationContext* opCtx,
+                              bool appendRC,
+                              bool appendWC,
+                              const BSONObj& cmdObj) {
+    if (TransactionRouter::get(opCtx)) {
+        // When running in a transaction, the rules are:
+        // - Never apply writeConcern.  Applying writeConcern to terminal operations such as
+        //   abortTransaction and commitTransaction is done directly by the TransactionRouter.
+        // - Apply readConcern only if this is the first operation in the transaction.
+
+        if (!opCtx->isStartingMultiDocumentTransaction()) {
+            // Cannot apply either read or writeConcern, so short-circuit.
+            return cmdObj;
+        }
+
+        if (!appendRC) {
+            // First operation in transaction, but the caller has not requested readConcern be
+            // applied, so there's nothing to do.
+            return cmdObj;
+        }
+
+        // First operation in transaction, so ensure that writeConcern is not applied, then continue
+        // and apply the readConcern.
+        appendWC = false;
+    }
+
+    // Append all original fields except the readConcern/writeConcern field to the new command.
+    BSONObjBuilder output;
+    bool seenReadConcern = false;
+    bool seenWriteConcern = false;
+    for (const auto& elem : cmdObj) {
+        const auto name = elem.fieldNameStringData();
+        if (appendRC && name == repl::ReadConcernArgs::kReadConcernFieldName) {
+            seenReadConcern = true;
+        }
+        if (appendWC && name == WriteConcernOptions::kWriteConcernField) {
+            seenWriteConcern = true;
+        }
+        if (!output.hasField(name)) {
+            output.append(elem);
+        }
+    }
+
+    // Finally, add the new read/write concern.
+    if (appendRC && !seenReadConcern) {
+        const auto& readConcernArgs = repl::ReadConcernArgs::get(opCtx);
+        output.appendElements(readConcernArgs.toBSON());
+    }
+    if (appendWC && !seenWriteConcern) {
+        output.append(WriteConcernOptions::kWriteConcernField, opCtx->getWriteConcern().toBSON());
+    }
+
+    return output.obj();
+}
+
+BSONObj applyReadWriteConcern(OperationContext* opCtx,
+                              CommandInvocation* invocation,
+                              const BSONObj& cmdObj) {
+    const auto& readConcernArgs = repl::ReadConcernArgs::get(opCtx);
+    const auto readConcernSupport = invocation->supportsReadConcern(readConcernArgs.getLevel());
+    return applyReadWriteConcern(opCtx,
+                                 readConcernSupport.readConcernSupport.isOK(),
+                                 invocation->supportsWriteConcern(),
+                                 cmdObj);
+}
+
+BSONObj applyReadWriteConcern(OperationContext* opCtx, BasicCommand* cmd, const BSONObj& cmdObj) {
+    const auto& readConcernArgs = repl::ReadConcernArgs::get(opCtx);
+    const auto readConcernSupport = cmd->supportsReadConcern(cmdObj, readConcernArgs.getLevel());
+    return applyReadWriteConcern(opCtx,
+                                 readConcernSupport.readConcernSupport.isOK(),
+                                 cmd->supportsWriteConcern(cmdObj),
+                                 cmdObj);
+}
+
+BSONObj stripWriteConcern(const BSONObj& cmdObj) {
+    BSONObjBuilder output;
+    for (const auto& elem : cmdObj) {
+        const auto name = elem.fieldNameStringData();
+        if (name == WriteConcernOptions::kWriteConcernField) {
+            continue;
+        }
+        output.append(elem);
+    }
+    return output.obj();
 }
 
 std::vector<AsyncRequestsSender::Response> scatterGatherUnversionedTargetAllShards(
@@ -334,6 +408,28 @@ AsyncRequestsSender::Response executeCommandAgainstDatabasePrimary(
     return std::move(responses.front());
 }
 
+AsyncRequestsSender::Response executeCommandAgainstShardWithMinKeyChunk(
+    OperationContext* opCtx,
+    const NamespaceString& nss,
+    const CachedCollectionRoutingInfo& routingInfo,
+    const BSONObj& cmdObj,
+    const ReadPreferenceSetting& readPref,
+    Shard::RetryPolicy retryPolicy) {
+
+    const auto query = routingInfo.cm()
+        ? routingInfo.cm()->getShardKeyPattern().getKeyPattern().globalMin()
+        : BSONObj();
+
+    auto responses =
+        gatherResponses(opCtx,
+                        nss.db(),
+                        readPref,
+                        retryPolicy,
+                        buildVersionedRequestsForTargetedShards(
+                            opCtx, nss, routingInfo, cmdObj, query, BSONObj() /* collation */));
+    return std::move(responses.front());
+}
+
 bool appendRawResponses(OperationContext* opCtx,
                         std::string* errmsg,
                         BSONObjBuilder* output,
@@ -351,6 +447,15 @@ bool appendRawResponses(OperationContext* opCtx,
 
     const auto processError = [&](const ShardId& shardId, const Status& status) {
         invariant(!status.isOK());
+        // It is safe to pass `hasWriteConcernError` as false in the below check because operations
+        // run inside transactions do not wait for write concern, except for commit and abort.
+        if (TransactionRouter::get(opCtx) &&
+            isTransientTransactionError(
+                status.code(), false /*hasWriteConcernError*/, false /*isCommitOrAbort*/)) {
+            // Re-throw on transient transaction errors to make sure appropriate error labels are
+            // appended to the result.
+            uassertStatusOK(status);
+        }
         if (ignorableErrors.find(status.code()) != ignorableErrors.end()) {
             ignorableErrorsReceived.emplace_back(std::move(shardId), std::move(status));
             return;
@@ -554,6 +659,26 @@ std::set<ShardId> getTargetedShardsForQuery(OperationContext* opCtx,
     return {routingInfo.db().primaryId()};
 }
 
+std::vector<std::pair<ShardId, BSONObj>> getVersionedRequestsForTargetedShards(
+    OperationContext* opCtx,
+    const NamespaceString& nss,
+    const CachedCollectionRoutingInfo& routingInfo,
+    const BSONObj& cmdObj,
+    const BSONObj& query,
+    const BSONObj& collation) {
+    std::vector<std::pair<ShardId, BSONObj>> requests;
+    auto ars_requests =
+        buildVersionedRequestsForTargetedShards(opCtx, nss, routingInfo, cmdObj, query, collation);
+    std::transform(std::make_move_iterator(ars_requests.begin()),
+                   std::make_move_iterator(ars_requests.end()),
+                   std::back_inserter(requests),
+                   [](auto&& ars) {
+                       return std::pair<ShardId, BSONObj>(std::move(ars.shardId),
+                                                          std::move(ars.cmdObj));
+                   });
+    return requests;
+}
+
 StatusWith<CachedCollectionRoutingInfo> getCollectionRoutingInfoForTxnCmd(
     OperationContext* opCtx, const NamespaceString& nss) {
     auto catalogCache = Grid::get(opCtx)->catalogCache();
@@ -568,29 +693,6 @@ StatusWith<CachedCollectionRoutingInfo> getCollectionRoutingInfoForTxnCmd(
 
     auto atClusterTime = txnRouter.getSelectedAtClusterTime();
     return catalogCache->getCollectionRoutingInfoAt(opCtx, nss, atClusterTime.asTimestamp());
-}
-
-std::vector<AsyncRequestsSender::Response> dispatchCommandAssertCollectionExistsOnAtLeastOneShard(
-    OperationContext* opCtx, const NamespaceString& nss, const BSONObj& cmdObj) {
-    auto shardResponses = scatterGatherOnlyVersionIfUnsharded(
-        opCtx,
-        nss,
-        CommandHelpers::filterCommandRequestForPassthrough(cmdObj),
-        ReadPreferenceSetting::get(opCtx),
-        Shard::RetryPolicy::kNoRetry,
-        {ErrorCodes::CannotImplicitlyCreateCollection});
-
-    if (std::all_of(shardResponses.begin(), shardResponses.end(), [](const auto& response) {
-            return response.swResponse.getStatus().isOK() &&
-                getStatusFromCommandResult(response.swResponse.getValue().data) ==
-                ErrorCodes::CannotImplicitlyCreateCollection;
-        })) {
-        // Propagate the ExtraErrorInfo from the first response.
-        uassertStatusOK(
-            getStatusFromCommandResult(shardResponses.front().swResponse.getValue().data));
-    }
-
-    return shardResponses;
 }
 
 }  // namespace mongo

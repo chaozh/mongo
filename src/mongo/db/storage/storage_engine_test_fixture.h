@@ -48,19 +48,20 @@ public:
 
     StorageEngineTest() : StorageEngineTest(RepairAction::kNoRepair) {}
 
-    /**
-     * Create a collection in the catalog and in the KVEngine. Return the storage engine's `ident`.
-     */
-    StatusWith<std::string> createCollection(OperationContext* opCtx, NamespaceString ns) {
+    StatusWith<DurableCatalog::Entry> createCollection(OperationContext* opCtx,
+                                                       NamespaceString ns) {
         AutoGetDb db(opCtx, ns.db(), LockMode::MODE_X);
         CollectionOptions options;
         options.uuid = UUID::gen();
-        auto rs = unittest::assertGet(
+        RecordId catalogId;
+        std::unique_ptr<RecordStore> rs;
+        std::tie(catalogId, rs) = unittest::assertGet(
             _storageEngine->getCatalog()->createCollection(opCtx, ns, options, true));
-        CollectionCatalog::get(opCtx).registerCollection(options.uuid.get(),
-                                                         std::make_unique<CollectionMock>(ns));
 
-        return _storageEngine->getCatalog()->getCollectionIdent(ns);
+        std::unique_ptr<Collection> coll = std::make_unique<CollectionMock>(ns, catalogId);
+        CollectionCatalog::get(opCtx).registerCollection(options.uuid.get(), &coll);
+
+        return {{_storageEngine->getCatalog()->getEntry(catalogId)}};
     }
 
     std::unique_ptr<TemporaryRecordStore> makeTemporary(OperationContext* opCtx) {
@@ -77,16 +78,18 @@ public:
     }
 
     Status dropIndexTable(OperationContext* opCtx, NamespaceString nss, std::string indexName) {
-        std::string indexIdent = _storageEngine->getCatalog()->getIndexIdent(opCtx, nss, indexName);
-        return dropIdent(opCtx, indexIdent);
+        RecordId catalogId =
+            CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, nss)->getCatalogId();
+        std::string indexIdent =
+            _storageEngine->getCatalog()->getIndexIdent(opCtx, catalogId, indexName);
+        return dropIdent(opCtx, opCtx->recoveryUnit(), indexIdent);
     }
 
-    Status dropIdent(OperationContext* opCtx, StringData ident) {
-        return _storageEngine->getEngine()->dropIdent(opCtx, ident);
+    Status dropIdent(OperationContext* opCtx, RecoveryUnit* ru, StringData ident) {
+        return _storageEngine->getEngine()->dropIdent(opCtx, ru, ident);
     }
 
-    StatusWith<std::vector<StorageEngine::CollectionIndexNamePair>> reconcile(
-        OperationContext* opCtx) {
+    StatusWith<StorageEngine::ReconcileResult> reconcile(OperationContext* opCtx) {
         return _storageEngine->reconcileCatalogAndIdents(opCtx);
     }
 
@@ -95,9 +98,13 @@ public:
     }
 
     bool collectionExists(OperationContext* opCtx, const NamespaceString& nss) {
-        auto allCollections = _storageEngine->getCatalog()->getAllCollections();
-        return std::count(allCollections.begin(), allCollections.end(), nss);
+        std::vector<DurableCatalog::Entry> allCollections =
+            _storageEngine->getCatalog()->getAllCatalogEntries(opCtx);
+        return std::count_if(allCollections.begin(), allCollections.end(), [&](auto& entry) {
+            return nss == entry.nss;
+        });
     }
+
     bool identExists(OperationContext* opCtx, const std::string& ident) {
         auto idents = getAllKVEngineIdents(opCtx);
         return std::find(idents.begin(), idents.end(), ident) != idents.end();
@@ -110,7 +117,8 @@ public:
                        NamespaceString collNs,
                        std::string key,
                        bool isBackgroundSecondaryBuild) {
-        auto ret = startIndexBuild(opCtx, collNs, key, isBackgroundSecondaryBuild);
+        auto buildUUID = UUID::gen();
+        auto ret = startIndexBuild(opCtx, collNs, key, isBackgroundSecondaryBuild, buildUUID);
         if (!ret.isOK()) {
             return ret;
         }
@@ -122,7 +130,8 @@ public:
     Status startIndexBuild(OperationContext* opCtx,
                            NamespaceString collNs,
                            std::string key,
-                           bool isBackgroundSecondaryBuild) {
+                           bool isBackgroundSecondaryBuild,
+                           boost::optional<UUID> buildUUID) {
         BSONObjBuilder builder;
         {
             BSONObjBuilder keyObj;
@@ -130,35 +139,30 @@ public:
         }
         BSONObj spec = builder.append("name", key).append("v", 2).done();
 
-        auto collection = std::make_unique<CollectionMock>(collNs);
-        auto descriptor = std::make_unique<IndexDescriptor>(
-            collection.get(), IndexNames::findPluginName(spec), spec);
+        Collection* collection =
+            CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, collNs);
+        auto descriptor =
+            std::make_unique<IndexDescriptor>(collection, IndexNames::findPluginName(spec), spec);
 
-        const auto protocol = IndexBuildProtocol::kTwoPhase;
-        auto ret = DurableCatalog::get(opCtx)->prepareForIndexBuild(
-            opCtx, collNs, descriptor.get(), protocol, isBackgroundSecondaryBuild);
+        auto ret = DurableCatalog::get(opCtx)->prepareForIndexBuild(opCtx,
+                                                                    collection->getCatalogId(),
+                                                                    descriptor.get(),
+                                                                    buildUUID,
+                                                                    isBackgroundSecondaryBuild);
         return ret;
     }
 
-    void indexBuildScan(OperationContext* opCtx,
-                        NamespaceString collNs,
-                        std::string key,
-                        std::string sideWritesIdent,
-                        std::string constraintViolationsIdent) {
-        DurableCatalog::get(opCtx)->setIndexBuildScanning(
-            opCtx, collNs, key, sideWritesIdent, constraintViolationsIdent);
-    }
-
-    void indexBuildDrain(OperationContext* opCtx, NamespaceString collNs, std::string key) {
-        DurableCatalog::get(opCtx)->setIndexBuildDraining(opCtx, collNs, key);
-    }
-
     void indexBuildSuccess(OperationContext* opCtx, NamespaceString collNs, std::string key) {
-        DurableCatalog::get(opCtx)->indexBuildSuccess(opCtx, collNs, key);
+        Collection* collection =
+            CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, collNs);
+        DurableCatalog::get(opCtx)->indexBuildSuccess(opCtx, collection->getCatalogId(), key);
     }
 
-    Status removeEntry(OperationContext* opCtx, StringData ns, DurableCatalog* catalog) {
-        return dynamic_cast<DurableCatalogImpl*>(catalog)->_removeEntry(opCtx, NamespaceString(ns));
+    Status removeEntry(OperationContext* opCtx, StringData collNs, DurableCatalog* catalog) {
+        Collection* collection = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(
+            opCtx, NamespaceString(collNs));
+        return dynamic_cast<DurableCatalogImpl*>(catalog)->_removeEntry(opCtx,
+                                                                        collection->getCatalogId());
     }
 
     StorageEngine* _storageEngine;

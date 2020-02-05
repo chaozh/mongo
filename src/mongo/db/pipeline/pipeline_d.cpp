@@ -67,7 +67,6 @@
 #include "mongo/db/pipeline/document_source_sample_from_random_cursor.h"
 #include "mongo/db/pipeline/document_source_single_document_transformation.h"
 #include "mongo/db/pipeline/document_source_sort.h"
-#include "mongo/db/pipeline/parsed_inclusion_projection.h"
 #include "mongo/db/pipeline/pipeline.h"
 #include "mongo/db/query/collation/collator_interface.h"
 #include "mongo/db/query/get_executor.h"
@@ -100,27 +99,6 @@ using std::unique_ptr;
 using write_ops::Insert;
 
 namespace {
-
-/**
- * Return whether the given sort spec can be used in a find() sort.
- */
-bool canSortBePushedDown(const SortPattern& sortPattern) {
-    for (auto&& patternPart : sortPattern) {
-        if (!patternPart.expression) {
-            continue;
-        }
-
-        // Technically sorting by {$meta: "textScore"} can be done in find() but requires a
-        // corresponding projection, so for simplicity we don't support pushing it down.
-        const auto metaType = patternPart.expression->getMetaType();
-        if (metaType == DocumentMetadataFields::kTextScore ||
-            metaType == DocumentMetadataFields::kRandVal) {
-            return false;
-        }
-    }
-    return true;
-}
-
 /**
  * Returns a PlanExecutor which uses a random cursor to sample documents if successful. Returns {}
  * if the storage engine doesn't support random cursors, or if 'sampleSize' is a large enough
@@ -151,14 +129,14 @@ StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> createRandomCursorEx
 
     // If the incoming operation is sharded, use the CSS to infer the filtering metadata for the
     // collection, otherwise treat it as unsharded
-    auto shardMetadata =
-        CollectionShardingState::get(opCtx, coll->ns())->getOrphansFilter(opCtx, coll);
+    auto collectionFilter =
+        CollectionShardingState::get(opCtx, coll->ns())->getOwnershipFilter(opCtx, coll);
 
     // Because 'numRecords' includes orphan documents, our initial decision to optimize the $sample
     // cursor may have been mistaken. For sharded collections, build a TRIAL plan that will switch
     // to a collection scan if the ratio of orphaned to owned documents encountered over the first
     // 100 works() is such that we would have chosen not to optimize.
-    if (shardMetadata->isSharded()) {
+    if (collectionFilter.isSharded()) {
         // The ratio of owned to orphaned documents must be at least equal to the ratio between the
         // requested sampleSize and the maximum permitted sampleSize for the original constraints to
         // be satisfied. For instance, if there are 200 documents and the sampleSize is 5, then at
@@ -169,12 +147,12 @@ StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> createRandomCursorEx
             sampleSize / (numRecords * kMaxSampleRatioForRandCursor), kMaxSampleRatioForRandCursor);
         // The trial plan is SHARDING_FILTER-MULTI_ITERATOR.
         auto randomCursorPlan =
-            std::make_unique<ShardFilterStage>(opCtx, shardMetadata, ws.get(), std::move(root));
+            std::make_unique<ShardFilterStage>(opCtx, collectionFilter, ws.get(), std::move(root));
         // The backup plan is SHARDING_FILTER-COLLSCAN.
         std::unique_ptr<PlanStage> collScanPlan = std::make_unique<CollectionScan>(
             opCtx, coll, CollectionScanParams{}, ws.get(), nullptr);
         collScanPlan = std::make_unique<ShardFilterStage>(
-            opCtx, shardMetadata, ws.get(), std::move(collScanPlan));
+            opCtx, collectionFilter, ws.get(), std::move(collScanPlan));
         // Place a TRIAL stage at the root of the plan tree, and pass it the trial and backup plans.
         root = std::make_unique<TrialStage>(opCtx,
                                             ws.get(),
@@ -219,8 +197,12 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> attemptToGetExe
 
     const ExtensionsCallbackReal extensionsCallback(expCtx->opCtx, &nss);
 
-    auto cq = CanonicalQuery::canonicalize(
-        expCtx->opCtx, std::move(qr), expCtx, extensionsCallback, matcherFeatures);
+    auto cq = CanonicalQuery::canonicalize(expCtx->opCtx,
+                                           std::move(qr),
+                                           expCtx,
+                                           extensionsCallback,
+                                           matcherFeatures,
+                                           ProjectionPolicies::aggregateProjectionPolicies());
 
     if (!cq.isOK()) {
         // Return an error instead of uasserting, since there are cases where the combination of
@@ -360,9 +342,7 @@ PipelineD::buildInnerQueryExecutor(Collection* collection,
                 // Pipeline) and an exception is thrown, an invariant will trigger in the
                 // DocumentSourceCursor. This is a design flaw in DocumentSourceCursor.
 
-                // TODO SERVER-37453 this should no longer be necessary when we no don't need locks
-                // to destroy a PlanExecutor.
-                auto deps = pipeline->getDependencies(DepsTracker::kNoMetadata);
+                auto deps = pipeline->getDependencies(DepsTracker::kAllMetadata);
                 const bool shouldProduceEmptyDocs = deps.hasNoRequirements();
                 auto attachExecutorCallback =
                     [shouldProduceEmptyDocs](
@@ -450,14 +430,15 @@ getSortAndGroupStagesFromPipeline(const Pipeline::SourceContainer& sources) {
 }
 
 boost::optional<long long> extractLimitForPushdown(Pipeline* pipeline) {
+    // If the disablePipelineOptimization failpoint is enabled, then do not attempt the limit
+    // pushdown optimization.
+    if (MONGO_unlikely(disablePipelineOptimization.shouldFail())) {
+        return boost::none;
+    }
     auto&& sources = pipeline->getSources();
     auto limit = DocumentSourceSort::extractLimitForPushdown(sources.begin(), &sources);
     if (limit) {
         // Removing $limit stages may have produced the opportunity for additional optimizations.
-        //
-        // In addition, since a stage was removed from the middle of the pipeline, we need to
-        // re-stitch the pipeline in order to ensure that each stage has a valid pointer to the
-        // previous document source. 'optimizePipeline()' will take care of re-stitching for us.
         pipeline->optimizePipeline();
     }
     return limit;
@@ -546,9 +527,9 @@ PipelineD::buildInnerQueryExecutorGeneric(Collection* collection,
     // layer, but that is handled elsewhere.
     const auto limit = extractLimitForPushdown(pipeline);
 
-    auto metadataAvailable = DocumentSourceMatch::isTextQuery(queryObj)
-        ? DepsTracker::kOnlyTextScore
-        : DepsTracker::kNoMetadata;
+    auto unavailableMetadata = DocumentSourceMatch::isTextQuery(queryObj)
+        ? DepsTracker::kDefaultUnavailableMetadata & ~DepsTracker::kOnlyTextScore
+        : DepsTracker::kDefaultUnavailableMetadata;
 
     // Create the PlanExecutor.
     bool shouldProduceEmptyDocs = false;
@@ -558,7 +539,7 @@ PipelineD::buildInnerQueryExecutorGeneric(Collection* collection,
                                                 pipeline,
                                                 sortStage,
                                                 std::move(rewrittenGroupStage),
-                                                metadataAvailable,
+                                                unavailableMetadata,
                                                 queryObj,
                                                 limit,
                                                 aggRequest,
@@ -608,18 +589,19 @@ PipelineD::buildInnerQueryExecutorGeoNear(Collection* collection,
     BSONObj fullQuery = geoNearStage->asNearQuery(nearFieldName);
 
     bool shouldProduceEmptyDocs = false;
-    auto exec = uassertStatusOK(prepareExecutor(expCtx,
-                                                collection,
-                                                nss,
-                                                pipeline,
-                                                nullptr, /* sortStage */
-                                                nullptr, /* rewrittenGroupStage */
-                                                DepsTracker::kAllGeoNearData,
-                                                std::move(fullQuery),
-                                                boost::none, /* limit */
-                                                aggRequest,
-                                                Pipeline::kGeoNearMatcherFeatures,
-                                                &shouldProduceEmptyDocs));
+    auto exec = uassertStatusOK(
+        prepareExecutor(expCtx,
+                        collection,
+                        nss,
+                        pipeline,
+                        nullptr, /* sortStage */
+                        nullptr, /* rewrittenGroupStage */
+                        DepsTracker::kDefaultUnavailableMetadata & ~DepsTracker::kAllGeoNearData,
+                        std::move(fullQuery),
+                        boost::none, /* limit */
+                        aggRequest,
+                        Pipeline::kGeoNearMatcherFeatures,
+                        &shouldProduceEmptyDocs));
 
     auto attachExecutorCallback = [shouldProduceEmptyDocs,
                                    distanceField = geoNearStage->getDistanceField(),
@@ -649,7 +631,7 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> PipelineD::prep
     Pipeline* pipeline,
     const boost::intrusive_ptr<DocumentSourceSort>& sortStage,
     std::unique_ptr<GroupFromFirstDocumentTransformation> rewrittenGroupStage,
-    QueryMetadataBitSet metadataAvailable,
+    QueryMetadataBitSet unavailableMetadata,
     const BSONObj& queryObj,
     boost::optional<long long> limit,
     const AggregationRequest* aggRequest,
@@ -662,12 +644,6 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> PipelineD::prep
     if (pipeline->peekFront() && pipeline->peekFront()->constraints().isChangeStreamStage()) {
         invariant(expCtx->tailableMode == TailableModeEnum::kTailableAndAwaitData);
         plannerOpts |= QueryPlannerParams::TRACK_LATEST_OPLOG_TS;
-
-        // SERVER-42713: If "use44SortKeys" isn't set, then this aggregation request is from an
-        // earlier version of mongos, and we must fall back to the old way of serializing change
-        // stream sort keys from 4.2 and earlier.
-        invariant(aggRequest);
-        expCtx->use42ChangeStreamSortKeys = !aggRequest->getUse44SortKeys();
     }
 
     // If there is a sort stage eligible for pushdown, serialize its SortPattern to a BSONObj. The
@@ -675,7 +651,7 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> PipelineD::prep
     // inside the inner PlanExecutor. We also remove the $sort stage from the Pipeline, since it
     // will be handled instead by PlanStage execution.
     BSONObj sortObj;
-    if (sortStage && canSortBePushedDown(sortStage->getSortKeyPattern())) {
+    if (sortStage) {
         sortObj = sortStage->getSortKeyPattern()
                       .serialize(SortPattern::SortKeySerialization::kForPipelineSerialization)
                       .toBson();
@@ -691,7 +667,7 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> PipelineD::prep
     // Perform dependency analysis. In order to minimize the dependency set, we only analyze the
     // stages that remain in the pipeline after pushdown. In particular, any dependencies for a
     // $match or $sort pushed down into the query layer will not be reflected here.
-    auto deps = pipeline->getDependencies(metadataAvailable);
+    auto deps = pipeline->getDependencies(unavailableMetadata);
     *hasNoRequirements = deps.hasNoRequirements();
 
     // If we're pushing down a sort, and a merge will be required later, then we need the query

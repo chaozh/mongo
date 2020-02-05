@@ -37,6 +37,7 @@
 #include "mongo/bson/bsontypes.h"
 #include "mongo/bson/mutable/document.h"
 #include "mongo/bson/simple_bsonelement_comparator.h"
+#include "mongo/db/field_ref.h"
 #include "mongo/db/index_names.h"
 #include "mongo/db/matcher/expression_geo.h"
 #include "mongo/db/query/collation/collation_index_key.h"
@@ -292,15 +293,13 @@ bool AndHashNode::fetched() const {
     return false;
 }
 
-bool AndHashNode::hasField(const string& field) const {
-    // Any WSM output from this stage came from all children stages.  Therefore we have all
-    // fields covered in our children.
+FieldAvailability AndHashNode::getFieldAvailability(const string& field) const {
+    // A field can be provided by any of the children.
+    auto result = FieldAvailability::kNotProvided;
     for (size_t i = 0; i < children.size(); ++i) {
-        if (children[i]->hasField(field)) {
-            return true;
-        }
+        result = std::max(result, children[i]->getFieldAvailability(field));
     }
-    return false;
+    return result;
 }
 
 QuerySolutionNode* AndHashNode::clone() const {
@@ -342,15 +341,13 @@ bool AndSortedNode::fetched() const {
     return false;
 }
 
-bool AndSortedNode::hasField(const string& field) const {
-    // Any WSM output from this stage came from all children stages.  Therefore we have all
-    // fields covered in our children.
+FieldAvailability AndSortedNode::getFieldAvailability(const string& field) const {
+    // A field can be provided by any of the children.
+    auto result = FieldAvailability::kNotProvided;
     for (size_t i = 0; i < children.size(); ++i) {
-        if (children[i]->hasField(field)) {
-            return true;
-        }
+        result = std::max(result, children[i]->getFieldAvailability(field));
     }
-    return false;
+    return result;
 }
 
 QuerySolutionNode* AndSortedNode::clone() const {
@@ -403,13 +400,12 @@ bool OrNode::fetched() const {
  * we want to guarantee that any output has a certain field, all of our children must
  * have that field.
  */
-bool OrNode::hasField(const string& field) const {
+FieldAvailability OrNode::getFieldAvailability(const string& field) const {
+    auto result = FieldAvailability::kFullyProvided;
     for (size_t i = 0; i < children.size(); ++i) {
-        if (!children[i]->hasField(field)) {
-            return false;
-        }
+        result = std::min(result, children[i]->getFieldAvailability(field));
     }
-    return true;
+    return result;
 }
 
 QuerySolutionNode* OrNode::clone() const {
@@ -464,13 +460,12 @@ bool MergeSortNode::fetched() const {
  * we want to guarantee that any output has a certain field, all of our children must
  * have that field.
  */
-bool MergeSortNode::hasField(const string& field) const {
+FieldAvailability MergeSortNode::getFieldAvailability(const string& field) const {
+    auto result = FieldAvailability::kFullyProvided;
     for (size_t i = 0; i < children.size(); ++i) {
-        if (!children[i]->hasField(field)) {
-            return false;
-        }
+        result = std::min(result, children[i]->getFieldAvailability(field));
     }
-    return true;
+    return result;
 }
 
 QuerySolutionNode* MergeSortNode::clone() const {
@@ -544,23 +539,30 @@ void IndexScanNode::appendToString(str::stream* ss, int indent) const {
     addCommon(ss, indent);
 }
 
-bool IndexScanNode::hasField(const string& field) const {
+FieldAvailability IndexScanNode::getFieldAvailability(const string& field) const {
     // A $** index whose bounds overlap the object type bracket cannot provide covering, since the
     // index only contains the leaf nodes along each of the object's subpaths.
     if (index.type == IndexType::INDEX_WILDCARD && wcp::isWildcardObjectSubpathScan(this)) {
-        return false;
+        return FieldAvailability::kNotProvided;
     }
 
     // The index is multikey but does not have any path-level multikeyness information. Such indexes
     // can never provide covering.
     if (index.multikey && index.multikeyPaths.empty()) {
-        return false;
+        return FieldAvailability::kNotProvided;
     }
 
-    // Custom index access methods may return non-exact key data - this function is currently
-    // used for covering exact key data only.
-    if (IndexNames::BTREE != IndexNames::findPluginName(index.keyPattern)) {
-        return false;
+    // Compound hashed indexes can be covered when the projection is not on the hashed field. Other
+    // custom index access methods may return non-exact key data - this function is currently used
+    // for covering exact key data only.
+    auto indexPluginName = IndexNames::findPluginName(index.keyPattern);
+    switch (IndexNames::nameToType(indexPluginName)) {
+        case IndexType::INDEX_BTREE:
+        case IndexType::INDEX_HASHED:
+            break;
+        default:
+            // All other index types provide no fields.
+            return FieldAvailability::kNotProvided;
     }
 
     // If the index has a non-simple collation and we have collation keys inside 'field', then this
@@ -568,7 +570,7 @@ bool IndexScanNode::hasField(const string& field) const {
     if (index.collator) {
         std::set<StringData> collatedFields = getFieldsWithStringBounds(bounds, index.keyPattern);
         if (collatedFields.find(field) != collatedFields.end()) {
-            return false;
+            return FieldAvailability::kNotProvided;
         }
     }
 
@@ -584,14 +586,18 @@ bool IndexScanNode::hasField(const string& field) const {
         // The index can provide this field if the requested path appears in the index key pattern,
         // and that path has no multikey components. We can't cover a field that has multikey
         // components because the index keys contain individual array elements, and we can't
-        // reconstitute the array from the index keys in the right order.
+        // reconstitute the array from the index keys in the right order. In order for the field to
+        // be fully provided by the scan, it must be ascending (1) or descending (-1).
         if (field == elt.fieldName() &&
             (!index.multikey || index.multikeyPaths[keyPatternFieldIndex].empty())) {
-            return true;
+            // We already know that the index is either ascending, descending or hashed. If the
+            // field is hashed, we only provide hashed value.
+            return elt.isNumber() ? FieldAvailability::kFullyProvided
+                                  : FieldAvailability::kHashedValueProvided;
         }
         ++keyPatternFieldIndex;
     }
-    return false;
+    return FieldAvailability::kNotProvided;
 }
 
 bool IndexScanNode::sortedByDiskLoc() const {
@@ -692,28 +698,114 @@ std::set<StringData> getMultikeyFields(const BSONObj& keyPattern,
 }
 
 /**
- * Computes sort orders for index scans, including DISTINCT_SCAN. The 'sortsOut' set gets populated
- * with all the sort orders that will be provided by the index scan, and the 'multikeyFieldsOut'
- * field gets populated with the names of all fields that the index indicates are multikey.
+ * Returns true if the index scan described by 'multikeyFields' and 'bounds' can legally provide the
+ * 'sortSpec', or false if the sort cannot be provided. A multikey index cannot provide a sort if
+ * either of the following is true: 1) the sort spec includes a multikey field that has bounds other
+ * than [minKey, maxKey], 2) there are bounds other than [minKey, maxKey] over a multikey field
+ * which share a path prefix with a component of the sort pattern. These cases are further explained
+ * in SERVER-31898.
  */
-void computeSortsAndMultikeyPathsForScan(const IndexEntry& index,
-                                         int direction,
-                                         const IndexBounds& bounds,
-                                         const CollatorInterface* queryCollator,
-                                         BSONObjSet* sortsOut,
-                                         std::set<StringData>* multikeyFieldsOut) {
-    sortsOut->clear();
-    multikeyFieldsOut->clear();
+bool confirmBoundsProvideSortGivenMultikeyness(const BSONObj& sortSpec,
+                                               const IndexBounds& bounds,
+                                               const std::set<StringData>& multikeyFields) {
+    // Forwardize the bounds to correctly apply checks to descending sorts and well as ascending
+    // sorts.
+    const auto ascendingBounds = bounds.forwardize();
+    const auto& fields = ascendingBounds.fields;
+    for (auto&& sortPatternComponent : sortSpec) {
+        if (multikeyFields.count(sortPatternComponent.fieldNameStringData()) == 0) {
+            // If this component of the sort pattern (which must be one of the components of
+            // the index spec) is not multikey, we don't need additional checks.
+            continue;
+        }
 
-    // If the index is multikey but does not have path-level multikey metadata, then this index
-    // cannot provide any sorts.
-    if (index.multikey && index.multikeyPaths.empty()) {
-        return;
+        // Bail out if the bounds are specified as a simple range. As a future improvement, we could
+        // extend this optimization to allow simple multikey scans to provide a sort.
+        if (ascendingBounds.isSimpleRange) {
+            return false;
+        }
+
+        // Checks if the current 'sortPatternComponent' has [MinKey, MaxKey].
+        const auto name = sortPatternComponent.fieldNameStringData();
+        for (auto&& intervalList : fields) {
+            if (name == intervalList.name && !intervalList.isMinToMax()) {
+                return false;
+            }
+        }
+
+        // Checks if there is a shared path prefix between the bounds and the sort pattern of
+        // multikey fields.
+        FieldRef refName(name);
+        for (const auto& intervalList : fields) {
+            // Ignores the prefix if the bounds are [MinKey, MaxKey] or if the field is not
+            // multikey.
+            if (intervalList.isMinToMax() ||
+                (multikeyFields.find(intervalList.name) == multikeyFields.end())) {
+                continue;
+            }
+
+            FieldRef boundsPath(intervalList.name);
+            const auto commonPrefixSize = boundsPath.commonPrefixSize(refName);
+            // The interval list name and the sort pattern name will never be equal at this point.
+            // This is because if they are equal and do not have [minKey, maxKey] bounds, we would
+            // already have bailed out of the function. If they do have [minKey, maxKey] bounds,
+            // they will be skipped in the check for [minKey, maxKey] bounds above.
+            invariant(refName != boundsPath);
+            // Checks if there's a common prefix between the interval list name and the sort pattern
+            // name.
+            if (commonPrefixSize > 0) {
+                return false;
+            }
+        }
     }
+    return true;
+}
+
+
+/**
+ * Populates 'sortsOut' with the sort orders provided by an index scan over 'index', with the given
+ * 'bounds' and 'direction'.
+ *
+ * The caller must ensure that the set pointed to by 'sortsOut' is empty before calling this
+ * function.
+ */
+void computeSortsForScan(const IndexEntry& index,
+                         int direction,
+                         const IndexBounds& bounds,
+                         const CollatorInterface* queryCollator,
+                         const std::set<StringData>& multikeyFields,
+                         BSONObjSet* sortsOut) {
+    invariant(sortsOut->empty());
 
     BSONObj sortPattern = QueryPlannerAnalysis::getSortPattern(index.keyPattern);
     if (direction == -1) {
         sortPattern = QueryPlannerCommon::reverseSortObj(sortPattern);
+    }
+
+    // If 'index' is the result of expanding a wildcard index, then its key pattern should look like
+    // {$_path: 1, <field>: 1}. The "$_path" prefix stores the value of the path associated with the
+    // key as opposed to real user data. We shouldn't report any sort orders including "$_path". In
+    // fact, $-prefixed path components are illegal in queries in most contexts, so misinterpreting
+    // this as a path in user-data could trigger subsequent assertions.
+    if (index.type == IndexType::INDEX_WILDCARD) {
+        invariant(bounds.fields.size() == 2u);
+        // No sorts are provided if the bounds for '$_path' consist of multiple intervals. This can
+        // happen for existence queries. For example, {a: {$exists: true}} results in bounds
+        // [["a","a"], ["a.", "a/")] for '$_path' so that keys from documents where "a" is a nested
+        // object are in bounds.
+        if (bounds.fields[0].intervals.size() != 1u) {
+            return;
+        }
+
+        // Strip '$_path' out of 'sortPattern' and then proceed with regular sort analysis.
+        BSONObjIterator it{sortPattern};
+        invariant(it.more());
+        auto pathElement = it.next();
+        invariant(pathElement.fieldNameStringData() == "$_path"_sd);
+        invariant(it.more());
+        auto secondElement = it.next();
+        invariant(!it.more());
+        sortPattern = BSONObjBuilder{}.append(secondElement).obj();
     }
 
     sortsOut->insert(sortPattern);
@@ -789,28 +881,46 @@ void computeSortsAndMultikeyPathsForScan(const IndexEntry& index,
         }
     }
 
-    // We cannot provide a sort which involves a multikey field. Prune such sort orders, if the
-    // index is multikey.
     if (index.multikey) {
-        *multikeyFieldsOut = getMultikeyFields(index.keyPattern, index.multikeyPaths);
         for (auto sortsIt = sortsOut->begin(); sortsIt != sortsOut->end();) {
-            bool foundMultikeyField = false;
-            for (auto&& elt : *sortsIt) {
-                if (multikeyFieldsOut->find(elt.fieldNameStringData()) !=
-                    multikeyFieldsOut->end()) {
-                    foundMultikeyField = true;
-                    break;
-                }
-            }
-
-            if (foundMultikeyField) {
-                sortsIt = sortsOut->erase(sortsIt);
-            } else {
+            // Erase this sort from 'sortsOut' if it is not compatible with multikey fields in the
+            // index.
+            if (confirmBoundsProvideSortGivenMultikeyness(*sortsIt, bounds, multikeyFields)) {
                 ++sortsIt;
+            } else {
+                sortsIt = sortsOut->erase(sortsIt);
             }
         }
     }
 }
+
+/**
+ * Computes sort orders for index scans, including DISTINCT_SCAN. The 'sortsOut' set gets populated
+ * with all the sort orders that will be provided by the index scan, and the 'multikeyFieldsOut'
+ * field gets populated with the names of all fields that the index indicates are multikey.
+ */
+void computeSortsAndMultikeyPathsForScan(const IndexEntry& index,
+                                         int direction,
+                                         const IndexBounds& bounds,
+                                         const CollatorInterface* queryCollator,
+                                         BSONObjSet* sortsOut,
+                                         std::set<StringData>* multikeyFieldsOut) {
+    sortsOut->clear();
+    multikeyFieldsOut->clear();
+
+    // If the index is multikey but does not have path-level multikey metadata, then this index
+    // cannot provide any sorts and we need not populate 'multikeyFieldsOut'.
+    if (index.multikey && index.multikeyPaths.empty()) {
+        return;
+    }
+
+    if (index.multikey) {
+        *multikeyFieldsOut = getMultikeyFields(index.keyPattern, index.multikeyPaths);
+    }
+
+    computeSortsForScan(index, direction, bounds, queryCollator, *multikeyFieldsOut, sortsOut);
+}
+
 }  // namespace
 
 void IndexScanNode::computeProperties() {

@@ -45,6 +45,7 @@
 #include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/query/explain.h"
+#include "mongo/db/read_concern_support_result.h"
 #include "mongo/db/repl/read_concern_args.h"
 #include "mongo/db/write_concern.h"
 #include "mongo/rpc/op_msg.h"
@@ -56,6 +57,7 @@ namespace mongo {
 
 extern FailPoint failCommand;
 extern FailPoint waitInCommandMarkKillOnClientDisconnect;
+extern const OperationContext::Decoration<boost::optional<BSONArray>> errorLabelsOverride;
 
 class Command;
 class CommandInvocation;
@@ -144,9 +146,11 @@ struct CommandHelpers {
                                            const BSONObj& request);
 
     /**
-     * Returns a copy of 'cmdObj' with a majority writeConcern appended.
+     * Returns a copy of 'cmdObj' with a majority writeConcern appended.  If the command object does
+     * not contain a writeConcern, 'defaultWC' will be used instead, if supplied.
      */
-    static BSONObj appendMajorityWriteConcern(const BSONObj& cmdObj);
+    static BSONObj appendMajorityWriteConcern(
+        const BSONObj& cmdObj, WriteConcernOptions defaultWC = WriteConcernOptions());
 
     /**
      * Rewrites cmdObj into a format safe to blindly forward to shards.
@@ -224,16 +228,14 @@ struct CommandHelpers {
      * Checks if the command passed in is in the list of failCommands defined in the fail point.
      */
     static bool shouldActivateFailCommandFailPoint(const BSONObj& data,
-                                                   StringData cmdName,
-                                                   Client* client,
-                                                   const NamespaceString& nss);
+                                                   const CommandInvocation* invocation,
+                                                   Client* client);
 
     /**
      * Possibly uasserts according to the "failCommand" fail point.
      */
     static void evaluateFailCommandFailPoint(OperationContext* opCtx,
-                                             StringData commandName,
-                                             const NamespaceString& nss);
+                                             const CommandInvocation* invocation);
 
     /**
      * Handles marking kill on client disconnect.
@@ -254,9 +256,15 @@ public:
      * Constructs a new command and causes it to be registered with the global commands list. It is
      * not safe to construct commands other than when the server is starting up.
      *
-     * @param oldName an optional old, deprecated name for the command
+     * @param oldName an old, deprecated name for the command
      */
-    Command(StringData name, StringData oldName = StringData());
+    Command(StringData name, StringData oldName)
+        : Command(name, std::vector<StringData>({oldName})) {}
+
+    /**
+     * @param aliases the optional list of aliases (e.g., old names) for the command
+     */
+    Command(StringData name, std::vector<StringData> aliases = {});
 
     Command(const Command&) = delete;
     Command& operator=(const Command&) = delete;
@@ -267,6 +275,13 @@ public:
 
     virtual std::unique_ptr<CommandInvocation> parse(OperationContext* opCtx,
                                                      const OpMsgRequest& request) = 0;
+
+    virtual std::unique_ptr<CommandInvocation> parseForExplain(
+        OperationContext* opCtx,
+        const OpMsgRequest& request,
+        boost::optional<ExplainOptions::Verbosity> explainVerbosity) {
+        return parse(opCtx, request);
+    }
 
     /**
      * Returns the command's name. This value never changes for the lifetime of the command.
@@ -419,9 +434,17 @@ public:
         return true;
     }
 
+    /**
+     * Checks if the command is also known by the provided alias.
+     */
+    bool hasAlias(const StringData& alias) const;
+
 private:
     // The full name of the command
     const std::string _name;
+
+    // The list of aliases for the command
+    const std::vector<StringData> _aliases;
 
     // Counters for how many times this command has been executed and failed
     mutable Counter64 _commandsExecuted;
@@ -429,46 +452,6 @@ private:
     // Pointers to hold the metrics tree references
     ServerStatusMetricField<Counter64> _commandsExecutedMetric;
     ServerStatusMetricField<Counter64> _commandsFailedMetric;
-};
-
-/**
- * The result of checking an invocation's support for readConcern.  There are two parts:
- * - Whether or not the invocation supports the given readConcern.
- * - Whether or not the invocation permits having the default readConcern applied to it.
- */
-struct ReadConcernSupportResult {
-    /**
-     * Whether this command invocation supports the requested readConcern level. This only
-     * applies when running outside transactions because all commands that are allowed to run
-     * in a transaction must support all the read concerns that can be used in a transaction.
-     */
-    enum class ReadConcern { kSupported, kNotSupported } readConcern;
-
-    /**
-     * Whether this command invocation supports applying the default readConcern to it.
-     */
-    enum class DefaultReadConcern { kPermitted, kNotPermitted } defaultReadConcern;
-
-    /**
-     * Construct with either the enum value or a bool, where true indicates
-     * ReadConcern::kSupported or DefaultReadConcern::kPermitted (as appropriate).
-     */
-    ReadConcernSupportResult(ReadConcern supported, DefaultReadConcern defaultPermitted)
-        : readConcern(supported), defaultReadConcern(defaultPermitted) {}
-
-    ReadConcernSupportResult(bool supported, DefaultReadConcern defaultPermitted)
-        : readConcern(supported ? ReadConcern::kSupported : ReadConcern::kNotSupported),
-          defaultReadConcern(defaultPermitted) {}
-
-    ReadConcernSupportResult(ReadConcern supported, bool defaultPermitted)
-        : readConcern(supported),
-          defaultReadConcern(defaultPermitted ? DefaultReadConcern::kPermitted
-                                              : DefaultReadConcern::kNotPermitted) {}
-
-    ReadConcernSupportResult(bool supported, bool defaultPermitted)
-        : readConcern(supported ? ReadConcern::kSupported : ReadConcern::kNotSupported),
-          defaultReadConcern(defaultPermitted ? DefaultReadConcern::kPermitted
-                                              : DefaultReadConcern::kNotPermitted) {}
 };
 
 /**
@@ -515,8 +498,12 @@ public:
      * Returns this invocation's support for readConcern.
      */
     virtual ReadConcernSupportResult supportsReadConcern(repl::ReadConcernLevel level) const {
-        return {level == repl::ReadConcernLevel::kLocalReadConcern,
-                ReadConcernSupportResult::DefaultReadConcern::kNotPermitted};
+        static const Status kReadConcernNotSupported{ErrorCodes::InvalidOptions,
+                                                     "read concern not supported"};
+        static const Status kDefaultReadConcernNotPermitted{ErrorCodes::InvalidOptions,
+                                                            "default read concern not permitted"};
+        return {{level != repl::ReadConcernLevel::kLocalReadConcern, kReadConcernNotSupported},
+                {kDefaultReadConcernNotPermitted}};
     }
 
     /**
@@ -581,9 +568,10 @@ private:
 
 /**
  * A subclass of Command that only cares about the BSONObj body and doesn't need access to document
- * sequences.
+ * sequences. Commands should implement this class if they require access to the
+ * ReplyBuilderInterface (e.g. to set the next invocation for an exhaust command).
  */
-class BasicCommand : public Command {
+class BasicCommandWithReplyBuilderInterface : public Command {
 private:
     class Invocation;
 
@@ -603,15 +591,12 @@ public:
     //
 
     /**
-     * run the given command
-     * implement this...
-     *
-     * return value is true if succeeded.  if false, set errmsg text.
+     * Runs the given command. Returns true upon success.
      */
-    virtual bool run(OperationContext* opCtx,
-                     const std::string& db,
-                     const BSONObj& cmdObj,
-                     BSONObjBuilder& result) = 0;
+    virtual bool runWithReplyBuilder(OperationContext* opCtx,
+                                     const std::string& db,
+                                     const BSONObj& cmdObj,
+                                     rpc::ReplyBuilderInterface* replyBuilder) = 0;
 
     /**
      * Commands which can be explained override this method. Any operation which has a query
@@ -663,11 +648,14 @@ public:
      * the option to the shards as needed. We rely on the shards to fail the commands in the
      * cases where it isn't supported.
      */
-    virtual ReadConcernSupportResult supportsReadConcern(const std::string& dbName,
-                                                         const BSONObj& cmdObj,
+    virtual ReadConcernSupportResult supportsReadConcern(const BSONObj& cmdObj,
                                                          repl::ReadConcernLevel level) const {
-        return {level == repl::ReadConcernLevel::kLocalReadConcern,
-                ReadConcernSupportResult::DefaultReadConcern::kNotPermitted};
+        static const Status kReadConcernNotSupported{ErrorCodes::InvalidOptions,
+                                                     "read concern not supported"};
+        static const Status kDefaultReadConcernNotPermitted{ErrorCodes::InvalidOptions,
+                                                            "default read concern not permitted"};
+        return {{level != repl::ReadConcernLevel::kLocalReadConcern, kReadConcernNotSupported},
+                {kDefaultReadConcernNotPermitted}};
     }
 
     virtual bool allowsAfterClusterTime(const BSONObj& cmdObj) const {
@@ -710,6 +698,30 @@ private:
                                        std::vector<Privilege>* out) const {
         // The default implementation of addRequiredPrivileges should never be hit.
         fassertFailed(16940);
+    }
+};
+
+/**
+ * Commands should implement this class if they do not require access to the ReplyBuilderInterface.
+ */
+class BasicCommand : public BasicCommandWithReplyBuilderInterface {
+public:
+    using BasicCommandWithReplyBuilderInterface::BasicCommandWithReplyBuilderInterface;
+
+    /**
+     * Runs the given command. Returns true upon success.
+     */
+    virtual bool run(OperationContext* opCtx,
+                     const std::string& db,
+                     const BSONObj& cmdObj,
+                     BSONObjBuilder& result) = 0;
+
+    bool runWithReplyBuilder(OperationContext* opCtx,
+                             const std::string& db,
+                             const BSONObj& cmdObj,
+                             rpc::ReplyBuilderInterface* replyBuilder) final {
+        auto result = replyBuilder->getBodyBuilder();
+        return run(opCtx, db, cmdObj, result);
     }
 };
 
@@ -884,7 +896,7 @@ public:
         return _commands;
     }
 
-    void registerCommand(Command* command, StringData name, StringData oldName);
+    void registerCommand(Command* command, StringData name, std::vector<StringData> aliases);
 
     Command* findCommand(StringData name) const;
 

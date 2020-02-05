@@ -33,22 +33,29 @@
 
 #include "mongo/transport/transport_layer_asio.h"
 
+#include <fstream>
+
 #include <asio.hpp>
 #include <asio/system_timer.hpp>
 #include <boost/algorithm/string.hpp>
+#include <boost/filesystem/operations.hpp>
 
 #include "mongo/config.h"
 
 #include "mongo/base/system_error.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/service_context.h"
+#include "mongo/db/stats/counters.h"
 #include "mongo/transport/asio_utils.h"
 #include "mongo/transport/service_entry_point.h"
+#include "mongo/transport/transport_options_gen.h"
+#include "mongo/util/hierarchical_acquisition.h"
 #include "mongo/util/log.h"
 #include "mongo/util/net/hostandport.h"
 #include "mongo/util/net/sockaddr.h"
 #include "mongo/util/net/ssl_manager.h"
 #include "mongo/util/net/ssl_options.h"
+#include "mongo/util/options_parser/startup_options.h"
 
 #ifdef MONGO_CONFIG_SSL
 #include "mongo/util/net/ssl.hpp"
@@ -64,6 +71,30 @@
 
 namespace mongo {
 namespace transport {
+
+namespace {
+#ifdef TCP_FASTOPEN
+using TCPFastOpen = asio::detail::socket_option::integer<IPPROTO_TCP, TCP_FASTOPEN>;
+#endif
+/**
+ * On systems with TCP_FASTOPEN_CONNECT (linux >= 4.11),
+ * we can get TFO "for free" by letting the kernel handle
+ * postponing connect() until the first send() call.
+ *
+ * https://github.com/torvalds/linux/commit/19f6d3f3c8422d65b5e3d2162e30ef07c6e21ea2
+ */
+#ifdef TCP_FASTOPEN_CONNECT
+using TCPFastOpenConnect = asio::detail::socket_option::boolean<IPPROTO_TCP, TCP_FASTOPEN_CONNECT>;
+#endif
+
+/**
+ * Set to `true` if any of the following set parameters were explicitly configured.
+ * - tcpFastOpenServer
+ * - tcpFastOpenClient
+ * - tcpFastOpenQueueSize
+ */
+bool tcpFastOpenIsConfigured = false;
+}  // namespace
 
 MONGO_FAIL_POINT_DEFINE(transportLayerASIOasyncConnectTimesOut);
 
@@ -143,23 +174,13 @@ public:
     void run() noexcept override {
         ThreadIdGuard threadIdGuard(this);
         asio::io_context::work work(_ioContext);
-        try {
-            _ioContext.run();
-        } catch (...) {
-            severe() << "Uncaught exception in reactor: " << exceptionToStatus();
-            fassertFailed(40491);
-        }
+        _ioContext.run();
     }
 
     void runFor(Milliseconds time) noexcept override {
         ThreadIdGuard threadIdGuard(this);
         asio::io_context::work work(_ioContext);
-        try {
-            _ioContext.run_for(time.toSystemDuration());
-        } catch (...) {
-            severe() << "Uncaught exception in reactor: " << exceptionToStatus();
-            fassertFailed(50473);
-        }
+        _ioContext.run_for(time.toSystemDuration());
     }
 
     void stop() override {
@@ -167,6 +188,7 @@ public:
     }
 
     void drain() override {
+        ThreadIdGuard threadIdGuard(this);
         _ioContext.restart();
         while (_ioContext.poll()) {
             LOG(2) << "Draining remaining work in reactor.";
@@ -202,10 +224,12 @@ private:
     class ThreadIdGuard {
     public:
         ThreadIdGuard(TransportLayerASIO::ASIOReactor* reactor) {
+            invariant(!_reactorForThread);
             _reactorForThread = reactor;
         }
 
         ~ThreadIdGuard() {
+            invariant(_reactorForThread);
             _reactorForThread = nullptr;
         }
     };
@@ -475,7 +499,21 @@ StatusWith<TransportLayerASIO::ASIOSessionHandle> TransportLayerASIO::_doSyncCon
     Endpoint endpoint, const HostAndPort& peer, const Milliseconds& timeout) {
     GenericSocket sock(*_egressReactor);
     std::error_code ec;
-    sock.open(endpoint->protocol());
+
+    const auto protocol = endpoint->protocol();
+    sock.open(protocol);
+
+#ifdef TCP_FASTOPEN_CONNECT
+    const auto family = protocol.family();
+    if ((family == AF_INET) || (family == AF_INET6)) {
+        sock.set_option(TCPFastOpenConnect(gTCPFastOpenClient), ec);
+        if (tcpFastOpenIsConfigured) {
+            return errorCodeToStatus(ec);
+        }
+        ec = std::error_code();
+    }
+#endif
+
     sock.non_blocking(true);
 
     auto now = Date_t::now();
@@ -506,7 +544,7 @@ StatusWith<TransportLayerASIO::ASIOSessionHandle> TransportLayerASIO::_doSyncCon
 
     sock.non_blocking(false);
     try {
-        return std::make_shared<ASIOSession>(this, std::move(sock), false);
+        return std::make_shared<ASIOSession>(this, std::move(sock), false, *endpoint);
     } catch (const DBException& e) {
         return e.toStatus();
     }
@@ -530,7 +568,7 @@ Future<SessionHandle> TransportLayerASIO::asyncConnect(HostAndPort peer,
         AtomicWord<bool> done{false};
         Promise<SessionHandle> promise;
 
-        Mutex mutex = MONGO_MAKE_LATCH("AsyncConnectState::mutex");
+        Mutex mutex = MONGO_MAKE_LATCH(HierarchicalAcquisitionLevel(0), "AsyncConnectState::mutex");
         GenericSocket socket;
         ASIOReactorTimer timeoutTimer;
         WrappedResolver resolver;
@@ -592,12 +630,19 @@ Future<SessionHandle> TransportLayerASIO::asyncConnect(HostAndPort peer,
                 return futurize(ex.code());
             }
 
+#ifdef TCP_FASTOPEN_CONNECT
+            std::error_code ec;
+            connector->socket.set_option(TCPFastOpenConnect(gTCPFastOpenClient), ec);
+            if (tcpFastOpenIsConfigured) {
+                return futurize(ec);
+            }
+#endif
             return connector->socket.async_connect(*connector->resolvedEndpoint, UseFuture{});
         })
         .then([this, connector, sslMode]() -> Future<void> {
             stdx::unique_lock<Latch> lk(connector->mutex);
-            connector->session =
-                std::make_shared<ASIOSession>(this, std::move(connector->socket), false);
+            connector->session = std::make_shared<ASIOSession>(
+                this, std::move(connector->socket), false, *connector->resolvedEndpoint);
             connector->session->ensureAsync();
 
 #ifndef MONGO_CONFIG_SSL
@@ -641,6 +686,104 @@ Future<SessionHandle> TransportLayerASIO::asyncConnect(HostAndPort peer,
     return mergedFuture;
 }
 
+#if defined(TCP_FASTOPEN) || defined(TCP_FASTOPEN_CONNECT)
+/**
+ * Attempt to set an option on a dummy SOCK_STREAM/AF_INET socket
+ * and report success/failure.
+ */
+bool trySetSockOpt(int level, int opt, int val) {
+    auto sock = ::socket(AF_INET, SOCK_STREAM, 0);
+
+#ifdef _WIN32
+    char* pval = reinterpret_cast<char*>(&val);
+#else
+    void* pval = &val;
+#endif
+
+    const auto ret = ::setsockopt(sock, IPPROTO_TCP, TCP_FASTOPEN, pval, sizeof(val));
+
+#ifdef _WIN32
+    closesocket(sock);
+#else
+    close(sock);
+#endif
+
+    return ret == 0;
+}
+#endif
+
+Status validateFastOpen() noexcept {
+    namespace moe = optionenvironment;
+    if (moe::startupOptionsParsed.count("setParameter")) {
+        const auto params =
+            moe::startupOptionsParsed["setParameter"].as<std::map<std::string, std::string>>();
+        tcpFastOpenIsConfigured = (params.find("tcpFastOpenServer") != params.end()) ||
+            (params.find("tcpFastOpenClient") != params.end()) ||
+            (params.find("tcpFastOpenQueueSize") != params.end());
+    }
+
+#ifndef TCP_FASTOPEN
+    if (tcpFastOpenIsConfigured && gTCPFastOpenServer) {
+        return {ErrorCodes::BadValue,
+                "TCP FastOpen server support requested, but unavailable in this build of MongoDB"};
+    }
+#else
+    networkCounter.setTFOServerSupport(trySetSockOpt(IPPROTO_TCP, TCP_FASTOPEN, 1));
+#endif
+
+#ifndef TCP_FASTOPEN_CONNECT
+    if (tcpFastOpenIsConfigured && gTCPFastOpenClient) {
+        return {ErrorCodes::BadValue,
+                "TCP FastOpen client support requested, but unavailable in this build of MongoDB"};
+    }
+#else
+    networkCounter.setTFOClientSupport(trySetSockOpt(IPPROTO_TCP, TCP_FASTOPEN_CONNECT, 1));
+#endif
+
+#if defined(TCP_FASTOPEN) && defined(__linux)
+    if (!gTCPFastOpenServer && !gTCPFastOpenClient) {
+        return Status::OK();
+    }
+
+    std::string procfile("/proc/sys/net/ipv4/tcp_fastopen");
+    boost::system::error_code ec;
+    if (!boost::filesystem::exists(procfile, ec)) {
+        return {ErrorCodes::BadValue,
+                str::stream() << "TCP FastOpen support requested, but unable to locate " << procfile
+                              << ": " << errorCodeToStatus(ec)};
+    }
+
+    std::fstream f(procfile, std::ifstream::in);
+    if (!f.is_open()) {
+        return {ErrorCodes::BadValue, str::stream() << "Unable to read " << procfile};
+    }
+
+    std::int64_t val;
+    f >> val;
+    networkCounter.setTFOKernelSetting(val);
+
+    constexpr std::int64_t kTFOClientBit = (1 << 0);
+    constexpr std::int64_t kTFOServerBit = (1 << 1);
+
+    // Future proof this setting by allowing extra bits to stay set in help output.
+    std::int64_t wantval = val;
+    if (gTCPFastOpenClient) {
+        wantval |= kTFOClientBit;
+    }
+    if (gTCPFastOpenServer) {
+        wantval |= kTFOServerBit;
+    }
+
+    if (val != wantval) {
+        return {ErrorCodes::BadValue,
+                str::stream() << "TCP FastOpen support requested, but disabled in kernel. "
+                              << "Set " << procfile << " to " << std::to_string(wantval)};
+    }
+#endif
+
+    return Status::OK();
+}
+
 Status TransportLayerASIO::setup() {
     std::vector<std::string> listenAddrs;
     if (_listenerOptions.ipList.empty() && _listenerOptions.isIngress()) {
@@ -657,6 +800,14 @@ Status TransportLayerASIO::setup() {
         listenAddrs.emplace_back(makeUnixSockPath(_listenerOptions.port));
     }
 #endif
+
+    if (auto foStatus = validateFastOpen(); !foStatus.isOK()) {
+        if (tcpFastOpenIsConfigured) {
+            return foStatus;
+        } else {
+            log() << foStatus.reason();
+        }
+    }
 
     if (!(_listenerOptions.isIngress()) && !listenAddrs.empty()) {
         return {ErrorCodes::BadValue,
@@ -702,11 +853,21 @@ Status TransportLayerASIO::setup() {
         GenericAcceptor acceptor(*_acceptorReactor);
         acceptor.open(addr->protocol());
         acceptor.set_option(GenericAcceptor::reuse_address(true));
+
+        std::error_code ec;
+#ifdef TCP_FASTOPEN
+        if (gTCPFastOpenServer && ((addr.family() == AF_INET) || (addr.family() == AF_INET6))) {
+            acceptor.set_option(TCPFastOpen(gTCPFastOpenQueueSize), ec);
+            if (tcpFastOpenIsConfigured) {
+                return errorCodeToStatus(ec);
+            }
+            ec = std::error_code();
+        }
+#endif
         if (addr.family() == AF_INET6) {
             acceptor.set_option(asio::ip::v6_only(true));
         }
 
-        std::error_code ec;
         acceptor.non_blocking(true, ec);
         if (ec) {
             return errorCodeToStatus(ec);
@@ -740,9 +901,7 @@ Status TransportLayerASIO::setup() {
             _listenerPort = endpointToHostAndPort(endpoint).port();
         }
 
-        sockaddr_storage sa;
-        memcpy(&sa, addr->data(), addr->size());
-        _acceptors.emplace_back(SockAddr(sa, addr->size()), std::move(acceptor));
+        _acceptors.emplace_back(SockAddr(addr->data(), addr->size()), std::move(acceptor));
     }
 
     if (_acceptors.empty() && _listenerOptions.isIngress()) {
@@ -779,48 +938,47 @@ Status TransportLayerASIO::setup() {
     return Status::OK();
 }
 
-Status TransportLayerASIO::start() {
-    stdx::lock_guard<Latch> lk(_mutex);
-    _running.store(true);
+void TransportLayerASIO::_runListener() noexcept {
+    setThreadName("listener");
 
-    if (_listenerOptions.isIngress()) {
-        for (auto& acceptor : _acceptors) {
-            asio::error_code ec;
-            acceptor.second.listen(serverGlobalParams.listenBacklog, ec);
-            if (ec) {
-                severe() << "Error listening for new connections on " << acceptor.first << ": "
-                         << ec.message();
-                fassertFailed(31339);
-            }
-
-            _acceptConnection(acceptor.second);
-            log() << "Listening on " << acceptor.first.getAddr();
-        }
-
-        _listenerThread = stdx::thread([this] {
-            setThreadName("listener");
-            while (_running.load()) {
-                _acceptorReactor->run();
-            }
-        });
-
-        const char* ssl = "";
-#ifdef MONGO_CONFIG_SSL
-        if (_sslMode() != SSLParams::SSLMode_disabled) {
-            ssl = " ssl";
-        }
-#endif
-        log() << "waiting for connections on port " << _listenerPort << ssl;
-    } else {
-        invariant(_acceptors.empty());
+    stdx::unique_lock lk(_mutex);
+    if (_isShutdown) {
+        return;
     }
 
-    return Status::OK();
-}
+    for (auto& acceptor : _acceptors) {
+        asio::error_code ec;
+        acceptor.second.listen(serverGlobalParams.listenBacklog, ec);
+        if (ec) {
+            severe() << "Error listening for new connections on " << acceptor.first << ": "
+                     << ec.message();
+            fassertFailed(31339);
+        }
 
-void TransportLayerASIO::shutdown() {
-    stdx::lock_guard<Latch> lk(_mutex);
-    _running.store(false);
+        _acceptConnection(acceptor.second);
+        log() << "Listening on " << acceptor.first.getAddr();
+    }
+
+    const char* ssl = "";
+#ifdef MONGO_CONFIG_SSL
+    if (_sslMode() != SSLParams::SSLMode_disabled) {
+        ssl = " ssl";
+    }
+#endif
+    log() << "waiting for connections on port " << _listenerPort << ssl;
+
+    _listener.active = true;
+    _listener.cv.notify_all();
+    ON_BLOCK_EXIT([&] {
+        _listener.active = false;
+        _listener.cv.notify_all();
+    });
+
+    while (!_isShutdown) {
+        lk.unlock();
+        _acceptorReactor->run();
+        lk.lock();
+    }
 
     // Loop through the acceptors and cancel their calls to async_accept. This will prevent new
     // connections from being opened.
@@ -836,17 +994,53 @@ void TransportLayerASIO::shutdown() {
             }
         }
     }
+}
 
-    // If the listener thread is joinable (that is, we created/started a listener thread), then
-    // the io_context is owned exclusively by the TransportLayer and we should stop it and join
-    // the listener thread.
-    //
-    // Otherwise the ServiceExecutor may need to continue running the io_context to drain running
-    // connections, so we just cancel the acceptors and return.
-    if (_listenerThread.joinable()) {
-        _acceptorReactor->stop();
-        _listenerThread.join();
+Status TransportLayerASIO::start() {
+    stdx::unique_lock lk(_mutex);
+
+    // Make sure we haven't shutdown already
+    invariant(!_isShutdown);
+
+    if (_listenerOptions.isIngress()) {
+        _listener.thread = stdx::thread([this] { _runListener(); });
+        _listener.cv.wait(lk, [&] { return _isShutdown || _listener.active; });
+        return Status::OK();
     }
+
+    invariant(_acceptors.empty());
+    return Status::OK();
+}
+
+void TransportLayerASIO::shutdown() {
+    stdx::unique_lock lk(_mutex);
+
+    if (std::exchange(_isShutdown, true)) {
+        // We were already stopped
+        return;
+    }
+
+    if (!_listenerOptions.isIngress()) {
+        // Egress only reactors never start a listener
+        return;
+    }
+
+    auto thread = std::exchange(_listener.thread, {});
+    if (!thread.joinable()) {
+        // If the listener never started, then we can return now
+        return;
+    }
+
+    // Spam stop() on the reactor, it interrupts run()
+    while (_listener.active) {
+        lk.unlock();
+        _acceptorReactor->stop();
+        lk.lock();
+    }
+
+    // Release the lock and wait for the thread to die
+    lk.unlock();
+    thread.join();
 }
 
 ReactorHandle TransportLayerASIO::getReactor(WhichReactor which) {
@@ -864,8 +1058,9 @@ ReactorHandle TransportLayerASIO::getReactor(WhichReactor which) {
 
 void TransportLayerASIO::_acceptConnection(GenericAcceptor& acceptor) {
     auto acceptCb = [this, &acceptor](const std::error_code& ec, GenericSocket peerSocket) mutable {
-        if (!_running.load())
+        if (auto lk = stdx::lock_guard(_mutex); _isShutdown) {
             return;
+        }
 
         if (ec) {
             log() << "Error accepting new connection on "
@@ -873,6 +1068,15 @@ void TransportLayerASIO::_acceptConnection(GenericAcceptor& acceptor) {
             _acceptConnection(acceptor);
             return;
         }
+
+#ifdef TCPI_OPT_SYN_DATA
+        struct tcp_info info;
+        socklen_t info_len = sizeof(info);
+        if (!getsockopt(peerSocket.native_handle(), IPPROTO_TCP, TCP_INFO, &info, &info_len) &&
+            (info.tcpi_options & TCPI_OPT_SYN_DATA)) {
+            networkCounter.acceptedTFOIngress();
+        }
+#endif
 
         try {
             std::shared_ptr<ASIOSession> session(

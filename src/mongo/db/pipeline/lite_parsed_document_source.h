@@ -36,11 +36,13 @@
 
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/db/pipeline/aggregation_request.h"
+#include "mongo/db/read_concern_support_result.h"
 #include "mongo/db/repl/read_concern_args.h"
 #include "mongo/stdx/unordered_set.h"
 
 namespace mongo {
+
+class LiteParsedPipeline;
 
 /**
  * A lightly parsed version of a DocumentSource. It is not executable and not guaranteed to return a
@@ -56,12 +58,12 @@ public:
      * This is the type of parser you should register using REGISTER_DOCUMENT_SOURCE. It need not
      * do any validation of options, only enough parsing to be able to implement the interface.
      *
-     * The AggregationRequest can be used to determine related information like the namespace on
-     * which this aggregation is being performed, and the BSONElement will be the element whose
-     * field name is the name of this stage (e.g. the first and only element in {$limit: 1}).
+     * The NamespaceString can be used to determine the namespace on which this aggregation is being
+     * performed, and the BSONElement will be the element whose field name is the name of this stage
+     * (e.g. the first and only element in {$limit: 1}).
      */
-    using Parser = std::function<std::unique_ptr<LiteParsedDocumentSource>(
-        const AggregationRequest&, const BSONElement&)>;
+    using Parser = std::function<std::unique_ptr<LiteParsedDocumentSource>(const NamespaceString&,
+                                                                           const BSONElement&)>;
 
     /**
      * Registers a DocumentSource with a spec parsing function, so that when a stage with the given
@@ -79,7 +81,7 @@ public:
      * Extracts the first field name from 'spec', and delegates to the parser that was registered
      * with that field name using registerParser() above.
      */
-    static std::unique_ptr<LiteParsedDocumentSource> parse(const AggregationRequest& request,
+    static std::unique_ptr<LiteParsedDocumentSource> parse(const NamespaceString& nss,
                                                            const BSONObj& spec);
 
     /**
@@ -90,7 +92,8 @@ public:
     /**
      * Returns a list of the privileges required for this stage.
      */
-    virtual PrivilegeVector requiredPrivileges(bool isMongos) const = 0;
+    virtual PrivilegeVector requiredPrivileges(bool isMongos,
+                                               bool bypassDocumentValidation) const = 0;
 
     /**
      * Returns true if this is a $collStats stage.
@@ -130,10 +133,11 @@ public:
     }
 
     /**
-     * Verifies that this stage is allowed to run with the specified read concern. Throws a
-     * UserException if not compatible.
+     * Verifies that this stage is allowed to run with the specified read concern level.
      */
-    virtual void assertSupportsReadConcern(const repl::ReadConcernArgs& readConcern) const {}
+    virtual ReadConcernSupportResult supportsReadConcern(repl::ReadConcernLevel level) const {
+        return ReadConcernSupportResult::allSupportedAndDefaultPermitted();
+    }
 
     /**
      * Verifies that this stage is allowed to run in a multi-document transaction. Throws a
@@ -150,14 +154,26 @@ protected:
                                 << "multi-document transaction.");
     }
 
-    void onlyReadConcernLocalSupported(StringData stageName,
-                                       const repl::ReadConcernArgs& readConcern) const {
-        uassert(ErrorCodes::InvalidOptions,
-                str::stream()
-                    << "Aggregation stage " << stageName
-                    << " cannot run with a readConcern other than 'local'. Current readConcern: "
-                    << readConcern.toString(),
-                readConcern.getLevel() == repl::ReadConcernLevel::kLocalReadConcern);
+    ReadConcernSupportResult onlySingleReadConcernSupported(
+        StringData stageName,
+        repl::ReadConcernLevel supportedLevel,
+        repl::ReadConcernLevel candidateLevel) const {
+        return {{candidateLevel != supportedLevel,
+                 {ErrorCodes::InvalidOptions,
+                  str::stream() << "Aggregation stage " << stageName
+                                << " cannot run with a readConcern other than '"
+                                << repl::readConcernLevels::toString(supportedLevel)
+                                << "'. Current readConcern: "
+                                << repl::readConcernLevels::toString(candidateLevel)}},
+                {{ErrorCodes::InvalidOptions,
+                  str::stream() << "Aggregation stage " << stageName
+                                << " does not permit default readConcern to be applied."}}};
+    }
+
+    ReadConcernSupportResult onlyReadConcernLocalSupported(StringData stageName,
+                                                           repl::ReadConcernLevel level) const {
+        return onlySingleReadConcernSupported(
+            stageName, repl::ReadConcernLevel::kLocalReadConcern, level);
     }
 };
 
@@ -168,7 +184,7 @@ public:
      * your stage doesn't need to communicate any special behavior before registering a
      * DocumentSource using this parser.
      */
-    static std::unique_ptr<LiteParsedDocumentSourceDefault> parse(const AggregationRequest& request,
+    static std::unique_ptr<LiteParsedDocumentSourceDefault> parse(const NamespaceString& nss,
                                                                   const BSONElement& spec) {
         return std::make_unique<LiteParsedDocumentSourceDefault>();
     }
@@ -179,36 +195,49 @@ public:
         return stdx::unordered_set<NamespaceString>();
     }
 
-    PrivilegeVector requiredPrivileges(bool isMongos) const final {
+    PrivilegeVector requiredPrivileges(bool isMongos, bool bypassDocumentValidation) const final {
         return {};
     }
 };
 
 /**
- * Helper class for DocumentSources which reference one or more foreign collections.
+ * Helper class for DocumentSources which reference a foreign collection.
  */
-class LiteParsedDocumentSourceForeignCollections : public LiteParsedDocumentSource {
+class LiteParsedDocumentSourceForeignCollection : public LiteParsedDocumentSource {
 public:
-    LiteParsedDocumentSourceForeignCollections(NamespaceString foreignNss,
-                                               PrivilegeVector privileges)
-        : _foreignNssSet{std::move(foreignNss)}, _requiredPrivileges(std::move(privileges)) {}
-
-    LiteParsedDocumentSourceForeignCollections(stdx::unordered_set<NamespaceString> foreignNssSet,
-                                               PrivilegeVector privileges)
-        : _foreignNssSet(std::move(foreignNssSet)), _requiredPrivileges(std::move(privileges)) {}
+    LiteParsedDocumentSourceForeignCollection(NamespaceString foreignNss)
+        : _foreignNss(std::move(foreignNss)) {}
 
     stdx::unordered_set<NamespaceString> getInvolvedNamespaces() const final {
-        return {_foreignNssSet};
+        return {_foreignNss};
     }
 
-    PrivilegeVector requiredPrivileges(bool isMongos) const final {
-        return _requiredPrivileges;
-    }
+    virtual PrivilegeVector requiredPrivileges(bool isMongos,
+                                               bool bypassDocumentValidation) const = 0;
 
 protected:
-    stdx::unordered_set<NamespaceString> _foreignNssSet;
+    NamespaceString _foreignNss;
+};
 
-private:
-    PrivilegeVector _requiredPrivileges;
+/**
+ * Helper class for DocumentSources which can reference one or more child pipelines.
+ */
+class LiteParsedDocumentSourceNestedPipelines : public LiteParsedDocumentSource {
+public:
+    LiteParsedDocumentSourceNestedPipelines(boost::optional<NamespaceString> foreignNss,
+                                            std::vector<LiteParsedPipeline> pipelines);
+
+    LiteParsedDocumentSourceNestedPipelines(boost::optional<NamespaceString> foreignNss,
+                                            boost::optional<LiteParsedPipeline> pipeline);
+
+    stdx::unordered_set<NamespaceString> getInvolvedNamespaces() const final override;
+
+    bool allowedToPassthroughFromMongos() const final override;
+
+    bool allowShardedForeignCollection(NamespaceString nss) const override;
+
+protected:
+    boost::optional<NamespaceString> _foreignNss;
+    std::vector<LiteParsedPipeline> _pipelines;
 };
 }  // namespace mongo

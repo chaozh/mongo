@@ -43,6 +43,8 @@ void ReplicationCoordinatorNoOp::enterTerminalShutdown() {}
 
 void ReplicationCoordinatorNoOp::shutdown(OperationContext* opCtx) {}
 
+void ReplicationCoordinatorNoOp::markAsCleanShutdownIfPossible(OperationContext* opCtx) {}
+
 ReplicationCoordinator::Mode ReplicationCoordinatorNoOp::getReplicationMode() const {
     return modeReplSet;
 }
@@ -279,11 +281,6 @@ Status ReplicationCoordinatorNoOp::processReplSetGetStatus(BSONObjBuilder*,
     MONGO_UNREACHABLE;
 }
 
-void ReplicationCoordinatorNoOp::fillIsMasterForReplSet(IsMasterResponse*,
-                                                        const SplitHorizon::Parameters&) {
-    MONGO_UNREACHABLE;
-}
-
 void ReplicationCoordinatorNoOp::appendSlaveInfoData(BSONObjBuilder*) {
     MONGO_UNREACHABLE;
 }
@@ -416,7 +413,7 @@ Status ReplicationCoordinatorNoOp::processHeartbeatV1(const ReplSetHeartbeatArgs
     MONGO_UNREACHABLE;
 }
 
-long long ReplicationCoordinatorNoOp::getTerm() {
+long long ReplicationCoordinatorNoOp::getTerm() const {
     MONGO_UNREACHABLE;
 }
 
@@ -465,6 +462,26 @@ void ReplicationCoordinatorNoOp::updateAndLogStateTransitionMetrics(
     const size_t numOpsKilled,
     const size_t numOpsRunning) const {
     MONGO_UNREACHABLE;
+}
+
+TopologyVersion ReplicationCoordinatorNoOp::getTopologyVersion() const {
+    MONGO_UNREACHABLE;
+}
+
+void ReplicationCoordinatorNoOp::incrementTopologyVersion(OperationContext* opCtx) {
+    MONGO_UNREACHABLE;
+}
+
+std::shared_ptr<const IsMasterResponse> ReplicationCoordinatorNoOp::awaitIsMasterResponse(
+    OperationContext* opCtx,
+    const SplitHorizon::Parameters& horizonParams,
+    boost::optional<TopologyVersion> clientTopologyVersion,
+    boost::optional<Date_t> deadline) const {
+    MONGO_UNREACHABLE;
+}
+
+OpTime ReplicationCoordinatorNoOp::getLatestWriteOpTime(OperationContext* opCtx) const {
+    return getMyLastAppliedOpTime();
 }
 
 }  // namespace repl

@@ -41,7 +41,6 @@
 #include "mongo/platform/mutex.h"
 #include "mongo/util/concurrency/thread_pool.h"
 #include "mongo/util/future.h"
-#include "mongo/util/system_clock_source.h"
 
 namespace mongo {
 namespace repl {
@@ -53,8 +52,7 @@ public:
                HostAndPort source,
                DBClientConnection* client,
                StorageInterface* storageInterface,
-               ThreadPool* dbPool,
-               ClockSource* clock = SystemClockSource::get());
+               ThreadPool* dbPool);
 
     virtual ~BaseCloner() = default;
 
@@ -66,10 +64,15 @@ public:
     Status run();
 
     /**
-     * Executes the run() method asychronously on the given taskExecutor, returning the result
-     * as a Future.
+     * Executes the run() method asychronously on the given taskExecutor when the event is
+     * signalled, returning the result as a Future.
+     *
+     * If the executor is valid, the Future is guaranteed to not be ready until the event is
+     * signalled.  If the executor is not valid (e.g. shutting down), the future will be
+     * ready immediately after the call and the EventHandle will be invalid.
      */
-    Future<void> runOnExecutor(executor::TaskExecutor* executor);
+    std::pair<Future<void>, executor::TaskExecutor::EventHandle> runOnExecutorEvent(
+        executor::TaskExecutor* executor);
 
     /**
      * For unit testing, allow stopping after any given stage.
@@ -101,9 +104,20 @@ protected:
 
         virtual AfterStageBehavior run() = 0;
 
-        // Returns true if the Status represents an error which should be retried.
-        virtual bool isTransientError(Status) {
-            return false;
+        /**
+         * Returns true if the Status represents an error which should be retried.
+         */
+        virtual bool isTransientError(const Status& status) {
+            return ErrorCodes::isRetriableError(status);
+        }
+
+        /**
+         * Returns true if the rollback ID should be checked before retrying.
+         * This is provided because the "connect" stage must complete successfully
+         * before checking rollback ID.
+         */
+        virtual bool checkRollBackIdOnRetry() {
+            return true;
         }
 
         std::string getName() const {
@@ -161,10 +175,6 @@ protected:
         return _dbPool;
     }
 
-    ClockSource* getClock() const {
-        return _clock;
-    }
-
     bool isActive(WithLock) const {
         return _active;
     }
@@ -194,6 +204,13 @@ protected:
      */
     bool mustExit();
 
+    /**
+     * A stage may, but is not required, to call this when we should clear the retrying state
+     * because the operation has at least partially succeeded.  If the stage does not call this,
+     * the retrying state is cleared upon successful completion of the entire stage.
+     */
+    void clearRetryingState();
+
 private:
     virtual ClonerStages getStages() = 0;
 
@@ -205,6 +222,14 @@ private:
     virtual void postStage() {}
 
     AfterStageBehavior runStage(BaseClonerStage* stage);
+
+    AfterStageBehavior runStageWithRetries(BaseClonerStage* stage);
+
+    /**
+     * Make sure the rollback ID has not changed.  Throws an exception if it has.  Returns
+     * a not-OK status if a network error occurs.
+     */
+    Status checkRollBackIdIsUnchanged();
 
     /**
      * Supports pausing at certain stages for the initial sync fuzzer test framework.
@@ -233,21 +258,23 @@ private:
     StorageInterface* _storageInterface;  // (X)
     ThreadPool* _dbPool;                  // (X)
     HostAndPort _source;                  // (R)
-    ClockSource* _clock;                  // (S)
 
     // _active indicates this cloner is being run, and is used only for status reporting and
     // invariant checking.
     bool _active = false;           // (M)
     Status _status = Status::OK();  // (M)
-    // _startedAsync indicates the cloner is being run on some executor using runOnExecutor(),
+    // _startedAsync indicates the cloner is being run on some executor using runOnExecutorEvent(),
     // and is used only for invariant checking.
     bool _startedAsync = false;  // (M)
-    // _promise corresponds to the Future returned by runOnExecutor().  When not running
+    // _promise corresponds to the Future returned by runOnExecutorEvent().  When not running
     // asynchronously, this is a null promise.
     Promise<void> _promise;  // (S)
     // _stopAfterStage is used for unit testing and causes the cloner to exit after a given
     // stage.
     std::string _stopAfterStage;  // (X)
+
+    // Operation that may currently be retrying.
+    InitialSyncSharedData::RetryableOperation _retryableOp;  // (X)
 };
 
 }  // namespace repl

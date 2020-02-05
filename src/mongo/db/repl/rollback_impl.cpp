@@ -424,6 +424,9 @@ StatusWith<std::set<NamespaceString>> RollbackImpl::_namespacesForOp(const Oplog
             case OplogEntry::CommandType::kDrop:
             case OplogEntry::CommandType::kCreateIndexes:
             case OplogEntry::CommandType::kDropIndexes:
+            case OplogEntry::CommandType::kStartIndexBuild:
+            case OplogEntry::CommandType::kAbortIndexBuild:
+            case OplogEntry::CommandType::kCommitIndexBuild:
             case OplogEntry::CommandType::kCollMod: {
                 // For all other command types, we should be able to parse the collection name from
                 // the first command argument.
@@ -435,12 +438,6 @@ StatusWith<std::set<NamespaceString>> RollbackImpl::_namespacesForOp(const Oplog
                 }
                 break;
             }
-            // TODO(SERVER-39451): Ignore no-op startIndexBuild, abortIndexBuild, and
-            // commitIndexBuild commands.
-            // Revisit when we are ready to implement rollback logic.
-            case OplogEntry::CommandType::kStartIndexBuild:
-            case OplogEntry::CommandType::kAbortIndexBuild:
-            case OplogEntry::CommandType::kCommitIndexBuild:
             case OplogEntry::CommandType::kCommitTransaction:
             case OplogEntry::CommandType::kAbortTransaction: {
                 break;
@@ -505,11 +502,12 @@ void RollbackImpl::_runPhaseFromAbortToReconstructPreparedTxns(
           << " update operations and " << _observerInfo.rollbackCommandCounts[kDeleteCmdName]
           << " delete operations.";
 
-    // During replication recovery, we truncate all oplog entries with timestamps greater than
-    // or equal to the oplog truncate after point. As a result, we must find the oplog entry
-    // after the common point so we do not truncate the common point itself. If we entered
-    // rollback, we are guaranteed to have at least one oplog entry after the common point.
-    Timestamp truncatePoint = _findTruncateTimestamp(opCtx, commonPoint);
+    // During replication recovery, we truncate all oplog entries with timestamps greater than the
+    // oplog truncate after point. If we entered rollback, we are guaranteed to have at least one
+    // oplog entry after the common point.
+    log() << "Marking to truncate all oplog entries with timestamps greater than "
+          << commonPoint.getOpTime().getTimestamp();
+    Timestamp truncatePoint = commonPoint.getOpTime().getTimestamp();
 
     // Persist the truncate point to the 'oplogTruncateAfterPoint' document. We save this value so
     // that the replication recovery logic knows where to truncate the oplog. We save this value
@@ -552,7 +550,7 @@ void RollbackImpl::_correctRecordStoreCounts(OperationContext* opCtx) {
     const auto& catalog = CollectionCatalog::get(opCtx);
     for (const auto& uiCount : _newCounts) {
         const auto uuid = uiCount.first;
-        const auto coll = catalog.lookupCollectionByUUID(uuid);
+        const auto coll = catalog.lookupCollectionByUUID(opCtx, uuid);
         invariant(coll,
                   str::stream() << "The collection with UUID " << uuid
                                 << " is unexpectedly missing in the CollectionCatalog");
@@ -632,7 +630,7 @@ Status RollbackImpl::_findRecordStoreCounts(OperationContext* opCtx) {
             continue;
         }
 
-        auto nss = catalog.lookupNSSByUUID(uuid);
+        auto nss = catalog.lookupNSSByUUID(opCtx, uuid);
         StorageInterface::CollectionCount oldCount = 0;
 
         // Drop-pending collections are not visible to rollback via the catalog when they are
@@ -1008,34 +1006,6 @@ Status RollbackImpl::_checkAgainstTimeLimit(
     return Status::OK();
 }
 
-Timestamp RollbackImpl::_findTruncateTimestamp(
-    OperationContext* opCtx, RollBackLocalOperations::RollbackCommonPoint commonPoint) const {
-
-    AutoGetCollectionForRead oplog(opCtx, NamespaceString::kRsOplogNamespace);
-    invariant(oplog.getCollection());
-    auto oplogCursor = oplog.getCollection()->getCursor(opCtx, /*forward=*/true);
-
-    auto commonPointRecord = oplogCursor->seekExact(commonPoint.getRecordId());
-    auto commonPointOpTime = commonPoint.getOpTime();
-    // Check that we've found the right document for the common point.
-    invariant(commonPointRecord);
-    auto commonPointTime = OpTime::parseFromOplogEntry(commonPointRecord->data.releaseToBson());
-    invariant(commonPointTime.getStatus());
-    invariant(commonPointTime.getValue() == commonPointOpTime,
-              str::stream() << "Common point: " << commonPointOpTime.toString()
-                            << ", record found: " << commonPointTime.getValue().toString());
-
-    // Get the next document, which will be the first document to truncate.
-    auto truncatePointRecord = oplogCursor->next();
-    invariant(truncatePointRecord);
-    auto truncatePointTime = OpTime::parseFromOplogEntry(truncatePointRecord->data.releaseToBson());
-    invariant(truncatePointTime.getStatus());
-
-    log() << "Marking to truncate all oplog entries with timestamps greater than or equal to "
-          << truncatePointTime.getValue();
-    return truncatePointTime.getValue().getTimestamp();
-}
-
 boost::optional<BSONObj> RollbackImpl::_findDocumentById(OperationContext* opCtx,
                                                          UUID uuid,
                                                          NamespaceString nss,
@@ -1059,7 +1029,7 @@ Status RollbackImpl::_writeRollbackFiles(OperationContext* opCtx) {
     auto storageEngine = opCtx->getServiceContext()->getStorageEngine();
     for (auto&& entry : _observerInfo.rollbackDeletedIdsMap) {
         const auto& uuid = entry.first;
-        const auto nss = catalog.lookupNSSByUUID(uuid);
+        const auto nss = catalog.lookupNSSByUUID(opCtx, uuid);
 
         // Drop-pending collections are not visible to rollback via the catalog when they are
         // managed by the storage engine. See StorageEngine::supportsPendingDrops().

@@ -39,7 +39,6 @@
 #include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/json.h"
 #include "mongo/db/server_options.h"
-#include "mongo/db/storage/mobile/mobile_options.h"
 #include "mongo/embedded/mongo_embedded/mongo_embedded_test_gen.h"
 #include "mongo/rpc/message.h"
 #include "mongo/rpc/op_msg.h"
@@ -110,9 +109,6 @@ protected:
         params.log_callback = nullptr;
         params.log_user_data = nullptr;
 
-        // Set a parameter that lives in mobileGlobalOptions to verify it can be set using YAML.
-        uint32_t vacuumCheckIntervalMinutes = 1;
-
         YAML::Emitter yaml;
         yaml << YAML::BeginMap;
 
@@ -120,10 +116,6 @@ protected:
         yaml << YAML::Value << YAML::BeginMap;
         yaml << YAML::Key << "dbPath";
         yaml << YAML::Value << globalTempDir->path();
-        yaml << YAML::Key << "mobile" << YAML::BeginMap;
-        yaml << YAML::Key << "vacuumCheckIntervalMinutes" << YAML::Value
-             << vacuumCheckIntervalMinutes;
-        yaml << YAML::EndMap;  // mobile
         yaml << YAML::EndMap;  // storage
 
         yaml << YAML::EndMap;
@@ -135,8 +127,6 @@ protected:
 
         db = mongo_embedded_v1_instance_create(lib, yaml.c_str(), status);
         ASSERT(db != nullptr) << mongo_embedded_v1_status_get_explanation(status);
-        ASSERT(mongo::embedded::mobileGlobalOptions.vacuumCheckIntervalMinutes ==
-               vacuumCheckIntervalMinutes);
     }
 
     void tearDown() {
@@ -309,27 +299,6 @@ TEST_F(MongodbCAPITest, CreateTTLIndex) {
     ASSERT(output.hasField("ok")) << output;
     ASSERT(output.getField("ok").numberDouble() != 1.0) << output;
 }
-
-TEST_F(MongodbCAPITest, TrimMemory) {
-    // create the client object
-    auto client = createClient();
-
-    // craft the isMaster message
-    mongo::BSONObj inputObj = mongo::fromjson("{trimMemory: 'aggressive'}");
-    auto inputOpMsg = mongo::OpMsgRequest::fromDBAndBody("admin", inputObj);
-    performRpc(client, inputOpMsg);
-}
-
-TEST_F(MongodbCAPITest, BatteryLevel) {
-    // create the client object
-    auto client = createClient();
-
-    // craft the isMaster message
-    mongo::BSONObj inputObj = mongo::fromjson("{setBatteryLevel: 'low'}");
-    auto inputOpMsg = mongo::OpMsgRequest::fromDBAndBody("admin", inputObj);
-    performRpc(client, inputOpMsg);
-}
-
 
 TEST_F(MongodbCAPITest, InsertDocument) {
     auto client = createClient();
@@ -563,6 +532,7 @@ TEST_F(MongodbCAPITest, RunListCommands) {
     auto client = createClient();
 
     std::vector<std::string> whitelist = {"_hashBSONElement",
+                                          "_killOperations",
                                           "aggregate",
                                           "buildInfo",
                                           "collMod",
@@ -604,8 +574,6 @@ TEST_F(MongodbCAPITest, RunListCommands) {
                                           "planCacheClear",
                                           "planCacheClearFilters",
                                           "planCacheListFilters",
-                                          "planCacheListPlans",
-                                          "planCacheListQueryShapes",
                                           "planCacheSetFilter",
                                           "reIndex",
                                           "refreshLogicalSessionCacheNow",
@@ -614,11 +582,9 @@ TEST_F(MongodbCAPITest, RunListCommands) {
                                           "repairDatabase",
                                           "resetError",
                                           "serverStatus",
-                                          "setBatteryLevel",
                                           "setParameter",
                                           "sleep",
                                           "startSession",
-                                          "trimMemory",
                                           "update",
                                           "validate",
                                           "waitForFailPoint",
@@ -788,7 +754,7 @@ int main(const int argc, const char* const* const argv) {
         return EXIT_FAILURE;
     }
 
-    const auto result = ::mongo::unittest::Suite::run(std::vector<std::string>(), "", 1);
+    const auto result = ::mongo::unittest::Suite::run(std::vector<std::string>(), "", "", 1);
 
     globalTempDir.reset();
     mongo::quickExit(result);

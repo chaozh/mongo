@@ -61,7 +61,8 @@ public:
 
     virtual void fsyncUnlock(OperationContext* opCtx);
 
-    virtual BackupCursorState openBackupCursor(OperationContext* opCtx);
+    virtual BackupCursorState openBackupCursor(OperationContext* opCtx,
+                                               const StorageEngine::BackupOptions& options);
 
     virtual void closeBackupCursor(OperationContext* opCtx, const UUID& backupId);
 

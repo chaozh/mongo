@@ -34,9 +34,8 @@
 #include "mongo/bson/bsonobj.h"
 #include "mongo/util/assert_util.h"
 
-namespace mongo::stacktrace_detail {
+namespace mongo::stack_trace_detail {
 namespace {
-constexpr StringData kHexDigits = "0123456789ABCDEF"_sd;
 
 /**
  * Wrapper that streams a string-like object to a StackTraceSink, surrounded by double
@@ -55,30 +54,50 @@ private:
     static constexpr StringData kQuote = "\""_sd;
     const T& _v;
 };
-}  // namespace
 
-StringData Hex::toHex(uint64_t x, Buf& buf) {
-    char* data = buf.data();
-    size_t nBuf = buf.size();
-    char* p = data + nBuf;
+template <size_t base>
+StringData kDigits;
+template <>
+constexpr StringData kDigits<16> = "0123456789ABCDEF"_sd;
+template <>
+constexpr StringData kDigits<10> = "0123456789"_sd;
+
+template <size_t base, typename Buf>
+StringData toNumericBase(uint64_t x, Buf& buf, bool showBase) {
+    auto it = buf.rbegin();
     if (!x) {
-        *--p = '0';
+        *it++ = '0';
     } else {
-        for (int d = 0; d < 16; ++d) {
-            if (!x)
-                break;
-            *--p = kHexDigits[x & 0xf];
-            x >>= 4;
+        for (; x; ++it) {
+            *it = kDigits<base>[x % base];
+            x /= base;
+        }
+        // base is prepended only when x is nonzero (matching printf)
+        if (base == 16 && showBase) {
+            static const auto kPrefix = "0x"_sd;
+            it = std::reverse_copy(kPrefix.begin(), kPrefix.end(), it);
         }
     }
-    return StringData(p, data + nBuf - p);
+    size_t n = std::distance(it.base(), buf.end());
+    const char* p = buf.data() + buf.size() - n;
+    return StringData(p, n);
+}
+
+}  // namespace
+
+StringData Dec::toDec(uint64_t x, Buf& buf) {
+    return toNumericBase<10>(x, buf, false);
+}
+
+StringData Hex::toHex(uint64_t x, Buf& buf, bool showBase) {
+    return toNumericBase<16>(x, buf, showBase);
 }
 
 uint64_t Hex::fromHex(StringData s) {
     uint64_t x = 0;
     for (char c : s) {
         char uc = std::toupper(static_cast<unsigned char>(c));
-        if (size_t pos = kHexDigits.find(uc); pos == std::string::npos) {
+        if (size_t pos = kDigits<16>.find(uc); pos == std::string::npos) {
             return x;
         } else {
             x <<= 4;
@@ -90,35 +109,44 @@ uint64_t Hex::fromHex(StringData s) {
 
 CheapJson::Value::Value(CheapJson* env, Kind k) : _env(env), _kind(k) {
     if (_kind == kObj) {
+        _env->indent();
         _env->_sink << "{";
     } else if (_kind == kArr) {
+        _env->indent();
         _env->_sink << "[";
     }
+}
+
+CheapJson::Value::Value(const Value& parent, Kind k) : Value{parent._env, k} {
+    _parent = &parent;
+    _pretty = _parent->_pretty;
 }
 
 CheapJson::Value::~Value() {
     if (_kind == kObj) {
         _env->_sink << "}";
+        _env->dedent();
     } else if (_kind == kArr) {
         _env->_sink << "]";
+        _env->dedent();
     }
 }
 
 auto CheapJson::Value::appendObj() -> Value {
     _next();
-    return Value{_env, kObj};
+    return Value{*this, kObj};
 }
 
 auto CheapJson::Value::appendArr() -> Value {
     _next();
-    return Value{_env, kArr};
+    return Value{*this, kArr};
 }
 
 auto CheapJson::Value::appendKey(StringData k) -> Value {
     fassert(_kind == kObj, "appendKey requires this to be kObj");
     _next();
     _env->_sink << Quoted(k) << ":";
-    return Value{_env, kNop};
+    return Value{*this, kNop};
 }
 
 void CheapJson::Value::append(StringData v) {
@@ -128,7 +156,7 @@ void CheapJson::Value::append(StringData v) {
 
 void CheapJson::Value::append(uint64_t v) {
     _next();
-    _env->_sink << v;
+    _env->_sink << Dec(v);
 }
 
 void CheapJson::Value::append(const BSONElement& be) {
@@ -165,6 +193,12 @@ void CheapJson::Value::_copyBsonElementValue(const BSONElement& be) {
 void CheapJson::Value::_next() {
     _env->_sink << _sep;
     _sep = ","_sd;
+    if (_pretty && (_kind == kObj || _kind == kArr)) {
+        _env->_sink << "\n"_sd;
+        for (int i = 0; i < _env->_indent; ++i) {
+            _env->_sink << "  "_sd;
+        }
+    }
 }
 
 auto CheapJson::doc() -> Value {
@@ -173,4 +207,4 @@ auto CheapJson::doc() -> Value {
 
 CheapJson::CheapJson(StackTraceSink& sink) : _sink(sink) {}
 
-}  // namespace mongo::stacktrace_detail
+}  // namespace mongo::stack_trace_detail

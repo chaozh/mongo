@@ -57,6 +57,13 @@ class OperationContext;
 class PipelineDeleter;
 
 /**
+ * Enabling the disablePipelineOptimization fail point will stop the aggregate command from
+ * attempting to optimize the pipeline or the pipeline stages. Neither DocumentSource::optimizeAt()
+ * nor DocumentSource::optimize() will be attempted.
+ */
+extern FailPoint disablePipelineOptimization;
+
+/**
  * A Pipeline object represents a list of DocumentSources and is responsible for optimizing the
  * pipeline.
  */
@@ -248,10 +255,10 @@ public:
     std::vector<Value> writeExplainOps(ExplainOptions::Verbosity verbosity) const;
 
     /**
-     * Returns the dependencies needed by this pipeline. 'metadataAvailable' should reflect what
-     * metadata is present on documents that are input to the front of the pipeline.
+     * Returns the dependencies needed by this pipeline. 'unavailableMetadata' should reflect what
+     * metadata is not present on documents that are input to the front of the pipeline.
      */
-    DepsTracker getDependencies(QueryMetadataBitSet metadataAvailable) const;
+    DepsTracker getDependencies(QueryMetadataBitSet unavailableMetadata) const;
 
     const SourceContainer& getSources() const {
         return _sources;

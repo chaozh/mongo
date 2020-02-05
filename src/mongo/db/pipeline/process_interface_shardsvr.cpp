@@ -38,6 +38,7 @@
 #include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/catalog/document_validation.h"
+#include "mongo/db/commands.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/db_raii.h"
@@ -49,6 +50,7 @@
 #include "mongo/db/query/query_knobs_gen.h"
 #include "mongo/db/s/collection_sharding_state.h"
 #include "mongo/db/s/sharding_state.h"
+#include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/s/catalog_cache.h"
 #include "mongo/s/cluster_commands_helpers.h"
 #include "mongo/s/grid.h"
@@ -83,7 +85,9 @@ void MongoInterfaceShardServer::checkRoutingInfoEpochOrThrow(
     const NamespaceString& nss,
     ChunkVersion targetCollectionVersion) const {
     auto catalogCache = Grid::get(expCtx->opCtx)->catalogCache();
-    return catalogCache->checkEpochOrThrow(nss, targetCollectionVersion);
+    auto const shardId = ShardingState::get(expCtx->opCtx)->shardId();
+
+    return catalogCache->checkEpochOrThrow(nss, targetCollectionVersion, shardId);
 }
 
 std::pair<std::vector<FieldPath>, bool>
@@ -135,7 +139,7 @@ StatusWith<MongoProcessInterface::UpdateResult> MongoInterfaceShardServer::updat
     const NamespaceString& ns,
     BatchedObjects&& batch,
     const WriteConcernOptions& wc,
-    bool upsert,
+    UpsertType upsert,
     bool multi,
     boost::optional<OID> targetEpoch) {
     BatchedCommandResponse response;
@@ -155,59 +159,173 @@ StatusWith<MongoProcessInterface::UpdateResult> MongoInterfaceShardServer::updat
 }
 
 unique_ptr<Pipeline, PipelineDeleter> MongoInterfaceShardServer::attachCursorSourceToPipeline(
-    const boost::intrusive_ptr<ExpressionContext>& expCtx, Pipeline* ownedPipeline) {
+    const boost::intrusive_ptr<ExpressionContext>& expCtx,
+    Pipeline* ownedPipeline,
+    bool allowTargetingShards) {
     std::unique_ptr<Pipeline, PipelineDeleter> pipeline(ownedPipeline,
                                                         PipelineDeleter(expCtx->opCtx));
-
     invariant(pipeline->getSources().empty() ||
               !dynamic_cast<DocumentSourceMergeCursors*>(pipeline->getSources().front().get()));
 
-    // $lookup on a sharded collection is not allowed in a transaction. We assume that if we're in
-    // a transaction, the foreign collection is unsharded. Otherwise, we may access the catalog
-    // cache, and attempt to do a network request while holding locks.
-    // TODO: SERVER-39162 allow $lookup in sharded transactions.
-    const bool inTxn = expCtx->opCtx->inMultiDocumentTransaction();
-
-    const bool isSharded = [&]() {
-        if (inTxn || !ShardingState::get(expCtx->opCtx)->enabled()) {
-            // Sharding isn't enabled or we're in a transaction. In either case we assume it's
-            // unsharded.
-            return false;
-        } else if (expCtx->ns.db() == "local") {
-            // This may be a change stream examining the oplog. We know the oplog (or any local
-            // collections for that matter) will never be sharded.
-            return false;
-        }
-        return uassertStatusOK(getCollectionRoutingInfoForTxnCmd(expCtx->opCtx, expCtx->ns)).cm() !=
-            nullptr;
-    }();
-
-    if (isSharded) {
-        const bool foreignShardedAllowed =
-            getTestCommandsEnabled() && internalQueryAllowShardedLookup.load();
-        if (foreignShardedAllowed) {
-            // For a sharded collection we may have to establish cursors on a remote host.
-            return sharded_agg_helpers::targetShardsAndAddMergeCursors(expCtx, pipeline.release());
-        }
-
-        uasserted(51069, "Cannot run $lookup with sharded foreign collection");
+    if (!allowTargetingShards || expCtx->ns.db() == "local") {
+        // If the db is local, this may be a change stream examining the oplog. We know the oplog
+        // (and any other local collections) will not be sharded.
+        return attachCursorSourceToPipelineForLocalRead(expCtx, pipeline.release());
     }
-
-    // Perform a "local read", the same as if we weren't a shard server.
-
-    // TODO SERVER-39015 we should do a shard version check here after we acquire a lock within
-    // this function, to be sure the collection didn't become sharded between the time we checked
-    // whether it's sharded and the time we took the lock.
-
-    return attachCursorSourceToPipelineForLocalRead(expCtx, pipeline.release());
+    return sharded_agg_helpers::targetShardsAndAddMergeCursors(expCtx, pipeline.release());
 }
 
 std::unique_ptr<ShardFilterer> MongoInterfaceShardServer::getShardFilterer(
     const boost::intrusive_ptr<ExpressionContext>& expCtx) const {
     const bool aggNsIsCollection = expCtx->uuid != boost::none;
-    auto shardingMetadata = CollectionShardingState::get(expCtx->opCtx, expCtx->ns)
-                                ->getOrphansFilter(expCtx->opCtx, aggNsIsCollection);
-    return std::make_unique<ShardFiltererImpl>(std::move(shardingMetadata));
+    auto collectionFilter = CollectionShardingState::get(expCtx->opCtx, expCtx->ns)
+                                ->getOwnershipFilter(expCtx->opCtx, aggNsIsCollection);
+    return std::make_unique<ShardFiltererImpl>(std::move(collectionFilter));
+}
+
+void MongoInterfaceShardServer::renameIfOptionsAndIndexesHaveNotChanged(
+    OperationContext* opCtx,
+    const BSONObj& renameCommandObj,
+    const NamespaceString& destinationNs,
+    const BSONObj& originalCollectionOptions,
+    const std::list<BSONObj>& originalIndexes) {
+    BSONObjBuilder newCmd;
+    newCmd.append("internalRenameIfOptionsAndIndexesMatch", 1);
+    newCmd.append("from", renameCommandObj["renameCollection"].String());
+    newCmd.append("to", renameCommandObj["to"].String());
+    newCmd.append("collectionOptions", originalCollectionOptions);
+    if (!opCtx->getWriteConcern().usedDefault) {
+        newCmd.append(WriteConcernOptions::kWriteConcernField, opCtx->getWriteConcern().toBSON());
+    }
+    BSONArrayBuilder indexArrayBuilder(newCmd.subarrayStart("indexes"));
+    for (auto&& index : originalIndexes) {
+        indexArrayBuilder.append(index);
+    }
+    indexArrayBuilder.done();
+    auto cachedDbInfo =
+        uassertStatusOK(Grid::get(opCtx)->catalogCache()->getDatabase(opCtx, destinationNs.db()));
+    auto newCmdObj = newCmd.obj();
+    auto response =
+        executeCommandAgainstDatabasePrimary(opCtx,
+                                             // internalRenameIfOptionsAndIndexesMatch is adminOnly.
+                                             NamespaceString::kAdminDb,
+                                             std::move(cachedDbInfo),
+                                             newCmdObj,
+                                             ReadPreferenceSetting(ReadPreference::PrimaryOnly),
+                                             Shard::RetryPolicy::kNoRetry);
+    uassertStatusOKWithContext(response.swResponse,
+                               str::stream() << "failed while running command " << newCmdObj);
+    auto result = response.swResponse.getValue().data;
+    uassertStatusOKWithContext(getStatusFromCommandResult(result),
+                               str::stream() << "failed while running command " << newCmdObj);
+    uassertStatusOKWithContext(getWriteConcernStatusFromCommandResult(result),
+                               str::stream() << "failed while running command " << newCmdObj);
+}
+
+std::list<BSONObj> MongoInterfaceShardServer::getIndexSpecs(OperationContext* opCtx,
+                                                            const NamespaceString& ns,
+                                                            bool includeBuildUUIDs) {
+    auto cachedDbInfo =
+        uassertStatusOK(Grid::get(opCtx)->catalogCache()->getDatabase(opCtx, ns.db()));
+    auto shard = uassertStatusOK(
+        Grid::get(opCtx)->shardRegistry()->getShard(opCtx, cachedDbInfo.primaryId()));
+    auto cmdObj = BSON("listIndexes" << ns.coll());
+    Shard::QueryResponse indexes;
+    try {
+        indexes = uassertStatusOK(
+            shard->runExhaustiveCursorCommand(opCtx,
+                                              ReadPreferenceSetting(ReadPreference::PrimaryOnly),
+                                              ns.db().toString(),
+                                              appendDbVersionIfPresent(cmdObj, cachedDbInfo),
+                                              Milliseconds(-1)));
+    } catch (ExceptionFor<ErrorCodes::NamespaceNotFound>&) {
+        return std::list<BSONObj>();
+    }
+    return std::list<BSONObj>(indexes.docs.begin(), indexes.docs.end());
+}
+void MongoInterfaceShardServer::createCollection(OperationContext* opCtx,
+                                                 const std::string& dbName,
+                                                 const BSONObj& cmdObj) {
+    auto cachedDbInfo =
+        uassertStatusOK(Grid::get(opCtx)->catalogCache()->getDatabase(opCtx, dbName));
+    BSONObj finalCmdObj = cmdObj;
+    if (!opCtx->getWriteConcern().usedDefault) {
+        auto writeObj =
+            BSON(WriteConcernOptions::kWriteConcernField << opCtx->getWriteConcern().toBSON());
+        finalCmdObj = cmdObj.addField(writeObj.getField(WriteConcernOptions::kWriteConcernField));
+    }
+    auto response =
+        executeCommandAgainstDatabasePrimary(opCtx,
+                                             dbName,
+                                             std::move(cachedDbInfo),
+                                             finalCmdObj,
+                                             ReadPreferenceSetting(ReadPreference::PrimaryOnly),
+                                             Shard::RetryPolicy::kIdempotent);
+    uassertStatusOKWithContext(response.swResponse,
+                               str::stream() << "failed while running command " << finalCmdObj);
+    auto result = response.swResponse.getValue().data;
+    uassertStatusOKWithContext(getStatusFromCommandResult(result),
+                               str::stream() << "failed while running command " << finalCmdObj);
+    uassertStatusOKWithContext(getWriteConcernStatusFromCommandResult(result),
+                               str::stream()
+                                   << "write concern failed while running command " << finalCmdObj);
+}
+
+void MongoInterfaceShardServer::createIndexesOnEmptyCollection(
+    OperationContext* opCtx, const NamespaceString& ns, const std::vector<BSONObj>& indexSpecs) {
+    auto cachedDbInfo =
+        uassertStatusOK(Grid::get(opCtx)->catalogCache()->getDatabase(opCtx, ns.db()));
+    BSONObjBuilder newCmdBuilder;
+    newCmdBuilder.append("createIndexes", ns.coll());
+    newCmdBuilder.append("indexes", indexSpecs);
+    if (!opCtx->getWriteConcern().usedDefault) {
+        newCmdBuilder.append(WriteConcernOptions::kWriteConcernField,
+                             opCtx->getWriteConcern().toBSON());
+    }
+    auto cmdObj = newCmdBuilder.done();
+    auto response =
+        executeCommandAgainstDatabasePrimary(opCtx,
+                                             ns.db(),
+                                             std::move(cachedDbInfo),
+                                             cmdObj,
+                                             ReadPreferenceSetting(ReadPreference::PrimaryOnly),
+                                             Shard::RetryPolicy::kIdempotent);
+    uassertStatusOKWithContext(response.swResponse,
+                               str::stream() << "failed while running command " << cmdObj);
+    auto result = response.swResponse.getValue().data;
+    uassertStatusOKWithContext(getStatusFromCommandResult(result),
+                               str::stream() << "failed while running command " << cmdObj);
+    uassertStatusOKWithContext(getWriteConcernStatusFromCommandResult(result),
+                               str::stream()
+                                   << "write concern failed while running command " << cmdObj);
+}
+void MongoInterfaceShardServer::dropCollection(OperationContext* opCtx, const NamespaceString& ns) {
+    // Build and execute the dropCollection command against the primary shard of the given
+    // database.
+    auto cachedDbInfo =
+        uassertStatusOK(Grid::get(opCtx)->catalogCache()->getDatabase(opCtx, ns.db()));
+    BSONObjBuilder newCmdBuilder;
+    newCmdBuilder.append("drop", ns.coll());
+    if (!opCtx->getWriteConcern().usedDefault) {
+        newCmdBuilder.append(WriteConcernOptions::kWriteConcernField,
+                             opCtx->getWriteConcern().toBSON());
+    }
+    auto cmdObj = newCmdBuilder.done();
+    auto response =
+        executeCommandAgainstDatabasePrimary(opCtx,
+                                             ns.db(),
+                                             std::move(cachedDbInfo),
+                                             cmdObj,
+                                             ReadPreferenceSetting(ReadPreference::PrimaryOnly),
+                                             Shard::RetryPolicy::kIdempotent);
+    uassertStatusOKWithContext(response.swResponse,
+                               str::stream() << "failed while running command " << cmdObj);
+    auto result = response.swResponse.getValue().data;
+    uassertStatusOKWithContext(getStatusFromCommandResult(result),
+                               str::stream() << "failed while running command " << cmdObj);
+    uassertStatusOKWithContext(getWriteConcernStatusFromCommandResult(result),
+                               str::stream()
+                                   << "write concern failed while running command " << cmdObj);
 }
 
 }  // namespace mongo

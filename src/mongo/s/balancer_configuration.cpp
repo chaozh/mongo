@@ -42,6 +42,7 @@
 #include "mongo/base/status_with.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/util/bson_extract.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/s/catalog/sharding_catalog_client.h"
 #include "mongo/s/grid.h"
 #include "mongo/util/log.h"
@@ -75,8 +76,7 @@ const char kStopped[] = "stopped";
 const char kMode[] = "mode";
 const char kActiveWindow[] = "activeWindow";
 const char kWaitForDelete[] = "_waitForDelete";
-
-const NamespaceString kSettingsNamespace("config", "settings");
+const char kAttemptToBalanceJumboChunks[] = "attemptToBalanceJumboChunks";
 
 }  // namespace
 
@@ -104,7 +104,7 @@ Status BalancerConfiguration::setBalancerMode(OperationContext* opCtx,
                                               BalancerSettingsType::BalancerMode mode) {
     auto updateStatus = Grid::get(opCtx)->catalogClient()->updateConfigDocument(
         opCtx,
-        kSettingsNamespace,
+        NamespaceString::kConfigSettingsNamespace,
         BSON("_id" << BalancerSettingsType::kKey),
         BSON("$set" << BSON(kStopped << (mode == BalancerSettingsType::kOff) << kMode
                                      << BalancerSettingsType::kBalancerModes[mode])),
@@ -128,7 +128,7 @@ Status BalancerConfiguration::setBalancerMode(OperationContext* opCtx,
 Status BalancerConfiguration::enableAutoSplit(OperationContext* opCtx, bool enable) {
     auto updateStatus = Grid::get(opCtx)->catalogClient()->updateConfigDocument(
         opCtx,
-        kSettingsNamespace,
+        NamespaceString::kConfigSettingsNamespace,
         BSON("_id" << AutoSplitSettingsType::kKey),
         BSON("$set" << BSON(kEnabled << enable)),
         true,
@@ -174,6 +174,11 @@ MigrationSecondaryThrottleOptions BalancerConfiguration::getSecondaryThrottle() 
 bool BalancerConfiguration::waitForDelete() const {
     stdx::lock_guard<Latch> lk(_balancerSettingsMutex);
     return _balancerSettings.waitForDelete();
+}
+
+bool BalancerConfiguration::attemptToBalanceJumboChunks() const {
+    stdx::lock_guard<Latch> lk(_balancerSettingsMutex);
+    return _balancerSettings.attemptToBalanceJumboChunks();
 }
 
 Status BalancerConfiguration::refreshAndCheck(OperationContext* opCtx) {
@@ -364,6 +369,16 @@ StatusWith<BalancerSettingsType> BalancerSettingsType::fromBSON(const BSONObj& o
             return status;
 
         settings._waitForDelete = waitForDelete;
+    }
+
+    {
+        bool attemptToBalanceJumboChunks;
+        Status status = bsonExtractBooleanFieldWithDefault(
+            obj, kAttemptToBalanceJumboChunks, false, &attemptToBalanceJumboChunks);
+        if (!status.isOK())
+            return status;
+
+        settings._attemptToBalanceJumboChunks = attemptToBalanceJumboChunks;
     }
 
     return settings;

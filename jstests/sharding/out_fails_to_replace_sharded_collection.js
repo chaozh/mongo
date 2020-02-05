@@ -1,5 +1,7 @@
 // Tests that an aggregate with an $out cannot output to a sharded collection, even if the
 // collection becomes sharded during the aggregation.
+// Requires fcv44 because the expected error codes for $out have changed in 4.4.
+// @tags: [requires_fcv_44]
 (function() {
 "use strict";
 
@@ -33,7 +35,7 @@ const cursorResponse = assert.commandWorked(mongosDB.runCommand({
 }));
 st.shardColl(targetColl, {_id: 1}, false);
 error = assert.throws(() => new DBCommandCursor(mongosDB, cursorResponse).itcount());
-assert.eq(error.code, ErrorCodes.CommandFailed);
+assert.eq(error.code, ErrorCodes.IllegalOperation);
 
 st.stop();
 }());

@@ -9,6 +9,7 @@
  *
  * @tags: [requires_sharding, assumes_balancer_off]
  */
+load("jstests/concurrency/fsm_workload_helpers/assert_handle_fail_in_transaction.js");
 
 var $config = (function() {
     var data = {numSplitPoints: 100, shardKey: {key: 1}};
@@ -28,13 +29,27 @@ var $config = (function() {
             var chunkBoundary = Random.randInt(this.numSplitPoints);
 
             // We don't assert that the command succeeded when migrating a chunk because it's
-            // possible another thread has already started migrating a chunk.
-            db.adminCommand({
-                moveChunk: db[collName].getFullName(),
-                find: {key: chunkBoundary},
-                to: shardName,
-                _waitForDelete: true,
-            });
+            // possible another thread has already started migrating a chunk. (see exception below)
+            try {
+                db.adminCommand({
+                    moveChunk: db[collName].getFullName(),
+                    find: {key: chunkBoundary},
+                    to: shardName,
+                    _waitForDelete: true,
+                });
+            } catch (ex) {
+                // SERVER-42781: if the runInsideTransaction TestOption is true
+                // then runCommandCheckForOperationNotSupportedInTransaction (in
+                // check_for_operation_not_supported_in_transaction.js) will assert that the command
+                // worked. We ignore the InvalidOptions error below since we can get this error due
+                // to concurrent moveChunks.
+                if (ex.code == ErrorCodes.InvalidOptions &&
+                    ex.errmsg.valueOf() === "Destination shard cannot be the same as source") {
+                    print(`ignored InvalidOptions exception: ${tojson(ex)}`);
+                } else {
+                    throw ex;
+                }
+            }
         },
 
         dropIndex: function dropIndex(db, collName) {
@@ -43,7 +58,8 @@ var $config = (function() {
             db[collName].dropIndex(this.shardKey);
 
             // Re-create the index that was dropped.
-            assertAlways.commandWorked(db[collName].createIndex(this.shardKey));
+            assertWorkedHandleTxnErrors(db[collName].createIndex(this.shardKey),
+                                        ErrorCodes.IndexBuildAlreadyInProgress);
         }
 
     };

@@ -50,6 +50,7 @@
 #include "mongo/db/pipeline/sharded_agg_helpers.h"
 #include "mongo/db/query/collation/collator_factory_interface.h"
 #include "mongo/db/query/cursor_response.h"
+#include "mongo/db/query/explain_common.h"
 #include "mongo/db/query/find_common.h"
 #include "mongo/db/views/resolved_view.h"
 #include "mongo/db/views/view.h"
@@ -58,6 +59,7 @@
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/rpc/op_msg_rpc_impls.h"
 #include "mongo/s/catalog_cache.h"
+#include "mongo/s/client/num_hosts_targeted_metrics.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/cluster_commands_helpers.h"
 #include "mongo/s/grid.h"
@@ -137,11 +139,68 @@ void appendEmptyResultSetWithStatus(OperationContext* opCtx,
     appendEmptyResultSet(opCtx, *result, status, nss.ns());
 }
 
+void updateHostsTargetedMetrics(OperationContext* opCtx,
+                                const NamespaceString& executionNss,
+                                boost::optional<CachedCollectionRoutingInfo> executionNsRoutingInfo,
+                                stdx::unordered_set<NamespaceString> involvedNamespaces) {
+    if (!executionNsRoutingInfo)
+        return;
+
+    // Create a set of ShardIds that own a chunk belonging to any of the collections involved in
+    // this pipeline. This will be used to determine whether the pipeline targeted all of the shards
+    // that own chunks for any collection involved or not.
+    std::set<ShardId> shardsOwningChunks = [&]() {
+        std::set<ShardId> shardsIds;
+
+        if (executionNsRoutingInfo->cm()) {
+            std::set<ShardId> shardIdsForNs;
+            executionNsRoutingInfo->cm()->getAllShardIds(&shardIdsForNs);
+            for (const auto& shardId : shardIdsForNs) {
+                shardsIds.insert(shardId);
+            }
+        }
+
+        for (const auto& nss : involvedNamespaces) {
+            if (nss == executionNss)
+                continue;
+
+            const auto resolvedNsRoutingInfo =
+                uassertStatusOK(getCollectionRoutingInfoForTxnCmd(opCtx, nss));
+            if (resolvedNsRoutingInfo.cm()) {
+                std::set<ShardId> shardIdsForNs;
+                resolvedNsRoutingInfo.cm()->getAllShardIds(&shardIdsForNs);
+                for (const auto& shardId : shardIdsForNs) {
+                    shardsIds.insert(shardId);
+                }
+            }
+        }
+
+        return shardsIds;
+    }();
+
+    auto nShardsTargeted = CurOp::get(opCtx)->debug().nShards;
+    if (nShardsTargeted > 0) {
+        auto targetType = NumHostsTargetedMetrics::get(opCtx).parseTargetType(
+            opCtx, nShardsTargeted, shardsOwningChunks.size());
+        NumHostsTargetedMetrics::get(opCtx).addNumHostsTargeted(
+            NumHostsTargetedMetrics::QueryType::kAggregateCmd, targetType);
+    }
+}
+
 }  // namespace
 
 Status ClusterAggregate::runAggregate(OperationContext* opCtx,
                                       const Namespaces& namespaces,
                                       const AggregationRequest& request,
+                                      const PrivilegeVector& privileges,
+                                      BSONObjBuilder* result) {
+    return runAggregate(opCtx, namespaces, request, {request}, privileges, result);
+}
+
+Status ClusterAggregate::runAggregate(OperationContext* opCtx,
+                                      const Namespaces& namespaces,
+                                      const AggregationRequest& request,
+                                      const LiteParsedPipeline& liteParsedPipeline,
                                       const PrivilegeVector& privileges,
                                       BSONObjBuilder* result) {
     uassert(51028, "Cannot specify exchange option to a mongos", !request.getExchangeSpec());
@@ -160,13 +219,31 @@ Status ClusterAggregate::runAggregate(OperationContext* opCtx,
         return resolvedNsRoutingInfo.cm().get();
     };
 
-    LiteParsedPipeline litePipe(request);
-    litePipe.verifyIsSupported(
+    liteParsedPipeline.verifyIsSupported(
         opCtx, isSharded, request.getExplain(), serverGlobalParams.enableMajorityReadConcern);
-    auto hasChangeStream = litePipe.hasChangeStream();
-    auto involvedNamespaces = litePipe.getInvolvedNamespaces();
+    auto hasChangeStream = liteParsedPipeline.hasChangeStream();
+    auto involvedNamespaces = liteParsedPipeline.getInvolvedNamespaces();
 
-    const auto pipelineBuilder = [&](boost::optional<CachedCollectionRoutingInfo> routingInfo) {
+    // If the routing table is valid, we obtain a reference to it. If the table is not valid, then
+    // either the database does not exist, or there are no shards in the cluster. In the latter
+    // case, we always return an empty cursor. In the former case, if the requested aggregation is a
+    // $changeStream, we allow the operation to continue so that stream cursors can be established
+    // on the given namespace before the database or collection is actually created. If the database
+    // does not exist and this is not a $changeStream, then we return an empty cursor.
+    boost::optional<CachedCollectionRoutingInfo> routingInfo;
+    auto executionNsRoutingInfoStatus =
+        sharded_agg_helpers::getExecutionNsRoutingInfo(opCtx, namespaces.executionNss);
+    if (executionNsRoutingInfoStatus.isOK()) {
+        routingInfo = std::move(executionNsRoutingInfoStatus.getValue());
+    } else if (!(hasChangeStream &&
+                 executionNsRoutingInfoStatus == ErrorCodes::NamespaceNotFound)) {
+        appendEmptyResultSetWithStatus(
+            opCtx, namespaces.requestedNss, executionNsRoutingInfoStatus.getStatus(), result);
+        return Status::OK();
+    }
+
+    boost::intrusive_ptr<ExpressionContext> expCtx;
+    const auto pipelineBuilder = [&]() {
         // Populate the collection UUID and the appropriate collation to use.
         auto [collationObj, uuid] = [&]() -> std::pair<BSONObj, boost::optional<UUID>> {
             // If this is a change stream, take the user-defined collation if one exists, or an
@@ -178,14 +255,14 @@ Status ClusterAggregate::runAggregate(OperationContext* opCtx,
                 return {request.getCollation(), boost::none};
             }
 
-            return sharded_agg_helpers::getCollationAndUUID(
+            return cluster_aggregation_planner::getCollationAndUUID(
                 routingInfo, namespaces.executionNss, request.getCollation());
         }();
 
         // Build an ExpressionContext for the pipeline. This instantiates an appropriate collator,
         // resolves all involved namespaces, and creates a shared MongoProcessInterface for use by
         // the pipeline's stages.
-        auto expCtx = makeExpressionContext(
+        expCtx = makeExpressionContext(
             opCtx, request, collationObj, uuid, resolveInvolvedNamespaces(involvedNamespaces));
 
         // Parse and optimize the full pipeline.
@@ -194,64 +271,84 @@ Status ClusterAggregate::runAggregate(OperationContext* opCtx,
         return pipeline;
     };
 
-    auto targetingStatus =
-        sharded_agg_helpers::AggregationTargeter::make(opCtx,
-                                                       namespaces.executionNss,
-                                                       pipelineBuilder,
-                                                       involvedNamespaces,
-                                                       hasChangeStream,
-                                                       litePipe.allowedToPassthroughFromMongos());
-    if (!targetingStatus.isOK()) {
-        appendEmptyResultSetWithStatus(
-            opCtx, namespaces.requestedNss, targetingStatus.getStatus(), result);
-        return Status::OK();
+    auto targeter = cluster_aggregation_planner::AggregationTargeter::make(
+        opCtx,
+        namespaces.executionNss,
+        pipelineBuilder,
+        routingInfo,
+        involvedNamespaces,
+        hasChangeStream,
+        liteParsedPipeline.allowedToPassthroughFromMongos());
+
+    if (!expCtx) {
+        // When the AggregationTargeter chooses a "passthrough" policy, it does not call the
+        // 'pipelineBuilder' function, so we never get an expression context. Because this is a
+        // passthrough, we only need a bare minimum expression context anyway.
+        invariant(targeter.policy ==
+                  cluster_aggregation_planner::AggregationTargeter::kPassthrough);
+        expCtx = make_intrusive<ExpressionContext>(opCtx, nullptr);
     }
 
-    auto targeter = std::move(targetingStatus.getValue());
-    switch (targeter.policy) {
-        case sharded_agg_helpers::AggregationTargeter::TargetingPolicy::kPassthrough: {
-            // A pipeline with $changeStream should never be allowed to passthrough.
-            invariant(!hasChangeStream);
-            return sharded_agg_helpers::runPipelineOnPrimaryShard(opCtx,
-                                                                  namespaces,
-                                                                  targeter.routingInfo->db(),
-                                                                  request.getExplain(),
-                                                                  request.serializeToCommandObj(),
-                                                                  privileges,
-                                                                  result);
-        }
+    if (request.getExplain()) {
+        explain_common::generateServerInfo(result);
+    }
 
-        case sharded_agg_helpers::AggregationTargeter::TargetingPolicy::kMongosRequired: {
-            auto expCtx = targeter.pipeline->getContext();
-            // If this is an explain write the explain output and return.
-            if (expCtx->explain) {
-                *result << "splitPipeline" << BSONNULL << "mongos"
-                        << Document{
-                               {"host", getHostNameCachedAndPort()},
-                               {"stages", targeter.pipeline->writeExplainOps(*expCtx->explain)}};
-                return Status::OK();
+    auto status = [&]() {
+        switch (targeter.policy) {
+            case cluster_aggregation_planner::AggregationTargeter::TargetingPolicy::kPassthrough: {
+                // A pipeline with $changeStream should never be allowed to passthrough.
+                invariant(!hasChangeStream);
+                return cluster_aggregation_planner::runPipelineOnPrimaryShard(
+                    expCtx,
+                    namespaces,
+                    targeter.routingInfo->db(),
+                    request.getExplain(),
+                    request.serializeToCommandObj(),
+                    privileges,
+                    result);
             }
 
-            return sharded_agg_helpers::runPipelineOnMongoS(namespaces,
-                                                            request.getBatchSize(),
-                                                            std::move(targeter.pipeline),
-                                                            result,
-                                                            privileges);
-        }
+            case cluster_aggregation_planner::AggregationTargeter::TargetingPolicy::
+                kMongosRequired: {
+                // If this is an explain write the explain output and return.
+                auto expCtx = targeter.pipeline->getContext();
+                if (expCtx->explain) {
+                    *result << "splitPipeline" << BSONNULL << "mongos"
+                            << Document{{"host", getHostNameCachedAndPort()},
+                                        {"stages",
+                                         targeter.pipeline->writeExplainOps(*expCtx->explain)}};
+                    return Status::OK();
+                }
 
-        case sharded_agg_helpers::AggregationTargeter::TargetingPolicy::kAnyShard: {
-            return sharded_agg_helpers::dispatchPipelineAndMerge(opCtx,
-                                                                 std::move(targeter),
-                                                                 request.serializeToCommandObj(),
-                                                                 request.getBatchSize(),
-                                                                 namespaces,
-                                                                 privileges,
-                                                                 result,
-                                                                 hasChangeStream);
-        }
-    }
+                return cluster_aggregation_planner::runPipelineOnMongoS(
+                    namespaces,
+                    request.getBatchSize(),
+                    std::move(targeter.pipeline),
+                    result,
+                    privileges);
+            }
 
-    MONGO_UNREACHABLE;
+            case cluster_aggregation_planner::AggregationTargeter::TargetingPolicy::kAnyShard: {
+                return cluster_aggregation_planner::dispatchPipelineAndMerge(
+                    opCtx,
+                    std::move(targeter),
+                    request.serializeToCommandObj(),
+                    request.getBatchSize(),
+                    namespaces,
+                    privileges,
+                    result,
+                    hasChangeStream);
+            }
+
+                MONGO_UNREACHABLE;
+        }
+        MONGO_UNREACHABLE;
+    }();
+
+    if (status.isOK())
+        updateHostsTargetedMetrics(opCtx, namespaces.executionNss, routingInfo, involvedNamespaces);
+
+    return status;
 }
 
 Status ClusterAggregate::retryOnViewError(OperationContext* opCtx,
@@ -281,8 +378,8 @@ Status ClusterAggregate::retryOnViewError(OperationContext* opCtx,
     nsStruct.requestedNss = requestedNss;
     nsStruct.executionNss = resolvedView.getNamespace();
 
-    auto status =
-        ClusterAggregate::runAggregate(opCtx, nsStruct, resolvedAggRequest, privileges, result);
+    auto status = ClusterAggregate::runAggregate(
+        opCtx, nsStruct, resolvedAggRequest, {resolvedAggRequest}, privileges, result);
 
     // If the underlying namespace was changed to a view during retry, then re-run the aggregation
     // on the new resolved namespace.

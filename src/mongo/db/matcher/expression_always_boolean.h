@@ -29,6 +29,8 @@
 
 #pragma once
 
+#include <boost/optional.hpp>
+
 #include "mongo/db/matcher/expression.h"
 
 namespace mongo {
@@ -58,7 +60,7 @@ public:
         debug << name() << ": 1\n";
     }
 
-    void serialize(BSONObjBuilder* out) const final {
+    void serialize(BSONObjBuilder* out, bool includePath) const final {
         out->append(name(), 1);
     }
 
@@ -78,8 +80,8 @@ public:
         MONGO_UNREACHABLE;
     }
 
-    std::vector<MatchExpression*>* getChildVector() override {
-        return nullptr;
+    boost::optional<std::vector<MatchExpression*>&> getChildVector() final {
+        return boost::none;
     }
 
 private:

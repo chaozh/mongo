@@ -14,6 +14,10 @@ if (typeof db === 'undefined') {
         "Expected mongo shell to be connected a server, but global 'db' object isn't defined");
 }
 
+// Disable implicit sessions so FSM workloads that kill random sessions won't interrupt the
+// operations in this test that aren't resilient to interruptions.
+TestData.disableImplicitSessions = true;
+
 const conn = db.getMongo();
 const topology = DiscoverTopology.findConnectedNodes(conn);
 
@@ -63,7 +67,7 @@ const validateCollectionsBackgroundThread = function validateCollectionsBackgrou
                conn,
                "Failed to connect to host '" + host + "' for background collection validation");
 
-    if (!conn.adminCommand("serverStatus").storageEngine.supportsCheckpoints) {
+    if (!conn.adminCommand("serverStatus").storageEngine.supportsCheckpointCursors) {
         print("Skipping background validation against test node: " + host +
               " because its storage engine does not support background validation (checkpoints).");
         return {ok: 1};

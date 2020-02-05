@@ -6,7 +6,7 @@
 (function() {
 "use strict";
 
-load('jstests/libs/check_log.js');
+load("jstests/libs/fail_point_util.js");
 load('jstests/noPassthrough/libs/index_build.js');
 
 const rst = new ReplSetTest({
@@ -30,18 +30,23 @@ const coll = testDB.getCollection('test');
 
 assert.commandWorked(coll.insert({a: 1}));
 
-assert.commandWorked(primary.adminCommand(
+const res = assert.commandWorked(primary.adminCommand(
     {configureFailPoint: 'hangAfterInitializingIndexBuild', mode: 'alwaysOn'}));
+const failpointTimesEntered = res.count;
 
 const createIdx = IndexBuildTest.startIndexBuild(primary, coll.getFullName(), {a: 1});
 
-checkLog.contains(
-    primary, 'index build: starting on ' + coll.getFullName() + ' properties: { v: 2, key: { a:');
-
 try {
+    assert.commandWorked(primary.adminCommand({
+        waitForFailPoint: "hangAfterInitializingIndexBuild",
+        timesEntered: failpointTimesEntered + 1,
+        maxTimeMS: kDefaultWaitForFailPointTimeout
+    }));
+
     // When the index build starts, find its op id. This will be the op id of the client
     // connection, not the thread pool task managed by IndexBuildsCoordinatorMongod.
-    const opId = IndexBuildTest.waitForIndexBuildToStart(testDB, coll.getName(), 'a_1');
+    const filter = {"desc": {$regex: /conn.*/}};
+    const opId = IndexBuildTest.waitForIndexBuildToStart(testDB, coll.getName(), 'a_1', filter);
 
     // Kill the index build.
     assert.commandWorked(testDB.killOp(opId));

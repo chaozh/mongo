@@ -12,6 +12,28 @@
  * 4. kSyncSourceOpsDuringRollback: apply operations on the sync source after rollback has begun.
  * 5. kSteadyStateOps: (same as stage 1) with the option of waiting for the rollback to finish.
  *
+ * --------------------------------------------------
+ * | STATE TRANSITION            | NETWORK TOPOLOGY |
+ * |-------------------------------------------------
+ * |  kSteadyStateOps            |       T          |
+ * |                             |     /   \        |
+ * |                             |    P1 -  S       |
+ * |-----------------------------|------------------|
+ * |  kRollbackOps               |       T          |
+ * |                             |     /            |
+ * |                             |    P1    S       |
+ * |-----------------------------|------------------|
+ * | kSyncSourceOpsBeforeRollback|       T          |
+ * |                             |         \        |
+ * |                             |    P1    P2      |
+ * |-----------------------------|------------------|
+ * | kSyncSourceOpsDuringRollback|        T         |
+ * |                             |          \       |
+ * |                             |     R  -  P2     |
+ * |-------------------------------------------------
+ * Note: 'T' refers to tiebreaker node, 'S' refers to secondary, 'P[n]' refers to primary in
+ * nth term and 'R' refers to rollback node.
+ *
  * Please refer to the various `transition*` functions for more information on the behavior
  * of each stage.
  */
@@ -31,9 +53,16 @@ load("jstests/hooks/validate_collections.js");
  *         must be configured with priority: 0 so that it won't be elected primary. Throughout
  *         this file, this secondary will be referred to as the tiebreaker node.
  *      2. It must be running with mongobridge.
+ *      3. Must initiate the replset with high election timeout to avoid unplanned elections in the
+ *         rollback test.
  *
  * If the caller does not provide their own replica set, a standard three-node
  * replset will be initialized instead, with all nodes running the latest version.
+ *
+ * After the initial fixture setup, nodes may be added to the fixture using RollbackTest.add(),
+ * provided they are non-voting nodes.  These nodes will not be checked for replication state or
+ * progress until kSteadyStateOps, or if consistency checks are skipped in kSteadyStateOps, the end
+ * of the test.  If voting nodes are added directly to the ReplSetTest, the results are undefined.
  *
  * @param {string} [optional] name the name of the test being run
  * @param {Object} [optional] replSet the ReplSetTest instance to adopt
@@ -61,6 +90,8 @@ function RollbackTest(name = "RollbackTest", replSet) {
     const SIGTERM = 15;
     const kNumDataBearingNodes = 3;
     const kElectableNodes = 2;
+
+    let awaitSecondaryNodesForRollbackTimeout;
 
     let rst;
     let curPrimary;
@@ -105,6 +136,12 @@ function RollbackTest(name = "RollbackTest", replSet) {
                   false,
                   "Must set up ReplSetTest with chaining disabled.");
 
+        // Make sure electionTimeoutMillis is set to high value to avoid unplanned elections in
+        // the rollback test.
+        assert.gte(config.settings.electionTimeoutMillis,
+                   ReplSetTest.kForeverMillis,
+                   "Must initiate the replset with high election timeout");
+
         // Make sure the primary is not a priority: 0 node.
         assert.neq(0, config.members[0].priority);
         assert.eq(config.members[0].host, curPrimary.host);
@@ -131,6 +168,20 @@ function RollbackTest(name = "RollbackTest", replSet) {
     }
 
     /**
+     * We set the election timeout to 24 hours to prevent unplanned elections, but this has the
+     * side-effect of causing `getMore` in replication to wait up 30 seconds prior to returning.
+     *
+     * The `setSmallOplogGetMoreMaxTimeMS` failpoint causes the `getMore` calls to block for a
+     * maximum of 50 milliseconds.
+     */
+    function setFastGetMoreEnabled(node) {
+        assert.commandWorked(
+            node.adminCommand(
+                {configureFailPoint: 'setSmallOplogGetMoreMaxTimeMS', mode: 'alwaysOn'}),
+            `Failed to enable setSmallOplogGetMoreMaxTimeMS failpoint.`);
+    }
+
+    /**
      * Return an instance of ReplSetTest initialized with a standard
      * three-node replica set running with the latest version.
      *
@@ -149,11 +200,12 @@ function RollbackTest(name = "RollbackTest", replSet) {
 
         let replSet = new ReplSetTest({name, nodes: 3, useBridge: true, nodeOptions: nodeOptions});
         replSet.startSet();
+        replSet.nodes.forEach(setFastGetMoreEnabled);
 
         let config = replSet.getReplSetConfig();
         config.members[2].priority = 0;
         config.settings = {chainingAllowed: false};
-        replSet.initiate(config);
+        replSet.initiateWithHighElectionTimeout(config);
 
         assert.eq(replSet.nodes.length,
                   kNumDataBearingNodes,
@@ -162,8 +214,11 @@ function RollbackTest(name = "RollbackTest", replSet) {
         return replSet;
     }
 
-    function checkDataConsistency(
-        {skipCheckCollectionCounts: skipCheckCollectionCounts = false} = {}) {
+    // Track if we've done consistency checks.
+    let doneConsistencyChecks = false;
+
+    // This is an instance method primarily so it can be overridden in testing.
+    this._checkDataConsistencyImpl = function() {
         assert.eq(curState,
                   State.kSteadyStateOps,
                   "Not in kSteadyStateOps state, cannot check data consistency");
@@ -175,14 +230,18 @@ function RollbackTest(name = "RollbackTest", replSet) {
         const name = rst.name;
         // We must check counts before we validate since validate fixes counts. We cannot check
         // counts if unclean shutdowns occur.
-        if ((!TestData.allowUncleanShutdowns || !TestData.rollbackShutdowns) &&
-            !skipCheckCollectionCounts) {
+        if (!TestData.allowUncleanShutdowns || !TestData.rollbackShutdowns) {
             rst.checkCollectionCounts(name);
         }
         rst.checkOplogs(name);
         rst.checkReplicatedDataHashes(name);
         collectionValidator.validateNodes(rst.nodeList());
-    }
+    };
+
+    this.checkDataConsistency = function() {
+        doneConsistencyChecks = true;
+        this._checkDataConsistencyImpl();
+    };
 
     function log(msg, important = false) {
         if (important) {
@@ -207,15 +266,39 @@ function RollbackTest(name = "RollbackTest", replSet) {
         }
     }
 
+    function stepUp(conn) {
+        log(`Waiting for the new primary ${conn.host} to be elected`);
+        assert.soonNoExcept(() => {
+            const res = conn.adminCommand({replSetStepUp: 1});
+            return res.ok;
+        });
+
+        // Waits for the primary to accept new writes.
+        return rst.getPrimary();
+    }
+
+    /**
+     * Add a node to the ReplSetTest.  It must be a non-voting node.  If reInitiate is true,
+     * also run ReplSetTest.reInitiate to configure the replset to include the new node.
+     */
+    this.add = function({config: config, reInitiate: reInitiate = true}) {
+        assert.eq(config.rsConfig.votes, 0, "Nodes added to a RollbackTest must be non-voting.");
+        let node = rst.add(config);
+        if (reInitiate) {
+            rst.reInitiate();
+        }
+        // New node to do consistency checks on.
+        // Note that this behavior isn't tested in rollbacktest_unittest.js.
+        doneConsistencyChecks = false;
+        return node;
+    };
+
     /**
      * Transition from a rollback state to a steady state. Operations applied in this phase will
      * be replicated to all nodes and should not be rolled back.
      */
     this.transitionToSteadyStateOperations = function({skipDataConsistencyChecks = false} = {}) {
-        // If we shut down the primary before the secondary begins rolling back against it, then
-        // the secondary may get elected and not actually roll back. In that case we do not check
-        // the RBID and just await replication.
-        if (!TestData.rollbackShutdowns) {
+        if (this.isMajorityReadConcernEnabledOnRollbackNode) {
             log(`Waiting for rollback to complete on ${curSecondary.host}`, true);
             let rbid = -1;
             assert.soon(() => {
@@ -232,6 +315,8 @@ function RollbackTest(name = "RollbackTest", replSet) {
                 return rbid === lastRBID + 1;
             }, "Timed out waiting for RBID to increment on " + curSecondary.host);
         } else {
+            // TODO: After fixing SERVER-45178, we can remove the else block as we are guaranteed
+            // that the rollback id will get updated if the rollback has happened on that node.
             log(`Skipping RBID check on ${curSecondary.host} because shutdowns ` +
                 `may prevent a rollback here.`);
         }
@@ -243,13 +328,29 @@ function RollbackTest(name = "RollbackTest", replSet) {
         // Allow replication temporarily so the following checks succeed.
         restartServerReplication(tiebreakerNode);
 
-        rst.awaitSecondaryNodes();
-        rst.awaitReplication();
+        // If the rollback node has {enableMajorityReadConcern:false} set, it will use the
+        // rollbackViaRefetch algorithm. That can lead to unrecoverable rollbacks, particularly
+        // in unclean shutdown suites, as it it is possible in rare cases for the sync source to
+        // lose the entry corresponding to the optime the rollback node chose as its minValid.
+        try {
+            rst.awaitSecondaryNodesForRollbackTest(
+                awaitSecondaryNodesForRollbackTimeout,
+                [curSecondary, tiebreakerNode],
+                curSecondary /* connToCheckForUnrecoverableRollback */);
+        } catch (e) {
+            if (e.unrecoverableRollbackDetected) {
+                log(`Detected unrecoverable rollback on ${curSecondary.host}. Ending test.`,
+                    true /* important */);
+                TestData.skipCheckDBHashes = true;
+                rst.stopSet();
+                quit();
+            }
+            // Re-throw the original exception in all other cases.
+            throw e;
+        }
+        rst.awaitReplication(null, null, [curSecondary, tiebreakerNode]);
 
         log(`Rollback on ${curSecondary.host} (if needed) and awaitReplication completed`, true);
-
-        // Unfreeze the node if it was previously frozen, so that it can run for the election.
-        assert.commandWorked(curSecondary.adminCommand({replSetFreeze: 0}));
 
         // We call transition to steady state ops after awaiting replication has finished,
         // otherwise it could be confusing to see operations being replicated when we're already
@@ -262,7 +363,7 @@ function RollbackTest(name = "RollbackTest", replSet) {
         if (skipDataConsistencyChecks) {
             print('Skipping data consistency checks');
         } else {
-            checkDataConsistency();
+            this.checkDataConsistency();
         }
 
         // Now that awaitReplication and checkDataConsistency are done, stop replication again so
@@ -280,8 +381,14 @@ function RollbackTest(name = "RollbackTest", replSet) {
         // Ensure previous operations are replicated to the secondary that will be used as the sync
         // source later on. It must be up-to-date to prevent any previous operations from being
         // rolled back.
-        rst.awaitSecondaryNodes();
+        rst.awaitSecondaryNodes(null, [curSecondary, tiebreakerNode]);
         rst.awaitReplication(null, null, [curSecondary]);
+
+        // The current primary will be the node that rolls back. Check if it supports majority reads
+        // here while we are in a steady state.
+        this.isMajorityReadConcernEnabledOnRollbackNode =
+            assert.commandWorked(curPrimary.adminCommand({serverStatus: 1}))
+                .storageEngine.supportsCommittedReads;
 
         transitionIfAllowed(State.kRollbackOps);
 
@@ -297,6 +404,9 @@ function RollbackTest(name = "RollbackTest", replSet) {
         // We do not disconnect the primary from the tiebreaker node so that it remains primary.
         log(`Isolating the primary ${curPrimary.host} from the secondary ${curSecondary.host}`);
         curPrimary.disconnect([curSecondary]);
+
+        // We go through this phase every time a rollback occurs.
+        doneConsistencyChecks = false;
 
         return curPrimary;
     };
@@ -336,13 +446,7 @@ function RollbackTest(name = "RollbackTest", replSet) {
             elected`);
         curSecondary.reconnect([tiebreakerNode]);
 
-        log(`Waiting for the new primary ${curSecondary.host} to be elected`);
-        assert.soonNoExcept(() => {
-            const res = curSecondary.adminCommand({replSetStepUp: 1});
-            return res.ok;
-        });
-
-        const newPrimary = rst.getPrimary();
+        const newPrimary = stepUp(curSecondary);
 
         // As a sanity check, ensure the new primary is the old secondary. The opposite scenario
         // should never be possible with 2 electable nodes and the sequence of operations thus far.
@@ -353,6 +457,16 @@ function RollbackTest(name = "RollbackTest", replSet) {
         // primary, so we update the topology to reflect this change.
         curSecondary = curPrimary;
         curPrimary = newPrimary;
+
+        // To ensure rollback won't be skipped for shutdowns, wait till the no-op oplog
+        // entry ("new primary") written in the new term gets persisted in the disk.
+        // Note: rollbackShutdowns are not allowed for in-memory/ephemeral storage engines.
+        if (TestData.rollbackShutdowns) {
+            const dbName = "TermGetsPersisted";
+            assert.commandWorked(curPrimary.getDB(dbName).ensureRollback.insert(
+                {thisDocument: 'is inserted to ensure rollback is not skipped'},
+                {writeConcern: {w: 1, j: true}}));
+        }
 
         lastRBID = assert.commandWorked(curSecondary.adminCommand("replSetGetRBID")).rbid;
 
@@ -372,18 +486,6 @@ function RollbackTest(name = "RollbackTest", replSet) {
     this.transitionToSyncSourceOperationsDuringRollback = function() {
         transitionIfAllowed(State.kSyncSourceOpsDuringRollback);
 
-        // If the rollback node was restarted, make sure it has finished restarting and become a
-        // secondary again. Otherwise, the subsequent 'replSetFreeze' command could fail with
-        // NotYetInitialized if the node is still in the process of restarting (e.g. not yet loaded
-        // the local config or reached the STARTUP2 state).
-        waitForState(curSecondary, ReplSetTest.State.SECONDARY);
-
-        // If the nodes are restarted after the rollback node is able to rollback successfully and
-        // catch up to curPrimary's oplog, then the rollback node can become the new primary.
-        // If so, it can lead to unplanned state transitions, like unconditional step down, during
-        // the test. To avoid those problems, prevent rollback node from starting an election.
-        assert.commandWorked(curSecondary.adminCommand({replSetFreeze: ReplSetTest.kForeverSecs}));
-
         log(`Reconnecting the secondary ${curSecondary.host} so it'll go into rollback`);
         // Reconnect the rollback node to the current primary, which is the node we want to sync
         // from. If we reconnect to both the current primary and the tiebreaker node, the rollback
@@ -396,9 +498,13 @@ function RollbackTest(name = "RollbackTest", replSet) {
     this.stop = function(checkDataConsistencyOptions) {
         restartServerReplication(tiebreakerNode);
         rst.awaitReplication();
-        checkDataConsistency(checkDataConsistencyOptions);
+        if (!doneConsistencyChecks) {
+            this.checkDataConsistency(checkDataConsistencyOptions);
+        }
         transitionIfAllowed(State.kStopped);
-        return rst.stopSet();
+        return rst.stopSet(undefined /* signal */,
+                           undefined /* forRestart */,
+                           {skipCheckDBHashes: true, skipValidation: true});
     };
 
     this.getPrimary = function() {
@@ -448,20 +554,24 @@ function RollbackTest(name = "RollbackTest", replSet) {
         log(`Restarting node ${hostName}`);
         rst.start(nodeId, startOptions, true /* restart */);
 
-        // Freeze the node if the restarted node is the rollback node.
-        if (curState === State.kSyncSourceOpsDuringRollback &&
-            rst.getNodeId(curSecondary) === nodeId) {
-            rst.freeze(nodeId);
-        }
+        // Fail-point will clear on restart so do post-start.
+        setFastGetMoreEnabled(rst.nodes[nodeId]);
 
-        const oldPrimary = curPrimary;
-        // Wait for the new primary to be elected and ready to take operations before continuing.
-        curPrimary = rst.getPrimary();
+        // Step up if the restarted node is the current primary.
+        if (rst.getNodeId(curPrimary) === nodeId) {
+            // To prevent below step up from being flaky, we step down and freeze the
+            // current secondary to prevent starting a new election. The current secondary
+            // can start running election due to explicit step up by the shutting down of current
+            // primary if the server parameter "enableElectionHandoff" is set to true.
+            rst.freeze(curSecondary);
 
-        // The primary can change after node restarts only if all the 3 nodes are connected to each
-        // other.
-        if (curState !== State.kSteadyStateOps) {
-            assert.eq(curPrimary, oldPrimary);
+            const newPrimary = stepUp(curPrimary);
+            // As a sanity check, ensure the new primary is the current primary. This is true,
+            // because we have configured the replica set with high electionTimeoutMillis.
+            assert.eq(newPrimary, curPrimary, "Did not elect the same node as primary");
+
+            // Unfreeze the current secondary so that it can step up again.
+            assert.commandWorked(curSecondary.adminCommand({replSetFreeze: 0}));
         }
 
         curSecondary = rst.getSecondary();
@@ -490,5 +600,14 @@ function RollbackTest(name = "RollbackTest", replSet) {
      */
     this.getTestFixture = function() {
         return rst;
+    };
+
+    /**
+     * Use this to control the timeout being used in the awaitSecondaryNodesForRollbackTest call
+     * in transitionToSteadyStateOperations.
+     * For use only in tests that expect unrecoverable rollbacks.
+     */
+    this.setAwaitSecondaryNodesForRollbackTimeout = function(timeoutMillis) {
+        awaitSecondaryNodesForRollbackTimeout = timeoutMillis;
     };
 }

@@ -59,6 +59,22 @@ TEST_F(ServiceContextTest, ValidateConfigForInitiate_VersionMustBe1) {
                   validateConfigForInitiate(&rses, config, getGlobalServiceContext()).getStatus());
 }
 
+TEST_F(ServiceContextTest, ValidateConfigForInitiate_TermIsAlwaysInitialTerm) {
+    ReplicationCoordinatorExternalStateMock rses;
+    rses.addSelf(HostAndPort("h1"));
+
+    ReplSetConfig config;
+    ASSERT_OK(
+        config.initializeForInitiate(BSON("_id"
+                                          << "rs0"
+                                          << "version" << 1 << "term" << (OpTime::kInitialTerm + 1)
+                                          << "protocolVersion" << 1 << "members"
+                                          << BSON_ARRAY(BSON("_id" << 1 << "host"
+                                                                   << "h1")))));
+    ASSERT_OK(validateConfigForInitiate(&rses, config, getGlobalServiceContext()).getStatus());
+    ASSERT_EQUALS(config.getConfigTerm(), OpTime::kInitialTerm);
+}
+
 TEST_F(ServiceContextTest, ValidateConfigForInitiate_MustFindSelf) {
     ReplSetConfig config;
     ASSERT_OK(
@@ -136,41 +152,41 @@ TEST_F(ServiceContextTest, ValidateConfigForInitiate_ArbiterPriorityMustBeZeroOr
     ReplSetConfig zeroConfig;
     ReplSetConfig oneConfig;
     ReplSetConfig twoConfig;
-    ASSERT_OK(zeroConfig.initialize(BSON("_id"
-                                         << "rs0"
-                                         << "version" << 1 << "protocolVersion" << 1 << "members"
-                                         << BSON_ARRAY(BSON("_id" << 1 << "host"
-                                                                  << "h1")
-                                                       << BSON("_id" << 2 << "host"
-                                                                     << "h2"
-                                                                     << "priority" << 0
-                                                                     << "arbiterOnly" << true)
-                                                       << BSON("_id" << 3 << "host"
-                                                                     << "h3")))));
+    ASSERT_OK(zeroConfig.initializeForInitiate(
+        BSON("_id"
+             << "rs0"
+             << "version" << 1 << "protocolVersion" << 1 << "members"
+             << BSON_ARRAY(BSON("_id" << 1 << "host"
+                                      << "h1")
+                           << BSON("_id" << 2 << "host"
+                                         << "h2"
+                                         << "priority" << 0 << "arbiterOnly" << true)
+                           << BSON("_id" << 3 << "host"
+                                         << "h3")))));
 
-    ASSERT_OK(oneConfig.initialize(BSON("_id"
-                                        << "rs0"
-                                        << "version" << 1 << "protocolVersion" << 1 << "members"
-                                        << BSON_ARRAY(BSON("_id" << 1 << "host"
-                                                                 << "h1")
-                                                      << BSON("_id" << 2 << "host"
-                                                                    << "h2"
-                                                                    << "priority" << 1
-                                                                    << "arbiterOnly" << true)
-                                                      << BSON("_id" << 3 << "host"
-                                                                    << "h3")))));
+    ASSERT_OK(oneConfig.initializeForInitiate(
+        BSON("_id"
+             << "rs0"
+             << "version" << 1 << "protocolVersion" << 1 << "members"
+             << BSON_ARRAY(BSON("_id" << 1 << "host"
+                                      << "h1")
+                           << BSON("_id" << 2 << "host"
+                                         << "h2"
+                                         << "priority" << 1 << "arbiterOnly" << true)
+                           << BSON("_id" << 3 << "host"
+                                         << "h3")))));
 
-    ASSERT_OK(twoConfig.initialize(BSON("_id"
-                                        << "rs0"
-                                        << "version" << 1 << "protocolVersion" << 1 << "members"
-                                        << BSON_ARRAY(BSON("_id" << 1 << "host"
-                                                                 << "h1")
-                                                      << BSON("_id" << 2 << "host"
-                                                                    << "h2"
-                                                                    << "priority" << 2
-                                                                    << "arbiterOnly" << true)
-                                                      << BSON("_id" << 3 << "host"
-                                                                    << "h3")))));
+    ASSERT_OK(twoConfig.initializeForInitiate(
+        BSON("_id"
+             << "rs0"
+             << "version" << 1 << "protocolVersion" << 1 << "members"
+             << BSON_ARRAY(BSON("_id" << 1 << "host"
+                                      << "h1")
+                           << BSON("_id" << 2 << "host"
+                                         << "h2"
+                                         << "priority" << 2 << "arbiterOnly" << true)
+                           << BSON("_id" << 3 << "host"
+                                         << "h3")))));
     ReplicationCoordinatorExternalStateMock presentOnceExternalState;
     presentOnceExternalState.addSelf(HostAndPort("h1"));
 
@@ -498,12 +514,14 @@ TEST_F(ServiceContextTest, ValidateConfigForReconfig_HostAndIdRemappingRestricte
                                                                      << BSON("_id" << 3 << "host"
                                                                                    << "h3")))));
     ASSERT_OK(legalNewConfigWithNewHostAndId.validate());
-    ASSERT_OK(validateConfigForReconfig(&externalState,
-                                        oldConfig,
-                                        legalNewConfigWithNewHostAndId,
-                                        getGlobalServiceContext(),
-                                        false)
-                  .getStatus());
+    ASSERT_OK(
+        validateConfigForReconfig(&externalState,
+                                  oldConfig,
+                                  legalNewConfigWithNewHostAndId,
+                                  getGlobalServiceContext(),
+                                  // Use 'force' since we're adding and removing a node atomically.
+                                  true)
+            .getStatus());
 
     //
     // Here, the new config is invalid because we've reused host name "h2" with
@@ -1005,6 +1023,130 @@ TEST_F(ServiceContextTest, ValidateForReconfig_ForceStillNeedsSelfPresent) {
         validateConfigForReconfig(
             &presentOnceExternalState, oldConfig, newConfig, getGlobalServiceContext(), true)
             .getStatus());
+}
+
+//
+// Reusable member object definitions for reconfig tests below.
+//
+BSONObj m1 = BSON("_id" << 1 << "host"
+                        << "h1");
+BSONObj m2 = BSON("_id" << 2 << "host"
+                        << "h2");
+BSONObj m3 = BSON("_id" << 3 << "host"
+                        << "h3");
+BSONObj m4 = BSON("_id" << 4 << "host"
+                        << "h4");
+BSONObj m2_Arbiter = BSON("_id" << 2 << "host"
+                                << "h2"
+                                << "arbiterOnly" << true);
+BSONObj m3_Arbiter = BSON("_id" << 3 << "host"
+                                << "h3"
+                                << "arbiterOnly" << true);
+BSONObj m4_Arbiter = BSON("_id" << 4 << "host"
+                                << "h4"
+                                << "arbiterOnly" << true);
+BSONObj m2_NonVoting = BSON("_id" << 2 << "host"
+                                  << "h2"
+                                  << "votes" << 0 << "priority" << 0);
+BSONObj m3_NonVoting = BSON("_id" << 3 << "host"
+                                  << "h3"
+                                  << "votes" << 0 << "priority" << 0);
+BSONObj m4_NonVoting = BSON("_id" << 4 << "host"
+                                  << "h4"
+                                  << "votes" << 0 << "priority" << 0);
+
+// Test helper to initialize config more concisely.
+Status initializeConfig(ReplSetConfig& cfg, std::string id, int version, BSONArray members) {
+    return cfg.initialize(BSON("_id" << id << "version" << version << "protocolVersion" << 1
+                                     << "members" << members));
+}
+
+// Validate reconfig between the two given member arrays and return the Status.
+Status validateMemberReconfig(BSONArray oldMembers, BSONArray newMembers, BSONObj selfMember) {
+    // Initialize configs.
+    ReplSetConfig oldConfig, newConfig;
+    ASSERT_OK(initializeConfig(oldConfig, "rs0", 1, oldMembers));
+    ASSERT_OK(initializeConfig(newConfig, "rs0", 2, newMembers));
+    ReplicationCoordinatorExternalStateMock presentOnceExternalState;
+    presentOnceExternalState.addSelf(HostAndPort(selfMember.getStringField("host")));
+
+    // Do reconfig.
+    const bool force = false;
+    return validateConfigForReconfig(
+               &presentOnceExternalState, oldConfig, newConfig, getGlobalServiceContext(), force)
+        .getStatus();
+}
+
+TEST_F(ServiceContextTest, ValidateForReconfig_SingleNodeAdditionAllowed) {
+    BSONArray oldMembers = BSON_ARRAY(m1 << m2);
+    BSONArray newMembers = BSON_ARRAY(m1 << m2 << m3);  // add 1 voting node.
+    ASSERT_OK(validateMemberReconfig(oldMembers, newMembers, m1));
+}
+
+TEST_F(ServiceContextTest, ValidateForReconfig_SingleNodeRemovalAllowed) {
+    BSONArray oldMembers = BSON_ARRAY(m1 << m2 << m3);
+    BSONArray newMembers = BSON_ARRAY(m1 << m2);  // remove 1 voting node.
+    ASSERT_OK(validateMemberReconfig(oldMembers, newMembers, m1));
+}
+
+TEST_F(ServiceContextTest, ValidateForReconfig_SimultaneousAddAndRemoveDisallowed) {
+    BSONArray oldMembers = BSON_ARRAY(m1 << m2);
+    BSONArray newMembers = BSON_ARRAY(m1 << m3);  // remove node 2, add node 3.
+    ASSERT_EQUALS(ErrorCodes::InvalidReplicaSetConfig,
+                  validateMemberReconfig(oldMembers, newMembers, m1));
+}
+
+TEST_F(ServiceContextTest, ValidateForReconfig_MultiNodeAdditionDisallowed) {
+    BSONArray oldMembers = BSON_ARRAY(m1 << m2);
+    BSONArray newMembers = BSON_ARRAY(m1 << m2 << m3 << m4);  // add 2 voting nodes.
+    ASSERT_EQUALS(ErrorCodes::InvalidReplicaSetConfig,
+                  validateMemberReconfig(oldMembers, newMembers, m1));
+}
+
+TEST_F(ServiceContextTest, ValidateForReconfig_MultiNodeRemovalDisallowed) {
+    BSONArray oldMembers = BSON_ARRAY(m1 << m2 << m3 << m4);
+    BSONArray newMembers = BSON_ARRAY(m1 << m2);  // remove 2 voting nodes.
+    ASSERT_EQUALS(ErrorCodes::InvalidReplicaSetConfig,
+                  validateMemberReconfig(oldMembers, newMembers, m1));
+}
+
+TEST_F(ServiceContextTest, ValidateForReconfig_MultiNodeAdditionOfNonVotingNodesAllowed) {
+    BSONArray oldMembers = BSON_ARRAY(m1 << m2);
+    BSONArray newMembers =
+        BSON_ARRAY(m1 << m2 << m3_NonVoting << m4_NonVoting);  // add 2 non-voting nodes.
+    ASSERT_OK(validateMemberReconfig(oldMembers, newMembers, m1));
+}
+
+TEST_F(ServiceContextTest, ValidateForReconfig_MultiNodeRemovalOfNonVotingNodesAllowed) {
+    BSONArray oldMembers = BSON_ARRAY(m1 << m2 << m3_NonVoting << m4_NonVoting);
+    BSONArray newMembers = BSON_ARRAY(m1 << m2);  // remove 2 non-voting nodes.
+    ASSERT_OK(validateMemberReconfig(oldMembers, newMembers, m1));
+}
+
+TEST_F(ServiceContextTest, ValidateForReconfig_SimultaneousAddAndRemoveOfNonVotingNodesAllowed) {
+    BSONArray oldMembers = BSON_ARRAY(m1 << m2_NonVoting);
+    BSONArray newMembers = BSON_ARRAY(m1 << m3_NonVoting);  // Remove non-voter 2, add non-voter 3.
+    ASSERT_OK(validateMemberReconfig(oldMembers, newMembers, m1));
+}
+
+TEST_F(ServiceContextTest, ValidateForReconfig_SingleNodeAdditionOfArbitersAllowed) {
+    BSONArray oldMembers = BSON_ARRAY(m1 << m2);
+    BSONArray newMembers = BSON_ARRAY(m1 << m2 << m3_Arbiter);  // add 1 arbiter.
+    ASSERT_OK(validateMemberReconfig(oldMembers, newMembers, m1));
+}
+
+TEST_F(ServiceContextTest, ValidateForReconfig_SimultaneousAddAndRemoveOfArbitersDisallowed) {
+    BSONArray oldMembers = BSON_ARRAY(m1 << m2_Arbiter);
+    BSONArray newMembers = BSON_ARRAY(m1 << m3_Arbiter);  // remove node 2, add node 3.
+    ASSERT_EQUALS(ErrorCodes::InvalidReplicaSetConfig,
+                  validateMemberReconfig(oldMembers, newMembers, m1));
+}
+
+TEST_F(ServiceContextTest, ValidateForReconfig_MultiNodeAdditionOfArbitersDisallowed) {
+    BSONArray oldMembers = BSON_ARRAY(m1 << m2);
+    BSONArray newMembers = BSON_ARRAY(m1 << m2 << m3_Arbiter << m4_Arbiter);  // add two arbiters.
+    ASSERT_EQUALS(ErrorCodes::InvalidReplicaSetConfig,
+                  validateMemberReconfig(oldMembers, newMembers, m1));
 }
 
 }  // namespace

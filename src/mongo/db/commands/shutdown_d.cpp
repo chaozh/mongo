@@ -27,13 +27,12 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
-
 #include "mongo/platform/basic.h"
 
 #include <string>
 
 #include "mongo/db/commands/shutdown.h"
+#include "mongo/db/index_builds_coordinator.h"
 #include "mongo/db/repl/replication_coordinator.h"
 
 namespace mongo {
@@ -59,6 +58,19 @@ public:
         long long timeoutSecs = 10;
         if (cmdObj.hasField("timeoutSecs")) {
             timeoutSecs = cmdObj["timeoutSecs"].numberLong();
+        }
+
+        // This code may race with a new index build starting up. We may get 0 active index builds
+        // from the IndexBuildsCoordinator shutdown to proceed, but there is nothing to prevent a
+        // new index build from starting after that check.
+        if (!force) {
+            auto indexBuildsCoord = IndexBuildsCoordinator::get(opCtx);
+            auto numIndexBuilds = indexBuildsCoord->getActiveIndexBuildCount(opCtx);
+            uassert(ErrorCodes::ConflictingOperationInProgress,
+                    str::stream() << "Index builds in progress while processing shutdown command "
+                                     "without {force: true}: "
+                                  << numIndexBuilds,
+                    numIndexBuilds == 0U);
         }
 
         try {

@@ -44,6 +44,10 @@ public:
 
     void recoverFromOplog(OperationContext* opCtx,
                           boost::optional<Timestamp> stableTimestamp) override {}
+
+    void recoverFromOplogAsStandalone(OperationContext* opCtx) override {}
+
+    void recoverFromOplogUpTo(OperationContext* opCtx, Timestamp endPoint) override {}
 };
 
 }  // namespace repl

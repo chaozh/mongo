@@ -33,6 +33,7 @@
 
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/catalog/list_indexes.h"
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
@@ -59,9 +60,6 @@ using std::unique_ptr;
 using std::vector;
 
 namespace {
-
-// Failpoint which causes to hang "listIndexes" cmd after acquiring the DB lock.
-MONGO_FAIL_POINT_DEFINE(hangBeforeListIndexes);
 
 /**
  * Lists the indexes for a given collection.
@@ -120,7 +118,7 @@ public:
 
         // Check for the listIndexes ActionType on the database.
         const auto nss = CollectionCatalog::get(opCtx).resolveNamespaceStringOrUUID(
-            CommandHelpers::parseNsOrUUID(dbname, cmdObj));
+            opCtx, CommandHelpers::parseNsOrUUID(dbname, cmdObj));
         if (authzSession->isAuthorizedForActionsOnResource(ResourcePattern::forExactNamespace(nss),
                                                            ActionType::listIndexes)) {
             return Status::OK();
@@ -153,39 +151,12 @@ public:
             uassert(ErrorCodes::NamespaceNotFound,
                     str::stream() << "ns does not exist: " << ctx.getNss().ns(),
                     collection);
-
-            auto durableCatalog = DurableCatalog::get(opCtx);
-
             nss = ctx.getNss();
-
-            CurOpFailpointHelpers::waitWhileFailPointEnabled(
-                &hangBeforeListIndexes, opCtx, "hangBeforeListIndexes", []() {}, false, nss);
-
-            vector<string> indexNames;
-            writeConflictRetry(opCtx, "listIndexes", nss.ns(), [&] {
-                indexNames.clear();
-                durableCatalog->getAllIndexes(opCtx, nss, &indexNames);
-            });
-
+            auto indexList = listIndexesInLock(opCtx, collection, nss, includeBuildUUIDs);
             auto ws = std::make_unique<WorkingSet>();
             auto root = std::make_unique<QueuedDataStage>(opCtx, ws.get());
 
-            for (size_t i = 0; i < indexNames.size(); i++) {
-                auto indexSpec = writeConflictRetry(opCtx, "listIndexes", nss.ns(), [&] {
-                    if (includeBuildUUIDs &&
-                        !durableCatalog->isIndexReady(opCtx, nss, indexNames[i])) {
-                        BSONObjBuilder builder;
-                        builder.append("spec"_sd,
-                                       durableCatalog->getIndexSpec(opCtx, nss, indexNames[i]));
-
-                        // TODO(SERVER-37980): Replace with index build UUID.
-                        auto indexBuildUUID = UUID::gen();
-                        indexBuildUUID.appendToBuilder(&builder, "buildUUID"_sd);
-                        return builder.obj();
-                    }
-                    return durableCatalog->getIndexSpec(opCtx, nss, indexNames[i]);
-                });
-
+            for (auto&& indexSpec : indexList) {
                 WorkingSetID id = ws->allocate();
                 WorkingSetMember* member = ws->get(id);
                 member->keyData.clear();

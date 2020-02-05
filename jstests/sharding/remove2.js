@@ -5,7 +5,6 @@
  * of 5MB across all sharding tests in wiredTiger.
  * @tags: [resource_intensive]
  */
-load("jstests/replsets/rslib.js");
 
 // The UUID consistency check uses connections to shards cached on the ShardingTest object, but this
 // test restarts a shard, so the cached connection is not usable.
@@ -13,6 +12,7 @@ TestData.skipCheckingUUIDsConsistentAcrossCluster = true;
 
 (function() {
 'use strict';
+load("jstests/replsets/rslib.js");
 
 function seedString(replTest) {
     var members = replTest.getReplSetConfig().members.map(function(elem) {
@@ -22,8 +22,8 @@ function seedString(replTest) {
 }
 
 function awaitReplicaSetMonitorTimeout() {
-    print("Sleeping for 20 seconds to let the other shard's ReplicaSetMonitor time out");
-    sleep(20000);  // 1 failed check should take 15 seconds, wait a few more seconds.
+    print("Sleeping for 60 seconds to let the other shard's ReplicaSetMonitor time out");
+    sleep(60000);  // 60s should be plenty since the ReplicaSetMonitor refreshes every 30s.
 }
 
 function setupInitialData(st, coll) {

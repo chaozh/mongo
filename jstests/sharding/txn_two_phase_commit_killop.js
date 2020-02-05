@@ -68,6 +68,7 @@ const setUp = function() {
     assert.commandWorked(coordinator.adminCommand({_flushRoutingTableCacheUpdates: ns}));
     assert.commandWorked(participant1.adminCommand({_flushRoutingTableCacheUpdates: ns}));
     assert.commandWorked(participant2.adminCommand({_flushRoutingTableCacheUpdates: ns}));
+    st.refreshCatalogCacheForNs(st.s, ns);
 
     // Start a new transaction by inserting a document onto each shard.
     assert.commandWorked(st.s.getDB(dbName).runCommand({
@@ -120,11 +121,12 @@ const testCommitProtocol = function(shouldCommit, failpointData) {
                      failpointData.numTimesShouldBeHit);
 
     jsTest.log("Going to find coordinator opCtx ids");
-    let coordinatorOps =
-        coordinator.getDB("admin")
-            .aggregate(
-                [{$currentOp: {'allUsers': true}}, {$match: {desc: "TransactionCoordinator"}}])
-            .toArray();
+    let coordinatorOps = coordinator.getDB("admin")
+                             .aggregate([
+                                 {$currentOp: {'allUsers': true, 'idleConnections': true}},
+                                 {$match: {desc: "TransactionCoordinator"}}
+                             ])
+                             .toArray();
 
     // Use "greater than or equal to" since, for failpoints that pause the coordinator while
     // it's sending prepare or sending the decision, there might be one additional thread that's

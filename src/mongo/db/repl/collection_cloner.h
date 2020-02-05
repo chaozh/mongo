@@ -78,10 +78,14 @@ public:
                      const HostAndPort& source,
                      DBClientConnection* client,
                      StorageInterface* storageInterface,
-                     ThreadPool* dbPool,
-                     ClockSource* clock = SystemClockSource::get());
+                     ThreadPool* dbPool);
 
     virtual ~CollectionCloner() = default;
+
+    /**
+     * Waits for any database work to finish or fail.
+     */
+    void waitForDatabaseWorkToComplete();
 
     Stats getStats() const;
 
@@ -104,6 +108,15 @@ public:
         _collectionClonerBatchSize = batchSize;
     }
 
+    /**
+     * Overrides how executor schedules database work.
+     *
+     * For testing only.
+     */
+    void setScheduleDbWorkFn_forTest(ScheduleDbWorkFn scheduleDbWorkFn) {
+        _scheduleDbWorkFn = std::move(scheduleDbWorkFn);
+    }
+
 protected:
     ClonerStages getStages() final;
 
@@ -119,10 +132,46 @@ private:
         AfterStageBehavior run() override;
     };
 
+    class CollectionClonerQueryStage : public CollectionClonerStage {
+    public:
+        CollectionClonerQueryStage(std::string name,
+                                   CollectionCloner* cloner,
+                                   ClonerRunFn stageFunc)
+            : CollectionClonerStage(name, cloner, stageFunc) {}
+
+        bool isTransientError(const Status& status) override {
+            if (isCursorError(status)) {
+                // We have already lost this cursor so do not try to kill it.
+                getCloner()->forgetOldQueryCursor();
+                return true;
+            }
+            return ErrorCodes::isRetriableError(status);
+        }
+
+        static bool isCursorError(const Status& status) {
+            // Our cursor was killed due to changes on the remote collection.
+            if ((status == ErrorCodes::CursorNotFound) || (status == ErrorCodes::OperationFailed) ||
+                (status == ErrorCodes::QueryPlanKilled)) {
+                return true;
+            }
+            return false;
+        }
+    };
+
     std::string describeForFuzzer(BaseClonerStage* stage) const final {
         return _sourceNss.db() + " db: { " + stage->getName() + ": UUID(\"" +
             _sourceDbAndUuid.uuid()->toString() + "\") coll: " + _sourceNss.coll() + " }";
     }
+
+    /**
+     * The preStage sets the start time in _stats.
+     */
+    void preStage() final;
+
+    /**
+     * The postStage sets the end time in _stats.
+     */
+    void postStage() final;
 
     /**
      * Stage function that counts the number of documents in the collection on the source in order
@@ -163,6 +212,30 @@ private:
      */
     void insertDocumentsCallback(const executor::TaskExecutor::CallbackArgs& cbd);
 
+    /**
+     * Sends a query command to the source. That query command with be parameterized based on
+     * wire version and clone progress.
+     */
+    void runQuery();
+
+    /**
+     * Attempts to clean up the cursor on the upstream node. This is called any time we
+     * receive a transient error during the query stage.
+     */
+    void killOldQueryCursor();
+
+    /**
+     * Clears the stored id of the remote cursor so that we do not attempt to kill it.
+     * We call this when we know it has already been killed by the sync source itself.
+     */
+    void forgetOldQueryCursor();
+
+    /**
+     * Used to terminate the clone when we encounter a fatal error during a non-resumable query.
+     * Throws.
+     */
+    void abortNonResumableClone(const Status& status);
+
     // All member variables are labeled with one of the following codes indicating the
     // synchronization rules for accessing them.
     //
@@ -180,18 +253,37 @@ private:
     CollectionClonerStage _countStage;             // (R)
     CollectionClonerStage _listIndexesStage;       // (R)
     CollectionClonerStage _createCollectionStage;  // (R)
-    CollectionClonerStage _queryStage;             // (R)
+    CollectionClonerQueryStage _queryStage;        // (R)
 
     ProgressMeter _progressMeter;                       // (X) progress meter for this instance.
     std::vector<BSONObj> _indexSpecs;                   // (X) Except for _id_
     BSONObj _idIndexSpec;                               // (X)
     std::unique_ptr<CollectionBulkLoader> _collLoader;  // (X)
-    TaskRunner _dbWorkTaskRunner;                       // (R)
     //  Function for scheduling database work using the executor.
     ScheduleDbWorkFn _scheduleDbWorkFn;  // (R)
     // Documents read from source to insert.
     std::vector<BSONObj> _documentsToInsert;  // (M)
     Stats _stats;                             // (M)
+    // Putting _dbWorkTaskRunner last ensures anything the database work threads depend on,
+    // like _documentsToInsert, is destroyed after those threads exit.
+    TaskRunner _dbWorkTaskRunner;  // (R)
+
+    // Does the sync source support resumable queries? (wire version 4.4+)
+    bool _resumeSupported = false;  // (X)
+
+    // The resumeToken used to resume after network error.
+    boost::optional<BSONObj> _resumeToken;  // (X)
+
+    // The cursorId of the remote collection cursor.
+    long long _remoteCursorId = -1;  // (X)
+
+    // If true, it means we are starting a new query or resuming an interrupted one.
+    bool _firstBatchOfQueryRound = true;  // (X)
+
+    // Only set during non-resumable (4.2) queries.
+    // Signifies that there were changes to the collection on the sync source that resulted in
+    // our remote cursor getting killed.
+    bool _lostNonResumableCursor = false;  // (X)
 };
 
 }  // namespace repl

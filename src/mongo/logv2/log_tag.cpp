@@ -29,19 +29,21 @@
 
 #include "mongo/logv2/log_tag.h"
 
+#include "mongo/bson/bsonobjbuilder.h"
+
 namespace mongo {
 namespace logv2 {
 
-std::string LogTag::toJSONArray() {
-    // Very naive impl
-    if (_value == kStartupWarnings)
-        return "[\"startupWarnings\"]";
-    else if (_value == kJavascript)
-        return "[\"javaScript\"]";
-    else if (_value == (kStartupWarnings | kJavascript))
-        return "[\"startupWarnings\",\"javaScript\"]";
-    else
-        return "[]";
+BSONArray LogTag::toBSONArray() {
+    BSONArrayBuilder builder;
+    if (_value | kStartupWarnings) {
+        builder.append("startupWarnings"_sd);
+    }
+    if (_value | kPlainShell) {
+        builder.append("plainShellOutput"_sd);
+    }
+
+    return builder.arr();
 }
 }  // namespace logv2
 }  // namespace mongo

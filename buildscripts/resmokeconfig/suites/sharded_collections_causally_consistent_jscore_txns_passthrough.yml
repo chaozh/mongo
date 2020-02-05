@@ -14,7 +14,7 @@ selector:
   # cluster.
   - jstests/core/txns/transactions_block_ddl.js
 
-  # TODO SERVER-36121: Set the transactionLifetimeLimitSeconds parameter, which is not on mongos.
+  # Set the transactionLifetimeLimitSeconds parameter, which is not on mongos.
   - jstests/core/txns/abort_expired_transaction.js
   - jstests/core/txns/abort_transaction_thread_does_not_block_on_locks.js
   - jstests/core/txns/kill_op_on_txn_expiry.js
@@ -28,6 +28,12 @@ selector:
   # Does not use the transactions shell helpers so afterClusterTime read concern is incorrectly
   # attached to statements in a transaction beyond the first one.
   - jstests/core/txns/non_transactional_operations_on_session_with_transaction.js
+
+  # TODO(SERVER-45368) re-enable once collection creation is permitted in cross-shard transactions.
+  - jstests/core/txns/create_collection.js
+  - jstests/core/txns/create_collection_parallel.js
+  - jstests/core/txns/create_indexes.js
+  - jstests/core/txns/create_indexes_parallel.js
 
   exclude_with_any_tags:
   - assumes_against_mongod_not_mongos

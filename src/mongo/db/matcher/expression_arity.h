@@ -31,6 +31,7 @@
 
 #include <algorithm>
 #include <array>
+#include <boost/optional.hpp>
 #include <memory>
 
 #include "mongo/db/matcher/expression.h"
@@ -57,7 +58,7 @@ public:
         _debugAddSpace(debug, indentationLevel);
 
         BSONObjBuilder builder;
-        serialize(&builder);
+        serialize(&builder, true);
         debug << builder.obj().toString();
     }
 
@@ -80,8 +81,8 @@ public:
             [](const auto& expr1, const auto& expr2) { return expr1->equivalent(expr2.get()); });
     }
 
-    std::vector<MatchExpression*>* getChildVector() final {
-        return nullptr;
+    boost::optional<std::vector<MatchExpression*>&> getChildVector() final {
+        return boost::none;
     }
 
     size_t numChildren() const final {
@@ -101,11 +102,11 @@ public:
     /**
      * Serializes each subexpression sequentially in a BSONArray.
      */
-    void serialize(BSONObjBuilder* builder) const final {
+    void serialize(BSONObjBuilder* builder, bool includePath) const final {
         BSONArrayBuilder exprArray(builder->subarrayStart(name()));
         for (const auto& expr : _expressions) {
             BSONObjBuilder exprBuilder(exprArray.subobjStart());
-            expr->serialize(&exprBuilder);
+            expr->serialize(&exprBuilder, includePath);
             exprBuilder.doneFast();
         }
         exprArray.doneFast();

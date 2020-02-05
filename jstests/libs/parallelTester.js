@@ -155,9 +155,13 @@ if (typeof _threadInject != "undefined") {
             "index_bigkeys_nofail.js",
             "index_bigkeys_validation.js",
 
+            // Tests that set the notablescan parameter, which makes queries fail rather than use a
+            // non-indexed plan.
+            "notablescan.js",
+            "notablescan_capped.js",
+
             "mr_fail_invalid_js.js",
             "run_program1.js",
-            "notablescan.js",
             "bench_test1.js",
 
             // These tests use the getLastError command, which is unsafe to use in this environment,
@@ -218,6 +222,7 @@ if (typeof _threadInject != "undefined") {
             var requires_find_command = [
                 "update_pipeline_shell_helpers.js",
                 "update_with_pipeline.js",
+                "views/dbref_projection.js",
                 "views/views_aggregation.js",
                 "views/views_change.js",
                 "views/views_drop.js",
@@ -281,13 +286,6 @@ if (typeof _threadInject != "undefined") {
             parallelFilesDir + "/profile_query_hash.js",
             parallelFilesDir + "/profile_sampling.js",
             parallelFilesDir + "/profile_update.js",
-
-            // These tests can't be run in parallel because they expect an awaitData cursor to
-            // return after maxTimeMS, however this doesn't work if a long running blocking
-            // operation is running in parallel.
-            // TODO: Remove this restriction as part of SERVER-33942.
-            parallelFilesDir + "/compact_keeps_indexes.js",
-            parallelFilesDir + "/awaitdata_getmore_cmd.js",
 
             // These tests rely on a deterministically refreshable logical session cache. If they
             // run in parallel, they could interfere with the cache and cause failures.

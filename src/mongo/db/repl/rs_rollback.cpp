@@ -42,6 +42,7 @@
 #include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/catalog/document_validation.h"
+#include "mongo/db/catalog/index_build_oplog_entry.h"
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/catalog/rename_collection.h"
 #include "mongo/db/catalog_raii.h"
@@ -53,12 +54,14 @@
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/exec/working_set_common.h"
+#include "mongo/db/index_builds_coordinator.h"
 #include "mongo/db/logical_session_id.h"
 #include "mongo/db/logical_time_validator.h"
 #include "mongo/db/ops/delete.h"
 #include "mongo/db/ops/update.h"
 #include "mongo/db/ops/update_request.h"
 #include "mongo/db/query/internal_plans.h"
+#include "mongo/db/read_write_concern_defaults.h"
 #include "mongo/db/repl/bgsync.h"
 #include "mongo/db/repl/drop_pending_collection_reaper.h"
 #include "mongo/db/repl/oplog.h"
@@ -379,6 +382,16 @@ Status rollback_internal::updateFixUpInfoFromLocalOplogEntry(OperationContext* o
 
                 // Inserts the index name and the index spec of the index to be created into the map
                 // of index name and index specs that need to be created for the given collection.
+                //
+                // If this dropped index was a two-phase index build, we add it to the list to
+                // build in the foreground, without the IndexBuildsCoordinator, since we have no
+                // knowledge of the original build UUID information. If no start or commit oplog
+                // entries are rolled-back, this forces the index build to complete before rollback
+                // finishes.
+                //
+                // If we find by processing earlier oplog entries that the commit or abort
+                // entries are also rolled-back, we will instead rebuild the index with the
+                // Coordinator so it can wait for a replicated commit or abort.
                 fixUpInfo.indexesToCreate[*uuid].insert(
                     std::pair<std::string, BSONObj>(indexName, obj2));
 
@@ -417,21 +430,127 @@ Status rollback_internal::updateFixUpInfoFromLocalOplogEntry(OperationContext* o
                 }
 
                 // Inserts the index name to be dropped into the set of indexes that
-                // need to be dropped for the collection.
+                // need to be dropped for the collection. Any errors dropping the index are ignored
+                // if it does not exist.
                 fixUpInfo.indexesToDrop[*uuid].insert(indexName);
 
                 return Status::OK();
             }
-            // TODO(SERVER-39452): Ignore no-op startIndexBuild, abortIndexBuild, and
-            // commitIndexBuild commands.
-            // Revisit when we are ready to implement rollback logic.
             case OplogEntry::CommandType::kStartIndexBuild: {
+                auto swIndexBuildOplogEntry = IndexBuildOplogEntry::parse(oplogEntry);
+                if (!swIndexBuildOplogEntry.isOK()) {
+                    return {ErrorCodes::UnrecoverableRollbackError,
+                            str::stream()
+                                << "Error parsing 'startIndexBuild' oplog entry: "
+                                << swIndexBuildOplogEntry.getStatus() << ": " << redact(obj)};
+                }
+
+                auto& indexBuildOplogEntry = swIndexBuildOplogEntry.getValue();
+
+                // If the index build has been committed or aborted, and the commit or abort
+                // oplog entry has also been rolled back, the index build will have been added
+                // to the set to be restarted. An index build may also be in the set to be restarted
+                // if it was in-progress and aborted before rollback.
+                // Remove it, and then add it to the set to be dropped. If the index has already
+                // been dropped by abort, then this is a no-op.
+                auto& buildsToRestart = fixUpInfo.indexBuildsToRestart;
+                auto buildUUID = indexBuildOplogEntry.buildUUID;
+                auto existingIt = buildsToRestart.find(buildUUID);
+                if (existingIt != buildsToRestart.end()) {
+                    LOG(2) << "Index build that was previously marked to be restarted will now be "
+                              "dropped due to a rolled-back 'startIndexBuild' oplog entry: "
+                           << buildUUID;
+                    buildsToRestart.erase(existingIt);
+
+                    // If the index build was committed or aborted, we must mark the index as
+                    // needing to be dropped. Add each index to drop by name individually.
+                    for (auto& indexName : indexBuildOplogEntry.indexNames) {
+                        fixUpInfo.indexesToDrop[*uuid].insert(indexName);
+                    }
+                    // Intentionally allow this index build to be added to both 'indexesToDrop' and
+                    // 'unfinishedIndexesToDrop', since we can not tell at this point if it is
+                    // finished or not.
+                }
+
+                // If the index build was not committed or aborted, the index build is
+                // unfinished in the catalog will need to be dropped before any other collection
+                // operations.
+                for (auto& indexName : indexBuildOplogEntry.indexNames) {
+                    fixUpInfo.unfinishedIndexesToDrop[*uuid].insert(indexName);
+                }
+
                 return Status::OK();
             }
             case OplogEntry::CommandType::kAbortIndexBuild: {
+                auto swIndexBuildOplogEntry = IndexBuildOplogEntry::parse(oplogEntry);
+                if (!swIndexBuildOplogEntry.isOK()) {
+                    return {ErrorCodes::UnrecoverableRollbackError,
+                            str::stream()
+                                << "Error parsing 'abortIndexBuild' oplog entry: "
+                                << swIndexBuildOplogEntry.getStatus() << ": " << redact(obj)};
+                }
+
+                auto& indexBuildOplogEntry = swIndexBuildOplogEntry.getValue();
+                auto& buildsToRestart = fixUpInfo.indexBuildsToRestart;
+                auto buildUUID = indexBuildOplogEntry.buildUUID;
+                invariant(buildsToRestart.find(buildUUID) == buildsToRestart.end(),
+                          str::stream()
+                              << "Tried to restart an index build after rolling back an "
+                                 "'abortIndexBuild' oplog entry, but a build with the same "
+                                 "UUID is already marked to be restarted: "
+                              << buildUUID);
+
+                LOG(2) << "Index build will be restarted after a rolled-back 'abortIndexBuild': "
+                       << buildUUID;
+                IndexBuildDetails details{*uuid};
+                for (auto& spec : indexBuildOplogEntry.indexSpecs) {
+                    invariant(spec.isOwned());
+                    details.indexSpecs.emplace_back(spec);
+                }
+                buildsToRestart.insert({buildUUID, details});
                 return Status::OK();
             }
             case OplogEntry::CommandType::kCommitIndexBuild: {
+                auto swIndexBuildOplogEntry = IndexBuildOplogEntry::parse(oplogEntry);
+                if (!swIndexBuildOplogEntry.isOK()) {
+                    return {ErrorCodes::UnrecoverableRollbackError,
+                            str::stream()
+                                << "Error parsing 'commitIndexBuild' oplog entry: "
+                                << swIndexBuildOplogEntry.getStatus() << ": " << redact(obj)};
+                }
+
+                auto& indexBuildOplogEntry = swIndexBuildOplogEntry.getValue();
+
+                // If a dropIndexes oplog entry was already rolled-back, the index build needs to
+                // be restarted, but not committed. If the index is in the set to be created, then
+                // its drop was rolled-back and it should be removed.
+                auto& toCreate = fixUpInfo.indexesToCreate[*uuid];
+                for (auto& indexName : indexBuildOplogEntry.indexNames) {
+                    auto existing = toCreate.find(indexName);
+                    if (existing != toCreate.end()) {
+                        toCreate.erase(existing);
+                    }
+                }
+
+                // Add the index build to be restarted.
+                auto& buildsToRestart = fixUpInfo.indexBuildsToRestart;
+                auto buildUUID = indexBuildOplogEntry.buildUUID;
+                invariant(buildsToRestart.find(buildUUID) == buildsToRestart.end(),
+                          str::stream()
+                              << "Tried to restart an index build after rolling back a "
+                                 "'commitIndexBuild' oplog entry, but a build with the same "
+                                 "UUID is already marked to be restarted: "
+                              << buildUUID);
+
+                LOG(2) << "Index build will be restarted after a rolled-back 'commitIndexBuild': "
+                       << buildUUID;
+
+                IndexBuildDetails details{*uuid};
+                for (auto& spec : indexBuildOplogEntry.indexSpecs) {
+                    invariant(spec.isOwned());
+                    details.indexSpecs.emplace_back(spec);
+                }
+                buildsToRestart.insert({buildUUID, details});
                 return Status::OK();
             }
             case OplogEntry::CommandType::kRenameCollection: {
@@ -690,7 +809,7 @@ void dropIndex(OperationContext* opCtx,
                IndexCatalog* indexCatalog,
                const string& indexName,
                NamespaceString& nss) {
-    bool includeUnfinishedIndexes = false;
+    bool includeUnfinishedIndexes = true;
     auto indexDescriptor =
         indexCatalog->findIndexByName(opCtx, indexName, includeUnfinishedIndexes);
     if (!indexDescriptor) {
@@ -699,10 +818,19 @@ void dropIndex(OperationContext* opCtx,
         return;
     }
     WriteUnitOfWork wunit(opCtx);
-    auto status = indexCatalog->dropIndex(opCtx, indexDescriptor);
-    if (!status.isOK()) {
-        severe() << "Rollback failed to drop index " << indexName << " in " << nss.toString()
-                 << ": " << redact(status);
+    auto entry = indexCatalog->getEntry(indexDescriptor);
+    if (entry->isReady(opCtx)) {
+        auto status = indexCatalog->dropIndex(opCtx, indexDescriptor);
+        if (!status.isOK()) {
+            severe() << "Rollback failed to drop index " << indexName << " in " << nss.toString()
+                     << ": " << redact(status);
+        }
+    } else {
+        auto status = indexCatalog->dropUnfinishedIndex(opCtx, indexDescriptor);
+        if (!status.isOK()) {
+            severe() << "Rollback failed to drop unfinished index " << indexName << " in "
+                     << nss.toString() << ": " << redact(status);
+        }
     }
     wunit.commit();
 }
@@ -713,10 +841,11 @@ void dropIndex(OperationContext* opCtx,
  */
 void rollbackCreateIndexes(OperationContext* opCtx, UUID uuid, std::set<std::string> indexNames) {
 
-    boost::optional<NamespaceString> nss = CollectionCatalog::get(opCtx).lookupNSSByUUID(uuid);
+    boost::optional<NamespaceString> nss =
+        CollectionCatalog::get(opCtx).lookupNSSByUUID(opCtx, uuid);
     invariant(nss);
     Lock::DBLock dbLock(opCtx, nss->db(), MODE_X);
-    Collection* collection = CollectionCatalog::get(opCtx).lookupCollectionByUUID(uuid);
+    Collection* collection = CollectionCatalog::get(opCtx).lookupCollectionByUUID(opCtx, uuid);
 
     // If we cannot find the collection, we skip over dropping the index.
     if (!collection) {
@@ -753,11 +882,12 @@ void rollbackCreateIndexes(OperationContext* opCtx, UUID uuid, std::set<std::str
 void rollbackDropIndexes(OperationContext* opCtx,
                          UUID uuid,
                          std::map<std::string, BSONObj> indexNames) {
-    boost::optional<NamespaceString> nss = CollectionCatalog::get(opCtx).lookupNSSByUUID(uuid);
+    boost::optional<NamespaceString> nss =
+        CollectionCatalog::get(opCtx).lookupNSSByUUID(opCtx, uuid);
     invariant(nss);
     Lock::DBLock dbLock(opCtx, nss->db(), MODE_IX);
     Lock::CollectionLock collLock(opCtx, *nss, MODE_X);
-    Collection* collection = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(*nss);
+    Collection* collection = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, *nss);
 
     // If we cannot find the collection, we skip over dropping the index.
     if (!collection) {
@@ -850,7 +980,8 @@ void dropCollection(OperationContext* opCtx,
 void renameOutOfTheWay(OperationContext* opCtx, RenameCollectionInfo info, Database* db) {
 
     // Finds the UUID of the collection that we are renaming out of the way.
-    auto collection = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(info.renameTo);
+    auto collection =
+        CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, info.renameTo);
     invariant(collection);
 
     // The generated unique collection name is only guaranteed to exist if the database is
@@ -932,6 +1063,7 @@ void rollbackRenameCollection(OperationContext* opCtx, UUID uuid, RenameCollecti
 Status _syncRollback(OperationContext* opCtx,
                      const OplogInterface& localOplog,
                      const RollbackSource& rollbackSource,
+                     const IndexBuilds& abortedIndexBuilds,
                      int requiredRBID,
                      ReplicationCoordinator* replCoord,
                      ReplicationProcess* replicationProcess) {
@@ -947,6 +1079,11 @@ Status _syncRollback(OperationContext* opCtx,
     // Find the UUID of the transactions collection. An OperationContext is required because the
     // UUID is not known at compile time, so the SessionCatalog needs to load the collection.
     how.transactionTableUUID = MongoDSessionCatalog::getTransactionTableUUID(opCtx);
+
+    // Populate the initial list of index builds to restart with the builds that were aborted due to
+    // rollback. They may need to be restarted if no associated oplog entries are rolled-back, or
+    // they may be made redundant by a rolled-back startIndexBuild oplog entry.
+    how.indexBuildsToRestart.insert(abortedIndexBuilds.begin(), abortedIndexBuilds.end());
 
     log() << "Finding the Common Point";
     try {
@@ -1012,6 +1149,17 @@ Status _syncRollback(OperationContext* opCtx,
         }
     } catch (const RSFatalException& e) {
         return Status(ErrorCodes::UnrecoverableRollbackError, e.what());
+    } catch (const DBException& e) {
+        // If we encounter an error during rollback, but we aborted index builds beforehand, we
+        // will be unable to successfully perform any more rollback attempts. The knowledge of these
+        // aborted index builds gets lost after the first attempt.
+        if (abortedIndexBuilds.size()) {
+            return Status{ErrorCodes::UnrecoverableRollbackError,
+                          "Index builds aborted prior to rollback cannot be restarted by "
+                          "subsequent rollback attempts"}
+                .withContext(e.what());
+        }
+        throw;
     }
 
     if (MONGO_unlikely(rollbackHangBeforeFinish.shouldFail())) {
@@ -1049,7 +1197,7 @@ void rollback_internal::syncFixUp(OperationContext* opCtx,
         invariant(!doc._id.eoo());  // This is checked when we insert to the set.
 
         UUID uuid = doc.uuid;
-        boost::optional<NamespaceString> nss = catalog.lookupNSSByUUID(uuid);
+        boost::optional<NamespaceString> nss = catalog.lookupNSSByUUID(opCtx, uuid);
 
         try {
             if (nss) {
@@ -1140,11 +1288,23 @@ void rollback_internal::syncFixUp(OperationContext* opCtx,
     // indexes.
     // We drop indexes before renaming collections so that if a collection name gets longer,
     // any indexes with names that are now too long will already be dropped.
-    log() << "Rolling back createIndexes commands.";
+    log() << "Rolling back createIndexes and startIndexBuild operations";
     for (auto it = fixUpInfo.indexesToDrop.begin(); it != fixUpInfo.indexesToDrop.end(); it++) {
 
         UUID uuid = it->first;
         std::set<std::string> indexNames = it->second;
+
+        rollbackCreateIndexes(opCtx, uuid, indexNames);
+    }
+
+    // Drop any unfinished indexes. These are indexes where the startIndexBuild oplog entry was
+    // rolled-back, but the unfinished index still exists in the catalog. Drop these before any
+    // collection drops, because one of the preconditions of dropping a collection is that there are
+    // no unfinished indxes.
+    log() << "Rolling back unfinished startIndexBuild operations";
+    for (auto index : fixUpInfo.unfinishedIndexesToDrop) {
+        UUID uuid = index.first;
+        std::set<std::string> indexNames = index.second;
 
         rollbackCreateIndexes(opCtx, uuid, indexNames);
     }
@@ -1163,8 +1323,12 @@ void rollback_internal::syncFixUp(OperationContext* opCtx,
         invariant(!fixUpInfo.indexesToCreate.count(uuid));
         invariant(!fixUpInfo.collectionsToRename.count(uuid));
         invariant(!fixUpInfo.collectionsToResyncMetadata.count(uuid));
+        invariant(!std::any_of(fixUpInfo.indexBuildsToRestart.begin(),
+                               fixUpInfo.indexBuildsToRestart.end(),
+                               [&](auto build) { return build.second.collUUID == uuid; }));
 
-        boost::optional<NamespaceString> nss = CollectionCatalog::get(opCtx).lookupNSSByUUID(uuid);
+        boost::optional<NamespaceString> nss =
+            CollectionCatalog::get(opCtx).lookupNSSByUUID(opCtx, uuid);
         // Do not attempt to acquire the database lock with an empty namespace. We should survive
         // an attempt to drop a non-existent collection.
         if (!nss) {
@@ -1175,7 +1339,8 @@ void rollback_internal::syncFixUp(OperationContext* opCtx,
 
             Database* db = dbLock.getDb();
             if (db) {
-                Collection* collection = CollectionCatalog::get(opCtx).lookupCollectionByUUID(uuid);
+                Collection* collection =
+                    CollectionCatalog::get(opCtx).lookupCollectionByUUID(opCtx, uuid);
                 dropCollection(opCtx, *nss, collection, db);
                 LOG(1) << "Dropped collection: " << *nss << ", UUID: " << uuid;
             }
@@ -1223,7 +1388,7 @@ void rollback_internal::syncFixUp(OperationContext* opCtx,
         // collection, we will not be able to retrieve the collection's catalog entries.
         for (auto uuid : fixUpInfo.collectionsToResyncMetadata) {
             boost::optional<NamespaceString> nss =
-                CollectionCatalog::get(opCtx).lookupNSSByUUID(uuid);
+                CollectionCatalog::get(opCtx).lookupNSSByUUID(opCtx, uuid);
             invariant(nss);
 
             log() << "Resyncing collection metadata for collection: " << *nss << ", UUID: " << uuid;
@@ -1234,7 +1399,8 @@ void rollback_internal::syncFixUp(OperationContext* opCtx,
             auto db = databaseHolder->openDb(opCtx, nss->db().toString());
             invariant(db);
 
-            Collection* collection = CollectionCatalog::get(opCtx).lookupCollectionByUUID(uuid);
+            Collection* collection =
+                CollectionCatalog::get(opCtx).lookupCollectionByUUID(opCtx, uuid);
             invariant(collection);
 
             auto infoResult = rollbackSource.getCollectionInfoByUUID(nss->db().toString(), uuid);
@@ -1278,7 +1444,7 @@ void rollback_internal::syncFixUp(OperationContext* opCtx,
             WriteUnitOfWork wuow(opCtx);
 
             // Set collection to whatever temp status is on the sync source.
-            DurableCatalog::get(opCtx)->setIsTemp(opCtx, *nss, options.temp);
+            DurableCatalog::get(opCtx)->setIsTemp(opCtx, collection->getCatalogId(), options.temp);
 
             // Set any document validation options. We update the validator fields without
             // parsing/validation, since we fetched the options object directly from the sync
@@ -1296,8 +1462,9 @@ void rollback_internal::syncFixUp(OperationContext* opCtx,
 
             LOG(1) << "Resynced collection metadata for collection: " << *nss << ", UUID: " << uuid
                    << ", with: " << redact(info) << ", to: "
-                   << redact(
-                          DurableCatalog::get(opCtx)->getCollectionOptions(opCtx, *nss).toBSON());
+                   << redact(DurableCatalog::get(opCtx)
+                                 ->getCollectionOptions(opCtx, collection->getCatalogId())
+                                 .toBSON());
         }
 
         // Since we read from the sync source to retrieve the metadata of the
@@ -1317,6 +1484,10 @@ void rollback_internal::syncFixUp(OperationContext* opCtx,
         rollbackDropIndexes(opCtx, uuid, indexNames);
     }
 
+    log() << "Restarting rolled-back committed or aborted index builds.";
+    IndexBuildsCoordinator::get(opCtx)->restartIndexBuildsForRecovery(
+        opCtx, fixUpInfo.indexBuildsToRestart);
+
     log() << "Deleting and updating documents to roll back insert, update and remove "
              "operations";
     unsigned deletes = 0, updates = 0;
@@ -1332,7 +1503,7 @@ void rollback_internal::syncFixUp(OperationContext* opCtx,
         unique_ptr<RemoveSaver> removeSaver;
         invariant(!fixUpInfo.collectionsToDrop.count(uuid));
 
-        boost::optional<NamespaceString> nss = catalog.lookupNSSByUUID(uuid);
+        boost::optional<NamespaceString> nss = catalog.lookupNSSByUUID(opCtx, uuid);
         if (!nss) {
             nss = NamespaceString();
         }
@@ -1361,7 +1532,7 @@ void rollback_internal::syncFixUp(OperationContext* opCtx,
                 const NamespaceString docNss(doc.ns);
                 Lock::DBLock docDbLock(opCtx, docNss.db(), MODE_X);
                 OldClientContext ctx(opCtx, doc.ns.toString());
-                Collection* collection = catalog.lookupCollectionByUUID(uuid);
+                Collection* collection = catalog.lookupCollectionByUUID(opCtx, uuid);
 
                 // Adds the doc to our rollback file if the collection was not dropped while
                 // rolling back createCollection operations. Does not log an error when
@@ -1529,7 +1700,7 @@ void rollback_internal::syncFixUp(OperationContext* opCtx,
         Lock::CollectionLock oplogCollectionLoc(opCtx, oplogNss, MODE_X);
         OldClientContext ctx(opCtx, oplogNss.ns());
         Collection* oplogCollection =
-            CollectionCatalog::get(opCtx).lookupCollectionByNamespace(oplogNss);
+            CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, oplogNss);
         if (!oplogCollection) {
             fassertFailedWithStatusNoTrace(
                 40495,
@@ -1585,6 +1756,10 @@ void rollback_internal::syncFixUp(OperationContext* opCtx,
         }
     }
 
+    // Force the default read/write concern cache to reload on next access in case the defaults
+    // document was rolled back.
+    ReadWriteConcernDefaults::get(opCtx).invalidate();
+
     // Reload the lastAppliedOpTime and lastDurableOpTime value in the replcoord and the
     // lastApplied value in bgsync to reflect our new last op. The rollback common point does
     // not necessarily represent a consistent database state. For example, on a secondary, we may
@@ -1598,6 +1773,7 @@ void rollback_internal::syncFixUp(OperationContext* opCtx,
 Status syncRollback(OperationContext* opCtx,
                     const OplogInterface& localOplog,
                     const RollbackSource& rollbackSource,
+                    const IndexBuilds& abortedIndexBuilds,
                     int requiredRBID,
                     ReplicationCoordinator* replCoord,
                     ReplicationProcess* replicationProcess) {
@@ -1606,8 +1782,13 @@ Status syncRollback(OperationContext* opCtx,
 
     DisableDocumentValidation validationDisabler(opCtx);
     UnreplicatedWritesBlock replicationDisabler(opCtx);
-    Status status = _syncRollback(
-        opCtx, localOplog, rollbackSource, requiredRBID, replCoord, replicationProcess);
+    Status status = _syncRollback(opCtx,
+                                  localOplog,
+                                  rollbackSource,
+                                  abortedIndexBuilds,
+                                  requiredRBID,
+                                  replCoord,
+                                  replicationProcess);
 
     log() << "Rollback finished. The final minValid is: "
           << replicationProcess->getConsistencyMarkers()->getMinValid(opCtx) << rsLog;
@@ -1618,6 +1799,7 @@ Status syncRollback(OperationContext* opCtx,
 void rollback(OperationContext* opCtx,
               const OplogInterface& localOplog,
               const RollbackSource& rollbackSource,
+              const IndexBuilds& abortedIndexBuilds,
               int requiredRBID,
               ReplicationCoordinator* replCoord,
               ReplicationProcess* replicationProcess,
@@ -1652,8 +1834,13 @@ void rollback(OperationContext* opCtx,
     }
 
     try {
-        auto status = syncRollback(
-            opCtx, localOplog, rollbackSource, requiredRBID, replCoord, replicationProcess);
+        auto status = syncRollback(opCtx,
+                                   localOplog,
+                                   rollbackSource,
+                                   abortedIndexBuilds,
+                                   requiredRBID,
+                                   replCoord,
+                                   replicationProcess);
 
         // Aborts only when syncRollback detects we are in a unrecoverable state.
         // WARNING: these statuses sometimes have location codes which are lost with uassertStatusOK

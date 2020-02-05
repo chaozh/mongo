@@ -40,8 +40,8 @@ env.Library(
         ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
-        ]
-    )
+    ]
+)
 
 env.Library(
     target='log_and_backoff',
@@ -66,6 +66,8 @@ env.Library(
 debuggerEnv = env.Clone()
 if has_option("gdbserver"):
     debuggerEnv.Append(CPPDEFINES=["USE_GDBSERVER"])
+elif has_option("lldb-server"):
+    debuggerEnv.Append(CPPDEFINES=["USE_LLDB_SERVER"])
 
 debuggerEnv.Library(
     target='debugger',
@@ -200,6 +202,16 @@ env.Library(
     ],
 )
 
+env.Library(
+    target='caching',
+    source=[
+        'read_through_cache.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
+    ]
+)
+
 if env['MONGO_ALLOCATOR'] in ['tcmalloc', 'tcmalloc-experimental']:
     tcmspEnv = env.Clone()
 
@@ -284,6 +296,21 @@ env.Library(
     ],
 )
 
+env.Library(
+    target='latch_analyzer',
+    source= [
+        'latch_analyzer.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/db/commands/test_commands_enabled',
+        '$BUILD_DIR/mongo/db/service_context',
+    ],
+    LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/db/commands/server_status',
+    ],
+)
+
 env.Benchmark(
     target='clock_source_bm',
     source=[
@@ -313,18 +340,6 @@ if has_option('gcov'):
             'MONGO_GCOV',
         ],
     )
-
-if has_option('use-cpu-profiler'):
-    quick_exit_env.Append(
-        CPPDEFINES=[
-            'MONGO_CPU_PROFILER',
-        ],
-    )
-
-    if not use_system_version_of_library('tcmalloc'):
-        quick_exit_env.InjectThirdParty(
-            'gperftools'
-        )
 
 quick_exit_env.Library(
     target='quick_exit',
@@ -367,7 +382,12 @@ env.Library(
     ],
 )
 
-env.Library(
+signalEnv = env.Clone()
+
+if use_libunwind:
+    signalEnv.InjectThirdParty('unwind')
+
+signalEnv.Library(
     target="signal_handlers",
     source=[
         "signal_handlers.cpp",
@@ -423,7 +443,6 @@ env.Benchmark(
     LIBDEPS=[
     ],
 )
-
 
 env.Benchmark(
     target='future_bm',
@@ -548,9 +567,13 @@ icuEnv.CppUnitTest(
         'future_test_promise_int.cpp',
         'future_test_promise_void.cpp',
         'future_test_shared_future.cpp',
+        'future_util_test.cpp',
+        'hierarchical_acquisition_test.cpp',
         'icu_test.cpp',
         'invalidating_lru_cache_test.cpp',
+        'interruptible_test.cpp',
         'itoa_test.cpp',
+        'latch_analyzer_test.cpp',
         'lockable_adapter_test.cpp',
         'lru_cache_test.cpp',
         'md5_test.cpp',
@@ -560,6 +583,8 @@ icuEnv.CppUnitTest(
         'procparser_test.cpp' if env.TargetOSIs('linux') else [],
         'producer_consumer_queue_test.cpp',
         'progress_meter_test.cpp',
+        'read_through_cache_test.cpp',
+        'registry_list_test.cpp',
         'represent_as_test.cpp',
         'safe_num_test.cpp',
         'secure_zero_memory_test.cpp',
@@ -576,16 +601,18 @@ icuEnv.CppUnitTest(
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
-        '$BUILD_DIR/mongo/db/service_context',
         '$BUILD_DIR/mongo/db/service_context_test_fixture',
+        '$BUILD_DIR/mongo/executor/thread_pool_task_executor_test_fixture',
         'alarm',
         'background_job',
+        'caching',
         'clock_source_mock',
         'clock_sources',
         'diagnostic_info',
         'dns_query',
         'fail_point',
         'icu',
+        'latch_analyzer',
         'md5',
         'periodic_runner_impl',
         'processinfo',
@@ -614,26 +641,23 @@ if env.TargetOSIs('windows'):
         ],
     )
 
-generateItoATable = env.Command(
-    target=[
-        'itoa_table_4.h',
-    ],
-    source=[
-        'generate_itoa_table.py',
-    ],
-    action=[
-        '$PYTHON ${SOURCES[0]} --digit_count=4 --output=${TARGETS[0]}'
-    ],
+env.Benchmark(
+    target='base64_bm',
+    source='base64_bm.cpp',
 )
-env.Alias('generated-sources', generateItoATable)
 
-env.CppUnitTest(
+stacktraceEnv = env.Clone()
+if use_libunwind:
+    stacktraceEnv.InjectThirdParty(libraries=['unwind'])
+
+stacktraceEnv.CppUnitTest(
     target='stacktrace_test',
-    source=[
-        'stacktrace_test.cpp',
-    ],
-    LIBDEPS=[
-    ],
+    source='stacktrace_test.cpp',
+)
+
+stacktraceEnv.Benchmark(
+    target='stacktrace_bm',
+    source='stacktrace_bm.cpp',
 )
 
 if use_libunwind:

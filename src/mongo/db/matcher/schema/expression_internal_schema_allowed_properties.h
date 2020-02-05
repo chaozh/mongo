@@ -29,6 +29,7 @@
 
 #pragma once
 
+#include <boost/optional.hpp>
 #include <memory>
 #include <pcrecpp.h>
 #include <utility>
@@ -134,12 +135,12 @@ public:
     bool matches(const MatchableDocument* doc, MatchDetails* details) const final;
     bool matchesSingleElement(const BSONElement& element, MatchDetails* details) const final;
 
-    void serialize(BSONObjBuilder* builder) const final;
+    void serialize(BSONObjBuilder* builder, bool includePath) const final;
 
     std::unique_ptr<MatchExpression> shallowClone() const final;
 
-    std::vector<MatchExpression*>* getChildVector() final {
-        return nullptr;
+    boost::optional<std::vector<MatchExpression*>&> getChildVector() final {
+        return boost::none;
     }
 
     size_t numChildren() const final {

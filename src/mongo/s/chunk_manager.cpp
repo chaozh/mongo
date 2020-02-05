@@ -70,6 +70,9 @@ std::string extractKeyStringInternal(const BSONObj& shardKeyValue, Ordering orde
 
 }  // namespace
 
+ShardVersionTargetingInfo::ShardVersionTargetingInfo(const OID& epoch)
+    : shardVersion(0, 0, epoch) {}
+
 RoutingTableHistory::RoutingTableHistory(NamespaceString nss,
                                          boost::optional<UUID> uuid,
                                          KeyPattern shardKeyPattern,
@@ -87,6 +90,19 @@ RoutingTableHistory::RoutingTableHistory(NamespaceString nss,
       _chunkMap(std::move(chunkMap)),
       _collectionVersion(collectionVersion),
       _shardVersions(_constructShardVersionMap()) {}
+
+void RoutingTableHistory::setShardStale(const ShardId& shardId) {
+    auto it = _shardVersions.find(shardId);
+    if (it != _shardVersions.end()) {
+        it->second.isStale.store(true);
+    }
+}
+
+void RoutingTableHistory::setAllShardsRefreshed() {
+    for (auto& [shard, targetingInfo] : _shardVersions) {
+        targetingInfo.isStale.store(false);
+    }
+}
 
 Chunk ChunkManager::findIntersectingChunk(const BSONObj& shardKey, const BSONObj& collation) const {
     const bool hasSimpleCollation = (collation.isEmpty() && !_rt->getDefaultCollator()) ||
@@ -234,6 +250,10 @@ void RoutingTableHistory::getAllShardIds(std::set<ShardId>* all) const {
                    [](const ShardVersionMap::value_type& pair) { return pair.first; });
 }
 
+int RoutingTableHistory::getNShardsOwningChunks() const {
+    return _shardVersions.size();
+}
+
 std::pair<ChunkInfoMap::const_iterator, ChunkInfoMap::const_iterator>
 RoutingTableHistory::overlappingRanges(const BSONObj& min,
                                        const BSONObj& max,
@@ -293,19 +313,23 @@ IndexBounds ChunkManager::getIndexBoundsForQuery(const BSONObj& key,
                           nullptr /* projExec */);
     plannerParams.indices.push_back(std::move(indexEntry));
 
-    auto solutions = uassertStatusOK(QueryPlanner::plan(canonicalQuery, plannerParams));
+    auto plannerResult = QueryPlanner::plan(canonicalQuery, plannerParams);
+    if (plannerResult.getStatus().code() != ErrorCodes::NoQueryExecutionPlans) {
+        auto solutions = uassertStatusOK(std::move(plannerResult));
 
+        // Pick any solution that has non-trivial IndexBounds. bounds.size() == 0 represents a
+        // trivial IndexBounds where none of the fields' values are bounded.
+        for (auto&& soln : solutions) {
+            IndexBounds bounds = collapseQuerySolution(soln->root.get());
+            if (bounds.size() > 0) {
+                return bounds;
+            }
+        }
+    }
+
+    // We cannot plan the query without collection scan, so target to all shards.
     IndexBounds bounds;
-
-    for (auto&& soln : solutions) {
-        // Try next solution if we failed to generate index bounds, i.e. bounds.size() == 0
-        bounds = collapseQuerySolution(soln->root.get());
-    }
-
-    if (bounds.size() == 0) {
-        // We cannot plan the query without collection scan, so target to all shards.
-        IndexBoundsBuilder::allValuesBounds(key, &bounds);  // [minKey, maxKey]
-    }
+    IndexBoundsBuilder::allValuesBounds(key, &bounds);  // [minKey, maxKey]
     return bounds;
 }
 
@@ -385,7 +409,11 @@ ChunkVersion RoutingTableHistory::getVersion(const ShardId& shardName) const {
         return ChunkVersion(0, 0, _collectionVersion.epoch());
     }
 
-    return it->second;
+    uassert(StaleConfigInfo(_nss, {}, {}, shardName),
+            "shard has been marked stale",
+            !it->second.isStale.load());
+
+    return it->second.shardVersion;
 }
 
 std::string RoutingTableHistory::toString() const {
@@ -399,7 +427,7 @@ std::string RoutingTableHistory::toString() const {
 
     sb << "Shard versions:\n";
     for (const auto& entry : _shardVersions) {
-        sb << "\t" << entry.first << ": " << entry.second.toString() << '\n';
+        sb << "\t" << entry.first << ": " << entry.second.shardVersion.toString() << '\n';
     }
 
     return sb.str();
@@ -421,11 +449,10 @@ ShardVersionMap RoutingTableHistory::_constructShardVersionMap() const {
         // Tracks the max shard version for the shard on which the current range will reside
         auto shardVersionIt = shardVersions.find(currentRangeShardId);
         if (shardVersionIt == shardVersions.end()) {
-            shardVersionIt =
-                shardVersions.emplace(currentRangeShardId, ChunkVersion(0, 0, epoch)).first;
+            shardVersionIt = shardVersions.emplace(currentRangeShardId, epoch).first;
         }
 
-        auto& maxShardVersion = shardVersionIt->second;
+        auto& maxShardVersion = shardVersionIt->second.shardVersion;
 
         current =
             std::find_if(current,
@@ -577,6 +604,7 @@ std::shared_ptr<RoutingTableHistory> RoutingTableHistory::makeUpdated(
     // sequence number to detect batch writes not making progress because of chunks moving across
     // shards too frequently.
     if (collectionVersion == startingCollectionVersion) {
+        setAllShardsRefreshed();
         return shared_from_this();
     }
 

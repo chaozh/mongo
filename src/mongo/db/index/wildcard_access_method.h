@@ -71,10 +71,10 @@ public:
                                    const MultikeyPaths& multikeyPaths) const final;
 
     /**
-     * Returns a pointer to the ProjectionExecAgg owned by the underlying WildcardKeyGenerator.
+     * Returns a pointer to the WildcardProjection owned by the underlying WildcardKeyGenerator.
      */
-    const ProjectionExecAgg* getProjectionExec() const {
-        return _keyGen.getProjectionExec();
+    const WildcardProjection* getWildcardProjection() const {
+        return _keyGen.getWildcardProjection();
     }
 
     /**
@@ -94,6 +94,7 @@ public:
 
 private:
     void doGetKeys(const BSONObj& obj,
+                   GetKeysContext context,
                    KeyStringSet* keys,
                    KeyStringSet* multikeyMetadataKeys,
                    MultikeyPaths* multikeyPaths,

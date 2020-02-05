@@ -245,14 +245,16 @@ void doReplSetInitiate(ReplicationCoordinatorImpl* replCoord,
 
 void doReplSetReconfig(ReplicationCoordinatorImpl* replCoord,
                        Status* status,
-                       OperationContext* opCtx) {
+                       OperationContext* opCtx,
+                       long long term = OpTime::kInitialTerm) {
     BSONObjBuilder garbage;
     ReplSetReconfigArgs args;
     args.force = false;
     // Replica set id will be copied from existing configuration.
     args.newConfigObj = BSON("_id"
                              << "mySet"
-                             << "version" << 3 << "protocolVersion" << 1 << "members"
+                             << "version" << 3 << "term" << term << "protocolVersion" << 1
+                             << "members"
                              << BSON_ARRAY(BSON("_id" << 1 << "host"
                                                       << "node1:12345")
                                            << BSON("_id" << 2 << "host"
@@ -450,6 +452,38 @@ TEST_F(ReplCoordTest, PrimaryNodeAcceptsNewConfigWhenReceivingAReconfigWithAComp
     ASSERT_OK(status);
 }
 
+TEST_F(ReplCoordTest, OverrideReconfigBsonTermSoReconfigSucceeds) {
+    // start up, become primary, reconfig successfully
+    assertStartSuccess(BSON("_id"
+                            << "mySet"
+                            << "version" << 2 << "members"
+                            << BSON_ARRAY(BSON("_id" << 1 << "host"
+                                                     << "node1:12345")
+                                          << BSON("_id" << 2 << "host"
+                                                        << "node2:12345"))
+                            << "settings" << BSON("replicaSetId" << OID::gen())),
+                       HostAndPort("node1", 12345));
+    ASSERT_OK(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
+    replCoordSetMyLastAppliedOpTime(OpTime(Timestamp(100, 1), 0), Date_t() + Seconds(100));
+    replCoordSetMyLastDurableOpTime(OpTime(Timestamp(100, 1), 0), Date_t() + Seconds(100));
+    simulateSuccessfulV1Election();  // Since we have simulated one election, term should be 1.
+
+    Status status(ErrorCodes::InternalError, "Not Set");
+    const auto opCtx = makeOperationContext();
+    // Term is 1, but pass an invalid term, 50, to the reconfig command. The reconfig should still
+    // succeed because we will override 50 with 1.
+    stdx::thread reconfigThread(
+        [&] { doReplSetReconfig(getReplCoord(), &status, opCtx.get(), 50 /* incorrect term */); });
+
+    replyToReceivedHeartbeatV1();
+    reconfigThread.join();
+    ASSERT_OK(status);
+
+    // After the reconfig, the config term should be 1, not 50.
+    const auto config = getReplCoord()->getConfig();
+    ASSERT_EQUALS(config.getConfigTerm(), 1);
+}
+
 TEST_F(
     ReplCoordTest,
     NodeReturnsConfigurationInProgressWhenReceivingAReconfigWhileInTheMidstOfAHeartbeatReconfig) {
@@ -564,18 +598,19 @@ TEST_F(ReplCoordTest, NodeDoesNotAcceptHeartbeatReconfigWhileInTheMidstOfReconfi
     hbResp.addToBSON(&respObj2);
     net->scheduleResponse(noi, net->now(), makeResponseStatus(respObj2.obj()));
 
-    logger::globalLogDomain()->setMinimumLoggedSeverity(logger::LogSeverity::Debug(1));
+    setMinimumLoggedSeverity(logger::LogSeverity::Debug(1));
     startCapturingLogMessages();
     // execute hb reconfig, which should fail with a log message; confirmed at end of test
     net->runReadyNetworkOperations();
     // respond to reconfig's quorum check so that we can join that thread and exit cleanly
     net->exitNetwork();
     stopCapturingLogMessages();
-    ASSERT_EQUALS(
-        1, countLogLinesContaining("because already in the midst of a configuration process"));
+    ASSERT_EQUALS(1,
+                  countTextFormatLogLinesContaining(
+                      "because already in the midst of a configuration process"));
     shutdown(opCtx.get());
     reconfigThread.join();
-    logger::globalLogDomain()->setMinimumLoggedSeverity(logger::LogSeverity::Log());
+    setMinimumLoggedSeverity(logger::LogSeverity::Log());
 }
 
 TEST_F(ReplCoordTest, NodeAcceptsConfigFromAReconfigWithForceTrueWhileNotPrimary) {

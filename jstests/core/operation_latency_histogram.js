@@ -11,8 +11,6 @@
 //     incompatible_with_embedded,
 // ]
 //
-// TODO (SERVER-36055): Correct error code reported when run on mobile, and then we can remove the
-// tag incompatible_with_embedded.
 
 (function() {
 "use strict";
@@ -167,7 +165,7 @@ testColl.dataSize();
 lastHistogram = assertHistogramDiffEq(testColl, lastHistogram, 0, 0, 1);
 
 // PlanCache
-testColl.getPlanCache().listQueryShapes();
+testColl.getPlanCache().clear();
 lastHistogram = assertHistogramDiffEq(testColl, lastHistogram, 0, 0, 1);
 
 // Commands which occur on the database only should not effect the collection stats.

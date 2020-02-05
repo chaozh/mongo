@@ -34,6 +34,7 @@
 #include <vector>
 
 #include "mongo/base/status.h"
+#include "mongo/logv2/log_format.h"
 #include "mongo/rpc/protocol.h"
 
 namespace mongo {
@@ -82,7 +83,7 @@ struct ShellGlobalParams {
     bool nokillop = false;
     Seconds idleSessionTimeout = Seconds{0};
 
-    bool logV2 = false;
+    logv2::LogFormat logFormat = logv2::LogFormat::kDefault;  // Log format to output to
 };
 
 extern ShellGlobalParams shellGlobalParams;

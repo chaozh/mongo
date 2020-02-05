@@ -46,9 +46,8 @@ DatabaseCloner::DatabaseCloner(const std::string& dbName,
                                const HostAndPort& source,
                                DBClientConnection* client,
                                StorageInterface* storageInterface,
-                               ThreadPool* dbPool,
-                               ClockSource* clock)
-    : BaseCloner("DatabaseCloner"_sd, sharedData, source, client, storageInterface, dbPool, clock),
+                               ThreadPool* dbPool)
+    : BaseCloner("DatabaseCloner"_sd, sharedData, source, client, storageInterface, dbPool),
       _dbName(dbName),
       _listCollectionsStage("listCollections", this, &DatabaseCloner::listCollectionsStage) {
     invariant(!dbName.empty());
@@ -62,6 +61,11 @@ BaseCloner::ClonerStages DatabaseCloner::getStages() {
 /* static */
 CollectionOptions DatabaseCloner::parseCollectionOptions(const BSONObj& obj) {
     return uassertStatusOK(CollectionOptions::parse(obj, CollectionOptions::parseForStorage));
+}
+
+void DatabaseCloner::preStage() {
+    stdx::lock_guard<Latch> lk(_mutex);
+    _stats.start = getSharedData()->getClock()->now();
 }
 
 BaseCloner::AfterStageBehavior DatabaseCloner::listCollectionsStage() {
@@ -112,7 +116,11 @@ void DatabaseCloner::postStage() {
     {
         stdx::lock_guard<Latch> lk(_mutex);
         _stats.collections = _collections.size();
-        _stats.start = getClock()->now();
+        _stats.collectionStats.reserve(_collections.size());
+        for (const auto& coll : _collections) {
+            _stats.collectionStats.emplace_back();
+            _stats.collectionStats.back().ns = coll.first.ns();
+        }
     }
     for (const auto& coll : _collections) {
         auto& sourceNss = coll.first;
@@ -125,8 +133,7 @@ void DatabaseCloner::postStage() {
                                                                           getSource(),
                                                                           getClient(),
                                                                           getStorageInterface(),
-                                                                          getDBPool(),
-                                                                          getClock());
+                                                                          getDBPool());
         }
         auto collStatus = _currentCollectionCloner->run();
         if (collStatus.isOK()) {
@@ -143,7 +150,7 @@ void DatabaseCloner::postStage() {
         }
         {
             stdx::lock_guard<Latch> lk(_mutex);
-            _stats.collectionStats.emplace_back(_currentCollectionCloner->getStats());
+            _stats.collectionStats[_stats.clonedCollections] = _currentCollectionCloner->getStats();
             _currentCollectionCloner = nullptr;
             // Abort the database cloner if the collection clone failed.
             if (!collStatus.isOK())
@@ -151,13 +158,15 @@ void DatabaseCloner::postStage() {
             _stats.clonedCollections++;
         }
     }
+    stdx::lock_guard<Latch> lk(_mutex);
+    _stats.end = getSharedData()->getClock()->now();
 }
 
 DatabaseCloner::Stats DatabaseCloner::getStats() const {
     stdx::lock_guard<Latch> lk(_mutex);
     DatabaseCloner::Stats stats = _stats;
     if (_currentCollectionCloner) {
-        stats.collectionStats.emplace_back(_currentCollectionCloner->getStats());
+        stats.collectionStats[_stats.clonedCollections] = _currentCollectionCloner->getStats();
     }
     return stats;
 }

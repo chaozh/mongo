@@ -1,4 +1,5 @@
 test_kind: js_test
+use_in_multiversion: sharded_collections_jscore_multiversion_passthrough
 
 selector:
   roots:
@@ -30,8 +31,6 @@ selector:
   - jstests/core/geo_update_btree2.js  # notablescan.
   - jstests/core/index_id_options.js  # "local" database.
   - jstests/core/index9.js  # "local" database.
-  - jstests/core/max_time_ms.js  # sleep, SERVER-2212.
-  - jstests/core/notablescan.js  # notablescan.
   - jstests/core/queryoptimizera.js  # "local" database.
   - jstests/core/rename*.js # renameCollection.
   - jstests/core/stages*.js  # stageDebug.
@@ -67,7 +66,7 @@ selector:
   # These tests fail because sharded clusters do not clean up correctly after failed index builds.
   # See SERVER-33207 as an example.
   - jstests/core/geo_borders.js
-  # TODO: Remove after fixing SERVER-32555. executionStats.nReturned is incorrect for sharded
+  # TODO: Remove after fixing SERVER-29449. executionStats.nReturned is incorrect for sharded
   # queries with a limit or for distinct commands.
   - jstests/core/distinct_index1.js
   - jstests/core/explain1.js
@@ -76,9 +75,6 @@ selector:
   # TODO: Remove after fixing SERVER-32563. The implementation of explain for the count command is
   # incorrect on sharded collections.
   - jstests/core/explain_count.js
-  # TODO: Remove after fixing SERVER-14324. mapReduce behaves unpredictably when the out collection
-  # is sharded on anything other than {_id: 1}.
-  - jstests/core/mr_undef.js
   # TODO SERVER-32311: These tests use plan stage helpers which can't handle sharded explain output.
   - jstests/core/expr_index_use.js
   - jstests/core/index_multikey.js

@@ -110,11 +110,14 @@
  *     Common case allocate-and-grow function. Starts by allocating the requested number of items
  *     (at least 10), then doubles each time the list needs to grow.
  */
-#define __wt_realloc_def(session, sizep, number, addr) \
-    (((number) * sizeof(**(addr)) <= *(sizep)) ?       \
-        0 :                                            \
-        __wt_realloc(                                  \
-          session, sizep, WT_MAX(*(sizep)*2, WT_MAX(10, (number)) * sizeof(**(addr))), addr))
+#define __wt_realloc_def(session, sizep, number, addr)                                      \
+    (((number) * sizeof(**(addr)) <= *(sizep)) ?                                            \
+        0 :                                                                                 \
+        __wt_realloc(session, sizep, (F_ISSET(S2C(session), WT_CONN_DEBUG_REALLOC_EXACT)) ? \
+            (number) * sizeof(**(addr)) :                                                   \
+            WT_MAX(*(sizep)*2, WT_MAX(10, (number)) * sizeof(**(addr))),                    \
+          addr))
+
 /*
  * Our internal free function clears the underlying address atomically so there is a smaller chance
  * of racing threads seeing intermediate results while a structure is being free'd. (That would be a
@@ -128,15 +131,18 @@
         if (*(void **)__p != NULL)       \
             __wt_free_int(session, __p); \
     } while (0)
+
+/* Overwrite whether or not this is a diagnostic build. */
+#define __wt_explicit_overwrite(p, size) memset(p, WT_DEBUG_BYTE, size)
 #ifdef HAVE_DIAGNOSTIC
-#define __wt_overwrite_and_free(session, p)     \
-    do {                                        \
-        memset(p, WT_DEBUG_BYTE, sizeof(*(p))); \
-        __wt_free(session, p);                  \
+#define __wt_overwrite_and_free(session, p)       \
+    do {                                          \
+        __wt_explicit_overwrite(p, sizeof(*(p))); \
+        __wt_free(session, p);                    \
     } while (0)
 #define __wt_overwrite_and_free_len(session, p, len) \
     do {                                             \
-        memset(p, WT_DEBUG_BYTE, len);               \
+        __wt_explicit_overwrite(p, len);             \
         __wt_free(session, p);                       \
     } while (0)
 #else

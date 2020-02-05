@@ -53,7 +53,6 @@
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/repl_set_config.h"
-#include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/s/add_shard_cmd_gen.h"
 #include "mongo/db/s/add_shard_util.h"
 #include "mongo/db/s/sharding_logging.h"
@@ -71,7 +70,6 @@
 #include "mongo/s/cluster_identity_loader.h"
 #include "mongo/s/database_version_helpers.h"
 #include "mongo/s/grid.h"
-#include "mongo/s/shard_util.h"
 #include "mongo/s/write_ops/batched_command_request.h"
 #include "mongo/s/write_ops/batched_command_response.h"
 #include "mongo/util/fail_point.h"
@@ -549,23 +547,8 @@ StatusWith<std::string> ShardingCatalogManager::addShard(
         return existingShard.getValue()->getName();
     }
 
-    // Force a reload of the ShardRegistry to ensure that, in case this addShard is to re-add a
-    // replica set that has recently been removed, we have detached the ReplicaSetMonitor for the
-    // set with that setName from the ReplicaSetMonitorManager and will create a new
-    // ReplicaSetMonitor when targeting the set below.
-    // Note: This is necessary because as of 3.4, removeShard is performed by mongos (unlike
-    // addShard), so the ShardRegistry is not synchronously reloaded on the config server when a
-    // shard is removed.
-    if (!Grid::get(opCtx)->shardRegistry()->reload(opCtx)) {
-        // If the first reload joined an existing one, call reload again to ensure the reload is
-        // fresh.
-        Grid::get(opCtx)->shardRegistry()->reload(opCtx);
-    }
-
-    // TODO: Don't create a detached Shard object, create a detached RemoteCommandTargeter instead.
     const std::shared_ptr<Shard> shard{
         Grid::get(opCtx)->shardRegistry()->createConnection(shardConnectionString)};
-    invariant(shard);
     auto targeter = shard->getTargeter();
 
     auto stopMonitoringGuard = makeGuard([&] {
@@ -741,9 +724,24 @@ StatusWith<std::string> ShardingCatalogManager::addShard(
     return shardType.getName();
 }
 
-ShardDrainingStatus ShardingCatalogManager::removeShard(OperationContext* opCtx,
+RemoveShardProgress ShardingCatalogManager::removeShard(OperationContext* opCtx,
                                                         const ShardId& shardId) {
     const auto name = shardId.toString();
+
+    const auto configShard = Grid::get(opCtx)->shardRegistry()->getConfigShard();
+
+    auto findShardResponse = uassertStatusOK(
+        configShard->exhaustiveFindOnConfig(opCtx,
+                                            kConfigReadSelector,
+                                            repl::ReadConcernLevel::kLocalReadConcern,
+                                            ShardType::ConfigNS,
+                                            BSON(ShardType::name() << name),
+                                            BSONObj(),
+                                            1));
+    uassert(ErrorCodes::ShardNotFound,
+            str::stream() << "Shard " << shardId << " does not exist",
+            !findShardResponse.docs.empty());
+    const auto shard = uassertStatusOK(ShardType::fromBSON(findShardResponse.docs[0]));
 
     // Find how many *other* shards exist, which are *not* currently draining
     const auto countOtherNotDrainingShards = uassertStatusOK(_runCountCommandOnConfig(
@@ -754,6 +752,17 @@ ShardDrainingStatus ShardingCatalogManager::removeShard(OperationContext* opCtx,
             "Operation not allowed because it would remove the last shard",
             countOtherNotDrainingShards > 0);
 
+    // Ensure there are no non-empty zones that only belong to this shard
+    for (auto& zoneName : shard.getTags()) {
+        auto isRequiredByZone = uassertStatusOK(
+            _isShardRequiredByZoneStillInUse(opCtx, kConfigReadSelector, name, zoneName));
+        uassert(ErrorCodes::ZoneStillInUse,
+                str::stream()
+                    << "Operation not allowed because it would remove the only shard for zone "
+                    << zoneName << " which has a chunk range is associated with it",
+                !isRequiredByZone);
+    }
+
     // Figure out if shard is already draining
     const bool isShardCurrentlyDraining =
         uassertStatusOK(_runCountCommandOnConfig(
@@ -761,7 +770,6 @@ ShardDrainingStatus ShardingCatalogManager::removeShard(OperationContext* opCtx,
             ShardType::ConfigNS,
             BSON(ShardType::name() << name << ShardType::draining(true)))) > 0;
 
-    auto* const shardRegistry = Grid::get(opCtx)->shardRegistry();
     auto* const catalogClient = Grid::get(opCtx)->catalogClient();
 
     if (!isShardCurrentlyDraining) {
@@ -775,6 +783,8 @@ ShardDrainingStatus ShardingCatalogManager::removeShard(OperationContext* opCtx,
             BSON("shard" << name),
             ShardingCatalogClient::kLocalWriteConcern));
 
+        Lock::ExclusiveLock shardLock(opCtx->lockState(), _kShardMembershipLock);
+
         uassertStatusOKWithContext(
             catalogClient->updateConfigDocument(opCtx,
                                                 ShardType::ConfigNS,
@@ -784,9 +794,8 @@ ShardDrainingStatus ShardingCatalogManager::removeShard(OperationContext* opCtx,
                                                 ShardingCatalogClient::kLocalWriteConcern),
             "error starting removeShard");
 
-        shardRegistry->reload(opCtx);
-
-        return ShardDrainingStatus::STARTED;
+        return {RemoveShardProgress::STARTED,
+                boost::optional<RemoveShardProgress::DrainingShardUsage>(boost::none)};
     }
 
     // Draining has already started, now figure out how many chunks and databases are still on the
@@ -797,12 +806,18 @@ ShardDrainingStatus ShardingCatalogManager::removeShard(OperationContext* opCtx,
     const auto databaseCount = uassertStatusOK(
         _runCountCommandOnConfig(opCtx, DatabaseType::ConfigNS, BSON(DatabaseType::primary(name))));
 
+    const auto jumboCount = uassertStatusOK(_runCountCommandOnConfig(
+        opCtx, ChunkType::ConfigNS, BSON(ChunkType::shard(name) << ChunkType::jumbo(true))));
+
     if (chunkCount > 0 || databaseCount > 0) {
         // Still more draining to do
         LOG(0) << "chunkCount: " << chunkCount;
         LOG(0) << "databaseCount: " << databaseCount;
+        LOG(0) << "jumboCount: " << jumboCount;
 
-        return ShardDrainingStatus::ONGOING;
+        return {RemoveShardProgress::ONGOING,
+                boost::optional<RemoveShardProgress::DrainingShardUsage>(
+                    {chunkCount, databaseCount, jumboCount})};
     }
 
     // Draining is done, now finish removing the shard.
@@ -816,54 +831,22 @@ ShardDrainingStatus ShardingCatalogManager::removeShard(OperationContext* opCtx,
                                              ShardingCatalogClient::kLocalWriteConcern),
         str::stream() << "error completing removeShard operation on: " << name);
 
+    // The shard which was just removed must be reflected in the shard registry, before the replica
+    // set monitor is removed, otherwise the shard would be referencing a dropped RSM
+    Grid::get(opCtx)->shardRegistry()->reload(opCtx);
     shardConnectionPool.removeHost(name);
     ReplicaSetMonitor::remove(name);
-
-    shardRegistry->reload(opCtx);
 
     // Record finish in changelog
     ShardingLogging::get(opCtx)->logChange(
         opCtx, "removeShard", "", BSON("shard" << name), ShardingCatalogClient::kLocalWriteConcern);
 
-    return ShardDrainingStatus::COMPLETED;
+    return {RemoveShardProgress::COMPLETED,
+            boost::optional<RemoveShardProgress::DrainingShardUsage>(boost::none)};
 }
 
 void ShardingCatalogManager::appendConnectionStats(executor::ConnectionPoolStats* stats) {
     _executorForAddShard->appendConnectionStats(stats);
-}
-
-// static
-StatusWith<ShardId> ShardingCatalogManager::_selectShardForNewDatabase(
-    OperationContext* opCtx, ShardRegistry* shardRegistry) {
-    std::vector<ShardId> allShardIds;
-
-    shardRegistry->getAllShardIds(opCtx, &allShardIds);
-    if (allShardIds.empty()) {
-        return Status(ErrorCodes::ShardNotFound, "No shards found");
-    }
-
-    ShardId candidateShardId = allShardIds[0];
-
-    auto candidateSizeStatus = shardutil::retrieveTotalShardSize(opCtx, candidateShardId);
-    if (!candidateSizeStatus.isOK()) {
-        return candidateSizeStatus.getStatus();
-    }
-
-    for (size_t i = 1; i < allShardIds.size(); i++) {
-        const ShardId shardId = allShardIds[i];
-
-        const auto sizeStatus = shardutil::retrieveTotalShardSize(opCtx, shardId);
-        if (!sizeStatus.isOK()) {
-            return sizeStatus.getStatus();
-        }
-
-        if (sizeStatus.getValue() < candidateSizeStatus.getValue()) {
-            candidateSizeStatus = sizeStatus;
-            candidateShardId = shardId;
-        }
-    }
-
-    return candidateShardId;
 }
 
 StatusWith<long long> ShardingCatalogManager::_runCountCommandOnConfig(OperationContext* opCtx,

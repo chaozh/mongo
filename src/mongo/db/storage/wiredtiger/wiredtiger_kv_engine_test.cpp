@@ -48,6 +48,7 @@
 #include "mongo/unittest/temp_dir.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/clock_source_mock.h"
+#include "mongo/util/log_global_settings.h"
 
 namespace mongo {
 namespace {
@@ -165,7 +166,7 @@ TEST_F(WiredTigerKVEngineRepairTest, OrphanedDataFilesCanBeRecovered) {
     boost::filesystem::rename(*dataFilePath, tmpFile, err);
     ASSERT(!err) << err.message();
 
-    ASSERT_OK(_engine->dropIdent(opCtxPtr.get(), ident));
+    ASSERT_OK(_engine->dropIdent(opCtxPtr.get(), opCtxPtr.get()->recoveryUnit(), ident));
 
     // The data file is moved back in place so that it becomes an "orphan" of the storage
     // engine and the restoration process can be tested.
@@ -208,7 +209,7 @@ TEST_F(WiredTigerKVEngineRepairTest, UnrecoverableOrphanedDataFilesAreRebuilt) {
 
     ASSERT(boost::filesystem::exists(*dataFilePath));
 
-    ASSERT_OK(_engine->dropIdent(opCtxPtr.get(), ident));
+    ASSERT_OK(_engine->dropIdent(opCtxPtr.get(), opCtxPtr.get()->recoveryUnit(), ident));
 
 #ifdef _WIN32
     auto status =
@@ -253,11 +254,9 @@ TEST_F(WiredTigerKVEngineTest, TestOplogTruncation) {
 
     // To diagnose any intermittent failures, maximize logging from WiredTigerKVEngine and friends.
     const auto kStorage = logger::LogComponent::kStorage;
-    auto originalVerbosity = logger::globalLogDomain()->getMinimumLogSeverity(kStorage);
-    logger::globalLogDomain()->setMinimumLoggedSeverity(kStorage, logger::LogSeverity::Debug(3));
-    ON_BLOCK_EXIT([&]() {
-        logger::globalLogDomain()->setMinimumLoggedSeverity(kStorage, originalVerbosity);
-    });
+    auto originalVerbosity = getMinimumLogSeverity(kStorage);
+    setMinimumLoggedSeverity(kStorage, logger::LogSeverity::Debug(3));
+    ON_BLOCK_EXIT([&]() { setMinimumLoggedSeverity(kStorage, originalVerbosity); });
 
     // Simulate the callback that queries config.transactions for the oldest active transaction.
     boost::optional<Timestamp> oldestActiveTxnTimestamp;

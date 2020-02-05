@@ -1,11 +1,14 @@
 /**
  * Tests that the index's full specification is included in the oplog entry corresponding to its
  * creation.
+ *
+ * @tags: [requires_fcv_44]
  */
 (function() {
 "use strict";
 
 load("jstests/libs/get_index_helpers.js");
+load('jstests/noPassthrough/libs/index_build.js');
 
 const rst = new ReplSetTest({nodes: 1});
 rst.startSet();
@@ -15,12 +18,6 @@ const primary = rst.getPrimary();
 
 const testDB = primary.getDB("test");
 const oplogColl = primary.getDB("local").oplog.rs;
-
-// If two phase index builds are enabled, index creation will show up in the oplog as a pair of
-// startIndexBuild and commitIndexBuild oplog entries rather than a single createIndexes entry.
-const enableTwoPhaseIndexBuild =
-    assert.commandWorked(testDB.adminCommand({getParameter: 1, enableTwoPhaseIndexBuild: 1}))
-        .enableTwoPhaseIndexBuild;
 
 function testOplogEntryContainsIndexInfoObj(coll, keyPattern, indexOptions) {
     assert.commandWorked(coll.createIndex(keyPattern, indexOptions));
@@ -32,8 +29,9 @@ function testOplogEntryContainsIndexInfoObj(coll, keyPattern, indexOptions) {
         indexSpec,
         "Index with key pattern " + tojson(keyPattern) + " not found: " + tojson(allIndexes));
 
-    // Find the createIndexes command entries.
-    const indexCreationOplogQuery = enableTwoPhaseIndexBuild
+    // If two phase index builds are enabled, index creation will show up in the oplog as a pair of
+    // startIndexBuild and commitIndexBuild oplog entries rather than a single createIndexes entry.
+    const indexCreationOplogQuery = IndexBuildTest.supportsTwoPhaseIndexBuild(primary)
         ? {op: "c", ns: testDB.getName() + ".$cmd", "o.startIndexBuild": coll.getName()}
         : {op: "c", ns: testDB.getName() + ".$cmd", "o.createIndexes": coll.getName()};
 
@@ -43,8 +41,8 @@ function testOplogEntryContainsIndexInfoObj(coll, keyPattern, indexOptions) {
     const allOplogEntriesJson = tojson(allOplogEntries);
     const indexSpecJson = tojson(indexSpec);
 
-    // Because of differences between the new and old oplog entries for createIndexes,
-    // treat the namespace part separately and compare entries without ns field.
+    // Compare entries without ns field, which may still be present in 4.2 index specs.
+    delete indexSpec.ns;
     const found = allOplogEntries.filter((entry) => {
         const entrySpec = entry.o;
 
@@ -61,6 +59,7 @@ function testOplogEntryContainsIndexInfoObj(coll, keyPattern, indexOptions) {
             return true;
         }
 
+        delete entrySpec.ns;
         delete entrySpec.createIndexes;
         return bsonWoCompare(indexSpec, entrySpec) === 0;
     });
@@ -71,6 +70,9 @@ function testOplogEntryContainsIndexInfoObj(coll, keyPattern, indexOptions) {
 
     assert.commandWorked(coll.dropIndex(keyPattern));
 }
+
+// Insert document into collection to avoid optimization for index creation on an empty collection.
+assert.commandWorked(testDB.oplog_format.insert({a: 1}));
 
 // Test that options both explicitly included in the command and implicitly filled in with
 // defaults by the server are serialized into the corresponding oplog entry.
@@ -83,6 +85,10 @@ testOplogEntryContainsIndexInfoObj(
 // non-simple default collation exactly matches that of the index's full specification.
 assert.commandWorked(
     testDB.runCommand({create: "oplog_format_collation", collation: {locale: "fr"}}));
+
+// Insert document into collection to avoid optimization for index creation on an empty collection.
+assert.commandWorked(testDB.oplog_format_collation.insert({a: 1}));
+
 testOplogEntryContainsIndexInfoObj(testDB.oplog_format_collation, {withDefaultCollation: 1});
 testOplogEntryContainsIndexInfoObj(
     testDB.oplog_format_collation, {withNonDefaultCollation: 1}, {collation: {locale: "en"}});

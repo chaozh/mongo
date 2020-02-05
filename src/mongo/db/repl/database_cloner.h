@@ -57,8 +57,7 @@ public:
                    const HostAndPort& source,
                    DBClientConnection* client,
                    StorageInterface* storageInterface,
-                   ThreadPool* dbPool,
-                   ClockSource* clock = SystemClockSource::get());
+                   ThreadPool* dbPool);
 
     virtual ~DatabaseCloner() = default;
 
@@ -82,8 +81,13 @@ private:
     AfterStageBehavior listCollectionsStage();
 
     /**
+     * The preStage sets the start time in _stats.
+     */
+    void preStage() final;
+
+    /**
      * The postStage creates and runs the individual CollectionCloners on each database found on
-     * the sync source.
+     * the sync source, and sets the end time in _stats when done.
      */
     void postStage() final;
 

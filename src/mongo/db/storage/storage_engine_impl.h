@@ -97,8 +97,10 @@ public:
 
     virtual void endBackup(OperationContext* opCtx) override;
 
-    virtual StatusWith<std::vector<BackupBlock>> beginNonBlockingBackup(
-        OperationContext* opCtx) override;
+    virtual Status disableIncrementalBackup(OperationContext* opCtx) override;
+
+    virtual StatusWith<BackupInformation> beginNonBlockingBackup(
+        OperationContext* opCtx, const BackupOptions& options) override;
 
     virtual void endNonBlockingBackup(OperationContext* opCtx) override;
 
@@ -111,7 +113,9 @@ public:
 
     virtual bool isEphemeral() const override;
 
-    virtual Status repairRecordStore(OperationContext* opCtx, const NamespaceString& nss) override;
+    virtual Status repairRecordStore(OperationContext* opCtx,
+                                     RecordId catalogId,
+                                     const NamespaceString& nss) override;
 
     virtual std::unique_ptr<TemporaryRecordStore> makeTemporaryRecordStore(
         OperationContext* opCtx) override;
@@ -159,7 +163,9 @@ public:
 
     void clearDropPendingState() final;
 
-    virtual void replicationBatchIsComplete() const override;
+    bool supportsTwoPhaseIndexBuild() const final;
+
+    void triggerJournalFlush() const final;
 
     SnapshotManager* getSnapshotManager() const final;
 
@@ -342,11 +348,7 @@ public:
         return _engine->isInIndividuallyCheckpointedIndexesList(ident);
     }
 
-    /**
-     * Drop abandoned idents. Returns a parallel list of index name, index spec pairs to rebuild.
-     */
-    StatusWith<std::vector<StorageEngine::CollectionIndexNamePair>> reconcileCatalogAndIdents(
-        OperationContext* opCtx) override;
+    StatusWith<ReconcileResult> reconcileCatalogAndIdents(OperationContext* opCtx) override;
 
     std::string getFilesystemPathForDb(const std::string& dbName) const override;
 
@@ -376,7 +378,10 @@ public:
 private:
     using CollIter = std::list<std::string>::iterator;
 
-    void _initCollection(OperationContext* opCtx, const NamespaceString& nss, bool forRepair);
+    void _initCollection(OperationContext* opCtx,
+                         RecordId catalogId,
+                         const NamespaceString& nss,
+                         bool forRepair);
 
     Status _dropCollectionsNoTimestamp(OperationContext* opCtx,
                                        std::vector<NamespaceString>& toDrop);
@@ -392,6 +397,7 @@ private:
      * collection.
      */
     Status _recoverOrphanedCollection(OperationContext* opCtx,
+                                      RecordId catalogId,
                                       const NamespaceString& collectionName,
                                       StringData collectionIdent);
 

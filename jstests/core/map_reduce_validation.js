@@ -3,6 +3,7 @@
 //   assumes_no_implicit_collection_creation_after_drop,
 //   uses_map_reduce_with_temp_collections,
 //   does_not_support_stepdowns,
+//   requires_fcv_44
 // ]
 (function() {
 "use strict";
@@ -47,6 +48,9 @@ assert.commandFailedWithCode(db.runCommand({
                              ErrorCodes.CommandNotSupported);
 
 // Test that you can output to a different database.
+// Create the other database.
+db.getSiblingDB("mr_validation_other").foo.drop();
+assert.commandWorked(db.getSiblingDB("mr_validation_other").createCollection("foo"));
 assert.commandWorked(db.runCommand({
     mapReduce: source.getName(),
     map: mapFunc,
@@ -70,11 +74,6 @@ if (resultWithNonExistent.ok) {
 }
 
 // Test that you can't use a regex as the namespace.
-// TODO SERVER-42677 We should be able to expect a single error code here once the parsing logic
-// is shared across mongos and mongod. For each of the remaining assertions it looks like there
-// are two possible error codes: one for mongos and one for mongod, and each of these are likely
-// different than the code we will use once we switch over to the IDL parser, so we'll avoid
-// asserting on the error code.
 assert.commandFailed(db.runCommand(
     {mapReduce: /bar/, map: mapFunc, reduce: reduceFunc, out: {replace: "foo", db: "test"}}));
 
@@ -123,11 +122,9 @@ if (!FixtureHelpers.isMongos(db)) {
         db.runCommand({mapReduce: "sourceView", map: mapFunc, reduce: reduceFunc, out: "foo"}),
         ErrorCodes.CommandNotSupportedOnView);
 
-    assert.commandWorked(db.adminCommand({setParameter: 1, internalQueryUseAggMapReduce: true}));
     assert.commandFailedWithCode(
         db.runCommand({mapReduce: "sourceView", map: mapFunc, reduce: reduceFunc, out: "foo"}),
         ErrorCodes.CommandNotSupportedOnView);
-    assert.commandWorked(db.adminCommand({setParameter: 1, internalQueryUseAggMapReduce: false}));
 }
 
 // Test that mapReduce fails gracefully if the query parameter is the wrong type.

@@ -27,15 +27,21 @@
  *    it in the license file.
  */
 
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+
 #include <string>
 #include <utility>
 
 #include "mongo/db/commands/map_reduce_out_options.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/util/log.h"
 
 namespace mongo {
 
 using namespace std::string_literals;
+
+// Used to occasionally log deprecation messages.
+Rarely shardedDeprecationSampler;
 
 MapReduceOutOptions MapReduceOutOptions::parseFromBSON(const BSONElement& element) {
     if (element.type() == BSONType::String) {
@@ -52,14 +58,19 @@ MapReduceOutOptions MapReduceOutOptions::parseFromBSON(const BSONElement& elemen
             return MapReduceOutOptions(boost::none, "", OutputType::InMemory, false);
         }
 
-        int allowedNFields = 3;
+        int allowedNFields = 4;
 
         const auto sharded = [&]() {
             if (const auto sharded = obj["sharded"]) {
                 uassert(ErrorCodes::BadValue,
                         "sharded field value must be boolean",
                         sharded.type() == Bool);
-                return sharded.boolean();
+                uassert(
+                    ErrorCodes::BadValue, "sharded field value must be true", sharded.boolean());
+                if (shardedDeprecationSampler.tick()) {
+                    warning() << "The out.sharded option in MapReduce is deprecated";
+                }
+                return true;
             } else {
                 --allowedNFields;
                 return false;
@@ -99,6 +110,16 @@ MapReduceOutOptions MapReduceOutOptions::parseFromBSON(const BSONElement& elemen
                 return boost::none;
             }
         }();
+
+        if (const auto nonAtomic = obj["nonAtomic"]) {
+            uassert(ErrorCodes::BadValue,
+                    "nonAtomic field value must be boolean",
+                    nonAtomic.type() == Bool);
+            uassert(
+                ErrorCodes::BadValue, "nonAtomic field value must be true", nonAtomic.boolean());
+        } else {
+            --allowedNFields;
+        }
 
         uassert(ErrorCodes::BadValue,
                 "'out' supports only output type with collection name, optional 'sharded' and "

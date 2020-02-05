@@ -155,12 +155,15 @@ void ReplicationConsistencyMarkersImpl::clearInitialSyncFlag(OperationContext* o
                                        << MinValidDocument::kMinValidTermFieldName << time.getTerm()
                                        << MinValidDocument::kAppliedThroughFieldName << time));
 
-    // We clear the initial sync flag at the 'lastAppliedOpTime'. This is unnecessary, since there
-    // should not be any stable checkpoints being taken that this write could inadvertantly enter.
-    // This 'lastAppliedOpTime' will be the first stable timestamp candidate, so it will be in the
-    // first stable checkpoint taken after initial sync. This provides more clarity than providing
-    // no timestamp.
-    update.timestamp = time.getTimestamp();
+    // As we haven't yet updated our initialDataTimestamp from
+    // Timestamp::kAllowUnstableCheckpointsSentinel to lastAppliedTimestamp, we are only allowed to
+    // take unstable checkpoints. And, this "lastAppliedTimestamp" will be the first stable
+    // checkpoint taken after initial sync. So, no way this minValid update can be part of a stable
+    // checkpoint taken earlier than lastAppliedTimestamp. So, it's safe to make it as an
+    // non-timestamped write. Also, this has to be non-timestamped write because we may have readers
+    // at lastAppliedTimestamp, commiting the storage writes before or at such timestamps is
+    // illegal.
+    update.timestamp = Timestamp();
 
     _updateMinValidDocument(opCtx, update);
 
@@ -306,6 +309,40 @@ ReplicationConsistencyMarkersImpl::_getOplogTruncateAfterPointDocument(
     auto oplogTruncateAfterPoint = OplogTruncateAfterPointDocument::parse(
         IDLParserErrorContext("OplogTruncateAfterPointDocument"), doc.getValue());
     return oplogTruncateAfterPoint;
+}
+
+void ReplicationConsistencyMarkersImpl::ensureFastCountOnOplogTruncateAfterPoint(
+    OperationContext* opCtx) {
+    LOG(3) << "Updating cached fast-count on collection " << _oplogTruncateAfterPointNss
+           << " in case an unclean shutdown caused it to become incorrect.";
+
+    auto result = _storageInterface->findSingleton(opCtx, _oplogTruncateAfterPointNss);
+
+    if (result.getStatus() == ErrorCodes::NamespaceNotFound) {
+        return;
+    }
+
+    if (result.getStatus() == ErrorCodes::CollectionIsEmpty) {
+        // The count is updated before successful commit of a write, so unclean shutdown can leave
+        // the value incorrectly set to one.
+        invariant(
+            _storageInterface->setCollectionCount(opCtx, _oplogTruncateAfterPointNss, 0).isOK());
+        return;
+    }
+
+    if (result.getStatus() == ErrorCodes::TooManyMatchingDocuments) {
+        fassert(51265,
+                {result.getStatus().code(),
+                 str::stream() << "More than one document was found in the '"
+                               << kDefaultOplogTruncateAfterPointNamespace
+                               << "' collection. Users should not write to this collection. Please "
+                                  "delete the excess documents"});
+    }
+    fassert(51266, result.getStatus());
+
+    // We can safely set a count of one. We know that we only ever write one document, and the
+    // success of findSingleton above confirms only one document exists in the collection.
+    invariant(_storageInterface->setCollectionCount(opCtx, _oplogTruncateAfterPointNss, 1).isOK());
 }
 
 void ReplicationConsistencyMarkersImpl::_upsertOplogTruncateAfterPointDocument(

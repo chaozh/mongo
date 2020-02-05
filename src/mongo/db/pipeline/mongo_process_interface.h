@@ -36,7 +36,6 @@
 #include <string>
 #include <vector>
 
-#include "mongo/base/shim.h"
 #include "mongo/client/dbclient_base.h"
 #include "mongo/db/collection_index_usage_tracker.h"
 #include "mongo/db/exec/document_value/document.h"
@@ -51,6 +50,7 @@
 #include "mongo/db/query/explain_options.h"
 #include "mongo/db/repl/oplog_entry.h"
 #include "mongo/db/resource_yielder.h"
+#include "mongo/db/storage/backup_cursor_hooks.h"
 #include "mongo/db/storage/backup_cursor_state.h"
 #include "mongo/s/chunk_version.h"
 
@@ -86,6 +86,12 @@ public:
         std::tuple<BSONObj, write_ops::UpdateModification, boost::optional<BSONObj>>;
     using BatchedObjects = std::vector<BatchObject>;
 
+    enum class UpsertType {
+        kNone,              // This operation is not an upsert.
+        kGenerateNewDoc,    // If no documents match, generate a new document using the update spec.
+        kInsertSuppliedDoc  // If no documents match, insert the document supplied in 'c.new' as-is.
+    };
+
     enum class CurrentOpConnectionsMode { kIncludeIdle, kExcludeIdle };
     enum class CurrentOpUserMode { kIncludeAll, kExcludeOthers };
     enum class CurrentOpTruncateMode { kNoTruncation, kTruncateOps };
@@ -98,14 +104,14 @@ public:
      * Factory function to create MongoProcessInterface of the right type. The implementation will
      * be installed by a lib higher up in the link graph depending on the application type.
      */
-    static MONGO_DECLARE_SHIM(
-        (OperationContext * opCtx)->std::shared_ptr<MongoProcessInterface>) create;
+    static std::shared_ptr<MongoProcessInterface> create(OperationContext* opCtx);
 
     struct MakePipelineOptions {
         MakePipelineOptions(){};
 
         bool optimize = true;
         bool attachCursorSource = true;
+        bool allowTargetingShards = true;
     };
 
     /**
@@ -119,19 +125,6 @@ public:
     };
 
     virtual ~MongoProcessInterface(){};
-
-    /**
-     * Sets the OperationContext of the DBDirectClient returned by directClient(). This method must
-     * be called after updating the 'opCtx' member of the ExpressionContext associated with the
-     * document source.
-     */
-    virtual void setOperationContext(OperationContext* opCtx) = 0;
-
-    /**
-     * Always returns a DBDirectClient. The return type in the function signature is a DBClientBase*
-     * because DBDirectClient isn't linked into mongos.
-     */
-    virtual DBClientBase* directClient() = 0;
 
     /**
      * Creates a new TransactionHistoryIterator object. Only applicable in processes which support
@@ -168,12 +161,26 @@ public:
                                             const NamespaceString& ns,
                                             BatchedObjects&& batch,
                                             const WriteConcernOptions& wc,
-                                            bool upsert,
+                                            UpsertType upsert,
                                             bool multi,
                                             boost::optional<OID> targetEpoch) = 0;
 
-    virtual CollectionIndexUsageMap getIndexStats(OperationContext* opCtx,
-                                                  const NamespaceString& ns) = 0;
+    /**
+     * Returns index usage statistics for each index on collection 'ns' along with additional
+     * information including the index specification and whether the index is currently being built.
+     *
+     * By passing true for 'addShardName', the caller can request that each document in the
+     * resulting vector includes a 'shard' field which denotes this node's shard name. It is illegal
+     * to set this option unless this node is a shardsvr.
+     */
+    virtual std::vector<Document> getIndexStats(OperationContext* opCtx,
+                                                const NamespaceString& ns,
+                                                StringData host,
+                                                bool addShardName) = 0;
+
+    virtual std::list<BSONObj> getIndexSpecs(OperationContext* opCtx,
+                                             const NamespaceString& ns,
+                                             bool includeBuildUUIDs) = 0;
 
     /**
      * Appends operation latency statistics for collection "nss" to "builder"
@@ -209,7 +216,7 @@ public:
      * ErrorCodes::CommandNotSupportedOnView if 'nss' describes a view. Future callers may want to
      * parameterize this behavior.
      */
-    virtual BSONObj getCollectionOptions(const NamespaceString& nss) = 0;
+    virtual BSONObj getCollectionOptions(OperationContext* opCtx, const NamespaceString& nss) = 0;
 
     /**
      * Performs the given rename command if the collection given by 'targetNs' has the same options
@@ -223,6 +230,24 @@ public:
         const NamespaceString& targetNs,
         const BSONObj& originalCollectionOptions,
         const std::list<BSONObj>& originalIndexes) = 0;
+
+    /**
+     * Creates a collection on the given database by running the given command. On shardsvr targets
+     * the primary shard of 'dbName'.
+     */
+    virtual void createCollection(OperationContext* opCtx,
+                                  const std::string& dbName,
+                                  const BSONObj& cmdObj) = 0;
+
+    /**
+     * Runs createIndexes on the given database for the given index specs. If running on a shardsvr
+     * this targets the primary shard of the database part of 'ns'.
+     */
+    virtual void createIndexesOnEmptyCollection(OperationContext* opCtx,
+                                                const NamespaceString& ns,
+                                                const std::vector<BSONObj>& indexSpecs) = 0;
+
+    virtual void dropCollection(OperationContext* opCtx, const NamespaceString& collection) = 0;
 
     /**
      * Parses a Pipeline from a vector of BSONObjs representing DocumentSources. The state of the
@@ -247,9 +272,14 @@ public:
      * This function takes ownership of the 'pipeline' argument as if it were a unique_ptr.
      * Changing it to a unique_ptr introduces a circular dependency on certain platforms where the
      * compiler expects to find an implementation of PipelineDeleter.
+     *
+     * If `allowTargetingShards` is true, the cursor will only be for local reads regardless of
+     * whether or not this function is called in a sharded environment.
      */
     virtual std::unique_ptr<Pipeline, PipelineDeleter> attachCursorSourceToPipeline(
-        const boost::intrusive_ptr<ExpressionContext>& expCtx, Pipeline* pipeline) = 0;
+        const boost::intrusive_ptr<ExpressionContext>& expCtx,
+        Pipeline* pipeline,
+        bool allowTargetingShards = true) = 0;
 
     /**
      * Accepts a pipeline and returns a new one which will draw input from the underlying
@@ -292,6 +322,11 @@ public:
      * Returns the name of the local shard if sharding is enabled, or an empty string.
      */
     virtual std::string getShardName(OperationContext* opCtx) const = 0;
+
+    /**
+     * Returns the "host:port" string for this node.
+     */
+    virtual std::string getHostAndPort(OperationContext* opCtx) const = 0;
 
     /**
      * Returns the fields of the document key (in order) for the collection corresponding to 'uuid',
@@ -341,7 +376,8 @@ public:
     /**
      * The following methods forward to the BackupCursorHooks decorating the ServiceContext.
      */
-    virtual BackupCursorState openBackupCursor(OperationContext* opCtx) = 0;
+    virtual BackupCursorState openBackupCursor(OperationContext* opCtx,
+                                               const StorageEngine::BackupOptions& options) = 0;
 
     virtual void closeBackupCursor(OperationContext* opCtx, const UUID& backupId) = 0;
 

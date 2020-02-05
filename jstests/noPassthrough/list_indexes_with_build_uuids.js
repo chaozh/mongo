@@ -24,17 +24,21 @@ function addTestDocuments(db) {
     assert.commandWorked(bulk.execute());
 }
 
-let replSet = new ReplSetTest({name: "indexBuilds", nodes: 2});
-let nodes = replSet.nodeList();
-
-replSet.startSet({startClean: true});
-replSet.initiate({
-    _id: "indexBuilds",
-    members: [
-        {_id: 0, host: nodes[0]},
-        {_id: 1, host: nodes[1], votes: 0, priority: 0},
+const replSet = new ReplSetTest({
+    nodes: [
+        {},
+        {
+            // Disallow elections on secondary.
+            rsConfig: {
+                priority: 0,
+                votes: 0,
+            },
+            slowms: 30000,  // Don't log slow operations on secondary. See SERVER-44821.
+        },
     ]
 });
+const nodes = replSet.startSet();
+replSet.initiate();
 
 let primary = replSet.getPrimary();
 let primaryDB = primary.getDB(dbName);
@@ -53,11 +57,20 @@ replSet.waitForAllIndexBuildsToFinish(dbName, collName);
 // Start hanging index builds on the secondary.
 IndexBuildTest.pauseIndexBuilds(secondary);
 
-// Build and hang on the second index.
-assert.commandWorked(primaryDB.runCommand({
-    createIndexes: collName,
-    indexes: [{key: {j: 1}, name: secondIndexName, background: true}],
-}));
+// With storage engines that do not support snapshot reads, the commitIndexBuild oplog entry may
+// block the listIndexes command on the secondary during oplog application because it will hold the
+// PBWM while waiting for the index build to complete in the backgroud. Therefore, we get the
+// primary to hold off on writing the commitIndexBuild oplog entry until we are ready to resume
+// index builds on the secondary.
+if (IndexBuildTest.supportsTwoPhaseIndexBuild(primary)) {
+    IndexBuildTest.pauseIndexBuilds(primary);
+}
+
+// Build and hang on the second index. This should be run in the background if we pause index
+// builds on the primary because the createIndexes command will block.
+const coll = primaryDB.getCollection(collName);
+const createIdx =
+    IndexBuildTest.startIndexBuild(primary, coll.getFullName(), {j: 1}, {name: secondIndexName});
 
 // Wait for index builds to start on the secondary.
 const opId = IndexBuildTest.waitForIndexBuildToStart(secondaryDB);
@@ -74,11 +87,20 @@ jsTest.log(indexes);
 
 assert.eq(indexes[0].name, "_id_");
 assert.eq(indexes[1].name, "first");
-assert.eq(indexes[2].spec.name, "second");
-assert(indexes[2].hasOwnProperty("buildUUID"));
 
-// Allow the secondary to finish the index build.
+if (IndexBuildTest.supportsTwoPhaseIndexBuild(secondary)) {
+    assert.eq(indexes[2].spec.name, "second");
+    assert(indexes[2].hasOwnProperty("buildUUID"));
+} else {
+    assert.eq(indexes[2].name, "second");
+}
+
+// Allow the replica set to finish the index build.
 IndexBuildTest.resumeIndexBuilds(secondary);
+
+// Wait for the index build to complete on the primary if we paused it.
+IndexBuildTest.resumeIndexBuilds(primary);
+createIdx();
 
 replSet.stopSet();
 }());

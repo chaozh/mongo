@@ -53,6 +53,12 @@ class OperationContext;
 static constexpr int kMaxNumStaleVersionRetries = 10;
 
 /**
+ * If true, this operation should block behind a catalog cache refresh. Otherwise, the operation
+ * will block skip the catalog cache refresh.
+ */
+extern const OperationContext::Decoration<bool> operationShouldBlockBehindCatalogCacheRefresh;
+
+/**
  * Constructed exclusively by the CatalogCache, contains a reference to the cached information for
  * the specified database.
  */
@@ -204,7 +210,39 @@ public:
      *
      * To be called if using the input routing info caused a StaleShardVersion to be received.
      */
-    void onStaleShardVersion(CachedCollectionRoutingInfo&&);
+    void onStaleShardVersion(CachedCollectionRoutingInfo&&, const ShardId& staleShardId);
+
+    /**
+     * Gets whether this operation should block behind a catalog cache refresh.
+     */
+    static bool getOperationShouldBlockBehindCatalogCacheRefresh(OperationContext* opCtx);
+
+    /**
+     * Sets whether this operation should block behind a catalog cache refresh.
+     */
+    static void setOperationShouldBlockBehindCatalogCacheRefresh(OperationContext* opCtx,
+                                                                 bool shouldBlock);
+
+    /**
+     * Invalidates a single shard for the current collection if:
+     *   1. The shard's id is given, and
+     *   2. The epochs given in the two chunk versions match.
+     * Otherwise, invalidates the entire collection, causing any future targetting requests to
+     * block on an upcoming catalog cache refresh.
+     */
+    void invalidateShardOrEntireCollectionEntryForShardedCollection(
+        OperationContext* opCtx,
+        const NamespaceString& nss,
+        boost::optional<ChunkVersion> wantedVersion,
+        const ChunkVersion& receivedVersion,
+        boost::optional<ShardId> shardId);
+
+    /**
+     * Non-blocking method that marks the current collection entry for the namespace as needing
+     * refresh due to an epoch change. Will cause all further targetting attempts for this
+     * namespace to block on a catalog cache refresh.
+     */
+    void onEpochChange(const NamespaceString& nss);
 
     /**
      * Throws a StaleConfigException if this catalog cache does not have an entry for the given
@@ -213,7 +251,9 @@ public:
      * epoch of 'targetCollectionVersion' when performing the check, but needs the entire target
      * version to throw a StaleConfigException.
      */
-    void checkEpochOrThrow(const NamespaceString& nss, ChunkVersion targetCollectionVersion) const;
+    void checkEpochOrThrow(const NamespaceString& nss,
+                           ChunkVersion targetCollectionVersion,
+                           const ShardId& shardId) const;
 
     /**
      * Non-blocking method, which indiscriminately causes the database entry for the specified
@@ -222,10 +262,12 @@ public:
     void invalidateDatabaseEntry(const StringData dbName);
 
     /**
-     * Non-blocking method, which indiscriminately causes the routing table for the specified
-     * namespace to be refreshed the next time getCollectionRoutingInfo is called.
+     * Non-blocking method, which invalidates the shard for the routing table for the specified
+     * namespace. If that shard is targetted in the future, getCollectionRoutingInfo will wait on a
+     * refresh.
      */
-    void invalidateShardedCollection(const NamespaceString& nss);
+    void invalidateShardForShardedCollection(const NamespaceString& nss,
+                                             const ShardId& staleShardId);
 
     /**
      * Non-blocking method, which invalidates all namespaces which contain data on the specified
@@ -265,15 +307,19 @@ private:
      * Cache entry describing a collection.
      */
     struct CollectionRoutingInfoEntry {
-        // Specifies whether this cache entry needs a refresh (in which case routingInfo should not
-        // be relied on) or it doesn't, in which case there should be a non-null routingInfo.
-        bool needsRefresh{true};
+        // Specifies whether the namespace needs a full refresh, which indicates that every shard
+        // should block on said upcoming refresh.
+        bool needsFullRefresh{true};
 
-        // Contains a notification to be waited on for the refresh to complete (only available if
-        // needsRefresh is true)
+        // Contains a notification to be waited on for the refresh to complete. The
+        // refreshCompletionNotification is only available if:
+        // 1. needsFullRefresh is true, OR
+        // 2. The operation context for a particular operation is marked as needing refresh.
         std::shared_ptr<Notification<Status>> refreshCompletionNotification;
 
-        // Contains the cached routing information (only available if needsRefresh is false)
+        // Contains the cached routing information. The routingInfo is only available if:
+        // 1. needsFullRefresh is false, AND
+        // 2. The operation context for a particular operation is marked as NOT needing refresh.
         std::shared_ptr<RoutingTableHistory> routingInfo;
     };
 
@@ -314,6 +360,34 @@ private:
                                     std::shared_ptr<CollectionRoutingInfoEntry> collEntry,
                                     NamespaceString const& nss,
                                     int refreshAttempt);
+
+    /**
+     * Marks a collection entry as needing refresh. Will create the collection entry if one does
+     * not exist. Also marks the collection as needing a full refresh, which will cause all further
+     * targeting requests against this namespace to block upon a catalog cache refresh.
+     */
+    void _createOrGetCollectionEntryAndMarkNeedsFullRefresh(const NamespaceString& nss);
+
+    /**
+     * Marks a collection entry as needing refresh. Will create the collection entry if one does
+     * not exist. Will mark the given shard ID as stale, which will cause all further targetting
+     * requests for the given shard for this namespace to block upon a catalog cache refresh.
+     */
+    void _createOrGetCollectionEntryAndMarkShardStale(const NamespaceString& nss,
+                                                      const ShardId& shardId);
+
+    /**
+     * Will create the collection entry if one does not exist.
+     */
+    void _createCollectionEntry(const NamespaceString& nss);
+
+    /**
+     * Retrieves the collection entry for the given namespace, creating the entry if one does not
+     * already exist.
+     */
+    boost::optional<CollectionRoutingInfoEntry&> _createOrGetCollectionEntry(
+        WithLock wl, const NamespaceString& nss);
+
     /**
      * Used as a flag to indicate whether or not this thread performed its own
      * refresh for certain helper functions
@@ -339,6 +413,13 @@ private:
         StatusWith<CachedCollectionRoutingInfo> statusWithInfo;
         RefreshAction actionTaken;
     };
+
+    /**
+     * Retrieves the collection routing info for this namespace after blocking on a catalog cache
+     * refresh.
+     */
+    CatalogCache::RefreshResult _getCollectionRoutingInfoWithForcedRefresh(
+        OperationContext* opctx, const NamespaceString& nss);
 
     /**
      * Helper function used when we need the refresh action taken (e.g. when we

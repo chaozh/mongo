@@ -2,7 +2,7 @@
 // Tests that documents in a sharded collection with missing shard key fields are treated as if they
 // contain an explicit null value for any missing fields.
 //
-// @tags: [requires_find_command, uses_transactions, uses_multi_shard_transactions]
+// @tags: [requires_find_command, uses_transactions, uses_multi_shard_transactions, requires_fcv_44]
 
 (function() {
 'use strict';
@@ -170,6 +170,14 @@ assert(!isOwnedBySecondaryShard({b: 1, c: 4, d: 1}));
 // This implies that upsert still requires the entire shard key to be specified in the query.
 assert.writeErrorWithCode(
     mongos.getCollection(kNsName).update({b: 1}, {$set: {c: 2}}, {upsert: true}),
+    ErrorCodes.ShardKeyNotFound);
+
+// Find and modify will not treat missing shard key values as null and require the full shard key to
+// be specified.
+assert.commandWorked(sessionColl.insert({_id: "findAndModify", a: 1}));
+assert.commandFailedWithCode(
+    sessionDB.runCommand(
+        {findAndModify: kCollName, query: {a: 1}, update: {$set: {updated: true}}}),
     ErrorCodes.ShardKeyNotFound);
 
 st.stop();

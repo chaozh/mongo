@@ -51,9 +51,9 @@ using boost::intrusive_ptr;
 using std::vector;
 
 //
-// DocumentSourceProject delegates much of its responsibilities to the ParsedAggregationProjection.
-// Most of the functional tests are testing ParsedAggregationProjection directly. These are meant as
-// simpler integration tests.
+// DocumentSourceProject delegates much of its responsibilities to the ProjectionExecutor. Most of
+// the functional tests are testing ProjectionExecutor directly. These are meant as simpler
+// integration tests.
 //
 
 // This provides access to getExpCtx(), but we'll use a different name for this test suite.
@@ -171,7 +171,7 @@ TEST_F(ProjectStageTest, InclusionShouldAddDependenciesOfIncludedAndComputedFiel
         fromjson("{a: true, x: '$b', y: {$and: ['$c','$d']}, z: {$meta: 'textScore'}}"),
         getExpCtx(),
         "$project"_sd);
-    DepsTracker dependencies(DepsTracker::kOnlyTextScore);
+    DepsTracker dependencies(DepsTracker::kAllMetadata & ~DepsTracker::kOnlyTextScore);
     ASSERT_EQUALS(DepsTracker::State::EXHAUSTIVE_FIELDS, project->getDependencies(&dependencies));
     ASSERT_EQUALS(5U, dependencies.fields.size());
 

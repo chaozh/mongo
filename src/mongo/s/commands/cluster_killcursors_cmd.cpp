@@ -42,12 +42,10 @@ class ClusterKillCursorsCmd final : public KillCursorsCmdBase {
 public:
     ClusterKillCursorsCmd() = default;
 
-    ReadConcernSupportResult supportsReadConcern(const std::string& dbName,
-                                                 const BSONObj& cmdObj,
+    ReadConcernSupportResult supportsReadConcern(const BSONObj& cmdObj,
                                                  repl::ReadConcernLevel level) const final {
         // killCursors must support read concerns in order to be run in transactions.
-        return {ReadConcernSupportResult::ReadConcern::kSupported,
-                ReadConcernSupportResult::DefaultReadConcern::kPermitted};
+        return ReadConcernSupportResult::allSupportedAndDefaultPermitted();
     }
 
     bool run(OperationContext* opCtx,

@@ -50,16 +50,27 @@
 #include "mongo/db/pipeline/document_source_unwind.h"
 #include "mongo/db/pipeline/expression.h"
 #include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/storage/storage_options.h"
 #include "mongo/util/fail_point.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
 
-/**
- * Enabling the disablePipelineOptimization fail point will stop the aggregate command from
- * attempting to optimize the pipeline or the pipeline stages. Neither DocumentSource::optimizeAt()
- * nor DocumentSource::optimize() will be attempted.
- */
+namespace {
+
+// Given a serialized document source, appends execution stats 'nReturned' and
+// 'executionTimeMillisEstimate' to it.
+Value appendExecStats(Value docSource, const CommonStats& stats) {
+    invariant(docSource.getType() == BSONType::Object);
+    MutableDocument doc(docSource.getDocument());
+    auto nReturned = static_cast<long long>(stats.advanced);
+    auto executionTimeMillisEstimate = static_cast<long long>(stats.executionTimeMillis);
+    doc.addField("nReturned", Value(nReturned));
+    doc.addField("executionTimeMillisEstimate", Value(executionTimeMillisEstimate));
+    return Value(doc.freeze());
+}
+}  // namespace
+
 MONGO_FAIL_POINT_DEFINE(disablePipelineOptimization);
 
 using boost::intrusive_ptr;
@@ -192,20 +203,6 @@ void Pipeline::validateTopLevelPipeline() const {
             }
         }
     }
-    // Make sure we aren't reading from and writing to the same namespace for a $merge.
-    if (auto mergeStage = dynamic_cast<DocumentSourceMerge*>(_sources.back().get())) {
-        const auto& outNss = mergeStage->getOutputNs();
-        stdx::unordered_set<NamespaceString> collectionNames;
-        // In order to gather only the involved namespaces which we are reading from, not the one we
-        // are writing to, skip the final stage as we know it is a $merge stage.
-        for (auto it = _sources.begin(); it != std::prev(_sources.end()); it++) {
-            (*it)->addInvolvedCollections(&collectionNames);
-        }
-        uassert(51079,
-                "Cannot use $merge to write to the same namespace being read from elsewhere in the "
-                "pipeline",
-                collectionNames.find(outNss) == collectionNames.end());
-    }
 }
 
 void Pipeline::validateFacetPipeline() const {
@@ -319,7 +316,6 @@ bool Pipeline::aggHasWriteStage(const BSONObj& cmd) {
 
 void Pipeline::detachFromOperationContext() {
     pCtx->opCtx = nullptr;
-    pCtx->mongoProcessInterface->setOperationContext(nullptr);
 
     for (auto&& source : _sources) {
         source->detachFromOperationContext();
@@ -328,7 +324,6 @@ void Pipeline::detachFromOperationContext() {
 
 void Pipeline::reattachToOperationContext(OperationContext* opCtx) {
     pCtx->opCtx = opCtx;
-    pCtx->mongoProcessInterface->setOperationContext(opCtx);
 
     for (auto&& source : _sources) {
         source->reattachToOperationContext(opCtx);
@@ -480,8 +475,17 @@ boost::optional<Document> Pipeline::getNext() {
 
 vector<Value> Pipeline::writeExplainOps(ExplainOptions::Verbosity verbosity) const {
     vector<Value> array;
-    for (SourceContainer::const_iterator it = _sources.begin(); it != _sources.end(); ++it) {
-        (*it)->serializeToArray(array, verbosity);
+    for (auto&& stage : _sources) {
+        auto beforeSize = array.size();
+        stage->serializeToArray(array, verbosity);
+        auto afterSize = array.size();
+        // Append execution stats to the serialized stage if the specified verbosity is
+        // 'executionStats' or 'allPlansExecution'.
+        invariant(afterSize - beforeSize == 1u);
+        if (verbosity >= ExplainOptions::Verbosity::kExecStats) {
+            auto serializedStage = array.back();
+            array.back() = appendExecStats(serializedStage, stage->getCommonStats());
+        }
     }
     return array;
 }
@@ -500,14 +504,14 @@ void Pipeline::addFinalSource(intrusive_ptr<DocumentSource> source) {
     _sources.push_back(source);
 }
 
-DepsTracker Pipeline::getDependencies(QueryMetadataBitSet metadataAvailable) const {
-    DepsTracker deps(metadataAvailable);
+DepsTracker Pipeline::getDependencies(QueryMetadataBitSet unavailableMetadata) const {
+    DepsTracker deps(unavailableMetadata);
     const bool scopeHasVariables = pCtx->variablesParseState.hasDefinedVariables();
     bool skipFieldsAndMetadataDeps = false;
     bool knowAllFields = false;
     bool knowAllMeta = false;
     for (auto&& source : _sources) {
-        DepsTracker localDeps(deps.getMetadataAvailable());
+        DepsTracker localDeps(deps.getUnavailableMetadata());
         DepsTracker::State status = source->getDependencies(&localDeps);
 
         deps.vars.insert(localDeps.vars.begin(), localDeps.vars.end());
@@ -546,7 +550,7 @@ DepsTracker Pipeline::getDependencies(QueryMetadataBitSet metadataAvailable) con
     if (!knowAllFields)
         deps.needWholeDocument = true;  // don't know all fields we need
 
-    if (metadataAvailable[DocumentMetadataFields::kTextScore]) {
+    if (!unavailableMetadata[DocumentMetadataFields::kTextScore]) {
         // If there is a text score, assume we need to keep it if we can't prove we don't. If we are
         // the first half of a pipeline which has been split, future stages might need it.
         if (!knowAllMeta) {
@@ -571,7 +575,7 @@ Status Pipeline::_pipelineCanRunOnMongoS() const {
         const bool mustWriteToDisk =
             (constraints.diskRequirement == DiskUseRequirement::kWritesPersistentData);
         const bool mayWriteTmpDataAndDiskUseIsAllowed =
-            (pCtx->allowDiskUse &&
+            (pCtx->allowDiskUse && !storageGlobalParams.readOnly &&
              constraints.diskRequirement == DiskUseRequirement::kWritesTmpData);
         const bool needsDisk = (mustWriteToDisk || mayWriteTmpDataAndDiskUseIsAllowed);
 

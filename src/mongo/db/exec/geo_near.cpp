@@ -245,7 +245,7 @@ static R2Annulus twoDDistanceBounds(const GeoNearParams& nearParams,
         // Reset the full bounds based on our index bounds
         GeoHashConverter::Parameters hashParams;
         Status status = GeoHashConverter::parseParameters(twoDIndex->infoObj(), &hashParams);
-        invariant(status.isOK());  // The index status should always be valid
+        invariantStatusOK(status);  // The index status should always be valid
 
         // The biggest distance possible in this indexed collection is the diagonal of the
         // square indexed region.
@@ -272,7 +272,7 @@ GeoNear2DStage::DensityEstimator::DensityEstimator(PlanStage::Children* children
     GeoHashConverter::Parameters hashParams;
     Status status = GeoHashConverter::parseParameters(std::move(infoObj), &hashParams);
     // The index status should always be valid.
-    invariant(status.isOK());
+    invariantStatusOK(status);
 
     _converter.reset(new GeoHashConverter(hashParams));
     _centroidCell = _converter->hash(_nearParams->nearQuery->centroid->oldPoint);
@@ -420,8 +420,8 @@ PlanStage::StageState GeoNear2DStage::initialize(OperationContext* opCtx,
 
         // Estimator finished its work, we need to finish initialization too.
         if (SPHERE == _nearParams.nearQuery->centroid->crs) {
-            // Estimated distance is in degrees, convert it to meters.
-            _boundsIncrement = deg2rad(estimatedDistance) * kRadiusOfEarthInMeters * 3;
+            // Estimated distance is in degrees, convert it to meters multiplied by 3.
+            _boundsIncrement = (estimatedDistance * kRadiusOfEarthInMeters * 3) * (M_PI / 180);
             // Limit boundsIncrement to ~20KM, so that the first circle won't be too aggressive.
             _boundsIncrement = std::min(_boundsIncrement, kMaxEarthDistanceInMeters / 1000.0);
         } else {
@@ -473,7 +473,7 @@ public:
     TwoDPtInAnnulusExpression(const R2Annulus& annulus, StringData twoDPath)
         : LeafMatchExpression(INTERNAL_2D_POINT_IN_ANNULUS, twoDPath), _annulus(annulus) {}
 
-    void serialize(BSONObjBuilder* out) const final {
+    void serialize(BSONObjBuilder* out, bool includePath) const final {
         out->append("TwoDPtInAnnulusExpression", true);
     }
 
@@ -538,7 +538,7 @@ static double min2DBoundsIncrement(const GeoNearExpression& query,
                                    const IndexDescriptor* twoDIndex) {
     GeoHashConverter::Parameters hashParams;
     Status status = GeoHashConverter::parseParameters(twoDIndex->infoObj(), &hashParams);
-    invariant(status.isOK());  // The index status should always be valid
+    invariantStatusOK(status);  // The index status should always be valid
     GeoHashConverter hasher(hashParams);
 
     // The hasher error is the diagonal of a 2D hash region - it's generally not helpful

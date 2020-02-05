@@ -35,6 +35,7 @@
 
 #include "mongo/base/init.h"
 #include "mongo/base/owned_pointer_vector.h"
+#include "mongo/db/exec/projection_executor_utils.h"
 #include "mongo/db/index/wildcard_key_generator.h"
 #include "mongo/db/matcher/expression.h"
 #include "mongo/db/matcher/expression_algo.h"
@@ -118,7 +119,7 @@ void PlanCacheIndexabilityState::processWildcardIndex(const CoreIndexInfo& cii) 
     invariant(cii.type == IndexType::INDEX_WILDCARD);
 
     _wildcardIndexDiscriminators.emplace_back(
-        cii.wildcardProjection, cii.identifier.catalogName, cii.filterExpr, cii.collator);
+        cii.wildcardProjection->exec(), cii.identifier.catalogName, cii.filterExpr, cii.collator);
 }
 
 void PlanCacheIndexabilityState::processIndexCollation(const std::string& indexName,
@@ -148,7 +149,8 @@ IndexToDiscriminatorMap PlanCacheIndexabilityState::buildWildcardDiscriminators(
 
     IndexToDiscriminatorMap ret;
     for (auto&& wildcardDiscriminator : _wildcardIndexDiscriminators) {
-        if (wildcardDiscriminator.projectionExec->applyProjectionToOneField(path)) {
+        if (projection_executor_utils::applyProjectionToOneField(
+                wildcardDiscriminator.projectionExec, path)) {
             CompositeIndexabilityDiscriminator& cid = ret[wildcardDiscriminator.catalogName];
 
             // We can use these 'shallow' functions because the code building the plan cache key

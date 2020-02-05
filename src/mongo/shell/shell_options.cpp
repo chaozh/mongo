@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault;
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
 
 #include "mongo/platform/basic.h"
 
@@ -62,6 +62,9 @@ using std::vector;
 
 // SERVER-36807: Limit --setShellParameter to SetParameters we know we want to expose.
 const std::set<std::string> kSetShellParameterWhitelist = {
+    "awsEC2InstanceMetadataUrl",
+    "awsECSInstanceMetadataUrl",
+    "ocspEnabled",
     "disabledSecureAllocatorDomains",
     "newLineAfterPasswordPromptForTest",
     "skipShellCursorFinalize",
@@ -109,7 +112,7 @@ Status storeMongoShellOptions(const moe::Environment& params,
     }
 
     if (params.count("verbose")) {
-        logger::globalLogDomain()->setMinimumLoggedSeverity(logger::LogSeverity::Debug(1));
+        setMinimumLoggedSeverity(logger::LogSeverity::Debug(1));
     }
 
     // `objcheck` option is part of `serverGlobalParams` to avoid making common parts depend upon
@@ -338,7 +341,24 @@ Status storeMongoShellOptions(const moe::Environment& params,
     }
 
     if (params.count("logv2")) {
-        shellGlobalParams.logV2 = true;
+        logV2Set(true);
+    }
+
+    if (params.count("logFormat")) {
+        std::string formatStr = params["logFormat"].as<string>();
+        if (!logV2Enabled() && formatStr != "default")
+            return Status(ErrorCodes::BadValue, "Can only use logFormat if logv2 is enabled.");
+        if (formatStr == "default") {
+            shellGlobalParams.logFormat = logv2::LogFormat::kDefault;
+        } else if (formatStr == "text") {
+            shellGlobalParams.logFormat = logv2::LogFormat::kText;
+        } else if (formatStr == "json") {
+            shellGlobalParams.logFormat = logv2::LogFormat::kJson;
+        } else {
+            return Status(ErrorCodes::BadValue,
+                          "Unsupported value for logFormat: " + formatStr +
+                              ". Valid values are: default, text or json");
+        }
     }
 
     return Status::OK();

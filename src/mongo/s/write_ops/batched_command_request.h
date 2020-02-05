@@ -92,6 +92,10 @@ public:
         _writeConcern = writeConcern.getOwned();
     }
 
+    void unsetWriteConcern() {
+        _writeConcern = boost::none;
+    }
+
     bool hasWriteConcern() const {
         return _writeConcern.is_initialized();
     }
@@ -196,7 +200,7 @@ private:
     boost::optional<DatabaseVersion> _dbVersion;
 
     boost::optional<BSONObj> _writeConcern;
-    bool _allowImplicitCollectionCreation = false;
+    bool _allowImplicitCollectionCreation = true;
 };
 
 /**

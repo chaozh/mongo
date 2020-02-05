@@ -74,7 +74,7 @@ public:
     virtual std::unique_ptr<SortedDataInterface> getSortedDataInterface(
         OperationContext* opCtx, StringData ident, const IndexDescriptor* desc);
 
-    virtual Status dropIdent(OperationContext* opCtx, StringData ident) {
+    virtual Status dropIdent(OperationContext* opCtx, RecoveryUnit* ru, StringData ident) {
         return Status::OK();
     }
 
@@ -139,8 +139,8 @@ public:
 
     virtual void endBackup(OperationContext* opCtx) {}
 
-    virtual StatusWith<std::vector<StorageEngine::BackupBlock>> beginNonBlockingBackup(
-        OperationContext* opCtx) override;
+    virtual StatusWith<StorageEngine::BackupInformation> beginNonBlockingBackup(
+        OperationContext* opCtx, const StorageEngine::BackupOptions& options) override;
 
     virtual void endNonBlockingBackup(OperationContext* opCtx) override {}
 

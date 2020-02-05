@@ -72,6 +72,8 @@ public:
 
     virtual void shutdown(OperationContext* opCtx);
 
+    void markAsCleanShutdownIfPossible(OperationContext* opCtx) override;
+
     virtual void appendDiagnosticBSON(BSONObjBuilder* bob) override {}
 
     virtual const ReplSettings& getSettings() const;
@@ -176,9 +178,6 @@ public:
 
     virtual Status processReplSetGetStatus(BSONObjBuilder*, ReplSetGetStatusResponseStyle);
 
-    void fillIsMasterForReplSet(IsMasterResponse* result,
-                                const SplitHorizon::Parameters& horizon) override;
-
     virtual void appendSlaveInfoData(BSONObjBuilder* result);
 
     void appendConnectionStats(executor::ConnectionPoolStats* stats) const override;
@@ -256,7 +255,7 @@ public:
 
     virtual bool getWriteConcernMajorityShouldJournal();
 
-    virtual long long getTerm();
+    virtual long long getTerm() const;
 
     virtual Status updateTerm(OperationContext* opCtx, long long term);
 
@@ -319,6 +318,18 @@ public:
         const size_t numOpsRunning) const override;
 
     virtual void setCanAcceptNonLocalWrites(bool canAcceptNonLocalWrites);
+
+    virtual TopologyVersion getTopologyVersion() const;
+
+    virtual void incrementTopologyVersion(OperationContext* opCtx) override;
+
+    virtual std::shared_ptr<const IsMasterResponse> awaitIsMasterResponse(
+        OperationContext* opCtx,
+        const SplitHorizon::Parameters& horizonParams,
+        boost::optional<TopologyVersion> clientTopologyVersion,
+        boost::optional<Date_t> deadline) const override;
+
+    virtual OpTime getLatestWriteOpTime(OperationContext* opCtx) const override;
 
 private:
     ServiceContext* const _service;

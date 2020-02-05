@@ -67,9 +67,9 @@ ClusterClientCursorImpl::ClusterClientCursorImpl(OperationContext* opCtx,
       _opCtx(opCtx),
       _createdDate(opCtx->getServiceContext()->getPreciseClockSource()->now()),
       _lastUseDate(_createdDate) {
-    dassert(!_params.compareWholeSortKey ||
+    dassert(!_params.compareWholeSortKeyOnRouter ||
             SimpleBSONObjComparator::kInstance.evaluate(
-                _params.sort == AsyncResultsMerger::kWholeSortKeySortPattern));
+                _params.sortToApplyOnRouter == AsyncResultsMerger::kWholeSortKeySortPattern));
 }
 
 ClusterClientCursorImpl::ClusterClientCursorImpl(OperationContext* opCtx,
@@ -82,9 +82,9 @@ ClusterClientCursorImpl::ClusterClientCursorImpl(OperationContext* opCtx,
       _opCtx(opCtx),
       _createdDate(opCtx->getServiceContext()->getPreciseClockSource()->now()),
       _lastUseDate(_createdDate) {
-    dassert(!_params.compareWholeSortKey ||
+    dassert(!_params.compareWholeSortKeyOnRouter ||
             SimpleBSONObjComparator::kInstance.evaluate(
-                _params.sort == AsyncResultsMerger::kWholeSortKeySortPattern));
+                _params.sortToApplyOnRouter == AsyncResultsMerger::kWholeSortKeySortPattern));
 }
 
 StatusWith<ClusterQueryResult> ClusterClientCursorImpl::next(
@@ -143,6 +143,10 @@ BSONObj ClusterClientCursorImpl::getOriginatingCommand() const {
 
 const PrivilegeVector& ClusterClientCursorImpl::getOriginatingPrivileges() const& {
     return _params.originatingPrivileges;
+}
+
+bool ClusterClientCursorImpl::partialResultsReturned() const {
+    return _root->partialResultsReturned();
 }
 
 std::size_t ClusterClientCursorImpl::getNumRemotes() const {
@@ -209,7 +213,7 @@ std::unique_ptr<RouterExecStage> ClusterClientCursorImpl::buildMergerPlan(
     OperationContext* opCtx,
     std::shared_ptr<executor::TaskExecutor> executor,
     ClusterClientCursorParams* params) {
-    const auto skip = params->skip;
+    const auto skip = params->skipToApplyOnRouter;
     const auto limit = params->limit;
 
     std::unique_ptr<RouterExecStage> root =
@@ -223,7 +227,7 @@ std::unique_ptr<RouterExecStage> ClusterClientCursorImpl::buildMergerPlan(
         root = std::make_unique<RouterStageLimit>(opCtx, std::move(root), *limit);
     }
 
-    const bool hasSort = !params->sort.isEmpty();
+    const bool hasSort = !params->sortToApplyOnRouter.isEmpty();
     if (hasSort) {
         // Strip out the sort key after sorting.
         root = std::make_unique<RouterStageRemoveMetadataFields>(

@@ -31,6 +31,7 @@
 
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/simple_bsonobj_comparator.h"
+#include "mongo/db/catalog/collection_options.h"
 #include "mongo/db/logical_session_id.h"
 #include "mongo/db/repl/apply_ops_gen.h"
 #include "mongo/db/repl/oplog_entry_gen.h"
@@ -38,6 +39,11 @@
 
 namespace mongo {
 namespace repl {
+
+/**
+ * The first oplog entry is a no-op with this message in its "msg" field.
+ */
+constexpr auto kInitiatingSetMsg = "initiating set"_sd;
 
 /**
  * A parsed DurableReplOperation along with information about the operation that should only exist
@@ -84,6 +90,18 @@ public:
     static ReplOperation makeDeleteOperation(const NamespaceString& nss,
                                              boost::optional<UUID> uuid,
                                              const BSONObj& docToDelete);
+
+    static ReplOperation makeCreateCommand(const NamespaceString nss,
+                                           const mongo::CollectionOptions& options,
+                                           const BSONObj& idIndex);
+
+    static ReplOperation makeCreateIndexesCommand(const NamespaceString nss,
+                                                  CollectionUUID uuid,
+                                                  const BSONObj& indexDoc);
+
+    static BSONObj makeCreateCollCmdObj(const NamespaceString& collectionName,
+                                        const mongo::CollectionOptions& options,
+                                        const BSONObj& idIndex);
 
     static StatusWith<MutableOplogEntry> parse(const BSONObj& object);
 
@@ -208,6 +226,8 @@ public:
 
     // Make helper functions accessible.
     using MutableOplogEntry::getOpTime;
+    using MutableOplogEntry::makeCreateCommand;
+    using MutableOplogEntry::makeCreateIndexesCommand;
     using MutableOplogEntry::makeDeleteOperation;
     using MutableOplogEntry::makeInsertOperation;
     using MutableOplogEntry::makeUpdateOperation;
@@ -295,6 +315,12 @@ public:
         return getCommandType() == OplogEntry::CommandType::kApplyOps && !shouldPrepare() &&
             !isPartialTransaction() && !getObject().getBoolField("prepare");
     }
+
+    /**
+     * Returns whether the oplog entry represents an applyOps with a commnd inside. This will occur
+     * if a multi-document transaction performs a command.
+     */
+    bool isTransactionWithCommand() const;
 
     /**
      * Returns if the oplog entry is for a CRUD operation.

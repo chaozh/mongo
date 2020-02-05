@@ -116,12 +116,12 @@ public:
         configShardCollRequest.setKey(shardCollRequest.getKey());
         configShardCollRequest.setUnique(shardCollRequest.getUnique());
         configShardCollRequest.setNumInitialChunks(shardCollRequest.getNumInitialChunks());
+        configShardCollRequest.setPresplitHashedZones(shardCollRequest.getPresplitHashedZones());
         configShardCollRequest.setCollation(shardCollRequest.getCollation());
 
         // Invalidate the routing table cache entry for this collection so that we reload the
         // collection the next time it's accessed, even if we receive a failure, e.g. NetworkError.
-        ON_BLOCK_EXIT(
-            [opCtx, nss] { Grid::get(opCtx)->catalogCache()->invalidateShardedCollection(nss); });
+        ON_BLOCK_EXIT([opCtx, nss] { Grid::get(opCtx)->catalogCache()->onEpochChange(nss); });
 
         auto configShard = Grid::get(opCtx)->shardRegistry()->getConfigShard();
         auto cmdResponse = uassertStatusOK(configShard->runCommandWithFixedRetryAttempts(
@@ -129,7 +129,8 @@ public:
             ReadPreferenceSetting(ReadPreference::PrimaryOnly),
             "admin",
             CommandHelpers::appendMajorityWriteConcern(
-                CommandHelpers::appendPassthroughFields(cmdObj, configShardCollRequest.toBSON())),
+                CommandHelpers::appendPassthroughFields(cmdObj, configShardCollRequest.toBSON()),
+                opCtx->getWriteConcern()),
             Shard::RetryPolicy::kIdempotent));
 
         CommandHelpers::filterCommandReplyForPassthrough(cmdResponse.response, &result);

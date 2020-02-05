@@ -27,14 +27,59 @@
  *    it in the license file.
  */
 
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+
 #include "mongo/platform/basic.h"
 
+#include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/rwc_defaults_commands_gen.h"
+#include "mongo/db/dbdirectclient.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/ops/write_ops.h"
 #include "mongo/db/read_write_concern_defaults.h"
+#include "mongo/db/repl/read_concern_args.h"
+#include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/rw_concern_default_gen.h"
+#include "mongo/rpc/get_status_from_command_result.h"
+#include "mongo/util/log.h"
 
 namespace mongo {
 namespace {
+
+/**
+ * Replaces the persisted default read/write concern document with a new one representing the given
+ * defaults. Waits for the write concern on the given operation context to be satisfied before
+ * returning.
+ */
+void updatePersistedDefaultRWConcernDocument(OperationContext* opCtx, const RWConcernDefault& rw) {
+    DBDirectClient client(opCtx);
+    const auto commandResponse = client.runCommand([&] {
+        write_ops::Update updateOp(NamespaceString::kConfigSettingsNamespace);
+        updateOp.setUpdates({[&] {
+            write_ops::UpdateOpEntry entry;
+            entry.setQ(BSON("_id" << ReadWriteConcernDefaults::kPersistedDocumentId));
+            // Note the _id is propagated from the query into the upserted document.
+            entry.setU(rw.toBSON());
+            entry.setUpsert(true);
+            return entry;
+        }()});
+        return updateOp.serialize(
+            BSON(WriteConcernOptions::kWriteConcernField << opCtx->getWriteConcern().toBSON()));
+    }());
+    uassertStatusOK(getStatusFromWriteCommandReply(commandResponse->getCommandReply()));
+}
+
+void assertNotStandaloneOrShardServer(OperationContext* opCtx, StringData cmdName) {
+    const auto replCoord = repl::ReplicationCoordinator::get(opCtx);
+    uassert(51300,
+            str::stream() << "'" << cmdName << "' is not supported on standalone nodes.",
+            replCoord->isReplEnabled());
+
+    uassert(51301,
+            str::stream() << "'" << cmdName << "' is not supported on shard nodes.",
+            serverGlobalParams.clusterRole != ClusterRole::ShardServer);
+}
 
 class SetDefaultRWConcernCommand : public TypedCommand<SetDefaultRWConcernCommand> {
 public:
@@ -56,17 +101,24 @@ public:
         using InvocationBase::InvocationBase;
 
         auto typedRun(OperationContext* opCtx) {
-            auto rc = request().getDefaultReadConcern();
-            auto wc = request().getDefaultWriteConcern();
-            uassert(ErrorCodes::BadValue,
-                    str::stream() << "At least one of the \""
-                                  << SetDefaultRWConcern::kDefaultReadConcernFieldName << "\" or \""
-                                  << SetDefaultRWConcern::kDefaultWriteConcernFieldName
-                                  << "\" fields must be present",
-                    rc || wc);
+            assertNotStandaloneOrShardServer(opCtx, SetDefaultRWConcern::kCommandName);
+
+            uassert(ErrorCodes::CommandNotSupported,
+                    str::stream() << "'" << SetDefaultRWConcern::kCommandName
+                                  << "' is only supported in feature compatibility version 4.4",
+                    serverGlobalParams.featureCompatibility.getVersion() ==
+                        ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo44);
 
             auto& rwcDefaults = ReadWriteConcernDefaults::get(opCtx->getServiceContext());
-            return rwcDefaults.setConcerns(opCtx, rc, wc);
+            auto newDefaults = rwcDefaults.generateNewConcerns(
+                opCtx, request().getDefaultReadConcern(), request().getDefaultWriteConcern());
+
+            updatePersistedDefaultRWConcernDocument(opCtx, newDefaults);
+            log() << "successfully set RWC defaults to " << newDefaults.toBSON();
+
+            // Refresh to populate the cache with the latest defaults.
+            rwcDefaults.refreshIfNecessary(opCtx);
+            return rwcDefaults.getDefault(opCtx);
         }
 
     private:
@@ -74,8 +126,12 @@ public:
             return true;
         }
 
-        void doCheckAuthorization(OperationContext*) const override {
-            // TODO: add and use privilege action
+        void doCheckAuthorization(OperationContext* opCtx) const override {
+            uassert(ErrorCodes::Unauthorized,
+                    "Unauthorized",
+                    AuthorizationSession::get(opCtx->getClient())
+                        ->isAuthorizedForPrivilege(Privilege{ResourcePattern::forClusterResource(),
+                                                             ActionType::setDefaultRWConcern}));
         }
 
         NamespaceString ns() const override {
@@ -104,8 +160,18 @@ public:
         using InvocationBase::InvocationBase;
 
         auto typedRun(OperationContext* opCtx) {
+            assertNotStandaloneOrShardServer(opCtx, GetDefaultRWConcern::kCommandName);
+
             auto& rwcDefaults = ReadWriteConcernDefaults::get(opCtx->getServiceContext());
-            return rwcDefaults.getDefault();
+            if (request().getInMemory() && *request().getInMemory()) {
+                auto rwc = rwcDefaults.getDefault(opCtx);
+                rwc.setInMemory(true);
+                return rwc;
+            }
+
+            // Force a refresh to find the most recent defaults, then return them.
+            rwcDefaults.refreshIfNecessary(opCtx);
+            return rwcDefaults.getDefault(opCtx);
         }
 
     private:
@@ -113,8 +179,12 @@ public:
             return false;
         }
 
-        void doCheckAuthorization(OperationContext*) const override {
-            // TODO: add and use privilege action
+        void doCheckAuthorization(OperationContext* opCtx) const override {
+            uassert(ErrorCodes::Unauthorized,
+                    "Unauthorized",
+                    AuthorizationSession::get(opCtx->getClient())
+                        ->isAuthorizedForPrivilege(Privilege{ResourcePattern::forClusterResource(),
+                                                             ActionType::getDefaultRWConcern}));
         }
 
         NamespaceString ns() const override {

@@ -40,6 +40,7 @@
 #include "mongo/db/s/chunk_splitter.h"
 #include "mongo/db/s/database_sharding_state.h"
 #include "mongo/db/s/migration_source_manager.h"
+#include "mongo/db/s/migration_util.h"
 #include "mongo/db/s/range_deletion_task_gen.h"
 #include "mongo/db/s/shard_identity_rollback_notifier.h"
 #include "mongo/db/s/sharding_initialization_mongod.h"
@@ -187,6 +188,19 @@ void incrementChunkOnInsertOrUpdate(OperationContext* opCtx,
     }
 }
 
+/**
+ * Aborts any ongoing migration for the given namespace. Should only be called when observing index
+ * operations.
+ */
+void abortOngoingMigration(OperationContext* opCtx, const NamespaceString nss) {
+    auto* const csr = CollectionShardingRuntime::get(opCtx, nss);
+    auto csrLock = CollectionShardingRuntime::CSRLock::lockShared(opCtx, csr);
+    auto msm = MigrationSourceManager::get(csr, csrLock);
+    if (msm) {
+        msm->abortDueToConflictingIndexOperation();
+    }
+}
+
 }  // namespace
 
 ShardServerOpObserver::ShardServerOpObserver() = default;
@@ -216,6 +230,14 @@ void ShardServerOpObserver::onInserts(OperationContext* opCtx,
                                                                     std::move(shardIdentityDoc)));
                 }
             }
+        }
+
+        if (nss == NamespaceString::kRangeDeletionNamespace) {
+            auto deletionTask = RangeDeletionTask::parse(
+                IDLParserErrorContext("ShardServerOpObserver"), insertedDoc);
+
+            if (!deletionTask.getPending())
+                migrationutil::submitRangeDeletionTask(opCtx, deletionTask);
         }
 
         if (metadata->isSharded()) {
@@ -272,8 +294,8 @@ void ShardServerOpObserver::onUpdate(OperationContext* opCtx, const OplogUpdateE
             // Need the WUOW to retain the lock for CollectionVersionLogOpHandler::commit()
             AutoGetCollection autoColl(opCtx, updatedNss, MODE_IX);
 
-            if (setField.hasField(ShardCollectionType::kLastRefreshedCollectionVersionFieldName) &&
-                !setField.getBoolField("refreshing")) {
+            auto refreshingField = setField.getField(ShardCollectionType::kRefreshingFieldName);
+            if (refreshingField.isBoolean() && !refreshingField.boolean()) {
                 opCtx->recoveryUnit()->registerChange(
                     std::make_unique<CollectionVersionLogOpHandler>(opCtx, updatedNss));
             }
@@ -334,27 +356,7 @@ void ShardServerOpObserver::onUpdate(OperationContext* opCtx, const OplogUpdateE
             auto deletionTask = RangeDeletionTask::parse(
                 IDLParserErrorContext("ShardServerOpObserver"), args.updateArgs.updatedDoc);
 
-            const auto whenToClean = deletionTask.getWhenToClean() == CleanWhenEnum::kNow
-                ? CollectionShardingRuntime::kNow
-                : CollectionShardingRuntime::kDelayed;
-
-            AutoGetCollection autoColl(opCtx, deletionTask.getNss(), MODE_IS);
-
-            if (!autoColl.getCollection() ||
-                autoColl.getCollection()->uuid() !=
-                    UUID::parse(deletionTask.getCollectionUuid().toString())) {
-                LOG(0) << "Collection UUID doesn't match the one marked for deletion: "
-                       << autoColl.getCollection()->uuid()
-                       << " != " << deletionTask.getCollectionUuid();
-            } else {
-                LOG(0) << "Scheduling range " << deletionTask.getRange() << " in namespace "
-                       << deletionTask.getNss() << " for deletion.";
-
-                auto notification = CollectionShardingRuntime::get(opCtx, deletionTask.getNss())
-                                        ->cleanUpRange(*deletionTask.getRange(), whenToClean);
-
-                notification.abandon();
-            }
+            migrationutil::submitRangeDeletionTask(opCtx, deletionTask);
         }
     }
 
@@ -439,5 +441,37 @@ repl::OpTime ShardServerOpObserver::onDropCollection(OperationContext* opCtx,
 
     return {};
 }
+
+void ShardServerOpObserver::onStartIndexBuild(OperationContext* opCtx,
+                                              const NamespaceString& nss,
+                                              CollectionUUID collUUID,
+                                              const UUID& indexBuildUUID,
+                                              const std::vector<BSONObj>& indexes,
+                                              bool fromMigrate) {
+    abortOngoingMigration(opCtx, nss);
+};
+
+void ShardServerOpObserver::onStartIndexBuildSinglePhase(OperationContext* opCtx,
+                                                         const NamespaceString& nss) {
+    abortOngoingMigration(opCtx, nss);
+}
+
+void ShardServerOpObserver::onDropIndex(OperationContext* opCtx,
+                                        const NamespaceString& nss,
+                                        OptionalCollectionUUID uuid,
+                                        const std::string& indexName,
+                                        const BSONObj& indexInfo) {
+    abortOngoingMigration(opCtx, nss);
+};
+
+void ShardServerOpObserver::onCollMod(OperationContext* opCtx,
+                                      const NamespaceString& nss,
+                                      OptionalCollectionUUID uuid,
+                                      const BSONObj& collModCmd,
+                                      const CollectionOptions& oldCollOptions,
+                                      boost::optional<TTLCollModInfo> ttlInfo) {
+    abortOngoingMigration(opCtx, nss);
+};
+
 
 }  // namespace mongo

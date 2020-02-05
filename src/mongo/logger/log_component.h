@@ -71,7 +71,7 @@ public:
         kTracking,
         kTransaction,
         kConnectionPool,
-        kNumLogComponents
+        kNumLogComponents,
     };
 
     /* implicit */ LogComponent(Value value) : _value(value) {}

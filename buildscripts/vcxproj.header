@@ -6,7 +6,7 @@
      writes it back out you will use the comments and semi-neat formatting below.
 -->
 
-<Project DefaultTargets="Build" ToolsVersion="15.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+<Project DefaultTargets="Build" ToolsVersion="%ToolsVersion%" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <ItemGroup Label="ProjectConfigurations">
     <ProjectConfiguration Include="Debug|x64">
       <Configuration>Debug</Configuration>
@@ -19,15 +19,15 @@
   </ItemGroup>
 
   <PropertyGroup Label="Globals">
-    <VCProjectVersion>15.0</VCProjectVersion>
+    <VCProjectVersion>%ToolsVersion%</VCProjectVersion>
     <ProjectName>%_TARGET_%</ProjectName>
     <RootNamespace>mongod</RootNamespace>
-    <PlatformToolset>v141</PlatformToolset>
+    <PlatformToolset>%PlatformToolset%</PlatformToolset>
     <UseNativeEnvironment>true</UseNativeEnvironment>
     <!-- <ProjectGuid>{215B2D68-0A70-4D10-8E75-B31010C62A91}</ProjectGuid> -->
     <Keyword>MakeFileProj</Keyword>
     <RootNamespace>%_TARGET_%</RootNamespace>
-    <WindowsTargetPlatformVersion>10.0.17763.0</WindowsTargetPlatformVersion>
+    <WindowsTargetPlatformVersion>%WindowsTargetPlatformVersion%</WindowsTargetPlatformVersion>
   </PropertyGroup>
 
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
@@ -108,6 +108,7 @@
     <NMakeReBuildCommandLine>not_supported</NMakeReBuildCommandLine>
     <NMakePreprocessorDefinitions>MONGO_SSL;WIN32;_DEBUG;$(NMakePreprocessorDefinitions)</NMakePreprocessorDefinitions>
     <NMakeIncludeSearchPath>$(NMakeIncludeSearchPath)</NMakeIncludeSearchPath>
+    <AdditionalOptions>/std:c++latest</AdditionalOptions>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)'=='Release'">
     <NMakeBuildCommandLine>ninja.exe -k 0 core</NMakeBuildCommandLine>
@@ -116,6 +117,7 @@
     <NMakeReBuildCommandLine>not_supported</NMakeReBuildCommandLine>
     <NMakePreprocessorDefinitions>not_supported;WIN32;NDEBUG;$(NMakePreprocessorDefinitions)</NMakePreprocessorDefinitions>
     <NMakeIncludeSearchPath>$(NMakeIncludeSearchPath)</NMakeIncludeSearchPath>
+    <AdditionalOptions>/std:c++latest</AdditionalOptions>
   </PropertyGroup>
 
    <!-- SPECIFICS -->

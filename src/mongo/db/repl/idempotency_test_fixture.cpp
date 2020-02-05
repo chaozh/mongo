@@ -598,8 +598,13 @@ CollectionState IdempotencyTest::validate(const NamespaceString& nss) {
         ValidateResults validateResults;
         BSONObjBuilder bob;
 
-        ASSERT_OK(CollectionValidation::validate(
-            _opCtx.get(), nss, /*fullValidate=*/true, false, &validateResults, &bob));
+        ASSERT_OK(
+            CollectionValidation::validate(_opCtx.get(),
+                                           nss,
+                                           CollectionValidation::ValidateOptions::kFullValidation,
+                                           false,
+                                           &validateResults,
+                                           &bob));
         ASSERT_TRUE(validateResults.valid);
     }
 
@@ -609,12 +614,14 @@ CollectionState IdempotencyTest::validate(const NamespaceString& nss) {
     std::string dataHash = computeDataHash(collection);
 
     auto durableCatalog = DurableCatalog::get(_opCtx.get());
-    auto collectionOptions = durableCatalog->getCollectionOptions(_opCtx.get(), collection->ns());
+    auto collectionOptions =
+        durableCatalog->getCollectionOptions(_opCtx.get(), collection->getCatalogId());
     std::vector<std::string> allIndexes;
     BSONObjSet indexSpecs = SimpleBSONObjComparator::kInstance.makeBSONObjSet();
-    durableCatalog->getAllIndexes(_opCtx.get(), collection->ns(), &allIndexes);
+    durableCatalog->getAllIndexes(_opCtx.get(), collection->getCatalogId(), &allIndexes);
     for (auto const& index : allIndexes) {
-        indexSpecs.insert(durableCatalog->getIndexSpec(_opCtx.get(), collection->ns(), index));
+        indexSpecs.insert(
+            durableCatalog->getIndexSpec(_opCtx.get(), collection->getCatalogId(), index));
     }
     ASSERT_EQUALS(indexSpecs.size(), allIndexes.size());
 

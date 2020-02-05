@@ -40,6 +40,7 @@
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/index_timestamp_helper.h"
 #include "mongo/db/catalog/multi_index_block_gen.h"
+#include "mongo/db/catalog/uncommitted_collections.h"
 #include "mongo/db/client.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/index/multikey_paths.h"
@@ -116,8 +117,7 @@ void MultiIndexBlock::cleanUpAfterBuild(OperationContext* opCtx,
     }
 
     auto nss = collection->ns();
-
-    invariant(opCtx->lockState()->isCollectionLockedForMode(nss, MODE_X), nss.toString());
+    UncommittedCollections::get(opCtx).invariantHasExclusiveAccessToCollection(opCtx, nss);
 
     while (true) {
         try {
@@ -166,12 +166,6 @@ void MultiIndexBlock::cleanUpAfterBuild(OperationContext* opCtx,
 }
 
 bool MultiIndexBlock::areHybridIndexBuildsEnabled() {
-    // The mobile storage engine does not suport dupsAllowed mode on bulk builders, which means that
-    // it does not support hybrid builds. See SERVER-38550
-    if (storageGlobalParams.engine == "mobile") {
-        return false;
-    }
-
     return enableHybridIndexBuilds.load();
 }
 
@@ -185,29 +179,7 @@ MultiIndexBlock::OnInitFn MultiIndexBlock::kNoopOnInitFn =
 MultiIndexBlock::OnInitFn MultiIndexBlock::makeTimestampedIndexOnInitFn(OperationContext* opCtx,
                                                                         const Collection* coll) {
     return [opCtx, ns = coll->ns()](std::vector<BSONObj>& specs) -> Status {
-        // This function sets a timestamp for the initial catalog write when beginning an index
-        // build, if necessary.  There are four scenarios:
-
-        // 1. A timestamp is already set -- replication application sets a timestamp ahead of time.
-        // This could include the phase of initial sync where it applies oplog entries.  Also,
-        // primaries performing an index build via `applyOps` may have a wrapping commit timestamp.
-        if (!opCtx->recoveryUnit()->getCommitTimestamp().isNull())
-            return Status::OK();
-
-        // 2. If the node is initial syncing, we do not set a timestamp.
-        auto replCoord = repl::ReplicationCoordinator::get(opCtx);
-        if (replCoord->isReplEnabled() && replCoord->getMemberState().startup2())
-            return Status::OK();
-
-        // 3. If the index build is on the local database, do not timestamp.
-        if (ns.isLocal())
-            return Status::OK();
-
-        // 4. All other cases, we generate a timestamp by writing a no-op oplog entry.  This is
-        // better than using a ghost timestamp.  Writing an oplog entry ensures this node is
-        // primary.
-        opCtx->getServiceContext()->getOpObserver()->onOpMessage(
-            opCtx, BSON("msg" << std::string(str::stream() << "Creating indexes. Coll: " << ns)));
+        opCtx->getServiceContext()->getOpObserver()->onStartIndexBuildSinglePhase(opCtx, ns);
         return Status::OK();
     };
 }
@@ -224,12 +196,15 @@ StatusWith<std::vector<BSONObj>> MultiIndexBlock::init(OperationContext* opCtx,
                                                        Collection* collection,
                                                        const std::vector<BSONObj>& indexSpecs,
                                                        OnInitFn onInit) {
+    invariant(opCtx->lockState()->isCollectionLockedForMode(collection->ns(), MODE_IX),
+              str::stream() << "Collection " << collection->ns() << " with UUID "
+                            << collection->uuid() << " is holding the incorrect lock");
     if (State::kAborted == _getState()) {
         return {ErrorCodes::IndexBuildAborted,
                 str::stream() << "Index build aborted: " << _abortReason
                               << ". Cannot initialize index builder: " << collection->ns() << " ("
                               << collection->uuid() << "): " << indexSpecs.size()
-                              << " provided. First index spec: "
+                              << " index spec(s) provided. First index spec: "
                               << (indexSpecs.empty() ? BSONObj() : indexSpecs[0])};
     }
 
@@ -310,7 +285,7 @@ StatusWith<std::vector<BSONObj>> MultiIndexBlock::init(OperationContext* opCtx,
 
             IndexToBuild index;
             index.block = std::make_unique<IndexBuildBlock>(
-                collection->getIndexCatalog(), collection->ns(), info, _method);
+                collection->getIndexCatalog(), collection->ns(), info, _method, _buildUUID);
             status = index.block->init(opCtx, collection);
             if (!status.isOK())
                 return status;
@@ -378,10 +353,12 @@ StatusWith<std::vector<BSONObj>> MultiIndexBlock::init(OperationContext* opCtx,
     } catch (const WriteConflictException&) {
         throw;
     } catch (...) {
-        return {exceptionToStatus().code(),
+        auto status = exceptionToStatus();
+        return {status.code(),
                 str::stream() << "Caught exception during index builder initialization "
                               << collection->ns() << " (" << collection->uuid()
-                              << "): " << indexSpecs.size() << " provided. First index spec: "
+                              << "): " << status.reason() << ". " << indexSpecs.size()
+                              << " provided. First index spec: "
                               << (indexSpecs.empty() ? BSONObj() : indexSpecs[0])};
     }
 }
@@ -542,7 +519,7 @@ Status MultiIndexBlock::insertAllDocumentsInCollection(OperationContext* opCtx,
 
     if (MONGO_unlikely(leaveIndexBuildUnfinishedForShutdown.shouldFail())) {
         log() << "Index build interrupted due to 'leaveIndexBuildUnfinishedForShutdown' failpoint. "
-                 "Mimicing shutdown error code.";
+                 "Mimicking shutdown error code.";
         return Status(
             ErrorCodes::InterruptedAtShutdown,
             "background index build interrupted due to failpoint. returning a shutdown error.");
@@ -708,6 +685,20 @@ Status MultiIndexBlock::drainBackgroundWrites(
     return Status::OK();
 }
 
+Status MultiIndexBlock::retrySkippedRecords(OperationContext* opCtx, Collection* collection) {
+    for (auto&& index : _indexes) {
+        auto interceptor = index.block->getEntry()->indexBuildInterceptor();
+        if (!interceptor)
+            continue;
+
+        auto status = interceptor->retrySkippedRecords(opCtx, collection);
+        if (!status.isOK()) {
+            return status;
+        }
+    }
+    return Status::OK();
+}
+
 Status MultiIndexBlock::checkConstraints(OperationContext* opCtx) {
     _constraintsChecked = true;
 
@@ -761,6 +752,10 @@ Status MultiIndexBlock::commit(OperationContext* opCtx,
                                Collection* collection,
                                OnCreateEachFn onCreateEach,
                                OnCommitFn onCommit) {
+    invariant(opCtx->lockState()->isCollectionLockedForMode(collection->ns(), MODE_X),
+              str::stream() << "Collection " << collection->ns() << " with UUID "
+                            << collection->uuid() << " is holding the incorrect lock");
+
     // UUIDs are not guaranteed during startup because the check happens after indexes are rebuilt.
     if (_collectionUUID) {
         invariant(_collectionUUID.get() == collection->uuid());
@@ -841,7 +836,7 @@ Status MultiIndexBlock::commit(OperationContext* opCtx,
                 opCtx->getServiceContext()->getStorageEngine()->getCheckpointLock(opCtx);
             auto indexIdent =
                 opCtx->getServiceContext()->getStorageEngine()->getCatalog()->getIndexIdent(
-                    opCtx, collection->ns(), _indexes[i].block->getIndexName());
+                    opCtx, collection->getCatalogId(), _indexes[i].block->getIndexName());
             opCtx->getServiceContext()->getStorageEngine()->addIndividuallyCheckpointedIndexToList(
                 indexIdent);
         }

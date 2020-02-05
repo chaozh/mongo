@@ -233,11 +233,11 @@ MONGO_INITIALIZER_GENERAL(ServerLogRedirection,
         std::unique_ptr<logger::Appender<MessageEventEphemeral>> appender;
         std::unique_ptr<logger::Appender<MessageEventEphemeral>> javascriptAppender;
 
-        if (serverGlobalParams.logV2) {
+        if (logV2Enabled()) {
             appender = std::make_unique<logger::LogV2Appender<MessageEventEphemeral>>(
-                &(lv2Manager.getGlobalDomain()));
+                &(lv2Manager.getGlobalDomain()), true);
             javascriptAppender = std::make_unique<logger::LogV2Appender<MessageEventEphemeral>>(
-                &(lv2Manager.getGlobalDomain()));
+                &(lv2Manager.getGlobalDomain()), true);
 
             lv2Config._consoleEnabled = false;
             lv2Config._syslogEnabled = true;
@@ -255,7 +255,7 @@ MONGO_INITIALIZER_GENERAL(ServerLogRedirection,
         }
         manager->getGlobalDomain()->clearAppenders();
         manager->getGlobalDomain()->attachAppender(std::move(appender));
-        manager->getNamedDomain("javascriptOutput")->attachAppender(std::move(javascriptAppender));
+        manager->getNamedDomain("plainShellOutput")->attachAppender(std::move(javascriptAppender));
 
 #endif  // defined(_WIN32)
     } else if (!serverGlobalParams.logpath.empty()) {
@@ -302,12 +302,12 @@ MONGO_INITIALIZER_GENERAL(ServerLogRedirection,
         std::unique_ptr<logger::Appender<MessageEventEphemeral>> appender;
         std::unique_ptr<logger::Appender<MessageEventEphemeral>> javascriptAppender;
 
-        if (serverGlobalParams.logV2) {
+        if (logV2Enabled()) {
 
             appender = std::make_unique<logger::LogV2Appender<MessageEventEphemeral>>(
-                &(lv2Manager.getGlobalDomain()));
+                &(lv2Manager.getGlobalDomain()), true);
             javascriptAppender = std::make_unique<logger::LogV2Appender<MessageEventEphemeral>>(
-                &(lv2Manager.getGlobalDomain()));
+                &(lv2Manager.getGlobalDomain()), true);
 
             lv2Config._consoleEnabled = false;
             lv2Config._fileEnabled = true;
@@ -347,31 +347,31 @@ MONGO_INITIALIZER_GENERAL(ServerLogRedirection,
 
         manager->getGlobalDomain()->clearAppenders();
         manager->getGlobalDomain()->attachAppender(std::move(appender));
-        manager->getNamedDomain("javascriptOutput")->attachAppender(std::move(javascriptAppender));
+        manager->getNamedDomain("plainShellOutput")->attachAppender(std::move(javascriptAppender));
 
     } else {
-        if (serverGlobalParams.logV2) {
+        if (logV2Enabled()) {
             manager->getGlobalDomain()->clearAppenders();
             manager->getGlobalDomain()->attachAppender(
                 std::make_unique<logger::LogV2Appender<MessageEventEphemeral>>(
-                    &(lv2Manager.getGlobalDomain())));
-            manager->getNamedDomain("javascriptOutput")
+                    &(lv2Manager.getGlobalDomain()), true));
+            manager->getNamedDomain("plainShellOutput")
                 ->attachAppender(std::make_unique<logger::LogV2Appender<MessageEventEphemeral>>(
-                    &(lv2Manager.getGlobalDomain())));
+                    &(lv2Manager.getGlobalDomain()), true));
         } else {
             logger::globalLogManager()
-                ->getNamedDomain("javascriptOutput")
+                ->getNamedDomain("plainShellOutput")
                 ->attachAppender(std::make_unique<logger::ConsoleAppender<MessageEventEphemeral>>(
                     std::make_unique<MessageEventDetailsEncoder>()));
         }
     }
-    if (!serverGlobalParams.logV2) {
+    if (!logV2Enabled()) {
         logger::globalLogDomain()->attachAppender(
             std::make_unique<RamLogAppender>(RamLog::get("global")));
     }
 
 
-    if (serverGlobalParams.logV2) {
+    if (logV2Enabled()) {
         lv2Config._format = serverGlobalParams.logFormat;
         return lv2Manager.getGlobalDomainInternal().configure(lv2Config);
     }

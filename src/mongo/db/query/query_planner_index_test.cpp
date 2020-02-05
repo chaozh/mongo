@@ -181,13 +181,13 @@ TEST_F(QueryPlannerTest, SparseIndexCanSupportGTEOrLTENull) {
     assertNumSolutions(1U);
     assertSolutionExists(
         "{fetch: {filter: {i: {$gte: null}}, node: {ixscan: {pattern: "
-        "{i: 1}, bounds: {i: [[null,null,true,true]]}}}}}");
+        "{i: 1}, bounds: {i: [[undefined,undefined,true,true], [null,null,true,true]]}}}}}");
 
     runQuery(fromjson("{i: {$lte: null}}"));
     assertNumSolutions(1U);
     assertSolutionExists(
         "{fetch: {filter: {i: {$lte: null}}, node: {ixscan: {pattern: "
-        "{i: 1}, bounds: {i: [[null,null,true,true]]}}}}}");
+        "{i: 1}, bounds: {i: [[undefined,undefined,true,true], [null,null,true,true]]}}}}}");
 }
 
 //
@@ -587,13 +587,12 @@ TEST_F(QueryPlannerTest, CompoundMultikeyBoundsNoIntersect) {
 
 TEST_F(QueryPlannerTest, NoTableScanBasic) {
     params.options = QueryPlannerParams::NO_TABLE_SCAN;
-    runQuery(BSONObj());
-    assertNumSolutions(0U);
+    runInvalidQuery(BSONObj());
+    assertNoSolutions();
 
     addIndex(BSON("x" << 1));
-
-    runQuery(BSONObj());
-    assertNumSolutions(0U);
+    runInvalidQuery(BSONObj());
+    assertNoSolutions();
 
     runQuery(fromjson("{x: {$gte: 0}}"));
     assertNumSolutions(1U);
@@ -1259,9 +1258,9 @@ TEST_F(QueryPlannerTest, NoFetchStageWhenSingleFieldSortIsCoveredByIndex) {
                  "sort: {b: 1}}"));
     assertNumSolutions(1U);
     assertSolutionExists(
-        "{proj: {spec: {a: 1, b:1, _id: 0}, node: {sort: {pattern: {b: 1}, limit: 0, node: "
-        "{sortKeyGen:{node: {ixscan: "
-        "{pattern: {a: 1, b: 1}}}}}}}}}");
+        "{sort: {pattern: {b: 1}, limit: 0, node: {sortKeyGen: {node:"
+        "{proj: {spec: {a: 1, b: 1, _id: 0}, node:"
+        "{ixscan: {pattern: {a: 1, b: 1}}}}}}}}}");
 }
 
 TEST_F(QueryPlannerTest, NoFetchStageWhenTwoFieldAscendingSortIsCoveredByIndex) {
@@ -1274,9 +1273,9 @@ TEST_F(QueryPlannerTest, NoFetchStageWhenTwoFieldAscendingSortIsCoveredByIndex) 
                  "sort: {b: 1, a: 1}}"));
     assertNumSolutions(1U);
     assertSolutionExists(
-        "{proj: {spec: {a: 1, b:1, _id: 0}, node: {sort: {pattern: {b: 1, a: 1}, limit: 0, node: "
-        "{sortKeyGen:{node: {ixscan: "
-        "{pattern: {a: 1, b: 1}}}}}}}}}");
+        "{sort: {pattern: {b: 1, a: 1}, limit: 0, node: {sortKeyGen: {node:"
+        "{proj: {spec: {a: 1, b: 1, _id: 0}, node:"
+        "{ixscan: {pattern: {a: 1, b: 1}}}}}}}}}");
 }
 
 TEST_F(QueryPlannerTest, NoFetchStageWhenTwoFieldMixedSortOrderSortIsCoveredByIndex) {
@@ -1289,9 +1288,8 @@ TEST_F(QueryPlannerTest, NoFetchStageWhenTwoFieldMixedSortOrderSortIsCoveredByIn
                  "sort: {b: 1, a: -1}}"));
     assertNumSolutions(1U);
     assertSolutionExists(
-        "{proj: {spec: {a: 1, b:1, _id: 0}, node: {sort: {pattern: {b: 1, a: -1}, limit: 0, node: "
-        "{sortKeyGen:{node: {ixscan: "
-        "{pattern: {a: 1, b: 1}}}}}}}}}");
+        "{sort: {pattern: {b: 1, a: -1}, limit: 0, node: {sortKeyGen: {node:"
+        "{proj: {spec: {a: 1, b: 1, _id: 0}, node: {ixscan: {pattern: {a: 1, b: 1}}}}}}}}}");
 }
 
 TEST_F(QueryPlannerTest, MustFetchWhenNotAllSortKeysAreCoveredByIndex) {
@@ -1309,6 +1307,123 @@ TEST_F(QueryPlannerTest, MustFetchWhenNotAllSortKeysAreCoveredByIndex) {
         "{pattern: {a: 1, b: 1}}}}}}}}}}}");
 }
 
+TEST_F(QueryPlannerTest, NoFetchStageWhenProjectionUsesExpressionWithCoveredDependency) {
+    params.options &= ~QueryPlannerParams::INCLUDE_COLLSCAN;
+    addIndex(fromjson("{a: 1, b: 1}"));
+
+    runQueryAsCommand(fromjson(
+        "{find: 'testns', filter: {a: {$gt: 0}}, projection: {_id: 0, a: {$add: ['$a', 1]}}}"));
+    assertNumSolutions(1U);
+    assertSolutionExists(
+        "{proj: {spec: {_id: 0, a: {$add: ['$a', 1]}}, node: "
+        "{ixscan: {pattern: {a: 1, b: 1}}}}}");
+}
+
+TEST_F(QueryPlannerTest,
+       NoFetchStageWhenProjectionAssignsExpressionWithCoveredDependencyToUnIndexedField) {
+    params.options &= ~QueryPlannerParams::INCLUDE_COLLSCAN;
+    addIndex(fromjson("{a: 1, b: 1}"));
+
+    // Assign the result of the expression to 'x' which has no index.
+    runQueryAsCommand(fromjson(
+        "{find: 'testns', filter: {a: {$gt: 0}}, projection: {_id: 0, x: {$add: ['$a', 1]}}}"));
+    assertNumSolutions(1U);
+    assertSolutionExists(
+        "{proj: {spec: {_id: 0, x: {$add: ['$a', 1]}}, node: "
+        "{ixscan: {pattern: {a: 1, b: 1}}}}}");
+}
+
+TEST_F(QueryPlannerTest, AddsFetchWhenProjectionAssignsToUnindexedDottedField) {
+    params.options &= ~QueryPlannerParams::INCLUDE_COLLSCAN;
+    addIndex(fromjson("{a: 1, b: 1}"));
+
+    // Cannot be covered since 'x' may be an array.
+    runQueryAsCommand(fromjson(
+        "{find: 'testns', filter: {a: {$gt: 0}}, projection: {_id: 0, 'x.y': {$add: ['$a', 1]}}}"));
+    assertNumSolutions(1U);
+    assertSolutionExists(
+        "{proj: {spec: {_id: 0, 'x.y': {$add: ['$a', 1]}}, node: "
+        "{fetch: {node: {ixscan: {pattern: {a: 1, b: 1}}}}}}}");
+}
+
+TEST_F(QueryPlannerTest, NoFetchWhenProjectionAssignsToDottedIndexedNonArrayField) {
+    params.options &= ~QueryPlannerParams::INCLUDE_COLLSCAN;
+    addIndex(fromjson("{a: 1, b: 1, 'b.c': 1}"));
+
+    // Can be covered since 'b' and 'b.c' are known to not be multikey.
+    runQueryAsCommand(fromjson(
+        "{find: 'testns', filter: {a: {$gt: 0}}, projection: {_id: 0, 'b.c': {$add: ['$a', 1]}}}"));
+    assertNumSolutions(1U);
+    assertSolutionExists(
+        "{proj: {spec: {_id: 0, 'b.c': {$add: ['$a', 1]}}, node: "
+        "{ixscan: {pattern: {a: 1, b: 1, 'b.c': 1}}}}}");
+}
+
+TEST_F(QueryPlannerTest, NoFetchWhenProjectionAssignsToIndexedNonArrayField) {
+    params.options &= ~QueryPlannerParams::INCLUDE_COLLSCAN;
+    addIndex(fromjson("{a: 1, b: 1}"));
+
+    // Can be covered since 'b' is known to not be multikey.
+    runQueryAsCommand(fromjson(
+        "{find: 'testns', filter: {a: {$gt: 0}}, projection: {_id: 0, b: {$add: ['$a', 1]}}}"));
+    assertNumSolutions(1U);
+    assertSolutionExists(
+        "{proj: {spec: {_id: 0, b: {$add: ['$a', 1]}}, node: "
+        "{ixscan: {pattern: {a: 1, b: 1}}}}}");
+}
+
+TEST_F(QueryPlannerTest, MustFetchWhenExpressionUsesMultiKeyPath) {
+    params.options &= ~QueryPlannerParams::INCLUDE_COLLSCAN;
+    addIndex(fromjson("{a: 1, b: 1}"), {{}, {0}});
+
+    // Cannot be covered since 'b' is multikey.
+    runQueryAsCommand(fromjson(
+        "{find: 'testns', filter: {a: {$gt: 0}}, projection: {_id: 0, x: {$add: ['$b', 1]}}}"));
+    assertNumSolutions(1U);
+    assertSolutionExists(
+        "{proj: {spec: {_id: 0, x: {$add: ['$b', 1]}}, node: "
+        "{fetch: {node: {ixscan: {pattern: {a: 1, b: 1}}}}}}}");
+}
+
+TEST_F(QueryPlannerTest, MustFetchWhenExpressionUsesDottedMultiKeyPath) {
+    params.options &= ~QueryPlannerParams::INCLUDE_COLLSCAN;
+    addIndex(fromjson("{a: 1, b: 1}"), {{}, {0}});
+
+    // Cannot be covered since 'b' is multikey, meaning the result of the expression '$b.c' could
+    // result in an array.
+    runQueryAsCommand(fromjson(
+        "{find: 'testns', filter: {a: {$gt: 0}}, projection: {_id: 0, x: {$add: ['$b.c', 1]}}}"));
+    assertNumSolutions(1U);
+    assertSolutionExists(
+        "{proj: {spec: {_id: 0, x: {$add: ['$b.c', 1]}}, node: "
+        "{fetch: {node: {ixscan: {pattern: {a: 1, b: 1}}}}}}}");
+}
+
+TEST_F(QueryPlannerTest, MustFetchWhenExpressionUsesROOT) {
+    params.options &= ~QueryPlannerParams::INCLUDE_COLLSCAN;
+    addIndex(fromjson("{a: 1, b: 1}"), {{}, {0}});
+
+    runQueryAsCommand(
+        fromjson("{find: 'testns', filter: {a: {$gt: 0}}, projection: {_id: 0, x: '$$ROOT'}}"));
+    assertNumSolutions(1U);
+    assertSolutionExists(
+        "{proj: {spec: {_id: 0, x: '$$ROOT'}, node: "
+        "{fetch: {node: {ixscan: {pattern: {a: 1, b: 1}}}}}}}");
+}
+
+TEST_F(QueryPlannerTest, PlansForWholeIndexScanWithSortAreGenerated) {
+    params.options &= ~QueryPlannerParams::INCLUDE_COLLSCAN;
+    addIndex(BSON("a" << 1));
+    addIndex(BSON("a" << 1 << "b" << 1));
+
+    runQueryAsCommand(
+        fromjson("{find: 'testns', filter: {}, projection: {'b': 1, _id: 0}, sort: {'a': 1}}"));
+    assertNumSolutions(2U);
+    assertSolutionExists(
+        "{proj: {spec: {'b': 1, _id: 0}, node: {ixscan: {pattern: {a: 1, b: 1}}}}}");
+    assertSolutionExists(
+        "{proj: {spec: {'b': 1, _id: 0}, node: {fetch: {node: {ixscan: {pattern: {a: 1}}}}}}}");
+}
 
 }  // namespace
 }  // namespace mongo

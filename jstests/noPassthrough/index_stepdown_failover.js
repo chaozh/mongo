@@ -8,7 +8,6 @@
 (function() {
 "use strict";
 
-load('jstests/libs/check_log.js');
 load('jstests/noPassthrough/libs/index_build.js');
 
 const rst = new ReplSetTest({
@@ -22,10 +21,7 @@ const primary = rst.getPrimary();
 const testDB = primary.getDB('test');
 const coll = testDB.getCollection('test');
 
-const enableTwoPhaseIndexBuild =
-    assert.commandWorked(primary.adminCommand({getParameter: 1, enableTwoPhaseIndexBuild: 1}))
-        .enableTwoPhaseIndexBuild;
-if (!enableTwoPhaseIndexBuild) {
+if (!IndexBuildTest.supportsTwoPhaseIndexBuild(primary)) {
     jsTestLog('Two phase index builds not enabled, skipping test.');
     rst.stopSet();
     return;

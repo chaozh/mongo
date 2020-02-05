@@ -55,12 +55,12 @@
 #include "mongo/db/pipeline/field_path.h"
 #include "mongo/db/pipeline/pipeline.h"
 #include "mongo/db/pipeline/semantic_analysis.h"
+#include "mongo/db/pipeline/sharded_agg_helpers.h"
 #include "mongo/db/pipeline/stub_mongo_process_interface.h"
 #include "mongo/db/query/collation/collator_interface_mock.h"
 #include "mongo/db/query/query_test_service_context.h"
 #include "mongo/db/repl/replication_coordinator_mock.h"
 #include "mongo/dbtests/dbtests.h"
-#include "mongo/s/query/cluster_aggregation_planner.h"
 #include "mongo/unittest/death_test.h"
 #include "mongo/unittest/temp_dir.h"
 
@@ -1067,15 +1067,15 @@ TEST(PipelineOptimizationTest, PartiallyDependentMatchWithRenameShouldSplitAcros
 
 TEST(PipelineOptimizationTest, NorCanSplitAcrossProjectWithRename) {
     string inputPipe =
-        "[{$project: {_id: false, x: true, y: '$z'}},"
+        "[{$project: {x: true, y: '$z', _id: false}},"
         "{$match: {$nor: [{w: {$eq: 1}}, {y: {$eq: 1}}]}}]";
     string outputPipe =
         R"([{$match: {z : {$not: {$eq: 1}}}},
-             {$project: {_id: false, x: true, y: "$z"}},
+             {$project: {x: true, y: "$z", _id: false}},
              {$match: {w: {$not: {$eq: 1}}}}])";
     string serializedPipe = R"(
         [{$match: {$nor: [ {z : {$eq: 1}}]}},
-         {$project: {_id: false, x: true, y: "$z"}},
+         {$project: {x: true, y: "$z", _id: false}},
          {$match: {$nor: [ {w: {$eq: 1}}]}}]
         )";
     assertPipelineOptimizesAndSerializesTo(inputPipe, outputPipe, serializedPipe);
@@ -1083,19 +1083,19 @@ TEST(PipelineOptimizationTest, NorCanSplitAcrossProjectWithRename) {
 
 TEST(PipelineOptimizationTest, MatchCanMoveAcrossSeveralRenames) {
     string inputPipe =
-        "[{$project: {_id: false, c: '$d'}},"
+        "[{$project: {c: '$d', _id: false}},"
         "{$addFields: {b: '$c'}},"
         "{$project: {a: '$b', z: 1}},"
         "{$match: {a: 1, z: 2}}]";
     string outputPipe =
         "[{$match: {d: {$eq: 1}}},"
-        "{$project: {_id: false, c: '$d'}},"
+        "{$project: {c: '$d', _id: false}},"
         "{$match: {z: {$eq: 2}}},"
         "{$addFields: {b: '$c'}},"
         "{$project: {_id: true, z: true, a: '$b'}}]";
     string serializedPipe = R"(
         [{$match: {d : {$eq: 1}}},
-         {$project: {_id: false, c: "$d"}},
+         {$project: {c: "$d", _id: false}},
          {$match: {z : {$eq: 2}}},
          {$addFields: {b: "$c"}},
          {$project: {_id: true, z: true, a: "$b"}}])";
@@ -1104,7 +1104,7 @@ TEST(PipelineOptimizationTest, MatchCanMoveAcrossSeveralRenames) {
 
 TEST(PipelineOptimizationTest, RenameShouldNotBeAppliedToDependentMatch) {
     string pipeline =
-        "[{$project: {_id: false, x: {$add: ['$foo', '$bar']}, y: '$z'}},"
+        "[{$project: {x: {$add: ['$foo', '$bar']}, y: '$z', _id: false}},"
         "{$match: {$or: [{x: {$eq: 1}}, {y: {$eq: 1}}]}}]";
     assertPipelineOptimizesTo(pipeline, pipeline);
 }
@@ -1115,8 +1115,8 @@ TEST(PipelineOptimizationTest, MatchCannotMoveAcrossAddFieldsRenameOfDottedPath)
 }
 
 TEST(PipelineOptimizationTest, MatchCannotMoveAcrossProjectRenameOfDottedPath) {
-    string inputPipe = "[{$project: {_id: false, a: '$$CURRENT.b.c'}}, {$match: {a: {$eq: 1}}}]";
-    string outputPipe = "[{$project: {_id: false, a: '$b.c'}}, {$match: {a: {$eq: 1}}}]";
+    string inputPipe = "[{$project: {a: '$$CURRENT.b.c', _id: false}}, {$match: {a: {$eq: 1}}}]";
+    string outputPipe = "[{$project: {a: '$b.c', _id: false}}, {$match: {a: {$eq: 1}}}]";
     assertPipelineOptimizesTo(inputPipe, outputPipe);
 }
 
@@ -1892,7 +1892,7 @@ public:
         mergePipe = uassertStatusOK(Pipeline::parse(request.getPipeline(), ctx));
         mergePipe->optimizePipeline();
 
-        auto splitPipeline = cluster_aggregation_planner::splitPipeline(std::move(mergePipe));
+        auto splitPipeline = sharded_agg_helpers::splitPipeline(std::move(mergePipe));
 
         ASSERT_VALUE_EQ(Value(splitPipeline.shardsPipeline->writeExplainOps(
                             ExplainOptions::Verbosity::kQueryPlanner)),
@@ -1991,7 +1991,7 @@ namespace propagateDocLimitToShards {
  * stage in the merge pipeline creates an upper bound on how many documents are necessary from any
  * of the shards, we can add a $limit to the shard pipeline to prevent it from sending more
  * documents than necessary. See the comment for propagateDocLimitToShard in
- * cluster_aggregation_planner.cpp and the explanation in SERVER-36881.
+ * sharded_agg_helpers.cpp and the explanation in SERVER-36881.
  */
 class MatchWithSkipAndLimit : public Base {
     string inputPipeJson() {
@@ -2065,7 +2065,7 @@ class MatchWithSkipGroupAndLimit : public Base {
         return "[{$match: {x: 4}}, {$skip: 10}, {$group: {_id: '$y'}}, {$limit: 5}]";
     }
     string shardPipeJson() {
-        return "[{$match: {x: {$eq: 4}}}, {$project: {_id: false, y: true}}]";
+        return "[{$match: {x: {$eq: 4}}}, {$project: {y: true, _id: false}}]";
     }
     string mergePipeJson() {
         return "[{$skip: 10}, {$group: {_id: '$y'}}, {$limit: 5}]";
@@ -2123,7 +2123,7 @@ class JustNeedsNonId : public Base {
         return "[{$limit:1}, {$group: {_id: '$a.b'}}]";
     }
     string shardPipeJson() {
-        return "[{$limit:1}, {$project: {_id: false, a: {b: true}}}]";
+        return "[{$limit:1}, {$project: {a: {b: true}, _id: false}}]";
     }
     string mergePipeJson() {
         return "[{$limit:1}, {$group: {_id: '$a.b'}}]";
@@ -2239,7 +2239,7 @@ class ShardedSortGroupProjLimDoesNotBecomeTopKSortProjGroup : public Base {
     }
     string shardPipeJson() {
         return "[{$sort: {sortKey: {a: 1}}}"
-               ",{$project : {_id: false, a: true}}"
+               ",{$project : {a: true, _id: false}}"
                "]";
     }
     string mergePipeJson() {
@@ -2524,7 +2524,7 @@ DEATH_TEST_F(PipelineMustRunOnMongoSTest,
     // $_internalSplitPipeline.
     ASSERT_FALSE(pipeline->requiredToRunOnMongos());
 
-    auto splitPipeline = cluster_aggregation_planner::splitPipeline(std::move(pipeline));
+    auto splitPipeline = sharded_agg_helpers::splitPipeline(std::move(pipeline));
     ASSERT(splitPipeline.shardsPipeline);
     ASSERT(splitPipeline.mergePipeline);
 
@@ -2565,7 +2565,7 @@ TEST_F(PipelineMustRunOnMongoSTest, SplitMongoSMergePipelineAssertsIfShardStageP
     // $_internalSplitPipeline.
     ASSERT_FALSE(pipeline->requiredToRunOnMongos());
 
-    auto splitPipeline = cluster_aggregation_planner::splitPipeline(std::move(pipeline));
+    auto splitPipeline = sharded_agg_helpers::splitPipeline(std::move(pipeline));
 
     // The merge pipeline must run on mongoS, but $out needs to run on  the primary shard.
     ASSERT_THROWS_CODE(splitPipeline.mergePipeline->requiredToRunOnMongos(),
@@ -2793,11 +2793,12 @@ using PipelineDependenciesTest = AggregationContextFixture;
 TEST_F(PipelineDependenciesTest, EmptyPipelineShouldRequireWholeDocument) {
     auto pipeline = unittest::assertGet(Pipeline::create({}, getExpCtx()));
 
-    auto depsTracker = pipeline->getDependencies(DepsTracker::kNoMetadata);
+    auto depsTracker = pipeline->getDependencies(DepsTracker::kAllMetadata);
     ASSERT_TRUE(depsTracker.needWholeDocument);
     ASSERT_FALSE(depsTracker.getNeedsMetadata(DocumentMetadataFields::kTextScore));
 
-    depsTracker = pipeline->getDependencies(DepsTracker::kOnlyTextScore);
+    depsTracker =
+        pipeline->getDependencies(DepsTracker::kAllMetadata & ~DepsTracker::kOnlyTextScore);
     ASSERT_TRUE(depsTracker.needWholeDocument);
     ASSERT_TRUE(depsTracker.getNeedsMetadata(DocumentMetadataFields::kTextScore));
 }
@@ -2887,7 +2888,7 @@ TEST_F(PipelineDependenciesTest, ShouldRequireWholeDocumentIfAnyStageDoesNotSupp
     auto notSupported = DocumentSourceDependenciesNotSupported::create();
     auto pipeline = unittest::assertGet(Pipeline::create({needsASeeNext, notSupported}, ctx));
 
-    auto depsTracker = pipeline->getDependencies(DepsTracker::kNoMetadata);
+    auto depsTracker = pipeline->getDependencies(DepsTracker::kAllMetadata);
     ASSERT_TRUE(depsTracker.needWholeDocument);
     // The inputs did not have a text score available, so we should not require a text score.
     ASSERT_FALSE(depsTracker.getNeedsMetadata(DocumentMetadataFields::kTextScore));
@@ -2895,7 +2896,7 @@ TEST_F(PipelineDependenciesTest, ShouldRequireWholeDocumentIfAnyStageDoesNotSupp
     // Now in the other order.
     pipeline = unittest::assertGet(Pipeline::create({notSupported, needsASeeNext}, ctx));
 
-    depsTracker = pipeline->getDependencies(DepsTracker::kNoMetadata);
+    depsTracker = pipeline->getDependencies(DepsTracker::kAllMetadata);
     ASSERT_TRUE(depsTracker.needWholeDocument);
 }
 
@@ -2927,7 +2928,7 @@ TEST_F(PipelineDependenciesTest, ShouldNotAddAnyRequiredFieldsAfterFirstStageWit
     auto needsASeeNext = DocumentSourceNeedsASeeNext::create();
     auto pipeline = unittest::assertGet(Pipeline::create({needsOnlyB, needsASeeNext}, ctx));
 
-    auto depsTracker = pipeline->getDependencies(DepsTracker::kNoMetadata);
+    auto depsTracker = pipeline->getDependencies(DepsTracker::kAllMetadata);
     ASSERT_FALSE(depsTracker.needWholeDocument);
     ASSERT_FALSE(depsTracker.getNeedsMetadata(DocumentMetadataFields::kTextScore));
 
@@ -2941,7 +2942,7 @@ TEST_F(PipelineDependenciesTest, ShouldNotRequireTextScoreIfThereIsNoScoreAvaila
     auto ctx = getExpCtx();
     auto pipeline = unittest::assertGet(Pipeline::create({}, ctx));
 
-    auto depsTracker = pipeline->getDependencies(DepsTracker::kNoMetadata);
+    auto depsTracker = pipeline->getDependencies(DepsTracker::kAllMetadata);
     ASSERT_FALSE(depsTracker.getNeedsMetadata(DocumentMetadataFields::kTextScore));
 }
 
@@ -2950,19 +2951,21 @@ TEST_F(PipelineDependenciesTest, ShouldThrowIfTextScoreIsNeededButNotPresent) {
     auto needsText = DocumentSourceNeedsOnlyTextScore::create();
     auto pipeline = unittest::assertGet(Pipeline::create({needsText}, ctx));
 
-    ASSERT_THROWS(pipeline->getDependencies(DepsTracker::kNoMetadata), AssertionException);
+    ASSERT_THROWS(pipeline->getDependencies(DepsTracker::kAllMetadata), AssertionException);
 }
 
 TEST_F(PipelineDependenciesTest, ShouldRequireTextScoreIfAvailableAndNoStageReturnsExhaustiveMeta) {
     auto ctx = getExpCtx();
     auto pipeline = unittest::assertGet(Pipeline::create({}, ctx));
 
-    auto depsTracker = pipeline->getDependencies(DepsTracker::kOnlyTextScore);
+    auto depsTracker =
+        pipeline->getDependencies(DepsTracker::kAllMetadata & ~DepsTracker::kOnlyTextScore);
     ASSERT_TRUE(depsTracker.getNeedsMetadata(DocumentMetadataFields::kTextScore));
 
     auto needsASeeNext = DocumentSourceNeedsASeeNext::create();
     pipeline = unittest::assertGet(Pipeline::create({needsASeeNext}, ctx));
-    depsTracker = pipeline->getDependencies(DepsTracker::kOnlyTextScore);
+    depsTracker =
+        pipeline->getDependencies(DepsTracker::kAllMetadata & ~DepsTracker::kOnlyTextScore);
     ASSERT_TRUE(depsTracker.getNeedsMetadata(DocumentMetadataFields::kTextScore));
 }
 
@@ -2972,7 +2975,8 @@ TEST_F(PipelineDependenciesTest, ShouldNotRequireTextScoreIfAvailableButDefinite
     auto needsText = DocumentSourceNeedsOnlyTextScore::create();
     auto pipeline = unittest::assertGet(Pipeline::create({stripsTextScore, needsText}, ctx));
 
-    auto depsTracker = pipeline->getDependencies(DepsTracker::kOnlyTextScore);
+    auto depsTracker =
+        pipeline->getDependencies(DepsTracker::kAllMetadata & ~DepsTracker::kOnlyTextScore);
 
     // 'stripsTextScore' claims that no further stage will need metadata information, so we
     // shouldn't have the text score as a dependency.

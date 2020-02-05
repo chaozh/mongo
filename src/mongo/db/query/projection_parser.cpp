@@ -35,6 +35,81 @@
 namespace mongo {
 namespace projection_ast {
 namespace {
+/**
+ * Uassert that the given policy permits using computed fields in a projection.
+ */
+void verifyComputedFieldsAllowed(const ProjectionPolicies& policies) {
+    uassert(51271,
+            "Bad projection specification, cannot use computed fields when parsing "
+            "a spec in kBanComputedFields mode",
+            policies.computedFieldsPolicy !=
+                ProjectionPolicies::ComputedFieldsPolicy::kBanComputedFields);
+}
+
+/**
+ * In some arcane situations, when a projection is empty, only contains top-level _id projections
+ * and find expressions, it is non-trivial to determine the type of the projection. These rules are
+ * kept purely for compatibility reasons.
+ *
+ * The significance of an _id inclusion or exclusion depends on the presence of the expressions find
+ * $slice, $elemMatch and $meta.
+ */
+ProjectType computeProjectionType(bool hasFindSlice,
+                                  bool hasElemMatch,
+                                  bool hasMeta,
+                                  const ProjectionPolicies& policies,
+                                  bool idIncludedEntirely,
+                                  bool idExcludedEntirely) {
+    if (hasFindSlice) {
+        // If there's a find $slice then the presence of an {_id: 1} overrides, regardless of other
+        // find() expressions. If there's no _id, then it defaults to exclusion.
+        if (idIncludedEntirely) {
+            return ProjectType::kInclusion;
+        } else {
+            // Either _id is explicitly excluded _or_ not mentioned at all, in which case we
+            // default to exclusion.
+            return ProjectType::kExclusion;
+        }
+    } else if (hasElemMatch) {
+        // If there's an $elemMatch (but no $slice) then it's an inclusion projection. Note that
+        // this is _regardless_ of what value is provided for _id. This is consistent with the
+        // behavior of most expressions: for an arbitrary $func expression, the rule is that {foo:
+        // {$func: ...}}, {_id: 0, foo: {$func: ...}}, and {_id: 1, foo: {$func: ...}} are all
+        // inclusions.
+        return ProjectType::kInclusion;
+    } else if (hasMeta) {
+        if (policies.findOnlyFeaturesAllowed()) {
+            // In find, {_id: 0, x: {$meta: ...}} is considered exclusion.
+            if (idExcludedEntirely) {
+                return ProjectType::kExclusion;
+            }
+
+            // In find, {_id: 1, x: {$meta: ...}} is considered inclusion.
+            if (idIncludedEntirely) {
+                return ProjectType::kInclusion;
+            }
+
+            // Just $meta by itself is exclusion.
+            return ProjectType::kExclusion;
+        } else {
+            // In aggregate(), any projection with a $meta is an inclusion projection.
+            return ProjectType::kInclusion;
+        }
+    } else if (idIncludedEntirely) {
+        // There were no expressions. So this is an {_id: 1} projection. It is an
+        // inclusion. The ParseContext's type field was not marked as an inclusion, because a
+        // projection {_id: 1, a: 0} is also valid, but considered exclusion.
+        return ProjectType::kInclusion;
+    } else if (idExcludedEntirely) {
+        // There were no expressions, but there is an {_id: 0} element. This is an exclusion.  The
+        // ParseContext's 'type' field was not marked as an exclusion because a projection {_id: 0,
+        // a: 1} is valid but considered inclusion.
+        return ProjectType::kExclusion;
+    }
+
+    // Default is exclusion otherwise.
+    return ProjectType::kExclusion;
+}
 
 /**
  * Returns whether an element's type implies that the element is an inclusion or exclusion.
@@ -50,6 +125,30 @@ bool isInclusionOrExclusionType(BSONType type) {
         default:
             return false;
     }
+}
+
+/**
+ * Given the 'root' of the AST and the field 'path', returns the last inner 'ProjectionPathASTNode'
+ * in the AST on that 'path'. For example, if the AST represents a projection {'a.b.c': 1} and the
+ * 'path' is 'a.b',  the returned node will be 'b'. If the node doesn't exist in the tree, or if the
+ * last node is a leaf node, the function returns 'nullptr'. For example, given the same projection
+ * specification and the 'path' of 'a.b.c.d', the function will return 'nullptr'.
+ */
+ProjectionPathASTNode* findLastInnerNodeOnPath(ProjectionPathASTNode* root,
+                                               const FieldPath& path,
+                                               size_t componentIndex) {
+    invariant(root);
+    invariant(path.getPathLength() > componentIndex);
+
+    auto child = exact_pointer_cast<ProjectionPathASTNode*>(
+        root->getChild(path.getFieldName(componentIndex)));
+    if (path.getPathLength() == componentIndex + 1) {
+        return child;
+    } else if (!child) {
+        return nullptr;
+    }
+
+    return findLastInnerNodeOnPath(child, path, componentIndex + 1);
 }
 
 void addNodeAtPathHelper(ProjectionPathASTNode* root,
@@ -93,51 +192,8 @@ void addNodeAtPath(ProjectionPathASTNode* root,
     addNodeAtPathHelper(root, path, 0, std::move(newChild));
 }
 
-/**
- * Return a pair {begin, end} indicating where the first positional operator in the string is.
- * If there is no positional operator, returns boost::none.
- */
-using PositionalProjectionLocation = boost::optional<std::pair<size_t, size_t>>;
-PositionalProjectionLocation findFirstPositionalOperator(StringData fullPath) {
-    size_t first = fullPath.find(".$.");
-    if (first != std::string::npos) {
-        return {{first, first + 3}};
-    }
-
-    // There are no cases of the positional operator in between paths, so it must be at the end.
-    if (fullPath.endsWith(".$")) {
-        return {{fullPath.size() - 2, fullPath.size()}};
-    }
-
-    // If the entire path is just a '$' we consider that part of the positional projection.
-    // This case may arise if there are two positional projections in a row, such as "a.$.$".
-    // For now such cases are banned elsewhere in the parsing code.
-    if (fullPath == "$") {
-        return {{0, fullPath.size()}};
-    }
-
-    return boost::none;
-}
-
-bool hasPositionalOperatorMatch(const MatchExpression* const query, StringData matchField) {
-    if (query->getCategory() == MatchExpression::MatchCategory::kLogical) {
-        for (unsigned int i = 0; i < query->numChildren(); ++i) {
-            if (hasPositionalOperatorMatch(query->getChild(i), matchField)) {
-                return true;
-            }
-        }
-    } else {
-        StringData queryPath = query->path();
-        // We have to make a distinction between match expressions that are
-        // initialized with an empty field/path name "" and match expressions
-        // for which the path is not meaningful (eg. $where).
-        if (!queryPath.rawData()) {
-            return false;
-        }
-        StringData pathPrefix = str::before(queryPath, '.');
-        return pathPrefix == matchField;
-    }
-    return false;
+bool hasPositionalOperator(StringData path) {
+    return path.endsWith(".$");
 }
 
 bool isPrefixOf(StringData first, StringData second) {
@@ -163,10 +219,14 @@ struct ParseContext {
     bool hasPositional = false;
     bool hasElemMatch = false;
     bool hasFindSlice = false;
+    bool hasMeta = false;
     boost::optional<ProjectType> type;
 
-    // Whether there's an {_id: 1} projection.
+    // Whether there's an {_id: 1} field in the projection.
     bool idIncludedEntirely = false;
+
+    // Whether there's an {_id: 0} field in the projection.
+    bool idExcludedEntirely = false;
 };
 
 void attemptToParseFindSlice(ParseContext* parseCtx,
@@ -223,6 +283,8 @@ bool attemptToParseGenericExpression(ParseContext* parseCtx,
     }
 
     // It must be an expression.
+    verifyComputedFieldsAllowed(parseCtx->policies);
+
     const bool isMeta = subObj.firstElementFieldNameStringData() == "$meta";
     uassert(31252,
             "Cannot use expression other than $meta in exclusion projection",
@@ -235,6 +297,7 @@ bool attemptToParseGenericExpression(ParseContext* parseCtx,
     auto expr = Expression::parseExpression(
         parseCtx->expCtx, subObj, parseCtx->expCtx->variablesParseState);
     addNodeAtPath(parent, path, std::make_unique<ExpressionASTNode>(expr));
+    parseCtx->hasMeta = parseCtx->hasMeta || isMeta;
     return true;
 }
 
@@ -250,9 +313,10 @@ bool parseSubObjectAsExpression(ParseContext* parseCtx,
                                 const FieldPath& path,
                                 const BSONObj& subObj,
                                 ProjectionPathASTNode* parent) {
-
     if (parseCtx->policies.findOnlyFeaturesAllowed()) {
         if (subObj.firstElementFieldNameStringData() == "$slice") {
+            verifyComputedFieldsAllowed(parseCtx->policies);
+
             Status findSliceStatus = Status::OK();
             try {
                 attemptToParseFindSlice(parseCtx, path, subObj, parent);
@@ -274,6 +338,8 @@ bool parseSubObjectAsExpression(ParseContext* parseCtx,
 
             return true;
         } else if (subObj.firstElementFieldNameStringData() == "$elemMatch") {
+            verifyComputedFieldsAllowed(parseCtx->policies);
+
             // Validate $elemMatch arguments and dependencies.
             uassert(31274,
                     str::stream() << "elemMatch: Invalid argument, object required, but got "
@@ -304,6 +370,10 @@ bool parseSubObjectAsExpression(ParseContext* parseCtx,
             parseCtx->hasElemMatch = true;
             return true;
         }
+    } else if (subObj.firstElementFieldNameStringData() == "$elemMatch") {
+        // find()-only features are not and the user tried invoking elemMatch. Here we can give a
+        // nicer error than the generic "unknown expression."
+        uasserted(ErrorCodes::InvalidPipelineOperator, "Cannot use $elemMatch in this context");
     }
 
     return attemptToParseGenericExpression(parseCtx, path, subObj, parent);
@@ -315,13 +385,14 @@ bool parseSubObjectAsExpression(ParseContext* parseCtx,
 void parseInclusion(ParseContext* ctx,
                     BSONElement elem,
                     ProjectionPathASTNode* parent,
-                    boost::optional<FieldPath> fullPathToParent,
-                    PositionalProjectionLocation firstPositionalProjection) {
+                    boost::optional<FieldPath> fullPathToParent) {
     // There are special rules about _id being included. _id may be included in both inclusion and
     // exclusion projections.
     const bool isTopLevelIdProjection = elem.fieldNameStringData() == "_id" && parent->isRoot();
 
-    if (!firstPositionalProjection) {
+    const bool hasPositional = hasPositionalOperator(elem.fieldNameStringData());
+
+    if (!hasPositional) {
         FieldPath path(elem.fieldNameStringData());
         addNodeAtPath(parent, path, std::make_unique<BooleanConstantASTNode>(true));
 
@@ -329,41 +400,21 @@ void parseInclusion(ParseContext* ctx,
             ctx->idIncludedEntirely = true;
         }
     } else {
+        verifyComputedFieldsAllowed(ctx->policies);
+
         uassert(31276,
                 "Cannot specify more than one positional projection per query.",
                 !ctx->hasPositional);
 
         uassert(31256, "Cannot specify positional operator and $elemMatch.", !ctx->hasElemMatch);
-
-        StringData matchField = fullPathToParent ? fullPathToParent->front()
-                                                 : str::before(elem.fieldNameStringData(), '.');
         uassert(51050, "Projections with a positional operator require a matcher", ctx->query);
-        uassert(31277,
-                str::stream() << "Positional projection '" << elem.fieldName() << "' does not "
-                              << "match the query document.",
-                hasPositionalOperatorMatch(ctx->query, matchField));
-
-        // Check that the path does not end with ".$." which can be interpreted as the
-        // positional projection.
-        uassert(31270,
-                str::stream() << "Path cannot end with '.$.'",
-                !elem.fieldNameStringData().endsWith(".$."));
-
-        const auto [firstPositionalBegin, firstPositionalEnd] = *firstPositionalProjection;
-
-        // See if there's another positional operator after the first one. If there is,
-        // it's invalid.
-        StringData remainingPathAfterPositional =
-            elem.fieldNameStringData().substr(firstPositionalEnd);
-        uassert(31287,
-                str::stream() << "Cannot use positional operator twice: "
-                              << elem.fieldNameStringData(),
-                findFirstPositionalOperator(remainingPathAfterPositional) == boost::none &&
-                    remainingPathAfterPositional != "$");
 
         // Get everything up to the first positional operator.
+        // Should at least be ".$"
+        StringData elemFieldName = elem.fieldNameStringData();
+        invariant(elemFieldName.size() > 2);
         StringData pathWithoutPositionalOperator =
-            elem.fieldNameStringData().substr(0, firstPositionalBegin);
+            elemFieldName.substr(0, elemFieldName.size() - 2);
 
         FieldPath path(pathWithoutPositionalOperator);
 
@@ -406,6 +457,8 @@ void parseExclusion(ParseContext* ctx, BSONElement elem, ProjectionPathASTNode* 
                               << " in inclusion projection",
                 !ctx->type || *ctx->type == ProjectType::kExclusion);
         ctx->type = ProjectType::kExclusion;
+    } else {
+        ctx->idExcludedEntirely = true;
     }
 }
 
@@ -413,6 +466,8 @@ void parseExclusion(ParseContext* ctx, BSONElement elem, ProjectionPathASTNode* 
  * Treats the given element as a literal value (e.g. {a: "foo"}) and updates the tree as necessary.
  */
 void parseLiteral(ParseContext* ctx, BSONElement elem, ProjectionPathASTNode* parent) {
+    verifyComputedFieldsAllowed(ctx->policies);
+
     auto expr = Expression::parseOperand(ctx->expCtx, elem, ctx->expCtx->variablesParseState);
 
     FieldPath pathFromParent(elem.fieldNameStringData());
@@ -440,6 +495,11 @@ void parseSubObject(ParseContext* ctx,
                     boost::optional<FieldPath> fullPathToParent,
                     const BSONObj& obj,
                     ProjectionPathASTNode* parent) {
+    uassert(
+        51270,
+        str::stream() << "An empty sub-projection is not a valid value. Found empty object at path",
+        !obj.isEmpty());
+
     FieldPath path(objFieldName);
 
     if (obj.nFields() == 1 && obj.firstElementFieldNameStringData().startsWith("$")) {
@@ -461,12 +521,11 @@ void parseSubObject(ParseContext* ctx,
         }
     }
 
-    // It's not an expression. Create a node to represent the new layer in the tree.
-    ProjectionPathASTNode* newParent = nullptr;
-    {
+    ProjectionPathASTNode* newParent = findLastInnerNodeOnPath(parent, path, 0);
+    if (!newParent) {
         auto ownedChild = std::make_unique<ProjectionPathASTNode>();
         newParent = ownedChild.get();
-        parent->addChild(objFieldName, std::move(ownedChild));
+        addNodeAtPath(parent, path, std::move(ownedChild));
     }
 
     const FieldPath fullPathToNewParent = fullPathToParent ? fullPathToParent->concat(path) : path;
@@ -483,12 +542,21 @@ void parseElement(ParseContext* ctx,
                   BSONElement elem,
                   boost::optional<FieldPath> fullPathToParent,
                   ProjectionPathASTNode* parent) {
-    const auto firstPositionalProjection = findFirstPositionalOperator(elem.fieldNameStringData());
+    const bool hasPositional = hasPositionalOperator(elem.fieldNameStringData());
 
     // If there is a positional projection, find only features must be enabled.
     uassert(31324,
             "Cannot use positional projection in aggregation projection",
-            (!firstPositionalProjection || ctx->policies.findOnlyFeaturesAllowed()));
+            (!hasPositional || ctx->policies.findOnlyFeaturesAllowed()));
+
+    // Be sure that uses of positional projection that were correct in versions before 4.4 that are
+    // now incorrect get a good error message.
+    uassert(31394,
+            "As of 4.4, it's illegal to specify positional operator in the middle of a path."
+            "Positional projection may only be used at the end, for example: a.b.$. If the query "
+            "previously used a form like a.b.$.d, remove the parts following the '$' and the "
+            "results will be equivalent.",
+            !str::contains(elem.fieldNameStringData(), ".$."));
 
     if (elem.type() == BSONType::Object) {
         BSONObj subObj = elem.embeddedObject();
@@ -497,19 +565,18 @@ void parseElement(ParseContext* ctx,
         // any expression.
         uassert(31271,
                 "positional projection cannot be used with an expression or sub object",
-                static_cast<bool>(!firstPositionalProjection));
+                !hasPositional);
 
         parseSubObject(ctx, elem.fieldNameStringData(), fullPathToParent, subObj, parent);
     } else if (isInclusionOrExclusionType(elem.type())) {
         if (elem.trueValue()) {
-            parseInclusion(ctx, elem, parent, fullPathToParent, firstPositionalProjection);
+            parseInclusion(ctx, elem, parent, fullPathToParent);
         } else {
+            uassert(31395, "positional projection cannot be used with exclusion", !hasPositional);
             parseExclusion(ctx, elem, parent);
         }
     } else {
-        uassert(31308,
-                "positional projection cannot be used with a literal",
-                static_cast<bool>(!firstPositionalProjection));
+        uassert(31308, "positional projection cannot be used with a literal", !hasPositional);
 
         parseLiteral(ctx, elem, parent);
     }
@@ -521,6 +588,11 @@ Projection parse(boost::intrusive_ptr<ExpressionContext> expCtx,
                  const MatchExpression* const query,
                  const BSONObj& queryObj,
                  ProjectionPolicies policies) {
+    if (!policies.findOnlyFeaturesAllowed()) {
+        // In agg-style syntax it is illegal to have an empty projection specification.
+        uassert(51272, "projection specification must have at least one field", !obj.isEmpty());
+    }
+
     ProjectionPathASTNode root;
 
     ParseContext ctx{expCtx, query, queryObj, obj, policies};
@@ -531,32 +603,28 @@ Projection parse(boost::intrusive_ptr<ExpressionContext> expCtx,
         parseElement(&ctx, elem, boost::none, &root);
     }
 
-    // find() defaults about inclusion/exclusion. These rules are preserved for compatibility
-    // reasons. If there are no explicit inclusion/exclusion fields, the type depends on which
-    // find() expressions (if any) are used in the following order: $slice, $elemMatch, $meta.
+    // If we have not yet determined the type, we must fall back to the defaults for ambiguous
+    // projections.
     if (!ctx.type) {
-        if (ctx.idIncludedEntirely) {
-            // The projection {_id: 1} is considered an inclusion. The ParseContext's type field was
-            // not marked as such, because a projection {_id: 1, a: 0} is also valid, but considered
-            // exclusion.
-            ctx.type = ProjectType::kInclusion;
-        } else if (ctx.hasFindSlice) {
-            // If the projection has only find() expressions, then $slice has highest precedence.
-            ctx.type = ProjectType::kExclusion;
-        } else if (ctx.hasElemMatch) {
-            // $elemMatch has next-highest precedent.
-            ctx.type = ProjectType::kInclusion;
-        } else {
-            // This happens only when the projection is entirely $meta expressions.
-            ctx.type = ProjectType::kExclusion;
-        }
+        ctx.type = computeProjectionType(ctx.hasFindSlice,
+                                         ctx.hasElemMatch,
+                                         ctx.hasMeta,
+                                         ctx.policies,
+                                         ctx.idIncludedEntirely,
+                                         ctx.idExcludedEntirely);
     }
     invariant(ctx.type);
 
-    if (!ctx.idSpecified && policies.idPolicy == ProjectionPolicies::DefaultIdPolicy::kIncludeId &&
-        *ctx.type == ProjectType::kInclusion) {
-        // Add a node to the root indicating that _id is included.
-        addNodeAtPath(&root, "_id", std::make_unique<BooleanConstantASTNode>(true));
+    if (!ctx.idSpecified) {
+        if (policies.idPolicy == ProjectionPolicies::DefaultIdPolicy::kIncludeId &&
+            *ctx.type == ProjectType::kInclusion) {
+            // Add a node to the root indicating that _id is included.
+            addNodeAtPath(&root, "_id", std::make_unique<BooleanConstantASTNode>(true));
+        } else if (policies.idPolicy == ProjectionPolicies::DefaultIdPolicy::kExcludeId &&
+                   *ctx.type == ProjectType::kExclusion) {
+            // Add a node to the root indicating that _id is not included.
+            addNodeAtPath(&root, "_id", std::make_unique<BooleanConstantASTNode>(false));
+        }
     }
 
     if (*ctx.type == ProjectType::kExclusion && ctx.idSpecified && ctx.idIncludedEntirely) {

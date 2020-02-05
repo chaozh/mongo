@@ -40,9 +40,9 @@ public:
 
     class LiteParsed final : public LiteParsedDocumentSource {
     public:
-        static std::unique_ptr<LiteParsed> parse(const AggregationRequest& request,
+        static std::unique_ptr<LiteParsed> parse(const NamespaceString& nss,
                                                  const BSONElement& spec) {
-            return std::make_unique<LiteParsed>(request.getNamespaceString());
+            return std::make_unique<LiteParsed>(nss);
         }
 
         explicit LiteParsed(NamespaceString nss) : _nss(std::move(nss)) {}
@@ -52,7 +52,8 @@ public:
             return stdx::unordered_set<NamespaceString>();
         }
 
-        PrivilegeVector requiredPrivileges(bool isMongos) const override {
+        PrivilegeVector requiredPrivileges(bool isMongos,
+                                           bool bypassDocumentValidation) const override {
             return {Privilege(ResourcePattern::forExactNamespace(_nss), ActionType::planCacheRead)};
         }
 
@@ -65,8 +66,8 @@ public:
             return false;
         }
 
-        void assertSupportsReadConcern(const repl::ReadConcernArgs& readConcern) const {
-            onlyReadConcernLocalSupported(DocumentSourcePlanCacheStats::kStageName, readConcern);
+        ReadConcernSupportResult supportsReadConcern(repl::ReadConcernLevel level) const {
+            return onlyReadConcernLocalSupported(kStageName, level);
         }
 
         void assertSupportsMultiDocumentTransaction() const {
@@ -86,8 +87,6 @@ public:
         Pipeline::SplitState = Pipeline::SplitState::kUnsplit) const override {
         StageConstraints constraints{StreamType::kStreaming,
                                      PositionRequirement::kFirst,
-                                     // This stage must run on a mongod, and will fail at parse time
-                                     // if an attempt is made to run it on mongos.
                                      HostTypeRequirement::kAnyShard,
                                      DiskUseRequirement::kNoDiskUse,
                                      FacetRequirement::kNotAllowed,
@@ -126,6 +125,14 @@ private:
         boost::optional<ExplainOptions::Verbosity> explain = boost::none) const override {
         MONGO_UNREACHABLE;  // Should call serializeToArray instead.
     }
+
+    // If running through mongos in a sharded cluster, stores the shard name so that it can be
+    // appended to each plan cache entry document.
+    std::string _shardName;
+
+    // If running through mongos in a sharded cluster, stores the "host:port" string so that it can
+    // be appended to each plan cache entry document.
+    std::string _hostAndPort;
 
     // The result set for this change is produced through the mongo process interface on the first
     // call to getNext(), and then held by this data member.

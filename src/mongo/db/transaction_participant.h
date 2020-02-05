@@ -33,6 +33,7 @@
 #include <iostream>
 #include <map>
 
+#include "mongo/db/catalog/uncommitted_collections.h"
 #include "mongo/db/commands/txn_cmds_gen.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/locker.h"
@@ -218,13 +219,16 @@ public:
         std::unique_ptr<RecoveryUnit> _recoveryUnit;
         repl::ReadConcernArgs _readConcernArgs;
         WriteUnitOfWork::RecoveryUnitState _ruState;
+        std::shared_ptr<UncommittedCollections::UncommittedCollectionsMap> _uncommittedCollections;
     };
 
     /**
-     *  An RAII object that stashes the recovery unit from the `opCtx` onto the stack and keeps
-     *  using the same locker of `opCtx`. The locker opts out of two-phase locking of the
-     *  current WUOW. At destruction it unstashes the recovery unit back onto the `opCtx` and
-     *  restores the locker state relevant to the original WUOW.
+     *  An RAII object that will allow the current transaction to be set aside so that a separate
+     *  transaction can be created. It stashes the recovery unit from the `opCtx` onto the stack and
+     *  keeps using the same locker of `opCtx`. The locker opts out of two-phase locking of the
+     *  current WUOW. At destruction the original transaction will be restored by unstashing the
+     *  recovery unit back onto the `opCtx` and restoring the locker state relevant to the original
+     *  WUOW.
      */
     class SideTransactionBlock {
     public:
@@ -611,6 +615,7 @@ public:
             stdx::lock_guard<Client> lk(*opCtx->getClient());
             o(lk).prepareOpTime = prepareOpTime;
             o(lk).txnState.transitionTo(TransactionState::kPrepared);
+            opCtx->lockState()->unlockRSTLforPrepare();
         }
 
         void transitionToAbortedWithoutPrepareforTest(OperationContext* opCtx) {
@@ -644,7 +649,7 @@ public:
         // has been updated.
         void _finishCommitTransaction(OperationContext* opCtx,
                                       size_t operationCount,
-                                      size_t oplogOperationBytes);
+                                      size_t oplogOperationBytes) noexcept;
 
         // Commits the storage-transaction on the OperationContext.
         //

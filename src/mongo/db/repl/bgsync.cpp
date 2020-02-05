@@ -144,6 +144,12 @@ size_t getSize(const BSONObj& o) {
 // Failpoint which causes rollback to hang before starting.
 MONGO_FAIL_POINT_DEFINE(rollbackHangBeforeStart);
 
+// Failpoint to override the time to sleep before retrying sync source selection.
+MONGO_FAIL_POINT_DEFINE(forceBgSyncSyncSourceRetryWaitMS);
+
+// Failpoint which causes rollback to hang after completing.
+MONGO_FAIL_POINT_DEFINE(bgSyncHangAfterRunRollback);
+
 BackgroundSync::BackgroundSync(
     ReplicationCoordinator* replicationCoordinator,
     ReplicationCoordinatorExternalState* replicationCoordinatorExternalState,
@@ -197,7 +203,7 @@ bool BackgroundSync::_inShutdown_inlock() const {
 }
 
 void BackgroundSync::_run() {
-    Client::initThread("rsBackgroundSync");
+    Client::initThread("BackgroundSync");
     AuthorizationSession::get(cc())->grantInternalAuthorization(&cc());
 
     while (!inShutdown()) {
@@ -374,11 +380,16 @@ void BackgroundSync::_produce() {
         // out of date. In that case we sleep for 1 second to reduce the amount we spin waiting
         // for our map to update.
         if (oldSource == source) {
+            long long sleepMS = 1000;
+            forceBgSyncSyncSourceRetryWaitMS.execute(
+                [&](const BSONObj& data) { sleepMS = data["sleepMS"].numberInt(); });
+
             log() << "Chose same sync source candidate as last time, " << source
-                  << ". Sleeping for 1 second to avoid immediately choosing a new sync source for "
-                     "the same reason as last time.";
+                  << ". Sleeping for " << sleepMS
+                  << "ms to avoid immediately choosing a new sync source for the same reason as "
+                     "last time.";
             numTimesChoseSameSyncSource.increment(1);
-            sleepsecs(1);
+            mongo::sleepmillis(sleepMS);
         } else {
             log() << "Changed sync source from "
                   << (oldSource.empty() ? std::string("empty") : oldSource.toString()) << " to "
@@ -390,11 +401,16 @@ void BackgroundSync::_produce() {
             log() << "failed to find sync source, received error "
                   << syncSourceResp.syncSourceStatus.getStatus();
         }
-        // No sync source found.
-        LOG(1) << "Could not find a sync source. Sleeping for 1 second before trying again.";
-        numTimesCouldNotFindSyncSource.increment(1);
 
-        sleepsecs(1);
+        long long sleepMS = 1000;
+        forceBgSyncSyncSourceRetryWaitMS.execute(
+            [&](const BSONObj& data) { sleepMS = data["sleepMS"].numberInt(); });
+
+        // No sync source found.
+        LOG(1) << "Could not find a sync source. Sleeping for " << sleepMS
+               << "ms before trying again.";
+        numTimesCouldNotFindSyncSource.increment(1);
+        mongo::sleepmillis(sleepMS);
         return;
     }
 
@@ -502,6 +518,13 @@ void BackgroundSync::_produce() {
         auto storageInterface = StorageInterface::get(opCtx.get());
         _runRollback(
             opCtx.get(), fetcherReturnStatus, source, syncSourceResp.rbid, storageInterface);
+
+        if (bgSyncHangAfterRunRollback.shouldFail()) {
+            log() << "bgSyncHangAfterRunRollback failpoint is set.";
+            while (MONGO_unlikely(bgSyncHangAfterRunRollback.shouldFail()) && !inShutdown()) {
+                mongo::sleepmillis(100);
+            }
+        }
     } else if (fetcherReturnStatus == ErrorCodes::InvalidBSON) {
         Seconds blacklistDuration(60);
         warning() << "Fetcher got invalid BSON while querying oplog. Blacklisting sync source "
@@ -632,7 +655,7 @@ void BackgroundSync::_runRollback(OperationContext* opCtx,
     // are visible before potentially truncating the oplog.
     storageInterface->waitForAllEarlierOplogWritesToBeVisible(opCtx);
 
-    IndexBuildsCoordinator::get(opCtx)->onRollback(opCtx);
+    auto abortedIndexBuilds = IndexBuildsCoordinator::get(opCtx)->onRollback(opCtx);
 
     auto storageEngine = opCtx->getServiceContext()->getStorageEngine();
     if (!forceRollbackViaRefetch.load() && storageEngine->supportsRecoverToStableTimestamp()) {
@@ -641,7 +664,8 @@ void BackgroundSync::_runRollback(OperationContext* opCtx,
             opCtx, source, &localOplog, storageInterface, getConnection);
     } else {
         log() << "Rollback using the 'rollbackViaRefetch' method.";
-        _fallBackOnRollbackViaRefetch(opCtx, source, requiredRBID, &localOplog, getConnection);
+        _fallBackOnRollbackViaRefetch(
+            opCtx, source, abortedIndexBuilds, requiredRBID, &localOplog, getConnection);
     }
 
     // Reset the producer to clear the sync source and the last optime fetched.
@@ -686,6 +710,7 @@ void BackgroundSync::_runRollbackViaRecoverToCheckpoint(
 void BackgroundSync::_fallBackOnRollbackViaRefetch(
     OperationContext* opCtx,
     const HostAndPort& source,
+    const IndexBuilds& abortedIndexBuilds,
     int requiredRBID,
     OplogInterface* localOplog,
     OplogInterfaceRemote::GetConnectionFn getConnection) {
@@ -695,7 +720,13 @@ void BackgroundSync::_fallBackOnRollbackViaRefetch(
                                       NamespaceString::kRsOplogNamespace.ns(),
                                       rollbackRemoteOplogQueryBatchSize.load());
 
-    rollback(opCtx, *localOplog, rollbackSource, requiredRBID, _replCoord, _replicationProcess);
+    rollback(opCtx,
+             *localOplog,
+             rollbackSource,
+             abortedIndexBuilds,
+             requiredRBID,
+             _replCoord,
+             _replicationProcess);
 }
 
 HostAndPort BackgroundSync::getSyncTarget() const {
@@ -770,7 +801,6 @@ OpTime BackgroundSync::_readLastAppliedOpTime(OperationContext* opCtx) {
     try {
         bool success = writeConflictRetry(
             opCtx, "readLastAppliedOpTime", NamespaceString::kRsOplogNamespace.ns(), [&] {
-                Lock::DBLock lk(opCtx, "local", MODE_X);
                 return Helpers::getLast(
                     opCtx, NamespaceString::kRsOplogNamespace.ns().c_str(), oplogEntry);
             });

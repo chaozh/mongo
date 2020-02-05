@@ -53,6 +53,7 @@
 #include "mongo/executor/task_executor_pool.h"
 #include "mongo/platform/overflow_arithmetic.h"
 #include "mongo/s/catalog_cache.h"
+#include "mongo/s/client/num_hosts_targeted_metrics.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/cluster_commands_helpers.h"
 #include "mongo/s/grid.h"
@@ -75,7 +76,6 @@ static const BSONObj kSortKeyMetaProjection = BSON("$meta"
                                                    << "sortKey");
 static const BSONObj kGeoNearDistanceMetaProjection = BSON("$meta"
                                                            << "geoNearDistance");
-
 // We must allow some amount of overhead per result document, since when we make a cursor response
 // the documents are elements of a BSONArray. The overhead is 1 byte/doc for the type + 1 byte/doc
 // for the field name's null terminator + 1 byte per digit in the array index. The index can be no
@@ -190,6 +190,10 @@ StatusWith<std::unique_ptr<QueryRequest>> transformQueryForShards(
     // Any expansion of the 'showRecordId' flag should have already happened on mongos.
     newQR->setShowRecordId(false);
 
+    // Indicate to shard servers that this is a 4.4 or newer mongoS, and they should serialize sort
+    // keys in the new format.
+    newQR->setUse44SortKeys(true);
+
     invariant(newQR->validate());
     return std::move(newQR);
 }
@@ -204,8 +208,19 @@ std::vector<std::pair<ShardId, BSONObj>> constructRequestsForShards(
     const std::set<ShardId>& shardIds,
     const CanonicalQuery& query,
     bool appendGeoNearDistanceProjection) {
-    const auto qrToForward = uassertStatusOK(
-        transformQueryForShards(query.getQueryRequest(), appendGeoNearDistanceProjection));
+
+    std::unique_ptr<QueryRequest> qrToForward;
+    if (shardIds.size() > 1) {
+        qrToForward = uassertStatusOK(
+            transformQueryForShards(query.getQueryRequest(), appendGeoNearDistanceProjection));
+    } else {
+        // Forwards the QueryRequest as is to a single shard so that limit and skip can
+        // be applied on mongod.
+        qrToForward = std::make_unique<QueryRequest>(query.getQueryRequest());
+        // Indicate to shard servers that this is a 4.4 or newer mongoS, and they should serialize
+        // sort keys in the new format.
+        qrToForward->setUse44SortKeys(true);
+    }
 
     auto shardRegistry = Grid::get(opCtx)->shardRegistry();
     std::vector<std::pair<ShardId, BSONObj>> requests;
@@ -234,24 +249,37 @@ std::vector<std::pair<ShardId, BSONObj>> constructRequestsForShards(
     return requests;
 }
 
+void updateNumHostsTargetedMetrics(OperationContext* opCtx,
+                                   const CachedCollectionRoutingInfo& routingInfo,
+                                   int nTargetedShards) {
+    int nShardsOwningChunks = 0;
+    if (routingInfo.cm()) {
+        nShardsOwningChunks = routingInfo.cm()->getNShardsOwningChunks();
+    }
+
+    auto targetType = NumHostsTargetedMetrics::get(opCtx).parseTargetType(
+        opCtx, nTargetedShards, nShardsOwningChunks);
+    NumHostsTargetedMetrics::get(opCtx).addNumHostsTargeted(
+        NumHostsTargetedMetrics::QueryType::kFindCmd, targetType);
+}
+
 CursorId runQueryWithoutRetrying(OperationContext* opCtx,
                                  const CanonicalQuery& query,
                                  const ReadPreferenceSetting& readPref,
                                  const CachedCollectionRoutingInfo& routingInfo,
-                                 std::vector<BSONObj>* results) {
+                                 std::vector<BSONObj>* results,
+                                 bool* partialResultsReturned) {
     // Get the set of shards on which we will run the query.
     auto shardIds = getTargetedShardsForQuery(opCtx,
                                               routingInfo,
                                               query.getQueryRequest().getFilter(),
                                               query.getQueryRequest().getCollation());
 
-    // Construct the query and parameters.
-
+    // Construct the query and parameters. Defer setting skip and limit here until
+    // we determine if the query is targeting multi-shards or a single shard below.
     ClusterClientCursorParams params(query.nss(), readPref);
     params.originatingCommandObj = CurOp::get(opCtx)->opDescription().getOwned();
-    params.limit = query.getQueryRequest().getLimit();
     params.batchSize = query.getQueryRequest().getEffectiveBatchSize();
-    params.skip = query.getQueryRequest().getSkip();
     params.tailableMode = query.getQueryRequest().getTailableMode();
     params.isAllowPartialResults = query.getQueryRequest().isAllowPartialResults();
     params.lsid = opCtx->getLogicalSessionId();
@@ -273,24 +301,26 @@ CursorId runQueryWithoutRetrying(OperationContext* opCtx,
     // $natural sort is actually a hint to use a collection scan, and shouldn't be treated like a
     // sort on mongos. Including a $natural anywhere in the sort spec results in the whole sort
     // being considered a hint to use a collection scan.
+    BSONObj sortComparatorBob;
     if (!query.getQueryRequest().getSort().hasField("$natural")) {
-        params.sort = transformSortSpec(query.getQueryRequest().getSort());
+        sortComparatorBob = transformSortSpec(query.getQueryRequest().getSort());
     }
 
     bool appendGeoNearDistanceProjection = false;
+    bool compareWholeSortKeyOnRouter = false;
     if (query.getQueryRequest().getSort().isEmpty() &&
         QueryPlannerCommon::hasNode(query.root(), MatchExpression::GEO_NEAR)) {
         // There is no specified sort, and there is a GEO_NEAR node. This means we should merge sort
         // by the geoNearDistance. Request the projection {$sortKey: <geoNearDistance>} from the
         // shards. Indicate to the AsyncResultsMerger that it should extract the sort key
         // {"$sortKey": <geoNearDistance>} and sort by the order {"$sortKey": 1}.
-        params.sort = AsyncResultsMerger::kWholeSortKeySortPattern;
-        params.compareWholeSortKey = true;
+        sortComparatorBob = AsyncResultsMerger::kWholeSortKeySortPattern;
+        compareWholeSortKeyOnRouter = true;
         appendGeoNearDistanceProjection = true;
     }
 
     // Tailable cursors can't have a sort, which should have already been validated.
-    invariant(params.sort.isEmpty() || !query.getQueryRequest().isTailable());
+    invariant(sortComparatorBob.isEmpty() || !query.getQueryRequest().isTailable());
 
     // Construct the requests that we will use to establish cursors on the targeted shards,
     // attaching the shardVersion and txnNumber, if necessary.
@@ -299,7 +329,6 @@ CursorId runQueryWithoutRetrying(OperationContext* opCtx,
         opCtx, routingInfo, shardIds, query, appendGeoNearDistanceProjection);
 
     // Establish the cursors with a consistent shardVersion across shards.
-
     params.remotes = establishCursors(opCtx,
                                       Grid::get(opCtx)->getExecutorPool()->getArbitraryExecutor(),
                                       query.nss(),
@@ -312,6 +341,16 @@ CursorId runQueryWithoutRetrying(OperationContext* opCtx,
     const auto cursorType = params.remotes.size() > 1
         ? ClusterCursorManager::CursorType::MultiTarget
         : ClusterCursorManager::CursorType::SingleTarget;
+
+    // Only set skip, limit and sort to be applied to on the router for the multi-shard case. For
+    // the single-shard case skip/limit as well as sorts are appled on mongod.
+    if (cursorType == ClusterCursorManager::CursorType::MultiTarget) {
+        const auto qr = query.getQueryRequest();
+        params.skipToApplyOnRouter = qr.getSkip();
+        params.limit = qr.getLimit();
+        params.sortToApplyOnRouter = sortComparatorBob;
+        params.compareWholeSortKeyOnRouter = compareWholeSortKeyOnRouter;
+    }
 
     // Transfer the established cursors to a ClusterClientCursor.
 
@@ -367,10 +406,19 @@ CursorId runQueryWithoutRetrying(OperationContext* opCtx,
     CurOp::get(opCtx)->debug().nShards = ccc->getNumRemotes();
     CurOp::get(opCtx)->debug().nreturned = results->size();
 
+    // If the caller wants to know whether the cursor returned partial results, set it here.
+    if (partialResultsReturned) {
+        *partialResultsReturned = ccc->partialResultsReturned();
+    }
+
     // If the cursor is exhausted, then there are no more results to return and we don't need to
     // allocate a cursor id.
     if (cursorState == ClusterCursorManager::CursorState::Exhausted) {
         CurOp::get(opCtx)->debug().cursorExhausted = true;
+
+        if (shardIds.size() > 0) {
+            updateNumHostsTargetedMetrics(opCtx, routingInfo, shardIds.size());
+        }
         return CursorId(0);
     }
 
@@ -388,6 +436,11 @@ CursorId runQueryWithoutRetrying(OperationContext* opCtx,
 
     // Record the cursorID in CurOp.
     CurOp::get(opCtx)->debug().cursorid = cursorId;
+
+    if (shardIds.size() > 0) {
+        updateNumHostsTargetedMetrics(opCtx, routingInfo, shardIds.size());
+    }
+
     return cursorId;
 }
 
@@ -435,7 +488,14 @@ const size_t ClusterFind::kMaxRetries = 10;
 CursorId ClusterFind::runQuery(OperationContext* opCtx,
                                const CanonicalQuery& query,
                                const ReadPreferenceSetting& readPref,
-                               std::vector<BSONObj>* results) {
+                               std::vector<BSONObj>* results,
+                               bool* partialResultsReturned) {
+    // If the user supplied a 'partialResultsReturned' out-parameter, default it to false here.
+    if (partialResultsReturned) {
+        *partialResultsReturned = false;
+    }
+
+    // We must always have a BSONObj vector into which to output our results.
     invariant(results);
 
     // Projection on the reserved sort key field is illegal in mongos.
@@ -445,6 +505,12 @@ CursorId ClusterFind::runQuery(OperationContext* opCtx,
                                 << AsyncResultsMerger::kSortKeyField
                                 << "': " << query.getQueryRequest().getProj());
     }
+
+    // Attempting to establish a resumable query through mongoS is illegal.
+    uassert(ErrorCodes::BadValue,
+            "Queries on mongoS may not request or provide a resume token",
+            !query.getQueryRequest().getRequestResumeToken() &&
+                query.getQueryRequest().getResumeAfter().isEmpty());
 
     auto const catalogCache = Grid::get(opCtx)->catalogCache();
 
@@ -461,7 +527,8 @@ CursorId ClusterFind::runQuery(OperationContext* opCtx,
         auto routingInfo = uassertStatusOK(routingInfoStatus);
 
         try {
-            return runQueryWithoutRetrying(opCtx, query, readPref, routingInfo, results);
+            return runQueryWithoutRetrying(
+                opCtx, query, readPref, routingInfo, results, partialResultsReturned);
         } catch (ExceptionFor<ErrorCodes::StaleDbVersion>& ex) {
             if (retries >= kMaxRetries) {
                 // Check if there are no retries remaining, so the last received error can be
@@ -508,7 +575,18 @@ CursorId ClusterFind::runQuery(OperationContext* opCtx,
             LOG(1) << "Received error status for query " << redact(query.toStringShort())
                    << " on attempt " << retries << " of " << kMaxRetries << ": " << redact(ex);
 
-            catalogCache->onStaleShardVersion(std::move(routingInfo));
+            if (auto staleInfo = ex.extraInfo<StaleConfigInfo>()) {
+                catalogCache->invalidateShardOrEntireCollectionEntryForShardedCollection(
+                    opCtx,
+                    query.nss(),
+                    staleInfo->getVersionWanted(),
+                    staleInfo->getVersionReceived(),
+                    staleInfo->getShardId());
+            } else {
+                catalogCache->onEpochChange(query.nss());
+            }
+
+            catalogCache->setOperationShouldBlockBehindCatalogCacheRefresh(opCtx, true);
 
             if (auto txnRouter = TransactionRouter::get(opCtx)) {
                 if (!txnRouter.canContinueOnStaleShardOrDbError(kFindCmdName)) {
@@ -731,6 +809,7 @@ StatusWith<CursorResponse> ClusterFind::runGetMore(OperationContext* opCtx,
         postBatchResumeToken = pinnedCursor.getValue()->getPostBatchResumeToken();
     }
 
+    const bool partialResultsReturned = pinnedCursor.getValue()->partialResultsReturned();
     pinnedCursor.getValue()->setLeftoverMaxTimeMicros(opCtx->getRemainingMaxTimeMicros());
     pinnedCursor.getValue()->incNBatches();
     // Upon successful completion, transfer ownership of the cursor back to the cursor manager. If
@@ -748,8 +827,13 @@ StatusWith<CursorResponse> ClusterFind::runGetMore(OperationContext* opCtx,
             "waitBeforeUnpinningOrDeletingCursorAfterGetMoreBatch");
     }
 
-    return CursorResponse(
-        request.nss, idToReturn, std::move(batch), startingFrom, postBatchResumeToken);
+    return CursorResponse(request.nss,
+                          idToReturn,
+                          std::move(batch),
+                          startingFrom,
+                          postBatchResumeToken,
+                          boost::none,
+                          partialResultsReturned);
 }
 
 }  // namespace mongo

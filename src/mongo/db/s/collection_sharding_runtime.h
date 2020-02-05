@@ -47,13 +47,15 @@ extern AtomicWord<int> migrationLockAcquisitionMaxWaitMS;
  */
 class CollectionShardingRuntime final : public CollectionShardingState,
                                         public Decorable<CollectionShardingRuntime> {
-    CollectionShardingRuntime(const CollectionShardingRuntime&) = delete;
-    CollectionShardingRuntime& operator=(const CollectionShardingRuntime&) = delete;
-
 public:
     CollectionShardingRuntime(ServiceContext* sc,
                               NamespaceString nss,
-                              executor::TaskExecutor* rangeDeleterExecutor);
+                              std::shared_ptr<executor::TaskExecutor> rangeDeleterExecutor);
+
+    CollectionShardingRuntime(const CollectionShardingRuntime&) = delete;
+    CollectionShardingRuntime& operator=(const CollectionShardingRuntime&) = delete;
+
+    using CSRLock = ShardingStateLock<CollectionShardingRuntime>;
 
     /**
      * Obtains the sharding runtime state for the specified collection. If it does not exist, it
@@ -70,6 +72,36 @@ public:
      */
     static CollectionShardingRuntime* get_UNSAFE(ServiceContext* svcCtx,
                                                  const NamespaceString& nss);
+
+    /**
+     * Waits for all ranges deletion tasks with UUID 'collectionUuid' overlapping range
+     * 'orphanRange' to be processed, even if the collection does not exist in the storage catalog.
+     */
+    static Status waitForClean(OperationContext* opCtx,
+                               const NamespaceString& nss,
+                               const UUID& collectionUuid,
+                               ChunkRange orphanRange);
+
+    ScopedCollectionFilter getOwnershipFilter(OperationContext* opCtx, bool isCollection) override;
+
+    ScopedCollectionMetadata getCurrentMetadata() override;
+
+    boost::optional<ScopedCollectionMetadata> getCurrentMetadataIfKnown() override;
+
+    boost::optional<ChunkVersion> getCurrentShardVersionIfKnown() override;
+
+    void checkShardVersionOrThrow(OperationContext* opCtx, bool isCollection) override;
+
+    Status checkShardVersionNoThrow(OperationContext* opCtx, bool isCollection) noexcept override;
+
+    void enterCriticalSectionCatchUpPhase(OperationContext* opCtx) override;
+
+    void enterCriticalSectionCommitPhase(OperationContext* opCtx) override;
+
+    void exitCriticalSection(OperationContext* opCtx) override;
+
+    std::shared_ptr<Notification<void>> getCriticalSectionSignal(
+        ShardingMigrationCriticalSection::Operation op) const override;
 
     /**
      * Updates the collection's filtering metadata based on changes received from the config server
@@ -94,17 +126,15 @@ public:
 
     /**
      * Schedules any documents in `range` for immediate cleanup iff no running queries can depend
-     * on them, and adds the range to the list of pending ranges. Otherwise, returns a notification
-     * that yields bad status immediately.  Does not block.  Call waitStatus(opCtx) on the result
-     * to wait for the deletion to complete or fail.  After that, call waitForClean to ensure no
-     * other deletions are pending for the range.
+     * on them, and adds the range to the list of ranges being received.
+     *
+     * Returns a future that will be resolved when the deletion has completed or failed.
      */
-    using CleanupNotification = CollectionRangeDeleter::DeleteNotification;
-    CleanupNotification beginReceive(ChunkRange const& range);
+    SharedSemiFuture<void> beginReceive(ChunkRange const& range);
 
     /*
-     * Removes `range` from the list of pending ranges, and schedules any documents in the range for
-     * immediate cleanup. Does not block.
+     * Removes `range` from the list of ranges being received, and schedules any documents in the
+     * range for immediate cleanup. Does not block.
      */
     void forgetReceive(const ChunkRange& range);
 
@@ -114,30 +144,11 @@ public:
      * Passed kDelayed, an additional delay (configured via server parameter orphanCleanupDelaySecs)
      * is added to permit (most) dependent queries on secondaries to complete, too.
      *
-     * Call result.waitStatus(opCtx) to wait for the deletion to complete or fail. If that succeeds,
-     * waitForClean can be called to ensure no other deletions are pending for the range. Call
-     * result.abandon(), instead of waitStatus, to ignore the outcome.
+     * Returns a future that will be resolved when the deletion completes or fails. If that
+     * succeeds, waitForClean can be called to ensure no other deletions are pending for the range.
      */
     enum CleanWhen { kNow, kDelayed };
-    CleanupNotification cleanUpRange(ChunkRange const& range, CleanWhen when);
-
-    /**
-     * Tracks deletion of any documents within the range, returning when deletion is complete.
-     * Throws if the collection is dropped while it sleeps.
-     */
-    static Status waitForClean(OperationContext* opCtx,
-                               const NamespaceString& nss,
-                               OID const& epoch,
-                               ChunkRange orphanRange);
-
-    /**
-     * Reports whether any range still scheduled for deletion overlaps the argument range. If so,
-     * it returns a notification n such that n->get(opCtx) will wake when the newest overlapping
-     * range's deletion (possibly the one of interest) completes or fails. This should be called
-     * again after each wakeup until it returns boost::none, because there can be more than one
-     * range scheduled for deletion that overlaps its argument.
-     */
-    auto trackOrphanedDataCleanup(ChunkRange const& range) -> boost::optional<CleanupNotification>;
+    SharedSemiFuture<void> cleanUpRange(ChunkRange const& range, CleanWhen when);
 
     /**
      * Returns a range _not_ owned by this shard that starts no lower than the specified
@@ -153,17 +164,54 @@ public:
     }
 
 private:
-    friend boost::optional<Date_t> CollectionRangeDeleter::cleanUpNextRange(
-        OperationContext*, NamespaceString const&, OID const&, int, CollectionRangeDeleter*);
+    friend CSRLock;
+
+    /**
+     * Returns the latest version of collection metadata with filtering configured for
+     * atClusterTime if specified.
+     */
+    boost::optional<ScopedCollectionMetadata> _getCurrentMetadataIfKnown(
+        const boost::optional<LogicalTime>& atClusterTime);
+
+    /**
+     * Returns the latest version of collection metadata with filtering configured for
+     * atClusterTime if specified. Throws StaleConfigInfo if the shard version attached to the
+     * operation context does not match the shard version on the active metadata object.
+     */
+    boost::optional<ScopedCollectionMetadata> _getMetadataWithVersionCheckAt(
+        OperationContext* opCtx,
+        const boost::optional<mongo::LogicalTime>& atClusterTime,
+        bool isCollection);
 
     // Namespace this state belongs to.
     const NamespaceString _nss;
 
-    // Contains all the metadata associated with this collection.
-    std::shared_ptr<MetadataManager> _metadataManager;
+    // The executor used for deleting ranges of orphan chunks.
+    std::shared_ptr<executor::TaskExecutor> _rangeDeleterExecutor;
 
-    boost::optional<ScopedCollectionMetadata> _getMetadata(
-        const boost::optional<mongo::LogicalTime>& atClusterTime) override;
+    // Object-wide ResourceMutex to protect changes to the CollectionShardingRuntime or objects held
+    // within (including the MigrationSourceManager, which is a decoration on the CSR). Use only the
+    // CSRLock to lock this mutex.
+    Lock::ResourceMutex _stateChangeMutex;
+
+    // Tracks the migration critical section state for this collection.
+    ShardingMigrationCriticalSection _critSec;
+
+    mutable Mutex _metadataManagerLock =
+        MONGO_MAKE_LATCH("CollectionShardingRuntime::_metadataManagerLock");
+
+    // Tracks whether the filtering metadata is unknown, unsharded, or sharded
+    enum class MetadataType {
+        kUnknown,
+        kUnsharded,
+        kSharded
+    } _metadataType{MetadataType::kUnknown};
+
+    // If the collection is sharded, contains all the metadata associated with this collection.
+    //
+    // If the collection is unsharded, the metadata has not been set yet, or the metadata has been
+    // specifically reset by calling clearFilteringMetadata(), this will be nullptr;
+    std::shared_ptr<MetadataManager> _metadataManager;
 };
 
 /**

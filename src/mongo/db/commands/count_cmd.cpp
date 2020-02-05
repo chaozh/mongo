@@ -90,11 +90,9 @@ public:
         return false;
     }
 
-    ReadConcernSupportResult supportsReadConcern(const std::string& dbName,
-                                                 const BSONObj& cmdObj,
+    ReadConcernSupportResult supportsReadConcern(const BSONObj& cmdObj,
                                                  repl::ReadConcernLevel level) const override {
-        return {ReadConcernSupportResult::ReadConcern::kSupported,
-                ReadConcernSupportResult::DefaultReadConcern::kPermitted};
+        return ReadConcernSupportResult::allSupportedAndDefaultPermitted();
     }
 
     ReadWriteType getReadWriteType() const override {
@@ -113,7 +111,7 @@ public:
         const auto hasTerm = false;
         return authSession->checkAuthForFind(
             CollectionCatalog::get(opCtx).resolveNamespaceStringOrUUID(
-                CommandHelpers::parseNsOrUUID(dbname, cmdObj)),
+                opCtx, CommandHelpers::parseNsOrUUID(dbname, cmdObj)),
             hasTerm);
     }
 

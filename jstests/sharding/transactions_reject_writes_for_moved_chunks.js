@@ -94,6 +94,8 @@ function runTest(testCase, ns, collName, moveChunkToFunc, moveChunkBack) {
         expectChunks(st, ns, [2, 2, 2]);
     }
 
+    st.refreshCatalogCacheForNs(st.s, ns);
+
     const session = st.s.startSession();
     const sessionDB = session.getDatabase(dbName);
     const sessionColl = sessionDB[collName];
@@ -119,6 +121,14 @@ function runTest(testCase, ns, collName, moveChunkToFunc, moveChunkBack) {
         assert.commandWorked(
             st.rs1.getPrimary().adminCommand({_flushRoutingTableCacheUpdates: ns}));
     }
+
+    st.refreshCatalogCacheForNs(st.s, ns);
+
+    // The find should target shard0 and find the doc. If it targets shard1, it will not be able to
+    // find the doc because it is using the snapshot for the pinned global read timestamp.
+    assert.eq(sessionColl.find({_id: -3}).itcount(),
+              1,
+              "expected find to target the right shard even after moveChunk");
 
     // The write should always fail, but the particular error varies.
     const res = assert.commandFailed(

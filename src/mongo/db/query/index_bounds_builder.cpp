@@ -35,6 +35,7 @@
 #include <limits>
 
 #include "mongo/base/string_data.h"
+#include "mongo/bson/bsontypes.h"
 #include "mongo/db/geo/geoconstants.h"
 #include "mongo/db/geo/s2.h"
 #include "mongo/db/index/expression_params.h"
@@ -78,8 +79,14 @@ void assertOILIsAscendingLocally(const vector<Interval>& intervals, size_t idx) 
 }
 
 // Tightness rules are shared for $lt, $lte, $gt, $gte.
-IndexBoundsBuilder::BoundsTightness getInequalityPredicateTightness(const BSONElement& dataElt,
+IndexBoundsBuilder::BoundsTightness getInequalityPredicateTightness(const Interval& interval,
+                                                                    const BSONElement& dataElt,
                                                                     const IndexEntry& index) {
+    if (interval.isNull()) {
+        // Any time the bounds are empty, we consider them to be exact.
+        return IndexBoundsBuilder::EXACT;
+    }
+
     return Indexability::isExactBoundsGenerating(dataElt) ? IndexBoundsBuilder::EXACT
                                                           : IndexBoundsBuilder::INEXACT_FETCH;
 }
@@ -120,6 +127,14 @@ const Interval kHashedUndefinedInterval = IndexBoundsBuilder::makePointInterval(
 const Interval kHashedNullInterval =
     IndexBoundsBuilder::makePointInterval(ExpressionMapping::hash(kNullElementObj.firstElement()));
 
+Interval makeUndefinedPointInterval(bool isHashed) {
+    return isHashed ? kHashedUndefinedInterval
+                    : IndexBoundsBuilder::makePointInterval(kUndefinedElementObj);
+}
+Interval makeNullPointInterval(bool isHashed) {
+    return isHashed ? kHashedNullInterval : IndexBoundsBuilder::makePointInterval(kNullElementObj);
+}
+
 void makeNullEqualityBounds(const IndexEntry& index,
                             bool isHashed,
                             OrderedIntervalList* oil,
@@ -129,17 +144,17 @@ void makeNullEqualityBounds(const IndexEntry& index,
     *tightnessOut = IndexBoundsBuilder::INEXACT_FETCH;
 
     // There are two values that could possibly be equal to null in an index: undefined and null.
-    oil->intervals.push_back(isHashed
-                                 ? kHashedUndefinedInterval
-                                 : IndexBoundsBuilder::makePointInterval(kUndefinedElementObj));
-    oil->intervals.push_back(isHashed ? kHashedNullInterval
-                                      : IndexBoundsBuilder::makePointInterval(kNullElementObj));
+    oil->intervals.push_back(makeUndefinedPointInterval(isHashed));
+    oil->intervals.push_back(makeNullPointInterval(isHashed));
+
     // Just to be sure, make sure the bounds are in the right order if the hash values are opposite.
     IndexBoundsBuilder::unionize(oil);
 }
 
 bool isEqualityOrInNull(MatchExpression* me) {
-    if (MatchExpression::EQ == me->matchType()) {
+    // Because of type-bracketing, {$gte: null} and {$lte: null} are equivalent to {$eq: null}.
+    if (MatchExpression::EQ == me->matchType() || MatchExpression::GTE == me->matchType() ||
+        MatchExpression::LTE == me->matchType()) {
         return static_cast<ComparisonMatchExpression*>(me)->getData().type() == BSONType::jstNULL;
     }
 
@@ -371,6 +386,120 @@ void IndexBoundsBuilder::translate(const MatchExpression* expr,
     }
 }
 
+namespace {
+IndexBoundsBuilder::BoundsTightness computeTightnessForTypeSet(const MatcherTypeSet& typeSet,
+                                                               const IndexEntry& index) {
+    // The Array case will not be handled because a typeSet with Array should not reach this
+    // function
+    invariant(!typeSet.hasType(BSONType::Array));
+
+    // The String and Object types with collation require an inexact fetch.
+    if (index.collator != nullptr &&
+        (typeSet.hasType(BSONType::String) || typeSet.hasType(BSONType::Object))) {
+        return IndexBoundsBuilder::INEXACT_FETCH;
+    }
+
+    // Null and Undefined Types always require an inexact fetch.
+    if (typeSet.hasType(BSONType::jstNULL) || typeSet.hasType(BSONType::Undefined)) {
+        return IndexBoundsBuilder::INEXACT_FETCH;
+    }
+
+    const auto numberTypesIncluded = static_cast<int>(typeSet.hasType(BSONType::NumberInt)) +
+        static_cast<int>(typeSet.hasType(BSONType::NumberLong)) +
+        static_cast<int>(typeSet.hasType(BSONType::NumberDecimal)) +
+        static_cast<int>(typeSet.hasType(BSONType::NumberDouble));
+
+    // Checks that either all the number types are present or "number" is present in the type set.
+    const bool hasAllNumbers = (numberTypesIncluded == 4) || typeSet.allNumbers;
+    const bool hasAnyNumbers = numberTypesIncluded > 0;
+
+    if (hasAnyNumbers && !hasAllNumbers) {
+        return IndexBoundsBuilder::INEXACT_COVERED;
+    }
+
+    // This check is effectively typeSet.hasType(BSONType::String) XOR
+    // typeSet.hasType(BSONType::Symbol).
+    if ((typeSet.hasType(BSONType::String) != typeSet.hasType(BSONType::Symbol))) {
+        return IndexBoundsBuilder::INEXACT_COVERED;
+    }
+
+    return IndexBoundsBuilder::EXACT;
+}
+
+// Contains all the logic for determining bounds of a LT or LTE query.
+void buildBoundsForQueryElementForLT(BSONElement dataElt,
+                                     const mongo::CollatorInterface* collator,
+                                     BSONObjBuilder* bob) {
+    // Use -infinity for one-sided numerical bounds
+    if (dataElt.isNumber()) {
+        bob->appendNumber("", -std::numeric_limits<double>::infinity());
+    } else if (dataElt.type() == BSONType::Array) {
+        // For comparison to an array, we do lexicographic comparisons. In a multikey index, the
+        // index entries are the array elements themselves. We must therefore look at all types, and
+        // all values between MinKey and the first element in the array.
+        bob->appendMinKey("");
+    } else {
+        bob->appendMinForType("", dataElt.type());
+    }
+    if (dataElt.type() != BSONType::Array) {
+        CollationIndexKey::collationAwareIndexKeyAppend(dataElt, collator, bob);
+        return;
+    }
+
+    auto eltArr = dataElt.Array();
+    if (eltArr.empty()) {
+        // The empty array is the lowest array.
+        bob->appendMinForType("", dataElt.type());
+    } else {
+        // If the type of the element is greater than the type of the array, the bounds have to
+        // include that element. Otherwise the array type, and therefore `dataElt` is
+        // sufficiently large to include all relevant keys.
+        if (canonicalizeBSONType(eltArr[0].type()) > canonicalizeBSONType(BSONType::Array)) {
+            CollationIndexKey::collationAwareIndexKeyAppend(eltArr[0], collator, bob);
+        } else {
+            CollationIndexKey::collationAwareIndexKeyAppend(dataElt, collator, bob);
+        }
+    }
+}
+
+void buildBoundsForQueryElementForGT(BSONElement dataElt,
+                                     const mongo::CollatorInterface* collator,
+                                     BSONObjBuilder* bob) {
+    if (dataElt.type() == BSONType::Array) {
+        auto eltArr = dataElt.Array();
+        if (eltArr.empty()) {
+            // If the array is empty, we need bounds that will match all arrays. Unfortunately,
+            // this means that we have to check the entire index, as any array could have a key
+            // anywhere in the multikey index.
+            bob->appendMinKey("");
+        } else {
+            // If the type of the element is smaller than the type of the array, the bounds need
+            // to extend to that element. Otherwise the array type, and therefore `dataElt` is
+            // sufficiently large include all relevant keys.
+            if (canonicalizeBSONType(eltArr[0].type()) < canonicalizeBSONType(BSONType::Array)) {
+                CollationIndexKey::collationAwareIndexKeyAppend(eltArr[0], collator, bob);
+            } else {
+                CollationIndexKey::collationAwareIndexKeyAppend(dataElt, collator, bob);
+            }
+        }
+    } else {
+        CollationIndexKey::collationAwareIndexKeyAppend(dataElt, collator, bob);
+    }
+
+    if (dataElt.isNumber()) {
+        bob->appendNumber("", std::numeric_limits<double>::infinity());
+        // For comparison to an array, we do lexicographic comparisons. In a multikey index, the
+        // index entries are the array elements themselves. We must therefore look at all types, and
+        // all values between the first element in the array and MaxKey.
+    } else if (dataElt.type() == BSONType::Array) {
+        bob->appendMaxKey("");
+    } else {
+        bob->appendMaxForType("", dataElt.type());
+    }
+}
+
+}  // namespace
+
 void IndexBoundsBuilder::_translatePredicate(const MatchExpression* expr,
                                              const BSONElement& elt,
                                              const IndexEntry& index,
@@ -386,10 +515,8 @@ void IndexBoundsBuilder::_translatePredicate(const MatchExpression* expr,
         isHashed = true;
     }
 
-    if (isHashed) {
-        invariant(MatchExpression::MATCH_IN == expr->matchType() ||
-                  ComparisonMatchExpressionBase::isEquality(expr->matchType()));
-    }
+    // We should never be asked to translate an unsupported predicate for a hashed index.
+    invariant(!isHashed || QueryPlannerIXSelect::nodeIsSupportedByHashedIndex(expr));
 
     if (MatchExpression::ELEM_MATCH_VALUE == expr->matchType()) {
         OrderedIntervalList acc;
@@ -425,13 +552,8 @@ void IndexBoundsBuilder::_translatePredicate(const MatchExpression* expr,
         if (MatchExpression::EXISTS == child->matchType()) {
             // We should never try to use a sparse index for $exists:false.
             invariant(!index.sparse);
-            BSONObjBuilder bob;
-            bob.appendNull("");
-            bob.appendNull("");
-            BSONObj dataObj = bob.obj();
-            oilOut->intervals.push_back(
-                makeRangeInterval(dataObj, BoundInclusion::kIncludeBothStartAndEndKeys));
-
+            // {$exists:false} is a point-interval on [null,null] that requires a fetch.
+            oilOut->intervals.push_back(makeNullPointInterval(isHashed));
             *tightnessOut = IndexBoundsBuilder::INEXACT_FETCH;
             return;
         }
@@ -446,8 +568,12 @@ void IndexBoundsBuilder::_translatePredicate(const MatchExpression* expr,
             *tightnessOut = IndexBoundsBuilder::EXACT;
         }
 
-        // If this invariant would fail, we would otherwise return incorrect query results.
-        invariant(*tightnessOut == IndexBoundsBuilder::EXACT);
+        // This disables indexed negation of array inequality.
+        // TODO: SERVER-45233 Perform correct behavior here once indexed array inequality without
+        // negation's semantics are correctly determined and implemented.
+        massert(ErrorCodes::InternalError,
+                "Indexed negation of array inequality not supported.",
+                *tightnessOut == IndexBoundsBuilder::EXACT);
 
         // If the index is multikey on this path, it doesn't matter what the tightness of the child
         // is, we must return INEXACT_FETCH. Consider a multikey index on 'a' with document
@@ -472,8 +598,10 @@ void IndexBoundsBuilder::_translatePredicate(const MatchExpression* expr,
         //
         // We can safely use an index in the following cases:
         // {a:{ $exists:true }} - normal index helps, but we must still fetch
+        // {a:{ $exists:true }} - hashed index helps, but we must still fetch
         // {a:{ $exists:true }} - sparse index is exact
         // {a:{ $exists:false }} - normal index requires a fetch
+        // {a:{ $exists:false }} - hashed index requires a fetch
         // {a:{ $exists:false }} - sparse indexes cannot be used at all.
         //
         // Noted in SERVER-12869, in case this ever changes some day.
@@ -515,30 +643,35 @@ void IndexBoundsBuilder::_translatePredicate(const MatchExpression* expr,
             return;
         }
 
-        BSONObjBuilder bob;
-        // Use -infinity for one-sided numerical bounds
-        if (dataElt.isNumber()) {
-            bob.appendNumber("", -std::numeric_limits<double>::infinity());
-        } else {
-            bob.appendMinForType("", dataElt.type());
+        if (BSONType::jstNULL == dataElt.type()) {
+            // Because of type-bracketing, $lte null is equivalent to $eq null. An equality to null
+            // query is special. It should return both undefined and null values.
+            makeNullEqualityBounds(index, isHashed, oilOut, tightnessOut);
+            return;
         }
-        CollationIndexKey::collationAwareIndexKeyAppend(dataElt, index.collator, &bob);
-        BSONObj dataObj = bob.obj();
-        verify(dataObj.isOwned());
-        oilOut->intervals.push_back(makeRangeInterval(
-            dataObj, IndexBounds::makeBoundInclusionFromBoundBools(typeMatch(dataObj), true)));
 
-        *tightnessOut = getInequalityPredicateTightness(dataElt, index);
+        BSONObjBuilder bob;
+        buildBoundsForQueryElementForLT(dataElt, index.collator, &bob);
+        BSONObj dataObj = bob.done().getOwned();
+        verify(dataObj.isOwned());
+
+        bool inclusiveBounds = dataElt.type() == BSONType::Array || typeMatch(dataObj);
+        const Interval interval = makeRangeInterval(
+            dataObj, IndexBounds::makeBoundInclusionFromBoundBools(inclusiveBounds, true));
+        oilOut->intervals.push_back(interval);
+
+        *tightnessOut = getInequalityPredicateTightness(interval, dataElt, index);
     } else if (MatchExpression::LT == expr->matchType()) {
         const LTMatchExpression* node = static_cast<const LTMatchExpression*>(expr);
         BSONElement dataElt = node->getData();
 
-        // Everything is < MaxKey, except for MaxKey.
+        // Everything is < MaxKey, except for MaxKey. However the bounds need to be inclusive to
+        // find the array [MaxKey] which is smaller for a comparison but equal in a multikey index.
         if (MaxKey == dataElt.type()) {
             oilOut->intervals.push_back(allValuesRespectingInclusion(
-                IndexBounds::makeBoundInclusionFromBoundBools(true, false)));
-            *tightnessOut =
-                index.collator ? IndexBoundsBuilder::INEXACT_FETCH : IndexBoundsBuilder::EXACT;
+                IndexBounds::makeBoundInclusionFromBoundBools(true, index.multikey)));
+            *tightnessOut = index.collator || index.multikey ? IndexBoundsBuilder::INEXACT_FETCH
+                                                             : IndexBoundsBuilder::EXACT;
             return;
         }
 
@@ -549,17 +682,14 @@ void IndexBoundsBuilder::_translatePredicate(const MatchExpression* expr,
         }
 
         BSONObjBuilder bob;
-        // Use -infinity for one-sided numerical bounds
-        if (dataElt.isNumber()) {
-            bob.appendNumber("", -std::numeric_limits<double>::infinity());
-        } else {
-            bob.appendMinForType("", dataElt.type());
-        }
-        CollationIndexKey::collationAwareIndexKeyAppend(dataElt, index.collator, &bob);
-        BSONObj dataObj = bob.obj();
+        buildBoundsForQueryElementForLT(dataElt, index.collator, &bob);
+        BSONObj dataObj = bob.done().getOwned();
         verify(dataObj.isOwned());
-        Interval interval = makeRangeInterval(
-            dataObj, IndexBounds::makeBoundInclusionFromBoundBools(typeMatch(dataObj), false));
+        bool inclusiveBounds = dataElt.type() == BSONType::Array;
+        Interval interval =
+            makeRangeInterval(dataObj,
+                              IndexBounds::makeBoundInclusionFromBoundBools(
+                                  typeMatch(dataObj) || inclusiveBounds, inclusiveBounds));
 
         // If the operand to LT is equal to the lower bound X, the interval [X, X) is invalid
         // and should not be added to the bounds.
@@ -567,17 +697,18 @@ void IndexBoundsBuilder::_translatePredicate(const MatchExpression* expr,
             oilOut->intervals.push_back(interval);
         }
 
-        *tightnessOut = getInequalityPredicateTightness(dataElt, index);
+        *tightnessOut = getInequalityPredicateTightness(interval, dataElt, index);
     } else if (MatchExpression::GT == expr->matchType()) {
         const GTMatchExpression* node = static_cast<const GTMatchExpression*>(expr);
         BSONElement dataElt = node->getData();
 
-        // Everything is > MinKey, except MinKey.
+        // Everything is > MinKey, except MinKey. However the bounds need to be inclusive to find
+        // the array [MinKey], which is larger for a comparison but equal in a multikey index.
         if (MinKey == dataElt.type()) {
             oilOut->intervals.push_back(allValuesRespectingInclusion(
-                IndexBounds::makeBoundInclusionFromBoundBools(false, true)));
-            *tightnessOut =
-                index.collator ? IndexBoundsBuilder::INEXACT_FETCH : IndexBoundsBuilder::EXACT;
+                IndexBounds::makeBoundInclusionFromBoundBools(index.multikey, true)));
+            *tightnessOut = index.collator || index.multikey ? IndexBoundsBuilder::INEXACT_FETCH
+                                                             : IndexBoundsBuilder::EXACT;
             return;
         }
 
@@ -588,24 +719,21 @@ void IndexBoundsBuilder::_translatePredicate(const MatchExpression* expr,
         }
 
         BSONObjBuilder bob;
-        CollationIndexKey::collationAwareIndexKeyAppend(dataElt, index.collator, &bob);
-        if (dataElt.isNumber()) {
-            bob.appendNumber("", std::numeric_limits<double>::infinity());
-        } else {
-            bob.appendMaxForType("", dataElt.type());
-        }
-        BSONObj dataObj = bob.obj();
+        buildBoundsForQueryElementForGT(dataElt, index.collator, &bob);
+        BSONObj dataObj = bob.done().getOwned();
         verify(dataObj.isOwned());
-        Interval interval = makeRangeInterval(
-            dataObj, IndexBounds::makeBoundInclusionFromBoundBools(false, typeMatch(dataObj)));
+        bool inclusiveBounds = dataElt.type() == BSONType::Array;
+        Interval interval =
+            makeRangeInterval(dataObj,
+                              IndexBounds::makeBoundInclusionFromBoundBools(
+                                  inclusiveBounds, inclusiveBounds || typeMatch(dataObj)));
 
         // If the operand to GT is equal to the upper bound X, the interval (X, X] is invalid
         // and should not be added to the bounds.
         if (!interval.isNull()) {
             oilOut->intervals.push_back(interval);
         }
-
-        *tightnessOut = getInequalityPredicateTightness(dataElt, index);
+        *tightnessOut = getInequalityPredicateTightness(interval, dataElt, index);
     } else if (MatchExpression::GTE == expr->matchType()) {
         const GTEMatchExpression* node = static_cast<const GTEMatchExpression*>(expr);
         BSONElement dataElt = node->getData();
@@ -626,20 +754,22 @@ void IndexBoundsBuilder::_translatePredicate(const MatchExpression* expr,
             return;
         }
 
-        BSONObjBuilder bob;
-        CollationIndexKey::collationAwareIndexKeyAppend(dataElt, index.collator, &bob);
-        if (dataElt.isNumber()) {
-            bob.appendNumber("", std::numeric_limits<double>::infinity());
-        } else {
-            bob.appendMaxForType("", dataElt.type());
+        if (BSONType::jstNULL == dataElt.type()) {
+            // Because of type-bracketing, $lte null is equivalent to $eq null. An equality to null
+            // query is special. It should return both undefined and null values.
+            makeNullEqualityBounds(index, isHashed, oilOut, tightnessOut);
+            return;
         }
-        BSONObj dataObj = bob.obj();
+        BSONObjBuilder bob;
+        buildBoundsForQueryElementForGT(dataElt, index.collator, &bob);
+        BSONObj dataObj = bob.done().getOwned();
         verify(dataObj.isOwned());
+        bool inclusiveBounds = dataElt.type() == BSONType::Array || typeMatch(dataObj);
+        const Interval interval = makeRangeInterval(
+            dataObj, IndexBounds::makeBoundInclusionFromBoundBools(true, inclusiveBounds));
+        oilOut->intervals.push_back(interval);
 
-        oilOut->intervals.push_back(makeRangeInterval(
-            dataObj, IndexBounds::makeBoundInclusionFromBoundBools(true, typeMatch(dataObj))));
-
-        *tightnessOut = getInequalityPredicateTightness(dataElt, index);
+        *tightnessOut = getInequalityPredicateTightness(interval, dataElt, index);
     } else if (MatchExpression::REGEX == expr->matchType()) {
         const RegexMatchExpression* rme = static_cast<const RegexMatchExpression*>(expr);
         translateRegex(rme, index, oilOut, tightnessOut);
@@ -678,15 +808,17 @@ void IndexBoundsBuilder::_translatePredicate(const MatchExpression* expr,
             BSONObjBuilder bob;
             bob.appendMinForType("", type);
             bob.appendMaxForType("", type);
-            oilOut->intervals.push_back(
-                makeRangeInterval(bob.obj(), BoundInclusion::kIncludeBothStartAndEndKeys));
+
+            // Types with variable width use the smallest value of the next type as their upper
+            // bound, so the upper bound needs to be excluded.
+            auto boundInclusionRule = BoundInclusion::kIncludeBothStartAndEndKeys;
+            if (isVariableWidthType(type)) {
+                boundInclusionRule = BoundInclusion::kIncludeStartKeyOnly;
+            }
+            oilOut->intervals.push_back(makeRangeInterval(bob.obj(), boundInclusionRule));
         }
 
-        // If we're only matching the "number" type, then the bounds are exact. Otherwise, the
-        // bounds may be inexact.
-        *tightnessOut = (tme->typeSet().isSingleType() && tme->typeSet().allNumbers)
-            ? IndexBoundsBuilder::EXACT
-            : IndexBoundsBuilder::INEXACT_FETCH;
+        *tightnessOut = computeTightnessForTypeSet(tme->typeSet(), index);
 
         // Sort the intervals, and merge redundant ones.
         unionize(oilOut);

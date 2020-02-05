@@ -3,13 +3,15 @@
  * shuts down a secondary while it's building that index, and confirms that the secondary
  * shuts down cleanly, without an fassert.
  * Also confirms that killOp has no effect on the background index build on the secondary.
- * @tags: [requires_replication]
+ *
+ * @tags: [
+ *   requires_replication,
+ * ]
  */
 
 (function() {
 "use strict";
 
-load('jstests/libs/check_log.js');
 load('jstests/noPassthrough/libs/index_build.js');
 
 var dbname = 'bgIndexSec';
@@ -26,6 +28,7 @@ const replTest = new ReplSetTest({
                 priority: 0,
                 votes: 0,
             },
+            slowms: 30000,  // Don't log slow operations on secondary. See SERVER-44821.
         },
     ]
 });

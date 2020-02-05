@@ -42,6 +42,7 @@
 #include "mongo/transport/transport_layer.h"
 #include "mongo/transport/transport_mode.h"
 #include "mongo/util/fail_point.h"
+#include "mongo/util/hierarchical_acquisition.h"
 #include "mongo/util/net/hostandport.h"
 #include "mongo/util/net/ssl_options.h"
 #include "mongo/util/net/ssl_types.h"
@@ -156,11 +157,13 @@ private:
                                                  const HostAndPort& peer,
                                                  const Milliseconds& timeout);
 
+    void _runListener() noexcept;
+
 #ifdef MONGO_CONFIG_SSL
     SSLParams::SSLModes _sslMode() const;
 #endif
 
-    Mutex _mutex = MONGO_MAKE_LATCH("TransportLayerASIO::_mutex");
+    Mutex _mutex = MONGO_MAKE_LATCH(HierarchicalAcquisitionLevel(0), "TransportLayerASIO::_mutex");
 
     // There are three reactors that are used by TransportLayerASIO. The _ingressReactor contains
     // all the accepted sockets and all ingress networking activity. The _acceptorReactor contains
@@ -196,13 +199,20 @@ private:
     std::vector<std::pair<SockAddr, GenericAcceptor>> _acceptors;
 
     // Only used if _listenerOptions.async is false.
-    stdx::thread _listenerThread;
+    struct Listener {
+        stdx::thread thread;
+        stdx::condition_variable cv;
+        bool active = false;
+    };
+    Listener _listener;
 
     ServiceEntryPoint* const _sep = nullptr;
-    AtomicWord<bool> _running{false};
+
     Options _listenerOptions;
     // The real incoming port in case of _listenerOptions.port==0 (ephemeral).
     int _listenerPort = 0;
+
+    bool _isShutdown = false;
 };
 
 }  // namespace transport

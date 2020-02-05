@@ -29,6 +29,7 @@
 
 #include "mongo/platform/basic.h"
 
+#include "mongo/base/shim.h"
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/embedded/not_implemented.h"
@@ -124,10 +125,6 @@ public:
         UASSERT_NOT_IMPLEMENTED;
     }
 
-    Status _initializeUserFromPrivilegeDocument(User*, const BSONObj&) override {
-        UASSERT_NOT_IMPLEMENTED;
-    }
-
     void logOp(OperationContext*,
                const char*,
                const NamespaceString&,
@@ -146,10 +143,19 @@ public:
 private:
     bool _shouldValidate = false;
 };
+
 }  // namespace
 }  // namespace embedded
 
-MONGO_REGISTER_SHIM(AuthorizationManager::create)()->std::unique_ptr<AuthorizationManager> {
+namespace {
+
+std::unique_ptr<AuthorizationManager> authorizationManagerCreateImpl() {
     return std::make_unique<embedded::AuthorizationManager>();
 }
+
+auto authorizationManagerCreateRegistration =
+    MONGO_WEAK_FUNCTION_REGISTRATION(AuthorizationManager::create, authorizationManagerCreateImpl);
+
+}  // namespace
+
 }  // namespace mongo

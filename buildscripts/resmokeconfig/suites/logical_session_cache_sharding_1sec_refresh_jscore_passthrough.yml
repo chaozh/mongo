@@ -29,8 +29,6 @@ selector:
   - jstests/core/geo_update_btree2.js  # notablescan.
   - jstests/core/index_id_options.js  # "local" database.
   - jstests/core/index9.js  # "local" database.
-  - jstests/core/max_time_ms.js  # sleep, SERVER-2212.
-  - jstests/core/notablescan.js  # notablescan.
   - jstests/core/queryoptimizera.js  # "local" database.
   - jstests/core/rename*.js # renameCollection.
   - jstests/core/stages*.js  # stageDebug.
@@ -72,7 +70,7 @@ selector:
   - jstests/core/list_all_sessions.js
   - jstests/core/list_local_sessions.js
   - jstests/core/list_sessions.js
-  # TODO: Remove after fixing SERVER-32555. executionStats.nReturned is incorrect for sharded
+  # TODO: Remove after fixing SERVER-29449. executionStats.nReturned is incorrect for sharded
   # queries with a limit or for distinct commands.
   - jstests/core/distinct_index1.js
   - jstests/core/explain1.js
@@ -81,23 +79,11 @@ selector:
   # TODO: Remove after fixing SERVER-32563. The implementation of explain for the count command is
   # incorrect on sharded collections.
   - jstests/core/explain_count.js
-  # TODO: Remove after fixing SERVER-14324. mapReduce behaves unpredictably when the out collection
-  # is sharded on anything other than {_id: 1}.
-  - jstests/core/mr_undef.js
   # TODO SERVER-32311: These tests use plan stage helpers which can't handle sharded explain output.
   - jstests/core/expr_index_use.js
   - jstests/core/index_multikey.js
   - jstests/core/optimized_match_explain.js
   - jstests/core/sort_array.js
-  # mapReduce requires sharded output collections to be sharded by {_id: 1}. {_id: "hashed"} is not
-  # supported.
-  - jstests/core/mr_correctness.js
-  - jstests/core/mr_fail_invalid_js.js
-  - jstests/core/mr_preserve_indexes.js
-  - jstests/core/mr_scope.js
-  - jstests/core/mr_use_this_object.js
-  # TODO: SERVER-36966
-  - jstests/core/autocomplete.js
 
   # The tests below use applyOps, SERVER-1439.
   - jstests/core/list_collections1.js
